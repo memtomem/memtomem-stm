@@ -218,12 +218,17 @@ class SurfacingEngine:
             "Surfacing %d memories for %s/%s (query=%s)", len(relevant), server, tool, query[:50]
         )
 
-        # Session context (working memory): temporarily disabled.
-        # The previous in-process implementation called SqliteBackend.scratch_list()
-        # directly. After the remote-only refactor it must go through the MCP
-        # adapter (mem_scratch_get). Tracked as follow-up: see
-        # McpClientSearchAdapter.scratch_list() task.
-        scratch_items = None
+        # Session context (working memory): when enabled, fetch scratchpad
+        # entries via the MCP adapter and inject alongside LTM hits. Failures
+        # are silent — surfacing must still deliver the LTM hits even if
+        # working memory is unavailable.
+        scratch_items: list[dict] | None = None
+        if self._config.include_session_context:
+            try:
+                scratch_items = await self._mcp_adapter.scratch_list()
+            except Exception:
+                logger.debug("Failed to fetch session scratch items", exc_info=True)
+                scratch_items = None
 
         # Generate surfacing ID and record event
         surfacing_id = uuid.uuid4().hex[:12]

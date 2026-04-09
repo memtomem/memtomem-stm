@@ -252,3 +252,62 @@ class TestSurfacingCache:
         out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "cached memory" in out2
         assert adapter.search.call_count == 1  # not called again
+
+
+class TestSessionContextInjection:
+    """Verify include_session_context wires the scratchpad through the MCP adapter."""
+
+    async def test_scratch_items_injected_when_enabled(self):
+        results = [FakeSearchResult(chunk=FakeChunk(content="LTM hit content"), score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        adapter.scratch_list = AsyncMock(
+            return_value=[{"key": "current_task", "value": "running follow-up 4"}]
+        )
+        engine = SurfacingEngine(
+            config=_make_config(include_session_context=True),
+            mcp_adapter=adapter,
+        )
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "LTM hit content" in output
+        assert "Working Memory" in output
+        assert "current_task" in output
+        adapter.scratch_list.assert_awaited_once()
+
+    async def test_scratch_not_fetched_when_disabled(self):
+        results = [FakeSearchResult(chunk=FakeChunk(content="LTM hit content"), score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        adapter.scratch_list = AsyncMock(return_value=[])
+        engine = SurfacingEngine(
+            config=_make_config(include_session_context=False),
+            mcp_adapter=adapter,
+        )
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "LTM hit content" in output
+        assert "Working Memory" not in output
+        adapter.scratch_list.assert_not_called()
+
+    async def test_scratch_failure_silent_fallback(self):
+        """LTM injection still happens even if scratch_list raises."""
+        results = [FakeSearchResult(chunk=FakeChunk(content="LTM hit content"), score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        adapter.scratch_list = AsyncMock(side_effect=RuntimeError("scratch broke"))
+        engine = SurfacingEngine(
+            config=_make_config(include_session_context=True),
+            mcp_adapter=adapter,
+        )
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "LTM hit content" in output
+        assert "Working Memory" not in output
+        adapter.scratch_list.assert_awaited_once()
+
+    async def test_empty_scratch_list_omits_section(self):
+        results = [FakeSearchResult(chunk=FakeChunk(content="LTM hit content"), score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        adapter.scratch_list = AsyncMock(return_value=[])
+        engine = SurfacingEngine(
+            config=_make_config(include_session_context=True),
+            mcp_adapter=adapter,
+        )
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "LTM hit content" in output
+        assert "Working Memory" not in output
