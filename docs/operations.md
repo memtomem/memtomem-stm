@@ -8,12 +8,25 @@ Reference for running memtomem-stm in production: safety, privacy, scaling, obse
 
 A unified 3-state circuit breaker protects against cascading failures:
 
-```
-closed ──(3 failures)──→ open ──(60s timeout)──→ half-open
-  ↑                                                  │
-  └──────────(success)──────────────────────────────←─┤
-                                                      │
-open ←──────(failure)─────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: 3 consecutive failures
+    Open --> HalfOpen: 60s reset timeout
+    HalfOpen --> Closed: probe call succeeds
+    HalfOpen --> Open: probe call fails
+
+    note right of Closed
+        all calls pass through
+    end note
+    note right of Open
+        calls blocked,
+        fallback returned
+    end note
+    note right of HalfOpen
+        exactly one probe
+        call allowed
+    end note
 ```
 
 - **Closed**: all calls pass through normally
@@ -23,6 +36,20 @@ open ←──────(failure)───────────────
 Applied to both surfacing (LTM search) and LLM compression (external API calls).
 
 ### Connection Recovery
+
+```mermaid
+flowchart TD
+    Call["upstream call"] --> Try{"call succeeds?"}
+    Try -->|yes| Done["return result"]
+    Try -->|no| Class{"classify error"}
+    Class -->|"transport<br/>(OSError, Timeout, …)"| Retry{"retries<br/>remaining?"}
+    Class -->|"protocol<br/>(JSON-RPC -32600..-32603)"| Reset["reset connection<br/>(no retry)"]
+    Class -->|"programming<br/>(TypeError, …)"| Raise["propagate immediately"]
+    Retry -->|yes| Backoff["wait (1s → 2s → 4s,<br/>capped at 30s)"]
+    Backoff --> Call
+    Retry -->|no| Fail["fail with<br/>fallback / error"]
+    Reset --> Fail
+```
 
 - **Retry with backoff** — transport errors retried up to `max_retries` (default 3) with exponential backoff (1s → 2s → 4s → max 30s)
 - **Protocol error isolation** — JSON-RPC errors (-32600 to -32603) are not retried; the connection is reset for the next call
@@ -57,6 +84,19 @@ Detection scans the first 10K characters. When sensitive content is found, LLM c
 ## Horizontal Scaling
 
 By default, `SelectiveCompressor` stores pending TOC selections in memory. For multi-instance deployments, switch to SQLite-backed storage so instances share state:
+
+```mermaid
+flowchart TB
+    AgentA["Agent A"] --> InstA["STM instance A"]
+    AgentB["Agent B"] --> InstB["STM instance B"]
+    AgentC["Agent C"] --> InstC["STM instance C"]
+    InstA <--> Store
+    InstB <--> Store
+    InstC <--> Store
+    Store[("SQLitePendingStore<br/>~/.memtomem/pending_selections.db<br/>(WAL mode)")]
+    Store -.->|"selective TOC<br/>shared across instances"| All["agent A creates TOC,<br/>agent B can resolve it"]
+```
+
 
 ```json
 {
@@ -140,3 +180,53 @@ Traces proxy calls for latency analysis and debugging.
 | `~/.memtomem/stm_feedback.db` | Surfacing events & feedback ratings | FeedbackStore |
 | `~/.memtomem/pending_selections.db` | Shared pending TOC state (horizontal scaling) | SQLitePendingStore |
 | `~/.memtomem/proxy_index/*.md` | Auto-indexed responses | auto-index pipeline |
+
+```mermaid
+erDiagram
+    SURFACING_EVENT ||--o{ FEEDBACK : "0..n ratings"
+    SURFACING_EVENT ||--o{ MEMORY_REF : "1..n memories"
+    SEEN_MEMORY }o--|| MEMORY_REF : "dedup window"
+
+    SURFACING_EVENT {
+        string surfacing_id PK
+        string server
+        string tool
+        string query
+        float scores
+        timestamp created_at
+    }
+    FEEDBACK {
+        string surfacing_id FK
+        string rating "helpful / not_relevant / already_known"
+        string memory_id
+        timestamp created_at
+    }
+    MEMORY_REF {
+        string memory_id PK
+        string surfacing_id FK
+    }
+    SEEN_MEMORY {
+        string memory_id PK
+        timestamp first_seen
+        timestamp ttl_until
+    }
+
+    METRIC {
+        int id PK
+        string server
+        string tool
+        int original_chars
+        int compressed_chars
+        float duration_ms
+        string error_category
+        string trace_id
+        timestamp created_at
+    }
+    PENDING_SELECTION {
+        string key PK
+        blob payload
+        timestamp expires_at
+    }
+```
+
+The `SURFACING_EVENT`, `FEEDBACK`, `MEMORY_REF`, and `SEEN_MEMORY` tables live in `stm_feedback.db`. `METRIC` lives in `proxy_metrics.db`. `PENDING_SELECTION` lives in `pending_selections.db` only when the SQLite-backed `PendingStore` is enabled.

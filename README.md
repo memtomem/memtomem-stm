@@ -9,19 +9,22 @@ Sits between your AI agent and upstream MCP servers. Compresses responses to sav
 - Long-running coding sessions where the agent should *recall* prior decisions instead of re-searching
 - Teams running custom MCP servers that need a proxy layer for compression, caching, and observability — no upstream code changes required
 
-```
-Agent (Claude Code, Cursor, etc.)
-    │
-    ▼
-┌──────────────────────────────────────┐
-│        memtomem-stm (STM)            │
-│  CLEAN → COMPRESS → SURFACE → INDEX  │
-└──────────┬───────────────────────────┘
-           │ stdio / SSE / HTTP
-     ┌─────┴──────┐
-     ▼            ▼
- [filesystem]  [github]
-  MCP server    MCP server
+```mermaid
+flowchart TB
+    Agent["Agent<br/>(Claude Code, Cursor, …)"]
+    subgraph STM["memtomem-stm (STM)"]
+        Pipe["CLEAN → COMPRESS → SURFACE → INDEX"]
+    end
+    LTM[("memtomem LTM<br/>(MCP server)")]
+    FS["filesystem<br/>MCP server"]
+    GH["github<br/>MCP server"]
+    Other["…any MCP server"]
+
+    Agent -->|MCP| STM
+    STM <-->|MCP: stdio / SSE / HTTP| FS
+    STM <-->|MCP| GH
+    STM <-->|MCP| Other
+    STM <-.->|surfacing<br/>via MCP| LTM
 ```
 
 ## Installation
@@ -98,7 +101,16 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 | [Configuration](docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
 | [CLI](docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 6 MCP tools |
 | [Operations](docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
-| [Testing](docs/testing.md) | Test layout and how to run them |
+
+## Development
+
+```bash
+uv sync                                      # install dev deps
+uv run pytest -m "not ollama"                # tests (CI filter)
+uv run ruff check src && uv run mypy src     # lint + typecheck
+```
+
+CI runs the same three commands on every PR via `.github/workflows/ci.yml`. Mypy is advisory; lint and tests are required to pass.
 
 ## License
 

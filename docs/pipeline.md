@@ -2,27 +2,68 @@
 
 Every proxied tool call goes through 4 stages (plus an optional 4b for fact extraction).
 
+```mermaid
+flowchart TD
+    Up["upstream response"] --> Clean
+    subgraph Clean["1. CLEAN"]
+        C1["HTML / script strip"]
+        C2["paragraph dedup"]
+        C3["link flood collapse"]
+    end
+    Clean --> Compress
+    subgraph Compress["2. COMPRESS"]
+        C4["10 strategies"]
+        C5["auto-selection"]
+        C6["query-aware budget"]
+    end
+    Compress --> Surface
+    subgraph Surface["3. SURFACE"]
+        S1["gated · deduped<br/>rate-limited"]
+        S2["inject LTM memories"]
+    end
+    Surface --> Index
+    subgraph Index["4. INDEX (optional)"]
+        I1["auto-index large<br/>responses → LTM"]
+    end
+    Index --> Agent["to agent"]
+
+    Surface -.->|optional| Extract
+    Extract["4b. EXTRACT<br/>(fact extraction)"] -.-> LTM[("memtomem LTM")]
+    Index -.->|optional| LTM
 ```
-upstream response
-       │
-       ▼
-┌──────────────┐
-│ 1. CLEAN     │  HTML/script strip · paragraph dedup · link flood collapse
-└──────┬───────┘
-       ▼
-┌──────────────┐
-│ 2. COMPRESS  │  10 strategies · auto-selection · query-aware budget
-└──────┬───────┘
-       ▼
-┌──────────────┐
-│ 3. SURFACE   │  inject relevant LTM memories (gated, deduped, rate-limited)
-└──────┬───────┘
-       ▼
-┌──────────────┐
-│ 4. INDEX     │  optional auto-indexing of large responses → LTM
-└──────┬───────┘
-       ▼
-   to agent
+
+The CLEAN → COMPRESS → SURFACE → INDEX path is synchronous. The optional **4b EXTRACT** stage runs in parallel via a background extractor that does not block the agent response.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as memtomem-stm
+    participant Up as upstream MCP
+    participant LTM as memtomem LTM
+    participant Cache as ProxyCache
+
+    Agent->>STM: tool call (server, tool, args)
+    STM->>Cache: lookup(server:tool:args)
+    alt cache miss
+        STM->>Up: forward call
+        Up-->>STM: raw response
+        STM->>STM: CLEAN
+        STM->>STM: COMPRESS
+        STM->>Cache: store pre-surfacing payload
+    else cache hit
+        Cache-->>STM: cached payload
+    end
+    STM->>LTM: search (mem_search via MCP)
+    LTM-->>STM: ranked memories
+    STM->>STM: SURFACE (inject)
+    opt response ≥ min_chars and auto_index on
+        STM->>LTM: mem_add (auto-index)
+    end
+    opt extraction enabled
+        STM-)STM: EXTRACT (background)
+    end
+    STM-->>Agent: enriched response
 ```
 
 ## Stage 1: CLEAN

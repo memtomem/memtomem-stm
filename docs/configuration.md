@@ -2,8 +2,17 @@
 
 memtomem-stm reads configuration from two sources, in order of precedence:
 
+```mermaid
+flowchart LR
+    Env["env vars<br/>MEMTOMEM_STM_*"] -->|highest| Merge["effective config"]
+    File["~/.memtomem/<br/>stm_proxy.json<br/>(hot-reloaded)"] -->|fallback| Merge
+    Defaults["pydantic-settings<br/>defaults"] -->|baseline| Merge
+    Merge --> STM["STM runtime"]
+```
+
 1. **Environment variables** — prefix `MEMTOMEM_STM_`, double-underscore (`__`) for nesting
 2. **Config file** — `~/.memtomem/stm_proxy.json` (hot-reloaded; changes take effect on the next tool call without restarting)
+3. **Defaults** — every setting has a sensible default in pydantic-settings, so you can run STM with zero configuration
 
 For most quick-start scenarios you can ignore the config file entirely and use the [CLI](cli.md) (`mms add ...`) plus a few env vars.
 
@@ -145,6 +154,25 @@ Full example with all options:
 ```
 
 The config file is **hot-reloaded** — changes take effect on the next tool call without restarting STM.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant CLI as mms
+    participant File as stm_proxy.json
+    participant Watcher as ConfigWatcher
+    participant STM as proxy runtime
+    actor Agent
+
+    User->>CLI: mms add github --prefix gh ...
+    CLI->>File: write new server entry
+    Watcher-)Watcher: detect mtime change
+    Watcher->>STM: reload()
+    Note over STM: new ToolConfig built;<br/>existing in-flight call unaffected
+    Agent->>STM: next proxied call
+    STM-->>Agent: served with new config
+```
 
 ## Transport Types
 

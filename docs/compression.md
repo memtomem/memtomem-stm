@@ -2,6 +2,28 @@
 
 memtomem-stm has 10 compression strategies. The CLI's `--compression` flag exposes 4 of them (`none`, `truncate`, `selective`, `hybrid`); the remaining six are selected via the config file or by setting `default_compression: "auto"` and letting `auto_select_strategy()` pick per response.
 
+```mermaid
+flowchart TD
+    R["upstream response<br/>(after CLEAN)"] --> A{"strategy ==<br/>'auto'?"}
+    A -->|no| Fixed["use configured<br/>strategy directly"]
+    A -->|yes| T{"detect content<br/>type"}
+    T -->|"JSON dict /<br/>config"| EF["extract_fields"]
+    T -->|"large JSON<br/>array"| SP["schema_pruning"]
+    T -->|"markdown +<br/>headings"| H["hybrid"]
+    T -->|"API doc /<br/>schema"| Sk["skeleton"]
+    T -->|"large structured<br/>doc"| Sel["selective<br/>(2-phase TOC)"]
+    T -->|"small / plain"| Tr["truncate"]
+    Fixed --> Out["compressed<br/>response"]
+    EF --> Out
+    SP --> Out
+    H --> Out
+    Sk --> Out
+    Sel --> Out
+    Tr --> Out
+```
+
+> **Note**: `progressive` and `llm_summary` are **never** chosen by `auto` — they're opt-in only because they change the agent interaction pattern (progressive needs `stm_proxy_read_more`; `llm_summary` adds external API latency).
+
 | Strategy | Best for | Description |
 |----------|----------|-------------|
 | **auto** (default) | All responses | Content-aware: picks the best strategy per response based on content type |
@@ -35,6 +57,25 @@ memtomem-stm has 10 compression strategies. The CLI's `--compression` flag expos
 
 **Phase 2** — Agent calls `stm_proxy_select_chunks` to retrieve only the sections it needs.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as SelectiveCompressor
+    participant Store as PendingStore
+
+    Agent->>STM: tool call (large response)
+    STM->>STM: parse into sections
+    STM->>Store: save full sections (key=abc123, ttl=300s)
+    STM-->>Agent: TOC only<br/>{key, entries[], hint}
+    Note over Agent: agent decides which sections matter
+    Agent->>STM: stm_proxy_select_chunks(key=abc123, sections=["src/main.py","README"])
+    STM->>Store: fetch by key
+    Store-->>STM: full sections
+    STM-->>Agent: only the requested sections
+    Note over Store: TTL expires → eviction
+```
+
 Auto-detects format: JSON dicts (parsed by keys), JSON arrays (parsed by index), Markdown (parsed by headings), plain text (parsed by paragraphs).
 
 Pending selections are stored for 5 minutes (max 100 concurrent), then auto-evicted. For multi-instance deployments, switch to SQLite-backed pending storage — see [Operations → Horizontal Scaling](operations.md#horizontal-scaling).
@@ -43,16 +84,15 @@ Pending selections are stored for 5 minutes (max 100 concurrent), then auto-evic
 
 Combines immediate access with selective retrieval:
 
-```
-┌─────────────────────────────────┐
-│  HEAD (first 5000 chars)        │  ← Immediately available
-├─────────────────────────────────┤
-│  --- Remaining content (45K) ---│
-│  Table of Contents:             │  ← Selective retrieval
-│  • Section A (2K chars)         │
-│  • Section B (8K chars)         │
-│  ...                            │
-└─────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Resp["hybrid response"]
+        Head["HEAD<br/>(first 5000 chars)<br/><br/><b>immediately available</b>"]
+        TOC["TOC of remaining content<br/>• Section A — 2K chars<br/>• Section B — 8K chars<br/>• Section C — 35K chars<br/>…"]
+        Head --- TOC
+    end
+    Resp -->|agent reads| Quick["quick scan"]
+    Resp -.->|"stm_proxy_select_chunks(<br/>key, sections=['B'])"| Detail["full Section B"]
 ```
 
 Configurable per server:
@@ -72,12 +112,21 @@ Configurable per server:
 
 Inspired by how Claude Code reads files progressively (150 lines at a time), progressive delivery stores the full cleaned content and delivers it in chunks on demand — **zero information loss**.
 
-```
-Agent ← first 4000 chars + footer metadata
-Agent → stm_proxy_read_more(key="abc123", offset=4000)
-Agent ← next 4000 chars + footer metadata
-Agent → stm_proxy_read_more(key="abc123", offset=8000)
-Agent ← final chunk (has_more=false)
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant STM as memtomem-stm
+    participant Store as PendingStore
+
+    Agent->>STM: tool call (large response)
+    STM->>Store: store full content (key=abc123)
+    STM-->>Agent: chunk 1 (0-4000) + footer<br/>{key, has_more, hint}
+    Agent->>STM: stm_proxy_read_more(key=abc123, offset=4000)
+    STM->>Store: fetch content
+    STM-->>Agent: chunk 2 (4000-8000)
+    Agent->>STM: stm_proxy_read_more(key=abc123, offset=8000)
+    STM->>Store: fetch content
+    STM-->>Agent: final chunk (has_more=false)
 ```
 
 The first chunk includes a metadata footer with remaining headings/structure hints so the agent can decide whether to continue reading.

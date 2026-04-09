@@ -8,6 +8,15 @@ memtomem-stm ships three console scripts:
 | `memtomem-stm-proxy` | Management CLI for editing `~/.memtomem/stm_proxy.json`. |
 | `mms` | Short alias for `memtomem-stm-proxy` — identical behavior. |
 
+```mermaid
+flowchart LR
+    User["you"] -->|edit config| MMS["mms<br/>(= memtomem-stm-proxy)"]
+    MMS -->|writes| Conf["~/.memtomem/<br/>stm_proxy.json"]
+    Conf -.->|hot reload| Server
+    Client["AI client<br/>(Claude Code, …)"] -->|MCP| Server["memtomem-stm<br/>(MCP server)"]
+    Server --> Up["upstream<br/>MCP servers"]
+```
+
 The `mms` short form pairs with memtomem core's `mm` CLI: `mm` for long-term memory, `mms` for the STM proxy. Use whichever name you prefer; the docs below use `mms` for brevity.
 
 ## `mms` (= `memtomem-stm-proxy`)
@@ -92,3 +101,22 @@ These are exposed by the `memtomem-stm` MCP server and become available to your 
 | `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness % |
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
+
+A typical agent session uses a mix of proxied tools and STM-specific control tools:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as memtomem-stm
+
+    Agent->>STM: fs__read_file(path="/big/file.md")
+    STM-->>Agent: TOC + selection key (selective compression)
+    Agent->>STM: stm_proxy_select_chunks(key, sections=["Config","API"])
+    STM-->>Agent: only the requested sections
+    Note over Agent,STM: agent reads memories injected at top of fs__read_file response
+    Agent->>STM: stm_surfacing_feedback(surfacing_id, "helpful")
+    STM-->>Agent: ack (auto-tuner notes positive sample)
+    Agent->>STM: stm_proxy_stats
+    STM-->>Agent: token savings · cache hit ratio · latency p50/p95/p99
+```
