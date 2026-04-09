@@ -34,10 +34,12 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 
 ## Quick Start
 
+`mms` is the short alias for `memtomem-stm-proxy` — both commands are identical, use whichever you prefer.
+
 ### 1. Add an upstream MCP server
 
 ```bash
-memtomem-stm-proxy add filesystem \
+mms add filesystem \
   --command npx \
   --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
   --prefix fs
@@ -46,8 +48,8 @@ memtomem-stm-proxy add filesystem \
 `--prefix` is required: it's the namespace under which the upstream server's tools will appear (e.g. `fs__read_file`). Repeat for each MCP server you want to proxy.
 
 ```bash
-memtomem-stm-proxy list      # show what you've added
-memtomem-stm-proxy status    # show full config + connectivity
+mms list      # show what you've added
+mms status    # show full config + connectivity
 ```
 
 ### 2. Connect your AI client to STM
@@ -94,7 +96,7 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 | [Surfacing](docs/surfacing.md) | Memory surfacing engine, relevance gating, feedback loop, auto-tuning |
 | [Caching](docs/caching.md) | Response cache and auto-indexing |
 | [Configuration](docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
-| [CLI](docs/cli.md) | `memtomem-stm-proxy` commands and the 6 MCP tools |
+| [CLI](docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 6 MCP tools |
 | [Operations](docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
 | [Testing](docs/testing.md) | Test layout and how to run them |
 
