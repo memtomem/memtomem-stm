@@ -1,9 +1,10 @@
 """Tiny stdio MCP server used by integration tests.
 
 Stands in for `memtomem-server` so that STM's McpClientSearchAdapter can be
-exercised end-to-end without depending on a real memtomem installation. The
-server exposes a single tool, `mem_search`, that returns canned content in the
-format the adapter knows how to parse.
+exercised end-to-end without depending on a real memtomem installation. It
+exposes the two tools the adapter actually calls — ``mem_search`` and the
+``mem_do`` meta-tool routing the ``scratch_get`` action — both returning
+canned text in the format the adapter knows how to parse.
 
 Run with: `python <path-to-this-file>`
 """
@@ -28,6 +29,23 @@ async def mem_search(
         "--- [0.87] /notes/api.md ---\n"
         "All API responses include rate limit headers (X-RateLimit-*).\n"
     )
+
+
+@mcp.tool()
+async def mem_do(action: str, params: dict | None = None) -> str:
+    """Stand-in for the core ``mem_do`` meta-tool.
+
+    Only the actions STM actually calls are implemented; everything else
+    returns an unknown-action error matching real core's response.
+    """
+    if action == "scratch_get":
+        return (
+            "Working memory: 2 entries\n"
+            "\n"
+            "  current_task: drafting follow-up 4 implementation plan...\n"
+            "  recent_branch: feat/stm-session-context-restore..."
+        )
+    return f"Error: unknown action '{action}'."
 
 
 if __name__ == "__main__":

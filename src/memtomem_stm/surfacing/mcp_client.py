@@ -99,6 +99,89 @@ class McpClientSearchAdapter:
         text = "\n".join(text_parts)
         return self._parse_results(text), None
 
+    async def scratch_list(self) -> list[dict]:
+        """Fetch working memory entries via mem_do(action="scratch_get").
+
+        The remote core's ``mem_scratch_get`` returns a human-readable
+        listing when called with no key. We parse it back into the
+        ``[{"key": ..., "value": ...}, ...]`` shape that
+        :class:`SurfacingFormatter` expects.
+
+        Returns an empty list if the session is not started, the call
+        fails, or working memory is empty — surfacing must always be
+        able to silently skip session-context injection without losing
+        the LTM hits.
+        """
+        if self._session is None:
+            return []
+
+        try:
+            result = await self._session.call_tool(
+                "mem_do",
+                {"action": "scratch_get", "params": {}},
+            )
+        except Exception as exc:
+            logger.debug("MCP mem_do(scratch_get) failed: %s", exc)
+            return []
+
+        text_parts = [c.text for c in result.content if c.type == "text"]
+        if not text_parts:
+            return []
+
+        return self._parse_scratch_list("\n".join(text_parts))
+
+    @staticmethod
+    def _parse_scratch_list(text: str) -> list[dict]:
+        """Parse ``mem_scratch_get`` listing output into entry dicts.
+
+        Expected format from core (mem_scratch_get with key=None)::
+
+            Working memory: 2 entries
+
+              key1: value preview... (expires: 2026-04-09T12:00:00) [promoted]
+              key2: another value...
+
+        Each entry line starts with two leading spaces. The trailing
+        ``...`` marker is stripped (core always appends it after the
+        truncated preview); ``(expires: ...)`` and ``[promoted]`` are
+        captured into optional fields.
+        """
+        if not text or "Working memory is empty" in text:
+            return []
+
+        entries: list[dict] = []
+        for line in text.splitlines():
+            if not line.startswith("  "):
+                continue
+            body = line[2:]
+            key, sep, rest = body.partition(": ")
+            if not sep:
+                continue
+
+            value_part = rest
+            promoted = False
+            if value_part.endswith(" [promoted]"):
+                value_part = value_part[: -len(" [promoted]")]
+                promoted = True
+
+            expires_at: str | None = None
+            expires_match = re.search(r"\s*\(expires:\s*([^)]+)\)\s*$", value_part)
+            if expires_match:
+                expires_at = expires_match.group(1)
+                value_part = value_part[: expires_match.start()]
+
+            if value_part.endswith("..."):
+                value_part = value_part[:-3]
+
+            entry: dict = {"key": key, "value": value_part}
+            if expires_at is not None:
+                entry["expires_at"] = expires_at
+            if promoted:
+                entry["promoted"] = True
+            entries.append(entry)
+
+        return entries
+
     @staticmethod
     def _parse_results(text: str) -> list[RemoteSearchResult]:
         """Parse mem_search formatted output into RemoteSearchResult objects.
