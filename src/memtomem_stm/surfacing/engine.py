@@ -66,6 +66,10 @@ class SurfacingEngine:
                     )
             except Exception:
                 logger.debug("Failed to load cross-session seen IDs", exc_info=True)
+        # In-memory boost guard — at most one mem_do(increment_access) call
+        # per surfacing event, even if the agent fires multiple "helpful"
+        # ratings for it.
+        self._boosted_event_ids: set[str] = set()
 
     async def surface(
         self,
@@ -130,17 +134,36 @@ class SurfacingEngine:
     ) -> str:
         """Record feedback for a surfaced memory.
 
-        Note: the previous in-process implementation also incremented
-        access_count on the surfaced chunks via direct SqliteBackend access
-        when the rating was "helpful". After the move to remote-only LTM
-        access this boost is temporarily disabled — it will be restored once
-        the core exposes an MCP action for incrementing access counts (see
-        follow-up task: mem_increment_access action).
+        On a ``helpful`` rating, also boosts the chunk's ``access_count`` in
+        core via ``mem_do(action="increment_access")`` so the search pipeline
+        can rank it higher next time. The boost is guarded with an in-memory
+        per-event set so multiple "helpful" ratings for the same surfacing
+        event only trigger one increment.
         """
         if self._feedback_tracker is None:
             return "Feedback tracking is not enabled."
 
-        return self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+        result = self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+
+        if rating == "helpful" and surfacing_id not in self._boosted_event_ids:
+            try:
+                if memory_id:
+                    target_ids: list[str] = [memory_id]
+                else:
+                    target_ids = self._feedback_tracker.store.get_memory_ids_for_surfacing(
+                        surfacing_id
+                    )
+                if target_ids:
+                    await self._mcp_adapter.increment_access(target_ids)
+                    self._boosted_event_ids.add(surfacing_id)
+            except Exception:
+                logger.debug(
+                    "Failed to boost access_count for surfacing %s",
+                    surfacing_id,
+                    exc_info=True,
+                )
+
+        return result
 
     async def _do_surface(
         self,

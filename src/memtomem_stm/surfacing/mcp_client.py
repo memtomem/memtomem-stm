@@ -99,6 +99,25 @@ class McpClientSearchAdapter:
         text = "\n".join(text_parts)
         return self._parse_results(text), None
 
+    async def increment_access(self, chunk_ids: list[str]) -> None:
+        """Boost the access_count of the given chunks via mem_do(increment_access).
+
+        Used by ``SurfacingEngine.handle_feedback`` when an agent rates a
+        surfaced memory as ``helpful``. Failures are silent (debug log
+        only) — feedback recording itself must never depend on the boost
+        round trip succeeding.
+        """
+        if self._session is None or not chunk_ids:
+            return
+
+        try:
+            await self._session.call_tool(
+                "mem_do",
+                {"action": "increment_access", "params": {"chunk_ids": chunk_ids}},
+            )
+        except Exception as exc:
+            logger.debug("MCP mem_do(increment_access) failed: %s", exc)
+
     async def scratch_list(self) -> list[dict]:
         """Fetch working memory entries via mem_do(action="scratch_get").
 

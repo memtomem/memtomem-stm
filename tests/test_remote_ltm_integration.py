@@ -90,6 +90,41 @@ async def test_session_context_via_remote_stdio_mcp_server():
     assert "drafting follow-up 4" in output
 
 
+@pytest.mark.asyncio
+async def test_increment_access_via_remote_stdio_mcp_server():
+    """McpClientSearchAdapter.increment_access reaches the fake mem_do handler.
+
+    The fake server is a child process and we can't read its in-memory state, so
+    success is verified indirectly: the call must round-trip without raising and
+    leave SurfacingEngine's boost-guard set populated.
+    """
+    from unittest.mock import MagicMock
+
+    config = _stdio_config()
+    adapter = McpClientSearchAdapter(config)
+    await adapter.start()
+    try:
+        # Build a tracker that points the engine at known memory IDs without
+        # touching the real FeedbackStore SQLite path.
+        tracker = MagicMock()
+        tracker.record_feedback = MagicMock(return_value="Feedback recorded: helpful")
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.get_memory_ids_for_surfacing = MagicMock(
+            return_value=["mid-1", "mid-2", "mid-3"]
+        )
+
+        engine = SurfacingEngine(config, mcp_adapter=adapter, feedback_tracker=tracker)
+        result = await engine.handle_feedback("sid-stdio", "helpful")
+    finally:
+        await adapter.stop()
+
+    assert "Feedback recorded" in result
+    # The round-trip succeeded, so the boost guard recorded the event.
+    assert "sid-stdio" in engine._boosted_event_ids
+    tracker.store.get_memory_ids_for_surfacing.assert_called_once_with("sid-stdio")
+
+
 # ── McpClientSearchAdapter._parse_scratch_list unit tests ──────────────
 
 

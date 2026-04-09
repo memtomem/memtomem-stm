@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 
@@ -311,3 +311,128 @@ class TestSessionContextInjection:
         output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "LTM hit content" in output
         assert "Working Memory" not in output
+
+
+class TestFeedbackBoost:
+    """Verify handle_feedback boosts access_count via the MCP adapter on 'helpful'."""
+
+    def _make_tracker(self, memory_ids: list[str]):
+        """Build a fake FeedbackTracker the engine can call."""
+        tracker = MagicMock()
+        tracker.record_feedback = MagicMock(return_value="Feedback recorded: helpful")
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.get_memory_ids_for_surfacing = MagicMock(return_value=list(memory_ids))
+        return tracker
+
+    async def test_helpful_with_explicit_memory_id_boosts_only_that_id(self):
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(["mid-A", "mid-B"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback("sid-1", "helpful", memory_id="mid-X")
+
+        assert "Feedback recorded" in result
+        adapter.increment_access.assert_awaited_once_with(["mid-X"])
+        tracker.store.get_memory_ids_for_surfacing.assert_not_called()
+        assert "sid-1" in engine._boosted_event_ids
+
+    async def test_helpful_without_memory_id_boosts_all_event_ids(self):
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(["mid-A", "mid-B", "mid-C"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-2", "helpful")
+
+        tracker.store.get_memory_ids_for_surfacing.assert_called_once_with("sid-2")
+        adapter.increment_access.assert_awaited_once_with(["mid-A", "mid-B", "mid-C"])
+
+    async def test_non_helpful_ratings_skip_boost(self):
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-3", "not_relevant", memory_id="mid-A")
+        await engine.handle_feedback("sid-3", "already_known", memory_id="mid-A")
+
+        adapter.increment_access.assert_not_called()
+
+    async def test_boost_guard_caps_per_event(self):
+        """Repeat 'helpful' for the same surfacing_id only triggers one boost."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-4", "helpful", memory_id="mid-A")
+        await engine.handle_feedback("sid-4", "helpful", memory_id="mid-A")
+        await engine.handle_feedback("sid-4", "helpful", memory_id="mid-A")
+
+        assert adapter.increment_access.await_count == 1
+
+    async def test_boost_failure_does_not_break_feedback(self):
+        """If increment_access raises, record_feedback still returns success."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock(side_effect=RuntimeError("MCP gone"))
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback("sid-5", "helpful", memory_id="mid-A")
+
+        assert "Feedback recorded" in result
+        adapter.increment_access.assert_awaited_once()
+        # The boost failed mid-flight — guard set should NOT mark this event
+        # so a future call can retry the boost.
+        assert "sid-5" not in engine._boosted_event_ids
+
+    async def test_no_boost_when_event_has_no_memories(self):
+        """When the surfacing event has no memories, skip the call entirely."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker([])  # store returns []
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-6", "helpful")
+
+        adapter.increment_access.assert_not_called()
+
+    async def test_no_tracker_returns_disabled_message(self):
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=None,
+        )
+
+        result = await engine.handle_feedback("sid-7", "helpful")
+
+        assert "not enabled" in result
+        adapter.increment_access.assert_not_called()
