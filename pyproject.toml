@@ -29,6 +29,7 @@ langfuse = ["langfuse>=4.0"]
 [project.scripts]
 memtomem-stm = "memtomem_stm.server:main"
 memtomem-stm-proxy = "memtomem_stm.cli.proxy:cli"
+mms = "memtomem_stm.cli.proxy:cli"
 
 [project.urls]
 Homepage = "https://github.com/memtomem/memtomem"

@@ -1,16 +1,19 @@
 # CLI Reference
 
-memtomem-stm ships two console scripts:
+memtomem-stm ships three console scripts:
 
 | Script | Purpose |
 |--------|---------|
 | `memtomem-stm` | The MCP server itself. Add this to your AI client's MCP config. |
 | `memtomem-stm-proxy` | Management CLI for editing `~/.memtomem/stm_proxy.json`. |
+| `mms` | Short alias for `memtomem-stm-proxy` — identical behavior. |
 
-## `memtomem-stm-proxy`
+The `mms` short form pairs with memtomem core's `mm` CLI: `mm` for long-term memory, `mms` for the STM proxy. Use whichever name you prefer; the docs below use `mms` for brevity.
+
+## `mms` (= `memtomem-stm-proxy`)
 
 ```
-Usage: memtomem-stm-proxy [OPTIONS] COMMAND [ARGS]...
+Usage: mms [OPTIONS] COMMAND [ARGS]...
 
   memtomem-stm proxy gateway management.
 
@@ -26,7 +29,7 @@ All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
 ### `add`
 
 ```
-Usage: memtomem-stm-proxy add [OPTIONS] NAME
+Usage: mms add [OPTIONS] NAME
 
 Options:
   --command TEXT                  Executable command (stdio).
@@ -47,32 +50,32 @@ Options:
 
 ```bash
 # Filesystem server
-memtomem-stm-proxy add filesystem \
+mms add filesystem \
   --command npx \
   --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
   --prefix fs
 
 # GitHub server with env var
-memtomem-stm-proxy add github \
+mms add github \
   --command npx \
   --args "-y @modelcontextprotocol/server-github" \
   --prefix gh \
   --env GITHUB_TOKEN=ghp_xxx
 
 # SSE transport
-memtomem-stm-proxy add docs \
+mms add docs \
   --transport sse \
   --url https://docs.example.com/mcp \
   --prefix docs
 
 # List configured upstreams
-memtomem-stm-proxy list
+mms list
 
 # Show full status
-memtomem-stm-proxy status
+mms status
 
 # Remove a server
-memtomem-stm-proxy remove github
+mms remove github
 ```
 
 ## MCP Tools (6 + proxied)

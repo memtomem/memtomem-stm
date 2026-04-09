@@ -5,7 +5,7 @@ memtomem-stm reads configuration from two sources, in order of precedence:
 1. **Environment variables** — prefix `MEMTOMEM_STM_`, double-underscore (`__`) for nesting
 2. **Config file** — `~/.memtomem/stm_proxy.json` (hot-reloaded; changes take effect on the next tool call without restarting)
 
-For most quick-start scenarios you can ignore the config file entirely and use the [CLI](cli.md) (`memtomem-stm-proxy add ...`) plus a few env vars.
+For most quick-start scenarios you can ignore the config file entirely and use the [CLI](cli.md) (`mms add ...`) plus a few env vars.
 
 ## Environment Variables
 

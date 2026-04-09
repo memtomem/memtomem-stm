@@ -134,7 +134,7 @@ Traces proxy calls for latency analysis and debugging.
 
 | File | Purpose | Managed by |
 |------|---------|------------|
-| `~/.memtomem/stm_proxy.json` | Upstream server config (hot-reloaded) | `memtomem-stm-proxy` CLI |
+| `~/.memtomem/stm_proxy.json` | Upstream server config (hot-reloaded) | `mms` CLI |
 | `~/.memtomem/proxy_cache.db` | Response cache (SQLite, WAL mode) | ProxyCache |
 | `~/.memtomem/proxy_metrics.db` | Compression metrics history | MetricsStore |
 | `~/.memtomem/stm_feedback.db` | Surfacing events & feedback ratings | FeedbackStore |
