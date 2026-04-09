@@ -1,0 +1,91 @@
+# CLI Reference
+
+memtomem-stm ships two console scripts:
+
+| Script | Purpose |
+|--------|---------|
+| `memtomem-stm` | The MCP server itself. Add this to your AI client's MCP config. |
+| `memtomem-stm-proxy` | Management CLI for editing `~/.memtomem/stm_proxy.json`. |
+
+## `memtomem-stm-proxy`
+
+```
+Usage: memtomem-stm-proxy [OPTIONS] COMMAND [ARGS]...
+
+  memtomem-stm proxy gateway management.
+
+Commands:
+  add     Add an upstream MCP server to the proxy configuration.
+  list    List configured upstream servers.
+  remove  Remove an upstream MCP server from the proxy configuration.
+  status  Show proxy gateway configuration and server list.
+```
+
+All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
+
+### `add`
+
+```
+Usage: memtomem-stm-proxy add [OPTIONS] NAME
+
+Options:
+  --command TEXT                  Executable command (stdio).
+  --args TEXT                     Space-separated arguments.
+  --prefix TEXT                   Tool name prefix (e.g. 'fs').  [required]
+  --transport [stdio|sse|streamable_http]
+                                  [default: stdio]
+  --url TEXT                      Endpoint URL (SSE / HTTP).
+  --env KEY=VALUE
+  --compression [none|truncate|selective|hybrid]
+                                  [default: hybrid]
+  --max-chars INTEGER             [default: 8000]
+```
+
+> **Note**: The CLI's `--compression` flag exposes 4 of the 10 strategies. The remaining six (`auto`, `extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
+
+### Examples
+
+```bash
+# Filesystem server
+memtomem-stm-proxy add filesystem \
+  --command npx \
+  --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
+  --prefix fs
+
+# GitHub server with env var
+memtomem-stm-proxy add github \
+  --command npx \
+  --args "-y @modelcontextprotocol/server-github" \
+  --prefix gh \
+  --env GITHUB_TOKEN=ghp_xxx
+
+# SSE transport
+memtomem-stm-proxy add docs \
+  --transport sse \
+  --url https://docs.example.com/mcp \
+  --prefix docs
+
+# List configured upstreams
+memtomem-stm-proxy list
+
+# Show full status
+memtomem-stm-proxy status
+
+# Remove a server
+memtomem-stm-proxy remove github
+```
+
+## MCP Tools (6 + proxied)
+
+These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
+
+| Tool | Arguments | Description |
+|------|-----------|-------------|
+| `stm_proxy_stats` | — | Token savings, compression stats, cache hit/miss ratio |
+| `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
+| `stm_proxy_read_more` | `key`, `offset`, `limit?` | Read next chunk from a progressive delivery response |
+| `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, or by server+tool) |
+| `stm_surfacing_feedback` | `surfacing_id`, `rating`, `memory_id?` | Rate surfaced memories (`helpful` / `not_relevant` / `already_known`) |
+| `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness % |
+
+Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
