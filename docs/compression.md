@@ -57,6 +57,25 @@ flowchart TD
 
 **Phase 2** — Agent calls `stm_proxy_select_chunks` to retrieve only the sections it needs.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as SelectiveCompressor
+    participant Store as PendingStore
+
+    Agent->>STM: tool call (large response)
+    STM->>STM: parse into sections
+    STM->>Store: save full sections (key=abc123, ttl=300s)
+    STM-->>Agent: TOC only<br/>{key, entries[], hint}
+    Note over Agent: agent decides which sections matter
+    Agent->>STM: stm_proxy_select_chunks(key=abc123, sections=["src/main.py","README"])
+    STM->>Store: fetch by key
+    Store-->>STM: full sections
+    STM-->>Agent: only the requested sections
+    Note over Store: TTL expires → eviction
+```
+
 Auto-detects format: JSON dicts (parsed by keys), JSON arrays (parsed by index), Markdown (parsed by headings), plain text (parsed by paragraphs).
 
 Pending selections are stored for 5 minutes (max 100 concurrent), then auto-evicted. For multi-instance deployments, switch to SQLite-backed pending storage — see [Operations → Horizontal Scaling](operations.md#horizontal-scaling).

@@ -180,3 +180,53 @@ Traces proxy calls for latency analysis and debugging.
 | `~/.memtomem/stm_feedback.db` | Surfacing events & feedback ratings | FeedbackStore |
 | `~/.memtomem/pending_selections.db` | Shared pending TOC state (horizontal scaling) | SQLitePendingStore |
 | `~/.memtomem/proxy_index/*.md` | Auto-indexed responses | auto-index pipeline |
+
+```mermaid
+erDiagram
+    SURFACING_EVENT ||--o{ FEEDBACK : "0..n ratings"
+    SURFACING_EVENT ||--o{ MEMORY_REF : "1..n memories"
+    SEEN_MEMORY }o--|| MEMORY_REF : "dedup window"
+
+    SURFACING_EVENT {
+        string surfacing_id PK
+        string server
+        string tool
+        string query
+        float scores
+        timestamp created_at
+    }
+    FEEDBACK {
+        string surfacing_id FK
+        string rating "helpful / not_relevant / already_known"
+        string memory_id
+        timestamp created_at
+    }
+    MEMORY_REF {
+        string memory_id PK
+        string surfacing_id FK
+    }
+    SEEN_MEMORY {
+        string memory_id PK
+        timestamp first_seen
+        timestamp ttl_until
+    }
+
+    METRIC {
+        int id PK
+        string server
+        string tool
+        int original_chars
+        int compressed_chars
+        float duration_ms
+        string error_category
+        string trace_id
+        timestamp created_at
+    }
+    PENDING_SELECTION {
+        string key PK
+        blob payload
+        timestamp expires_at
+    }
+```
+
+The `SURFACING_EVENT`, `FEEDBACK`, `MEMORY_REF`, and `SEEN_MEMORY` tables live in `stm_feedback.db`. `METRIC` lives in `proxy_metrics.db`. `PENDING_SELECTION` lives in `pending_selections.db` only when the SQLite-backed `PendingStore` is enabled.

@@ -5,15 +5,29 @@
 Proxied tool responses are cached in SQLite to avoid repeated upstream calls:
 
 ```mermaid
-flowchart LR
-    Call["proxied tool call"] --> Key["compute cache key<br/>SHA-256(server:tool:args)"]
-    Key --> Lookup{"lookup in<br/>SQLite cache"}
-    Lookup -->|miss| Up["call upstream"]
-    Up --> Pipe["CLEAN → COMPRESS"]
-    Pipe --> Save[("write pre-surfacing<br/>content to cache")]
-    Save --> Surf["SURFACE<br/>(re-applied each call)"]
-    Lookup -->|hit| Surf
-    Surf --> Resp["enriched response"]
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as memtomem-stm
+    participant Cache as ProxyCache (SQLite)
+    participant Up as upstream MCP
+    participant LTM as memtomem LTM
+
+    Agent->>STM: tool call (server, tool, args)
+    STM->>Cache: lookup(SHA-256 of server:tool:args)
+    alt cache miss
+        Cache-->>STM: none
+        STM->>Up: forward call
+        Up-->>STM: raw response
+        STM->>STM: CLEAN + COMPRESS
+        STM->>Cache: store pre-surfacing payload (ttl)
+    else cache hit
+        Cache-->>STM: cached payload
+    end
+    STM->>LTM: surface (every call, even on hit)
+    LTM-->>STM: relevant memories
+    STM->>STM: inject memories
+    STM-->>Agent: enriched response
 ```
 
 The key insight: **the cache stores pre-surfacing content**. Surfacing runs on every cache hit so injected memories stay fresh even when the upstream payload was cached hours ago.

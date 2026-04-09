@@ -34,6 +34,38 @@ flowchart TD
 
 The CLEAN → COMPRESS → SURFACE → INDEX path is synchronous. The optional **4b EXTRACT** stage runs in parallel via a background extractor that does not block the agent response.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as memtomem-stm
+    participant Up as upstream MCP
+    participant LTM as memtomem LTM
+    participant Cache as ProxyCache
+
+    Agent->>STM: tool call (server, tool, args)
+    STM->>Cache: lookup(server:tool:args)
+    alt cache miss
+        STM->>Up: forward call
+        Up-->>STM: raw response
+        STM->>STM: CLEAN
+        STM->>STM: COMPRESS
+        STM->>Cache: store pre-surfacing payload
+    else cache hit
+        Cache-->>STM: cached payload
+    end
+    STM->>LTM: search (mem_search via MCP)
+    LTM-->>STM: ranked memories
+    STM->>STM: SURFACE (inject)
+    opt response ≥ min_chars and auto_index on
+        STM->>LTM: mem_add (auto-index)
+    end
+    opt extraction enabled
+        STM-)STM: EXTRACT (background)
+    end
+    STM-->>Agent: enriched response
+```
+
 ## Stage 1: CLEAN
 
 Removes noise from the upstream response before compression. Each step can be toggled per server in `stm_proxy.json`:

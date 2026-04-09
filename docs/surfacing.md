@@ -113,6 +113,48 @@ Fine-tune surfacing behavior per tool:
 
 Template variables: `{tool_name}`, `{server}`, `{arg.ARGUMENT_NAME}`
 
+## End-to-end Surface Call
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as SurfacingEngine
+    participant Ext as ContextExtractor
+    participant Gate as RelevanceGate
+    participant CB as CircuitBreaker
+    participant MCP as McpClientSearchAdapter
+    participant Core as memtomem core
+
+    Agent->>STM: tool response (≥ min_response_chars)
+    STM->>Ext: extract_query(server, tool, args)
+    Ext-->>STM: query
+    STM->>Gate: should_surface(server, tool, query)
+    Gate-->>STM: pass / skip
+    alt skip (write tool / cooldown / rate limit)
+        STM-->>Agent: original response
+    else pass
+        STM->>CB: check
+        alt circuit open
+            STM-->>Agent: original response
+        else closed / half-open
+            STM->>MCP: search(query, top_k, namespace)
+            MCP->>Core: mem_search (via stdio MCP)
+            Core-->>MCP: results
+            MCP-->>STM: parsed results
+            opt include_session_context
+                STM->>MCP: scratch_list()
+                MCP->>Core: mem_do(action="scratch_get")
+                Core-->>MCP: working memory text
+                MCP-->>STM: parsed entries
+            end
+            STM->>STM: filter min_score · dedup
+            STM->>STM: format + inject
+            STM-->>Agent: enriched response (+ surfacing_id)
+        end
+    end
+```
+
 ## LTM Connection
 
 STM connects to the LTM exclusively over the MCP protocol. The surfacing engine spawns (or attaches to) a memtomem MCP server using these settings:
@@ -130,6 +172,33 @@ This makes memtomem just another MCP upstream as far as STM is concerned — the
 > **Note**: prior versions supported an in-process mode that imported memtomem directly. That path was removed so STM has a single LTM retrieval path and so core internals can evolve without breaking STM.
 
 ## Feedback & Auto-Tuning
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent
+    participant STM as SurfacingEngine
+    participant FB as FeedbackTracker
+    participant AT as AutoTuner
+    participant Core as memtomem core
+
+    Note over Agent,STM: surfacing_id was returned with the memories
+    Agent->>STM: stm_surfacing_feedback(id, rating)
+    STM->>FB: record_feedback(id, rating)
+    alt rating == "helpful"
+        FB->>Core: mem_do(action="increment_access", chunk_ids)
+        Core-->>FB: ok (capped at max_boost=1.5)
+    end
+    FB->>AT: maybe_adjust(tool)
+    AT->>AT: compute not_relevant ratio
+    alt ≥ 20 samples for tool
+        AT->>AT: per-tool ratio
+    else cold start
+        AT->>AT: global ratio fallback
+    end
+    AT-->>STM: new min_score (clamped)
+    Note over STM: next call uses tuned threshold
+```
 
 Rate surfaced memories to improve future relevance:
 
