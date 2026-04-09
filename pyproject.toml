@@ -16,6 +16,7 @@ classifiers = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "memtomem>=0.1,<0.2",
     "mcp[cli]>=1.26.0",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
@@ -50,6 +51,12 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.14",
 ]
+
+[tool.uv.sources]
+# Local development against the sibling memtomem checkout. The published
+# wheel still declares the PyPI version range in `[project] dependencies`,
+# so end users get `memtomem` from PyPI while contributors track HEAD.
+memtomem = { path = "../memtomem/packages/memtomem", editable = true }
 
 [tool.ruff]
 target-version = "py312"

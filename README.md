@@ -83,24 +83,24 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 
 ## Key Features
 
-- 🗜️ **10 compression strategies** with auto-selection by content type, query-aware budget allocation, and zero-loss progressive delivery → [docs/compression.md](docs/compression.md)
-- 🧠 **Proactive memory surfacing** from a memtomem LTM server, gated by relevance threshold, rate limit, dedup, and circuit breaker → [docs/surfacing.md](docs/surfacing.md)
-- 💾 **Response caching** with TTL and eviction; surfacing re-applied on cache hit so injected memories stay fresh → [docs/caching.md](docs/caching.md)
-- 🔍 **Observability** — Langfuse tracing, RPS, latency percentiles (p50/p95/p99), error classification, per-tool metrics → [docs/operations.md#observability](docs/operations.md#observability)
-- 📈 **Horizontal scaling** — `PendingStore` protocol with InMemory (default) or SQLite-shared backend for multi-instance deployments → [docs/operations.md#horizontal-scaling](docs/operations.md#horizontal-scaling)
-- 🛡️ **Safety** — circuit breaker, retry with backoff, write-tool skip, query cooldown, session/cross-session dedup, sensitive content auto-detection → [docs/operations.md#safety--resilience](docs/operations.md#safety--resilience)
+- 🗜️ **10 compression strategies** with auto-selection by content type, query-aware budget allocation, and zero-loss progressive delivery → [docs/compression.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md)
+- 🧠 **Proactive memory surfacing** from a memtomem LTM server, gated by relevance threshold, rate limit, dedup, and circuit breaker → [docs/surfacing.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md)
+- 💾 **Response caching** with TTL and eviction; surfacing re-applied on cache hit so injected memories stay fresh → [docs/caching.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md)
+- 🔍 **Observability** — Langfuse tracing, RPS, latency percentiles (p50/p95/p99), error classification, per-tool metrics → [docs/operations.md#observability](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#observability)
+- 📈 **Horizontal scaling** — `PendingStore` protocol with InMemory (default) or SQLite-shared backend for multi-instance deployments → [docs/operations.md#horizontal-scaling](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#horizontal-scaling)
+- 🛡️ **Safety** — circuit breaker, retry with backoff, write-tool skip, query cooldown, session/cross-session dedup, sensitive content auto-detection → [docs/operations.md#safety--resilience](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#safety--resilience)
 
 ## Documentation
 
 | Guide | Topic |
 |-------|-------|
-| [Pipeline](docs/pipeline.md) | The 4-stage CLEAN → COMPRESS → SURFACE → INDEX flow |
-| [Compression](docs/compression.md) | All 10 strategies, query-aware compression, progressive delivery, model-aware defaults |
-| [Surfacing](docs/surfacing.md) | Memory surfacing engine, relevance gating, feedback loop, auto-tuning |
-| [Caching](docs/caching.md) | Response cache and auto-indexing |
-| [Configuration](docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
-| [CLI](docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 6 MCP tools |
-| [Operations](docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
+| [Pipeline](https://github.com/memtomem/memtomem-stm/blob/main/docs/pipeline.md) | The 4-stage CLEAN → COMPRESS → SURFACE → INDEX flow |
+| [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies, query-aware compression, progressive delivery, model-aware defaults |
+| [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | Memory surfacing engine, relevance gating, feedback loop, auto-tuning |
+| [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Response cache and auto-indexing |
+| [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
+| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 6 MCP tools |
+| [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
 
 ## Development
 
