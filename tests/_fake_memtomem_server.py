@@ -3,8 +3,9 @@
 Stands in for `memtomem-server` so that STM's McpClientSearchAdapter can be
 exercised end-to-end without depending on a real memtomem installation. It
 exposes the two tools the adapter actually calls — ``mem_search`` and the
-``mem_do`` meta-tool routing the ``scratch_get`` action — both returning
-canned text in the format the adapter knows how to parse.
+``mem_do`` meta-tool routing the ``scratch_get`` and ``increment_access``
+actions — both returning canned text in the format the adapter knows how
+to parse.
 
 Run with: `python <path-to-this-file>`
 """
@@ -45,6 +46,9 @@ async def mem_do(action: str, params: dict | None = None) -> str:
             "  current_task: drafting follow-up 4 implementation plan...\n"
             "  recent_branch: feat/stm-session-context-restore..."
         )
+    if action == "increment_access":
+        chunk_ids = list((params or {}).get("chunk_ids") or [])
+        return f"Incremented access_count for {len(chunk_ids)} chunk(s)."
     return f"Error: unknown action '{action}'."
 
 
