@@ -8,6 +8,15 @@ memtomem-stm ships three console scripts:
 | `memtomem-stm-proxy` | Management CLI for editing `~/.memtomem/stm_proxy.json`. |
 | `mms` | Short alias for `memtomem-stm-proxy` — identical behavior. |
 
+```mermaid
+flowchart LR
+    User["you"] -->|edit config| MMS["mms<br/>(= memtomem-stm-proxy)"]
+    MMS -->|writes| Conf["~/.memtomem/<br/>stm_proxy.json"]
+    Conf -.->|hot reload| Server
+    Client["AI client<br/>(Claude Code, …)"] -->|MCP| Server["memtomem-stm<br/>(MCP server)"]
+    Server --> Up["upstream<br/>MCP servers"]
+```
+
 The `mms` short form pairs with memtomem core's `mm` CLI: `mm` for long-term memory, `mms` for the STM proxy. Use whichever name you prefer; the docs below use `mms` for brevity.
 
 ## `mms` (= `memtomem-stm-proxy`)

@@ -4,6 +4,20 @@
 
 Proxied tool responses are cached in SQLite to avoid repeated upstream calls:
 
+```mermaid
+flowchart LR
+    Call["proxied tool call"] --> Key["compute cache key<br/>SHA-256(server:tool:args)"]
+    Key --> Lookup{"lookup in<br/>SQLite cache"}
+    Lookup -->|miss| Up["call upstream"]
+    Up --> Pipe["CLEAN → COMPRESS"]
+    Pipe --> Save[("write pre-surfacing<br/>content to cache")]
+    Save --> Surf["SURFACE<br/>(re-applied each call)"]
+    Lookup -->|hit| Surf
+    Surf --> Resp["enriched response"]
+```
+
+The key insight: **the cache stores pre-surfacing content**. Surfacing runs on every cache hit so injected memories stay fresh even when the upstream payload was cached hours ago.
+
 ```json
 {
   "cache": {
@@ -26,6 +40,18 @@ Key details:
 ## Auto-Indexing
 
 When enabled, large tool responses are automatically saved to memtomem LTM for future retrieval:
+
+```mermaid
+flowchart LR
+    Resp["compressed<br/>response"] --> Size{"original ≥<br/>min_chars?"}
+    Size -->|no| Skip["skip"]
+    Size -->|yes| FM["build markdown<br/>+ frontmatter"]
+    FM --> Write["write to<br/>memory_dir/"]
+    Write --> NS["namespace =<br/>'proxy-{server}'"]
+    NS --> LTM[("memtomem LTM<br/>(MCP mem_add)")]
+    LTM -.->|future calls| Search["surfacing search<br/>can find it"]
+```
+
 
 ```json
 {

@@ -9,19 +9,22 @@ Sits between your AI agent and upstream MCP servers. Compresses responses to sav
 - Long-running coding sessions where the agent should *recall* prior decisions instead of re-searching
 - Teams running custom MCP servers that need a proxy layer for compression, caching, and observability — no upstream code changes required
 
-```
-Agent (Claude Code, Cursor, etc.)
-    │
-    ▼
-┌──────────────────────────────────────┐
-│        memtomem-stm (STM)            │
-│  CLEAN → COMPRESS → SURFACE → INDEX  │
-└──────────┬───────────────────────────┘
-           │ stdio / SSE / HTTP
-     ┌─────┴──────┐
-     ▼            ▼
- [filesystem]  [github]
-  MCP server    MCP server
+```mermaid
+flowchart TB
+    Agent["Agent<br/>(Claude Code, Cursor, …)"]
+    subgraph STM["memtomem-stm (STM)"]
+        Pipe["CLEAN → COMPRESS → SURFACE → INDEX"]
+    end
+    LTM[("memtomem LTM<br/>(MCP server)")]
+    FS["filesystem<br/>MCP server"]
+    GH["github<br/>MCP server"]
+    Other["…any MCP server"]
+
+    Agent -->|MCP| STM
+    STM <-->|MCP: stdio / SSE / HTTP| FS
+    STM <-->|MCP| GH
+    STM <-->|MCP| Other
+    STM <-.->|surfacing<br/>via MCP| LTM
 ```
 
 ## Installation

@@ -7,17 +7,42 @@ When your agent calls a proxied tool, STM automatically:
 3. **Searches LTM** (memtomem) for related memories
 4. **Injects relevant memories** at the top of the response
 
+```mermaid
+flowchart LR
+    Tool["proxied tool call"] --> Extract["1. extract context<br/>(query)"]
+    Extract --> Gate{"2. relevance gate"}
+    Gate -->|skip| Pass["return original<br/>response"]
+    Gate -->|pass| Search["3. search LTM<br/>(MCP mem_search)"]
+    Search --> Filter{"score ≥ min_score?<br/>not already shown?"}
+    Filter -->|no| Pass
+    Filter -->|yes| Inject["4. inject memories<br/>+ working memory"]
+    Inject --> Out["enriched response"]
+```
+
 ## How Context Extraction Works
 
-STM extracts a search query in priority order:
+STM extracts a search query in priority order — the first match wins:
 
-1. **Per-tool template** — `"query_template": "file {arg.path}"` → `"file /src/main.py"`
-2. **Agent-provided** — `_context_query` argument if present
-3. **Path tokenization** — file paths like `/src/auth/jwt_handler.py` are auto-split on `/._-` separators → `"src auth jwt handler py"`
-4. **Heuristic** — extracts string values from semantic keys (`query`, `path`, `file`, `url`, `topic`, `name`, `title`, `description`). Skips UUIDs, hex strings, booleans.
-5. **Fallback** — tool name with underscores replaced (`search_repositories` → `"search repositories"`)
+```mermaid
+flowchart TD
+    Start(["tool call"]) --> P1{"per-tool<br/>query_template?"}
+    P1 -->|yes| Use1["render template<br/>e.g. 'file {arg.path}'"]
+    P1 -->|no| P2{"_context_query<br/>arg present?"}
+    P2 -->|yes| Use2["use agent-provided<br/>query"]
+    P2 -->|no| P3{"path-like arg?"}
+    P3 -->|yes| Use3["tokenize on /._-<br/>'src auth jwt handler'"]
+    P3 -->|no| P4{"semantic key?<br/>(query/path/file/url/…)"}
+    P4 -->|yes| Use4["extract string value<br/>(skip UUID / hex / bool)"]
+    P4 -->|no| Use5["fallback: tool name<br/>'search_repos' → 'search repos'"]
 
-Queries shorter than `min_query_tokens` (default 3) are skipped.
+    Use1 --> Check{"≥ min_query_tokens<br/>(default 3)?"}
+    Use2 --> Check
+    Use3 --> Check
+    Use4 --> Check
+    Use5 --> Check
+    Check -->|yes| Q["query"]
+    Check -->|no| Skip["skip surfacing"]
+```
 
 ## What the Agent Sees
 
@@ -122,6 +147,22 @@ When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on
 |----------------|--------|
 | > 60% `not_relevant` | Raise `min_score` by +0.002 (surface fewer, more relevant) |
 | < 20% `not_relevant` | Lower `min_score` by -0.002 (surface more) |
+
+```mermaid
+flowchart LR
+    Sample["new feedback"] --> N{"≥ 20 samples<br/>for this tool?"}
+    N -->|no| Cold["use global ratio<br/>(cold-start fallback)"]
+    N -->|yes| Local["use per-tool ratio"]
+    Cold --> R{"not_relevant<br/>ratio?"}
+    Local --> R
+    R -->|"> 60%"| Up["min_score += 0.002<br/>(surface less)"]
+    R -->|"< 20%"| Down["min_score -= 0.002<br/>(surface more)"]
+    R -->|"20-60%"| Hold["no change"]
+    Up --> Cap["clamp to<br/>[0.005, 0.05]"]
+    Down --> Cap
+    Cap --> Tool[("per-tool<br/>min_score")]
+    Tool -.->|next call| Sample
+```
 
 Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting. Score is capped between 0.005 and 0.05. **Cold-start fallback**: new tools with insufficient samples use the global ratio across all tools instead of waiting for 20 per-tool samples.
 
