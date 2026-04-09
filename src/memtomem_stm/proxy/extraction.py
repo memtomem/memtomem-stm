@@ -60,15 +60,111 @@ def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact]:
     return []
 
 
-def _extract_heuristic(text: str, *, max_facts: int) -> list[ExtractedFact]:
-    """Heuristic fallback for fact extraction.
+# ── Heuristic extraction patterns ─────────────────────────────────────
+# Regex-only fact extraction. No external NLP, no core dependency.
 
-    STM no longer imports memtomem core directly; the LLM extractor is the
-    primary path. This stub returns an empty list, so when LLM extraction
-    fails (circuit open, transport error) extraction silently yields no facts.
-    A native STM heuristic can be added later if demand emerges.
+_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+_DECISION_RE = re.compile(
+    r"^[\s*\-]*"
+    r"(?:Decision|Decided|Resolved|Conclusion|Agreed|We\s+will|We'll|We\s+chose)"
+    r"[:\s]+(.+)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+_ACTION_RE = re.compile(
+    r"(?:^|\n)\s*"
+    r"(?:"
+    r"(?:TODO|FIXME|HACK|XXX|ACTION)[:\s]+(.+)|"
+    r"[-*]\s*\[\s*\]\s+(.+)|"
+    r"(?:Action\s+item)[:\s]+(.+)"
+    r")",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Identifier shapes — kept conservative to limit noise.
+_SNAKE_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+_CAMEL_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b")
+_PASCAL_CASE_RE = re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b")
+
+_QUOTED_CONCEPT_RE = re.compile(r'"([^"\n]{3,80})"')
+
+
+def _extract_heuristic(text: str, *, max_facts: int) -> list[ExtractedFact]:
+    """Regex-based fact extraction with no external dependencies.
+
+    Recognizes the patterns most worth remembering from a tool response:
+      - URLs (http/https)
+      - ISO dates (YYYY-MM-DD)
+      - Decision statements ("Decision: ...", "We will ...", "Resolved: ...")
+      - Action items (TODO/FIXME, "- [ ] ...", "Action item: ...")
+      - Identifiers (snake_case / PascalCase / camelCase)
+      - Quoted concepts (terms in double quotes)
+
+    Used both as the LLM extractor's fallback when the LLM is unavailable
+    (circuit open, transport error) and as a complementary signal in
+    HYBRID strategy where it merges with LLM output.
     """
-    return []
+    if not text or max_facts <= 0:
+        return []
+
+    facts: list[ExtractedFact] = []
+    seen: set[str] = set()
+
+    def _emit(content: str, category: str, confidence: float) -> None:
+        if not content or len(facts) >= max_facts:
+            return
+        key = f"{category}:{content.lower()}"
+        if key in seen:
+            return
+        seen.add(key)
+        facts.append(
+            ExtractedFact(
+                content=content,
+                category=category,
+                confidence=confidence,
+                tags=[category],
+            )
+        )
+
+    # 1. URLs (highest signal)
+    for m in _URL_RE.finditer(text):
+        _emit(m.group(0).rstrip(".,;:)\"'"), "url", 0.95)
+
+    # 2. ISO dates
+    for m in _ISO_DATE_RE.finditer(text):
+        _emit(m.group(0), "date", 0.95)
+
+    # 3. Decision statements
+    for m in _DECISION_RE.finditer(text):
+        value = m.group(1).strip()
+        if len(value) >= 4:
+            _emit(value[:200], "decision", 0.85)
+
+    # 4. Action items
+    for m in _ACTION_RE.finditer(text):
+        value = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        if len(value) >= 3:
+            _emit(value[:200], "action_item", 0.85)
+
+    # 5. Identifiers (snake_case / PascalCase / camelCase)
+    for pattern, conf in (
+        (_SNAKE_CASE_RE, 0.7),
+        (_PASCAL_CASE_RE, 0.65),
+        (_CAMEL_CASE_RE, 0.6),
+    ):
+        for m in pattern.finditer(text):
+            _emit(m.group(0), "identifier", conf)
+
+    # 6. Quoted concepts (lowest confidence)
+    for m in _QUOTED_CONCEPT_RE.finditer(text):
+        value = m.group(1).strip()
+        if len(value) >= 3:
+            _emit(value, "concept", 0.55)
+
+    return facts
 
 
 class FactExtractor:
