@@ -2,7 +2,12 @@
 
 Short-term memory proxy gateway with **proactive memory surfacing** for AI agents.
 
-Sits between your AI agent and upstream MCP servers. Compresses responses to save tokens, caches results, and automatically surfaces relevant memories from memtomem LTM.
+Sits between your AI agent and upstream MCP servers. Compresses responses to save tokens, caches results, and automatically surfaces relevant memories from a memtomem LTM server.
+
+**Built for:**
+- Agents (Claude Code, Cursor, Claude Desktop, etc.) running multiple MCP servers and burning tokens on noisy upstream responses
+- Long-running coding sessions where the agent should *recall* prior decisions instead of re-searching
+- Teams running custom MCP servers that need a proxy layer for compression, caching, and observability — no upstream code changes required
 
 ```
 Agent (Claude Code, Cursor, etc.)
@@ -57,15 +62,13 @@ Agent (Claude Code, Cursor, etc.)
 ## Installation
 
 ```bash
-# Standalone (proxy + compression only)
 pip install memtomem-stm
-
-# With LTM integration (proactive surfacing)
-pip install "memtomem-stm[ltm]"
 
 # With Langfuse tracing
 pip install "memtomem-stm[langfuse]"
 ```
+
+memtomem-stm is independent: it has no Python-level dependency on memtomem core. To enable proactive memory surfacing, point STM at a running memtomem MCP server (or any compatible MCP server) — communication happens entirely through the MCP protocol.
 
 ## Quick Start
 
@@ -103,18 +106,6 @@ Point your AI agent's MCP client config to the STM server:
 ### 3. Use proxied tools
 
 Your agent now sees `fs__read_file`, `gh__search_repositories`, etc. Responses are automatically compressed, cached, and enriched with relevant memories.
-
-### 4. (Optional) Interactive setup via memtomem CLI
-
-If you have the core `memtomem` package installed, run the 8-step wizard:
-
-```bash
-mm stm init
-```
-
-This detects existing MCP client configs (Claude Code, Cursor, Claude Desktop), lets you select servers to proxy, choose compression strategies, enable caching/Langfuse, and writes everything to `~/.memtomem/stm_proxy.json`.
-
-To undo: `mm stm reset` restores original configs and removes STM.
 
 ---
 
@@ -929,7 +920,7 @@ Traces proxy calls for latency analysis and debugging.
 
 | File | Purpose | Managed by |
 |------|---------|------------|
-| `~/.memtomem/stm_proxy.json` | Upstream server config (hot-reloaded) | CLI / `mm stm init` |
+| `~/.memtomem/stm_proxy.json` | Upstream server config (hot-reloaded) | `memtomem-stm-proxy` CLI |
 | `~/.memtomem/proxy_cache.db` | Response cache (SQLite, WAL mode) | ProxyCache |
 | `~/.memtomem/proxy_metrics.db` | Compression metrics history | MetricsStore |
 | `~/.memtomem/stm_feedback.db` | Surfacing events & feedback ratings | FeedbackStore |
@@ -941,14 +932,17 @@ Traces proxy calls for latency analysis and debugging.
 ## Testing
 
 ```bash
-# Run STM tests
-uv run pytest packages/memtomem-stm/tests/ -v
+# Run all tests
+uv run pytest tests/ -v
 
 # Run a specific test file
-uv run pytest packages/memtomem-stm/tests/test_compression.py -v
+uv run pytest tests/test_compression.py -v
+
+# Skip Ollama-dependent tests
+uv run pytest -m "not ollama"
 ```
 
-735 tests covering:
+731 tests covering:
 
 | Test file | Coverage |
 |-----------|----------|
