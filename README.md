@@ -101,7 +101,16 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 | [Configuration](docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
 | [CLI](docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 6 MCP tools |
 | [Operations](docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
-| [Testing](docs/testing.md) | Test layout and how to run them |
+
+## Development
+
+```bash
+uv sync                                      # install dev deps
+uv run pytest -m "not ollama"                # tests (CI filter)
+uv run ruff check src && uv run mypy src     # lint + typecheck
+```
+
+CI runs the same three commands on every PR via `.github/workflows/ci.yml`. Mypy is advisory; lint and tests are required to pass.
 
 ## License
 
