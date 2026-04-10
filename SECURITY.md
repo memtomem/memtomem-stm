@@ -9,6 +9,7 @@ Please report security issues via [GitHub private vulnerability advisory](https:
 | Version | Supported |
 |---------|-----------|
 | 0.1.x   | Yes       |
+| < 0.1.0 | No        |
 
 ## Threat Model
 

@@ -1,6 +1,6 @@
 [project]
 name = "memtomem-stm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Short-term memory proxy gateway with proactive memory surfacing for AI agents"
 authors = [
     {name = "DAPADA Inc.", email = "contact@dapada.co.kr"},
