@@ -8,14 +8,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 ### CLI
 - `mms -h` short flag now works (previously only `--help`)
 - `mms status` and `mms list` now show compression strategy and max_chars per server
+- Add `auto` to `--compression` choices and set it as the default (aligned with `ProxyConfig.default_compression`)
+- Validate `--prefix` format (must start with a letter, no `__`) and warn on duplicate prefixes
+- Require `--command` for stdio transport, `--url` for sse/streamable_http transport
+- Support quoted paths with spaces in `--args` (via `shlex.split`)
 
 ### Fixes
 - Resolve all mypy type errors across proxy and surfacing modules (assert guards for optional AsyncClient)
+- Fix `cache.clear(tool=X)` without `server` silently wiping entire cache instead of filtering by tool
+- Fix `proxy.enabled` field being ignored at runtime — server now skips upstream connections when disabled
+- Fix non-deterministic ordering in feedback rating error message
 
 ### Docs
 - Add uv install options to README and Langfuse extra install sections
 - Add CHANGELOG, CONTRIBUTING, and SECURITY files
 - Sync LICENSE copyright and pyproject authors with parent memtomem repo
+- Align `stm_proxy_stats` example output in operations.md with actual code
+- Document `[proxied]` tool description prefix and `{prefix}__{name}` naming convention
+- Document that progressive delivery skips memory surfacing
+- Clarify hot-reload scope (per-server settings only; adding/removing servers requires restart)
+- Fix stale `min_result_retention` docstring (0.5 → 0.65)
 
 ### Meta
 - Correct pyproject Homepage/Repository URLs
@@ -63,7 +75,7 @@ Initial open-source release.
 - `PendingStore` protocol with InMemory (default) and SQLite shared backends
 
 ### Testing
-- 766 automated tests
+- 767 automated tests
 - CI: GitHub Actions (lint, typecheck, test)
 
 ### Related projects
