@@ -29,8 +29,12 @@ def _load(config_path: Path) -> dict[str, Any]:
 
 def _save(config_path: Path, data: dict[str, Any]) -> None:
     resolved = config_path.expanduser().resolve()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     resolved.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        resolved.chmod(0o600)
+    except OSError:
+        pass
 
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}

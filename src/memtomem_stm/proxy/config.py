@@ -267,8 +267,8 @@ class ProxyConfig(BaseModel):
     config_path: Path = Path("~/.memtomem/stm_proxy.json")
     upstream_servers: dict[str, UpstreamServerConfig] = {}
     default_compression: CompressionStrategy = CompressionStrategy.AUTO
-    default_max_result_chars: int = 16000
-    min_result_retention: float = 0.65
+    default_max_result_chars: int = Field(default=16000, gt=0)
+    min_result_retention: float = Field(default=0.65, ge=0.0, le=1.0)
     relevance_scorer: RelevanceScorerConfig = Field(default_factory=RelevanceScorerConfig)
     """Minimum fraction of response to preserve after compression (0-1).
 
