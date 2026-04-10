@@ -1,0 +1,56 @@
+"""Tiny stdio MCP server used by integration tests.
+
+Stands in for `memtomem-server` so that STM's McpClientSearchAdapter can be
+exercised end-to-end without depending on a real memtomem installation. It
+exposes the two tools the adapter actually calls — ``mem_search`` and the
+``mem_do`` meta-tool routing the ``scratch_get`` and ``increment_access``
+actions — both returning canned text in the format the adapter knows how
+to parse.
+
+Run with: `python <path-to-this-file>`
+"""
+
+from __future__ import annotations
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("fake-memtomem")
+
+
+@mcp.tool()
+async def mem_search(
+    query: str,
+    top_k: int | None = None,
+    namespace: str | list[str] | None = None,
+) -> str:
+    """Return canned search hits in the format McpClientSearchAdapter parses."""
+    return (
+        "--- [0.92] /notes/auth.md ---\n"
+        "JWT authentication uses HS256 with rotating secrets every 24 hours.\n"
+        "--- [0.87] /notes/api.md ---\n"
+        "All API responses include rate limit headers (X-RateLimit-*).\n"
+    )
+
+
+@mcp.tool()
+async def mem_do(action: str, params: dict | None = None) -> str:
+    """Stand-in for the core ``mem_do`` meta-tool.
+
+    Only the actions STM actually calls are implemented; everything else
+    returns an unknown-action error matching real core's response.
+    """
+    if action == "scratch_get":
+        return (
+            "Working memory: 2 entries\n"
+            "\n"
+            "  current_task: drafting follow-up 4 implementation plan...\n"
+            "  recent_branch: feat/stm-session-context-restore..."
+        )
+    if action == "increment_access":
+        chunk_ids = list((params or {}).get("chunk_ids") or [])
+        return f"Incremented access_count for {len(chunk_ids)} chunk(s)."
+    return f"Error: unknown action '{action}'."
+
+
+if __name__ == "__main__":
+    mcp.run()

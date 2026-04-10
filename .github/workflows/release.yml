@@ -1,0 +1,67 @@
+name: Publish
+
+# Publishes the memtomem-stm distribution to PyPI (or TestPyPI for dry-runs)
+# via PyPI Trusted Publishers (OIDC). No API tokens are stored.
+#
+# Tag conventions:
+#   v0.1.0          → PyPI                (production)
+#   test-v0.1.0a1   → TestPyPI            (dry run)
+#
+# Both paths share the same `pypi` GitHub environment, gated to tag
+# pushes matching `v*` and `test-v*` only.
+#
+# Build and publish run in a single job — actions/upload-artifact@v4
+# scopes artifacts per run-attempt, so a partial rerun cannot reuse the
+# previous attempt's build artifact. Keeping everything in one job means
+# every (re)run rebuilds locally and avoids the cross-attempt artifact
+# lookup entirely.
+#
+# Until memtomem core is on PyPI, the job needs the sibling memtomem
+# checkout to satisfy [tool.uv.sources]. Both this checkout step AND
+# the equivalent in ci.yml will be removed in a follow-up PR once
+# memtomem v0.1.0 is published.
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"        # production
+      - "test-v[0-9]*"   # TestPyPI dry-run
+
+jobs:
+  publish:
+    name: Build and publish to ${{ startsWith(github.ref_name, 'test-') && 'TestPyPI' || 'PyPI' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: memtomem-stm
+    environment:
+      name: pypi
+      url: ${{ startsWith(github.ref_name, 'test-') && 'https://test.pypi.org/p/memtomem-stm' || 'https://pypi.org/p/memtomem-stm' }}
+    permissions:
+      id-token: write   # required for OIDC token
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: memtomem/memtomem
+          path: memtomem
+      - uses: actions/checkout@v4
+        with:
+          path: memtomem-stm
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - name: Build distribution
+        run: uv build
+      - name: Publish to PyPI
+        if: ${{ !startsWith(github.ref_name, 'test-') }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: memtomem-stm/dist
+          skip-existing: true
+      - name: Publish to TestPyPI
+        if: ${{ startsWith(github.ref_name, 'test-') }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: memtomem-stm/dist
+          skip-existing: true
