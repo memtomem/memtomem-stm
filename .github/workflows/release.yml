@@ -57,9 +57,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: memtomem-stm/dist
+          skip-existing: true
       - name: Publish to TestPyPI
         if: ${{ startsWith(github.ref_name, 'test-') }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: memtomem-stm/dist
+          skip-existing: true
