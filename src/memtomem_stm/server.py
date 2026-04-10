@@ -121,23 +121,27 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
         surfacing_engine=surfacing_engine,
         cache=proxy_cache,
     )
-    await proxy_manager.start()
 
-    # Register proxy tools with upstream schema + annotations
-    from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+    if config.proxy.enabled:
+        await proxy_manager.start()
 
-    def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
-        async def proxy_tool(**kwargs: object) -> str | list:
-            return await pm.call_tool(server_name, tool_name, dict(kwargs))
+        # Register proxy tools with upstream schema + annotations
+        from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
 
-        return proxy_tool
+        def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
+            async def proxy_tool(**kwargs: object) -> str | list:
+                return await pm.call_tool(server_name, tool_name, dict(kwargs))
 
-    for info in proxy_manager.get_proxy_tools():
-        register_proxy_tool(
-            mcp,
-            _make_proxy_handler(proxy_manager, info.server, info.original_name),
-            info,
-        )
+            return proxy_tool
+
+        for info in proxy_manager.get_proxy_tools():
+            register_proxy_tool(
+                mcp,
+                _make_proxy_handler(proxy_manager, info.server, info.original_name),
+                info,
+            )
+    else:
+        logger.info("Proxy disabled (enabled=false) — only STM control tools available")
 
     ctx = STMContext(
         config=config,

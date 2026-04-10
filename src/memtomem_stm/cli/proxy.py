@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -184,7 +185,7 @@ def add(
     if transport == "stdio":
         entry["command"] = command
         if args_str:
-            entry["args"] = args_str.split()
+            entry["args"] = shlex.split(args_str)
     else:
         entry["url"] = url
 
