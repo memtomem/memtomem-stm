@@ -29,7 +29,10 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     resolved.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-@click.group()
+CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
+
+
+@click.group(context_settings=CONTEXT_SETTINGS)
 def cli() -> None:
     """memtomem-stm proxy gateway management."""
 
