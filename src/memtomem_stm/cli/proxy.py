@@ -68,7 +68,10 @@ def status(config_path: str) -> None:
                 detail = f"{cmd} {args_str}".strip()
             else:
                 detail = cfg.get("url", "")
+            compression = cfg.get("compression", "hybrid")
+            max_chars = cfg.get("max_result_chars", 8000)
             click.echo(f"  {name:<20} prefix={prefix}  [{transport}] {detail}")
+            click.echo(f"  {'':<20} compression={compression}  max_chars={max_chars}")
 
 
 @cli.command(name="list")
@@ -82,18 +85,19 @@ def list_servers(config_path: str) -> None:
         click.echo("No upstream servers configured.")
         return
 
-    click.echo(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<12} COMMAND / URL")
-    click.echo("-" * 70)
+    click.echo(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<12} {'COMPRESSION':<12} COMMAND / URL")
+    click.echo("-" * 80)
     for name, cfg in servers.items():
         transport = cfg.get("transport", "stdio")
         prefix = cfg.get("prefix", "")
+        compression = cfg.get("compression", "hybrid")
         if transport == "stdio":
             cmd = cfg.get("command", "")
             args_str = " ".join(cfg.get("args", []))
             detail = f"{cmd} {args_str}".strip()
         else:
             detail = cfg.get("url", "")
-        click.echo(f"{name:<20} {prefix:<10} {transport:<12} {detail}")
+        click.echo(f"{name:<20} {prefix:<10} {transport:<12} {compression:<12} {detail}")
 
 
 @cli.command()
