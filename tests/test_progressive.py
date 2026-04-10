@@ -318,7 +318,7 @@ class TestProgressiveConfig:
         cfg = ProgressiveConfig()
         assert cfg.chunk_size == 4000
         assert cfg.max_stored == 200
-        assert cfg.ttl_seconds == 600.0
+        assert cfg.ttl_seconds == 1800.0
         assert cfg.include_structure_hint is True
 
     def test_strategy_enum_includes_progressive(self):

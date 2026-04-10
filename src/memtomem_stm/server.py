@@ -46,75 +46,79 @@ mcp = FastMCP(
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     config = STMConfig()
 
-    # Initialize persistent metrics store
+    # Shared state — populated only when proxy is enabled
+    from memtomem_stm.proxy.cache import ProxyCache
     from memtomem_stm.proxy.metrics_store import MetricsStore
 
     metrics_store: MetricsStore | None = None
-    if config.proxy.metrics.enabled:
-        metrics_store = MetricsStore(
-            config.proxy.metrics.db_path.expanduser().resolve(),
-            max_history=config.proxy.metrics.max_history,
-        )
-        metrics_store.initialize()
-
-    tracker = TokenTracker(metrics_store=metrics_store)
-
-    # Initialize surfacing engine — LTM access is always remote-only via the
-    # MCP client adapter. The adapter spawns (or connects to) a memtomem
-    # MCP server using config.surfacing.ltm_mcp_command / ltm_mcp_args.
+    proxy_cache: ProxyCache | None = None
     surfacing_engine: SurfacingEngine | None = None
     mcp_adapter = None
     feedback_tracker: FeedbackTracker | None = None
-    if config.surfacing.enabled:
-        try:
-            from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
-
-            mcp_adapter = McpClientSearchAdapter(config.surfacing)
-            await mcp_adapter.start()
-            logger.info(
-                "Surfacing engine connected via MCP client to %s",
-                config.surfacing.ltm_mcp_command,
-            )
-        except Exception:
-            logger.warning(
-                "MCP client surfacing initialization failed — surfacing disabled",
-                exc_info=True,
-            )
-            mcp_adapter = None
-
-        if config.surfacing.feedback_enabled:
-            feedback_tracker = FeedbackTracker(config.surfacing)
-
-        if mcp_adapter is not None:
-            surfacing_engine = SurfacingEngine(
-                config.surfacing,
-                mcp_adapter=mcp_adapter,
-                feedback_tracker=feedback_tracker,
-            )
-
-    # Initialize proxy cache
-    from memtomem_stm.proxy.cache import ProxyCache
-
-    proxy_cache: ProxyCache | None = None
-    if config.proxy.cache.enabled:
-        proxy_cache = ProxyCache(
-            config.proxy.cache.db_path.expanduser().resolve(),
-            max_entries=config.proxy.cache.max_entries,
-        )
-        proxy_cache.initialize()
-
-    # Langfuse (optional)
     langfuse_client = None
-    try:
-        from memtomem_stm.observability.tracing import init_langfuse
+    tracker = TokenTracker()
 
-        langfuse_client = init_langfuse(config.langfuse)
-    except ImportError:
-        pass
-    except Exception:
-        logger.warning("Langfuse init failed, continuing without tracing", exc_info=True)
+    if config.proxy.enabled:
+        # Metrics store
+        if config.proxy.metrics.enabled:
+            metrics_store = MetricsStore(
+                config.proxy.metrics.db_path.expanduser().resolve(),
+                max_history=config.proxy.metrics.max_history,
+            )
+            metrics_store.initialize()
+        tracker = TokenTracker(metrics_store=metrics_store)
 
-    # Initialize proxy manager with surfacing and cache
+        # Surfacing engine — LTM access is always remote-only via the
+        # MCP client adapter. The adapter spawns (or connects to) a memtomem
+        # MCP server using config.surfacing.ltm_mcp_command / ltm_mcp_args.
+        if config.surfacing.enabled:
+            try:
+                from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+                mcp_adapter = McpClientSearchAdapter(config.surfacing)
+                await mcp_adapter.start()
+                logger.info(
+                    "Surfacing engine connected via MCP client to %s",
+                    config.surfacing.ltm_mcp_command,
+                )
+            except Exception:
+                logger.warning(
+                    "MCP client surfacing initialization failed — surfacing disabled",
+                    exc_info=True,
+                )
+                mcp_adapter = None
+
+            if config.surfacing.feedback_enabled:
+                feedback_tracker = FeedbackTracker(config.surfacing)
+
+            if mcp_adapter is not None:
+                surfacing_engine = SurfacingEngine(
+                    config.surfacing,
+                    mcp_adapter=mcp_adapter,
+                    feedback_tracker=feedback_tracker,
+                )
+
+        # Response cache
+        if config.proxy.cache.enabled:
+            proxy_cache = ProxyCache(
+                config.proxy.cache.db_path.expanduser().resolve(),
+                max_entries=config.proxy.cache.max_entries,
+            )
+            proxy_cache.initialize()
+
+        # Langfuse (optional)
+        try:
+            from memtomem_stm.observability.tracing import init_langfuse
+
+            langfuse_client = init_langfuse(config.langfuse)
+        except ImportError:
+            pass
+        except Exception:
+            logger.warning("Langfuse init failed, continuing without tracing", exc_info=True)
+    else:
+        logger.info("Proxy disabled (enabled=false) — only STM control tools available")
+
+    # Initialize proxy manager (always created for STM control tools like stm_proxy_stats)
     proxy_manager = ProxyManager(
         config.proxy,
         tracker,
@@ -140,8 +144,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 _make_proxy_handler(proxy_manager, info.server, info.original_name),
                 info,
             )
-    else:
-        logger.info("Proxy disabled (enabled=false) — only STM control tools available")
 
     ctx = STMContext(
         config=config,

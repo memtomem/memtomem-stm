@@ -144,7 +144,7 @@ The first chunk includes a metadata footer with remaining headings/structure hin
   "progressive": {
     "chunk_size": 4000,
     "max_stored": 200,
-    "ttl_seconds": 600,
+    "ttl_seconds": 1800,
     "include_structure_hint": true
   }
 }

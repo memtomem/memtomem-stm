@@ -147,7 +147,7 @@ class ProgressiveConfig(BaseModel):
     """Characters per chunk delivered to the agent."""
     max_stored: int = 200
     """Maximum concurrent stored progressive responses."""
-    ttl_seconds: float = 600.0
+    ttl_seconds: float = 1800.0
     """Time-to-live for stored responses (seconds)."""
     include_structure_hint: bool = True
     """Include remaining headings/structure hint in first chunk footer."""

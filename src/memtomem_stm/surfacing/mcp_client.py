@@ -68,6 +68,18 @@ class McpClientSearchAdapter:
             self._stack = None
             self._session = None
 
+    _TRANSPORT_ERRORS = (OSError, ConnectionError, EOFError, BrokenPipeError)
+
+    async def _reconnect(self) -> None:
+        """Tear down and re-establish the MCP connection."""
+        logger.info("Attempting MCP adapter reconnect to %s", self._config.ltm_mcp_command)
+        try:
+            await self.stop()
+        except Exception:
+            pass
+        await self.start()
+        logger.info("MCP adapter reconnected successfully")
+
     async def search(
         self,
         query: str,
@@ -87,6 +99,14 @@ class McpClientSearchAdapter:
 
         try:
             result = await self._session.call_tool("mem_search", args)
+        except self._TRANSPORT_ERRORS as exc:
+            logger.warning("MCP transport error, attempting reconnect: %s", exc)
+            try:
+                await self._reconnect()
+                result = await self._session.call_tool("mem_search", args)  # type: ignore[union-attr]
+            except Exception as retry_exc:
+                logger.debug("MCP mem_search failed after reconnect: %s", retry_exc)
+                return [], None
         except Exception as exc:
             logger.debug("MCP mem_search failed: %s", exc)
             return [], None
@@ -115,6 +135,16 @@ class McpClientSearchAdapter:
                 "mem_do",
                 {"action": "increment_access", "params": {"chunk_ids": chunk_ids}},
             )
+        except self._TRANSPORT_ERRORS as exc:
+            logger.warning("MCP transport error in increment_access, reconnecting: %s", exc)
+            try:
+                await self._reconnect()
+                await self._session.call_tool(  # type: ignore[union-attr]
+                    "mem_do",
+                    {"action": "increment_access", "params": {"chunk_ids": chunk_ids}},
+                )
+            except Exception as retry_exc:
+                logger.debug("MCP mem_do(increment_access) failed after reconnect: %s", retry_exc)
         except Exception as exc:
             logger.debug("MCP mem_do(increment_access) failed: %s", exc)
 
@@ -139,6 +169,16 @@ class McpClientSearchAdapter:
                 "mem_do",
                 {"action": "scratch_get", "params": {}},
             )
+        except self._TRANSPORT_ERRORS as exc:
+            logger.warning("MCP transport error in scratch_list, reconnecting: %s", exc)
+            try:
+                await self._reconnect()
+                result = await self._session.call_tool(  # type: ignore[union-attr]
+                    "mem_do",
+                    {"action": "scratch_get", "params": {}},
+                )
+            except Exception:
+                return []
         except Exception as exc:
             logger.debug("MCP mem_do(scratch_get) failed: %s", exc)
             return []

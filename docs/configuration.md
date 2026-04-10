@@ -111,7 +111,7 @@ Full example with all options:
       "progressive": {
         "chunk_size": 4000,
         "max_stored": 200,
-        "ttl_seconds": 600
+        "ttl_seconds": 1800
       },
       "tool_overrides": {
         "read_file": {
