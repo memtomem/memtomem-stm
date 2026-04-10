@@ -33,8 +33,9 @@ memtomem-stm-proxy = "memtomem_stm.cli.proxy:cli"
 mms = "memtomem_stm.cli.proxy:cli"
 
 [project.urls]
-Homepage = "https://github.com/memtomem/memtomem"
-Repository = "https://github.com/memtomem/memtomem"
+Homepage = "https://github.com/memtomem/memtomem-stm"
+Repository = "https://github.com/memtomem/memtomem-stm"
+Issues = "https://github.com/memtomem/memtomem-stm/issues"
 
 [build-system]
 requires = ["hatchling"]
