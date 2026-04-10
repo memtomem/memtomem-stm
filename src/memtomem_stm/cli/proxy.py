@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import click
+
+_PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
 
@@ -116,8 +119,8 @@ def list_servers(config_path: str) -> None:
 @click.option("--env", "env_pairs", multiple=True, metavar="KEY=VALUE")
 @click.option(
     "--compression",
-    type=click.Choice(["none", "truncate", "selective", "hybrid"]),
-    default="hybrid",
+    type=click.Choice(["auto", "none", "truncate", "selective", "hybrid"]),
+    default="auto",
     show_default=True,
 )
 @click.option("--max-chars", "max_result_chars", type=int, default=8000, show_default=True)
@@ -140,6 +143,36 @@ def add(
 
     if name in servers:
         click.echo(f"Error: server '{name}' already exists. Use `remove` first.", err=True)
+        sys.exit(1)
+
+    # VAL-1: prefix format validation
+    if not _PREFIX_RE.match(prefix) or "__" in prefix:
+        click.echo(
+            f"Error: invalid prefix '{prefix}'. "
+            "Must start with a letter, contain only letters/digits/underscores, "
+            "and must not contain '__'.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # VAL-2: duplicate prefix warning
+    for srv_name, srv_cfg in servers.items():
+        if srv_cfg.get("prefix") == prefix:
+            click.echo(
+                f"Warning: prefix '{prefix}' is already used by server '{srv_name}'. "
+                "Tools with the same prefixed name will be shadowed at runtime.",
+                err=True,
+            )
+            break
+
+    # VAL-3: stdio requires --command
+    if transport == "stdio" and not command:
+        click.echo("Error: --command is required for stdio transport.", err=True)
+        sys.exit(1)
+
+    # VAL-4: sse/streamable_http requires --url
+    if transport != "stdio" and not url:
+        click.echo(f"Error: --url is required for {transport} transport.", err=True)
         sys.exit(1)
 
     entry: dict[str, Any] = {

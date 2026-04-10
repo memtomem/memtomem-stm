@@ -53,7 +53,7 @@ class FeedbackTracker:
         memory_id: str | None = None,
     ) -> str:
         if rating not in _VALID_RATINGS:
-            return f"Error: rating must be one of {_VALID_RATINGS}"
+            return f"Error: rating must be one of {sorted(_VALID_RATINGS)}"
 
         ok = self._store.record_feedback(surfacing_id, rating, memory_id)
         if not ok:

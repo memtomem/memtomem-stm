@@ -60,6 +60,16 @@ class TestProxyCacheClear:
         assert removed == 1
         assert proxy_cache.get("s1", "t2", {}) == "r2"
 
+    def test_clear_by_tool_only(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s1", "t1", {}, "r1", ttl_seconds=60.0)
+        proxy_cache.set("s2", "t1", {}, "r2", ttl_seconds=60.0)
+        proxy_cache.set("s1", "t2", {}, "r3", ttl_seconds=60.0)
+        removed = proxy_cache.clear(tool="t1")
+        assert removed == 2
+        assert proxy_cache.get("s1", "t1", {}) is None
+        assert proxy_cache.get("s2", "t1", {}) is None
+        assert proxy_cache.get("s1", "t2", {}) == "r3"
+
 
 class TestProxyCacheEviction:
     def test_trim_evicts_oldest(self, tmp_path):

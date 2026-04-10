@@ -66,6 +66,10 @@ sequenceDiagram
     STM-->>Agent: enriched response
 ```
 
+## Tool Naming
+
+All upstream tools are exposed with a `{prefix}__{original_name}` naming convention (e.g. `fs__read_file`). Tool descriptions are prefixed with `[proxied]` to distinguish them from the 6 built-in STM control tools.
+
 ## Stage 1: CLEAN
 
 Removes noise from the upstream response before compression. Each step can be toggled per server in `stm_proxy.json`:

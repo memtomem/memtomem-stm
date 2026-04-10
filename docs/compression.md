@@ -152,6 +152,8 @@ The first chunk includes a metadata footer with remaining headings/structure hin
 
 Progressive is **opt-in only** — `auto` strategy never selects it because it changes the agent interaction pattern (requires calling `stm_proxy_read_more`).
 
+> **Note**: Memory surfacing (Stage 3) is **skipped** for progressive delivery responses. Injecting memories into the first chunk would shift character offsets for subsequent `stm_proxy_read_more` calls.
+
 ## LLM Compression
 
 Routes through an external LLM for intelligent summarization:

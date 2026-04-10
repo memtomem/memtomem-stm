@@ -140,6 +140,8 @@ class ProxyCache:
                 )
             elif server:
                 cur = self._db.execute("DELETE FROM proxy_cache WHERE server = ?", (server,))
+            elif tool:
+                cur = self._db.execute("DELETE FROM proxy_cache WHERE tool = ?", (tool,))
             else:
                 cur = self._db.execute("DELETE FROM proxy_cache")
             self._db.commit()

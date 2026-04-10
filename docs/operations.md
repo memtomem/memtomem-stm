@@ -127,29 +127,18 @@ Token savings, error rates, and latency tracked per server and tool. Example out
 ```
 STM Proxy Stats
 ===============
-Total calls:     247       Current RPS: 2.5
-Original chars:  1,234,567
-Compressed:      345,678
+Total calls:     247
+Original chars:  1234567
+Compressed:      345678
 Savings:         72.0%
-Token savings:   68.3%
 Cache hits:      89
 Cache misses:    158
-Errors:          3 (1.2%)
-  transport: 2, timeout: 1
-
-Latency (ms):
-  clean:    p50=0.1  p95=0.5  p99=1.2
-  compress: p50=0.3  p95=2.1  p99=8.5
-  surface:  p50=15   p95=120  p99=450
-  total:    p50=16   p95=125  p99=460
-
-Upstream Health:
-  filesystem: connected (12 tools)
-  github:     connected (8 tools)
 
 By server:
-  filesystem: 142 calls, 800K → 200K chars (75.0% saved)
-  github: 105 calls, 434K → 145K chars (66.6% saved)
+  filesystem: 142 calls, 800000 → 200000 chars (75.0% saved)
+  github: 105 calls, 434567 → 145678 chars (66.6% saved)
+
+Surfacing: enabled (min_score=0.02)
 ```
 
 - **Error classification** — errors are categorized as `transport`, `timeout`, `protocol`, `upstream_error`, or `programming`. Each failed call records the category and code for debugging.

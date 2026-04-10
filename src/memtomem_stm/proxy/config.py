@@ -276,7 +276,7 @@ class ProxyConfig(BaseModel):
     retain less than this fraction of the cleaned response, the effective
     budget is raised to ``len(response) * min_result_retention``.
 
-    Default 0.5 ensures at least 50% of every response survives compression.
+    Default 0.65 ensures at least 65% of every response survives compression.
     Set to 0 to disable and use fixed budgets only.
     """
     max_description_chars: int = 200

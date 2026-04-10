@@ -155,7 +155,7 @@ Full example with all options:
 }
 ```
 
-The config file is **hot-reloaded** — changes take effect on the next tool call without restarting STM.
+The config file is **hot-reloaded** — per-server settings (compression strategy, max_chars, cleaning options, tool_overrides) take effect on the next tool call without restarting STM. However, adding or removing upstream servers requires a server restart because transport connections are established once at startup.
 
 ```mermaid
 sequenceDiagram
