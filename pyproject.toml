@@ -2,7 +2,10 @@
 name = "memtomem-stm"
 version = "0.1.0"
 description = "Short-term memory proxy gateway with proactive memory surfacing for AI agents"
-authors = [{name = "memtomem contributors"}]
+authors = [
+    {name = "DAPADA Inc.", email = "contact@dapada.co.kr"},
+    {name = "memtomem contributors"},
+]
 license = {text = "Apache-2.0"}
 keywords = ["memory", "ai", "mcp", "proxy", "gateway", "agent", "caching", "compression"]
 classifiers = [
