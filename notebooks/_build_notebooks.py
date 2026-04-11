@@ -66,6 +66,300 @@ def _save(nb: nbf.NotebookNode, filename: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Notebook 00 — Hybrid CLI + MCP: how the pieces fit
+# ---------------------------------------------------------------------------
+
+
+def build_nb00() -> None:
+    nb = nbf.v4.new_notebook()
+    nb.cells = [
+        _md(
+            """
+            # 00 — Hybrid CLI + MCP: how the pieces fit
+
+            memtomem-stm has two faces. You talk to **one** at configuration
+            time, and **another** at runtime — and the two are the same
+            process wearing different hats.
+
+            - **`mms` CLI** — the operator interface. You run it to
+              register upstream MCP servers, list them, check status,
+              remove them. It writes to a JSON config file. It's what
+              you use *before* you hand STM over to an agent.
+            - **`memtomem-stm` MCP server** — the agent interface.
+              It reads that same JSON config, spawns the upstreams as
+              subprocesses, and exposes them as proxied tools over the
+              MCP stdio transport. It's what the agent talks to.
+
+            This notebook is a prelude to the rest of the series: it
+            walks both interfaces end-to-end against a trivial echo
+            fixture so you can see the relationship explicitly. Every
+            other notebook (01 through 04) assumes you already have this
+            mental model.
+
+            **You will learn:**
+
+            - How `mms add` / `mms list` shape STM's config file
+            - How the MCP server surfaces what the CLI registered
+            - Where each side's responsibility ends
+
+            **Prereqs:** `uv sync` (dev group, includes Jupyter). No
+            external services. No API keys for the 3 core cells — an
+            optional LangChain cell at the bottom gates itself on
+            `_HAS_KEY`.
+            """
+        ),
+        _md("## 1. Isolate state and import helpers"),
+        _code(_BOOTSTRAP),
+        _code(
+            """
+            import subprocess
+
+            from _helpers import (
+                isolate_stm_state,
+                stm_session,
+                extract_text,
+                fixtures_dir,
+            )
+
+            config_path = isolate_stm_state(prefix="nb00_")
+            print(f"STM config → {config_path}")
+            print(f"Fixtures   → {fixtures_dir()}")
+            """
+        ),
+        _md(
+            """
+            ## 2. CLI side — configuring STM with `mms`
+
+            `mms` is the operator CLI. Its job is to write and inspect
+            the proxy config file. It never runs as a long-lived server
+            and never talks to agents directly — it's a one-shot tool
+            for humans setting things up.
+
+            ### 2a. Register the echo fixture as an upstream
+            """
+        ),
+        _code(
+            """
+            echo_script = fixtures_dir() / "echo_mcp.py"
+            result = subprocess.run(
+                [
+                    "uv", "run", "mms", "add", "echo",
+                    "--config", str(config_path),
+                    "--command", "uv",
+                    "--args", f"run python {echo_script}",
+                    "--prefix", "echo",
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            print(result.stdout.strip())
+            """
+        ),
+        _md(
+            """
+            ### 2b. Inspect what was registered
+
+            `mms list` prints a compact table of every configured
+            upstream. Try running this *after* a second `mms add` in
+            your own experimenting — it's the fastest way to see at a
+            glance what STM will load when it starts.
+            """
+        ),
+        _code(
+            """
+            result = subprocess.run(
+                ["uv", "run", "mms", "list", "--config", str(config_path)],
+                capture_output=True, text=True, check=True,
+            )
+            print(result.stdout.strip())
+            """
+        ),
+        _md(
+            """
+            ## 3. MCP side — STM as a live server
+
+            Now switch perspectives. Every `memtomem-stm` subprocess
+            you spawn reads the same config file you just wrote,
+            launches the upstreams it finds there, and exposes their
+            tools (plus its own `stm_proxy_*` / `stm_surfacing_*`
+            control tools) over the MCP stdio transport. From here on
+            the CLI is out of the picture — you're talking to the
+            proxy directly as an MCP client, exactly like Claude Code
+            or Cursor would.
+
+            `stm_session()` (from `_helpers.py`) is a thin async
+            context manager that spawns `memtomem-stm`, wraps stdio in
+            an MCP `ClientSession`, and yields it initialized.
+            """
+        ),
+        _code(
+            """
+            async with stm_session() as session:
+                tools_response = await session.list_tools()
+                tool_names = sorted(t.name for t in tools_response.tools)
+                print(f"STM exposes {len(tool_names)} tools to MCP clients:")
+                for name in tool_names:
+                    print(f"  {name}")
+
+                # Call the proxied tool we registered via the CLI above.
+                echo_result = await session.call_tool(
+                    "echo__say", {"text": "hello from an MCP client"}
+                )
+                print()
+                print(f"echo__say → {extract_text(echo_result)}")
+
+                # And read the stats that recorded it.
+                stats = await session.call_tool("stm_proxy_stats", {})
+                print()
+                print("stm_proxy_stats output:")
+                print(extract_text(stats))
+            """
+        ),
+        _md(
+            """
+            Two families of tools appeared:
+
+            - **`echo__say`** — the echo fixture's own tool,
+              namespaced with the `--prefix echo` you passed to
+              `mms add`. STM discovered this dynamically when it
+              connected to the upstream.
+            - **`stm_proxy_*` / `stm_surfacing_*`** — STM's own
+              built-in tools (proxy stats, health, selective chunk
+              retrieval, surfacing feedback, etc.) — present on every
+              instance regardless of what's registered.
+
+            The CLI wrote the upstream entry. The MCP server read it,
+            spawned the subprocess, merged the upstream's tools into
+            its own catalog, and served the whole catalog to you. That
+            hand-off is the entire hybrid model.
+
+            ## 4. Optional — same tools, a LangChain agent's perspective
+
+            Everything above used the raw MCP client. In practice you
+            put a real agent framework in front of STM so the tool
+            calls happen as part of an autonomous loop. The cell below
+            shows the minimal LangChain `create_agent` integration —
+            notebook 04 has the full walkthrough including tool
+            streaming and result inspection.
+
+            This cell **does not run** unless you have an API key. It
+            checks for `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and
+            short-circuits if neither is set, so the notebook stays
+            runnable in CI.
+            """
+        ),
+        _code(
+            """
+            import os
+
+            _has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+            _has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+            _HAS_KEY = _has_anthropic or _has_openai
+
+            if not _HAS_KEY:
+                print(
+                    "Note: neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set.\\n"
+                    "      The next cell will render but skip the agent call.\\n"
+                    "      Set a key and re-run to see a LangChain agent drive\\n"
+                    "      the same echo__say tool. Notebook 04 has the full\\n"
+                    "      LangChain walkthrough."
+                )
+            else:
+                print(f"Anthropic key: {'yes' if _has_anthropic else 'no'}")
+                print(f"OpenAI key:    {'yes' if _has_openai else 'no'}")
+            """
+        ),
+        _code(
+            """
+            agent_answer = None
+
+            if _HAS_KEY:
+                from mcp import ClientSession
+                from mcp.client.stdio import StdioServerParameters, stdio_client
+                from langchain_mcp_adapters.tools import load_mcp_tools
+                from langchain.agents import create_agent
+
+                model_id = "anthropic:claude-sonnet-4-5" if _has_anthropic else "openai:gpt-4.1-mini"
+                print(f"Using model: {model_id}")
+
+                # stdio_client's default errlog is sys.stderr, which is a
+                # Jupyter OutStream without a usable fileno() — open /dev/null
+                # explicitly so Popen can attach it to the child.
+                params = StdioServerParameters(
+                    command="memtomem-stm", args=[], env=dict(os.environ),
+                )
+                with open(os.devnull, "w") as _devnull:
+                    async with stdio_client(params, errlog=_devnull) as (read, write):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            tools = await load_mcp_tools(session)
+                            agent = create_agent(model_id, tools)
+
+                            result = await agent.ainvoke({
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "Call the echo__say tool with the text "
+                                            "'hi from a langchain agent' and tell me "
+                                            "what the tool returned, in one sentence."
+                                        ),
+                                    }
+                                ]
+                            })
+
+                            last = result["messages"][-1]
+                            content = getattr(last, "content", last)
+                            if isinstance(content, list):
+                                content = " ".join(
+                                    part.get("text", str(part)) if isinstance(part, dict) else str(part)
+                                    for part in content
+                                )
+                            agent_answer = str(content)
+
+            if agent_answer is None:
+                print("(skipped — no API key)")
+            else:
+                print(f"Agent said: {agent_answer}")
+            """
+        ),
+        _md(
+            """
+            ## Recap
+
+            You just watched the same tool flow through both interfaces:
+
+            1. **CLI time** — `mms add echo` wrote an entry in an
+               isolated `stm_proxy.json`. `mms list` read it back.
+            2. **MCP time** — `stm_session()` spawned `memtomem-stm`,
+               which loaded that same JSON, launched the echo fixture
+               as a subprocess, and served `echo__say` to you as a
+               proxied tool. `stm_proxy_stats` recorded the call.
+            3. **Agent time (optional)** — a LangChain
+               `create_agent` wrapped the same catalog and drove it
+               autonomously.
+
+            Three interfaces, one config file, one running STM process.
+            Every notebook from here on skips straight to the MCP
+            client view; refer back to this one whenever the CLI
+            ↔ MCP hand-off feels fuzzy.
+
+            ## Where to next
+
+            - **Notebook 01** — deeper dive into the MCP client side
+              with `stm_proxy_stats` interpretation.
+            - **Notebook 02** — selective compression: turning an
+              18 KB structured response into a 1.5 KB TOC.
+            - **Notebook 03** — proactive memory surfacing with a
+              fake LTM.
+            - **Notebook 04** — full LangChain / LangGraph agent
+              integration.
+            """
+        ),
+    ]
+    _save(nb, "00_cli_and_mcp_hybrid.ipynb")
+
+
+# ---------------------------------------------------------------------------
 # Notebook 01 — Quickstart: Proxy a tool through STM
 # ---------------------------------------------------------------------------
 
@@ -843,6 +1137,7 @@ def build_nb04() -> None:
 
 
 if __name__ == "__main__":
+    build_nb00()
     build_nb01()
     build_nb02()
     build_nb03()

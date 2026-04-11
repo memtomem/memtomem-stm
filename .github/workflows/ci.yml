@@ -51,6 +51,7 @@ jobs:
       - name: Run tutorial notebooks (excluding LangChain — no API key in CI)
         run: |
           uv run pytest --nbmake \
+            notebooks/00_cli_and_mcp_hybrid.ipynb \
             notebooks/01_quickstart_proxy_setup.ipynb \
             notebooks/02_compression_and_selective.ipynb \
             notebooks/03_memory_surfacing.ipynb \
