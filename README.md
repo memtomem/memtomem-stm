@@ -1,5 +1,10 @@
 # memtomem-stm
 
+[![PyPI](https://img.shields.io/pypi/v/memtomem-stm)](https://pypi.org/project/memtomem-stm/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-green)](https://python.org)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![CLA](https://img.shields.io/badge/CLA-required-green)](CLA.md)
+
 Short-term memory proxy gateway with **proactive memory surfacing** for AI agents.
 
 Sits between your AI agent and upstream MCP servers. Compresses responses to save tokens, caches results, and automatically surfaces relevant memories from a memtomem LTM server.
@@ -126,4 +131,4 @@ CI runs the same three commands on every PR via `.github/workflows/ci.yml`. Mypy
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](LICENSE). Contributions are accepted under the terms of the [Contributor License Agreement](CLA.md), which allows DAPADA Inc. to distribute the Work under Apache-2.0 or any other license terms.
