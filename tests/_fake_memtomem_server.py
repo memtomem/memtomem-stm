@@ -4,8 +4,9 @@ Stands in for `memtomem-server` so that STM's McpClientSearchAdapter can be
 exercised end-to-end without depending on a real memtomem installation. It
 exposes the two tools the adapter actually calls — ``mem_search`` and the
 ``mem_do`` meta-tool routing the ``scratch_get`` and ``increment_access``
-actions — both returning canned text in the format the adapter knows how
-to parse.
+actions — both returning canned text in **core's real compact format**
+(``[rank] score | source > hierarchy``) so that integration tests validate
+the same parsing path used in production.
 
 **Content must vary per call.** STM's cross-session dedup keys on
 ``sha256(content)[:16]`` (see
@@ -35,20 +36,24 @@ async def mem_search(
     query: str,
     top_k: int | None = None,
     namespace: str | list[str] | None = None,
+    context_window: int = 0,
 ) -> str:
-    """Return canned search hits in the format McpClientSearchAdapter parses.
+    """Return canned search hits in core's compact format.
 
-    Each call embeds a fresh UUID in both the source path and the body
-    text so ``sha256(content)`` dedup never collapses repeated calls.
+    Matches the output of ``memtomem.server.formatters._format_compact_result``
+    so integration tests validate the real parsing path.  Each call embeds a
+    fresh UUID in both the source path and the body text so
+    ``sha256(content)`` dedup never collapses repeated calls.
     See the module docstring for the full rationale.
     """
     auth_tag = uuid.uuid4().hex[:8]
     api_tag = uuid.uuid4().hex[:8]
     return (
-        f"--- [0.92] /notes/auth-{auth_tag}.md ---\n"
-        f"JWT authentication uses HS256 with rotating secrets every 24 hours. [run={auth_tag}]\n"
-        f"--- [0.87] /notes/api-{api_tag}.md ---\n"
-        f"All API responses include rate limit headers (X-RateLimit-*). [run={api_tag}]\n"
+        "Found 2 results:\n\n"
+        f"[1] 0.92 | auth-{auth_tag}.md > Authentication\n"
+        f"JWT authentication uses HS256 with rotating secrets every 24 hours. [run={auth_tag}]\n\n"
+        f"[2] 0.87 | api-{api_tag}.md > Rate Limiting\n"
+        f"All API responses include rate limit headers (X-RateLimit-*). [run={api_tag}]"
     )
 
 

@@ -86,6 +86,7 @@ class McpClientSearchAdapter:
         query: str,
         top_k: int | None = None,
         namespace: str | list[str] | None = None,
+        context_window: int | None = None,
         **kwargs: Any,
     ) -> tuple[list[RemoteSearchResult], object]:
         """Call mem_search on the remote server and parse results."""
@@ -96,7 +97,11 @@ class McpClientSearchAdapter:
         if top_k is not None:
             args["top_k"] = top_k
         if namespace is not None:
-            args["namespace"] = namespace
+            # Core's mem_search accepts str|None; normalize lists to
+            # comma-separated strings which NamespaceFilter.parse() handles.
+            args["namespace"] = ",".join(namespace) if isinstance(namespace, list) else namespace
+        if context_window is not None and context_window > 0:
+            args["context_window"] = context_window
 
         try:
             result = await self._session.call_tool("mem_search", args)
@@ -266,37 +271,64 @@ class McpClientSearchAdapter:
     def _parse_results(text: str) -> list[RemoteSearchResult]:
         """Parse mem_search formatted output into RemoteSearchResult objects.
 
-        Expected format per result:
-        --- [score] source_file ---
-        content...
+        Handles core's compact format::
+
+            Found 2 results:
+
+            [1] 0.92 | auth.md > Authentication
+            JWT authentication uses HS256...
+
+            [2] 0.87 | api.md
+            All API responses include rate limit headers...
+
+        With optional namespace badge ``[ns]`` and context-window
+        position indicator ``[pos/total]`` on the header line.
         """
         results: list[RemoteSearchResult] = []
-        # Split by result separators — require score bracket to avoid
-        # collisions with YAML frontmatter or markdown horizontal rules
-        # inside the content itself.
-        blocks = re.split(r"^---\s*(?=\[[\d.]+\])", text, flags=re.MULTILINE)
+        if not text or not text.strip():
+            return results
+
+        # Split on result headers: lines starting with [rank] score |
+        blocks = re.split(r"^(?=\[\d+\]\s+\d+\.?\d*\s*\|)", text, flags=re.MULTILINE)
 
         for block in blocks:
             block = block.strip()
             if not block:
                 continue
 
-            # Try to extract score from first line
             first_line, _, rest = block.partition("\n")
-            score_match = re.search(r"\[(\d+\.?\d*)\]", first_line)
-            score = float(score_match.group(1)) if score_match else 0.5
 
-            # Extract source file
-            source_match = re.search(r"(\S+\.md)", first_line)
+            # Parse header: [rank] score | ...
+            header_match = re.match(r"\[(\d+)\]\s+(\d+\.?\d*)\s*\|(.+)", first_line)
+            if not header_match:
+                continue  # skip preamble ("Found N results:") or non-result blocks
+
+            score = float(header_match.group(2))
+            remainder = header_match.group(3).strip()
+
+            # Extract optional namespace badge [ns] (ns may contain hyphens, dots, etc.)
+            ns_match = re.match(r"\[([^\]]+)\]\s*(.*)", remainder)
+            if ns_match:
+                namespace = ns_match.group(1)
+                remainder = ns_match.group(2)
+            else:
+                namespace = "default"
+
+            # Strip trailing context-window position indicator [pos/total]
+            remainder = re.sub(r"\s*\[\d+/\d+\]\s*$", "", remainder)
+
+            # Source is the first token; optional hierarchy follows " > "
+            source_match = re.match(r"(\S+)", remainder)
             source = source_match.group(1) if source_match else "unknown"
 
-            content = rest.strip() if rest else first_line
+            content = rest.strip() if rest else ""
             if content:
                 results.append(
                     RemoteSearchResult(
                         content=content[:500],
                         score=score,
                         source=source,
+                        namespace=namespace,
                     )
                 )
 

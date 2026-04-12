@@ -96,7 +96,7 @@ class TestParseResultsRegex:
         return McpClientSearchAdapter._parse_results(text)
 
     def test_basic_parse(self):
-        text = "--- [0.9] notes.md ---\nHello world"
+        text = "Found 1 results:\n\n[1] 0.9 | notes.md\nHello world"
         results = self._parse(text)
         assert len(results) == 1
         assert results[0].score == 0.9
@@ -104,8 +104,9 @@ class TestParseResultsRegex:
 
     def test_multiple_results(self):
         text = (
-            "--- [0.9] notes.md ---\nFirst result\n"
-            "--- [0.5] other.md ---\nSecond result"
+            "Found 2 results:\n\n"
+            "[1] 0.9 | notes.md\nFirst result\n\n"
+            "[2] 0.5 | other.md\nSecond result"
         )
         results = self._parse(text)
         assert len(results) == 2
@@ -113,7 +114,8 @@ class TestParseResultsRegex:
     def test_yaml_frontmatter_not_split(self):
         """Content with --- horizontal rules should NOT be split."""
         text = (
-            "--- [0.9] notes.md ---\n"
+            "Found 1 results:\n\n"
+            "[1] 0.9 | notes.md\n"
             "Here is content with:\n"
             "---\n"
             "yaml: frontmatter\n"
@@ -121,24 +123,21 @@ class TestParseResultsRegex:
             "More content after HR"
         )
         results = self._parse(text)
-        # Should produce 1 result, not 3+
         assert len(results) == 1
         assert "yaml: frontmatter" in results[0].chunk.content
 
     def test_markdown_hr_not_split(self):
         """Markdown horizontal rule (---) should not split a result."""
-        text = "--- [0.8] doc.md ---\nSection 1\n---\nSection 2"
+        text = "Found 1 results:\n\n[1] 0.8 | doc.md\nSection 1\n---\nSection 2"
         results = self._parse(text)
         assert len(results) == 1
         assert "Section 2" in results[0].chunk.content
 
-    def test_no_score_bracket(self):
-        """Block without [score] should get default score."""
-        text = "--- notes.md ---\nContent without score"
+    def test_preamble_and_garbage_skipped(self):
+        """Lines without [rank] score | header are skipped."""
+        text = "No results found."
         results = self._parse(text)
-        # New regex requires score bracket — this should NOT match as a separator
-        # The text becomes one block with no valid separator
-        assert len(results) <= 1
+        assert len(results) == 0
 
 
 # ---------------------------------------------------------------------------

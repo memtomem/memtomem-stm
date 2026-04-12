@@ -330,14 +330,14 @@ class TestRemoteSearchResult:
 
 
 class TestMcpClientParseResults:
-    """Test the static _parse_results method of McpClientSearchAdapter."""
+    """Test _parse_results against core's compact format: [rank] score | source."""
 
     def test_empty_text(self) -> None:
         results = McpClientSearchAdapter._parse_results("")
         assert results == []
 
     def test_single_result(self) -> None:
-        text = "--- [0.92] notes.md ---\nSome memory content here"
+        text = "Found 1 results:\n\n[1] 0.92 | notes.md\nSome memory content here"
         results = McpClientSearchAdapter._parse_results(text)
         assert len(results) == 1
         assert results[0].score == 0.92
@@ -345,9 +345,10 @@ class TestMcpClientParseResults:
 
     def test_multiple_results(self) -> None:
         text = (
-            "--- [0.9] a.md ---\nFirst result\n"
-            "--- [0.7] b.md ---\nSecond result\n"
-            "--- [0.5] c.md ---\nThird result"
+            "Found 3 results:\n\n"
+            "[1] 0.9 | a.md\nFirst result\n\n"
+            "[2] 0.7 | b.md\nSecond result\n\n"
+            "[3] 0.5 | c.md\nThird result"
         )
         results = McpClientSearchAdapter._parse_results(text)
         assert len(results) == 3
@@ -355,14 +356,14 @@ class TestMcpClientParseResults:
         assert results[2].score == 0.5
 
     def test_source_extraction(self) -> None:
-        text = "--- [0.8] /path/to/doc.md ---\nContent"
+        text = "Found 1 results:\n\n[1] 0.8 | doc.md > Overview\nContent"
         results = McpClientSearchAdapter._parse_results(text)
         assert len(results) == 1
         assert "doc.md" in str(results[0].chunk.metadata.source_file)
 
     def test_content_truncated_to_500(self) -> None:
         long_content = "x" * 1000
-        text = f"--- [0.5] file.md ---\n{long_content}"
+        text = f"Found 1 results:\n\n[1] 0.5 | file.md\n{long_content}"
         results = McpClientSearchAdapter._parse_results(text)
         assert len(results) == 1
         assert len(results[0].chunk.content) <= 500
@@ -396,7 +397,7 @@ class TestMcpClientSearchAdapter:
 
         mock_content = MagicMock()
         mock_content.type = "text"
-        mock_content.text = "--- [0.9] notes.md ---\nRelevant memory"
+        mock_content.text = "Found 1 results:\n\n[1] 0.9 | notes.md\nRelevant memory"
 
         mock_result = MagicMock()
         mock_result.content = [mock_content]
