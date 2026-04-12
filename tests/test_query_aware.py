@@ -114,6 +114,23 @@ class TestRelevanceScorerProtocol:
         # BM25 fallback should score Redis higher
         assert scores[0] > scores[1]
 
+    def test_embedding_fallback_count_increments(self):
+        """fallback_count increments each time BM25 fallback fires."""
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        scorer = EmbeddingScorer(
+            provider="ollama",
+            model="nonexistent",
+            base_url="http://localhost:99999",
+            timeout=0.5,
+        )
+        sections = [("## A", "Content A.")]
+        assert scorer.fallback_count == 0
+        scorer.score_sections("query", sections)
+        assert scorer.fallback_count == 1
+        scorer.score_sections("another query", sections)
+        assert scorer.fallback_count == 2
+
     def test_custom_scorer_in_truncate(self):
         """TruncateCompressor accepts a custom scorer."""
 

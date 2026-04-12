@@ -66,6 +66,9 @@ class MetricsStore:
             "ratio_violation": (
                 "ALTER TABLE proxy_metrics ADD COLUMN ratio_violation INTEGER NOT NULL DEFAULT 0"
             ),
+            "scorer_fallback": (
+                "ALTER TABLE proxy_metrics ADD COLUMN scorer_fallback INTEGER NOT NULL DEFAULT 0"
+            ),
         }
         for col, ddl in migrations.items():
             if col not in existing:
@@ -86,8 +89,8 @@ class MetricsStore:
                 "INSERT INTO proxy_metrics "
                 "(server, tool, original_chars, compressed_chars, cleaned_chars, "
                 "is_error, error_category, error_code, trace_id, "
-                "compression_strategy, ratio_violation, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "compression_strategy, ratio_violation, scorer_fallback, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -100,6 +103,7 @@ class MetricsStore:
                     metrics.trace_id,
                     metrics.compression_strategy,
                     int(metrics.ratio_violation),
+                    int(metrics.scorer_fallback),
                     now,
                 ),
             )

@@ -121,6 +121,7 @@ class EmbeddingScorer:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._fallback = BM25Scorer()
+        self.fallback_count: int = 0
 
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
         if not query or not sections:
@@ -129,7 +130,8 @@ class EmbeddingScorer:
         try:
             return self._score_via_embedding(query, sections)
         except Exception:
-            logger.debug("EmbeddingScorer failed, falling back to BM25", exc_info=True)
+            self.fallback_count += 1
+            logger.warning("EmbeddingScorer failed, falling back to BM25", exc_info=True)
             return self._fallback.score_sections(query, sections)
 
     def _score_via_embedding(self, query: str, sections: list[tuple[str, str]]) -> list[float]:

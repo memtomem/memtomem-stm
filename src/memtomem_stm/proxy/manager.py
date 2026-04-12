@@ -1004,6 +1004,7 @@ class ProxyManager:
         # allows — it feeds into metrics for auditing R4 after the fact.
         effective_compression: CompressionStrategy = tc.compression
         ratio_violation = False
+        _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
 
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
@@ -1218,6 +1219,9 @@ class ProxyManager:
                 surfaced_chars=len(surfaced),
                 compression_strategy=metrics_strategy,
                 ratio_violation=ratio_violation,
+                scorer_fallback=(
+                    getattr(self._relevance_scorer, "fallback_count", 0) > _pre_scorer_fb
+                ),
             )
         )
 

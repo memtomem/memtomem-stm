@@ -81,6 +81,8 @@ class CallMetrics:
     # — useful for auditing R4 (min_retention bypass) after the fact.
     compression_strategy: str | None = None
     ratio_violation: bool = False
+    # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call.
+    scorer_fallback: bool = False
 
 
 class RPSTracker:
