@@ -136,6 +136,26 @@ class ProxyManager:
             loaded = ProxyConfig.load_from_file(self._config.config_path)
             servers = loaded.upstream_servers if loaded else {}
 
+        # Warn about dangerous config: compression active but auto_index disabled
+        # means compressed-away content is permanently lost (no LTM recovery).
+        ai_cfg = self._config.auto_index
+        if ai_cfg.enabled and self._index_engine is None:
+            logger.warning(
+                "auto_index.enabled=true but no index engine configured — "
+                "indexed content will not be stored"
+            )
+        for srv_name, srv_cfg in servers.items():
+            if (
+                srv_cfg.compression not in (CompressionStrategy.NONE, CompressionStrategy.AUTO)
+                and not ai_cfg.enabled
+            ):
+                logger.warning(
+                    "Server '%s' uses compression=%s but auto_index is disabled — "
+                    "compressed-away content is permanently lost",
+                    srv_name,
+                    srv_cfg.compression.value,
+                )
+
         seen_prefixed: set[str] = set()
         for name, cfg in servers.items():
             try:

@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 
 import pytest
 
 from memtomem_stm.proxy.config import (
+    AutoIndexConfig,
     CleaningConfig,
     CompressionStrategy,
+    ProxyConfig,
     SelectiveConfig,
     ToolOverrideConfig,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ToolConfig
+from memtomem_stm.proxy.manager import ProxyManager, ToolConfig
+from memtomem_stm.proxy.metrics import TokenTracker
 
 
 # ── ToolConfig resolution tests ──────────────────────────────────────────
@@ -135,6 +139,67 @@ class TestToolConfigResolution:
         tc = _resolve(cfg, "any_tool")
         assert tc.selective is sel
         assert tc.selective.max_pending == 50
+
+
+# ── Auto-index startup warning tests ────────────────────────────────────
+
+
+class TestAutoIndexStartupWarning:
+    @pytest.mark.asyncio
+    async def test_warns_compression_without_auto_index(self, caplog):
+        """Compression active + auto_index disabled → startup warning."""
+        config = ProxyConfig(
+            enabled=True,
+            auto_index=AutoIndexConfig(enabled=False),
+            upstream_servers={
+                "docs": UpstreamServerConfig(
+                    prefix="dc",
+                    compression=CompressionStrategy.HYBRID,
+                    command="echo",
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except Exception:
+                pass  # connection to "echo" will fail — we only care about warnings
+        assert any("compressed-away content is permanently lost" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_warns_auto_index_enabled_but_no_engine(self, caplog):
+        """auto_index.enabled=true but index_engine=None → startup warning."""
+        config = ProxyConfig(
+            enabled=True,
+            auto_index=AutoIndexConfig(enabled=True),
+        )
+        mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr.start()
+        assert any("no index engine configured" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_compression_none(self, caplog):
+        """compression=none + auto_index disabled → no warning."""
+        config = ProxyConfig(
+            enabled=True,
+            auto_index=AutoIndexConfig(enabled=False),
+            upstream_servers={
+                "pass": UpstreamServerConfig(
+                    prefix="ps",
+                    compression=CompressionStrategy.NONE,
+                    command="echo",
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except Exception:
+                pass
+        assert not any("permanently lost" in r.message for r in caplog.records)
 
 
 class TestToolConfigFrozen:
