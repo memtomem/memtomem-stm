@@ -40,6 +40,7 @@ from memtomem_stm.proxy.config import (
     ProxyConfig,
     ProxyConfigLoader,
     SelectiveConfig,
+    TailMode,
     TransportType,
     UpstreamServerConfig,
 )
@@ -269,6 +270,25 @@ class ProxyManager:
                 result[k] = v
         return result
 
+    @staticmethod
+    def _convention_suffix(
+        compression: CompressionStrategy,
+        hybrid_cfg: HybridConfig | None,
+    ) -> str:
+        """Return a convention hint for strategies that change agent interaction.
+
+        Returns empty string for strategies that produce standard text responses.
+        """
+        if compression == CompressionStrategy.SELECTIVE:
+            return " | TOC response: use stm_proxy_select_chunks"
+        if compression == CompressionStrategy.PROGRESSIVE:
+            return " | Chunked: use stm_proxy_read_more for more"
+        if compression == CompressionStrategy.HYBRID:
+            cfg = hybrid_cfg or HybridConfig()
+            if cfg.tail_mode == TailMode.TOC:
+                return " | Head+TOC: use stm_proxy_select_chunks"
+        return ""
+
     def get_proxy_tools(self) -> list[ProxyToolInfo]:
         result: list[ProxyToolInfo] = []
         global_max_desc = self._config.max_description_chars
@@ -285,11 +305,28 @@ class ProxyManager:
                 if override is not None and override.hidden:
                     continue
 
-                # Resolve description
+                # Resolve effective compression + hybrid config for convention suffix
+                effective_compression = cfg.compression
+                effective_hybrid = cfg.hybrid
+                if override is not None:
+                    if override.compression is not None:
+                        effective_compression = override.compression
+                    if override.hybrid is not None:
+                        effective_hybrid = override.hybrid
+
+                suffix = self._convention_suffix(effective_compression, effective_hybrid)
+
+                # Resolve description (reduce budget by suffix length)
                 desc = t.description or ""
                 if override is not None and override.description_override is not None:
                     desc = override.description_override
-                desc = self._truncate_description(desc, min(max_desc, global_max_desc))
+                budget = min(max_desc, global_max_desc)
+                if suffix:
+                    # Reserve room for suffix + possible "..." from truncation
+                    budget = max(budget - len(suffix) - 3, 40)
+                desc = self._truncate_description(desc, budget)
+                if suffix:
+                    desc = desc + suffix
 
                 # Resolve schema
                 schema = t.inputSchema or {"type": "object"}

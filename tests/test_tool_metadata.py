@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock
 
 
 from memtomem_stm.proxy.config import (
+    CompressionStrategy,
+    HybridConfig,
     ProxyConfig,
+    TailMode,
     ToolOverrideConfig,
     UpstreamServerConfig,
 )
@@ -134,12 +137,16 @@ def _make_manager_with_tools(
     strip_schema_descriptions: bool = False,
     server_max_desc: int = 200,
     server_strip: bool = False,
+    compression: CompressionStrategy = CompressionStrategy.AUTO,
+    hybrid: HybridConfig | None = None,
 ) -> ProxyManager:
     server_cfg = UpstreamServerConfig(
         prefix="test",
         tool_overrides=tool_overrides or {},
         max_description_chars=server_max_desc,
         strip_schema_descriptions=server_strip,
+        compression=compression,
+        hybrid=hybrid,
     )
     proxy_cfg = ProxyConfig(
         config_path=Path("/tmp/proxy.json"),
@@ -247,3 +254,100 @@ class TestTokenSavings:
         original_chars = 50 * 500
         savings_pct = (1 - total_chars / original_chars) * 100
         assert savings_pct > 50
+
+
+# ── Convention suffix ──────────────────────────────────────────────────
+
+
+class TestConventionSuffix:
+    def test_selective_suffix(self):
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.SELECTIVE)
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc.endswith(" | TOC response: use stm_proxy_select_chunks")
+
+    def test_progressive_suffix(self):
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.PROGRESSIVE)
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc.endswith(" | Chunked: use stm_proxy_read_more for more")
+
+    def test_hybrid_toc_suffix(self):
+        """hybrid + default HybridConfig (tail_mode=TOC) → suffix appended."""
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.HYBRID)
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc.endswith(" | Head+TOC: use stm_proxy_select_chunks")
+
+    def test_hybrid_truncate_no_suffix(self):
+        """hybrid + tail_mode=TRUNCATE → no suffix."""
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.HYBRID,
+            hybrid=HybridConfig(tail_mode=TailMode.TRUNCATE),
+        )
+        desc = mgr.get_proxy_tools()[0].description
+        assert "stm_proxy_select_chunks" not in desc
+        assert "stm_proxy_read_more" not in desc
+
+    def test_auto_no_suffix(self):
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.AUTO)
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc == "Fetches a document."
+
+    def test_none_no_suffix(self):
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.NONE)
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc == "Fetches a document."
+
+    def test_truncate_no_suffix(self):
+        tools = [_fake_tool("t", description="Fetches a document.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.TRUNCATE)
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc == "Fetches a document."
+
+    def test_per_tool_override_suffix(self):
+        """Server uses AUTO, but one tool overridden to selective → suffix on that tool."""
+        tools = [_fake_tool("normal"), _fake_tool("special")]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.AUTO,
+            tool_overrides={
+                "special": ToolOverrideConfig(compression=CompressionStrategy.SELECTIVE),
+            },
+        )
+        proxy_tools = {t.original_name: t for t in mgr.get_proxy_tools()}
+        assert "stm_proxy_select_chunks" not in proxy_tools["normal"].description
+        assert proxy_tools["special"].description.endswith(
+            " | TOC response: use stm_proxy_select_chunks"
+        )
+
+    def test_suffix_within_budget(self):
+        """description + suffix stays within max_description_chars."""
+        long_desc = "A" * 300
+        tools = [_fake_tool("t", description=long_desc)]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.SELECTIVE,
+            max_description_chars=200,
+        )
+        desc = mgr.get_proxy_tools()[0].description
+        assert len(desc) <= 200
+        assert desc.endswith(" | TOC response: use stm_proxy_select_chunks")
+
+    def test_suffix_budget_floor(self):
+        """Very tight budget still leaves ≥ 40 chars for upstream description."""
+        tools = [_fake_tool("t", description="A" * 100)]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.SELECTIVE,
+            max_description_chars=60,
+        )
+        desc = mgr.get_proxy_tools()[0].description
+        suffix = " | TOC response: use stm_proxy_select_chunks"
+        # The upstream part should be at least 40 chars (floor)
+        upstream_part = desc[: -len(suffix)]
+        assert len(upstream_part) >= 40

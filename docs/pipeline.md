@@ -68,7 +68,7 @@ sequenceDiagram
 
 ## Tool Naming
 
-All upstream tools are exposed with a `{prefix}__{original_name}` naming convention (e.g. `fs__read_file`). Tool descriptions are prefixed with `[proxied]` to distinguish them from the 6 built-in STM control tools.
+All upstream tools are exposed with a `{prefix}__{original_name}` naming convention (e.g. `fs__read_file`). Tool descriptions are prefixed with `[proxied]` to distinguish them from the built-in STM control tools. When a tool's compression strategy changes the agent interaction pattern (selective, progressive, or hybrid with `tail_mode: toc`), a convention suffix is appended to the description — e.g. `| TOC response: use stm_proxy_select_chunks` — so the agent knows which follow-up tool to call.
 
 ## Stage 1: CLEAN
 
