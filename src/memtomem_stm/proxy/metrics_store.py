@@ -129,3 +129,32 @@ class MetricsStore:
             }
             for r in rows
         ]
+
+    def lookup_recent_trace_id(
+        self,
+        server: str,
+        tool: str,
+        within_seconds: float,
+    ) -> str | None:
+        """Return the ``trace_id`` of the freshest ``(server, tool)`` row
+        recorded within the last ``within_seconds`` seconds, or ``None``
+        if the store is closed or nothing matches.
+
+        Best-effort correlation helper used by ``stm_compression_feedback``
+        when the caller omits an explicit ``trace_id``. The window should
+        stay narrow enough (see ``TRACE_LOOKUP_WINDOW_SECONDS`` in
+        ``compression_feedback_store``) that we don't attach a feedback
+        report to an unrelated historical call with the same ``(server,
+        tool)`` pair.
+        """
+        if self._db is None:
+            return None
+        cutoff = time.time() - within_seconds
+        row = self._db.execute(
+            "SELECT trace_id FROM proxy_metrics "
+            "WHERE server = ? AND tool = ? AND created_at >= ? "
+            "AND trace_id IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            (server, tool, cutoff),
+        ).fetchone()
+        return row[0] if row else None

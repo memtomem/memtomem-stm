@@ -205,6 +205,20 @@ class MetricsConfig(BaseModel):
     max_history: int = Field(default=10000, gt=0)
 
 
+class CompressionFeedbackConfig(BaseModel):
+    """Configuration for the stm_compression_feedback learning loop.
+
+    Collection-only in this release: reports are persisted for later
+    inspection via ``stm_compression_stats`` and for future auto-tuning.
+    Shares the user-wide ``~/.memtomem/stm_feedback.db`` file with
+    surfacing feedback (different tables; WAL mode makes concurrent
+    access safe).
+    """
+
+    enabled: bool = True
+    db_path: Path = Path("~/.memtomem/stm_feedback.db")
+
+
 # Static context window sizes (tokens) for known model families.
 # Used by ProxyConfig.effective_max_result_chars() to scale compression budget.
 # Prefix-matched: "claude-sonnet-4-20250514" matches "claude-sonnet-4".
@@ -287,6 +301,9 @@ class ProxyConfig(BaseModel):
     auto_index: AutoIndexConfig = Field(default_factory=AutoIndexConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    compression_feedback: CompressionFeedbackConfig = Field(
+        default_factory=CompressionFeedbackConfig
+    )
 
     def effective_max_result_chars(self) -> int:
         """Compute max_result_chars scaled by consumer model's context window.

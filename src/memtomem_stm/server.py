@@ -12,6 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from memtomem_stm.config import STMConfig
+from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import ProxyConfig
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
@@ -30,6 +31,7 @@ class STMContext:
     tracker: TokenTracker
     surfacing_engine: SurfacingEngine | None
     feedback_tracker: FeedbackTracker | None
+    compression_feedback_tracker: CompressionFeedbackTracker | None
 
 
 CtxType = Context[ServerSession, STMContext]
@@ -57,6 +59,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     surfacing_engine: SurfacingEngine | None = None
     mcp_adapter = None
     feedback_tracker: FeedbackTracker | None = None
+    compression_feedback_tracker: CompressionFeedbackTracker | None = None
     langfuse_client = None
     tracker = TokenTracker()
 
@@ -69,6 +72,22 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             )
             metrics_store.initialize()
         tracker = TokenTracker(metrics_store=metrics_store)
+
+        # Compression feedback tracker — learning loop for agent-reported
+        # information loss. Reads ``metrics_store`` read-only for
+        # best-effort trace_id correlation when the caller omits it.
+        if config.proxy.compression_feedback.enabled:
+            try:
+                compression_feedback_tracker = CompressionFeedbackTracker(
+                    config.proxy.compression_feedback.db_path,
+                    metrics_store=metrics_store,
+                )
+            except Exception:
+                logger.warning(
+                    "Compression feedback tracker init failed — tool will be disabled",
+                    exc_info=True,
+                )
+                compression_feedback_tracker = None
 
         # Surfacing engine — LTM access is always remote-only via the
         # MCP client adapter. The adapter spawns (or connects to) a memtomem
@@ -153,6 +172,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
         tracker=tracker,
         surfacing_engine=surfacing_engine,
         feedback_tracker=feedback_tracker,
+        compression_feedback_tracker=compression_feedback_tracker,
     )
     try:
         yield ctx
@@ -170,6 +190,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             (proxy_cache, "proxy_cache"),
             (metrics_store, "metrics_store"),
             (feedback_tracker, "feedback_tracker"),
+            (compression_feedback_tracker, "compression_feedback_tracker"),
         ]:
             if resource is not None:
                 try:
@@ -456,6 +477,101 @@ async def stm_surfacing_stats(
         helpful = stats["by_rating"].get("helpful", 0)
         pct = round(helpful / stats["total_feedback"] * 100, 1)
         lines.append(f"\nHelpfulness: {pct}%")
+
+    if tool:
+        lines.append(f"\n(filtered by tool: {tool})")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_compression_feedback
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def stm_compression_feedback(
+    server: str,
+    tool: str,
+    missing: str,
+    kind: str = "other",
+    trace_id: str | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Report missing information from a compressed proxy response.
+
+    Use this after a prior ``stm_proxy_*`` call returned a response whose
+    compression stripped something you needed for downstream work. This
+    is a *learning signal* — it does not repair the current turn. Reports
+    accumulate for later inspection via ``stm_compression_stats`` and
+    will feed future auto-tuning of compression strategies per tool.
+
+    Args:
+        server: Upstream server name (e.g. ``"docfix"``).
+        tool:   Upstream tool name (e.g. ``"get_document"``).
+        missing: Free-form description of what was missing
+                 (e.g. ``"example code for Query.select"``).
+        kind:   One of ``"truncated"``, ``"missing_example"``,
+                ``"missing_metadata"``, ``"wrong_topic"``, ``"other"``.
+        trace_id: Optional. If omitted, the server correlates to the most
+                  recent matching ``(server, tool)`` call within the last
+                  30 minutes; if no match, the report is stored with a
+                  NULL ``trace_id``.
+    """
+    app = _get_ctx(ctx)
+    if app.compression_feedback_tracker is None:
+        return "Compression feedback tracking is not enabled."
+    return app.compression_feedback_tracker.record(
+        server=server,
+        tool=tool,
+        missing=missing,
+        kind=kind,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_compression_stats
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def stm_compression_stats(
+    tool: str | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Show compression feedback counts.
+
+    Reports the total number of ``stm_compression_feedback`` calls, the
+    breakdown by ``kind``, and (when no tool filter is passed) the
+    breakdown by tool.
+
+    Args:
+        tool: Optional filter by upstream tool name.
+    """
+    app = _get_ctx(ctx)
+    if app.compression_feedback_tracker is None:
+        return "Compression feedback tracking is not enabled."
+
+    stats = app.compression_feedback_tracker.get_stats(tool)
+
+    lines = [
+        "Compression Feedback Stats",
+        "==========================",
+        f"Total feedback: {stats['total_feedback']}",
+    ]
+
+    if stats["by_kind"]:
+        lines.append("\nBy kind:")
+        for kind_name, count in sorted(stats["by_kind"].items()):
+            lines.append(f"  {kind_name}: {count}")
+
+    if not tool and stats["by_tool"]:
+        lines.append("\nBy tool:")
+        for tool_name, count in sorted(
+            stats["by_tool"].items(), key=lambda kv: kv[1], reverse=True
+        ):
+            lines.append(f"  {tool_name}: {count}")
 
     if tool:
         lines.append(f"\n(filtered by tool: {tool})")

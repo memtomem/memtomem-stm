@@ -449,14 +449,18 @@ class TestFeedbackTrackerPosition:
         tree = ast.parse(source)
 
         # Simple text check: "if mcp_adapter is not None:" should appear
-        # before "FeedbackTracker" in the code
+        # before the surfacing FeedbackTracker constructor in the code.
+        # We match "= FeedbackTracker(" (with leading "= ") so that the
+        # unrelated CompressionFeedbackTracker init — which lives on the
+        # metrics side of the lifespan and correctly runs outside the
+        # adapter guard — does not trip this assertion.
         lines = source.split("\n")
         adapter_check_line = None
         feedback_line = None
         for i, line in enumerate(lines):
             if "if mcp_adapter is not None:" in line and adapter_check_line is None:
                 adapter_check_line = i
-            if "FeedbackTracker(" in line and feedback_line is None:
+            if "= FeedbackTracker(" in line and feedback_line is None:
                 feedback_line = i
 
         assert adapter_check_line is not None
