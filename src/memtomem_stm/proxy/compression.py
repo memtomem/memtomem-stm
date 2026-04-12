@@ -1062,6 +1062,7 @@ class LLMCompressor:
             max_failures=3, reset_timeout=60.0, name=f"llm-{config.provider.value}"
         )
         self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=30) if httpx else None
+        self.last_fallback: str | None = None
         # Warn about non-standard base_url to flag potential credential exfiltration
         if config.base_url:
             from urllib.parse import urlparse
@@ -1077,6 +1078,7 @@ class LLMCompressor:
     async def compress(
         self, text: str, *, max_chars: int, privacy_patterns: list[str] | None = None
     ) -> str:
+        self.last_fallback = None
         if not text or len(text) <= max_chars:
             return text
         if privacy_patterns:
@@ -1084,8 +1086,10 @@ class LLMCompressor:
 
             if contains_sensitive_content(text, privacy_patterns):
                 logger.info("Sensitive content detected, skipping LLM compression")
+                self.last_fallback = "privacy"
                 return TruncateCompressor().compress(text, max_chars=max_chars)
         if self._cb.is_open:
+            self.last_fallback = "circuit_breaker"
             return TruncateCompressor().compress(text, max_chars=max_chars)
         try:
             result = await self._call_api(text, max_chars=max_chars)
@@ -1096,6 +1100,7 @@ class LLMCompressor:
             logger.warning(
                 "LLM compression failed (%s), falling back to truncate: %s", type(exc).__name__, exc
             )
+            self.last_fallback = "llm_error"
             return TruncateCompressor().compress(text, max_chars=max_chars)
 
     async def _call_api(self, text: str, *, max_chars: int) -> str:

@@ -458,12 +458,13 @@ class ProxyManager:
         tool: str,
         *,
         context_query: str | None = None,
-    ) -> str:
+    ) -> tuple[str, str | None]:
+        """Return (compressed_text, llm_fallback_reason_or_None)."""
         if compression == CompressionStrategy.AUTO:
             resolved = auto_select_strategy(text, max_chars=max_chars)
             logger.debug("auto_select_strategy → %s for %s/%s", resolved.value, server, tool)
             if resolved == CompressionStrategy.NONE:
-                return text
+                return text, None
             return await self._apply_compression(
                 text,
                 resolved,
@@ -477,34 +478,43 @@ class ProxyManager:
             )
 
         if compression == CompressionStrategy.HYBRID:
-            return await self._apply_hybrid(
+            result = await self._apply_hybrid(
                 text, max_chars, hybrid_cfg, sel_cfg, context_query=context_query
             )
+            return result, None
 
         if compression == CompressionStrategy.SELECTIVE:
             async with self._selective_lock:
                 if self._selective_compressor is None:
                     self._selective_compressor = self._create_selective(sel_cfg)
-            return self._selective_compressor.compress(text, max_chars=max_chars)
+            return self._selective_compressor.compress(text, max_chars=max_chars), None
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
-                return await LLMCompressor(llm_cfg).compress(text, max_chars=max_chars)
+                comp = LLMCompressor(llm_cfg)
+                result = await comp.compress(text, max_chars=max_chars)
+                return result, comp.last_fallback
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",
                 server,
                 tool,
             )
-            return TruncateCompressor(scorer=self._relevance_scorer).compress(
-                text, max_chars=max_chars
+            return (
+                TruncateCompressor(scorer=self._relevance_scorer).compress(
+                    text, max_chars=max_chars
+                ),
+                "no_config",
             )
 
         if compression == CompressionStrategy.TRUNCATE:
-            return TruncateCompressor(scorer=self._relevance_scorer).compress(
-                text, max_chars=max_chars, context_query=context_query
+            return (
+                TruncateCompressor(scorer=self._relevance_scorer).compress(
+                    text, max_chars=max_chars, context_query=context_query
+                ),
+                None,
             )
 
-        return get_compressor(compression).compress(text, max_chars=max_chars)
+        return get_compressor(compression).compress(text, max_chars=max_chars), None
 
     async def _apply_surfacing(
         self,
@@ -1030,14 +1040,11 @@ class ProxyManager:
                     effective_max_chars = min_budget
 
             # Resolve AUTO early so downstream metrics know which strategy ran.
-            # ``_apply_compression`` still handles AUTO internally for callers
-            # that pass it directly, but resolving here lets us record the
-            # effective strategy without threading a return tuple.
             if effective_compression == CompressionStrategy.AUTO:
                 effective_compression = auto_select_strategy(cleaned, max_chars=effective_max_chars)
 
             _t0 = _time.monotonic()
-            compressed = await self._apply_compression(
+            compressed, llm_fallback = await self._apply_compression(
                 cleaned,
                 effective_compression,
                 effective_max_chars,
@@ -1059,6 +1066,8 @@ class ProxyManager:
             # PROGRESSIVE is excluded above — it is zero-loss by construction.
             cleaned_len = len(cleaned)
             metrics_strategy = effective_compression.value
+            if llm_fallback:
+                metrics_strategy = f"llm_summary→{llm_fallback}_fallback"
             progressive_fallback = False  # set when progressive replaces the response
             if cleaned_len > 0 and dynamic > 0:
                 compressed_ratio = len(compressed) / cleaned_len

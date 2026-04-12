@@ -235,7 +235,7 @@ class TestProxyManagerRatioGuard:
         large_text = "content paragraph. " * 800  # ~15200 chars
         mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
         # Return something far below the retention floor
-        mgr._apply_compression = AsyncMock(return_value="x" * 100)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 100, None))
 
         result = await mgr.call_tool("srv", "tool", {})
 
@@ -254,7 +254,7 @@ class TestProxyManagerRatioGuard:
         mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
         large_text = "content paragraph. " * 800
         mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
-        mgr._apply_compression = AsyncMock(return_value="x" * 100)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 100, None))
 
         result = await mgr.call_tool("srv", "tool", {})
 
@@ -268,7 +268,7 @@ class TestProxyManagerRatioGuard:
         mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
         large_text = "content paragraph. " * 800
         mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
-        mgr._apply_compression = AsyncMock(return_value="x" * 100)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 100, None))
         # Force progressive to fail — truncate must catch it
         mgr._apply_progressive = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("store full"))
 
@@ -289,7 +289,7 @@ class TestProxyManagerRatioGuard:
             sections.append(f"\n## Section {i}\n\n{'Detail text paragraph. ' * 30}")
         markdown_text = "".join(sections)  # ~14K chars, 20 headings
         mgr._connections["srv"].session.call_tool.return_value = _make_result(markdown_text)
-        mgr._apply_compression = AsyncMock(return_value="x" * 50)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 50, None))
         # Force progressive to fail so truncate tier runs
         mgr._apply_progressive = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
 
@@ -310,7 +310,7 @@ class TestProxyManagerRatioGuard:
         # Simulate a compressor that keeps ~80% of the content — above the
         # 0.65 floor, so no violation should fire.
         kept = int(len(large_text) * 0.8)
-        mgr._apply_compression = AsyncMock(return_value=large_text[:kept])
+        mgr._apply_compression = AsyncMock(return_value=(large_text[:kept], None))
 
         await mgr.call_tool("srv", "tool", {})
 
@@ -324,7 +324,7 @@ class TestProxyManagerRatioGuard:
         mgr, store = _make_manager_with_store(tmp_path, min_retention=0.0, max_result_chars=500)
         large_text = "content paragraph. " * 800
         mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
-        mgr._apply_compression = AsyncMock(return_value="x" * 10)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 10, None))
 
         await mgr.call_tool("srv", "tool", {})
 

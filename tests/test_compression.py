@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from memtomem_stm.proxy.compression import (
     FieldExtractCompressor,
     HybridCompressor,
+    LLMCompressor,
     NoopCompressor,
     SelectiveCompressor,
     TruncateCompressor,
 )
+from memtomem_stm.proxy.config import LLMCompressorConfig, LLMProvider
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +237,71 @@ class TestHybridCompressor:
         c = HybridCompressor(head_chars=5000, min_head_chars=5000)
         result = c.compress(text, max_chars=100)
         assert "truncated" in result
+
+
+# ---------------------------------------------------------------------------
+# LLMCompressor — last_fallback attribute
+# ---------------------------------------------------------------------------
+
+
+def _make_llm_compressor() -> LLMCompressor:
+    cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA, base_url="http://localhost:11434")
+    return LLMCompressor(cfg)
+
+
+class TestLLMCompressorFallback:
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_text_fits(self):
+        comp = _make_llm_compressor()
+        result = await comp.compress("short", max_chars=1000)
+        assert result == "short"
+        assert comp.last_fallback is None
+
+    @pytest.mark.asyncio
+    async def test_privacy_fallback(self):
+        comp = _make_llm_compressor()
+        text = "API_KEY=sk-secret-1234567890 " * 50
+        with patch(
+            "memtomem_stm.proxy.privacy.contains_sensitive_content", return_value=True
+        ):
+            result = await comp.compress(
+                text, max_chars=100, privacy_patterns=["API_KEY"]
+            )
+        assert comp.last_fallback == "privacy"
+        assert len(result) < len(text)
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_fallback(self):
+        comp = _make_llm_compressor()
+        # Trip the circuit breaker
+        for _ in range(3):
+            comp._cb.failure()
+        assert comp._cb.is_open
+
+        text = "Long document content. " * 50
+        result = await comp.compress(text, max_chars=200)
+        assert comp.last_fallback == "circuit_breaker"
+        assert len(result) < len(text)
+
+    @pytest.mark.asyncio
+    async def test_llm_error_fallback(self):
+        comp = _make_llm_compressor()
+        text = "Long document content. " * 50
+        with patch.object(comp, "_call_api", new_callable=AsyncMock, side_effect=RuntimeError("API down")):
+            result = await comp.compress(text, max_chars=200)
+        assert comp.last_fallback == "llm_error"
+        assert len(result) < len(text)
+
+    @pytest.mark.asyncio
+    async def test_fallback_resets_on_each_call(self):
+        comp = _make_llm_compressor()
+        # First call: trip circuit breaker
+        for _ in range(3):
+            comp._cb.failure()
+        text = "Long document content. " * 50
+        await comp.compress(text, max_chars=200)
+        assert comp.last_fallback == "circuit_breaker"
+
+        # Second call: text fits budget — no compression needed
+        await comp.compress("short", max_chars=1000)
+        assert comp.last_fallback is None
