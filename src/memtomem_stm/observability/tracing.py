@@ -32,7 +32,7 @@ def init_langfuse(config: object, *, service_name: str = _SERVICE_NAME) -> Any:
 
     _sampling_rate = getattr(config, "sampling_rate", 1.0)
 
-    kwargs: dict[str, str] = {}
+    kwargs: dict[str, Any] = {}
     if getattr(config, "public_key", ""):
         kwargs["public_key"] = config.public_key  # type: ignore[union-attr]
     if getattr(config, "secret_key", ""):
