@@ -750,6 +750,7 @@ class ProxyManager:
             content_type=ProgressiveChunker.detect_content_type(text),
             structure_hint=ProgressiveChunker.structure_hint(text),
             created_at=_time.monotonic(),
+            ttl_seconds=cfg.ttl_seconds,
         )
         store.put(key, resp)
 
@@ -757,7 +758,7 @@ class ProxyManager:
             chunk_size=cfg.chunk_size,
             include_hint=cfg.include_structure_hint,
         )
-        return chunker.first_chunk(text, key)
+        return chunker.first_chunk(text, key, ttl_seconds=cfg.ttl_seconds)
 
     def read_more(self, key: str, offset: int, limit: int | None = None) -> str:
         """Return next chunk from a progressive delivery response."""
@@ -768,7 +769,9 @@ class ProxyManager:
         store.touch(key)
         chunk_size = limit or 4000
         chunker = ProgressiveChunker(chunk_size=chunk_size, include_hint=True)
-        return chunker.read_chunk(resp.content, offset, limit, key=key)
+        return chunker.read_chunk(
+            resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
+        )
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool count."""
@@ -1047,15 +1050,16 @@ class ProxyManager:
             )
             _compress_ms = (_time.monotonic() - _t0) * 1000
 
-            # ── Compression ratio guard (R4 defense + fallback) ──
+            # ── Compression ratio guard (R4 defense + fallback ladder) ──
             # When the compressor cuts below the dynamic retention floor,
-            # re-compress via boundary-aware TruncateCompressor at the full
-            # effective budget. This preserves heading/code-fence/SQL
-            # boundaries (M5) without changing the agent protocol — the
-            # response stays a single text block, just with more content.
+            # try progressive delivery first (zero-loss, agent retrieves via
+            # stm_proxy_read_more).  If progressive fails (store error, etc.),
+            # fall back to boundary-aware TruncateCompressor at the effective
+            # budget — lossy but immediate and guaranteed.
             # PROGRESSIVE is excluded above — it is zero-loss by construction.
             cleaned_len = len(cleaned)
             metrics_strategy = effective_compression.value
+            progressive_fallback = False  # set when progressive replaces the response
             if cleaned_len > 0 and dynamic > 0:
                 compressed_ratio = len(compressed) / cleaned_len
                 if compressed_ratio < dynamic:
@@ -1074,27 +1078,65 @@ class ProxyManager:
                         )
                     else:
                         original_strategy = effective_compression.value
-                        compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
-                            cleaned, max_chars=effective_max_chars
-                        )
-                        metrics_strategy = f"{original_strategy}→truncate_fallback"
-                        logger.warning(
-                            "Ratio guard fallback for %s/%s: %s (ratio %.3f→%.3f, budget=%d)",
-                            server,
-                            tool,
-                            metrics_strategy,
-                            compressed_ratio,
-                            len(compressed) / cleaned_len if cleaned_len else 0,
-                            effective_max_chars,
-                        )
+                        pcfg = tc.progressive or ProgressiveConfig()
+                        # Tier 1: progressive (zero-loss, best-effort).
+                        # Skip when content fits in a single chunk —
+                        # progressive adds footer overhead without benefit
+                        # (has_more=False, nothing to read_more).
+                        if cleaned_len > pcfg.chunk_size:
+                            try:
+                                compressed = self._apply_progressive(cleaned, pcfg, server, tool)
+                                metrics_strategy = f"{original_strategy}→progressive_fallback"
+                                progressive_fallback = True
+                                logger.info(
+                                    "Progressive fallback for %s/%s: %s "
+                                    "(ratio %.3f < %.3f, ttl=%ds)",
+                                    server,
+                                    tool,
+                                    metrics_strategy,
+                                    compressed_ratio,
+                                    dynamic,
+                                    int(pcfg.ttl_seconds),
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Progressive fallback failed for %s/%s, "
+                                    "falling through to truncate",
+                                    server,
+                                    tool,
+                                    exc_info=True,
+                                )
+                        # Tier 2: truncate (guaranteed floor) — also the
+                        # direct path when content is too small for progressive.
+                        if not progressive_fallback:
+                            compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
+                                cleaned, max_chars=effective_max_chars
+                            )
+                            metrics_strategy = f"{original_strategy}→truncate_fallback"
+                            logger.warning(
+                                "Ratio guard truncate fallback for %s/%s: %s "
+                                "(ratio %.3f→%.3f, budget=%d)",
+                                server,
+                                tool,
+                                metrics_strategy,
+                                compressed_ratio,
+                                (len(compressed) / cleaned_len if cleaned_len else 0),
+                                effective_max_chars,
+                            )
 
             # Record metrics BEFORE surfacing (surfacing adds content, not compresses)
             compressed_chars_for_metrics = len(compressed)
 
             # ── Stage 3: SURFACE (proactive memory injection) ──
-            _t0 = _time.monotonic()
-            surfaced = await self._apply_surfacing(server, tool, upstream_args, compressed)
-            _surface_ms = (_time.monotonic() - _t0) * 1000
+            # Skip surfacing when progressive fallback fired — injecting
+            # memories would shift character offsets for stm_proxy_read_more.
+            if progressive_fallback:
+                _surface_ms = 0.0
+                surfaced = compressed
+            else:
+                _t0 = _time.monotonic()
+                surfaced = await self._apply_surfacing(server, tool, upstream_args, compressed)
+                _surface_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stage 4: INDEX (optional) ──
         ai_cfg = cfg_snap.auto_index

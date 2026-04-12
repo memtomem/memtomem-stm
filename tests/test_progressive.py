@@ -326,6 +326,59 @@ class TestProgressiveConfig:
 
 
 # ---------------------------------------------------------------------------
+# TTL exposure in footer
+# ---------------------------------------------------------------------------
+
+
+class TestProgressiveTTL:
+    def test_first_chunk_includes_ttl(self):
+        """First chunk footer must expose TTL when provided."""
+        chunker = ProgressiveChunker(chunk_size=100)
+        text = "x" * 500
+        result = chunker.first_chunk(text, "key1", ttl_seconds=300.0)
+        assert "ttl=300s" in result
+
+    def test_read_chunk_includes_ttl(self):
+        """Continuation chunk footer must expose TTL when provided."""
+        chunker = ProgressiveChunker(chunk_size=100)
+        text = "x" * 500
+        result = chunker.read_chunk(text, offset=0, key="key1", ttl_seconds=1800.0)
+        assert "ttl=1800s" in result
+
+    def test_ttl_omitted_when_none(self):
+        """Footer must not include ttl field when ttl_seconds is None."""
+        chunker = ProgressiveChunker(chunk_size=100)
+        text = "x" * 500
+        result = chunker.first_chunk(text, "key1")
+        assert "ttl=" not in result
+
+    def test_ttl_omitted_on_last_chunk(self):
+        """Last chunk (has_more=False) should not show TTL — nothing left to retrieve."""
+        chunker = ProgressiveChunker(chunk_size=4000)
+        text = "short"
+        result = chunker.first_chunk(text, "key1", ttl_seconds=300.0)
+        assert "has_more=False" in result
+        assert "ttl=" not in result
+
+    def test_store_adapter_preserves_ttl(self):
+        """ProgressiveStoreAdapter must round-trip ttl_seconds."""
+        store = ProgressiveStoreAdapter(InMemoryPendingStore())
+        resp = ProgressiveResponse(
+            content="hello",
+            total_chars=5,
+            total_lines=1,
+            content_type="text",
+            structure_hint="1 lines",
+            created_at=time.monotonic(),
+            ttl_seconds=600.0,
+        )
+        store.put("key1", resp)
+        got = store.get("key1")
+        assert got is not None
+        assert got.ttl_seconds == 600.0
+
+
+# ---------------------------------------------------------------------------
 # Remaining headings hint
 # ---------------------------------------------------------------------------
 

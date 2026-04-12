@@ -80,6 +80,22 @@ class TestSelectiveCompressor:
         assert len(toc["entries"]) == 3
         assert toc["entries"][0]["key"] == "key1"
 
+    def test_toc_includes_ttl_seconds_remaining(self):
+        c = SelectiveCompressor(pending_ttl_seconds=120.0)
+        data = {"key1": "x" * 200, "key2": "y" * 200}
+        text = json.dumps(data)
+        result = c.compress(text, max_chars=50)
+        toc = json.loads(result)
+        assert toc["ttl_seconds_remaining"] == 120
+
+    def test_toc_ttl_default(self):
+        c = SelectiveCompressor()
+        data = {"key1": "x" * 200, "key2": "y" * 200}
+        text = json.dumps(data)
+        result = c.compress(text, max_chars=50)
+        toc = json.loads(result)
+        assert toc["ttl_seconds_remaining"] == 300  # default pending_ttl_seconds
+
     def test_json_array_produces_toc(self):
         data = [{"item": i, "content": "x" * 100} for i in range(5)]
         text = json.dumps(data)

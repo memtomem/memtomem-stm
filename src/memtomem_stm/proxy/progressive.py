@@ -25,6 +25,7 @@ class ProgressiveResponse:
     content_type: str  # "json" | "markdown" | "text" | "code"
     structure_hint: str  # e.g. "5 headings, 3 code blocks"
     created_at: float
+    ttl_seconds: float = 1800.0
     access_count: int = 0
 
 
@@ -45,6 +46,7 @@ class ProgressiveStoreAdapter:
                 "content_type": resp.content_type,
                 "structure_hint": resp.structure_hint,
                 "access_count": resp.access_count,
+                "ttl_seconds": resp.ttl_seconds,
             },
             ensure_ascii=False,
         )
@@ -68,6 +70,7 @@ class ProgressiveStoreAdapter:
             content_type=meta.get("content_type", "text"),
             structure_hint=meta.get("structure_hint", ""),
             created_at=sel.created_at,
+            ttl_seconds=meta.get("ttl_seconds", 1800.0),
             access_count=meta.get("access_count", 0),
         )
 
@@ -89,7 +92,7 @@ class ProgressiveChunker:
         self._chunk_size = chunk_size
         self._include_hint = include_hint
 
-    def first_chunk(self, content: str, key: str) -> str:
+    def first_chunk(self, content: str, key: str, *, ttl_seconds: float | None = None) -> str:
         """Return the first chunk of *content* with a progressive metadata footer."""
         end = self._find_boundary(content, self._chunk_size)
         chunk = content[:end]
@@ -105,10 +108,19 @@ class ProgressiveChunker:
             has_more=has_more,
             content=content,
             next_offset=end,
+            ttl_seconds=ttl_seconds,
         )
         return chunk + footer
 
-    def read_chunk(self, content: str, offset: int, limit: int | None = None, key: str = "") -> str:
+    def read_chunk(
+        self,
+        content: str,
+        offset: int,
+        limit: int | None = None,
+        key: str = "",
+        *,
+        ttl_seconds: float | None = None,
+    ) -> str:
         """Return a chunk starting at *offset* with a progressive metadata footer."""
         if offset >= len(content):
             return "(no more content)"
@@ -128,6 +140,7 @@ class ProgressiveChunker:
                 has_more=False,
                 content=content,
                 next_offset=len(content),
+                ttl_seconds=ttl_seconds,
             )
             return chunk + footer
 
@@ -143,6 +156,7 @@ class ProgressiveChunker:
             has_more=True,
             content=content,
             next_offset=end,
+            ttl_seconds=ttl_seconds,
         )
         return chunk + footer
 
@@ -157,9 +171,13 @@ class ProgressiveChunker:
         has_more: bool,
         content: str,
         next_offset: int,
+        ttl_seconds: float | None = None,
     ) -> str:
         parts = [f"\n---\n[progressive: chars={start}-{end}/{total}"]
-        parts.append(f" | remaining={remaining} | has_more={has_more}]")
+        parts.append(f" | remaining={remaining} | has_more={has_more}")
+        if ttl_seconds is not None and has_more:
+            parts.append(f" | ttl={int(ttl_seconds)}s")
+        parts.append("]")
 
         if has_more and self._include_hint:
             hint = self._remaining_headings(content, end)

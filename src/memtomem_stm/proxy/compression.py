@@ -661,6 +661,7 @@ class SelectiveCompressor:
             "selection_key": selection_key,
             "format": fmt,
             "total_chars": len(text),
+            "ttl_seconds_remaining": int(self._ttl),
             "entries": entries,
             "hint": f"Call stm_proxy_select_chunks(key='{selection_key}', sections=[...]) to retrieve.",
         }

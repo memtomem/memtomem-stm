@@ -45,6 +45,7 @@ flowchart TD
   "selection_key": "abc123def456",
   "format": "json",
   "total_chars": 50000,
+  "ttl_seconds_remaining": 300,
   "entries": [
     {"key": "README", "type": "heading", "size": 200, "preview": "..."},
     {"key": "src/main.py", "type": "heading", "size": 5000, "preview": "..."}
@@ -52,6 +53,8 @@ flowchart TD
   "hint": "Call stm_proxy_select_chunks(key='abc123def456', sections=[...]) to retrieve."
 }
 ```
+
+The `ttl_seconds_remaining` field tells the agent how many seconds it has to retrieve sections before the stored content expires. Each call to `stm_proxy_select_chunks` resets the TTL.
 
 The proxied tool description automatically includes a convention suffix (`| TOC response: use stm_proxy_select_chunks`) so the agent knows to expect a TOC and which tool to call.
 
@@ -129,7 +132,16 @@ sequenceDiagram
     STM-->>Agent: final chunk (has_more=false)
 ```
 
-The first chunk includes a metadata footer with remaining headings/structure hints so the agent can decide whether to continue reading.
+The first chunk includes a metadata footer with remaining headings/structure hints and a `ttl` field so the agent can decide whether to continue reading and how urgently:
+
+```
+---
+[progressive: chars=0-4000/50000 | remaining=46000 | has_more=True | ttl=1800s]
+[Remaining: "Configuration", "API Reference", ...]
+[-> stm_proxy_read_more(key="abc123", offset=4000)]
+```
+
+Each call to `stm_proxy_read_more` resets the TTL. The `ttl` field is omitted on the last chunk (`has_more=False`).
 
 | Feature | Selective | Progressive |
 |---------|-----------|-------------|
@@ -153,6 +165,29 @@ The first chunk includes a metadata footer with remaining headings/structure hin
 Progressive is **opt-in only** — `auto` strategy never selects it because it changes the agent interaction pattern (requires calling `stm_proxy_read_more`). When configured, the proxied tool description includes a convention suffix (`| Chunked: use stm_proxy_read_more for more`) so the agent knows to expect chunked delivery.
 
 > **Note**: Memory surfacing (Stage 3) is **skipped** for progressive delivery responses. Injecting memories into the first chunk would shift character offsets for subsequent `stm_proxy_read_more` calls.
+
+## Progressive Fallback Ladder
+
+When the compression ratio guard detects that a strategy cut below the dynamic retention floor (`min_result_retention`), it uses a two-tier fallback ladder:
+
+```mermaid
+flowchart TD
+    V{"ratio < floor?"} -->|no| OK["keep compressed result"]
+    V -->|yes| S{"strategy ==<br/>selective?"}
+    S -->|yes| Skip["no fallback<br/>(TOC is intentionally compact)"]
+    S -->|no| Size{"content ><br/>chunk_size?"}
+    Size -->|yes| T1["Tier 1: progressive<br/>(zero-loss, best-effort)"]
+    Size -->|no| T2["Tier 2: truncate<br/>(guaranteed floor)"]
+    T1 -->|success| Done["progressive_fallback<br/>+ skip surfacing"]
+    T1 -->|failure| T2
+    T2 --> Done2["truncate_fallback"]
+```
+
+**Tier 1 — Progressive (zero-loss)**: Stores the full cleaned content and returns the first chunk with `stm_proxy_read_more` instructions and TTL. The agent can retrieve remaining content on demand. Only attempted when content exceeds `chunk_size` (default 4000 chars) — smaller content fits in one chunk and progressive adds no value.
+
+**Tier 2 — Truncate (guaranteed floor)**: Falls back to boundary-aware `TruncateCompressor` at the effective budget. This is lossy but immediate, and always succeeds. Fires when progressive isn't applicable (small content) or fails (store error).
+
+The metrics `compression_strategy` field records the full transition path (e.g. `"hybrid→progressive_fallback"` or `"skeleton→truncate_fallback"`) so the two tiers can be audited independently via SQL.
 
 ## LLM Compression
 

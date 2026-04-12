@@ -226,14 +226,10 @@ class TestProxyManagerRatioGuard:
         assert row["ratio_violation"] == 0
         store.close()
 
-    async def test_violation_triggers_truncate_fallback(self, tmp_path):
+    async def test_violation_triggers_progressive_fallback(self, tmp_path):
         """When the compressor overshoots, the ratio guard falls back to
-        boundary-aware TruncateCompressor at the effective budget.
-
-        The fallback output should contain substantially more content
-        than the original compression, and the strategy should record
-        the ``"{original}→truncate_fallback"`` transition so SQL queries
-        can track fallback frequency."""
+        progressive delivery (zero-loss, Tier 1).  The strategy should
+        record ``"{original}→progressive_fallback"``."""
         mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
         # ~15KB upstream → cleaned length >= 10000 → dynamic = 0.65
         large_text = "content paragraph. " * 800  # ~15200 chars
@@ -241,20 +237,52 @@ class TestProxyManagerRatioGuard:
         # Return something far below the retention floor
         mgr._apply_compression = AsyncMock(return_value="x" * 100)
 
-        await mgr.call_tool("srv", "tool", {})
+        result = await mgr.call_tool("srv", "tool", {})
 
         row = _latest_row(store)
         assert row["cleaned_chars"] > 10000
-        # Fallback should produce substantially more than the 100-char stub.
-        # effective_max_chars = max(500, ~15200 * 0.65) ≈ 9880
-        assert row["compressed_chars"] > 5000
         assert row["ratio_violation"] == 1
-        assert "→truncate_fallback" in row["compression_strategy"]
+        assert "→progressive_fallback" in row["compression_strategy"]
+        # Progressive first chunk includes footer with read_more instruction
+        assert "stm_proxy_read_more" in result
+        assert "has_more=True" in result
         store.close()
 
-    async def test_fallback_preserves_heading_boundaries(self, tmp_path):
-        """Fallback via TruncateCompressor should cut at heading
-        boundaries rather than mid-sentence when the input is markdown."""
+    async def test_progressive_fallback_includes_ttl(self, tmp_path):
+        """Progressive fallback footer must expose TTL so the agent knows
+        how long the stored content remains available."""
+        mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
+        large_text = "content paragraph. " * 800
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
+        mgr._apply_compression = AsyncMock(return_value="x" * 100)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        # Default ProgressiveConfig.ttl_seconds = 1800
+        assert "ttl=1800s" in result
+        store.close()
+
+    async def test_progressive_fallback_failure_falls_to_truncate(self, tmp_path):
+        """When progressive fallback fails (Tier 1), the ratio guard must
+        fall through to TruncateCompressor (Tier 2, guaranteed floor)."""
+        mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
+        large_text = "content paragraph. " * 800
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
+        mgr._apply_compression = AsyncMock(return_value="x" * 100)
+        # Force progressive to fail — truncate must catch it
+        mgr._apply_progressive = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("store full"))
+
+        await mgr.call_tool("srv", "tool", {})
+
+        row = _latest_row(store)
+        assert row["ratio_violation"] == 1
+        assert "→truncate_fallback" in row["compression_strategy"]
+        assert row["compressed_chars"] > 5000  # truncate keeps ~65% budget
+        store.close()
+
+    async def test_truncate_fallback_preserves_heading_boundaries(self, tmp_path):
+        """Tier 2 truncate fallback should cut at heading boundaries
+        rather than mid-sentence when the input is markdown."""
         mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
         sections = []
         for i in range(20):
@@ -262,11 +290,11 @@ class TestProxyManagerRatioGuard:
         markdown_text = "".join(sections)  # ~14K chars, 20 headings
         mgr._connections["srv"].session.call_tool.return_value = _make_result(markdown_text)
         mgr._apply_compression = AsyncMock(return_value="x" * 50)
+        # Force progressive to fail so truncate tier runs
+        mgr._apply_progressive = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
 
         result = await mgr.call_tool("srv", "tool", {})
 
-        # The returned text should contain heading markers — TruncateCompressor
-        # cuts at section boundaries and appends remaining section titles.
         assert "## Section" in result
         row = _latest_row(store)
         assert "→truncate_fallback" in row["compression_strategy"]
