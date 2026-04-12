@@ -948,6 +948,13 @@ class ProxyManager:
         _clean_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stage 2: COMPRESS (or PROGRESSIVE) ──
+        # ``effective_compression`` is the strategy actually used (with AUTO
+        # already resolved). ``ratio_violation`` is set by the post-compression
+        # guard below when the compressor cut more than ``min_result_retention``
+        # allows — it feeds into metrics for auditing R4 after the fact.
+        effective_compression: CompressionStrategy = tc.compression
+        ratio_violation = False
+
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
             if len(cleaned) <= pcfg.chunk_size:
@@ -966,6 +973,7 @@ class ProxyManager:
             # This is the SINGLE place where retention is enforced — compressors trust max_chars.
             effective_max_chars = tc.max_chars
             min_retention = getattr(cfg_snap, "min_result_retention", 0.65)
+            dynamic = 0.0  # effective retention floor applied to this call (0 = unset)
             if min_retention > 0:
                 n = len(cleaned)
                 # Scale: short content (< 1KB) gets ~90% retention, large (10KB+) gets base
@@ -981,10 +989,17 @@ class ProxyManager:
                 if effective_max_chars < min_budget:
                     effective_max_chars = min_budget
 
+            # Resolve AUTO early so downstream metrics know which strategy ran.
+            # ``_apply_compression`` still handles AUTO internally for callers
+            # that pass it directly, but resolving here lets us record the
+            # effective strategy without threading a return tuple.
+            if effective_compression == CompressionStrategy.AUTO:
+                effective_compression = auto_select_strategy(cleaned, max_chars=effective_max_chars)
+
             _t0 = _time.monotonic()
             compressed = await self._apply_compression(
                 cleaned,
-                tc.compression,
+                effective_compression,
                 effective_max_chars,
                 tc.selective,
                 tc.llm,
@@ -994,6 +1009,39 @@ class ProxyManager:
                 context_query=context_query,
             )
             _compress_ms = (_time.monotonic() - _t0) * 1000
+
+            # ── Compression ratio guard (R4 defense) ──
+            # Flag calls where the compressor cut below the dynamic retention
+            # floor. This catches both deliberate ``min_result_retention=0``
+            # bypass configs and compressors that overshoot their char budget.
+            # PROGRESSIVE is excluded above — it is zero-loss by construction.
+            cleaned_len = len(cleaned)
+            if cleaned_len > 0 and dynamic > 0:
+                compressed_ratio = len(compressed) / cleaned_len
+                if compressed_ratio < dynamic:
+                    ratio_violation = True
+                    logger.warning(
+                        "Compression ratio violation for %s/%s: %.3f < %.3f "
+                        "(strategy=%s, cleaned=%d, compressed=%d)",
+                        server,
+                        tool,
+                        compressed_ratio,
+                        dynamic,
+                        effective_compression.value,
+                        cleaned_len,
+                        len(compressed),
+                    )
+                if compressed_ratio < 0.20:
+                    logger.error(
+                        "Heavy compression applied for %s/%s: ratio=%.3f "
+                        "(strategy=%s, cleaned=%d, compressed=%d) — review config",
+                        server,
+                        tool,
+                        compressed_ratio,
+                        effective_compression.value,
+                        cleaned_len,
+                        len(compressed),
+                    )
 
             # Record metrics BEFORE surfacing (surfacing adds content, not compresses)
             compressed_chars_for_metrics = len(compressed)
@@ -1072,6 +1120,8 @@ class ProxyManager:
                 compress_ms=_compress_ms,
                 surface_ms=_surface_ms,
                 surfaced_chars=len(surfaced),
+                compression_strategy=effective_compression.value,
+                ratio_violation=ratio_violation,
             )
         )
 

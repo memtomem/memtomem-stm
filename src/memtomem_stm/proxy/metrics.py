@@ -68,6 +68,19 @@ class CallMetrics:
     is_error: bool = False
     error_category: ErrorCategory | None = None
     error_code: int | None = None
+    # Compression fidelity tracking
+    #
+    # ``compression_strategy`` records the *effective* strategy used for this
+    # call (with AUTO already resolved to a concrete strategy). ``None`` means
+    # the strategy is unknown or the call did not go through compression
+    # (e.g., cached hits that bypass the pipeline).
+    #
+    # ``ratio_violation`` is set True when the compressed length falls below
+    # the dynamic ``min_result_retention`` budget enforced in ProxyManager.
+    # This flags calls where compression cut more than the configured floor
+    # — useful for auditing R4 (min_retention bypass) after the fact.
+    compression_strategy: str | None = None
+    ratio_violation: bool = False
 
 
 class RPSTracker:
