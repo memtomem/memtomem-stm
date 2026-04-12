@@ -3,6 +3,26 @@
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
+## [0.1.5] — 2026-04-12
+
+### Critical
+
+- **Fix `mem_search` response parser for real core format** — the `_parse_results()` regex expected a `--- [score] source ---` format that no real `memtomem-server` ever produced; core's actual compact output (`[rank] score | source > hierarchy`) was collapsed into a single garbage result with wrong score. Rewritten to match core's `_format_compact_result` output. The fake test server now emits the real format so integration tests validate the production parsing path.
+- **Forward `context_window` to MCP call** — `context_window` configured in `SurfacingConfig` was silently swallowed by `**kwargs` and never sent to the core server. Now forwarded as an explicit parameter.
+
+### Fixes
+
+- Normalize `list[str]` namespace to comma-separated string before MCP call (core's `mem_search` accepts `str | None`; `NamespaceFilter.parse()` handles comma-separated values)
+- Widen source-file regex from `.md`-only to any file extension
+- Widen namespace badge regex to support hyphens, dots, and other non-word characters
+- Fix mypy errors in `observability/tracing.py` — `Langfuse(**kwargs)` kwargs typed as `dict[str, Any]` instead of `dict[str, str]`
+
+### Testing
+
+- 975 automated tests (up from 963)
+- New `test_core_format_contract.py` — 12 contract tests with snapshots of core's real formatter output (namespace badge, context window position, non-.md sources)
+- Verified end-to-end against real `memtomem-server` v0.1.7
+
 ## [0.1.4] — 2026-04-12
 
 ### New Features
