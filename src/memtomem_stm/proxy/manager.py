@@ -1010,38 +1010,46 @@ class ProxyManager:
             )
             _compress_ms = (_time.monotonic() - _t0) * 1000
 
-            # ── Compression ratio guard (R4 defense) ──
-            # Flag calls where the compressor cut below the dynamic retention
-            # floor. This catches both deliberate ``min_result_retention=0``
-            # bypass configs and compressors that overshoot their char budget.
+            # ── Compression ratio guard (R4 defense + fallback) ──
+            # When the compressor cuts below the dynamic retention floor,
+            # re-compress via boundary-aware TruncateCompressor at the full
+            # effective budget. This preserves heading/code-fence/SQL
+            # boundaries (M5) without changing the agent protocol — the
+            # response stays a single text block, just with more content.
             # PROGRESSIVE is excluded above — it is zero-loss by construction.
             cleaned_len = len(cleaned)
+            metrics_strategy = effective_compression.value
             if cleaned_len > 0 and dynamic > 0:
                 compressed_ratio = len(compressed) / cleaned_len
                 if compressed_ratio < dynamic:
                     ratio_violation = True
-                    logger.warning(
-                        "Compression ratio violation for %s/%s: %.3f < %.3f "
-                        "(strategy=%s, cleaned=%d, compressed=%d)",
-                        server,
-                        tool,
-                        compressed_ratio,
-                        dynamic,
-                        effective_compression.value,
-                        cleaned_len,
-                        len(compressed),
-                    )
-                if compressed_ratio < 0.20:
-                    logger.error(
-                        "Heavy compression applied for %s/%s: ratio=%.3f "
-                        "(strategy=%s, cleaned=%d, compressed=%d) — review config",
-                        server,
-                        tool,
-                        compressed_ratio,
-                        effective_compression.value,
-                        cleaned_len,
-                        len(compressed),
-                    )
+                    # SELECTIVE returns a compact TOC by design — the agent
+                    # retrieves full content via stm_proxy_select_chunks.
+                    # Replacing the TOC would break the two-phase protocol.
+                    if effective_compression == CompressionStrategy.SELECTIVE:
+                        logger.warning(
+                            "Compression ratio below floor for %s/%s: %.3f < %.3f "
+                            "(strategy=selective — no fallback, TOC is intentionally compact)",
+                            server,
+                            tool,
+                            compressed_ratio,
+                            dynamic,
+                        )
+                    else:
+                        original_strategy = effective_compression.value
+                        compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
+                            cleaned, max_chars=effective_max_chars
+                        )
+                        metrics_strategy = f"{original_strategy}→truncate_fallback"
+                        logger.warning(
+                            "Ratio guard fallback for %s/%s: %s (ratio %.3f→%.3f, budget=%d)",
+                            server,
+                            tool,
+                            metrics_strategy,
+                            compressed_ratio,
+                            len(compressed) / cleaned_len if cleaned_len else 0,
+                            effective_max_chars,
+                        )
 
             # Record metrics BEFORE surfacing (surfacing adds content, not compresses)
             compressed_chars_for_metrics = len(compressed)
@@ -1120,7 +1128,7 @@ class ProxyManager:
                 compress_ms=_compress_ms,
                 surface_ms=_surface_ms,
                 surfaced_chars=len(surfaced),
-                compression_strategy=effective_compression.value,
+                compression_strategy=metrics_strategy,
                 ratio_violation=ratio_violation,
             )
         )
