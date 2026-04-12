@@ -116,7 +116,7 @@ Want to see STM's behavior without wiring it into Claude Code first? The [`noteb
 | [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | Memory surfacing engine, relevance gating, feedback loop, auto-tuning |
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Response cache and auto-indexing |
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
-| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 7 MCP tools |
+| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 10 MCP tools |
 | [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
 
 ## Development

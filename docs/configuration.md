@@ -64,9 +64,10 @@ export MEMTOMEM_STM_LANGFUSE__ENABLED=true
 export MEMTOMEM_STM_LANGFUSE__PUBLIC_KEY=pk-lf-...
 export MEMTOMEM_STM_LANGFUSE__SECRET_KEY=sk-lf-...
 export MEMTOMEM_STM_LANGFUSE__HOST=https://cloud.langfuse.com   # or http://localhost:3000 for self-hosted
+export MEMTOMEM_STM_LANGFUSE__SAMPLING_RATE=1.0                # 0.0–1.0, fraction of calls to trace
 ```
 
-When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse observation carrying `server`, `tool`, and `trace_id` metadata — see [Operations → Langfuse Tracing](operations.md#langfuse-tracing-optional) for the full span shape and correlation details.
+When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse observation with nested sub-spans for each pipeline stage (clean, compress, surface, index). See [Operations → Langfuse Tracing](operations.md#langfuse-tracing-optional) for the full span table and sampling details.
 
 ## Config File: `~/.memtomem/stm_proxy.json`
 
@@ -89,6 +90,7 @@ Full example with all options:
       "transport": "stdio",
       "compression": "auto",
       "max_result_chars": 8000,
+      "retention_floor": null,
       "max_retries": 3,
       "reconnect_delay_seconds": 1.0,
       "max_reconnect_delay_seconds": 30.0,
@@ -117,7 +119,8 @@ Full example with all options:
       },
       "tool_overrides": {
         "read_file": {
-          "compression": "progressive"
+          "compression": "progressive",
+          "retention_floor": 0.5
         },
         "internal_debug": {
           "hidden": true

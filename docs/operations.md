@@ -159,17 +159,26 @@ export MEMTOMEM_STM_LANGFUSE__SECRET_KEY=sk-lf-...
 export MEMTOMEM_STM_LANGFUSE__HOST=https://cloud.langfuse.com   # or http://localhost:3000 for self-hosted
 ```
 
-**What gets traced.** Every proxy tool invocation is wrapped in a single Langfuse observation called **`proxy_call`** for the full pipeline (cache lookup → upstream call → clean → compress → surface → index). The span carries:
+**What gets traced.** Every proxy tool invocation is wrapped in a top-level Langfuse observation called **`proxy_call`** with nested sub-spans for each pipeline stage:
 
-| Metadata key | Value |
-|---|---|
-| `server` | Upstream server name (e.g. `filesystem`, `github`) |
-| `tool` | Upstream tool name as seen by STM |
-| `trace_id` | Same 16-char hex id persisted in `proxy_metrics.db.trace_id` — join on this to correlate a Langfuse span with its SQLite metrics row |
+| Span name | When | Metadata |
+|---|---|---|
+| `proxy_call` | Every proxy invocation | `server`, `tool`, `trace_id` |
+| `proxy_call_clean` | Stage 1 (content cleaning) | `server`, `tool` |
+| `proxy_call_compress` | Stage 2 (compression) | `server`, `tool`, `strategy`, `max_chars` |
+| `proxy_call_surface` | Stage 3 (memory injection) | `server`, `tool` |
+| `proxy_call_index` | Stage 4 (auto-indexing) | `server`, `tool` |
+| `proxy_call_cache_hit` | Cache hit (replaces stages 1-2) | `server`, `tool` |
 
-Span duration is Langfuse-native (auto-recorded from the `with` block), so cache hits, upstream latency, compression cost, and surfacing are all reflected in the wall-clock timing without extra instrumentation. Errors propagate through the span — a failed upstream call shows up as a span with an exception attached.
+The `trace_id` (16-char hex) matches `proxy_metrics.db.trace_id` — join on this to correlate a Langfuse span with its SQLite metrics row. Span durations are auto-recorded from the `with` block. Errors propagate through spans — a failed upstream call shows up with an exception attached.
 
-**What is _not_ traced in this release** — nested sub-spans (cleaning / compression / surfacing), sampling, and the `stm_surfacing_feedback` / `stm_surfacing_stats` tool calls. These are deliberate follow-ups; the MVP focuses on closing the "docs promise something the code doesn't deliver" gap for the top-level proxy pipeline only.
+**Sampling.** For high-throughput deployments, set a sampling rate to reduce Langfuse ingest volume:
+
+```bash
+export MEMTOMEM_STM_LANGFUSE__SAMPLING_RATE=0.1  # trace 10% of calls
+```
+
+Default is `1.0` (trace all). When a call is sampled out, all sub-spans are skipped. Metrics recording (`proxy_metrics.db`) is never affected by sampling — it always runs.
 
 **Why this is the recommended observability UI.** memtomem-stm intentionally does not ship an in-repo web dashboard — the MCP tools (`stm_proxy_stats`, `stm_surfacing_stats`, `stm_proxy_health`), SQLite metrics (`proxy_metrics.db`, `stm_feedback.db`), and Langfuse together cover the observability surface without duplication. For team deployments that want a shared UI, point every instance at the same Langfuse project. When reporting issues, include the `trace_id` from `stm_proxy_stats` output so it can be located in Langfuse immediately.
 

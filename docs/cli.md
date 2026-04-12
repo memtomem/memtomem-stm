@@ -87,7 +87,7 @@ mms status
 mms remove github
 ```
 
-## MCP Tools (7 + proxied)
+## MCP Tools (10 + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -100,6 +100,9 @@ These are exposed by the `memtomem-stm` MCP server and become available to your 
 | `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating`, `memory_id?` | Rate surfaced memories (`helpful` / `not_relevant` / `already_known`) |
 | `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness % |
+| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
+| `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
+| `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner |
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
 

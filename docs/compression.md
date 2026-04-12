@@ -168,7 +168,7 @@ Progressive is **opt-in only** — `auto` strategy never selects it because it c
 
 ## Progressive Fallback Ladder
 
-When the compression ratio guard detects that a strategy cut below the dynamic retention floor (`min_result_retention`), it uses a two-tier fallback ladder:
+When the compression ratio guard detects that a strategy cut below the dynamic retention floor (`min_result_retention`), it uses a three-tier fallback ladder:
 
 ```mermaid
 flowchart TD
@@ -177,17 +177,42 @@ flowchart TD
     S -->|yes| Skip["no fallback<br/>(TOC is intentionally compact)"]
     S -->|no| Size{"content ><br/>chunk_size?"}
     Size -->|yes| T1["Tier 1: progressive<br/>(zero-loss, best-effort)"]
-    Size -->|no| T2["Tier 2: truncate<br/>(guaranteed floor)"]
+    Size -->|no| H{"≥ 3 headings?"}
     T1 -->|success| Done["progressive_fallback<br/>+ skip surfacing"]
-    T1 -->|failure| T2
-    T2 --> Done2["truncate_fallback"]
+    T1 -->|failure| H
+    H -->|yes| T2["Tier 2: hybrid<br/>(structure-preserving)"]
+    H -->|no| T3["Tier 3: truncate<br/>(guaranteed floor)"]
+    T2 -->|"ratio ≥ floor"| Done2["hybrid_fallback"]
+    T2 -->|"still below"| T3
+    T3 --> Done3["truncate_fallback"]
 ```
 
 **Tier 1 — Progressive (zero-loss)**: Stores the full cleaned content and returns the first chunk with `stm_proxy_read_more` instructions and TTL. The agent can retrieve remaining content on demand. Only attempted when content exceeds `chunk_size` (default 4000 chars) — smaller content fits in one chunk and progressive adds no value.
 
-**Tier 2 — Truncate (guaranteed floor)**: Falls back to boundary-aware `TruncateCompressor` at the effective budget. This is lossy but immediate, and always succeeds. Fires when progressive isn't applicable (small content) or fails (store error).
+**Tier 2 — Hybrid (structure-preserving)**: Applies `HybridCompressor` (head + TOC) at the effective budget. Fires when content has ≥ 3 markdown headings but is too small for progressive chunking. Preserves document structure (head section + table of contents) instead of a blunt truncation. If the hybrid output still falls below the retention floor, falls through to Tier 3.
 
-The metrics `compression_strategy` field records the full transition path (e.g. `"hybrid→progressive_fallback"` or `"skeleton→truncate_fallback"`) so the two tiers can be audited independently via SQL.
+**Tier 3 — Truncate (guaranteed floor)**: Falls back to boundary-aware `TruncateCompressor` at the effective budget. This is lossy but immediate, and always succeeds. Fires when progressive and hybrid aren't applicable or fail.
+
+The metrics `compression_strategy` field records the full transition path (e.g. `"hybrid→progressive_fallback"`, `"truncate→hybrid_fallback"`, or `"skeleton→truncate_fallback"`) so the three tiers can be audited independently via SQL.
+
+### Per-tool retention floor
+
+By default, the retention floor scales dynamically with response size (< 1KB → 90%, < 3KB → 75%, < 10KB → 65%, else → `min_result_retention`). You can override this per server or per tool:
+
+```json
+{
+  "upstream_servers": {
+    "docs": {
+      "retention_floor": 0.5,
+      "tool_overrides": {
+        "get_page": { "retention_floor": 0.4 }
+      }
+    }
+  }
+}
+```
+
+The auto-tuner (`stm_tuning_recommendations`) can recommend `retention_floor` adjustments based on observed violation patterns.
 
 ## LLM Compression
 
