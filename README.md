@@ -96,7 +96,7 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 
 ## Tutorial notebooks
 
-Want to see STM's behavior without wiring it into Claude Code first? The [`notebooks/`](notebooks/) directory contains four runnable Jupyter notebooks covering quickstart setup, selective compression, memory surfacing, and a LangChain `create_agent` integration. Clone the repo, run `uv sync`, and `uv run jupyter lab notebooks/` — no external services required for the first three.
+Want to see STM's behavior without wiring it into Claude Code first? The [`notebooks/`](notebooks/) directory contains six runnable Jupyter notebooks: a CLI-MCP prelude (00), quickstart setup (01), selective compression (02), memory surfacing (03), a LangChain agent integration (04), and observability/Langfuse tracing (05). Clone the repo, run `uv sync`, and `uv run jupyter lab notebooks/` — no external services required for notebooks 00–03 and 05.
 
 ## Key Features
 

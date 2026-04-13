@@ -2,7 +2,7 @@
 
 > **한국어 사용자 분들께**: 노트북은 유지보수 편의와 GitHub 인덱싱을 위해 영어로 작성되어 있지만, 코드 셀은 그대로 실행하시면 됩니다. 셀 사이의 설명도 직관적인 영어로 유지했으니 부담 없이 따라와 주세요.
 
-Four scenario-based Jupyter notebooks that let you see memtomem-stm behavior end-to-end without setting up Claude Code or Cursor first. Each notebook spawns STM as a subprocess, talks to it via the MCP Python client, and isolates its state into a temp directory so your real `~/.memtomem/` is untouched.
+Six scenario-based Jupyter notebooks that let you see memtomem-stm behavior end-to-end without setting up Claude Code or Cursor first. Each notebook spawns STM as a subprocess, talks to it via the MCP Python client, and isolates its state into a temp directory so your real `~/.memtomem/` is untouched.
 
 ## Notebooks
 
@@ -15,6 +15,7 @@ Start with **notebook 00** for the mental model — it walks both interfaces end
 | 02 | [`02_compression_and_selective.ipynb`](02_compression_and_selective.ipynb) | Selective compression turns an 18 KB doc into a 1.5 KB TOC, then retrieve specific sections via `stm_proxy_select_chunks` | None |
 | 03 | [`03_memory_surfacing.ipynb`](03_memory_surfacing.ipynb) | Proactive memory surfacing using an in-repo fake LTM server, with feedback via `stm_surfacing_feedback` | None (uses `_fixtures/fake_ltm.py`) |
 | 04 | [`04_langchain_agent_integration.ipynb`](04_langchain_agent_integration.ipynb) | LangChain `create_agent` + `langchain-mcp-adapters`: a real LangGraph agent using STM's proxied tools | `uv sync --extra langchain` and `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` |
+| 05 | [`05_observability_and_langfuse.ipynb`](05_observability_and_langfuse.ipynb) | Three observability layers: MCP tools, SQLite metrics, Langfuse spans | None (core cells); `LANGFUSE_PUBLIC_KEY` for live tracing |
 
 Notebooks 00–03 are fully reproducible, hit no external services, and run in CI on every PR. Notebook 00's optional LangChain cell short-circuits when no key is set so CI still passes. Notebook 04 requires an LLM API key end-to-end and is excluded from CI — run it manually when you want to see the full agent loop.
 
@@ -57,7 +58,7 @@ Every notebook's first code cell calls `isolate_stm_state()` from `_helpers.py`,
 - `MEMTOMEM_STM_PROXY__METRICS__DB_PATH`
 - `MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH`
 
-All four notebooks — including notebook 03's surfacing demo — are fully hermetic. Your real `~/.memtomem/` is untouched.
+All six notebooks — including notebook 03's surfacing demo and 05's observability demo — are fully hermetic. Your real `~/.memtomem/` is untouched.
 
 ## Files
 
@@ -74,7 +75,8 @@ notebooks/
 ├── 01_quickstart_proxy_setup.ipynb
 ├── 02_compression_and_selective.ipynb
 ├── 03_memory_surfacing.ipynb
-└── 04_langchain_agent_integration.ipynb
+├── 04_langchain_agent_integration.ipynb
+└── 05_observability_and_langfuse.ipynb
 ```
 
 The `.ipynb` files are generated from `_build_notebooks.py`. To edit, modify the builder script and re-run `uv run python notebooks/_build_notebooks.py`.
