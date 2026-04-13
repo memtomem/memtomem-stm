@@ -3,20 +3,23 @@
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
-## [Unreleased]
+## [0.1.6] — 2026-04-13
 
 ### Observability
 
 - **Langfuse spans for surfacing tools** — `stm_surfacing_feedback`, `stm_surfacing_stats`, and `surfacing_feedback_boost` (access count increment sub-span) are now wrapped in Langfuse observations
 - **Upstream trace context propagation** — proxy forwards `_trace_id` as a reserved field in upstream MCP call arguments for end-to-end distributed tracing; `McpClientSearchAdapter` also accepts `trace_id` for LTM calls
+- **End-to-end trace_id threading** — `SurfacingEngine.surface()` → `_do_surface()` → `mcp_adapter.search()`/`scratch_list()` now thread `trace_id` from the proxy call through the full surfacing pipeline
 
 ### Internal
 
 - **Strategy-based parser for Phase 2** — `_parse_results` refactored into `CompactResultParser` / `StructuredResultParser` strategy classes with `get_parser()` factory; backward-compatible `_parse_results` static method delegates to compact parser. `SurfacingConfig.result_format` field added (`"compact"` default, `"structured"` reserved for Phase 2)
+- **Extract `tool_metadata` and `memory_ops` from `manager.py`** — independent logic split into `proxy/tool_metadata.py` (62 LOC) and `proxy/memory_ops.py` (180 LOC); `manager.py` reduced from 1,333 → 1,179 LOC
+- **Fix all ruff warnings** — 16 pre-existing lint issues in `tests/` cleaned up (F841, E741, F401)
 
 ### Testing
 
-- 1034 automated tests (up from 975), +1 xfail for Phase 2 structured format
+- 1033 automated tests (up from 975), +1 xfail for Phase 2 structured format
 - New `test_proxy_manager_lifecycle.py` — 8 tests for start/stop/double-start guard
 - New `test_proxy_manager_pipeline.py` — 15 tests for compression, surfacing, indexing, chunks, read_more
 - New `test_server_tools.py` — 22 tests for all 10 MCP tool handlers + lifespan
