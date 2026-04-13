@@ -347,3 +347,85 @@ class TestOutputFormatForwarding:
 
         call_args = mock_session.call_tool.call_args
         assert "output_format" not in call_args[0][1]
+
+
+class TestFormatNegotiation:
+    """Verify _negotiate_format downgrades parser when core lacks structured support."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_structured_when_core_supports_it(self):
+        import json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter, StructuredResultParser
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        mock_session = AsyncMock()
+        version_result = MagicMock()
+        version_content = MagicMock()
+        version_content.type = "text"
+        version_content.text = json.dumps({
+            "version": "0.3.0",
+            "capabilities": {"search_formats": ["compact", "structured"]},
+        })
+        version_result.content = [version_content]
+        mock_session.call_tool = AsyncMock(return_value=version_result)
+        adapter._session = mock_session
+
+        await adapter._negotiate_format()
+
+        assert isinstance(adapter._parser, StructuredResultParser)
+
+    @pytest.mark.asyncio
+    async def test_downgrades_when_core_lacks_structured(self):
+        import json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser, McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        mock_session = AsyncMock()
+        version_result = MagicMock()
+        version_content = MagicMock()
+        version_content.type = "text"
+        version_content.text = json.dumps({
+            "version": "0.2.0",
+            "capabilities": {"search_formats": ["compact"]},
+        })
+        version_result.content = [version_content]
+        mock_session.call_tool = AsyncMock(return_value=version_result)
+        adapter._session = mock_session
+
+        await adapter._negotiate_format()
+
+        assert isinstance(adapter._parser, CompactResultParser)
+
+    @pytest.mark.asyncio
+    async def test_downgrades_when_version_call_fails(self):
+        from unittest.mock import AsyncMock
+
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser, McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=Exception("unknown action"))
+        adapter._session = mock_session
+
+        await adapter._negotiate_format()
+
+        assert isinstance(adapter._parser, CompactResultParser)
+
+    @pytest.mark.asyncio
+    async def test_skips_negotiation_for_compact(self):
+        from unittest.mock import AsyncMock
+
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser, McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        mock_session = AsyncMock()
+        adapter._session = mock_session
+
+        await adapter._negotiate_format()
+
+        assert isinstance(adapter._parser, CompactResultParser)
+        mock_session.call_tool.assert_not_called()

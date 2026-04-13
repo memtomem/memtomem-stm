@@ -125,6 +125,21 @@ async def test_increment_access_via_remote_stdio_mcp_server():
     tracker.store.get_memory_ids_for_surfacing.assert_called_once_with("sid-stdio")
 
 
+@pytest.mark.asyncio
+async def test_format_negotiation_keeps_structured_with_capable_server():
+    """When core advertises structured support, negotiation keeps StructuredResultParser."""
+    from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+    config = _stdio_config()
+    config = SurfacingConfig(**{**config.__dict__, "result_format": "structured"})
+    adapter = McpClientSearchAdapter(config)
+    await adapter.start()
+    try:
+        assert isinstance(adapter._parser, StructuredResultParser)
+    finally:
+        await adapter.stop()
+
+
 # ── McpClientSearchAdapter._parse_scratch_list unit tests ──────────────
 
 

@@ -24,6 +24,7 @@ Run with: `python <path-to-this-file>`
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from mcp.server.fastmcp import FastMCP
@@ -74,6 +75,15 @@ async def mem_do(action: str, params: dict | None = None) -> str:
     if action == "increment_access":
         chunk_ids = list((params or {}).get("chunk_ids") or [])
         return f"Incremented access_count for {len(chunk_ids)} chunk(s)."
+    if action == "version":
+        return json.dumps(
+            {
+                "version": "0.3.0-fake",
+                "capabilities": {
+                    "search_formats": ["compact", "structured"],
+                },
+            }
+        )
     return f"Error: unknown action '{action}'."
 
 

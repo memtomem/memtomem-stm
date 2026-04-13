@@ -168,6 +168,35 @@ class McpClientSearchAdapter:
         self._session = await self._stack.enter_async_context(ClientSession(streams[0], streams[1]))
         await self._session.initialize()
         logger.info("MCP client connected to memtomem server: %s", self._config.ltm_mcp_command)
+        await self._negotiate_format()
+
+    async def _negotiate_format(self) -> None:
+        """Downgrade to compact if core doesn't advertise structured support.
+
+        Called at the end of ``start()``. When ``result_format`` is
+        ``"structured"``, asks the remote server for its capabilities via
+        ``mem_do(action="version")``.  If the response doesn't list
+        ``"structured"`` in ``capabilities.search_formats`` — or if the
+        call fails (older core versions don't implement this action) —
+        the parser is silently downgraded to ``CompactResultParser``.
+        """
+        if not isinstance(self._parser, StructuredResultParser) or self._session is None:
+            return
+
+        try:
+            result = await self._session.call_tool("mem_do", {"action": "version"})
+            text_parts = [c.text for c in result.content if c.type == "text"]
+            if text_parts:
+                data = json.loads(text_parts[0])
+                formats = data.get("capabilities", {}).get("search_formats", [])
+                if "structured" in formats:
+                    logger.info("Core supports structured format — keeping StructuredResultParser")
+                    return
+        except Exception as exc:
+            logger.debug("Version negotiation failed (older core?): %s", exc)
+
+        logger.info("Core does not advertise structured format — falling back to compact")
+        self._parser = CompactResultParser()
 
     async def stop(self) -> None:
         """Disconnect from the memtomem MCP server."""
