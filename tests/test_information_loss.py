@@ -440,9 +440,7 @@ class TestHybridInfoLoss:
         comp = HybridCompressor(head_chars=500)
         result = comp.compress(CODE_FILE, max_chars=1500)
 
-        # First 500 chars should appear verbatim
-        head = CODE_FILE[:400]  # slightly less to account for break point
-        # Check key elements from the head
+        # Check key elements from the head (first ~400 chars)
         assert "Authentication Module" in result
         assert "Overview" in result
 
@@ -744,7 +742,6 @@ class TestCompressionCurve:
     def test_hybrid_retains_more_than_truncate_at_tight_budget(self):
         """At tight budgets, hybrid's head preservation beats pure truncation."""
         keywords_in_head = ["Authentication Module", "JWT", "access_token_ttl"]
-        keywords_in_tail = ["Security Notes", "Rate limit", "HTTPS"]
 
         budget = int(len(CODE_FILE) * 0.4)
 

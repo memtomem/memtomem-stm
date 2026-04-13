@@ -486,7 +486,6 @@ def _strategy_table_latex(
     matrix: dict[str, dict[str, StrategyResult]],
     strategies: list[str],
 ) -> str:
-    n_cols = len(strategies) + 1
     col_spec = "l" + "c" * len(strategies)
     lines: list[str] = []
     lines.append(r"\begin{tabular}{" + col_spec + "}")

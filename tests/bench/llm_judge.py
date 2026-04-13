@@ -405,14 +405,14 @@ def compute_correlation(
     pairs = list(zip(rule_scores, llm_scores))
 
     # Mean absolute difference
-    mean_abs_diff = sum(abs(r - l) for r, l in pairs) / n
+    mean_abs_diff = sum(abs(rs - ls) for rs, ls in pairs) / n
 
     # Pearson r
     mean_r = sum(rule_scores) / n
     mean_l = sum(llm_scores) / n
-    cov = sum((r - mean_r) * (l - mean_l) for r, l in pairs) / n
-    std_r = (sum((r - mean_r) ** 2 for r in rule_scores) / n) ** 0.5
-    std_l = (sum((l - mean_l) ** 2 for l in llm_scores) / n) ** 0.5
+    cov = sum((rs - mean_r) * (ls - mean_l) for rs, ls in pairs) / n
+    std_r = (sum((rs - mean_r) ** 2 for rs in rule_scores) / n) ** 0.5
+    std_l = (sum((ls - mean_l) ** 2 for ls in llm_scores) / n) ** 0.5
     pearson_r = cov / (std_r * std_l) if std_r > 0 and std_l > 0 else 0.0
 
     # Spearman rho (rank correlation)

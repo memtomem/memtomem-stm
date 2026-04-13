@@ -98,7 +98,6 @@ class TestFormatterInjection:
         results = [FakeResult(FakeChunk(content="x" * 500), 0.5)]
         output = fmt.inject("response", results, "query")
         # The memory block should be capped
-        memory_part = output.split("---")[-1] if "---" in output else output
         assert "truncated" in output
 
     def test_custom_section_header(self):

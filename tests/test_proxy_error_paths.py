@@ -193,7 +193,6 @@ class TestTransportFailureRetry:
         session.call_tool.side_effect = OSError("persistent")
 
         reconnect_calls: list[str] = []
-        original_reconnect = AsyncMock()
 
         async def track_reconnect(name):
             reconnect_calls.append(name)

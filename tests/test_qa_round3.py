@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import itertools
-import re
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
 
 import pytest
 
@@ -369,8 +365,6 @@ class TestUnicodeInjectionDetection:
         """Cyrillic substitution for 'ignore all previous instructions'."""
         from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 
-        import logging
-
         # Use Cyrillic а (U+0430) instead of Latin a, е (U+0435) for e, etc.
         # NFKC normalization should convert these to ASCII equivalents
         # and the pattern should match
@@ -440,14 +434,8 @@ class TestCompressionDocsFlowchart:
 class TestFeedbackTrackerPosition:
     def test_feedback_not_created_when_adapter_fails(self):
         """feedback_tracker should only be created when mcp_adapter succeeds."""
-        import ast
-
         server_py = Path(__file__).parent.parent / "src" / "memtomem_stm" / "server.py"
         source = server_py.read_text()
-
-        # Parse AST and verify feedback_tracker creation is inside
-        # the mcp_adapter-success guard
-        tree = ast.parse(source)
 
         # Simple text check: "if mcp_adapter is not None:" should appear
         # before the surfacing FeedbackTracker constructor in the code.

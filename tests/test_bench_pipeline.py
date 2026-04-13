@@ -1513,7 +1513,7 @@ class TestDistractorRobustness:
             )
             value = await h.measure_surfacing_value(task)
             # Content answers should not be lost due to distractors
-            content_qa = judge.qa_by_source(task, value.task_id)  # not used directly
+            judge.qa_by_source(task, value.task_id)  # side-effect: validates source
             assert value.quality_delta >= 0, (
                 f"{task.task_id}: distractors hurt quality by {value.quality_delta}"
             )

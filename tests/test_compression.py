@@ -45,7 +45,7 @@ class TestTruncateCompressor:
 
     def test_truncates_at_sentence_boundary(self):
         text = "First sentence. Second sentence. Third sentence."
-        result = c = TruncateCompressor().compress(text, max_chars=20)
+        result = TruncateCompressor().compress(text, max_chars=20)
         assert "First sentence." in result
         assert "truncated" in result
 

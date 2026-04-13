@@ -93,7 +93,6 @@ def format_matrix(
     best_strategy = ""
     best_score = -1.0
     for name, r in sorted(results.items(), key=lambda x: -x[1].quality_score):
-        marker = ""
         if r.quality_score > best_score:
             best_score = r.quality_score
             best_strategy = name
