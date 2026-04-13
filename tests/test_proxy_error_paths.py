@@ -453,7 +453,9 @@ class TestContextQueryStripping:
         call_args = session.call_tool.call_args
         forwarded_args = call_args[0][1]  # second positional arg
         assert "_context_query" not in forwarded_args
-        assert forwarded_args == {"q": "test"}
+        assert forwarded_args["q"] == "test"
+        # _trace_id is expected (trace context propagation)
+        assert "_trace_id" in forwarded_args
 
 
 # ── Cache interaction with errors ────────────────────────────────────────

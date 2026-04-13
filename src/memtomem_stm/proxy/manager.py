@@ -883,6 +883,10 @@ class ProxyManager:
         cfg = conn.config
         delay = cfg.reconnect_delay_seconds
 
+        # Propagate trace context to upstream server for end-to-end correlation.
+        if trace_id is not None:
+            upstream_args["_trace_id"] = trace_id
+
         for attempt in range(cfg.max_retries + 1):
             try:
                 result = await conn.session.call_tool(tool, upstream_args)

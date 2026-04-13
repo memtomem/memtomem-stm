@@ -17,6 +17,7 @@ from memtomem_stm.proxy.config import ProxyConfig
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 
 logger = logging.getLogger(__name__)
@@ -432,12 +433,16 @@ async def stm_surfacing_feedback(
         memory_id: Optional specific memory chunk ID to rate.
     """
     app = _get_ctx(ctx)
-    # Route through SurfacingEngine to trigger access boost for helpful feedback
-    if app.surfacing_engine is not None:
-        return await app.surfacing_engine.handle_feedback(surfacing_id, rating, memory_id)
-    if app.feedback_tracker is None:
-        return "Feedback tracking is not enabled."
-    return app.feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+    with traced(
+        "stm_surfacing_feedback",
+        metadata={"surfacing_id": surfacing_id, "rating": rating, "memory_id": memory_id},
+    ):
+        # Route through SurfacingEngine to trigger access boost for helpful feedback
+        if app.surfacing_engine is not None:
+            return await app.surfacing_engine.handle_feedback(surfacing_id, rating, memory_id)
+        if app.feedback_tracker is None:
+            return "Feedback tracking is not enabled."
+        return app.feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
 
 
 # ---------------------------------------------------------------------------
@@ -459,29 +464,30 @@ async def stm_surfacing_stats(
     if app.feedback_tracker is None:
         return "Feedback tracking is not enabled."
 
-    stats = app.feedback_tracker.get_stats(tool)
+    with traced("stm_surfacing_stats", metadata={"tool": tool}):
+        stats = app.feedback_tracker.get_stats(tool)
 
-    lines = [
-        "Surfacing Stats",
-        "===============",
-        f"Total surfacings: {stats['total_surfacings']}",
-        f"Total feedback:   {stats['total_feedback']}",
-    ]
+        lines = [
+            "Surfacing Stats",
+            "===============",
+            f"Total surfacings: {stats['total_surfacings']}",
+            f"Total feedback:   {stats['total_feedback']}",
+        ]
 
-    if stats["by_rating"]:
-        lines.append("\nBy rating:")
-        for rating, count in stats["by_rating"].items():
-            lines.append(f"  {rating}: {count}")
+        if stats["by_rating"]:
+            lines.append("\nBy rating:")
+            for rating, count in stats["by_rating"].items():
+                lines.append(f"  {rating}: {count}")
 
-    if stats["total_feedback"] > 0:
-        helpful = stats["by_rating"].get("helpful", 0)
-        pct = round(helpful / stats["total_feedback"] * 100, 1)
-        lines.append(f"\nHelpfulness: {pct}%")
+        if stats["total_feedback"] > 0:
+            helpful = stats["by_rating"].get("helpful", 0)
+            pct = round(helpful / stats["total_feedback"] * 100, 1)
+            lines.append(f"\nHelpfulness: {pct}%")
 
-    if tool:
-        lines.append(f"\n(filtered by tool: {tool})")
+        if tool:
+            lines.append(f"\n(filtered by tool: {tool})")
 
-    return "\n".join(lines)
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

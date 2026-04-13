@@ -169,8 +169,13 @@ export MEMTOMEM_STM_LANGFUSE__HOST=https://cloud.langfuse.com   # or http://loca
 | `proxy_call_surface` | Stage 3 (memory injection) | `server`, `tool` |
 | `proxy_call_index` | Stage 4 (auto-indexing) | `server`, `tool` |
 | `proxy_call_cache_hit` | Cache hit (replaces stages 1-2) | `server`, `tool` |
+| `stm_surfacing_feedback` | Surfacing feedback tool call | `surfacing_id`, `rating`, `memory_id` |
+| `stm_surfacing_stats` | Surfacing stats query | `tool` |
+| `surfacing_feedback_boost` | Access count boost (sub-span of feedback) | `surfacing_id`, `chunk_count` |
 
 The `trace_id` (16-char hex) matches `proxy_metrics.db.trace_id` — join on this to correlate a Langfuse span with its SQLite metrics row. Span durations are auto-recorded from the `with` block. Errors propagate through spans — a failed upstream call shows up with an exception attached.
+
+**Trace context propagation.** When forwarding calls to upstream MCP servers, STM includes a `_trace_id` reserved field in the tool arguments. Upstream servers can extract this to correlate their own spans with the originating STM trace. The same `_trace_id` field is available for `McpClientSearchAdapter.search()`, `increment_access()`, and `scratch_list()` calls to the LTM server.
 
 **Sampling.** For high-throughput deployments, set a sampling rate to reduce Langfuse ingest volume:
 

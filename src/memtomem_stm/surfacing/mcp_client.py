@@ -87,6 +87,8 @@ class McpClientSearchAdapter:
         top_k: int | None = None,
         namespace: str | list[str] | None = None,
         context_window: int | None = None,
+        *,
+        trace_id: str | None = None,
         **kwargs: Any,
     ) -> tuple[list[RemoteSearchResult], object]:
         """Call mem_search on the remote server and parse results."""
@@ -102,6 +104,8 @@ class McpClientSearchAdapter:
             args["namespace"] = ",".join(namespace) if isinstance(namespace, list) else namespace
         if context_window is not None and context_window > 0:
             args["context_window"] = context_window
+        if trace_id is not None:
+            args["_trace_id"] = trace_id
 
         try:
             result = await self._session.call_tool("mem_search", args)
@@ -125,7 +129,7 @@ class McpClientSearchAdapter:
         text = "\n".join(text_parts)
         return self._parse_results(text), None
 
-    async def increment_access(self, chunk_ids: list[str]) -> None:
+    async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:
         """Boost the access_count of the given chunks via mem_do(increment_access).
 
         Used by ``SurfacingEngine.handle_feedback`` when an agent rates a
@@ -136,25 +140,26 @@ class McpClientSearchAdapter:
         if self._session is None or not chunk_ids:
             return
 
+        call_args: dict[str, Any] = {
+            "action": "increment_access",
+            "params": {"chunk_ids": chunk_ids},
+        }
+        if trace_id is not None:
+            call_args["_trace_id"] = trace_id
+
         try:
-            await self._session.call_tool(
-                "mem_do",
-                {"action": "increment_access", "params": {"chunk_ids": chunk_ids}},
-            )
+            await self._session.call_tool("mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
             logger.warning("MCP transport error in increment_access, reconnecting: %s", exc)
             try:
                 await self._reconnect()
-                await self._session.call_tool(  # type: ignore[union-attr]
-                    "mem_do",
-                    {"action": "increment_access", "params": {"chunk_ids": chunk_ids}},
-                )
+                await self._session.call_tool("mem_do", call_args)  # type: ignore[union-attr]
             except Exception as retry_exc:
                 logger.debug("MCP mem_do(increment_access) failed after reconnect: %s", retry_exc)
         except Exception as exc:
             logger.debug("MCP mem_do(increment_access) failed: %s", exc)
 
-    async def scratch_list(self) -> list[dict]:
+    async def scratch_list(self, *, trace_id: str | None = None) -> list[dict]:
         """Fetch working memory entries via mem_do(action="scratch_get").
 
         The remote core's ``mem_scratch_get`` returns a human-readable
@@ -170,18 +175,19 @@ class McpClientSearchAdapter:
         if self._session is None:
             return []
 
+        call_args: dict[str, Any] = {"action": "scratch_get", "params": {}}
+        if trace_id is not None:
+            call_args["_trace_id"] = trace_id
+
         try:
-            result = await self._session.call_tool(
-                "mem_do",
-                {"action": "scratch_get", "params": {}},
-            )
+            result = await self._session.call_tool("mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
             logger.warning("MCP transport error in scratch_list, reconnecting: %s", exc)
             try:
                 await self._reconnect()
                 result = await self._session.call_tool(  # type: ignore[union-attr]
                     "mem_do",
-                    {"action": "scratch_get", "params": {}},
+                    call_args,
                 )
             except Exception:
                 return []

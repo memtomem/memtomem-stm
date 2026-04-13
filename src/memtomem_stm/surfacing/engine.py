@@ -8,6 +8,7 @@ import logging
 import uuid
 from typing import Any
 
+from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
@@ -158,7 +159,14 @@ class SurfacingEngine:
                         surfacing_id
                     )
                 if target_ids:
-                    await self._mcp_adapter.increment_access(target_ids)
+                    with traced(
+                        "surfacing_feedback_boost",
+                        metadata={
+                            "surfacing_id": surfacing_id,
+                            "chunk_count": len(target_ids),
+                        },
+                    ):
+                        await self._mcp_adapter.increment_access(target_ids)
                     self._boosted_event_ids.add(surfacing_id)
             except Exception:
                 logger.debug(

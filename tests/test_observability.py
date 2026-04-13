@@ -340,3 +340,164 @@ class TestLangfuseTracing:
         call = mock_client.start_as_current_observation.call_args
         assert call.kwargs["name"] == "proxy_call"
         assert call.kwargs["metadata"]["server"] == "srv"
+
+
+# ── Surfacing tool spans ─────────────────────────────────────────────────
+
+
+class TestSurfacingToolSpans:
+    """Verify that stm_surfacing_feedback/stats create Langfuse observations."""
+
+    async def test_surfacing_feedback_creates_span(self, monkeypatch):
+        mock_client = MagicMock()
+        monkeypatch.setattr("memtomem_stm.observability.tracing._langfuse_client", mock_client)
+
+        mock_engine = AsyncMock()
+        mock_engine.handle_feedback.return_value = "ok"
+
+        from memtomem_stm.server import STMContext, stm_surfacing_feedback
+        from memtomem_stm.config import STMConfig
+
+        cfg = ProxyConfig(config_path="/tmp/p.json", upstream_servers={})
+        app = STMContext(
+            config=STMConfig(),
+            proxy_manager=ProxyManager(cfg, TokenTracker()),
+            tracker=TokenTracker(),
+            surfacing_engine=mock_engine,
+            feedback_tracker=None,
+            compression_feedback_tracker=None,
+        )
+        ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+
+        await stm_surfacing_feedback(surfacing_id="s1", rating="helpful", memory_id="m1", ctx=ctx)
+
+        calls = mock_client.start_as_current_observation.call_args_list
+        span_names = [c.kwargs["name"] for c in calls]
+        assert "stm_surfacing_feedback" in span_names
+
+        fb_call = next(c for c in calls if c.kwargs["name"] == "stm_surfacing_feedback")
+        meta = fb_call.kwargs["metadata"]
+        assert meta["surfacing_id"] == "s1"
+        assert meta["rating"] == "helpful"
+        assert meta["memory_id"] == "m1"
+
+    async def test_surfacing_stats_creates_span(self, monkeypatch):
+        mock_client = MagicMock()
+        monkeypatch.setattr("memtomem_stm.observability.tracing._langfuse_client", mock_client)
+
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "total_surfacings": 5,
+            "total_feedback": 2,
+            "by_rating": {"helpful": 2},
+        }
+
+        from memtomem_stm.server import STMContext, stm_surfacing_stats
+        from memtomem_stm.config import STMConfig
+
+        cfg = ProxyConfig(config_path="/tmp/p.json", upstream_servers={})
+        app = STMContext(
+            config=STMConfig(),
+            proxy_manager=ProxyManager(cfg, TokenTracker()),
+            tracker=TokenTracker(),
+            surfacing_engine=None,
+            feedback_tracker=mock_tracker,
+            compression_feedback_tracker=None,
+        )
+        ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+
+        await stm_surfacing_stats(tool="t", ctx=ctx)
+
+        calls = mock_client.start_as_current_observation.call_args_list
+        span_names = [c.kwargs["name"] for c in calls]
+        assert "stm_surfacing_stats" in span_names
+
+        stats_call = next(c for c in calls if c.kwargs["name"] == "stm_surfacing_stats")
+        assert stats_call.kwargs["metadata"]["tool"] == "t"
+
+
+# ── Trace ID propagation to upstream ──────────────────────────────────────
+
+
+class TestTraceIdUpstreamPropagation:
+    """Verify _trace_id is included in upstream MCP call arguments."""
+
+    async def test_trace_id_propagated_to_upstream_args(self):
+        """call_tool passes _trace_id to upstream session.call_tool args."""
+        mgr = _make_manager()
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")], isError=False
+        )
+
+        await mgr.call_tool("srv", "tool", {"q": "test"})
+
+        call_args = session.call_tool.call_args
+        upstream_args = call_args.args[1]  # second positional arg is the dict
+        assert "_trace_id" in upstream_args
+        assert len(upstream_args["_trace_id"]) == 16
+
+    async def test_mcp_client_search_includes_trace_id(self):
+        """McpClientSearchAdapter.search() passes _trace_id when provided."""
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.config import SurfacingConfig
+
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+        mock_session.call_tool.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="No results")]
+        )
+        adapter._session = mock_session
+
+        await adapter.search("test query", trace_id="abc123")
+
+        call_args = mock_session.call_tool.call_args
+        assert call_args.args[1]["_trace_id"] == "abc123"
+
+    async def test_mcp_client_search_no_trace_id(self):
+        """Without trace_id, _trace_id is not included in args."""
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.config import SurfacingConfig
+
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+        mock_session.call_tool.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="No results")]
+        )
+        adapter._session = mock_session
+
+        await adapter.search("test query")
+
+        call_args = mock_session.call_tool.call_args
+        assert "_trace_id" not in call_args.args[1]
+
+    async def test_mcp_client_increment_access_includes_trace_id(self):
+        """increment_access passes _trace_id when provided."""
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.config import SurfacingConfig
+
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+        adapter._session = mock_session
+
+        await adapter.increment_access(["chunk1"], trace_id="xyz789")
+
+        call_args = mock_session.call_tool.call_args
+        assert call_args.args[1]["_trace_id"] == "xyz789"
+
+    async def test_mcp_client_scratch_list_includes_trace_id(self):
+        """scratch_list passes _trace_id when provided."""
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.config import SurfacingConfig
+
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+        mock_session.call_tool.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="")]
+        )
+        adapter._session = mock_session
+
+        await adapter.scratch_list(trace_id="trace456")
+
+        call_args = mock_session.call_tool.call_args
+        assert call_args.args[1]["_trace_id"] == "trace456"
