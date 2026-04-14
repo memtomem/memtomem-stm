@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +272,12 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 
+_EMBEDDING_PROVIDER_DEFAULTS: dict[str, str] = {
+    "ollama": "http://localhost:11434",
+    "openai": "https://api.openai.com",
+}
+
+
 class RelevanceScorerConfig(BaseModel):
     """Configuration for query-aware relevance scoring."""
 
@@ -281,10 +287,20 @@ class RelevanceScorerConfig(BaseModel):
     """Embedding provider: "ollama" or "openai". Only used when scorer="embedding"."""
     embedding_model: str = "nomic-embed-text"
     """Embedding model name. Only used when scorer="embedding"."""
-    embedding_base_url: str = "http://localhost:11434"
-    """Embedding API base URL. Only used when scorer="embedding"."""
+    embedding_base_url: str | None = None
+    """Embedding API base URL. Defaults to the provider's standard endpoint
+    (Ollama → http://localhost:11434, OpenAI → https://api.openai.com).
+    Only used when scorer="embedding"."""
     embedding_timeout: float = 10.0
     """Embedding API timeout in seconds."""
+
+    @model_validator(mode="after")
+    def _apply_provider_default_url(self) -> "RelevanceScorerConfig":
+        if self.embedding_base_url is None:
+            self.embedding_base_url = _EMBEDDING_PROVIDER_DEFAULTS.get(
+                self.embedding_provider, "http://localhost:11434"
+            )
+        return self
 
 
 class ProxyConfig(BaseModel):
