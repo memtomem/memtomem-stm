@@ -18,6 +18,7 @@ from memtomem_stm.proxy.config import (
     LLMProvider,
 )
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact]:
                         ExtractedFact(
                             content=str(item["content"]).strip(),
                             category=str(item.get("category", "technical")),
-                            confidence=float(item.get("confidence", 0.5)),
+                            confidence=safe_float(item.get("confidence", 0.5), 0.5),
                             tags=[str(t) for t in item.get("tags", [])],
                         )
                     )

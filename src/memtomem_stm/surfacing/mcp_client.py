@@ -16,6 +16,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ class StructuredResultParser(ResultParser):
                 )
             result = RemoteSearchResult(
                 content=content[:500],
-                score=float(item.get("score", 0.0)),
+                score=safe_float(item.get("score", 0.0), 0.0),
                 source=item.get("source", "unknown"),
                 namespace=item.get("namespace", "default"),
             )
