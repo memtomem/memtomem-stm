@@ -193,7 +193,7 @@ class ProxyManager:
         streams = await self._stack.enter_async_context(transport_ctx)
         read, write = streams[0], streams[1]
         session = await self._stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
+        await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
 
         result = await session.list_tools()
         valid_tools = []
@@ -225,7 +225,7 @@ class ProxyManager:
         streams = await conn_stack.enter_async_context(transport_ctx)
         read, write = streams[0], streams[1]
         session = await conn_stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
+        await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
         result = await session.list_tools()
 
         conn.session = session

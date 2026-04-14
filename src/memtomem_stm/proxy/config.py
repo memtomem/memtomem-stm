@@ -198,6 +198,7 @@ class UpstreamServerConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     reconnect_delay_seconds: float = Field(default=1.0, ge=0.0)
     max_reconnect_delay_seconds: float = Field(default=30.0, ge=0.0)
+    connect_timeout_seconds: float = Field(default=30.0, gt=0.0)
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
 
