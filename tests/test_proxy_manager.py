@@ -11,6 +11,7 @@ from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
     ProxyConfig,
+    RelevanceScorerConfig,
     SelectiveConfig,
     ToolOverrideConfig,
     UpstreamServerConfig,
@@ -215,3 +216,79 @@ class TestToolConfigFrozen:
         )
         with pytest.raises(AttributeError):
             tc.compression = CompressionStrategy.TRUNCATE
+
+
+# ── RelevanceScorer hot-reload (regression for #62) ─────────────────────
+
+
+class TestRelevanceScorerHotReload:
+    def _make_manager(self, scorer_cfg: RelevanceScorerConfig, tmp_path) -> ProxyManager:
+        cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={},
+            relevance_scorer=scorer_cfg,
+        )
+        return ProxyManager(cfg, TokenTracker())
+
+    def test_cached_when_config_unchanged(self, tmp_path):
+        """Repeated access with no config change returns the same scorer instance."""
+        mgr = self._make_manager(RelevanceScorerConfig(scorer="bm25"), tmp_path)
+        first = mgr._relevance_scorer
+        second = mgr._relevance_scorer
+        assert first is second
+
+    def test_recreated_when_scorer_type_changes(self, tmp_path):
+        """Hot-reloading the scorer type must rebuild the instance."""
+        mgr = self._make_manager(RelevanceScorerConfig(scorer="bm25"), tmp_path)
+        before = mgr._relevance_scorer
+
+        new_cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={},
+            relevance_scorer=RelevanceScorerConfig(
+                scorer="embedding",
+                embedding_provider="ollama",
+                embedding_model="nomic-embed-text",
+            ),
+        )
+        mgr._config_loader.seed(new_cfg)
+
+        after = mgr._relevance_scorer
+        assert after is not before
+
+    def test_recreated_when_embedding_model_changes(self, tmp_path):
+        """Changing the embedding model on an embedding scorer must rebuild."""
+        mgr = self._make_manager(
+            RelevanceScorerConfig(scorer="embedding", embedding_model="nomic-embed-text"),
+            tmp_path,
+        )
+        before = mgr._relevance_scorer
+
+        new_cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={},
+            relevance_scorer=RelevanceScorerConfig(
+                scorer="embedding",
+                embedding_model="mxbai-embed-large",
+            ),
+        )
+        mgr._config_loader.seed(new_cfg)
+
+        after = mgr._relevance_scorer
+        assert after is not before
+
+    def test_not_recreated_when_unrelated_field_changes(self, tmp_path):
+        """Changing unrelated proxy config (e.g. upstream_servers) must not rebuild the scorer."""
+        scorer_cfg = RelevanceScorerConfig(scorer="bm25")
+        mgr = self._make_manager(scorer_cfg, tmp_path)
+        before = mgr._relevance_scorer
+
+        new_cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test")},
+            relevance_scorer=scorer_cfg,
+        )
+        mgr._config_loader.seed(new_cfg)
+
+        after = mgr._relevance_scorer
+        assert after is before
