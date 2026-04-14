@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from dataclasses import dataclass
@@ -427,3 +428,21 @@ class TestMcpClientSearchAdapter:
         results, stats = await adapter.search("query")
         assert results == []
         assert stats is None
+
+    @pytest.mark.asyncio
+    async def test_search_timeout_triggers_reconnect(self) -> None:
+        """asyncio.TimeoutError is treated as a transport error, triggering reconnect."""
+        from memtomem_stm.surfacing.config import SurfacingConfig
+
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        mock_session = AsyncMock()
+        mock_session.call_tool.side_effect = asyncio.TimeoutError()
+        adapter._session = mock_session
+
+        adapter._reconnect = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
+
+        results, stats = await adapter.search("query")
+        assert results == []
+        # Reconnect was attempted (TimeoutError treated as transport error)
+        adapter._reconnect.assert_awaited_once()

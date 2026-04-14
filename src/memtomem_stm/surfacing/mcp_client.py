@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -205,7 +206,7 @@ class McpClientSearchAdapter:
             self._stack = None
             self._session = None
 
-    _TRANSPORT_ERRORS = (OSError, ConnectionError, EOFError, BrokenPipeError)
+    _TRANSPORT_ERRORS = (OSError, ConnectionError, EOFError, BrokenPipeError, asyncio.TimeoutError)
 
     async def _reconnect(self) -> None:
         """Tear down and re-establish the MCP connection."""

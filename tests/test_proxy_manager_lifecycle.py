@@ -160,3 +160,57 @@ class TestStop:
 
         mock_stack.aclose.assert_awaited_once()
         assert len(mgr._connections) == 0
+
+
+# ── connect timeout ─────────────────────────────────────────────────────
+
+
+class TestConnectTimeout:
+    async def test_connect_server_times_out_on_slow_initialize(self):
+        """_connect_server raises TimeoutError when session.initialize() exceeds timeout."""
+        cfg = UpstreamServerConfig(prefix="slow", connect_timeout_seconds=0.05)
+        mgr = _make_manager(servers={"slow": cfg})
+
+        # Initialize _stack without actually connecting
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        async def _slow_init():
+            await asyncio.sleep(10)
+
+        mock_session.initialize = _slow_init
+
+        mock_transport = AsyncMock()
+        mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        mock_transport.__aexit__ = AsyncMock(return_value=False)
+
+        import pytest as _pt
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            with _pt.raises(asyncio.TimeoutError):
+                await mgr._connect_server("slow", cfg, set())
+
+    async def test_start_logs_timeout_and_continues(self, caplog):
+        """start() catches TimeoutError from _connect_server and continues."""
+        mgr = _make_manager(
+            servers={
+                "ok": UpstreamServerConfig(prefix="ok"),
+                "slow": UpstreamServerConfig(prefix="slow"),
+            }
+        )
+
+        async def _conditional_connect(name, cfg, seen):
+            if name == "slow":
+                raise asyncio.TimeoutError()
+
+        with patch.object(mgr, "_connect_server", side_effect=_conditional_connect):
+            await mgr.start()
+
+        assert "Failed to connect to upstream server 'slow'" in caplog.text
