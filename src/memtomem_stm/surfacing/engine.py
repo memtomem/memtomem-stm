@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -75,6 +76,9 @@ class SurfacingEngine:
         # ratings for it.
         self._boosted_event_ids: set[str] = set()
         self._background_tasks: set[asyncio.Task] = set()
+        # Opportunistic cleanup: run cleanup_expired at most once per hour
+        self._cleanup_interval = 3600.0
+        self._last_cleanup: float = time.monotonic()
 
     async def surface(
         self,
@@ -95,6 +99,8 @@ class SurfacingEngine:
         """
         if not self._config.enabled:
             return response_text
+
+        self._maybe_cleanup_expired()
 
         if len(response_text) < self._config.min_response_chars:
             return response_text
@@ -342,3 +348,23 @@ class SurfacingEngine:
         exc = task.exception()
         if exc is not None:
             logger.warning("Webhook fire-and-forget task failed: %s", exc)
+
+    def _maybe_cleanup_expired(self) -> None:
+        """Run cleanup_expired() at most once per cleanup interval.
+
+        Called opportunistically from surface() — no separate timer thread
+        needed. The cleanup itself is synchronous (SQLite DELETE) and fast
+        enough to run inline.
+        """
+        if self._feedback_tracker is None or self._config.dedup_ttl_seconds <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        try:
+            deleted = self._feedback_tracker.store.cleanup_expired(self._config.dedup_ttl_seconds)
+            if deleted:
+                logger.info("Cleaned up %d expired seen_memories entries", deleted)
+        except Exception:
+            logger.warning("Failed to clean up expired seen_memories", exc_info=True)
