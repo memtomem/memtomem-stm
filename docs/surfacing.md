@@ -90,7 +90,7 @@ The injection mode is configurable: `prepend` (default), `append`, or `section`.
 | `cache_ttl_seconds` | `60.0` | Internal surfacing result cache TTL |
 | `circuit_max_failures` | `3` | Consecutive failures before circuit breaker opens |
 | `circuit_reset_seconds` | `60.0` | Seconds before half-open probe after circuit opens |
-| `auto_tune_enabled` | `true` | Enable automatic `min_score` adjustment from feedback |
+| `auto_tune_enabled` | `true` | Auto-adjust `min_score` from feedback: >60% `not_relevant` raises it (stricter), <20% lowers it (more inclusive) |
 | `auto_tune_min_samples` | `20` | Minimum feedback entries before adjusting per-tool score |
 | `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
 | `feedback_enabled` | `true` | Enable the feedback recording and `stm_surfacing_feedback` tool |
