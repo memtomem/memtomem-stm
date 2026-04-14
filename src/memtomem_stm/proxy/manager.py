@@ -122,6 +122,9 @@ class ProxyManager:
         self._extractor_lock = asyncio.Lock()
         self._progressive_store: ProgressiveStoreAdapter | None = None
         self._progressive_lock = asyncio.Lock()
+        self._llm_compressor: LLMCompressor | None = None
+        self._llm_compressor_cfg: LLMCompressorConfig | None = None
+        self._llm_compressor_lock = asyncio.Lock()
         self._relevance_scorer = self._create_scorer(config)
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -241,6 +244,9 @@ class ProxyManager:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
         # Close httpx clients
+        if self._llm_compressor is not None:
+            await self._llm_compressor.close()
+            self._llm_compressor = None
         if self._extractor is not None:
             await self._extractor.close()
         for conn in self._connections.values():
@@ -469,9 +475,14 @@ class ProxyManager:
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
-                comp = LLMCompressor(llm_cfg)
-                result = await comp.compress(text, max_chars=max_chars)
-                return result, comp.last_fallback
+                async with self._llm_compressor_lock:
+                    if self._llm_compressor is None or self._llm_compressor_cfg != llm_cfg:
+                        if self._llm_compressor is not None:
+                            await self._llm_compressor.close()
+                        self._llm_compressor = LLMCompressor(llm_cfg)
+                        self._llm_compressor_cfg = llm_cfg
+                result = await self._llm_compressor.compress(text, max_chars=max_chars)
+                return result, self._llm_compressor.last_fallback
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",
                 server,
