@@ -6,7 +6,11 @@ import json
 import time
 
 
-from memtomem_stm.proxy.config import ProxyConfig, ProxyConfigLoader
+from memtomem_stm.proxy.config import (
+    ProxyConfig,
+    ProxyConfigLoader,
+    RelevanceScorerConfig,
+)
 from memtomem_stm.proxy.metrics import CallMetrics, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.privacy import contains_sensitive_content
@@ -166,6 +170,49 @@ class TestPrivacyDetection:
 
     def test_clean_content_not_flagged(self):
         assert not contains_sensitive_content("This is a normal markdown document about APIs.")
+
+
+# ── Provider-aware embedding_base_url default (regression for #54) ──────
+
+
+class TestEmbeddingBaseUrlDefault:
+    def test_ollama_default_url(self):
+        """Unset embedding_base_url with ollama provider resolves to Ollama's endpoint."""
+        cfg = RelevanceScorerConfig(scorer="embedding", embedding_provider="ollama")
+        assert cfg.embedding_base_url == "http://localhost:11434"
+
+    def test_openai_default_url(self):
+        """Unset embedding_base_url with openai provider resolves to OpenAI's endpoint,
+        not Ollama's localhost:11434 (the original bug)."""
+        cfg = RelevanceScorerConfig(scorer="embedding", embedding_provider="openai")
+        assert cfg.embedding_base_url == "https://api.openai.com"
+
+    def test_explicit_url_preserved_for_openai(self):
+        """Explicit base_url must override the provider default."""
+        cfg = RelevanceScorerConfig(
+            scorer="embedding",
+            embedding_provider="openai",
+            embedding_base_url="http://custom-proxy:8080",
+        )
+        assert cfg.embedding_base_url == "http://custom-proxy:8080"
+
+    def test_explicit_url_preserved_for_ollama(self):
+        cfg = RelevanceScorerConfig(
+            scorer="embedding",
+            embedding_provider="ollama",
+            embedding_base_url="http://remote-ollama:11434",
+        )
+        assert cfg.embedding_base_url == "http://remote-ollama:11434"
+
+    def test_unknown_provider_falls_back_to_ollama_default(self):
+        """Unknown provider keeps the historical fallback, not None."""
+        cfg = RelevanceScorerConfig(scorer="embedding", embedding_provider="custom-xyz")
+        assert cfg.embedding_base_url == "http://localhost:11434"
+
+    def test_defaults_preserved_on_bm25_scorer(self):
+        """Provider default still applies even when scorer=bm25 (embedding fields unused)."""
+        cfg = RelevanceScorerConfig(scorer="bm25", embedding_provider="openai")
+        assert cfg.embedding_base_url == "https://api.openai.com"
 
     def test_empty_string_not_flagged(self):
         assert not contains_sensitive_content("")
