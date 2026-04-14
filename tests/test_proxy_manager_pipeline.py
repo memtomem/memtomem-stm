@@ -10,6 +10,8 @@ from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ExtractionConfig,
     HybridConfig,
+    LLMCompressorConfig,
+    LLMProvider,
     ProxyConfig,
     SelectiveConfig,
     UpstreamServerConfig,
@@ -166,6 +168,106 @@ class TestApplyCompression:
             context_query="find important data",
         )
         assert len(result) <= len(text)
+
+
+# ── LLMCompressor lifecycle (regression for #61) ────────────────────────
+
+
+def _make_llm_instance_mock() -> MagicMock:
+    """Return a MagicMock that stands in for an LLMCompressor instance."""
+    inst = MagicMock()
+    inst.compress = AsyncMock(return_value="compressed")
+    inst.close = AsyncMock()
+    inst.last_fallback = None
+    return inst
+
+
+class TestLLMCompressorLifecycle:
+    async def test_singleton_reused_across_calls(self, tmp_path):
+        """Repeated LLM_SUMMARY calls with the same config must reuse one instance."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k")
+        instance = _make_llm_instance_mock()
+
+        with patch(
+            "memtomem_stm.proxy.manager.LLMCompressor", return_value=instance
+        ) as mock_cls:
+            for _ in range(3):
+                await mgr._apply_compression(
+                    "x" * 500,
+                    CompressionStrategy.LLM_SUMMARY,
+                    max_chars=50,
+                    sel_cfg=None,
+                    llm_cfg=cfg,
+                    hybrid_cfg=None,
+                    server="srv",
+                    tool="t",
+                )
+
+        mock_cls.assert_called_once_with(cfg)
+        assert instance.compress.await_count == 3
+        instance.close.assert_not_awaited()  # still live
+        assert mgr._llm_compressor is instance
+
+    async def test_recreated_and_old_closed_on_config_change(self, tmp_path):
+        """Changing llm_cfg must close the previous compressor and create a new one."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        cfg1 = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k1")
+        cfg2 = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k2")
+
+        inst1 = _make_llm_instance_mock()
+        inst2 = _make_llm_instance_mock()
+
+        with patch(
+            "memtomem_stm.proxy.manager.LLMCompressor", side_effect=[inst1, inst2]
+        ) as mock_cls:
+            await mgr._apply_compression(
+                "x" * 500,
+                CompressionStrategy.LLM_SUMMARY,
+                max_chars=50,
+                sel_cfg=None,
+                llm_cfg=cfg1,
+                hybrid_cfg=None,
+                server="srv",
+                tool="t",
+            )
+            await mgr._apply_compression(
+                "x" * 500,
+                CompressionStrategy.LLM_SUMMARY,
+                max_chars=50,
+                sel_cfg=None,
+                llm_cfg=cfg2,
+                hybrid_cfg=None,
+                server="srv",
+                tool="t",
+            )
+
+        assert mock_cls.call_count == 2
+        inst1.close.assert_awaited_once()
+        inst2.close.assert_not_awaited()
+        assert mgr._llm_compressor is inst2
+
+    async def test_stop_closes_llm_compressor(self, tmp_path):
+        """ProxyManager.stop() must close any cached LLM compressor."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k")
+        instance = _make_llm_instance_mock()
+
+        with patch("memtomem_stm.proxy.manager.LLMCompressor", return_value=instance):
+            await mgr._apply_compression(
+                "x" * 500,
+                CompressionStrategy.LLM_SUMMARY,
+                max_chars=50,
+                sel_cfg=None,
+                llm_cfg=cfg,
+                hybrid_cfg=None,
+                server="srv",
+                tool="t",
+            )
+
+        await mgr.stop()
+        instance.close.assert_awaited_once()
+        assert mgr._llm_compressor is None
 
 
 # ── _apply_surfacing ─────────────────────────────────────────────────────
