@@ -84,6 +84,32 @@ class TestHeuristicExtraction:
         assert result is None
 
 
+class TestEdgeCases:
+    """Edge cases for extract_query — inputs realistic from LLM tool calls."""
+
+    def test_all_underscore_prefixed_keys_falls_back(self):
+        """When every key starts with _, heuristic yields nothing → tool name."""
+        result = _extract(
+            "search_docs",
+            {"_context_query": "", "_internal": "data", "_trace": "abc123"},
+            min_query_tokens=1,
+        )
+        assert result == "search docs"
+
+    def test_only_short_values_falls_back(self):
+        """Values with len <= 2 are skipped; only tool name remains."""
+        result = _extract("read_file", {"q": "ab", "x": "no"}, min_query_tokens=1)
+        assert result == "read file"
+
+    def test_non_string_context_query_falls_through(self):
+        """_context_query that is not a str should be ignored."""
+        result = _extract(
+            "search_tool",
+            {"_context_query": 42, "topic": "authentication patterns in the codebase"},
+        )
+        assert "authentication patterns" in result
+
+
 class TestIsIdentifier:
     def test_uuid(self):
         assert ContextExtractor._is_identifier("550e8400-e29b-41d4-a716-446655440000")
