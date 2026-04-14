@@ -74,9 +74,7 @@ class ProgressiveStoreAdapter:
         try:
             meta = json.loads(sel.chunks.get("__meta__", "{}"))
         except json.JSONDecodeError:
-            logger.warning(
-                "Corrupted __meta__ JSON for progressive key=%s; using defaults", key
-            )
+            logger.warning("Corrupted __meta__ JSON for progressive key=%s; using defaults", key)
             meta = {}
         return ProgressiveResponse(
             content=content,
