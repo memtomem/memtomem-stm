@@ -125,7 +125,8 @@ class ProxyManager:
         self._llm_compressor: LLMCompressor | None = None
         self._llm_compressor_cfg: LLMCompressorConfig | None = None
         self._llm_compressor_lock = asyncio.Lock()
-        self._relevance_scorer = self._create_scorer(config)
+        self._relevance_scorer_instance = self._create_scorer(config)
+        self._relevance_scorer_cfg = config.relevance_scorer
         self._background_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
@@ -263,6 +264,15 @@ class ProxyManager:
     @property
     def _config(self) -> ProxyConfig:
         return self._config_loader.get()
+
+    @property
+    def _relevance_scorer(self) -> "RelevanceScorer":
+        """Return the cached scorer, recreating if config changed via hot-reload."""
+        current_cfg = self._config.relevance_scorer
+        if current_cfg != self._relevance_scorer_cfg:
+            self._relevance_scorer_instance = self._create_scorer(self._config)
+            self._relevance_scorer_cfg = current_cfg
+        return self._relevance_scorer_instance
 
     # Delegates to proxy.tool_metadata module (backward-compatible)
     _truncate_description = staticmethod(truncate_description)
