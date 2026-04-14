@@ -185,8 +185,11 @@ class EmbeddingScorer:
         )
         resp.raise_for_status()
         data = resp.json()["data"]
-        # Sort by index to ensure order matches input
-        data.sort(key=lambda x: x["index"])
+        # Sort by "index" when the provider populates it (official OpenAI).
+        # OpenAI-compatible servers — Ollama's compat layer, LiteLLM, LM Studio —
+        # often omit the field, in which case we trust the input order.
+        if data and all("index" in d for d in data):
+            data.sort(key=lambda x: x["index"])
         return [d["embedding"] for d in data]
 
 

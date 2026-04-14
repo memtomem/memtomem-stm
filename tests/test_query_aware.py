@@ -164,6 +164,85 @@ class TestRelevanceScorerProtocol:
         assert third_len >= first_len
 
 
+# ── EmbeddingScorer OpenAI response parsing (#68) ──────────────────────
+
+
+class TestEmbeddingOpenAIResponseParsing:
+    """Provider compatibility for ``EmbeddingScorer._embed_openai``.
+
+    Official OpenAI populates ``index`` on every embedding object. Many
+    OpenAI-compatible servers (Ollama's compat layer, LiteLLM, LM Studio)
+    omit it. Sorting by a missing ``index`` used to raise ``KeyError`` and
+    fail the entire request.
+    """
+
+    def _make_scorer(self):
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        return EmbeddingScorer(
+            provider="openai",
+            model="text-embedding-3-small",
+            base_url="https://api.openai.com",
+        )
+
+    def _mock_response(self, payload: dict):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=payload)
+        return resp
+
+    def test_official_openai_response_sorts_by_index(self):
+        """Out-of-order items are sorted back by 'index'."""
+        scorer = self._make_scorer()
+        payload = {
+            "data": [
+                {"index": 2, "embedding": [0.2, 0.2]},
+                {"index": 0, "embedding": [0.0, 0.0]},
+                {"index": 1, "embedding": [0.1, 0.1]},
+            ]
+        }
+        with patch("httpx.post", return_value=self._mock_response(payload)):
+            result = scorer._embed_openai(None, ["a", "b", "c"])
+        assert result == [[0.0, 0.0], [0.1, 0.1], [0.2, 0.2]]
+
+    def test_ollama_compat_response_without_index_preserves_order(self):
+        """Provider omits 'index' entirely — input order is trusted, no KeyError."""
+        scorer = self._make_scorer()
+        payload = {
+            "data": [
+                {"embedding": [1.0, 1.0]},
+                {"embedding": [2.0, 2.0]},
+                {"embedding": [3.0, 3.0]},
+            ]
+        }
+        with patch("httpx.post", return_value=self._mock_response(payload)):
+            result = scorer._embed_openai(None, ["a", "b", "c"])
+        assert result == [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+
+    def test_partial_index_preserves_input_order(self):
+        """Mixed response (some items missing 'index') falls back to input order
+        rather than raising KeyError during sort."""
+        scorer = self._make_scorer()
+        payload = {
+            "data": [
+                {"index": 0, "embedding": [0.0, 0.0]},
+                {"embedding": [1.0, 1.0]},  # missing "index"
+                {"index": 2, "embedding": [2.0, 2.0]},
+            ]
+        }
+        with patch("httpx.post", return_value=self._mock_response(payload)):
+            result = scorer._embed_openai(None, ["a", "b", "c"])
+        assert result == [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+
+    def test_empty_data_returns_empty_list(self):
+        scorer = self._make_scorer()
+        with patch("httpx.post", return_value=self._mock_response({"data": []})):
+            result = scorer._embed_openai(None, [])
+        assert result == []
+
+
 # ── TruncateCompressor with context_query ─────────────────────────────
 
 
