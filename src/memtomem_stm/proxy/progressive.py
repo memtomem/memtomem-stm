@@ -215,7 +215,8 @@ class ProgressiveChunker:
             return len(text)
 
         span = target - floor_offset
-        floor = max(floor_offset, target - int(span * 0.2))
+        # max(1, ...) keeps span<=4 from collapsing int(span*0.2) to 0.
+        floor = max(floor_offset, target - max(1, int(span * 0.2)))
 
         # Paragraph boundary
         for i in range(target, floor - 1, -1):

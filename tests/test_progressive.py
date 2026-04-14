@@ -59,6 +59,45 @@ class TestProgressiveChunkerBoundary:
         # Should still produce a result without error
         assert "has_more=True" in result
 
+    def test_find_boundary_small_span_detects_paragraph_at_target_minus_one(self):
+        """Regression for #69: span<=4 collapsed floor to target, skipping \\n\\n
+        at target-1. The search now has at least 1 step of backward room."""
+        # target=3, floor_offset=0, span=3. \n\n starts at index 2.
+        text = "ab\n\ncd"
+        assert ProgressiveChunker._find_boundary(text, 3, floor_offset=0) == 2
+
+    def test_find_boundary_small_span_does_not_regress(self):
+        """span<=4 should still find line/word boundaries and fall back cleanly."""
+        # No natural boundary within the span — hard cut at target.
+        assert ProgressiveChunker._find_boundary("abcdef", 4, floor_offset=0) == 4
+        # span=0 (target == floor_offset) is a no-op and must not raise.
+        assert ProgressiveChunker._find_boundary("abc", 0, floor_offset=0) == 0
+
+    def test_small_chunk_size_sequential_integrity(self):
+        """Regression for #69: chunk_size=10 progressive reads must reproduce
+        the full content. Previously the small-span boundary no-op could cause
+        overshoots that broke offset arithmetic."""
+        text = "First.\n\nSecond.\n\nThird.\n\nFourth.\n\nFifth."
+        chunker = ProgressiveChunker(chunk_size=10)
+
+        parts: list[str] = []
+        result = chunker.first_chunk(text, "key1")
+        content = result.split("\n---\n")[0]
+        parts.append(content)
+        offset = len(content)
+
+        for _ in range(50):  # safety bound
+            result = chunker.read_chunk(text, offset)
+            if "no more content" in result:
+                break
+            content = result.split("\n---\n")[0]
+            parts.append(content)
+            offset += len(content)
+            if "has_more=False" in result:
+                break
+
+        assert "".join(parts) == text
+
 
 # ---------------------------------------------------------------------------
 # ProgressiveChunker — first_chunk metadata
