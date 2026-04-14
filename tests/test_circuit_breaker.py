@@ -140,7 +140,6 @@ class TestCircuitBreakerHalfOpen:
         # The important thing is the circuit reacts correctly to the result.
 
 
-        
 class TestCircuitBreakerProperties:
     def test_time_until_reset_when_closed(self):
         cb = CircuitBreaker()
