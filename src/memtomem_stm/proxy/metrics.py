@@ -5,15 +5,63 @@ from __future__ import annotations
 import logging
 import math
 import time as _time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.metrics_store import MetricsStore
 
 logger = logging.getLogger(__name__)
+
+# LRU cap for per-(server|tool) aggregate counters. Bounds worst-case memory on
+# long-lived daemons or multi-tenant gateways where upstream names churn.
+MAX_TRACKED_KEYS = 10_000
+
+
+class _BoundedCounterDict:
+    """LRU-bounded counter map with defaultdict-style lazy insertion.
+
+    Bounds memory for long-lived trackers. When the size exceeds *max_size*,
+    the least-recently-touched key is evicted. Both ``__getitem__`` and
+    ``__setitem__`` count as a touch.
+    """
+
+    def __init__(self, factory: Callable[[], Any], max_size: int = MAX_TRACKED_KEYS) -> None:
+        self._data: OrderedDict[str, Any] = OrderedDict()
+        self._factory = factory
+        self._max_size = max_size
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        value = self._factory()
+        self._data[key] = value
+        if len(self._data) > self._max_size:
+            self._data.popitem(last=False)
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        if len(self._data) > self._max_size:
+            self._data.popitem(last=False)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def items(self):
+        return self._data.items()
 
 
 class ErrorCategory(StrEnum):
@@ -114,7 +162,12 @@ class RPSTracker:
 class TokenTracker:
     """Aggregate proxy call metrics (in-memory + optional persistent store)."""
 
-    def __init__(self, metrics_store: MetricsStore | None = None) -> None:
+    def __init__(
+        self,
+        metrics_store: MetricsStore | None = None,
+        *,
+        max_tracked_keys: int = MAX_TRACKED_KEYS,
+    ) -> None:
         self._total_calls = 0
         self._total_original = 0
         self._total_compressed = 0
@@ -128,17 +181,20 @@ class TokenTracker:
         self._cache_misses = 0
         self._reconnects = 0
         self._metrics_store = metrics_store
-        self._by_server: dict[str, dict[str, int]] = defaultdict(
-            lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0}
+        self._by_server = _BoundedCounterDict(
+            lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0},
+            max_size=max_tracked_keys,
         )
-        self._by_tool: dict[str, dict[str, int]] = defaultdict(
-            lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0}
+        self._by_tool = _BoundedCounterDict(
+            lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0},
+            max_size=max_tracked_keys,
         )
         self._rps_tracker = RPSTracker()
         # Error tracking
         self._total_errors = 0
+        # _errors_by_category is bounded by the ErrorCategory enum — safe as defaultdict.
         self._errors_by_category: dict[str, int] = defaultdict(int)
-        self._errors_by_server: dict[str, int] = defaultdict(int)
+        self._errors_by_server = _BoundedCounterDict(int, max_size=max_tracked_keys)
         # Progressive delivery tracking
         self._progressive_first_chunks = 0
         self._progressive_continuations = 0
