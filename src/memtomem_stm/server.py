@@ -187,6 +187,11 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             await proxy_manager.stop()
         except Exception:
             logger.warning("Failed to stop proxy manager", exc_info=True)
+        if surfacing_engine is not None:
+            try:
+                await surfacing_engine.stop()
+            except Exception:
+                logger.warning("Failed to stop surfacing engine", exc_info=True)
         for resource, name in [
             (proxy_cache, "proxy_cache"),
             (metrics_store, "metrics_store"),

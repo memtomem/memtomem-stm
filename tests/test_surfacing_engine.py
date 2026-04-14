@@ -542,3 +542,39 @@ class TestMaybeCleanupExpired:
         # Should not crash — cleanup error is swallowed
         assert "mem" in output
         tracker.store.cleanup_expired.assert_called_once()
+
+
+class TestSurfacingEngineStop:
+    """Verify stop() drains background webhook tasks cleanly."""
+
+    async def test_stop_cancels_pending_background_tasks(self):
+        """Pending tasks are cancelled and drained."""
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([]),
+        )
+
+        async def never_completes():
+            await asyncio.sleep(100)
+
+        t1 = asyncio.create_task(never_completes())
+        t2 = asyncio.create_task(never_completes())
+        engine._background_tasks.add(t1)
+        engine._background_tasks.add(t2)
+
+        await engine.stop()
+
+        assert t1.cancelled()
+        assert t2.cancelled()
+        assert len(engine._background_tasks) == 0
+
+    async def test_stop_is_idempotent_with_no_tasks(self):
+        """stop() with no pending tasks is a no-op and does not raise."""
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([]),
+        )
+
+        await engine.stop()
+        await engine.stop()  # second call should also be safe
+        assert len(engine._background_tasks) == 0

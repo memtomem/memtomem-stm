@@ -351,6 +351,14 @@ class SurfacingEngine:
         if exc is not None:
             logger.warning("Webhook fire-and-forget task failed: %s", exc)
 
+    async def stop(self) -> None:
+        """Cancel and drain pending background tasks (webhooks)."""
+        for task in self._background_tasks:
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+
     def _maybe_cleanup_expired(self) -> None:
         """Run cleanup_expired() at most once per cleanup interval.
 
