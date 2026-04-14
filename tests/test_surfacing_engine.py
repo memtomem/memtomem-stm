@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 
@@ -436,3 +437,108 @@ class TestFeedbackBoost:
 
         assert "not enabled" in result
         adapter.increment_access.assert_not_called()
+
+
+class TestMaybeCleanupExpired:
+    """Integration: _maybe_cleanup_expired() scheduling from surface()."""
+
+    def _make_tracker(self):
+        tracker = MagicMock()
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.mark_surfaced = MagicMock()
+        tracker.store.cleanup_expired = MagicMock(return_value=0)
+        tracker.store.record_surfacing_event = MagicMock()
+        return tracker
+
+    async def test_cleanup_called_once_per_interval(self):
+        """Two surface() calls within the interval → cleanup runs only once."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        # Set last_cleanup to the past so first call triggers cleanup
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert tracker.store.cleanup_expired.call_count == 1
+
+        # Second call within interval — should NOT trigger cleanup again
+        engine._cache.clear()
+        await engine.surface(
+            "s", "read_file",
+            {"path": "/other", "_context_query": "different query for testing"},
+            LONG_RESPONSE,
+        )
+        assert tracker.store.cleanup_expired.call_count == 1
+
+    async def test_cleanup_fires_again_after_interval(self):
+        """Advance the clock past the interval → cleanup runs again."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert tracker.store.cleanup_expired.call_count == 1
+
+        # Simulate clock advancing past the 1-hour interval
+        engine._last_cleanup = time.monotonic() - 7200
+        engine._cache.clear()
+        await engine.surface(
+            "s", "read_file",
+            {"path": "/z", "_context_query": "another query for clock test"},
+            LONG_RESPONSE,
+        )
+        assert tracker.store.cleanup_expired.call_count == 2
+
+    async def test_cleanup_skipped_when_ttl_zero(self):
+        """dedup_ttl_seconds=0 disables cleanup entirely."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store.cleanup_expired.assert_not_called()
+
+    async def test_cleanup_skipped_when_no_tracker(self):
+        """No feedback_tracker → cleanup never fires."""
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=None,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # No tracker → no cleanup call possible
+
+    async def test_cleanup_exception_does_not_break_surface(self):
+        """cleanup_expired() raising should be caught, surface() continues."""
+        tracker = self._make_tracker()
+        tracker.store.cleanup_expired = MagicMock(side_effect=RuntimeError("DB locked"))
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        output = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # Should not crash — cleanup error is swallowed
+        assert "mem" in output
+        tracker.store.cleanup_expired.assert_called_once()
