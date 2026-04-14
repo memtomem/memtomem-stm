@@ -138,3 +138,53 @@ class TestCircuitBreakerHalfOpen:
         # This is acceptable because the consumer should call
         # record_success/failure before the next is_open check.
         # The important thing is the circuit reacts correctly to the result.
+
+
+class TestCircuitBreakerProperties:
+    def test_time_until_reset_when_closed(self):
+        cb = CircuitBreaker()
+        assert cb.time_until_reset is None
+
+    def test_time_until_reset_when_open(self):
+        cb = CircuitBreaker(max_failures=1, reset_timeout=60.0)
+        cb.record_failure()
+        remaining = cb.time_until_reset
+        assert remaining is not None
+        assert 0 < remaining <= 60.0
+
+    def test_time_until_reset_when_half_open(self):
+        cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
+        cb.record_failure()
+
+        with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
+            mock_time.monotonic.return_value = cb._opened_at + 11.0
+            assert not cb.is_open  # triggers half-open
+            # assertion inside the patch block — fix for timing concern
+            assert cb.time_until_reset is None
+
+    def test_time_until_reset_at_boundary(self):
+        cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
+        cb.record_failure()
+
+        with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
+            mock_time.monotonic.return_value = cb._opened_at + 10.0
+            result = cb.time_until_reset
+            assert result == 0.0
+
+    def test_backward_compat_failure_alias(self):
+        cb = CircuitBreaker(max_failures=2)
+        cb.failure()
+        assert cb.failure_count == 1
+
+    def test_backward_compat_success_alias(self):
+        cb = CircuitBreaker(max_failures=2)
+        cb.failure()
+        cb.failure()
+        assert cb.is_open
+        cb.success()
+        assert cb.failure_count == 0
+        assert cb._state == "closed"
+
+    def test_backward_compat_aliases_match_originals(self):
+        assert CircuitBreaker.success == CircuitBreaker.record_success
+        assert CircuitBreaker.failure == CircuitBreaker.record_failure
