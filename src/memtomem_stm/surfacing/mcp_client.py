@@ -85,6 +85,12 @@ class CompactResultParser(ResultParser):
 
             content = rest.strip() if rest else ""
             if content:
+                if len(content) > 500:
+                    logger.debug(
+                        "Truncating search result content from %d to 500 chars (source=%s)",
+                        len(content),
+                        source,
+                    )
                 results.append(
                     RemoteSearchResult(
                         content=content[:500],
@@ -120,6 +126,12 @@ class StructuredResultParser(ResultParser):
             content = item.get("content", "")
             if not content:
                 continue
+            if len(content) > 500:
+                logger.debug(
+                    "Truncating search result content from %d to 500 chars (source=%s)",
+                    len(content),
+                    item.get("source", "unknown"),
+                )
             result = RemoteSearchResult(
                 content=content[:500],
                 score=float(item.get("score", 0.0)),
