@@ -50,6 +50,8 @@ export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER=bm25           # "bm25" or "
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_PROVIDER=ollama
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_MODEL=nomic-embed-text
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_BASE_URL=http://localhost:11434
+# When embedding_provider is "openai", set OPENAI_API_KEY:
+# export OPENAI_API_KEY=sk-...
 
 # Extraction (Stage 4b — auto fact extraction)
 export MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED=false
@@ -194,7 +196,6 @@ Full example with all options:
     "scorer": "bm25",
     "embedding_provider": "ollama",
     "embedding_model": "nomic-embed-text",
-    "embedding_base_url": "http://localhost:11434",
     "embedding_timeout": 10.0
   },
   "extraction": {

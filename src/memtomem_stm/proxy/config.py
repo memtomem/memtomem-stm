@@ -279,7 +279,11 @@ _EMBEDDING_PROVIDER_DEFAULTS: dict[str, str] = {
 
 
 class RelevanceScorerConfig(BaseModel):
-    """Configuration for query-aware relevance scoring."""
+    """Configuration for query-aware relevance scoring.
+
+    When ``embedding_provider`` is ``"openai"``, the ``OPENAI_API_KEY``
+    environment variable must be set for authentication.
+    """
 
     scorer: str = "bm25"
     """Scorer type: "bm25" (default, zero-latency) or "embedding" (semantic)."""
