@@ -75,9 +75,9 @@ Sensitive content is auto-detected and never sent to external LLM compression:
 | Pattern | Example |
 |---------|---------|
 | API keys / tokens | `api_key=...`, `sk-xxxx`, `ghp_xxxx`, `xoxb-...` |
-| Passwords | `password=...`, `passwd: ...` |
+| Passwords | `password=...`, `passwd: ...`, `pwd=...` |
 | Email addresses | `user@example.com` |
-| Private keys | `BEGIN RSA PRIVATE KEY` |
+| Private keys | `BEGIN RSA PRIVATE KEY`, `BEGIN EC PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY` |
 
 Detection scans the first 10K characters. When sensitive content is found, LLM compression falls back to local truncation.
 

@@ -33,7 +33,17 @@ export MEMTOMEM_STM_PROXY__MAX_DESCRIPTION_CHARS=200
 export MEMTOMEM_STM_PROXY__STRIP_SCHEMA_DESCRIPTIONS=false
 export MEMTOMEM_STM_PROXY__CACHE__ENABLED=true
 export MEMTOMEM_STM_PROXY__CACHE__DEFAULT_TTL_SECONDS=3600
+export MEMTOMEM_STM_PROXY__CACHE__DB_PATH=~/.memtomem/proxy_cache.db
+export MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES=10000
 export MEMTOMEM_STM_PROXY__METRICS__ENABLED=true
+export MEMTOMEM_STM_PROXY__METRICS__DB_PATH=~/.memtomem/proxy_metrics.db
+export MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY=10000
+
+# Auto-indexing (Stage 4 — save large responses to LTM)
+export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=false
+export MEMTOMEM_STM_PROXY__AUTO_INDEX__MIN_CHARS=2000
+export MEMTOMEM_STM_PROXY__AUTO_INDEX__MEMORY_DIR=~/.memtomem/proxy_index
+export MEMTOMEM_STM_PROXY__AUTO_INDEX__NAMESPACE=proxy-{server}
 
 # Relevance scorer (query-aware compression)
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER=bm25           # "bm25" or "embedding"
@@ -46,10 +56,15 @@ export MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED=false
 export MEMTOMEM_STM_PROXY__EXTRACTION__STRATEGY=llm                # "llm", "heuristic", "hybrid", "none"
 export MEMTOMEM_STM_PROXY__EXTRACTION__MAX_FACTS=10
 export MEMTOMEM_STM_PROXY__EXTRACTION__MIN_RESPONSE_CHARS=500
+export MEMTOMEM_STM_PROXY__EXTRACTION__DEDUP_THRESHOLD=0.92
+export MEMTOMEM_STM_PROXY__EXTRACTION__MEMORY_DIR=~/.memtomem/extracted_facts
+export MEMTOMEM_STM_PROXY__EXTRACTION__NAMESPACE=facts-{server}
 export MEMTOMEM_STM_PROXY__EXTRACTION__BACKGROUND=true
+export MEMTOMEM_STM_PROXY__EXTRACTION__MAX_INPUT_CHARS=20000
 
 # Compression feedback (learning signal for auto-tuner)
 export MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__ENABLED=true
+export MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH=~/.memtomem/stm_feedback.db
 ```
 
 ### Surfacing
@@ -172,6 +187,7 @@ Full example with all options:
   "auto_index": {
     "enabled": false,
     "min_chars": 2000,
+    "memory_dir": "~/.memtomem/proxy_index",
     "namespace": "proxy-{server}"
   },
   "relevance_scorer": {
@@ -184,9 +200,15 @@ Full example with all options:
   "extraction": {
     "enabled": false,
     "strategy": "llm",
+    "llm": {
+      "provider": "ollama",
+      "model": "qwen3:4b",
+      "base_url": "http://localhost:11434"
+    },
     "max_facts": 10,
     "min_response_chars": 500,
     "dedup_threshold": 0.92,
+    "memory_dir": "~/.memtomem/extracted_facts",
     "namespace": "facts-{server}",
     "background": true,
     "max_input_chars": 20000

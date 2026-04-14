@@ -6,17 +6,22 @@ memtomem-stm has 10 compression strategies. The CLI's `--compression` flag expos
 flowchart TD
     R["upstream response<br/>(after CLEAN)"] --> A{"strategy ==<br/>'auto'?"}
     A -->|no| Fixed["use configured<br/>strategy directly"]
-    A -->|yes| T{"detect content<br/>type"}
-    T -->|"JSON dict /<br/>config"| EF["extract_fields"]
-    T -->|"large JSON<br/>array"| SP["schema_pruning"]
-    T -->|"markdown +<br/>headings"| H["hybrid"]
-    T -->|"API doc /<br/>schema"| Sk["skeleton"]
-    T -->|"small / plain"| Tr["truncate"]
+    A -->|yes| J{"valid JSON?"}
+    J -->|"list ≥ 20 items"| SP["schema_pruning"]
+    J -->|"dict w/ arrays ≥ 20"| SP
+    J -->|"dict w/ ≥ 3<br/>nested dicts/lists"| EF["extract_fields"]
+    J -->|"other JSON"| Tr["truncate"]
+    J -->|no| MD{"≥ 4 headings?"}
+    MD -->|"+ HTTP methods<br/>(GET/POST/…)"| Sk["skeleton"]
+    MD -->|"≥ 5 headings<br/>+ ≥ 5K chars"| H["hybrid"]
+    MD -->|no| Code{"≥ 6 code fences<br/>+ ≥ 5K chars?"}
+    Code -->|yes| H
+    Code -->|no| Tr
     Fixed --> Out["compressed<br/>response"]
-    EF --> Out
     SP --> Out
-    H --> Out
+    EF --> Out
     Sk --> Out
+    H --> Out
     Tr --> Out
 ```
 
