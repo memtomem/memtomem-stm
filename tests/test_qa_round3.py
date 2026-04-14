@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,7 +36,7 @@ class TestSurfacedIdsPruning:
     """Verify set pruning does not raise RuntimeError."""
 
     def test_pruning_no_runtime_error(self):
-        """Fill _surfaced_ids beyond max, trigger pruning via snapshot approach."""
+        """Fill _surfaced_ids beyond max, trigger pruning via dict-based FIFO."""
         from memtomem_stm.surfacing.engine import SurfacingEngine
 
         config = MagicMock()
@@ -54,30 +53,51 @@ class TestSurfacedIdsPruning:
         engine = SurfacingEngine(config, mcp_adapter=adapter)
         engine._surfaced_ids_max = 100
 
-        # Fill beyond max
+        # Fill beyond max (insertion-ordered dict)
         for i in range(150):
-            engine._surfaced_ids.add(f"id-{i}")
+            engine._surfaced_ids[f"id-{i}"] = None
 
         # Simulate the pruning logic (same code as engine.py)
         if len(engine._surfaced_ids) > engine._surfaced_ids_max:
             excess = len(engine._surfaced_ids) - engine._surfaced_ids_max // 2
-            to_remove = list(itertools.islice(engine._surfaced_ids, excess))
-            engine._surfaced_ids -= set(to_remove)
+            keys = list(engine._surfaced_ids)[:excess]
+            for k in keys:
+                del engine._surfaced_ids[k]
 
         assert len(engine._surfaced_ids) <= engine._surfaced_ids_max
 
     def test_pruning_reduces_to_half_max(self):
-        """After pruning, the set should be at max_size // 2."""
-        ids: set[str] = set()
+        """After pruning, the dict should be at max_size // 2."""
+        ids: dict[str, None] = {}
         max_size = 100
         for i in range(150):
-            ids.add(f"id-{i}")
+            ids[f"id-{i}"] = None
 
         excess = len(ids) - max_size // 2
-        to_remove = list(itertools.islice(ids, excess))
-        ids -= set(to_remove)
+        keys = list(ids)[:excess]
+        for k in keys:
+            del ids[k]
 
         assert len(ids) == max_size // 2
+
+    def test_pruning_evicts_oldest_entries(self):
+        """Pruning should evict the first-inserted entries (FIFO order)."""
+        ids: dict[str, None] = {}
+        max_size = 10
+        for i in range(15):
+            ids[f"id-{i}"] = None
+
+        excess = len(ids) - max_size // 2
+        keys = list(ids)[:excess]
+        for k in keys:
+            del ids[k]
+
+        # Newest entries (id-10 through id-14) should survive
+        for i in range(10, 15):
+            assert f"id-{i}" in ids
+        # Oldest entries (id-0 through id-9) should be evicted
+        for i in range(10):
+            assert f"id-{i}" not in ids
 
 
 # ---------------------------------------------------------------------------

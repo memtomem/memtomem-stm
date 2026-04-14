@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import logging
 import time
 import uuid
@@ -57,13 +56,16 @@ class SurfacingEngine:
             max_failures=config.circuit_max_failures,
             reset_timeout=config.circuit_reset_seconds,
         )
-        # Track memory IDs surfaced — seeded from persistent store for cross-session dedup.
+        # Track memory IDs surfaced — insertion-ordered dict for FIFO eviction.
+        # Seeded from persistent store for cross-session dedup.
         # Cap at 10k entries to prevent unbounded growth in long sessions.
-        self._surfaced_ids: set[str] = set()
+        self._surfaced_ids: dict[str, None] = {}
         self._surfaced_ids_max = 10000
         if feedback_tracker is not None and config.dedup_ttl_seconds > 0:
             try:
-                self._surfaced_ids = feedback_tracker.store.get_seen_ids(config.dedup_ttl_seconds)
+                self._surfaced_ids = dict.fromkeys(
+                    feedback_tracker.store.get_seen_ids(config.dedup_ttl_seconds)
+                )
                 if self._surfaced_ids:
                     logger.debug(
                         "Loaded %d seen memory IDs for cross-session dedup",
@@ -298,13 +300,13 @@ class SurfacingEngine:
         # Record surfaced IDs to suppress repeats (in-memory + persistent)
         new_ids = [str(r.chunk.id) for r in relevant]
         for mid in new_ids:
-            self._surfaced_ids.add(mid)
-        # Prune if exceeded cap (drop oldest half via snapshot to avoid
-        # RuntimeError from modifying a set during iteration).
+            self._surfaced_ids[mid] = None
+        # Prune if exceeded cap — evict oldest (first-inserted) entries.
         if len(self._surfaced_ids) > self._surfaced_ids_max:
             excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
-            to_remove = list(itertools.islice(self._surfaced_ids, excess))
-            self._surfaced_ids -= set(to_remove)
+            keys = list(self._surfaced_ids)[:excess]
+            for k in keys:
+                del self._surfaced_ids[k]
         if self._feedback_tracker is not None:
             try:
                 self._feedback_tracker.store.mark_surfaced(new_ids)
