@@ -1085,7 +1085,10 @@ class LLMCompressor:
             from memtomem_stm.proxy.privacy import contains_sensitive_content
 
             if contains_sensitive_content(text, privacy_patterns):
-                logger.info("Sensitive content detected, skipping LLM compression")
+                logger.info(
+                    "Sensitive content detected, skipping LLM compression (strategy=llm/%s)",
+                    self._cfg.provider.value,
+                )
                 self.last_fallback = "privacy"
                 return TruncateCompressor().compress(text, max_chars=max_chars)
         if self._cb.is_open:
@@ -1098,7 +1101,10 @@ class LLMCompressor:
         except Exception as exc:
             self._cb.failure()
             logger.warning(
-                "LLM compression failed (%s), falling back to truncate: %s", type(exc).__name__, exc
+                "LLM compression failed (strategy=llm/%s, %s), falling back to truncate: %s",
+                self._cfg.provider.value,
+                type(exc).__name__,
+                exc,
             )
             self.last_fallback = "llm_error"
             return TruncateCompressor().compress(text, max_chars=max_chars)
