@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
+
+logger = logging.getLogger(__name__)
 
 
 class PendingStore(Protocol):
@@ -132,8 +135,16 @@ class SQLitePendingStore:
             )
         if row is None:
             return None
+        try:
+            chunks = json.loads(row[0])
+        except json.JSONDecodeError:
+            logger.warning(
+                "Corrupted chunks_json in pending_selections for key=%s; treating as miss",
+                key,
+            )
+            return None
         return PendingSelection(
-            chunks=json.loads(row[0]),
+            chunks=chunks,
             format=row[1],
             created_at=row[2],
             total_chars=row[3],

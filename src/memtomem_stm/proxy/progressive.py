@@ -7,10 +7,13 @@ it in chunks on demand — like Claude Code reads files 150 lines at a time.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 
 from memtomem_stm.proxy.compression import PendingSelection
+
+logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"(?:^|\n)#{1,6}\s+(.+)")
 
@@ -62,9 +65,21 @@ class ProgressiveStoreAdapter:
         sel = self._store.get(key)
         if sel is None or sel.format != "progressive":
             return None
-        meta = json.loads(sel.chunks.get("__meta__", "{}"))
+        content = sel.chunks.get("__content__")
+        if content is None:
+            logger.warning(
+                "Progressive entry missing __content__ for key=%s; treating as miss", key
+            )
+            return None
+        try:
+            meta = json.loads(sel.chunks.get("__meta__", "{}"))
+        except json.JSONDecodeError:
+            logger.warning(
+                "Corrupted __meta__ JSON for progressive key=%s; using defaults", key
+            )
+            meta = {}
         return ProgressiveResponse(
-            content=sel.chunks["__content__"],
+            content=content,
             total_chars=sel.total_chars,
             total_lines=meta.get("total_lines", 0),
             content_type=meta.get("content_type", "text"),

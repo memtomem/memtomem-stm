@@ -144,6 +144,22 @@ class TestSQLitePendingStore:
         assert result.chunks == {"x": "data"}
         store2.close()
 
+    def test_get_returns_none_on_corrupted_json(self, tmp_path, caplog):
+        """Corrupted chunks_json should be treated as a cache miss, not crash."""
+        store = self._make_store(tmp_path)
+        # Bypass put() and insert invalid JSON directly
+        store._get_db().execute(
+            "INSERT INTO pending_selections "
+            "(key, chunks_json, format, created_at, total_chars) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("bad", "{not valid json", "markdown", time.time(), 10),
+        )
+        store._get_db().commit()
+        with caplog.at_level("WARNING"):
+            assert store.get("bad") is None
+        assert any("Corrupted chunks_json" in r.message for r in caplog.records)
+        store.close()
+
     def test_concurrent_access(self, tmp_path):
         """Multiple threads can put/get without errors."""
         store = self._make_store(tmp_path)

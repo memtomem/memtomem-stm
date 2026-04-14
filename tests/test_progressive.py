@@ -197,6 +197,44 @@ class TestProgressiveStoreAdapter:
         store = ProgressiveStoreAdapter(InMemoryPendingStore())
         assert store.get("nonexistent") is None
 
+    def test_missing_content_key_returns_none(self, caplog):
+        """Entry without __content__ should be treated as miss, not crash."""
+        backing = InMemoryPendingStore()
+        # Inject a progressive-format entry missing __content__
+        backing.put(
+            "broken",
+            PendingSelection(
+                chunks={"__meta__": "{}"},  # no __content__
+                format="progressive",
+                created_at=time.monotonic(),
+                total_chars=0,
+            ),
+        )
+        store = ProgressiveStoreAdapter(backing)
+        with caplog.at_level("WARNING"):
+            assert store.get("broken") is None
+        assert any("missing __content__" in r.message for r in caplog.records)
+
+    def test_corrupted_meta_uses_defaults(self, caplog):
+        """Corrupted __meta__ JSON should log and fall back to defaults."""
+        backing = InMemoryPendingStore()
+        backing.put(
+            "bad_meta",
+            PendingSelection(
+                chunks={"__content__": "hello", "__meta__": "{not json"},
+                format="progressive",
+                created_at=time.monotonic(),
+                total_chars=5,
+            ),
+        )
+        store = ProgressiveStoreAdapter(backing)
+        with caplog.at_level("WARNING"):
+            got = store.get("bad_meta")
+        assert got is not None
+        assert got.content == "hello"
+        assert got.content_type == "text"  # default
+        assert any("Corrupted __meta__ JSON" in r.message for r in caplog.records)
+
     def test_touch_does_not_error(self):
         store = ProgressiveStoreAdapter(InMemoryPendingStore())
         resp = ProgressiveResponse(
