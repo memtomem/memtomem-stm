@@ -1,6 +1,6 @@
 # Pipeline
 
-Every proxied tool call goes through 4 stages (plus an optional 4b for fact extraction).
+Every proxied tool call that returns a successful text response goes through 4 stages (plus an optional 4b for fact extraction). Non-text responses (images, binary data) and error responses are passed through without processing.
 
 ```mermaid
 flowchart TD
