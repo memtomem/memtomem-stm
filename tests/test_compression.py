@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -141,6 +141,7 @@ class TestSelectiveCompressor:
         key = toc["selection_key"]
 
         import time
+
         time.sleep(0.01)
         result = c.select(key, ["a"])
         assert "not found or expired" in result
@@ -261,12 +262,8 @@ class TestLLMCompressorFallback:
     async def test_privacy_fallback(self):
         comp = _make_llm_compressor()
         text = "API_KEY=sk-secret-1234567890 " * 50
-        with patch(
-            "memtomem_stm.proxy.privacy.contains_sensitive_content", return_value=True
-        ):
-            result = await comp.compress(
-                text, max_chars=100, privacy_patterns=["API_KEY"]
-            )
+        with patch("memtomem_stm.proxy.privacy.contains_sensitive_content", return_value=True):
+            result = await comp.compress(text, max_chars=100, privacy_patterns=["API_KEY"])
         assert comp.last_fallback == "privacy"
         assert len(result) < len(text)
 
@@ -287,7 +284,9 @@ class TestLLMCompressorFallback:
     async def test_llm_error_fallback(self):
         comp = _make_llm_compressor()
         text = "Long document content. " * 50
-        with patch.object(comp, "_call_api", new_callable=AsyncMock, side_effect=RuntimeError("API down")):
+        with patch.object(
+            comp, "_call_api", new_callable=AsyncMock, side_effect=RuntimeError("API down")
+        ):
             result = await comp.compress(text, max_chars=200)
         assert comp.last_fallback == "llm_error"
         assert len(result) < len(text)
@@ -305,3 +304,114 @@ class TestLLMCompressorFallback:
         # Second call: text fits budget — no compression needed
         await comp.compress("short", max_chars=1000)
         assert comp.last_fallback is None
+
+
+# ---------------------------------------------------------------------------
+# LLMCompressor — empty / malformed provider response guards (#67)
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_response(payload: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=payload)
+    return resp
+
+
+def _patch_post(comp: LLMCompressor, payload: dict) -> AsyncMock:
+    mock_post = AsyncMock(return_value=_make_mock_response(payload))
+    comp._client.post = mock_post  # type: ignore[union-attr]
+    return mock_post
+
+
+class TestLLMCompressorEmptyResponseGuard:
+    """Provider responses with empty / malformed payloads must raise a
+    descriptive ``ValueError`` rather than ``IndexError``/``KeyError``,
+    so the existing ``compress()`` fallback handler logs a useful message."""
+
+    def _openai_comp(self) -> LLMCompressor:
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="test")
+        return LLMCompressor(cfg)
+
+    def _anthropic_comp(self) -> LLMCompressor:
+        cfg = LLMCompressorConfig(provider=LLMProvider.ANTHROPIC, api_key="test")
+        return LLMCompressor(cfg)
+
+    def _ollama_comp(self) -> LLMCompressor:
+        cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA, base_url="http://localhost:11434")
+        return LLMCompressor(cfg)
+
+    @pytest.mark.asyncio
+    async def test_openai_empty_choices_raises(self):
+        comp = self._openai_comp()
+        _patch_post(comp, {"choices": []})
+        with pytest.raises(ValueError, match="empty 'choices'"):
+            await comp._openai("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_openai_missing_message_content_raises(self):
+        comp = self._openai_comp()
+        _patch_post(comp, {"choices": [{"message": {}}]})
+        with pytest.raises(ValueError, match="missing 'choices\\[0\\].message.content'"):
+            await comp._openai("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_openai_valid_response_succeeds(self):
+        comp = self._openai_comp()
+        _patch_post(comp, {"choices": [{"message": {"content": "hello"}}]})
+        result = await comp._openai("text", "system")
+        assert result == "hello"
+
+    @pytest.mark.asyncio
+    async def test_anthropic_empty_content_raises(self):
+        comp = self._anthropic_comp()
+        _patch_post(comp, {"content": []})
+        with pytest.raises(ValueError, match="empty 'content'"):
+            await comp._anthropic("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_anthropic_missing_text_raises(self):
+        comp = self._anthropic_comp()
+        _patch_post(comp, {"content": [{"type": "text"}]})
+        with pytest.raises(ValueError, match="missing 'content\\[0\\].text'"):
+            await comp._anthropic("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_anthropic_valid_response_succeeds(self):
+        comp = self._anthropic_comp()
+        _patch_post(comp, {"content": [{"text": "summary"}]})
+        result = await comp._anthropic("text", "system")
+        assert result == "summary"
+
+    @pytest.mark.asyncio
+    async def test_ollama_missing_message_raises(self):
+        comp = self._ollama_comp()
+        _patch_post(comp, {})
+        with pytest.raises(ValueError, match="missing 'message.content'"):
+            await comp._ollama("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_ollama_missing_content_raises(self):
+        comp = self._ollama_comp()
+        _patch_post(comp, {"message": {"role": "assistant"}})
+        with pytest.raises(ValueError, match="missing 'message.content'"):
+            await comp._ollama("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_ollama_valid_response_succeeds(self):
+        comp = self._ollama_comp()
+        _patch_post(comp, {"message": {"content": "summary"}})
+        result = await comp._ollama("text", "system")
+        assert result == "summary"
+
+    @pytest.mark.asyncio
+    async def test_compress_falls_back_to_truncate_on_empty_response(self):
+        """End-to-end: an empty provider response should trigger the
+        existing ``llm_error`` fallback rather than crash with IndexError."""
+        comp = self._openai_comp()
+        _patch_post(comp, {"choices": []})
+        text = "Long document content. " * 50
+        result = await comp.compress(text, max_chars=200)
+        assert comp.last_fallback == "llm_error"
+        assert len(result) < len(text)

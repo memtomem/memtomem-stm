@@ -1147,7 +1147,15 @@ class LLMCompressor:
             },
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("OpenAI response has empty 'choices' (likely quota or content filter)")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("OpenAI response missing 'choices[0].message.content'")
+        return content
 
     async def _anthropic(self, text: str, system_prompt: str) -> str:
         if self._client is None:
@@ -1171,7 +1179,16 @@ class LLMCompressor:
             },
         )
         resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+        data = resp.json()
+        content = data.get("content") or []
+        if not content:
+            raise ValueError(
+                "Anthropic response has empty 'content' (likely empty completion or filter)"
+            )
+        text_block = content[0].get("text")
+        if not isinstance(text_block, str):
+            raise ValueError("Anthropic response missing 'content[0].text'")
+        return text_block
 
     async def _ollama(self, text: str, system_prompt: str) -> str:
         if self._client is None:
@@ -1191,7 +1208,12 @@ class LLMCompressor:
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        data = resp.json()
+        message = data.get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("Ollama response missing 'message.content'")
+        return content
 
 
 class HybridCompressor:
