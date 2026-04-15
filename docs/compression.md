@@ -248,6 +248,8 @@ Providers: `openai`, `anthropic`, `ollama`. Falls back to truncation on API fail
 
 Sensitive content (API keys, passwords, PII) is auto-detected and **never** sent to external LLMs — falls back to local truncation. See [Operations → Privacy](operations.md#privacy) for the patterns.
 
+`LLMCompressor` holds a single `httpx.AsyncClient` for the life of the instance. `ProxyManager` caches one compressor per active `llm` config and swaps it (awaiting `close()` on the old one) whenever the config changes at runtime, so integrators generally do not need to manage it directly. If you construct an `LLMCompressor` standalone, `await compressor.close()` before discarding it to release the client — see [Operations → Shutdown & Lifecycle](operations.md#shutdown--lifecycle).
+
 ## Query-Aware Compression
 
 When an agent provides `_context_query` in tool arguments, compression allocates budget proportionally to section relevance instead of fixed top-down order. This preserves more information from query-relevant sections.

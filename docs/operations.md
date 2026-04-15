@@ -68,6 +68,32 @@ flowchart TD
 - **Boost guard** — each surfacing event can only boost `access_count` once (duplicate feedback ignored)
 - **Fresh cache** — proxy cache stores pre-surfacing content; surfacing is re-applied on cache hit so memories stay current
 
+## Shutdown & Lifecycle
+
+When STM is run as the packaged CLI (`mms serve` / `memtomem-stm-proxy`), the shutdown sequence is handled for you: signals cascade into `ProxyManager.stop()` and `SurfacingEngine.stop()`, which drain background tasks and close any held HTTP clients. Integrators embedding STM inside a long-lived application need to call these explicitly.
+
+```python
+from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.surfacing.engine import SurfacingEngine
+
+# ... run STM inside your app ...
+
+await surfacing_engine.stop()   # cancels & drains webhook tasks
+await proxy_manager.stop()      # drains background extraction,
+                                # closes LLMCompressor / extractor httpx clients,
+                                # closes per-upstream MCP connection stacks
+```
+
+| Shutdown step | What it cleans up |
+|---------------|-------------------|
+| `SurfacingEngine.stop()` | Cancels and awaits outstanding webhook tasks (fired via `asyncio.create_task`). Safe to call multiple times. |
+| `ProxyManager.stop()` | Cancels background extraction tasks, calls `LLMCompressor.close()` and `Extractor.close()` to release each `httpx.AsyncClient`, and `aclose()`s every `AsyncExitStack` that owns an upstream MCP connection. |
+| `LLMCompressor.close()` | Closes the held `httpx.AsyncClient` and sets it to `None` so the instance is safe to discard. Normally called via `ProxyManager.stop()`; call it directly only if you constructed `LLMCompressor` standalone (e.g. for tests or hot-reload replacement). |
+
+**Ordering.** Stop surfacing first so webhook tasks do not race against a half-closed proxy. Then stop the proxy manager, which is responsible for closing compressor/extractor HTTP clients and upstream connections. Inverting the order leaks an `httpx.AsyncClient` if a webhook task is mid-flight.
+
+**Hot-reload / replacement.** When swapping `LLMCompressor` or the relevance scorer at runtime (e.g. because config changed), `await old.close()` before discarding the reference so the old `httpx.AsyncClient` is drained. `ProxyManager` already does this for `LLMCompressor` via its config-reload path; the relevance scorer holds no `httpx.AsyncClient` (sync `httpx` per call) and is simply replaced in place.
+
 ## Privacy
 
 Sensitive content is auto-detected and never sent to external LLM compression:
