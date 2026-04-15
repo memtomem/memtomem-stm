@@ -405,6 +405,27 @@ class TestEdgeResponses:
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
 
+    async def test_text_field_none_degrades(self):
+        """Spec-noncompliant upstream returning ``TextContent.text=None`` must not crash.
+
+        Mirrors ``test_none_content_degrades_to_empty`` one level down: the MCP
+        spec requires ``TextContent.text`` to be ``str``, but the same upstream
+        servers that produce ``content=None`` also occasionally produce a
+        TextContent whose ``text`` field is ``None``. Without the ``or ""``
+        guard, ``len(text)`` raises ``TypeError`` and the failure propagates
+        before the metrics row is recorded — the same failure mode #114 fixed
+        for ``content`` itself.
+        """
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        none_text = SimpleNamespace(type="text", text=None)
+        session.call_tool.return_value = SimpleNamespace(content=[none_text], isError=False)
+
+        # Should not raise; concrete return value is implementation-defined
+        # (the empty text passes through compression as an empty payload).
+        result = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(result, str)
+
     async def test_non_text_content_passthrough(self):
         mgr = _make_manager()
         session = _get_session(mgr)

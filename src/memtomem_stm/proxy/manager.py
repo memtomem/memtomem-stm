@@ -911,7 +911,11 @@ class ProxyManager:
                 if remaining <= 0:
                     oversize = True
                     break
-                text = content.text
+                # ``content.text or ""`` tolerates spec-noncompliant upstreams
+                # that return ``None`` for a TextContent's ``text`` field.
+                # MCP spec requires ``text: str`` but mirrors the same gap
+                # that PR #114 fixed for ``result.content`` itself.
+                text = content.text or ""
                 if len(text) > remaining:
                     text_parts.append(text[:remaining])
                     total_chars += remaining

@@ -250,3 +250,39 @@ class TestNegotiationDowngradeAffectsParsing:
         assert len(results) == 1
         assert results[0].score == 0.42
         assert "Hello from compact" in results[0].chunk.content
+
+
+# ── Spec-noncompliant ``result.content=None`` from upstream ──────────────
+
+
+class TestNoneContentDefense:
+    """PR #114 fixed ``result.content=None`` in ``proxy/manager.py``; the
+    surfacing client kept the same unguarded iteration in ``search`` and
+    ``scratch_list`` and would crash with ``TypeError`` instead of returning
+    an empty result. Both paths must degrade silently — surfacing is always
+    allowed to skip on missing data."""
+
+    @pytest.mark.asyncio
+    async def test_search_returns_empty_when_content_is_none(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        bad = MagicMock()
+        bad.content = None
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=bad)
+        adapter._session = mock_session
+
+        results, stats = await adapter.search("anything")
+        assert results == []
+        assert stats is None
+
+    @pytest.mark.asyncio
+    async def test_scratch_list_returns_empty_when_content_is_none(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        bad = MagicMock()
+        bad.content = None
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=bad)
+        adapter._session = mock_session
+
+        entries = await adapter.scratch_list()
+        assert entries == []

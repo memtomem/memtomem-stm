@@ -281,7 +281,9 @@ class McpClientSearchAdapter:
             return [], None
 
         # Parse text response into results
-        text_parts = [c.text for c in result.content if c.type == "text"]
+        # ``result.content or []`` tolerates spec-noncompliant upstreams that
+        # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
+        text_parts = [c.text for c in (result.content or []) if c.type == "text"]
         if not text_parts:
             return [], None
 
@@ -354,7 +356,9 @@ class McpClientSearchAdapter:
             logger.debug("MCP mem_do(scratch_get) failed: %s", exc)
             return []
 
-        text_parts = [c.text for c in result.content if c.type == "text"]
+        # ``result.content or []`` tolerates spec-noncompliant upstreams that
+        # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
+        text_parts = [c.text for c in (result.content or []) if c.type == "text"]
         if not text_parts:
             return []
 
