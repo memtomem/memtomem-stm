@@ -334,7 +334,9 @@ class TestAtomicSave:
         def boom(*_a, **_kw):  # pragma: no cover - patched per test
             raise OSError("simulated rename failure")
 
-        monkeypatch.setattr("memtomem_stm.cli.proxy.os.replace", boom)
+        # ``_save`` was migrated to delegate to ``utils.fileio.atomic_write_text``;
+        # the rename now happens there, so patch the helper's ``os.replace``.
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", boom)
 
         with pytest.raises(OSError, match="simulated rename"):
             _save(target, {"enabled": True})

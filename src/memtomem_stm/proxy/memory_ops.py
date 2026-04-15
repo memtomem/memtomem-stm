@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from memtomem_stm.proxy.config import AutoIndexConfig, ExtractionConfig
 from memtomem_stm.proxy.extraction import ExtractedFact, FactExtractor
+from memtomem_stm.utils.fileio import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,9 @@ async def auto_index_response(
         f"{intent_section}"
         f"## Content\n\n{text}\n"
     )
-    file_path.write_text(md_content, encoding="utf-8")
+    # Atomic so the auto-indexer (called next) can't observe a partial file
+    # if the writer is killed mid-flush. Caller has already mkdir'd memory_dir.
+    atomic_write_text(file_path, md_content, ensure_parent=False)
 
     ns = ai_cfg.namespace.format(server=server, tool=tool)
 
@@ -128,7 +131,8 @@ async def extract_and_store(
             fname = f"{server}__{safe_tool}__fact__{ts}__{i:02d}.md"
             file_path = memory_dir / fname
             md_content = format_fact_md(fact, server, tool, arguments)
-            file_path.write_text(md_content, encoding="utf-8")
+            # Atomic so a kill between write and index_file leaves no partial.
+            atomic_write_text(file_path, md_content, ensure_parent=False)
 
             if index_engine is None:
                 continue
