@@ -117,7 +117,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
 
             if mcp_adapter is not None:
                 if config.surfacing.feedback_enabled:
-                    feedback_tracker = FeedbackTracker(config.surfacing)
+                    try:
+                        feedback_tracker = FeedbackTracker(config.surfacing)
+                    except Exception:
+                        logger.warning(
+                            "FeedbackTracker init failed — surfacing feedback disabled",
+                            exc_info=True,
+                        )
+                        feedback_tracker = None
 
                 surfacing_engine = SurfacingEngine(
                     config.surfacing,

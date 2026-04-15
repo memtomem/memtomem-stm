@@ -365,3 +365,56 @@ class TestLifespan:
             async with app_lifespan(mcp) as _ctx:
                 # ProxyManager.start() should NOT be called when proxy is disabled
                 mock_pm_instance.start.assert_not_awaited()
+
+    async def test_feedback_tracker_init_failure_degrades_gracefully(self):
+        """FeedbackTracker raising at init should log and fall back to
+        feedback_tracker=None — learning-loop feature must not crash the
+        server. Mirrors the CompressionFeedbackTracker guard pattern."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        mock_adapter = MagicMock()
+        mock_adapter.start = AsyncMock()
+        mock_adapter.stop = AsyncMock()
+
+        captured_engine_kwargs: dict = {}
+
+        def _capture_engine(*_args, **kwargs):
+            captured_engine_kwargs.update(kwargs)
+            engine = MagicMock()
+            engine.stop = AsyncMock()
+            return engine
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            patch(
+                "memtomem_stm.surfacing.mcp_client.McpClientSearchAdapter",
+                return_value=mock_adapter,
+            ),
+            patch(
+                "memtomem_stm.server.FeedbackTracker",
+                side_effect=RuntimeError("disk full"),
+            ),
+            patch("memtomem_stm.server.SurfacingEngine", side_effect=_capture_engine),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = True
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.metrics.enabled = False
+            mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.cache.enabled = False
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = True
+            mock_cfg.surfacing.feedback_enabled = True
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+
+            async with app_lifespan(mcp) as ctx:
+                assert ctx.feedback_tracker is None
+                assert captured_engine_kwargs.get("feedback_tracker") is None
