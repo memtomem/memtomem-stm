@@ -68,138 +68,146 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     compression_feedback_tracker: CompressionFeedbackTracker | None = None
     langfuse_client = None
     tracker = TokenTracker()
+    proxy_manager: ProxyManager | None = None
 
-    if config.proxy.enabled:
-        # Metrics store
-        if config.proxy.metrics.enabled:
-            metrics_store = MetricsStore(
-                config.proxy.metrics.db_path.expanduser().resolve(),
-                max_history=config.proxy.metrics.max_history,
-            )
-            metrics_store.initialize()
-        tracker = TokenTracker(metrics_store=metrics_store)
-
-        # Compression feedback tracker — learning loop for agent-reported
-        # information loss. Reads ``metrics_store`` read-only for
-        # best-effort trace_id correlation when the caller omits it.
-        if config.proxy.compression_feedback.enabled:
-            try:
-                compression_feedback_tracker = CompressionFeedbackTracker(
-                    config.proxy.compression_feedback.db_path,
-                    metrics_store=metrics_store,
-                )
-            except Exception:
-                logger.warning(
-                    "Compression feedback tracker init failed — tool will be disabled",
-                    exc_info=True,
-                )
-                compression_feedback_tracker = None
-
-        # Surfacing engine — LTM access is always remote-only via the
-        # MCP client adapter. The adapter spawns (or connects to) a memtomem
-        # MCP server using config.surfacing.ltm_mcp_command / ltm_mcp_args.
-        if config.surfacing.enabled:
-            try:
-                from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
-
-                mcp_adapter = McpClientSearchAdapter(config.surfacing)
-                await mcp_adapter.start()
-                logger.info(
-                    "Surfacing engine connected via MCP client to %s",
-                    config.surfacing.ltm_mcp_command,
-                )
-            except Exception:
-                logger.warning(
-                    "MCP client surfacing initialization failed — surfacing disabled",
-                    exc_info=True,
-                )
-                mcp_adapter = None
-
-            if mcp_adapter is not None:
-                if config.surfacing.feedback_enabled:
-                    try:
-                        feedback_tracker = FeedbackTracker(config.surfacing)
-                    except Exception:
-                        logger.warning(
-                            "FeedbackTracker init failed — surfacing feedback disabled",
-                            exc_info=True,
-                        )
-                        feedback_tracker = None
-
-                surfacing_engine = SurfacingEngine(
-                    config.surfacing,
-                    mcp_adapter=mcp_adapter,
-                    feedback_tracker=feedback_tracker,
-                )
-
-        # Response cache
-        if config.proxy.cache.enabled:
-            proxy_cache = ProxyCache(
-                config.proxy.cache.db_path.expanduser().resolve(),
-                max_entries=config.proxy.cache.max_entries,
-            )
-            proxy_cache.initialize()
-
-        # Langfuse (optional)
-        try:
-            from memtomem_stm.observability.tracing import init_langfuse
-
-            langfuse_client = init_langfuse(config.langfuse)
-        except ImportError:
-            pass
-        except Exception:
-            logger.warning("Langfuse init failed, continuing without tracing", exc_info=True)
-    else:
-        logger.info("Proxy disabled (enabled=false) — only STM control tools available")
-
-    # Initialize proxy manager (always created for STM control tools like stm_proxy_stats)
-    proxy_manager = ProxyManager(
-        config.proxy,
-        tracker,
-        surfacing_engine=surfacing_engine,
-        cache=proxy_cache,
-        env_overrides=proxy_env_overrides,
-    )
-
-    if config.proxy.enabled:
-        await proxy_manager.start()
-
-        # Register proxy tools with upstream schema + annotations
-        from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
-
-        def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
-            async def proxy_tool(**kwargs: object) -> str | list:
-                return await pm.call_tool(server_name, tool_name, dict(kwargs))
-
-            return proxy_tool
-
-        for info in proxy_manager.get_proxy_tools():
-            register_proxy_tool(
-                server,
-                _make_proxy_handler(proxy_manager, info.server, info.original_name),
-                info,
-            )
-
-    ctx = STMContext(
-        config=config,
-        proxy_manager=proxy_manager,
-        tracker=tracker,
-        surfacing_engine=surfacing_engine,
-        feedback_tracker=feedback_tracker,
-        compression_feedback_tracker=compression_feedback_tracker,
-    )
+    # Wrap init + yield in a single try/finally so a failure between
+    # resource acquisition and yield (e.g. proxy_cache.initialize() or
+    # proxy_manager.start() raising after mcp_adapter.start() succeeded)
+    # still runs the cleanup block. Without this, partial init leaks the
+    # mcp_adapter stdio subprocess, open sqlite handles, etc.
     try:
+        if config.proxy.enabled:
+            # Metrics store
+            if config.proxy.metrics.enabled:
+                metrics_store = MetricsStore(
+                    config.proxy.metrics.db_path.expanduser().resolve(),
+                    max_history=config.proxy.metrics.max_history,
+                )
+                metrics_store.initialize()
+            tracker = TokenTracker(metrics_store=metrics_store)
+
+            # Compression feedback tracker — learning loop for agent-reported
+            # information loss. Reads ``metrics_store`` read-only for
+            # best-effort trace_id correlation when the caller omits it.
+            if config.proxy.compression_feedback.enabled:
+                try:
+                    compression_feedback_tracker = CompressionFeedbackTracker(
+                        config.proxy.compression_feedback.db_path,
+                        metrics_store=metrics_store,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Compression feedback tracker init failed — tool will be disabled",
+                        exc_info=True,
+                    )
+                    compression_feedback_tracker = None
+
+            # Surfacing engine — LTM access is always remote-only via the
+            # MCP client adapter. The adapter spawns (or connects to) a
+            # memtomem MCP server using
+            # config.surfacing.ltm_mcp_command / ltm_mcp_args.
+            if config.surfacing.enabled:
+                try:
+                    from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+                    mcp_adapter = McpClientSearchAdapter(config.surfacing)
+                    await mcp_adapter.start()
+                    logger.info(
+                        "Surfacing engine connected via MCP client to %s",
+                        config.surfacing.ltm_mcp_command,
+                    )
+                except Exception:
+                    logger.warning(
+                        "MCP client surfacing initialization failed — surfacing disabled",
+                        exc_info=True,
+                    )
+                    mcp_adapter = None
+
+                if mcp_adapter is not None:
+                    if config.surfacing.feedback_enabled:
+                        try:
+                            feedback_tracker = FeedbackTracker(config.surfacing)
+                        except Exception:
+                            logger.warning(
+                                "FeedbackTracker init failed — surfacing feedback disabled",
+                                exc_info=True,
+                            )
+                            feedback_tracker = None
+
+                    surfacing_engine = SurfacingEngine(
+                        config.surfacing,
+                        mcp_adapter=mcp_adapter,
+                        feedback_tracker=feedback_tracker,
+                    )
+
+            # Response cache
+            if config.proxy.cache.enabled:
+                proxy_cache = ProxyCache(
+                    config.proxy.cache.db_path.expanduser().resolve(),
+                    max_entries=config.proxy.cache.max_entries,
+                )
+                proxy_cache.initialize()
+
+            # Langfuse (optional)
+            try:
+                from memtomem_stm.observability.tracing import init_langfuse
+
+                langfuse_client = init_langfuse(config.langfuse)
+            except ImportError:
+                pass
+            except Exception:
+                logger.warning("Langfuse init failed, continuing without tracing", exc_info=True)
+        else:
+            logger.info("Proxy disabled (enabled=false) — only STM control tools available")
+
+        # Initialize proxy manager (always created for STM control tools like stm_proxy_stats)
+        proxy_manager = ProxyManager(
+            config.proxy,
+            tracker,
+            surfacing_engine=surfacing_engine,
+            cache=proxy_cache,
+            env_overrides=proxy_env_overrides,
+        )
+
+        if config.proxy.enabled:
+            await proxy_manager.start()
+
+            # Register proxy tools with upstream schema + annotations
+            from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+
+            def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
+                async def proxy_tool(**kwargs: object) -> str | list:
+                    return await pm.call_tool(server_name, tool_name, dict(kwargs))
+
+                return proxy_tool
+
+            for info in proxy_manager.get_proxy_tools():
+                register_proxy_tool(
+                    server,
+                    _make_proxy_handler(proxy_manager, info.server, info.original_name),
+                    info,
+                )
+
+        ctx = STMContext(
+            config=config,
+            proxy_manager=proxy_manager,
+            tracker=tracker,
+            surfacing_engine=surfacing_engine,
+            feedback_tracker=feedback_tracker,
+            compression_feedback_tracker=compression_feedback_tracker,
+        )
         yield ctx
     finally:
-        for info in proxy_manager.get_proxy_tools():
+        if proxy_manager is not None:
+            for info in proxy_manager.get_proxy_tools():
+                try:
+                    server.remove_tool(info.prefixed_name)
+                except Exception:
+                    pass
             try:
-                server.remove_tool(info.prefixed_name)
+                await proxy_manager.stop()
             except Exception:
-                pass
-        try:
-            await proxy_manager.stop()
-        except Exception:
-            logger.warning("Failed to stop proxy manager", exc_info=True)
+                logger.warning("Failed to stop proxy manager", exc_info=True)
         if surfacing_engine is not None:
             try:
                 await surfacing_engine.stop()
