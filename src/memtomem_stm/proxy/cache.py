@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memtomem_stm.utils.sqlite_tuning import tune_connection
+
 logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
@@ -62,8 +64,7 @@ class ProxyCache:
             self._db_path.chmod(0o600)
         except OSError:
             pass
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=3000")
+        tune_connection(self._db)
         self._db.execute(_CREATE_TABLE)
         self._db.execute(_CREATE_INDEX)
         self._db.commit()

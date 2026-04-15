@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class SQLitePendingStore:
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        tune_connection(self._db)
         self._db.execute(
             """CREATE TABLE IF NOT EXISTS pending_selections (
                 key TEXT PRIMARY KEY,

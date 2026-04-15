@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 
+from memtomem_stm.utils.sqlite_tuning import tune_connection
+
 logger = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -54,8 +56,7 @@ class FeedbackStore:
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._db = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=3000")
+        tune_connection(self._db)
         self._db.executescript(_SCHEMA)
 
     def close(self) -> None:
