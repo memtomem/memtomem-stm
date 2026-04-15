@@ -222,12 +222,15 @@ stm_surfacing_feedback(surfacing_id="ghi789", rating="already_known")
 
 Valid ratings: `helpful`, `not_relevant`, `already_known`.
 
-When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback:
+When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback. In plain terms: **`not_relevant` ratings push `min_score` up** (surfacing becomes more selective), while a run of **`helpful`/`already_known` ratings pushes it down** (surfacing becomes more inclusive) because they keep the `not_relevant` ratio low. Concretely:
 
 | Feedback ratio | Action |
 |----------------|--------|
 | > 60% `not_relevant` | Raise `min_score` by +0.002 (surface fewer, more relevant) |
 | < 20% `not_relevant` | Lower `min_score` by -0.002 (surface more) |
+| 20–60% `not_relevant` | Hold current `min_score` |
+
+Adjustment step is `auto_tune_score_increment` (default `0.002`) and the tuned score is clamped to `[0.005, 0.05]`.
 
 ```mermaid
 flowchart LR
