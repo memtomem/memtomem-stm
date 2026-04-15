@@ -508,7 +508,11 @@ class ProxyConfigLoader:
             loaded = ProxyConfig.load_from_file(self._path, env_overrides=self._env_overrides)
             if loaded is not None:
                 self._cached = loaded
+                self._mtime = mtime
             else:
+                # Don't advance _mtime on parse failure: the next get() must
+                # retry instead of treating the broken file as up-to-date,
+                # otherwise a fix that lands within filesystem mtime
+                # granularity (or before any other write) would be ignored.
                 logger.warning("Proxy config parse failed; keeping previous config")
-            self._mtime = mtime
         return self._cached  # type: ignore[return-value]

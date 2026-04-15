@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 
 
@@ -62,6 +63,34 @@ class TestProxyConfigLoader:
         seeded = ProxyConfig(enabled=True)
         loader.seed(seeded)
         assert loader.get() is seeded  # same object, not re-parsed
+
+    def test_parse_failure_does_not_block_subsequent_reload(self, tmp_path):
+        """If a fix lands within filesystem mtime granularity after a parse
+        failure, the next get() must still pick it up — the loader must not
+        treat the broken file's mtime as "already seen".
+        """
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": False}))
+        loader = ProxyConfigLoader(cfg_file)
+
+        assert loader.get().enabled is False
+
+        # Write broken JSON (its mtime differs so the loader notices).
+        time.sleep(0.05)
+        cfg_file.write_text("{ not valid json")
+        broken_mtime = cfg_file.stat().st_mtime
+
+        # Parse fails — the loader must keep the previously cached good config.
+        assert loader.get().enabled is False
+
+        # Simulate a fix that lands at the same mtime as the broken write
+        # (e.g., a rapid in-place edit on a coarse-grained filesystem).
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        os.utime(cfg_file, (broken_mtime, broken_mtime))
+
+        # Without the fix, the loader stored broken_mtime when parsing failed
+        # and now sees the same mtime → skips reload → returns stale config.
+        assert loader.get().enabled is True
 
 
 # ── MetricsStore persistence ─────────────────────────────────────────────
