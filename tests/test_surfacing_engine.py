@@ -466,6 +466,66 @@ class TestFeedbackBoost:
         adapter.increment_access.assert_not_called()
 
 
+class TestConcurrentSurfacedIdsDedup:
+    """Dedup invariant: each memory surfaced at most once per session, even
+    under concurrency (engine.py:62 / L256 / docstring).
+
+    Before the fix, the in-memory write at ``_surfaced_ids`` happened AFTER
+    the ``scratch_list`` await, opening an interleaving window where two
+    concurrent ``_do_surface`` calls could both build ``relevant`` with the
+    same memory and both return responses containing it."""
+
+    def _make_tracker(self):
+        tracker = MagicMock()
+        tracker.record_feedback = MagicMock(return_value="ok")
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.mark_surfaced = MagicMock()
+        tracker.record_surfacing = MagicMock()
+        return tracker
+
+    async def test_concurrent_surface_same_memory_dedups(self):
+        shared_chunk = FakeChunk(id="mem-shared", content="the shared memory content")
+        results = [FakeSearchResult(chunk=shared_chunk, score=0.9)]
+        adapter = _make_mcp_adapter(results)
+
+        async def slow_scratch(**_kwargs):
+            await asyncio.sleep(0.01)
+            return []
+
+        adapter.scratch_list = AsyncMock(side_effect=slow_scratch)
+        adapter.increment_access = AsyncMock()
+
+        tracker = self._make_tracker()
+        engine = SurfacingEngine(
+            config=_make_config(include_session_context=True),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        out_a, out_b = await asyncio.gather(
+            engine.surface(
+                "gh",
+                "read_file",
+                {"path": "src/a.py", "_context_query": "Flask architecture"},
+                LONG_RESPONSE,
+            ),
+            engine.surface(
+                "gh",
+                "search",
+                {"path": "src/b.py", "_context_query": "Django routes"},
+                LONG_RESPONSE,
+            ),
+        )
+
+        appears_in_a = "the shared memory content" in out_a
+        appears_in_b = "the shared memory content" in out_b
+        assert not (appears_in_a and appears_in_b), (
+            "Session dedup violated under concurrency: shared memory surfaced "
+            "in both concurrent responses"
+        )
+
+
 class TestMaybeCleanupExpired:
     """Integration: _maybe_cleanup_expired() scheduling from surface()."""
 

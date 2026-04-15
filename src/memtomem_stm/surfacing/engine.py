@@ -272,6 +272,22 @@ class SurfacingEngine:
             )
             return response_text
 
+        # Record in-memory surfaced IDs EAGERLY — before any await — so a
+        # concurrent ``_do_surface`` for an overlapping memory observes the
+        # claim at L261 and excludes it. Without this, the await at
+        # ``scratch_list`` below opens an interleaving window where both
+        # coroutines build ``relevant`` including the same memory and
+        # violate the documented session-dedup invariant.
+        new_ids = [str(r.chunk.id) for r in relevant]
+        for mid in new_ids:
+            self._surfaced_ids[mid] = None
+        # Prune if exceeded cap — evict oldest (first-inserted) entries.
+        if len(self._surfaced_ids) > self._surfaced_ids_max:
+            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
+            keys = list(self._surfaced_ids)[:excess]
+            for k in keys:
+                del self._surfaced_ids[k]
+
         self._gate.record_surfacing(query)
         logger.info(
             "Surfacing %d memories for %s/%s (query=%s)", len(relevant), server, tool, query[:50]
@@ -298,22 +314,14 @@ class SurfacingEngine:
                     server=server,
                     tool=tool,
                     query=query,
-                    memory_ids=[str(r.chunk.id) for r in relevant],
+                    memory_ids=new_ids,
                     scores=[r.score for r in relevant],
                 )
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
 
-        # Record surfaced IDs to suppress repeats (in-memory + persistent)
-        new_ids = [str(r.chunk.id) for r in relevant]
-        for mid in new_ids:
-            self._surfaced_ids[mid] = None
-        # Prune if exceeded cap — evict oldest (first-inserted) entries.
-        if len(self._surfaced_ids) > self._surfaced_ids_max:
-            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
-            keys = list(self._surfaced_ids)[:excess]
-            for k in keys:
-                del self._surfaced_ids[k]
+        # Persist seen IDs for cross-session dedup (in-memory guard was
+        # claimed above to close the concurrent window).
         if self._feedback_tracker is not None:
             try:
                 self._feedback_tracker.store.mark_surfaced(new_ids)
