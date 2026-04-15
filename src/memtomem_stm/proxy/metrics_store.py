@@ -39,22 +39,28 @@ class MetricsStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
+        db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
         try:
-            self._db_path.chmod(0o600)
-        except OSError:
-            pass
-        tune_connection(self._db)
-        self._db.execute(_CREATE)
-        self._db.execute(_INDEX)
-        self._db.commit()
-        self._migrate()
+            try:
+                self._db_path.chmod(0o600)
+            except OSError:
+                pass
+            tune_connection(db)
+            db.execute(_CREATE)
+            db.execute(_INDEX)
+            db.commit()
+            # Run migrations against the local ``db`` before it is exposed
+            # as ``self._db`` so a failure here falls through to the outer
+            # except and leaves the store un-initialized.
+            self._migrate(db)
+        except Exception:
+            db.close()
+            raise
+        self._db = db
 
-    def _migrate(self) -> None:
+    def _migrate(self, db: sqlite3.Connection) -> None:
         """Add columns introduced after initial schema (idempotent)."""
-        if self._db is None:
-            return
-        existing = {row[1] for row in self._db.execute("PRAGMA table_info(proxy_metrics)")}
+        existing = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         migrations = {
             "is_error": "ALTER TABLE proxy_metrics ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0",
             "error_category": "ALTER TABLE proxy_metrics ADD COLUMN error_category TEXT DEFAULT NULL",
@@ -72,8 +78,8 @@ class MetricsStore:
         }
         for col, ddl in migrations.items():
             if col not in existing:
-                self._db.execute(ddl)
-        self._db.commit()
+                db.execute(ddl)
+        db.commit()
 
     def close(self) -> None:
         if self._db:

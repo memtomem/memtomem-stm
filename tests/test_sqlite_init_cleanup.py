@@ -15,7 +15,9 @@ from typing import Any
 
 import pytest
 
+from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
+from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.pending_store import SQLitePendingStore
 from memtomem_stm.surfacing.feedback_store import FeedbackStore
 
@@ -28,6 +30,8 @@ _CASES: list[tuple[str, type[Any], str]] = [
         "cfb.db",
     ),
     ("memtomem_stm.proxy.pending_store", SQLitePendingStore, "pending.db"),
+    ("memtomem_stm.proxy.cache", ProxyCache, "cache.db"),
+    ("memtomem_stm.proxy.metrics_store", MetricsStore, "metrics.db"),
 ]
 
 
