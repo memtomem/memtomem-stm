@@ -430,6 +430,27 @@ class TestFeedbackBoost:
 
         adapter.increment_access.assert_not_called()
 
+    async def test_boosted_event_ids_fifo_cap_evicts_oldest(self):
+        """When ``_boosted_event_ids`` exceeds its cap, oldest entries evict first."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+        engine._boosted_event_ids_max = 10  # shrink for test speed
+
+        for i in range(15):
+            await engine.handle_feedback(f"sid-cap-{i}", "helpful", memory_id="mid-A")
+
+        # Overflow triggers bulk prune to half the cap (~5 entries remain).
+        assert len(engine._boosted_event_ids) <= 10
+        # Oldest (first-inserted) entries should be gone; newest retained.
+        assert "sid-cap-0" not in engine._boosted_event_ids
+        assert "sid-cap-14" in engine._boosted_event_ids
+
     async def test_no_tracker_returns_disabled_message(self):
         adapter = _make_mcp_adapter([])
         adapter.increment_access = AsyncMock()

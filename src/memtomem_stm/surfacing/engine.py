@@ -75,8 +75,10 @@ class SurfacingEngine:
                 logger.warning("Failed to load cross-session seen IDs", exc_info=True)
         # In-memory boost guard — at most one mem_do(increment_access) call
         # per surfacing event, even if the agent fires multiple "helpful"
-        # ratings for it.
-        self._boosted_event_ids: set[str] = set()
+        # ratings for it. Insertion-ordered dict for FIFO eviction; cap at
+        # 10k matches the sibling _surfaced_ids bound.
+        self._boosted_event_ids: dict[str, None] = {}
+        self._boosted_event_ids_max = 10000
         self._background_tasks: set[asyncio.Task] = set()
         # Opportunistic cleanup: run cleanup_expired at most once per hour
         self._cleanup_interval = 3600.0
@@ -177,7 +179,12 @@ class SurfacingEngine:
                         },
                     ):
                         await self._mcp_adapter.increment_access(target_ids)
-                    self._boosted_event_ids.add(surfacing_id)
+                    self._boosted_event_ids[surfacing_id] = None
+                    # Prune if exceeded cap — evict oldest (first-inserted) entries.
+                    if len(self._boosted_event_ids) > self._boosted_event_ids_max:
+                        excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
+                        for k in list(self._boosted_event_ids)[:excess]:
+                            del self._boosted_event_ids[k]
             except Exception:
                 logger.debug(
                     "Failed to boost access_count for surfacing %s",
