@@ -77,6 +77,35 @@ class TestBM25Scorer:
         scores = scorer.score_sections("caching", sections)
         assert scores[0] > scores[1]
 
+    @pytest.mark.parametrize(
+        "query,matching_body,non_matching_body",
+        [
+            # Cyrillic (Russian)
+            ("кэширование", "Redis кэширование данных.", "PostgreSQL ACID транзакции."),
+            # Arabic
+            ("التخزين", "Redis التخزين المؤقت.", "قاعدة البيانات PostgreSQL."),
+            # Devanagari (Hindi)
+            ("कैशिंग", "Redis कैशिंग रणनीति.", "PostgreSQL डेटाबेस."),
+            # Thai
+            ("แคช", "Redis แคช ข้อมูล.", "ฐานข้อมูล PostgreSQL."),
+        ],
+    )
+    def test_non_ascii_scripts_tokenize(self, query, matching_body, non_matching_body):
+        """BM25 tokenizer recognizes Cyrillic, Arabic, Devanagari, and Thai.
+
+        Prior to the tokenizer Unicode expansion these scripts produced zero
+        tokens → BM25 score of 0.0 regardless of content, silently degrading
+        query-aware compression for multilingual users.
+        """
+        sections = [
+            ("## A", matching_body),
+            ("## B", non_matching_body),
+        ]
+        scorer = BM25Scorer()
+        scores = scorer.score_sections(query, sections)
+        assert scores[0] > 0.0
+        assert scores[0] > scores[1]
+
 
 # ── RelevanceScorer Protocol & Factory ─────────────────────────────────
 
