@@ -163,6 +163,11 @@ class SurfacingEngine:
         result = self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
 
         if rating == "helpful" and surfacing_id not in self._boosted_event_ids:
+            # Claim the guard optimistically BEFORE the increment_access
+            # await so a concurrent "helpful" for the same surfacing_id
+            # observes the claim and short-circuits. Rolled back on failure
+            # so the documented "retry on failure" behavior is preserved.
+            self._boosted_event_ids[surfacing_id] = None
             try:
                 if memory_id:
                     target_ids: list[str] = [memory_id]
@@ -179,13 +184,17 @@ class SurfacingEngine:
                         },
                     ):
                         await self._mcp_adapter.increment_access(target_ids)
-                    self._boosted_event_ids[surfacing_id] = None
                     # Prune if exceeded cap — evict oldest (first-inserted) entries.
                     if len(self._boosted_event_ids) > self._boosted_event_ids_max:
                         excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
                         for k in list(self._boosted_event_ids)[:excess]:
                             del self._boosted_event_ids[k]
+                else:
+                    # No memories to boost — release the guard so a later
+                    # call with a resolvable memory_id can retry.
+                    self._boosted_event_ids.pop(surfacing_id, None)
             except Exception:
+                self._boosted_event_ids.pop(surfacing_id, None)
                 logger.debug(
                     "Failed to boost access_count for surfacing %s",
                     surfacing_id,
