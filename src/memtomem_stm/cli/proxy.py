@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
 import click
+
+from memtomem_stm.utils.fileio import atomic_write_text
 
 _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
@@ -46,32 +46,15 @@ def _load(config_path: Path) -> dict[str, Any]:
 def _save(config_path: Path, data: dict[str, Any]) -> None:
     """Write the proxy config atomically.
 
-    Writes to a sibling temp file then ``os.replace``s onto the target.
-    A running proxy's hot-reload watcher would otherwise be able to read
-    a half-written JSON file in the gap between truncate and write
-    (``Path.write_text`` is not atomic), surfacing as a parse-error log
-    + a fall-through to the previous config.
+    Delegates to :func:`atomic_write_text` so the temp + ``os.replace``
+    pattern stays in one place (see PR #115 for the original failure
+    mode: a running proxy's mtime-based hot-reload would otherwise read
+    a half-written JSON file in the gap between truncate and write).
+    ``mode=0o600`` keeps the rendered file out of a permissive listing
+    even if the parent directory is shared.
     """
-    resolved = config_path.expanduser().resolve()
-    resolved.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=resolved.name + ".",
-        suffix=".tmp",
-        dir=str(resolved.parent),
-    )
-    tmp = Path(tmp_path)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-        try:
-            tmp.chmod(0o600)
-        except OSError:
-            pass
-        os.replace(tmp, resolved)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write_text(config_path, payload, mode=0o600)
 
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
