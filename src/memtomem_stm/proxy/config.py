@@ -101,6 +101,22 @@ class LLMCompressorConfig(BaseModel):
     )
     max_tokens: int = Field(default=500, gt=0)
 
+    @model_validator(mode="after")
+    def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:
+        if self.provider not in (LLMProvider.OPENAI, LLMProvider.ANTHROPIC):
+            return self
+        if self.api_key:
+            return self
+        env_var = "OPENAI_API_KEY" if self.provider == LLMProvider.OPENAI else "ANTHROPIC_API_KEY"
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            self.api_key = env_val
+            return self
+        raise ValueError(
+            f"api_key is required for provider='{self.provider.value}' "
+            f"(set api_key in config or the {env_var} environment variable)"
+        )
+
 
 class CleaningConfig(BaseModel):
     enabled: bool = True

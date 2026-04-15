@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 from typing import Protocol
 
@@ -127,10 +128,19 @@ class EmbeddingScorer:
         base_url: str = "http://localhost:11434",
         timeout: float = 10.0,
     ) -> None:
+        api_key = ""
+        if provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError(
+                    "OPENAI_API_KEY environment variable is required when "
+                    "EmbeddingScorer provider='openai'"
+                )
         self._provider = provider
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._api_key = api_key
         self._fallback = BM25Scorer()
         self.fallback_count: int = 0
 
@@ -186,16 +196,13 @@ class EmbeddingScorer:
         return resp.json()["embeddings"]
 
     def _embed_openai(self, httpx_mod: object, texts: list[str]) -> list[list[float]]:
-        import os
-
         import httpx as _httpx
 
-        api_key = os.environ.get("OPENAI_API_KEY", "")
         url = self._base_url + "/v1/embeddings"
         resp = _httpx.post(
             url,
             json={"model": self._model, "input": texts, "encoding_format": "float"},
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {self._api_key}"},
             timeout=self._timeout,
         )
         resp.raise_for_status()

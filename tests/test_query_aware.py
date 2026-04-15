@@ -160,6 +160,22 @@ class TestRelevanceScorerProtocol:
         scorer.score_sections("another query", sections)
         assert scorer.fallback_count == 2
 
+    def test_openai_provider_requires_api_key_env(self, monkeypatch):
+        """Missing OPENAI_API_KEY at construction raises loudly so the misconfig
+        does not get swallowed by the silent BM25 fallback in score_sections."""
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+            EmbeddingScorer(provider="openai", model="text-embedding-3-small")
+
+    def test_openai_provider_accepts_env_api_key(self, monkeypatch):
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        scorer = EmbeddingScorer(provider="openai", model="text-embedding-3-small")
+        assert scorer._api_key == "sk-test"
+
     def test_custom_scorer_in_truncate(self):
         """TruncateCompressor accepts a custom scorer."""
 
@@ -204,6 +220,10 @@ class TestEmbeddingOpenAIResponseParsing:
     omit it. Sorting by a missing ``index`` used to raise ``KeyError`` and
     fail the entire request.
     """
+
+    @pytest.fixture(autouse=True)
+    def _openai_key(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     def _make_scorer(self):
         from memtomem_stm.proxy.relevance import EmbeddingScorer

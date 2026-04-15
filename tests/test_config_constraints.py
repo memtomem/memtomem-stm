@@ -10,6 +10,7 @@ from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     ExtractionConfig,
     LLMCompressorConfig,
+    LLMProvider,
     RelevanceScorerConfig,
     SelectiveConfig,
 )
@@ -63,6 +64,54 @@ class TestProxyNumericConstraints:
             RelevanceScorerConfig(embedding_timeout=0.0)
         with pytest.raises(ValidationError):
             RelevanceScorerConfig(embedding_timeout=-1.0)
+
+
+class TestLLMCompressorApiKey:
+    """``provider=openai|anthropic`` with empty ``api_key`` used to send a
+    malformed ``Bearer `` header and silently fall back to truncate; validate
+    at config-load time instead so misconfiguration is loud."""
+
+    def test_openai_empty_api_key_rejected_when_env_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+            LLMCompressorConfig(provider=LLMProvider.OPENAI)
+
+    def test_anthropic_empty_api_key_rejected_when_env_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY"):
+            LLMCompressorConfig(provider=LLMProvider.ANTHROPIC)
+
+    def test_openai_env_fallback_populates_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI)
+        assert cfg.api_key == "sk-from-env"
+
+    def test_anthropic_env_fallback_populates_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-from-env")
+        cfg = LLMCompressorConfig(provider=LLMProvider.ANTHROPIC)
+        assert cfg.api_key == "ant-from-env"
+
+    def test_explicit_api_key_bypasses_env_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="sk-explicit")
+        assert cfg.api_key == "sk-explicit"
+
+    def test_ollama_does_not_require_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA)
+        assert cfg.api_key == ""
+
+    def test_whitespace_only_env_treated_as_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "   ")
+        with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+            LLMCompressorConfig(provider=LLMProvider.OPENAI)
 
 
 class TestSurfacingNumericConstraints:
