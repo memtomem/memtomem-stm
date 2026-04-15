@@ -167,7 +167,7 @@ By server:
 Surfacing: enabled (min_score=0.02)
 ```
 
-- **Error classification** — errors are categorized as `transport`, `timeout`, `protocol`, `upstream_error`, or `programming`. Each failed call records the category and code for debugging.
+- **Error classification** — errors are categorized as `transport`, `timeout`, `protocol`, `upstream_error`, `programming`, or `internal_error`. The `internal_error` category covers exceptions raised inside the CLEAN/COMPRESS/SURFACE/INDEX pipeline after the upstream call already returned (rare in practice — most strategies fall back internally — but recording these guarantees no failed call is invisible). Each failed call records the category and code for debugging.
 - **Trace IDs** — every proxy call generates a unique `trace_id` (16-char hex) for correlating logs and metrics.
 
 Metrics are persisted to SQLite (`~/.memtomem/proxy_metrics.db`, max 10K entries) with error category and trace_id columns.

@@ -72,6 +72,7 @@ class ErrorCategory(StrEnum):
     PROTOCOL = "protocol"  # JSON-RPC errors (-32600..-32603)
     UPSTREAM_ERROR = "upstream_error"  # result.isError=True from upstream
     PROGRAMMING = "programming"  # TypeError, AttributeError, etc.
+    INTERNAL_ERROR = "internal_error"  # raised inside the COMPRESS/SURFACE/INDEX pipeline
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
