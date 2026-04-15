@@ -51,7 +51,10 @@ class RelevanceGate:
 
         # Rate limit
         now = time.monotonic()
-        while self._surfacing_timestamps and now - self._surfacing_timestamps[0] > _RATE_LIMIT_WINDOW_SECONDS:
+        while (
+            self._surfacing_timestamps
+            and now - self._surfacing_timestamps[0] > _RATE_LIMIT_WINDOW_SECONDS
+        ):
             self._surfacing_timestamps.popleft()
         if len(self._surfacing_timestamps) >= self._config.max_surfacings_per_minute:
             return False
