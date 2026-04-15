@@ -55,9 +55,14 @@ class FeedbackStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._db = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        tune_connection(self._db)
-        self._db.executescript(_SCHEMA)
+        db = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        try:
+            tune_connection(db)
+            db.executescript(_SCHEMA)
+        except Exception:
+            db.close()
+            raise
+        self._db = db
 
     def close(self) -> None:
         if self._db:

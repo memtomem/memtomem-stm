@@ -86,18 +86,23 @@ class SQLitePendingStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
-        tune_connection(self._db)
-        self._db.execute(
-            """CREATE TABLE IF NOT EXISTS pending_selections (
-                key TEXT PRIMARY KEY,
-                chunks_json TEXT NOT NULL,
-                format TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                total_chars INTEGER NOT NULL
-            )"""
-        )
-        self._db.commit()
+        db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
+        try:
+            tune_connection(db)
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS pending_selections (
+                    key TEXT PRIMARY KEY,
+                    chunks_json TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    total_chars INTEGER NOT NULL
+                )"""
+            )
+            db.commit()
+        except Exception:
+            db.close()
+            raise
+        self._db = db
 
     def close(self) -> None:
         if self._db:
