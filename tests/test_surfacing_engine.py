@@ -6,7 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 
@@ -104,6 +104,7 @@ class TestSurfacingBasic:
         output = await engine.surface("gh", "tool", {}, LONG_RESPONSE)
         assert output == LONG_RESPONSE
 
+
 class TestSurfacingGating:
     async def test_short_response_skipped(self):
         engine = SurfacingEngine(
@@ -118,7 +119,9 @@ class TestSurfacingGating:
             config=_make_config(),
             mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
         )
-        output = await engine.surface("fs", "write_file", {"path": "x", "_context_query": "test"}, LONG_RESPONSE)
+        output = await engine.surface(
+            "fs", "write_file", {"path": "x", "_context_query": "test"}, LONG_RESPONSE
+        )
         assert output == LONG_RESPONSE
 
     async def test_delete_tool_skipped(self):
@@ -126,7 +129,9 @@ class TestSurfacingGating:
             config=_make_config(),
             mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
         )
-        output = await engine.surface("fs", "delete_file", {"path": "x", "_context_query": "test"}, LONG_RESPONSE)
+        output = await engine.surface(
+            "fs", "delete_file", {"path": "x", "_context_query": "test"}, LONG_RESPONSE
+        )
         assert output == LONG_RESPONSE
 
 
@@ -225,7 +230,8 @@ class TestSessionDedup:
         # Clear cache to force re-search, but dedup should filter
         engine._cache.clear()
         out2 = await engine.surface(
-            "s", "read_file",
+            "s",
+            "read_file",
             {"path": "/other", "_context_query": "different query for search"},
             LONG_RESPONSE,
         )
@@ -469,7 +475,8 @@ class TestMaybeCleanupExpired:
         # Second call within interval — should NOT trigger cleanup again
         engine._cache.clear()
         await engine.surface(
-            "s", "read_file",
+            "s",
+            "read_file",
             {"path": "/other", "_context_query": "different query for testing"},
             LONG_RESPONSE,
         )
@@ -493,7 +500,8 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
         engine._cache.clear()
         await engine.surface(
-            "s", "read_file",
+            "s",
+            "read_file",
             {"path": "/z", "_context_query": "another query for clock test"},
             LONG_RESPONSE,
         )
@@ -577,4 +585,95 @@ class TestSurfacingEngineStop:
 
         await engine.stop()
         await engine.stop()  # second call should also be safe
+
+
+class TestWebhookExceptionPaths:
+    """Verify `_on_webhook_done` handles failures without re-raising or leaking tasks.
+
+    `_background_tasks` are fire-and-forget: a failing webhook must not (a) crash
+    the caller of `surface()`, (b) leave a dangling task in the set, or (c)
+    vanish silently — the warning log is the only operator signal.
+    """
+
+    async def _run_surface_with_webhook(self, fire_mock):
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        webhook_manager = MagicMock()
+        webhook_manager.fire = fire_mock
+        engine = SurfacingEngine(
+            config=_make_config(fire_webhook=True),
+            mcp_adapter=_make_mcp_adapter(results),
+            webhook_manager=webhook_manager,
+        )
+        output = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # Drain the fire-and-forget task so `_on_webhook_done` gets a chance to run.
+        pending = list(engine._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        return engine, output
+
+    async def test_webhook_http_error_is_logged_not_raised(self, caplog):
+        """fire() raising (simulating HTTP 500) → warning logged, caller unaffected."""
+
+        async def failing_fire(*args, **kwargs):
+            raise RuntimeError("simulated 500 Internal Server Error")
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            engine, output = await self._run_surface_with_webhook(failing_fire)
+
+        assert "Relevant Memories" in output  # surface() returned normally
+        assert len(engine._background_tasks) == 0  # task cleaned up
+        assert any(
+            "Webhook fire-and-forget task failed" in rec.message for rec in caplog.records
+        ), "webhook failure must be logged as a warning"
+
+    async def test_webhook_timeout_is_logged_not_raised(self, caplog):
+        """fire() raising TimeoutError is treated the same as any other exception."""
+
+        async def timeout_fire(*args, **kwargs):
+            raise TimeoutError("webhook POST timed out")
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            engine, _ = await self._run_surface_with_webhook(timeout_fire)
+
+        assert len(engine._background_tasks) == 0
+        assert any("Webhook fire-and-forget task failed" in rec.message for rec in caplog.records)
+
+    async def test_webhook_success_no_warning_logged(self, caplog):
+        """Happy path: fire() returns cleanly, no warning produced."""
+
+        async def ok_fire(*args, **kwargs):
+            return None
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            engine, _ = await self._run_surface_with_webhook(ok_fire)
+
+        assert len(engine._background_tasks) == 0
+        assert not any(
+            "Webhook fire-and-forget task failed" in rec.message for rec in caplog.records
+        )
+
+    async def test_webhook_cancelled_does_not_log_failure(self, caplog):
+        """A cancelled task must NOT be logged as a failure — cancellation is
+        an expected shutdown path, not an error."""
+        webhook_manager = MagicMock()
+
+        # fire() blocks forever so we can cancel it mid-flight.
+        async def blocking_fire(*args, **kwargs):
+            await asyncio.sleep(100)
+
+        webhook_manager.fire = blocking_fire
+        engine = SurfacingEngine(
+            config=_make_config(fire_webhook=True),
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(), score=0.5)]),
+            webhook_manager=webhook_manager,
+        )
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+            await engine.stop()  # cancels and drains
+
+        assert len(engine._background_tasks) == 0
+        assert not any(
+            "Webhook fire-and-forget task failed" in rec.message for rec in caplog.records
+        ), "cancelled tasks must not be logged as failures"
         assert len(engine._background_tasks) == 0
