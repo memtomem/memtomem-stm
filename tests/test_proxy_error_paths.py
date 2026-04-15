@@ -323,6 +323,60 @@ class TestReconnectFailure:
         assert session.call_tool.call_count == 2
 
 
+# ── Reconnect cleans up partial stack on failure ────────────────────────
+
+
+class TestReconnectServerCleansUpOnFailure:
+    """If `_reconnect_server()` fails after entering the new transport+session
+    contexts (e.g. `session.initialize()` raises against an unreachable server),
+    the partially-entered AsyncExitStack must be aclosed so the new subprocess
+    and stdio streams aren't leaked across retry storms — otherwise repeated
+    transient failures pile up file descriptors and zombie processes.
+    """
+
+    async def test_initialize_failure_unwinds_stack(self, monkeypatch):
+        from memtomem_stm.proxy import manager as mod
+
+        transport_exited = asyncio.Event()
+        session_exited = asyncio.Event()
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (MagicMock(), MagicMock())
+
+            async def __aexit__(self, *args):
+                transport_exited.set()
+                return None
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                session_exited.set()
+                return None
+
+            async def initialize(self):
+                raise ConnectionError("simulated init failure")
+
+        mgr = _make_manager()
+        original_session = _get_session(mgr)
+        monkeypatch.setattr(mod, "ClientSession", FakeSession)
+        monkeypatch.setattr(mgr, "_open_transport", lambda cfg: FakeTransport())
+
+        with pytest.raises(ConnectionError, match="simulated init failure"):
+            await mgr._reconnect_server("srv")
+
+        assert transport_exited.is_set(), "transport context must be aclosed on init failure"
+        assert session_exited.is_set(), "session context must be aclosed on init failure"
+        # Connection state must not be partially mutated on failure.
+        assert mgr._connections["srv"].session is original_session
+        assert mgr._connections["srv"].stack is None
+
+
 # ── Zero retries configuration ──────────────────────────────────────────
 
 

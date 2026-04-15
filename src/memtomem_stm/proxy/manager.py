@@ -239,12 +239,22 @@ class ProxyManager:
                 logger.debug("Failed to close previous stack for '%s'", name, exc_info=True)
 
         conn_stack = AsyncExitStack()
-        transport_ctx = self._open_transport(cfg)
-        streams = await conn_stack.enter_async_context(transport_ctx)
-        read, write = streams[0], streams[1]
-        session = await conn_stack.enter_async_context(ClientSession(read, write))
-        await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-        result = await session.list_tools()
+        try:
+            transport_ctx = self._open_transport(cfg)
+            streams = await conn_stack.enter_async_context(transport_ctx)
+            read, write = streams[0], streams[1]
+            session = await conn_stack.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
+            result = await session.list_tools()
+        except BaseException:
+            # Roll back any contexts we entered (transport subprocess, session
+            # streams). Without this, a failed reconnect leaks file descriptors
+            # and child processes across retry storms.
+            try:
+                await conn_stack.aclose()
+            except Exception:
+                logger.debug("Error during reconnect cleanup for '%s'", name, exc_info=True)
+            raise
 
         conn.session = session
         conn.stack = conn_stack
