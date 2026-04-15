@@ -11,9 +11,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_PATTERNS = [
     r"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]",
     r"(?i)(password|passwd|pwd)\s*[:=]",
-    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-    r"(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|xoxb-[0-9]+-)",
-    r"(?i)(BEGIN\s+(RSA|EC|OPENSSH)\s+PRIVATE\s+KEY)",
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    # Provider-prefixed token formats. Anchored by prefix so false positives
+    # on arbitrary high-entropy strings are rare.
+    r"(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|xox[bps]-[0-9A-Za-z-]+)",
+    r"github_pat_[A-Za-z0-9_]{20,}",
+    r"(?:(?:sk|pk|rk)_(?:live|test)|whsec)_[A-Za-z0-9]{20,}",
+    r"\bnpm_[A-Za-z0-9]{20,}\b",
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    # JWT-ish: three base64url segments separated by dots, anchored to the
+    # canonical ``eyJ`` header prefix to limit false positives on arbitrary
+    # dotted identifiers.
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
 ]
 
 

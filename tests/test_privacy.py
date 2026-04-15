@@ -128,3 +128,55 @@ class TestEmptyAndDefaultPatterns:
         is malformed must not crash ``contains_sensitive_content``."""
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.privacy"):
             assert privacy.contains_sensitive_content("anything", ["(bad"]) is False
+
+
+class TestDefaultPatternCoverage:
+    """Lock in which common credential formats the default set catches.
+
+    Each added pattern has an associated positive + negative case so a
+    regression (an overly loose / tight regex) trips the suite.
+    """
+
+    @pytest.mark.parametrize(
+        "sample",
+        [
+            "user@example.com",  # email (regression: prior pattern had [A-Z|a-z])
+            "contact: alice.bob+tag@sub.example.co.uk",
+            "ghp_" + "A" * 36,  # classic GitHub PAT
+            "github_pat_11ABC" + "_" + "x" * 40,  # fine-grained PAT
+            "xoxb-123456-abcdef",  # Slack bot
+            "xoxp-123456-abcdef",  # Slack user
+            "xoxs-123456-abcdef",  # Slack scope
+            "sk-" + "a" * 48,  # OpenAI-style
+            "sk_live_" + "A" * 24,  # Stripe live
+            "pk_test_" + "B" * 24,  # Stripe pub test
+            "rk_live_" + "C" * 24,  # Stripe restricted
+            "whsec_" + "D" * 24,  # Stripe webhook
+            "npm_" + "E" * 32,
+            "AKIAIOSFODNN7EXAMPLE",  # AWS IAM user
+            "ASIAIOSFODNN7EXAMPLE",  # AWS temporary
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN DSA PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY-----",
+        ],
+    )
+    def test_default_patterns_match_common_secret_shapes(self, sample: str) -> None:
+        assert privacy.contains_sensitive_content(sample) is True
+
+    @pytest.mark.parametrize(
+        "sample",
+        [
+            "This is just a harmless sentence with no secrets.",
+            "version: 1.2.3",
+            "See RFC 5322 for email format rules.",
+            # JWT false-positive guard: not prefixed with eyJ → should not match JWT rule
+            "abc.def.ghi",
+            # Short alphanumerics that could trip the AWS prefix if unanchored
+            "AKIAshort",  # missing the 16-char IAM suffix
+            "github_pat_",  # just the prefix, no body
+            "npm_",  # prefix only
+        ],
+    )
+    def test_default_patterns_do_not_match_benign_strings(self, sample: str) -> None:
+        assert privacy.contains_sensitive_content(sample) is False
