@@ -169,7 +169,14 @@ class TestCircuitBreakerProperties:
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
             mock_time.monotonic.return_value = cb._opened_at + 10.0
             result = cb.time_until_reset
-            assert result == 0.0
+            # ``time_until_reset`` computes ``reset_timeout - (now - opened_at)``.
+            # ``opened_at`` is a real ``time.monotonic()`` value (often ~1e5-1e9
+            # seconds on CI runners), so ``(opened_at + 10.0) - opened_at`` loses
+            # a few low bits and the result is ``~1e-14`` rather than bit-exact
+            # ``0.0``. The contract here is "not positive, effectively zero" —
+            # pick a tolerance several orders of magnitude below any observable
+            # reset window.
+            assert result is not None and abs(result) < 1e-9
 
     def test_backward_compat_failure_alias(self):
         cb = CircuitBreaker(max_failures=2)
