@@ -8,14 +8,20 @@ from fnmatch import fnmatch
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 
+# Module-level constants
+_MAX_RECENT_QUERIES = 50
+_MAX_SURFACING_TIMESTAMPS = 200
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_SIMILARITY_THRESHOLD = 0.95
+
 
 class RelevanceGate:
     """Determine whether to run proactive surfacing for a given tool call."""
 
     def __init__(self, config: SurfacingConfig) -> None:
         self._config = config
-        self._recent_queries: deque[tuple[float, str]] = deque(maxlen=50)
-        self._surfacing_timestamps: deque[float] = deque(maxlen=200)
+        self._recent_queries: deque[tuple[float, str]] = deque(maxlen=_MAX_RECENT_QUERIES)
+        self._surfacing_timestamps: deque[float] = deque(maxlen=_MAX_SURFACING_TIMESTAMPS)
 
     def should_surface(
         self,
@@ -45,7 +51,10 @@ class RelevanceGate:
 
         # Rate limit
         now = time.monotonic()
-        while self._surfacing_timestamps and now - self._surfacing_timestamps[0] > 60.0:
+        while (
+            self._surfacing_timestamps
+            and now - self._surfacing_timestamps[0] > _RATE_LIMIT_WINDOW_SECONDS
+        ):
             self._surfacing_timestamps.popleft()
         if len(self._surfacing_timestamps) >= self._config.max_surfacings_per_minute:
             return False
@@ -54,7 +63,7 @@ class RelevanceGate:
         for ts, prev_query in reversed(self._recent_queries):
             if now - ts >= self._config.cooldown_seconds:
                 break
-            if self._jaccard_similarity(query, prev_query) > 0.95:
+            if self._jaccard_similarity(query, prev_query) > _SIMILARITY_THRESHOLD:
                 return False
 
         return True
