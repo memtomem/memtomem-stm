@@ -13,7 +13,7 @@ from mcp.server.session import ServerSession
 
 from memtomem_stm.config import STMConfig
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
-from memtomem_stm.proxy.config import ProxyConfig
+from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -41,13 +41,18 @@ CtxType = Context[ServerSession, STMContext]
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     config = STMConfig()
+    proxy_env_overrides = collect_proxy_env_overrides()
 
-    # Merge JSON config file if env var MEMTOMEM_STM_PROXY__ENABLED was not
-    # explicitly set.  The CLI writes "enabled": true to the JSON file, but
-    # STMConfig (pydantic-settings) only reads env vars, so without this
-    # merge the proxy would be silently disabled after a normal Quick Start.
+    # Load JSON config file and overlay env vars on top so the documented
+    # precedence (env > file > defaults) holds. The CLI writes
+    # ``"enabled": true`` to the JSON file, so a normal Quick Start enables
+    # the proxy without requiring ``MEMTOMEM_STM_PROXY__ENABLED``. Without
+    # the env overlay every other env-set field would be silently clobbered
+    # by the file values.
     if not os.environ.get("MEMTOMEM_STM_PROXY__ENABLED"):
-        file_cfg = ProxyConfig.load_from_file(config.proxy.config_path)
+        file_cfg = ProxyConfig.load_from_file(
+            config.proxy.config_path, env_overrides=proxy_env_overrides
+        )
         if file_cfg is not None:
             config.proxy = file_cfg
 
@@ -146,6 +151,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
         tracker,
         surfacing_engine=surfacing_engine,
         cache=proxy_cache,
+        env_overrides=proxy_env_overrides,
     )
 
     if config.proxy.enabled:

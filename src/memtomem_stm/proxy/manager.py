@@ -107,8 +107,9 @@ class ProxyManager:
         index_engine: FileIndexer | None = None,
         surfacing_engine: SurfacingEngine | None = None,
         cache: ProxyCache | None = None,
+        env_overrides: dict[str, Any] | None = None,
     ) -> None:
-        self._config_loader = ProxyConfigLoader(config.config_path)
+        self._config_loader = ProxyConfigLoader(config.config_path, env_overrides=env_overrides)
         self._config_loader.seed(config)
         self.tracker = tracker
         self._index_engine = index_engine
