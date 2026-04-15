@@ -21,6 +21,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
+from memtomem_stm.proxy.cache import _make_key as _cache_key
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
     HybridCompressor,
@@ -142,6 +143,13 @@ class ProxyManager:
         self._relevance_scorer_instance = self._create_scorer(config)
         self._relevance_scorer_cfg = config.relevance_scorer
         self._background_tasks: set[asyncio.Task] = set()
+        # Per-key stampede guard — identical concurrent ``call_tool`` invocations
+        # serialize on the same lock so a cache miss triggers one upstream
+        # call rather than N. Entries are popped when the work completes so
+        # the dict stays bounded by the number of in-flight unique keys.
+        # Named ``_key_locks`` to match the same pattern used by
+        # ``SurfacingEngine`` (extractable into a shared helper later).
+        self._key_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
@@ -698,6 +706,24 @@ class ProxyManager:
             }
         return health
 
+    async def _on_cache_hit(
+        self,
+        cached: str,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        trace_id: str,
+    ) -> str:
+        """Shared hit path: record metric, trace span, re-apply surfacing.
+
+        Called from both the stampede guard's fast-path check and its
+        post-lock double-check so concurrent duplicate requests return
+        through the same hit pipeline as a single call would.
+        """
+        self.tracker.record_cache_hit()
+        with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
+            return await self._apply_surfacing(server, tool, arguments, cached, trace_id=trace_id)
+
     async def call_tool(self, server: str, tool: str, arguments: dict[str, Any]) -> str | list:
         """Forward a tool call to upstream, compress, surface, and return.
 
@@ -716,7 +742,7 @@ class ProxyManager:
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
         ):
             try:
-                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+                return await self._call_tool_guarded(server, tool, arguments, trace_id=trace_id)
             except Exception as exc:
                 # Upstream/transport/timeout/protocol errors are already
                 # recorded inside _call_tool_inner via record_error(); a raise
@@ -739,6 +765,53 @@ class ProxyManager:
                     except Exception:
                         logger.debug("Failed to record INTERNAL_ERROR metrics row", exc_info=True)
                 raise
+
+    async def _call_tool_guarded(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        trace_id: str,
+    ) -> str | list:
+        """Cache stampede guard: serialize identical concurrent ``call_tool``
+        invocations on a per-key lock so a cold cache + duplicate requests
+        trigger one upstream call rather than N.
+
+        Structure: fast-path check (lock-free for cache hits) → per-key
+        ``asyncio.Lock`` with double-check (another coroutine may have
+        populated while we waited) → delegate to ``_call_tool_inner`` on
+        confirmed miss. The ``_key_locks`` dict entry is popped in
+        ``finally`` while the lock is still held so any waiter already
+        queued on the same lock sees the cached result on its own
+        double-check, and a new arrival after pop likewise finds the set
+        value (stampede window closed)."""
+        upstream_args = (
+            {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
+        )
+
+        # Fast-path: cache hit without lock contention.
+        if self._cache is not None:
+            cached = self._cache.get(server, tool, upstream_args)
+            if cached is not None:
+                return await self._on_cache_hit(cached, server, tool, arguments, trace_id)
+
+        # No cache configured — stampede protection N/A, go straight through.
+        if self._cache is None:
+            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+
+        cache_key = _cache_key(server, tool, upstream_args)
+        lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            try:
+                # Double-check inside the lock: a coroutine that held the
+                # lock ahead of us may have populated the cache already.
+                cached = self._cache.get(server, tool, upstream_args)
+                if cached is not None:
+                    return await self._on_cache_hit(cached, server, tool, arguments, trace_id)
+                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            finally:
+                self._key_locks.pop(cache_key, None)
 
     async def _call_tool_inner(
         self,
@@ -766,22 +839,10 @@ class ProxyManager:
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
 
-        # ── Cache lookup ──
+        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
+        # time we get here the cache has already missed. Just account the
+        # miss and proceed with the upstream fetch.
         if self._cache is not None:
-            cached = self._cache.get(server, tool, upstream_args)
-            if cached is not None:
-                self.tracker.record_cache_hit()
-                # Re-apply surfacing on cache hit so memories stay fresh.
-                # Use original arguments (with _context_query) so the
-                # surfacing engine can use the agent's explicit query hint.
-                with traced(
-                    "proxy_call_cache_hit",
-                    metadata={"server": server, "tool": tool},
-                ):
-                    cached = await self._apply_surfacing(
-                        server, tool, arguments, cached, trace_id=trace_id
-                    )
-                return cached
             self.tracker.record_cache_miss()
 
         conn = self._connections[server]

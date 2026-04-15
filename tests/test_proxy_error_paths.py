@@ -630,7 +630,9 @@ class TestCacheWithErrors:
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
 
-        cache.get.assert_called_once()
+        # ``cache.get`` is called twice: once on the stampede guard's
+        # lock-free fast-path, once on the post-lock double-check.
+        assert cache.get.call_count == 2
         mgr.tracker.get_summary()  # should record cache miss
         assert mgr.tracker.get_summary()["cache_misses"] == 1
 
@@ -688,6 +690,50 @@ class TestCacheWithErrors:
             )
         finally:
             cache.close()
+
+    async def test_concurrent_identical_requests_stampede_on_miss(self):
+        """Two concurrent ``call_tool`` invocations with identical
+        ``(server, tool, args)`` and a cold cache should result in a
+        **single** upstream ``session.call_tool`` — otherwise every
+        duplicate request pays the full upstream cost (LLM tokens,
+        rate-limit budget, latency). The ``cache.get`` fast-path and the
+        eventual ``cache.set`` inside ``_call_tool_inner`` are separated
+        by the ``await session.call_tool`` plus the compression /
+        extraction pipeline, so without a per-key lock both coroutines
+        see a miss before either writes back."""
+        mgr = _make_manager()
+        session = _get_session(mgr)
+
+        call_count = 0
+
+        async def slow_upstream(tool, args):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)  # keep the first call in flight
+            return _make_result(f"result-{call_count}")
+
+        session.call_tool.side_effect = slow_upstream
+
+        cache_store: dict[str, str] = {}
+
+        cache = MagicMock()
+        cache.get.side_effect = lambda srv, tl, a: cache_store.get(f"{srv}|{tl}|{a}")
+
+        def _set(srv, tl, a, result, ttl_seconds=None):
+            cache_store[f"{srv}|{tl}|{a}"] = result
+
+        cache.set.side_effect = _set
+        mgr._cache = cache
+
+        await asyncio.gather(
+            mgr.call_tool("srv", "tool", {"x": 1}),
+            mgr.call_tool("srv", "tool", {"x": 1}),
+        )
+
+        assert session.call_tool.call_count == 1, (
+            "Cache stampede: identical concurrent requests both hit upstream "
+            f"({session.call_tool.call_count} upstream calls for the same key)"
+        )
 
     async def test_cache_set_failure_does_not_break_response(self):
         """A failing ``cache.set`` (SQLite lock timeout, disk full, etc.)
