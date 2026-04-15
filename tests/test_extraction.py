@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -380,6 +380,167 @@ class TestFactExtractorLLM:
 
         assert captured_text is not None
         assert len(captured_text) <= 100
+
+
+# ---------------------------------------------------------------------------
+# Provider response defense (mirrors compression.py guards from #114/#119)
+# ---------------------------------------------------------------------------
+
+
+def _mock_http_response(payload: dict) -> MagicMock:
+    """Build an httpx-like response whose ``.json()`` returns ``payload``."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=payload)
+    return resp
+
+
+def _make_extractor(provider: LLMProvider) -> FactExtractor:
+    """FactExtractor with the given provider. api_key satisfies PR #123 validator;
+    system_prompt uses the ``{max_facts}`` placeholder that ``_call_api`` expects
+    (the compressor-config default uses ``{max_chars}`` and would KeyError here)."""
+    llm_cfg = LLMCompressorConfig(
+        provider=provider,
+        api_key="test-key",
+        system_prompt="Extract up to {max_facts} facts as JSON.",
+    )
+    cfg = ExtractionConfig(
+        enabled=True,
+        strategy=ExtractionStrategy.LLM,
+        llm=llm_cfg,
+        min_response_chars=10,
+    )
+    return FactExtractor(cfg)
+
+
+class TestOpenAIResponseDefense:
+    """OpenAI content filter / quota returns ``{"choices": []}`` with 200 OK.
+    Previously crashed with IndexError; now raises ValueError which the
+    ``_extract_llm`` caller catches and falls back to heuristic extraction."""
+
+    async def test_valid_response_returns_content(self):
+        extractor = _make_extractor(LLMProvider.OPENAI)
+        payload = {"choices": [{"message": {"content": '[{"content": "fact"}]'}}]}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            result = await extractor._openai("text", "prompt")
+        assert result == '[{"content": "fact"}]'
+
+    async def test_empty_choices_raises_valueerror(self):
+        extractor = _make_extractor(LLMProvider.OPENAI)
+        with patch.object(
+            extractor._client,
+            "post",
+            AsyncMock(return_value=_mock_http_response({"choices": []})),
+        ):
+            with pytest.raises(ValueError, match="empty 'choices'"):
+                await extractor._openai("text", "prompt")
+
+    async def test_missing_content_raises_valueerror(self):
+        extractor = _make_extractor(LLMProvider.OPENAI)
+        payload = {"choices": [{"message": {}}]}  # no "content" key
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            with pytest.raises(ValueError, match="choices\\[0\\].message.content"):
+                await extractor._openai("text", "prompt")
+
+    async def test_non_dict_root_raises_valueerror(self):
+        """Some proxies return a bare error string or array on 200 OK."""
+        extractor = _make_extractor(LLMProvider.OPENAI)
+        with patch.object(
+            extractor._client,
+            "post",
+            AsyncMock(return_value=_mock_http_response({"error": "rate limited"})),
+        ):
+            with pytest.raises(ValueError, match="empty 'choices'"):
+                await extractor._openai("text", "prompt")
+
+
+class TestAnthropicResponseDefense:
+    """Anthropic safety filter returns ``{"content": []}`` with 200 OK."""
+
+    async def test_valid_response_returns_text(self):
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        payload = {"content": [{"text": '[{"content": "fact"}]'}]}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            result = await extractor._anthropic("text", "prompt")
+        assert result == '[{"content": "fact"}]'
+
+    async def test_empty_content_raises_valueerror(self):
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        with patch.object(
+            extractor._client,
+            "post",
+            AsyncMock(return_value=_mock_http_response({"content": []})),
+        ):
+            with pytest.raises(ValueError, match="empty 'content'"):
+                await extractor._anthropic("text", "prompt")
+
+    async def test_missing_text_raises_valueerror(self):
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        payload = {"content": [{"type": "tool_use"}]}  # no "text" field
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            with pytest.raises(ValueError, match="content\\[0\\].text"):
+                await extractor._anthropic("text", "prompt")
+
+
+class TestOllamaResponseDefense:
+    """Ollama returns malformed responses when the model errors mid-generation
+    or when called with a wrong endpoint shape."""
+
+    async def test_valid_response_returns_content(self):
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        payload = {"message": {"role": "assistant", "content": '[{"content": "fact"}]'}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            result = await extractor._ollama("text", "prompt")
+        assert result == '[{"content": "fact"}]'
+
+    async def test_missing_message_raises_valueerror(self):
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        with patch.object(
+            extractor._client,
+            "post",
+            AsyncMock(return_value=_mock_http_response({"done": True})),
+        ):
+            with pytest.raises(ValueError, match="message.content"):
+                await extractor._ollama("text", "prompt")
+
+    async def test_non_string_content_raises_valueerror(self):
+        """Ollama occasionally emits ``content: null`` for tool-only turns."""
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        payload = {"message": {"content": None}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            with pytest.raises(ValueError, match="message.content"):
+                await extractor._ollama("text", "prompt")
+
+
+class TestExtractLlmFallsBackOnValueError:
+    """End-to-end: malformed provider response → ValueError → heuristic fallback.
+    Ensures the caller (_extract_llm) treats the new ValueError the same as
+    a transport error and doesn't regress into returning ``[]`` silently."""
+
+    async def test_empty_choices_triggers_heuristic_fallback(self):
+        extractor = _make_extractor(LLMProvider.OPENAI)
+        with patch.object(
+            extractor._client,
+            "post",
+            AsyncMock(return_value=_mock_http_response({"choices": []})),
+        ):
+            text = "Decision: Use Redis for caching. " * 20
+            facts = await extractor.extract(text, server="s", tool="t")
+
+        assert isinstance(facts, list)
+        assert extractor._cb.failure_count == 1
 
 
 # ---------------------------------------------------------------------------
