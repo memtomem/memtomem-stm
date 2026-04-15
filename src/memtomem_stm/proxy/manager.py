@@ -853,10 +853,13 @@ class ProxyManager:
                     logger.error("Reconnect to '%s' failed: %s", server, reconnect_exc)
                     raise
 
-        # Separate text and non-text content
+        # Separate text and non-text content. ``result.content`` is required by
+        # the MCP spec to be a list, but spec-noncompliant upstreams have been
+        # observed returning ``None`` — guard so we degrade to "[empty response]"
+        # via the existing empty-text-parts path instead of raising TypeError.
         text_parts: list[str] = []
         non_text_content: list = []
-        for content in result.content:
+        for content in result.content or []:
             if content.type == "text":
                 text_parts.append(content.text)
             else:
