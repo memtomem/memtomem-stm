@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from pydantic import BaseModel
 
 from memtomem_stm.proxy.config import ProxyConfig
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -22,6 +20,15 @@ class LangfuseConfig(BaseModel):
     host: str = ""
     sampling_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     """Fraction of proxy calls to trace (0.0–1.0).  Default 1.0 = all."""
+
+    @model_validator(mode="after")
+    def _require_keys_when_enabled(self) -> "LangfuseConfig":
+        if self.enabled and not (self.public_key and self.secret_key):
+            raise ValueError(
+                "LangfuseConfig.enabled=true requires both public_key and secret_key "
+                "to be set (non-empty)."
+            )
+        return self
 
 
 class STMConfig(BaseSettings):
