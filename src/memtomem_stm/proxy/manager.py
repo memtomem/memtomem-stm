@@ -99,6 +99,19 @@ class UpstreamConnection:
     stack: AsyncExitStack | None = None
 
 
+def _mark_recorded(exc: BaseException) -> None:
+    """Tag *exc* so the outer ``call_tool`` wrapper does not double-record it.
+
+    The pipeline records its own typed metrics rows for upstream / transport /
+    timeout / protocol errors. The ``call_tool`` outer wrapper catches anything
+    else as ``INTERNAL_ERROR``; this marker keeps the two paths from racing.
+    """
+    try:
+        exc._stm_metrics_recorded = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
+
 class ProxyManager:
     def __init__(
         self,
@@ -701,7 +714,30 @@ class ProxyManager:
             "proxy_call",
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
         ):
-            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            try:
+                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            except Exception as exc:
+                # Upstream/transport/timeout/protocol errors are already
+                # recorded inside _call_tool_inner via record_error(); a raise
+                # that escapes to here means a CLEAN/COMPRESS/SURFACE/INDEX
+                # stage threw after the upstream call had already returned.
+                # Without this guard the metrics row was silently skipped,
+                # leaving operators blind to in-pipeline failures.
+                if not getattr(exc, "_stm_metrics_recorded", False):
+                    try:
+                        self.tracker.record_error(
+                            CallMetrics(
+                                server=server,
+                                tool=tool,
+                                original_chars=0,
+                                compressed_chars=0,
+                                trace_id=trace_id,
+                                error_category=ErrorCategory.INTERNAL_ERROR,
+                            )
+                        )
+                    except Exception:
+                        logger.debug("Failed to record INTERNAL_ERROR metrics row", exc_info=True)
+                raise
 
     async def _call_tool_inner(
         self,
@@ -779,6 +815,7 @@ class ProxyManager:
                             trace_id=trace_id,
                         )
                     )
+                    _mark_recorded(exc)
                     raise
 
                 # Protocol errors (bad params, unknown method) — don't retry,
@@ -799,6 +836,7 @@ class ProxyManager:
                             trace_id=trace_id,
                         )
                     )
+                    _mark_recorded(exc)
                     try:
                         await self._reconnect_server(server)
                     except Exception:
@@ -826,6 +864,7 @@ class ProxyManager:
                             trace_id=trace_id,
                         )
                     )
+                    _mark_recorded(exc)
                     # Reconnect before raising so the NEXT call starts fresh
                     try:
                         await self._reconnect_server(server)
@@ -895,7 +934,9 @@ class ProxyManager:
             # proxied response instead of silently converting to a normal result.
             from mcp.server.fastmcp.exceptions import ToolError
 
-            raise ToolError(original_text)
+            tool_err = ToolError(original_text)
+            _mark_recorded(tool_err)
+            raise tool_err
 
         # Resolve effective settings (using config snapshot)
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
