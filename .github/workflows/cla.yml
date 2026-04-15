@@ -22,8 +22,21 @@ jobs:
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT from an admin account. The built-in GITHUB_TOKEN cannot push
+          # to `main` because branch protection requires status checks + a PR
+          # review, and GITHUB_TOKEN is not an admin actor. `enforce_admins`
+          # is false on this repo, so an admin PAT bypasses protection and
+          # lets the bot commit the signature JSON directly. See #89.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         with:
           path-to-signatures: 'signatures/v1/cla.json'
+          # Pin the action's `isRemoteRepoOrOrgConfigured` branch to true even
+          # though signatures live in this same repo. Without these inputs the
+          # action ignores PERSONAL_ACCESS_TOKEN and uses GITHUB_TOKEN, which
+          # cannot bypass branch protection on `main`. See #89 for the source-
+          # code analysis (src/persistence/persistence.ts).
+          remote-organization-name: memtomem
+          remote-repository-name: memtomem-stm
           path-to-document: 'https://github.com/memtomem/memtomem-stm/blob/main/CLA.md'
           branch: 'main'
           allowlist: dependabot[bot],memtomem

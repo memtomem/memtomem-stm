@@ -50,8 +50,10 @@ export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER=bm25           # "bm25" or "
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_PROVIDER=ollama
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_MODEL=nomic-embed-text
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_BASE_URL=http://localhost:11434
-# When embedding_provider is "openai", set OPENAI_API_KEY:
-# export OPENAI_API_KEY=sk-...
+
+# Required when embedding_provider="openai" — the scorer reads this from the
+# environment and falls back to BM25 with an HTTP 401 if missing.
+export OPENAI_API_KEY=sk-...
 
 # Extraction (Stage 4b — auto fact extraction)
 export MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED=false
@@ -196,6 +198,7 @@ Full example with all options:
     "scorer": "bm25",
     "embedding_provider": "ollama",
     "embedding_model": "nomic-embed-text",
+    "embedding_base_url": null,
     "embedding_timeout": 10.0
   },
   "extraction": {
@@ -225,7 +228,16 @@ Full example with all options:
 }
 ```
 
-The config file is **hot-reloaded** — per-server settings (compression strategy, max_chars, cleaning options, tool_overrides) take effect on the next tool call without restarting STM. However, adding or removing upstream servers requires a server restart because transport connections are established once at startup.
+The config file is **hot-reloaded** — changes take effect on the next tool call without restarting STM. Adding or removing upstream servers still requires a server restart because transport connections are established once at startup.
+
+| Setting group | Hot-reload? | Notes |
+|---------------|-------------|-------|
+| Per-server compression, cleaning, `tool_overrides` | Yes | `compression`, `max_result_chars`, `retention_floor`, `cleaning.*`, `tool_overrides.*` take effect on the next tool call |
+| `relevance_scorer.*` | Yes | All five fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`). A change in any field rebuilds the scorer instance in place. |
+| `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
+| Adding / removing upstream servers | **No** (restart) | Transport connections are established once at startup. |
+
+Omitting `embedding_base_url` (or setting it to `null`) lets provider-aware defaults fill it in — `ollama → http://localhost:11434`, `openai → https://api.openai.com`.
 
 ```mermaid
 sequenceDiagram

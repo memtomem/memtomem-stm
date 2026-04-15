@@ -183,6 +183,19 @@ This makes memtomem just another MCP upstream as far as STM is concerned — the
 
 > **Note**: prior versions supported an in-process mode that imported memtomem directly. That path was removed so STM has a single LTM retrieval path and so core internals can evolve without breaking STM.
 
+## Session & Cross-Session Dedup
+
+Surfacing tracks which memory IDs have already been shown so the same content does not surface twice. Two layers work together:
+
+| Layer | Storage | Purpose | Eviction |
+|-------|---------|---------|----------|
+| In-memory `_surfaced_ids` | Insertion-ordered `dict` on the `SurfacingEngine` | Skip IDs already surfaced in this process | Bulk prune to ~5,000 entries when size exceeds **10,000** (FIFO — oldest insertions go first) |
+| Persistent `seen_memories` | SQLite row in `stm_feedback.db` | Skip IDs surfaced in a prior session within `dedup_ttl_seconds` | TTL-based (default 7 days; `0` disables) |
+
+The in-memory set is **seeded from `seen_memories`** on startup so dedup survives restarts within the TTL, and every new surfacing writes to both layers via `FeedbackStore.mark_surfaced(ids)`.
+
+> **Why did an old memory re-surface?** Two common causes: (1) the 10k FIFO cap evicted the ID during a long session, so the in-memory layer no longer remembers it; (2) `dedup_ttl_seconds` elapsed, so the persistent row was ignored. Lower the TTL or raise it as needed — setting `dedup_ttl_seconds=0` disables cross-session dedup entirely.
+
 ## Feedback & Auto-Tuning
 
 ```mermaid
@@ -222,12 +235,15 @@ stm_surfacing_feedback(surfacing_id="ghi789", rating="already_known")
 
 Valid ratings: `helpful`, `not_relevant`, `already_known`.
 
-When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback:
+When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback. In plain terms: **`not_relevant` ratings push `min_score` up** (surfacing becomes more selective), while a run of **`helpful`/`already_known` ratings pushes it down** (surfacing becomes more inclusive) because they keep the `not_relevant` ratio low. Concretely:
 
 | Feedback ratio | Action |
 |----------------|--------|
 | > 60% `not_relevant` | Raise `min_score` by +0.002 (surface fewer, more relevant) |
 | < 20% `not_relevant` | Lower `min_score` by -0.002 (surface more) |
+| 20–60% `not_relevant` | Hold current `min_score` |
+
+Adjustment step is `auto_tune_score_increment` (default `0.002`) and the tuned score is clamped to `[0.005, 0.05]`.
 
 ```mermaid
 flowchart LR

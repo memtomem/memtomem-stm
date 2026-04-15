@@ -31,7 +31,18 @@ class BM25Scorer:
     basic suffix stemming. Zero external dependencies.
     """
 
-    _TOKEN_RE = re.compile(r"[a-zA-Z0-9\uac00-\ud7a3\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff_]+")
+    _TOKEN_RE = re.compile(
+        r"[a-zA-Z0-9"
+        r"\uac00-\ud7a3"  # Korean (Hangul syllables)
+        r"\u3040-\u309f"  # Hiragana
+        r"\u30a0-\u30ff"  # Katakana
+        r"\u4e00-\u9fff"  # CJK Unified Ideographs
+        r"\u0400-\u04ff"  # Cyrillic
+        r"\u0600-\u06ff"  # Arabic
+        r"\u0900-\u097f"  # Devanagari
+        r"\u0e00-\u0e7f"  # Thai
+        r"_]+"
+    )
     _SUFFIX_RE = re.compile(r"(ing|ed|ly|tion|ness|ment|ies|es|s)$")
     _HEADING_WEIGHT = 3.0
 
@@ -129,9 +140,13 @@ class EmbeddingScorer:
 
         try:
             return self._score_via_embedding(query, sections)
-        except Exception:
+        except Exception as exc:
+            # Expected fallback path (Ollama offline, network hiccup, timeout):
+            # we already have a working BM25 scorer and fallback_count surfaces
+            # the rate. Full stack on every hit buries real errors in log-
+            # aggregation pipelines, so log the exception message only.
             self.fallback_count += 1
-            logger.warning("EmbeddingScorer failed, falling back to BM25", exc_info=True)
+            logger.warning("EmbeddingScorer failed, falling back to BM25: %s", exc)
             return self._fallback.score_sections(query, sections)
 
     def _score_via_embedding(self, query: str, sections: list[tuple[str, str]]) -> list[float]:

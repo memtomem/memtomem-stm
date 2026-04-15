@@ -42,15 +42,39 @@ class TestSurfacingCacheEviction:
         # Should have evicted oldest entries
         assert len(cache._cache) <= 3
 
-    def test_expired_entries_evicted_first(self):
+    def test_fifo_eviction_drops_first_inserted(self):
+        """Overflow drops the first-inserted entry, not an arbitrary one."""
+        cache = SurfacingCache(ttl=60.0, max_entries=3)
+        cache.set("q1", ["r1"])
+        cache.set("q2", ["r2"])
+        cache.set("q3", ["r3"])
+        cache.set("q4", ["r4"])  # evicts q1
+        assert cache.get("q1") is None
+        assert cache.get("q2") == ["r2"]
+        assert cache.get("q3") == ["r3"]
+        assert cache.get("q4") == ["r4"]
+
+    def test_reinsert_refreshes_order(self):
+        """Setting an existing key moves it to the tail (youngest position)."""
+        cache = SurfacingCache(ttl=60.0, max_entries=3)
+        cache.set("q1", ["r1"])
+        cache.set("q2", ["r2"])
+        cache.set("q3", ["r3"])
+        cache.set("q1", ["r1_new"])  # re-insert moves q1 to tail
+        cache.set("q4", ["r4"])  # evicts q2 (now the oldest), not q1
+        assert cache.get("q1") == ["r1_new"]
+        assert cache.get("q2") is None
+        assert cache.get("q3") == ["r3"]
+        assert cache.get("q4") == ["r4"]
+
+    def test_expired_entries_evicted_lazily_on_get(self):
+        """Expired entries are removed on get() rather than scanned on set()."""
         cache = SurfacingCache(ttl=0.01, max_entries=3)
         cache.set("old1", ["r1"])
-        cache.set("old2", ["r2"])
         time.sleep(0.02)
-        # These should evict expired entries
-        cache.set("new1", ["r3"])
-        cache.set("new2", ["r4"])
-        assert cache.get("new1") == ["r3"]
+        # Lazy expiry: get() returns None and deletes the entry in place
+        assert cache.get("old1") is None
+        assert "old1" not in {k for k in cache._cache}
 
 
 class TestSurfacingCacheClear:

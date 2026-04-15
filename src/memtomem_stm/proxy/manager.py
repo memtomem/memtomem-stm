@@ -802,7 +802,11 @@ class ProxyManager:
                     try:
                         await self._reconnect_server(server)
                     except Exception:
-                        logger.warning("Post-protocol-error reconnect failed", exc_info=True)
+                        # Expected fallback: the primary error is already being
+                        # re-raised and carries the actionable trace. The
+                        # reconnect attempt here is best-effort for the NEXT
+                        # call — a failure is noise for current operators.
+                        logger.debug("Post-protocol-error reconnect failed", exc_info=True)
                     raise
 
                 if attempt >= cfg.max_retries:
@@ -826,7 +830,10 @@ class ProxyManager:
                     try:
                         await self._reconnect_server(server)
                     except Exception:
-                        logger.warning("Post-failure reconnect failed", exc_info=True)
+                        # Same reasoning as the protocol-error path above:
+                        # the primary failure is being re-raised, the
+                        # reconnect attempt is just pre-emptive cleanup.
+                        logger.debug("Post-failure reconnect failed", exc_info=True)
                     raise
                 logger.warning(
                     "Tool call %s/%s failed (attempt %d/%d): %s",
