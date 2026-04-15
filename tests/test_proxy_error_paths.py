@@ -377,6 +377,55 @@ class TestReconnectServerCleansUpOnFailure:
         assert mgr._connections["srv"].stack is None
 
 
+# ── Background task race during stop() ──────────────────────────────────
+
+
+class TestBackgroundTasksStopRace:
+    """When ``stop()`` is draining ``_background_tasks``, a task added to the
+    set after ``asyncio.gather(...)`` has snapshotted its arguments must
+    still be cancelled. In production, a request-path coroutine can
+    schedule a background extraction after ``stop()`` began its drain but
+    before it completes, leaving the new task orphaned and potentially
+    accessing ``_extractor`` / ``_index_engine`` after they have been
+    closed."""
+
+    async def test_task_added_during_stop_gather_is_cancelled(self):
+        """Deterministic variant: an existing task, when cancelled by ``stop``,
+        schedules a new background task before re-raising. This mirrors the
+        production race (a ``call_tool`` in flight during shutdown scheduling
+        extraction) without relying on sleep timing."""
+        mgr = _make_manager()
+        added: list[asyncio.Task] = []
+
+        async def self_spawning_on_cancel():
+            try:
+                # Park indefinitely until cancelled.
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Simulate ``call_tool`` racing with shutdown — a background
+                # extraction is scheduled and added to ``_background_tasks``
+                # after ``stop()`` has already snapshotted the original set.
+                new = asyncio.create_task(asyncio.sleep(5))
+                mgr._background_tasks.add(new)
+                added.append(new)
+                raise
+
+        existing = asyncio.create_task(self_spawning_on_cancel())
+        mgr._background_tasks.add(existing)
+        # Let the task start and park on the wait() before stop() cancels it,
+        # so cancellation triggers the except block rather than a cancel-
+        # before-start shortcut.
+        await asyncio.sleep(0)
+
+        await mgr.stop()
+
+        assert added, "self_spawning_on_cancel did not schedule follow-up task"
+        assert added[0].done() or added[0].cancelled(), (
+            "Task added to _background_tasks during stop()'s gather was "
+            "neither cancelled nor awaited — it leaks past stop()"
+        )
+
+
 # ── Zero retries configuration ──────────────────────────────────────────
 
 

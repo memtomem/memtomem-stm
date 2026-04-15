@@ -270,11 +270,29 @@ class ProxyManager:
         logger.info("Reconnected to '%s' (%s tools)", name, len(conn.tools))
 
     async def stop(self) -> None:
-        # Cancel and drain background tasks (extraction, etc.)
-        for task in self._background_tasks:
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        # Cancel and drain background tasks (extraction, etc.). Loop until
+        # the set is empty — a concurrent call_tool may schedule a new
+        # extraction task during our gather await (``call_tool`` adds to
+        # ``_background_tasks`` after ``asyncio.create_task(...)``), and
+        # ``asyncio.gather(*snapshot)`` only awaits the snapshot, leaving
+        # a late task pending. A second iteration catches and cancels it.
+        # Bound the loop so a pathological task that keeps scheduling
+        # replacements can't spin forever.
+        for _ in range(8):
+            if not self._background_tasks:
+                break
+            batch = list(self._background_tasks)
+            for task in batch:
+                task.cancel()
+            await asyncio.gather(*batch, return_exceptions=True)
+            for task in batch:
+                self._background_tasks.discard(task)
+        else:
+            logger.warning(
+                "ProxyManager.stop(): %d background tasks still pending after "
+                "drain loop; leaking them",
+                len(self._background_tasks),
+            )
         self._background_tasks.clear()
         # Close httpx clients
         if self._llm_compressor is not None:
