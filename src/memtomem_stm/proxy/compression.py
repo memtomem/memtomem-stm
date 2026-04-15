@@ -59,7 +59,13 @@ class Compressor(Protocol):
 
 
 class NoopCompressor:
-    """No compression — passthrough."""
+    """No compression — passthrough.
+
+    Example::
+
+        Input  (max_chars=20): "Unchanged response."
+        Output:                "Unchanged response."
+    """
 
     def compress(self, text: str, *, max_chars: int) -> str:
         return text
@@ -71,6 +77,16 @@ class TruncateCompressor:
     For text with markdown headings, prefers to cut at heading boundaries
     and appends a list of remaining section titles. For plain text, cuts
     at the nearest sentence or word boundary.
+
+    Example — markdown with multiple sections (preserves every heading)::
+
+        Input:  "## Setup\\nInstall deps.\\n\\n## API\\nGET /users.\\n\\n## Errors\\n500 means DB down."
+        Output: "## Setup\\nInstall deps.\\n\\n## API\\nGET /users.\\n\\n## Errors\\n500 means DB down."
+
+    Example — plain text (sentence-boundary cut with length suffix)::
+
+        Input:  "First sentence. Second sentence explains more. Third sentence adds context."
+        Output: "First sentence. Second sentence explains more.\\n... (truncated, original: 76 chars)"
 
     Note: minimum retention is enforced at the pipeline level
     (ProxyManager / BenchHarness), not in the compressor. The compressor
@@ -590,7 +606,26 @@ class PendingSelection:
 
 
 class SelectiveCompressor:
-    """2-phase compression: Phase 1 returns a TOC, Phase 2 returns selected sections."""
+    """2-phase compression: Phase 1 returns a TOC, Phase 2 returns selected sections.
+
+    Phase 1 parses the input into named chunks (JSON keys, markdown sections,
+    or text paragraphs), stores them keyed by a UUID, and returns a JSON
+    table of contents. Phase 2 (``select(key, sections=[...])``) retrieves
+    the selected chunks.
+
+    Example — Phase 1 (markdown → TOC JSON, shape simplified)::
+
+        Input:  "## Users\\n<120 chars>\\n\\n## Orders\\n<95 chars>"
+        Output: {"type": "toc", "selection_key": "a1b2c3d4e5f67890", "format": "markdown",
+                 "entries": [{"key": "users", "size": 120, "preview": "..."},
+                             {"key": "orders", "size": 95, "preview": "..."}],
+                 "hint": "Call stm_proxy_select_chunks(key=..., sections=[...]) to retrieve."}
+
+    Example — Phase 2 (caller picks ``['users']``)::
+
+        select(key="a1b2c3d4e5f67890", sections=["users"])
+          → "## Users\\n<120 chars of actual content>"
+    """
 
     def __init__(
         self,
@@ -797,7 +832,19 @@ class SelectiveCompressor:
 
 
 class FieldExtractCompressor:
-    """JSON: preserve key structure + truncate values. Text: head + tail lines."""
+    """JSON: preserve key structure + truncate values. Text: head + tail lines.
+
+    Example — JSON (keys kept, long values truncated)::
+
+        Input:  {"user": {"name": "Alice",
+                          "bio": "A very long biography spanning many sentences..."}}
+        Output: {"user": {"name": "Alice", "bio": "A very long biograp..."}}
+
+    Example — plain text (head + tail, middle elided)::
+
+        Input:  "Line 1\\nLine 2\\nLine 3\\nLine 4\\nLine 5"
+        Output: "Line 1\\nLine 2\\n...\\nLine 5"
+    """
 
     def compress(self, text: str, *, max_chars: int) -> str:
         if not text or len(text) <= max_chars:
@@ -940,6 +987,13 @@ class SchemaPruningCompressor:
     Arrays are sampled (first 2 + last 1 + count), strings are capped.
     This ensures every configuration field, every nested key, and every
     data relationship is represented in the output.
+
+    Example — nested config with a long array (all keys preserved, array sampled)::
+
+        Input:  {"db": {"host": "prod", "pool": {"min": 2, "max": 20}},
+                 "servers": ["s1", "s2", "s3", "s4", "s5"]}
+        Output: {"db": {"host": "prod", "pool": {"min": 2, "max": 20}},
+                 "servers": ["s1", "s2", "... (2 items omitted)", "s5"]}
     """
 
     def __init__(self, max_string: int = 80, max_array_items: int = 3) -> None:
@@ -992,6 +1046,15 @@ class SkeletonCompressor:
     For documents with many parallel sections (API docs, changelogs),
     keeps the full document skeleton so no section is completely lost.
     Body content is aggressively trimmed to heading + first key line only.
+
+    Example — API reference with many endpoints (every heading survives)::
+
+        Input:  "## GET /users\\nReturns list of users.\\n<20 more detail lines>\\n\\n"
+                "## POST /users\\nCreates user.\\n<15 more detail lines>\\n\\n"
+                "## DELETE /users/:id\\nRemoves user.\\n<10 more detail lines>"
+        Output: "## GET /users\\nReturns list of users.\\n\\n"
+                "## POST /users\\nCreates user.\\n\\n"
+                "## DELETE /users/:id\\nRemoves user."
     """
 
     _HEADING_RE = re.compile(r"^(#{1,6}\s.+)$", re.MULTILINE)
@@ -1049,7 +1112,17 @@ class SkeletonCompressor:
 
 
 class LLMCompressor:
-    """Compress by asking an LLM to summarize the text."""
+    """Compress by asking an LLM to summarize the text.
+
+    Uses OpenAI / Anthropic / Ollama depending on ``LLMCompressorConfig.provider``.
+    Output quality and exact wording depend on the model and system prompt.
+
+    Example (representative; actual output varies by model)::
+
+        Input:  "The Redis cache stores session IDs keyed by user ID with a 24h TTL.
+                 Eviction uses LRU and total memory cap is 2GB. Miss rate averages 3%."
+        Output: "Redis session cache — 24h TTL, LRU eviction, 2GB cap, ~3% miss rate."
+    """
 
     _OPENAI_URL = "https://api.openai.com/v1/chat/completions"
     _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -1223,7 +1296,22 @@ class LLMCompressor:
 
 
 class HybridCompressor:
-    """Head preserve + tail compress (TOC or truncate)."""
+    """Head preserve + tail compress (TOC or truncate).
+
+    The head (first ``head_chars``) is kept verbatim so the most important
+    context survives untouched. The tail is compressed via SelectiveCompressor
+    (``tail_mode=toc``) or TruncateCompressor (``tail_mode=truncate``),
+    separated by a marker line.
+
+    Example — long markdown (head verbatim, tail → selective TOC)::
+
+        Input:  "## Overview\\n<5000 chars of detail>\\n\\n"
+                "## API\\n<1500 chars>\\n\\n## Config\\n<1200 chars>"
+        Output: "## Overview\\n<5000 chars of detail>\\n"
+                "---\\n"
+                "Remaining content (2700 chars) — Table of Contents:\\n\\n"
+                "<JSON TOC listing api, config>"
+    """
 
     _SEPARATOR_TEMPLATE = "\n---\nRemaining content ({remaining} chars) — Table of Contents:\n\n"
     _SEPARATOR_TRUNC_TEMPLATE = "\n---\nRemaining content ({remaining} chars, truncated):\n\n"
