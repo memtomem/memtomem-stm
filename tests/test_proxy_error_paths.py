@@ -649,6 +649,46 @@ class TestCacheWithErrors:
         session.call_tool.assert_not_called()
         assert mgr.tracker.get_summary()["cache_hits"] == 1
 
+    async def test_cache_roundtrip_is_reachable_with_trace_id_propagation(self, tmp_path):
+        """End-to-end cache round-trip: a real ``ProxyCache`` backed by
+        SQLite must observe a hit on a second call with identical args,
+        *even while ``_trace_id`` is being injected into the upstream args
+        for observability*. The bug this regression protects against —
+        ``upstream_args["_trace_id"] = trace_id`` mutating the same dict
+        that later feeds ``cache.set`` — makes every stored entry keyed
+        on a per-request random hex, so no future lookup can ever match
+        (cache hit rate structurally 0%).
+
+        Uses a real ``ProxyCache``, not ``MagicMock``, because mock-backed
+        tests don't enforce key equality between ``get`` and ``set`` and
+        so can't detect the mutation bug."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [_make_result("upstream payload")]
+
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            # First call: miss → upstream → set.
+            r1 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "upstream payload" in r1
+            assert session.call_tool.call_count == 1
+
+            # Second call with the SAME args: must hit cache (no upstream).
+            r2 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "upstream payload" in r2
+            assert session.call_tool.call_count == 1, (
+                "Cache round-trip broken: second identical call went to "
+                f"upstream ({session.call_tool.call_count} calls). "
+                "cache.set key likely diverged from cache.get key "
+                "(e.g. trace_id injection mutating the shared args dict)."
+            )
+        finally:
+            cache.close()
+
     async def test_cache_set_failure_does_not_break_response(self):
         """A failing ``cache.set`` (SQLite lock timeout, disk full, etc.)
         must not discard a successful upstream response. Cache writes are

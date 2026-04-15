@@ -788,6 +788,14 @@ class ProxyManager:
         cfg = conn.config
         delay = cfg.reconnect_delay_seconds
 
+        # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
+        # The cache lookup at L771 used the original args (no ``_trace_id``);
+        # if cache.set uses the mutated args, every stored entry is keyed on
+        # a per-request random hex and is unreachable by any future lookup
+        # (hit rate structurally 0%). Keep upstream args mutated for trace
+        # propagation, but persist under the original key.
+        cache_args = {**upstream_args}
+
         # Propagate trace context to upstream server for end-to-end correlation.
         if trace_id is not None:
             upstream_args["_trace_id"] = trace_id
@@ -1282,7 +1290,7 @@ class ProxyManager:
                 self._cache.set(
                     server,
                     tool,
-                    upstream_args,
+                    cache_args,
                     compressed,
                     ttl_seconds=cfg_snap.cache.default_ttl_seconds,
                 )
