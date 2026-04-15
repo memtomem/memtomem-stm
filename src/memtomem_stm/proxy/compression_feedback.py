@@ -79,7 +79,11 @@ class CompressionFeedbackTracker:
                     server, tool, TRACE_LOOKUP_WINDOW_SECONDS
                 )
             except Exception:
-                logger.warning("trace_id lookup failed", exc_info=True)
+                # Expected fallback: trace_id is a best-effort correlation,
+                # not a hard requirement — the report still lands with
+                # trace_id=None. Demoted from warning to avoid treating a
+                # benign metrics-store query failure as an actionable error.
+                logger.debug("trace_id lookup failed", exc_info=True)
                 resolved_trace = None
 
         self._store.record(server, tool, kind, missing, resolved_trace)
