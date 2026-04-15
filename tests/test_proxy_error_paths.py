@@ -627,3 +627,22 @@ class TestCacheWithErrors:
         assert result == "cached result"
         session.call_tool.assert_not_called()
         assert mgr.tracker.get_summary()["cache_hits"] == 1
+
+    async def test_cache_set_failure_does_not_break_response(self):
+        """A failing ``cache.set`` (SQLite lock timeout, disk full, etc.)
+        must not discard a successful upstream response. Cache writes are
+        an optional fast-path, not a correctness dependency: a swallowed
+        warning is the expected behaviour."""
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("hello world")
+
+        cache = MagicMock()
+        cache.get.return_value = None  # miss → upstream is consulted
+        cache.set.side_effect = RuntimeError("simulated SQLite lock timeout")
+        mgr._cache = cache
+
+        # Must not raise — response returns normally.
+        result = await mgr.call_tool("srv", "tool", {})
+        assert "hello world" in result
+        cache.set.assert_called_once()

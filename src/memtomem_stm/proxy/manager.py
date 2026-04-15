@@ -1270,14 +1270,25 @@ class ProxyManager:
         )
 
         # ── Cache store (pre-surfacing content so memories stay fresh on hit) ──
+        # Cache writes are an optional fast-path: a SQLite lock timeout, disk
+        # full, or any other store error must NOT propagate to the agent and
+        # discard a successful upstream response. Log and continue.
         if self._cache is not None and not non_text_content:
-            self._cache.set(
-                server,
-                tool,
-                upstream_args,
-                compressed,
-                ttl_seconds=cfg_snap.cache.default_ttl_seconds,
-            )
+            try:
+                self._cache.set(
+                    server,
+                    tool,
+                    upstream_args,
+                    compressed,
+                    ttl_seconds=cfg_snap.cache.default_ttl_seconds,
+                )
+            except Exception:
+                logger.warning(
+                    "Cache store failed for %s/%s — response unaffected",
+                    server,
+                    tool,
+                    exc_info=True,
+                )
 
         # Combine compressed text with preserved non-text content
         if non_text_content:
