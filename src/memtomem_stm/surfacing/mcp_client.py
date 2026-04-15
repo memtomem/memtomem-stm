@@ -179,17 +179,30 @@ class McpClientSearchAdapter:
 
     async def start(self) -> None:
         """Connect to the memtomem MCP server."""
-        self._stack = AsyncExitStack()
-        params = StdioServerParameters(
-            command=self._config.ltm_mcp_command,
-            args=self._config.ltm_mcp_args,
-        )
-        transport = stdio_client(params)
-        streams = await self._stack.enter_async_context(transport)
-        self._session = await self._stack.enter_async_context(ClientSession(streams[0], streams[1]))
-        await self._session.initialize()
-        logger.info("MCP client connected to memtomem server: %s", self._config.ltm_mcp_command)
-        await self._negotiate_format()
+        stack = AsyncExitStack()
+        self._stack = stack
+        try:
+            params = StdioServerParameters(
+                command=self._config.ltm_mcp_command,
+                args=self._config.ltm_mcp_args,
+            )
+            transport = stdio_client(params)
+            streams = await stack.enter_async_context(transport)
+            self._session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await self._session.initialize()
+            logger.info("MCP client connected to memtomem server: %s", self._config.ltm_mcp_command)
+            await self._negotiate_format()
+        except BaseException:
+            # Roll back any contexts we entered (transport subprocess, session
+            # streams) so a failed start — common during reconnect storms —
+            # doesn't leak file descriptors and child processes across retries.
+            try:
+                await stack.aclose()
+            except Exception:
+                logger.debug("Error during MCP client start() cleanup", exc_info=True)
+            self._stack = None
+            self._session = None
+            raise
 
     async def _negotiate_format(self) -> None:
         """Downgrade to compact if core doesn't advertise structured support.

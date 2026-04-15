@@ -286,3 +286,57 @@ class TestNoneContentDefense:
 
         entries = await adapter.scratch_list()
         assert entries == []
+
+
+# ── start() cleanup on failure ───────────────────────────────────────────
+
+
+class TestStartCleansUpOnFailure:
+    """If `start()` fails after entering the transport+session contexts (e.g.
+    `session.initialize()` raises against an unreachable server), the
+    AsyncExitStack must be aclosed so the spawned subprocess and stdio streams
+    aren't leaked across reconnect retries — otherwise repeated transient
+    failures pile up file descriptors and zombie processes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_initialize_failure_unwinds_stack_and_clears_state(self, monkeypatch):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        transport_exited = asyncio.Event()
+        session_exited = asyncio.Event()
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (MagicMock(), MagicMock())
+
+            async def __aexit__(self, *args):
+                transport_exited.set()
+                return None
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                session_exited.set()
+                return None
+
+            async def initialize(self):
+                raise ConnectionError("simulated init failure")
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: FakeTransport())
+        monkeypatch.setattr(mod, "ClientSession", FakeSession)
+
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        with pytest.raises(ConnectionError, match="simulated init failure"):
+            await adapter.start()
+
+        assert transport_exited.is_set(), "transport context must be aclosed on init failure"
+        assert session_exited.is_set(), "session context must be aclosed on init failure"
+        assert adapter._stack is None
+        assert adapter._session is None
