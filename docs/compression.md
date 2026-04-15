@@ -271,6 +271,8 @@ When an agent provides `_context_query` in tool arguments, compression allocates
 
 `RelevanceScorer` protocol (`proxy/relevance.py`) enables custom scorer implementations. `EmbeddingScorer` uses sync httpx to call embedding APIs with automatic BM25 fallback on error.
 
+> **OpenAI provider requires `OPENAI_API_KEY`.** When `embedding_provider: "openai"`, `EmbeddingScorer` reads the API key from the `OPENAI_API_KEY` environment variable. Missing or empty keys produce HTTP 401 from the OpenAI endpoint and trigger the BM25 fallback. Ollama (the default) needs no key.
+
 ## Per-Server and Per-Tool Overrides
 
 ```json
