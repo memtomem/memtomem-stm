@@ -261,6 +261,77 @@ class TestSurfacingCache:
         assert adapter.search.call_count == 1  # not called again
 
 
+class TestSurfacingCacheStampede:
+    """Two concurrent ``surface()`` calls for the same ``{server}/{tool}/{query}``
+    cache key should trigger a single LTM search, not one per caller. The
+    cache exists specifically to avoid redundant LTM searches; under the
+    current check-then-await-then-set pattern (engine.py:209 get, L248 await
+    search, L267 set), the ``await`` window lets both coroutines observe a
+    miss before either writes back, so both hit LTM."""
+
+    async def test_concurrent_identical_queries_share_single_search(self):
+        """Three observable symptoms of the stampede, in order of severity:
+
+        1. Duplicate LTM search (wasted upstream load).
+        2. Second caller fails to receive the surfaced memory because the
+           session dedup (``_surfaced_ids``) was claimed by the first caller
+           between the two searches completing.
+        3. Cache poisoning: the second caller's ``cache.set(key, [])``
+           overwrites the first caller's ``cache.set(key, [memory])``, so
+           every subsequent call for the same query inside the TTL window
+           sees an empty-hit and skips surfacing entirely.
+
+        Of these, (3) is the most impactful — a transient race permanently
+        (for the TTL) suppresses surfacing for a query across future
+        requests."""
+        chunk = FakeChunk(id="mem-shared", content="shared result")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        adapter = AsyncMock()
+
+        async def slow_search(**_kwargs):
+            await asyncio.sleep(0.01)
+            return (results, {})
+
+        adapter.search = AsyncMock(side_effect=slow_search)
+
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+        )
+
+        out_a, out_b = await asyncio.gather(
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE),
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE),
+        )
+
+        # Symptom 1: duplicate LTM search
+        assert adapter.search.call_count == 1, (
+            f"Stampede: {adapter.search.call_count} LTM searches for the "
+            "same {server}/{tool}/{query} cache key (expected 1)"
+        )
+
+        # Symptom 2: both callers should see the memory.
+        assert "shared result" in out_a
+        assert "shared result" in out_b, (
+            "Second concurrent caller did not receive the shared memory — "
+            "the in-flight first caller claimed the _surfaced_ids slot "
+            "before the second caller's filter ran"
+        )
+
+        # Symptom 3: cache entry reflects the populated result, not the
+        # poisoned empty list. A subsequent call for the same query must
+        # still hit the memory, not bypass surfacing on an empty-hit.
+        cache_key = f"gh/read_file/{VALID_ARGS['_context_query']}"
+        cached = engine._cache.get(cache_key)
+        assert cached, (
+            "Cache poisoned with empty list — stampede's losing writer "
+            "overwrote the winning writer's populated cache entry"
+        )
+        assert any(r.chunk.id == "mem-shared" for r in cached), (
+            "Cache entry exists but is missing the shared memory"
+        )
+
+
 class TestSessionContextInjection:
     """Verify include_session_context wires the scratchpad through the MCP adapter."""
 

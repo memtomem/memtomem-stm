@@ -80,6 +80,15 @@ class SurfacingEngine:
         self._boosted_event_ids: dict[str, None] = {}
         self._boosted_event_ids_max = 10000
         self._background_tasks: set[asyncio.Task] = set()
+        # Per-key stampede guard — identical concurrent ``_do_surface`` calls
+        # serialize on the same lock so a cache miss triggers one LTM search
+        # rather than N and the losing coroutine cannot overwrite the
+        # winning coroutine's populated cache entry with its own (empty due
+        # to session dedup) result. Entries are popped while the lock is
+        # still held so any queued waiter sees the cached result on its
+        # own double-check. Named ``_key_locks`` to match the same pattern
+        # used by ``ProxyManager`` (extractable into a shared helper later).
+        self._key_locks: dict[str, asyncio.Lock] = {}
         # Opportunistic cleanup: run cleanup_expired at most once per hour
         self._cleanup_interval = 3600.0
         self._last_cleanup: float = time.monotonic()
@@ -194,6 +203,29 @@ class SurfacingEngine:
 
         return result
 
+    def _render_cached(
+        self,
+        cached: list[Any],
+        response_text: str,
+        query: str,
+        server: str,
+        tool: str,
+    ) -> str:
+        """Render a cached surfacing result into the response_text, or pass
+        the response through unchanged if the cache entry is an empty list
+        (the deliberate "no results for this query" case)."""
+        if not cached:
+            logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
+            return response_text
+        logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
+        surfacing_id = uuid.uuid4().hex[:16]
+        return self._formatter.inject(
+            response_text,
+            cached,
+            query,
+            surfacing_id=surfacing_id,
+        )
+
     async def _do_surface(
         self,
         server: str,
@@ -204,22 +236,48 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
     ) -> str:
-        # Check surfacing cache (keyed by server+tool+query)
+        # Check surfacing cache (keyed by server+tool+query). The full miss
+        # path lives in ``_do_surface_miss``; this shell handles the
+        # cache-check fast path, per-key stampede lock, and post-lock
+        # double-check so identical concurrent queries share a single LTM
+        # search and the losing coroutine cannot poison the cache with an
+        # empty result (see ``_key_locks`` init docstring).
         cache_key = f"{server}/{tool}/{query}"
         cached = self._cache.get(cache_key)
         if cached is not None:
-            if not cached:
-                logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
-                return response_text
-            logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
-            surfacing_id = uuid.uuid4().hex[:16]
-            return self._formatter.inject(
-                response_text,
-                cached,
-                query,
-                surfacing_id=surfacing_id,
-            )
+            return self._render_cached(cached, response_text, query, server, tool)
 
+        lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            try:
+                # Double-check inside the lock: a coroutine that held the
+                # lock ahead of us may have populated the cache already.
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return self._render_cached(cached, response_text, query, server, tool)
+                return await self._do_surface_miss(
+                    server,
+                    tool,
+                    arguments,
+                    response_text,
+                    query,
+                    cache_key,
+                    trace_id=trace_id,
+                )
+            finally:
+                self._key_locks.pop(cache_key, None)
+
+    async def _do_surface_miss(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        response_text: str,
+        query: str,
+        cache_key: str,
+        *,
+        trace_id: str | None = None,
+    ) -> str:
         # Resolve effective config (auto-tuned if enabled)
         tool_cfg = self._config.context_tools.get(tool)
         if self._auto_tuner is not None:
