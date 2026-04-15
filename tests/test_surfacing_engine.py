@@ -430,6 +430,36 @@ class TestFeedbackBoost:
 
         adapter.increment_access.assert_not_called()
 
+    async def test_concurrent_helpful_for_same_surfacing_id_boosts_once(self):
+        """Two concurrent ``handle_feedback`` calls for the same ``surfacing_id``
+        must fire a single ``increment_access`` RPC — the class docstring and
+        ``_boosted_event_ids`` guard promise "at most one per surfacing event"
+        even under concurrency. Without claiming the guard before the await,
+        both coroutines observe an empty guard, both await ``increment_access``,
+        and the boost is double-counted in core."""
+        adapter = _make_mcp_adapter([])
+
+        async def slow_increment(_ids):
+            await asyncio.sleep(0.01)
+
+        adapter.increment_access = AsyncMock(side_effect=slow_increment)
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await asyncio.gather(
+            engine.handle_feedback("sid-concurrent", "helpful", memory_id="mid-A"),
+            engine.handle_feedback("sid-concurrent", "helpful", memory_id="mid-A"),
+        )
+
+        assert adapter.increment_access.await_count == 1, (
+            "Dedup guard violated under concurrency: "
+            f"increment_access awaited {adapter.increment_access.await_count} times"
+        )
+
     async def test_boosted_event_ids_fifo_cap_evicts_oldest(self):
         """When ``_boosted_event_ids`` exceeds its cap, oldest entries evict first."""
         adapter = _make_mcp_adapter([])
