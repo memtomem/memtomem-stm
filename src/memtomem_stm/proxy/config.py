@@ -313,6 +313,16 @@ class ProxyConfig(BaseModel):
     upstream_servers: dict[str, UpstreamServerConfig] = {}
     default_compression: CompressionStrategy = CompressionStrategy.AUTO
     default_max_result_chars: int = Field(default=16000, gt=0)
+    max_upstream_chars: int = Field(default=10_000_000, gt=0)
+    """Hard cap on the size of the upstream response loaded into memory before
+    compression. A misbehaving (or malicious) upstream returning a 100 MB
+    payload would otherwise OOM the proxy. When the cap is exceeded the
+    response is truncated with a notice and the call is recorded as
+    ``upstream_error`` / ``oversize`` in ``proxy_metrics.db``.
+
+    Default 10 M chars (~10 MB UTF-8). Per-server / per-tool overrides are a
+    follow-up if needed.
+    """
     min_result_retention: float = Field(default=0.65, ge=0.0, le=1.0)
     relevance_scorer: RelevanceScorerConfig = Field(default_factory=RelevanceScorerConfig)
     """Minimum fraction of response to preserve after compression (0-1).

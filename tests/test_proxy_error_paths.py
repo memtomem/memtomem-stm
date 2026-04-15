@@ -407,15 +407,67 @@ class TestEdgeResponses:
         session = _get_session(mgr)
         text = _text_content("hello world")
         img = SimpleNamespace(type="image", data="png")
-        session.call_tool.return_value = SimpleNamespace(
-            content=[text, img], isError=False
-        )
+        session.call_tool.return_value = SimpleNamespace(content=[text, img], isError=False)
 
         result = await mgr.call_tool("srv", "tool", {})
         assert isinstance(result, list)
         assert len(result) == 2
         assert result[0].type == "text"
         assert result[1].type == "image"
+
+
+# ── max_upstream_chars hard cap ──────────────────────────────────────────
+
+
+class TestMaxUpstreamChars:
+    """Guards against OOM from upstreams returning huge payloads (#108)."""
+
+    async def test_oversized_response_truncated_with_notice(self):
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        # Shrink the cap for fast testing; default is 10 M chars.
+        mgr._config_loader._cached.max_upstream_chars = 100  # type: ignore[union-attr]
+
+        session = _get_session(mgr)
+        big = "a" * 500
+        session.call_tool.return_value = _make_result(big)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert isinstance(result, str)
+        assert "max_upstream_chars guard" in result
+        # Truncation was hard — text body cut to the cap (100), then the notice.
+        body = result.split("\n\n[response truncated")[0]
+        assert body == "a" * 100
+
+    async def test_under_cap_passes_through_unchanged(self):
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        mgr._config_loader._cached.max_upstream_chars = 1000  # type: ignore[union-attr]
+
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("hello world")
+
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result == "hello world"
+        assert "max_upstream_chars guard" not in result
+
+    async def test_cap_applies_across_multiple_text_blocks(self):
+        """The cap aggregates across blocks; not per-block."""
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        mgr._config_loader._cached.max_upstream_chars = 50  # type: ignore[union-attr]
+
+        session = _get_session(mgr)
+        # Two 30-char blocks → 60 chars total > 50 cap
+        block_a = _text_content("a" * 30)
+        block_b = _text_content("b" * 30)
+        session.call_tool.return_value = SimpleNamespace(content=[block_a, block_b], isError=False)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert "max_upstream_chars guard" in result
+        body = result.split("\n\n[response truncated")[0]
+        # First block fully kept (30 chars), second cut to remaining 20 chars.
+        # Joined with "\n" between text_parts.
+        assert body == "a" * 30 + "\n" + "b" * 20
 
 
 # ── Surfacing failure: graceful degradation ──────────────────────────────

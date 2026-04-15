@@ -67,6 +67,7 @@ flowchart TD
 - **Injection size cap** — memory block truncated if total exceeds `max_injection_chars` (default 3000)
 - **Boost guard** — each surfacing event can only boost `access_count` once (duplicate feedback ignored)
 - **Fresh cache** — proxy cache stores pre-surfacing content; surfacing is re-applied on cache hit so memories stay current
+- **Upstream size cap** — `max_upstream_chars` (default **10 M chars**) hard-caps the response loaded into memory before compression. Oversized payloads are truncated with a notice so a runaway upstream cannot OOM the proxy.
 
 ## Shutdown & Lifecycle
 
