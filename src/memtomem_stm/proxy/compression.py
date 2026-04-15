@@ -30,13 +30,19 @@ logger = logging.getLogger(__name__)
 QueryRelevanceScorer = BM25Scorer
 
 
+_HEADINGS_RE = re.compile(r"(?:^|\n)#{1,6}\s")
+_CODE_FENCE_RE = re.compile(r"```")
+_LIST_ITEM_RE = re.compile(r"(?:^|\n)\s*[-*]\s")
+_LINK_RE = re.compile(r"\[.*?\]\(.*?\)")
+
+
 def _content_summary(text: str) -> str:
     """Count structural elements in the original text for truncation metadata."""
     counts: list[str] = []
-    headings = len(re.findall(r"(?:^|\n)#{1,6}\s", text))
-    code_blocks = len(re.findall(r"```", text)) // 2
-    list_items = len(re.findall(r"(?:^|\n)\s*[-*]\s", text))
-    links = len(re.findall(r"\[.*?\]\(.*?\)", text))
+    headings = len(_HEADINGS_RE.findall(text))
+    code_blocks = len(_CODE_FENCE_RE.findall(text)) // 2
+    list_items = len(_LIST_ITEM_RE.findall(text))
+    links = len(_LINK_RE.findall(text))
     if headings:
         counts.append(f"{headings} headings")
     if code_blocks:
