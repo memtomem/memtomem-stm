@@ -392,6 +392,19 @@ class TestEdgeResponses:
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
 
+    async def test_none_content_degrades_to_empty(self):
+        """Spec-noncompliant upstream returning ``content=None`` must not crash.
+
+        The MCP spec requires ``content`` to be a list, but resilient proxies
+        should degrade rather than raise ``TypeError`` from ``for c in None``.
+        """
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = SimpleNamespace(content=None, isError=False)
+
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result == "[empty response]"
+
     async def test_non_text_content_passthrough(self):
         mgr = _make_manager()
         session = _get_session(mgr)
@@ -487,6 +500,75 @@ class TestSurfacingFailure:
         result = await mgr.call_tool("srv", "tool", {})
         # Should get the text back, not an exception
         assert "hello world" in result
+
+
+# ── Pipeline-stage exceptions: must surface in proxy_metrics as INTERNAL_ERROR ─
+
+
+class TestPipelineExceptionMetrics:
+    async def test_compress_failure_records_internal_error(self):
+        """If a COMPRESS-stage exception escapes _call_tool_inner, the outer
+        wrapper must record an INTERNAL_ERROR metrics row before re-raising
+        — otherwise operators are blind to in-pipeline failures."""
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("hello world")
+
+        # Force the compression stage to raise after upstream succeeds
+        with patch.object(
+            mgr, "_apply_compression", new_callable=AsyncMock, side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                await mgr.call_tool("srv", "tool", {})
+
+        # An INTERNAL_ERROR row must be present
+        assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 1
+        # And no double-count from typed paths
+        for cat in (
+            ErrorCategory.TRANSPORT,
+            ErrorCategory.TIMEOUT,
+            ErrorCategory.PROTOCOL,
+            ErrorCategory.UPSTREAM_ERROR,
+            ErrorCategory.PROGRAMMING,
+        ):
+            assert mgr.tracker._errors_by_category[cat.value] == 0
+
+    async def test_typed_upstream_error_not_double_recorded(self):
+        """A transport error already records its own row; the outer wrapper
+        must not add a second INTERNAL_ERROR row."""
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager(max_retries=0)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+
+        # Exactly one row, classified TRANSPORT — not INTERNAL_ERROR
+        assert mgr.tracker._errors_by_category[ErrorCategory.TRANSPORT.value] == 1
+        assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
+
+    async def test_upstream_iserror_not_double_recorded(self):
+        """A result.isError=True path raises ToolError after recording an
+        UPSTREAM_ERROR row; the outer wrapper must not add INTERNAL_ERROR."""
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("oops", is_error=True)
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ToolError):
+                await mgr.call_tool("srv", "tool", {})
+
+        assert mgr.tracker._errors_by_category[ErrorCategory.UPSTREAM_ERROR.value] == 1
+        assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
 
 
 # ── Context query stripping ──────────────────────────────────────────────

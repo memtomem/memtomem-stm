@@ -15,6 +15,7 @@ home directory is touched.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -280,6 +281,67 @@ class TestAddValidation:
         )
         assert result.exit_code == 1
         assert "blocked for security reasons" in result.output
+
+
+class TestAtomicSave:
+    """Direct exercises of ``_save``'s atomic-rename behaviour.
+
+    A torn write would otherwise let the proxy's hot-reload watcher read
+    a half-written JSON file (the previous ``Path.write_text`` path was
+    truncate-then-write).
+    """
+
+    def test_save_writes_payload_and_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        from memtomem_stm.cli.proxy import _save
+
+        target = tmp_path / "stm_proxy.json"
+        _save(target, {"enabled": True, "upstream_servers": {}})
+
+        assert target.exists()
+        assert json.loads(target.read_text(encoding="utf-8")) == {
+            "enabled": True,
+            "upstream_servers": {},
+        }
+        # No leftover sibling temp files (mkstemp prefix matches target name)
+        leftover = list(tmp_path.glob("stm_proxy.json.*.tmp"))
+        assert leftover == []
+
+    def test_save_overwrites_existing_atomically(self, tmp_path: Path) -> None:
+        from memtomem_stm.cli.proxy import _save
+
+        target = tmp_path / "stm_proxy.json"
+        target.write_text('{"enabled": false, "upstream_servers": {}}\n', encoding="utf-8")
+        old_inode = target.stat().st_ino
+
+        _save(target, {"enabled": True, "upstream_servers": {}})
+
+        # Content updated
+        assert json.loads(target.read_text(encoding="utf-8"))["enabled"] is True
+        # On POSIX, atomic rename replaces the file (new inode); the old
+        # inode is unlinked. Skip strict inode check on platforms where
+        # this is not guaranteed (Windows), but assert content correctness
+        # everywhere.
+        if hasattr(os, "fsync"):  # POSIX
+            new_inode = target.stat().st_ino
+            assert new_inode != old_inode
+
+    def test_save_cleans_up_temp_on_failure(self, tmp_path: Path, monkeypatch) -> None:
+        """If ``os.replace`` fails, the sibling temp file must be removed."""
+        from memtomem_stm.cli.proxy import _save
+
+        target = tmp_path / "stm_proxy.json"
+
+        def boom(*_a, **_kw):  # pragma: no cover - patched per test
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr("memtomem_stm.cli.proxy.os.replace", boom)
+
+        with pytest.raises(OSError, match="simulated rename"):
+            _save(target, {"enabled": True})
+
+        leftover = list(tmp_path.glob("stm_proxy.json.*.tmp"))
+        assert leftover == []
+        assert not target.exists()  # original was never written
 
 
 class TestAddPersistence:

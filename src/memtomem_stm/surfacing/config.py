@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from memtomem_stm.proxy.config import MODEL_CONTEXT_WINDOWS
 
@@ -15,8 +16,8 @@ class ToolSurfacingConfig(BaseModel):
     enabled: bool = True
     query_template: str = ""
     namespace: str | None = None
-    min_score: float | None = None
-    max_results: int | None = None
+    min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_results: int | None = Field(default=None, gt=0)
 
 
 class SurfacingConfig(BaseModel):
@@ -35,12 +36,12 @@ class SurfacingConfig(BaseModel):
     ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``."""
     ltm_mcp_command: str = "memtomem-server"
     ltm_mcp_args: list[str] = []
-    min_score: float = 0.02
-    max_results: int = 3
-    min_query_tokens: int = 3
-    cooldown_seconds: float = 5.0
-    timeout_seconds: float = 3.0
-    injection_mode: str = "prepend"  # prepend | append | section
+    min_score: float = Field(default=0.02, ge=0.0, le=1.0)
+    max_results: int = Field(default=3, gt=0)
+    min_query_tokens: int = Field(default=3, gt=0)
+    cooldown_seconds: float = Field(default=5.0, ge=0.0)
+    timeout_seconds: float = Field(default=3.0, gt=0.0)
+    injection_mode: Literal["prepend", "append", "section"] = "prepend"
     section_header: str = "## Relevant Memories"
     default_namespace: str | None = None
     exclude_tools: list[str] = []
@@ -54,21 +55,23 @@ class SurfacingConfig(BaseModel):
     ]
     context_tools: dict[str, ToolSurfacingConfig] = {}
     feedback_enabled: bool = True
-    max_surfacings_per_minute: int = 15
-    cache_ttl_seconds: float = 60.0
-    circuit_max_failures: int = 3
-    circuit_reset_seconds: float = 60.0
+    max_surfacings_per_minute: int = Field(default=15, gt=0)
+    cache_ttl_seconds: float = Field(default=60.0, ge=0.0)
+    circuit_max_failures: int = Field(default=3, ge=0)
+    circuit_reset_seconds: float = Field(default=60.0, gt=0.0)
     auto_tune_enabled: bool = True
-    auto_tune_min_samples: int = 20
-    auto_tune_score_increment: float = 0.002
-    min_response_chars: int = 5000
+    auto_tune_min_samples: int = Field(default=20, gt=0)
+    auto_tune_score_increment: float = Field(default=0.002, gt=0.0)
+    min_response_chars: int = Field(default=5000, ge=0)
     include_session_context: bool = True
     fire_webhook: bool = True
-    max_injection_chars: int = 3000
-    context_window_size: int = 0  # 0=disabled; >0 expands ±N adjacent chunks
-    dedup_ttl_seconds: float = 604800.0  # 7 days
+    max_injection_chars: int = Field(default=3000, gt=0)
+    context_window_size: int = Field(default=0, ge=0)
+    """0=disabled; >0 expands ±N adjacent chunks."""
+    dedup_ttl_seconds: float = Field(default=604800.0, ge=0.0)
+    """7 days default; 0 disables cross-session dedup."""
     consumer_model: str = ""
-    result_format: str = "compact"
+    result_format: Literal["compact", "structured"] = "compact"
     """Parser format for mem_search output. ``compact`` is the legacy
     core format (``[rank] score | source``). ``structured`` selects the
     machine-parseable JSON format (``{"results": [...]}``) with automatic
