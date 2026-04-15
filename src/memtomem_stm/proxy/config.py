@@ -6,7 +6,7 @@ import json
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -52,7 +52,7 @@ class LLMCompressorConfig(BaseModel):
         "Summarize the following content concisely, preserving all key information. "
         "Keep the summary under {max_chars} characters."
     )
-    max_tokens: int = 500
+    max_tokens: int = Field(default=500, gt=0)
 
 
 class CleaningConfig(BaseModel):
@@ -73,15 +73,15 @@ class HybridConfig(BaseModel):
 class SelectiveConfig(BaseModel):
     max_pending: int = Field(default=100, gt=0)
     pending_ttl_seconds: float = Field(default=300.0, ge=0.0)
-    json_depth: int = 1
-    min_section_chars: int = 50
-    pending_store: str = "memory"  # "memory" | "sqlite"
+    json_depth: int = Field(default=1, gt=0)
+    min_section_chars: int = Field(default=50, ge=0)
+    pending_store: Literal["memory", "sqlite"] = "memory"
     pending_store_path: Path = Path("~/.memtomem/pending_selections.db")
 
 
 class AutoIndexConfig(BaseModel):
     enabled: bool = False
-    min_chars: int = 2000
+    min_chars: int = Field(default=2000, ge=0)
     memory_dir: Path = Path("~/.memtomem/proxy_index")
     namespace: str = "proxy-{server}"
 
@@ -127,13 +127,13 @@ class ExtractionConfig(BaseModel):
     enabled: bool = False
     strategy: ExtractionStrategy = ExtractionStrategy.LLM
     llm: LLMCompressorConfig | None = None
-    max_facts: int = 10
-    min_response_chars: int = 500
-    dedup_threshold: float = 0.92
+    max_facts: int = Field(default=10, gt=0)
+    min_response_chars: int = Field(default=500, ge=0)
+    dedup_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
     memory_dir: Path = Path("~/.memtomem/extracted_facts")
     namespace: str = "facts-{server}"
     background: bool = True
-    max_input_chars: int = 20000
+    max_input_chars: int = Field(default=20000, gt=0)
 
     def effective_llm(self) -> LLMCompressorConfig:
         """Return user-provided LLM config or the default (Ollama qwen3:4b)."""
@@ -295,7 +295,7 @@ class RelevanceScorerConfig(BaseModel):
     """Embedding API base URL. Defaults to the provider's standard endpoint
     (Ollama → http://localhost:11434, OpenAI → https://api.openai.com).
     Only used when scorer="embedding"."""
-    embedding_timeout: float = 10.0
+    embedding_timeout: float = Field(default=10.0, gt=0.0)
     """Embedding API timeout in seconds."""
 
     @model_validator(mode="after")
