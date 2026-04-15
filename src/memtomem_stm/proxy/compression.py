@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -1142,6 +1143,14 @@ class LLMCompressor:
         )
         self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=30) if httpx else None
         self.last_fallback: str | None = None
+        # Shutdown gate: close() must wait for in-flight compress() calls to
+        # drain before aclose()ing the httpx client. Otherwise a config swap
+        # or stop() can tear the client down mid-request. Sister pattern to
+        # #125 (extraction), #129 (mcp_client), #130 (proxy conn_stack).
+        self._in_flight: int = 0
+        self._idle: asyncio.Event = asyncio.Event()
+        self._idle.set()
+        self._closed: bool = False
         # Warn about non-standard base_url to flag potential credential exfiltration
         if config.base_url:
             from urllib.parse import urlparse
@@ -1173,6 +1182,16 @@ class LLMCompressor:
         if self._cb.is_open:
             self.last_fallback = "circuit_breaker"
             return TruncateCompressor().compress(text, max_chars=max_chars)
+        if self._closed:
+            self.last_fallback = "closed"
+            return TruncateCompressor().compress(text, max_chars=max_chars)
+        # Register as in-flight so a concurrent close() blocks on ``_idle``
+        # until we finish touching ``_client``. The increment+clear pair is
+        # sync — no ``await`` between the ``_closed`` check above and the
+        # clear, so close() cannot slip in and aclose() the client between
+        # our check and our claim.
+        self._in_flight += 1
+        self._idle.clear()
         try:
             result = await self._call_api(text, max_chars=max_chars)
             self._cb.success()
@@ -1187,6 +1206,10 @@ class LLMCompressor:
             )
             self.last_fallback = "llm_error"
             return TruncateCompressor().compress(text, max_chars=max_chars)
+        finally:
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._idle.set()
 
     async def _call_api(self, text: str, *, max_chars: int) -> str:
         if self._client is None:
@@ -1201,6 +1224,11 @@ class LLMCompressor:
                 return await self._ollama(text, system_prompt)
 
     async def close(self) -> None:
+        # Flip the gate first so new compress() calls fall back to truncate
+        # instead of entering ``_in_flight``. Then wait for already-registered
+        # callers to drain before aclose()ing the client.
+        self._closed = True
+        await self._idle.wait()
         if self._client:
             await self._client.aclose()
             self._client = None

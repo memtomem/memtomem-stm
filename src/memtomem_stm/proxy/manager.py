@@ -541,8 +541,12 @@ class ProxyManager:
                             await self._llm_compressor.close()
                         self._llm_compressor = LLMCompressor(llm_cfg)
                         self._llm_compressor_cfg = llm_cfg
-                result = await self._llm_compressor.compress(text, max_chars=max_chars)
-                return result, self._llm_compressor.last_fallback
+                    # Capture the current instance under the lock so a later
+                    # concurrent config swap can't re-bind ``self._llm_compressor``
+                    # before we read ``.last_fallback`` below.
+                    compressor = self._llm_compressor
+                result = await compressor.compress(text, max_chars=max_chars)
+                return result, compressor.last_fallback
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",
                 server,

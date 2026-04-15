@@ -415,3 +415,114 @@ class TestLLMCompressorEmptyResponseGuard:
         result = await comp.compress(text, max_chars=200)
         assert comp.last_fallback == "llm_error"
         assert len(result) < len(text)
+
+
+# ---------------------------------------------------------------------------
+# LLMCompressor — close() vs in-flight compress() race
+# ---------------------------------------------------------------------------
+
+
+class TestLLMCompressorShutdown:
+    """``close()`` must wait for any in-flight ``compress()`` before closing
+    the httpx client. Otherwise the config-swap path in ProxyManager (which
+    calls ``close()`` on the old instance) and the ``stop()`` teardown path
+    can tear down the client while a concurrent caller is still awaiting
+    ``self._client.post(...)``, yielding ``httpx.ClosedError`` or
+    ``RuntimeError("stream has been closed")``.
+
+    Sister pattern to #125 (extraction), #129 (mcp_client), #130 (proxy
+    conn_stack) — the fix here uses an in-flight counter + ``asyncio.Event``
+    gate so ``close()`` drains in-flight callers before ``_client.aclose()``.
+    """
+
+    import asyncio
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_in_flight_compress(self):
+        """close() must block on in-flight compress() until it completes."""
+        import asyncio
+
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="test")
+        comp = LLMCompressor(cfg)
+        compress_started = asyncio.Event()
+        release_compress = asyncio.Event()
+
+        async def slow_call_api(text: str, *, max_chars: int) -> str:
+            compress_started.set()
+            await release_compress.wait()
+            return "summary"
+
+        with patch.object(comp, "_call_api", new=slow_call_api):
+            text = "x" * 500
+            compress_task = asyncio.create_task(comp.compress(text, max_chars=100))
+            await compress_started.wait()
+
+            close_task = asyncio.create_task(comp.close())
+            # Yield several times so close_task has a chance to observe that
+            # a compress is in flight and park on the idle gate.
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            assert not close_task.done(), (
+                "close() returned before in-flight compress finished — race not fixed"
+            )
+            assert comp._client is not None, (
+                "close() aclose'd the httpx client while compress was mid-call"
+            )
+
+            release_compress.set()
+            result = await compress_task
+            await close_task
+
+            assert result == "summary"
+            assert comp._client is None
+            assert comp.last_fallback is None  # success path
+
+    @pytest.mark.asyncio
+    async def test_compress_after_close_falls_back_to_truncate(self):
+        """Once close() has completed, subsequent compress() calls must
+        degrade to truncate rather than use the aclose'd client."""
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="test")
+        comp = LLMCompressor(cfg)
+        await comp.close()
+
+        text = "x" * 500
+        result = await comp.compress(text, max_chars=100)
+        assert len(result) <= len(text)
+        assert comp.last_fallback == "closed"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_compresses_drain_before_close(self):
+        """Multiple concurrent in-flight compresses must all drain before
+        close() proceeds — in-flight counter must track correctly."""
+        import asyncio
+
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="test")
+        comp = LLMCompressor(cfg)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        started_count = 0
+
+        async def slow_call_api(text: str, *, max_chars: int) -> str:
+            nonlocal started_count
+            started_count += 1
+            if started_count >= 3:
+                started.set()
+            await release.wait()
+            return "summary"
+
+        with patch.object(comp, "_call_api", new=slow_call_api):
+            tasks = [asyncio.create_task(comp.compress("x" * 500, max_chars=100)) for _ in range(3)]
+            await started.wait()
+
+            close_task = asyncio.create_task(comp.close())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not close_task.done()
+
+            release.set()
+            results = await asyncio.gather(*tasks)
+            await close_task
+
+            assert all(r == "summary" for r in results)
+            assert comp._client is None
