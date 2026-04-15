@@ -29,6 +29,18 @@ class RelevanceGate:
         tool: str,
         query: str | None,
     ) -> bool:
+        """Gate a prospective surfacing. On ``True``, eagerly claim a slot
+        in ``_surfacing_timestamps`` so concurrent callers see the budget
+        consumption immediately — otherwise N coroutines all check the
+        rate limit before any of them reaches ``record_surfacing`` and
+        every one passes, bursting through the ``max_surfacings_per_minute``
+        cap by up to the concurrency level.
+
+        Cooldown claim stays with ``record_surfacing`` (see that method)
+        because cooldown is a "skip if we already returned similar results"
+        heuristic — claiming it for queries that ultimately return nothing
+        would block legitimate retries on empty results.
+        """
         if not self._config.enabled or query is None:
             return False
 
@@ -66,13 +78,27 @@ class RelevanceGate:
             if self._jaccard_similarity(query, prev_query) > _SIMILARITY_THRESHOLD:
                 return False
 
+        # Eagerly claim the rate-limit slot. A concurrent ``should_surface``
+        # for a different query will now observe this timestamp and apply
+        # the cap correctly. A note on failure paths: the slot is kept even
+        # if the surfacing later fails, times out, or returns empty —
+        # ``max_surfacings_per_minute`` counts attempts because an attempt
+        # already consumed LTM/MCP resources and that is what the throttle
+        # is defending against.
+        self._surfacing_timestamps.append(now)
         return True
 
     def record_surfacing(self, query: str) -> None:
-        """Record that a surfacing was actually performed (call after success)."""
+        """Record that a surfacing was actually performed (call after success).
+
+        Updates the cooldown history only — the rate-limit slot was
+        already claimed in ``should_surface`` so this method intentionally
+        does not touch ``_surfacing_timestamps``. Calling it for a
+        cache-hit or empty-result path is not required and would only
+        suppress legitimate similar-query retries.
+        """
         now = time.monotonic()
         self._recent_queries.append((now, query))
-        self._surfacing_timestamps.append(now)
 
     @staticmethod
     def _jaccard_similarity(a: str, b: str) -> float:

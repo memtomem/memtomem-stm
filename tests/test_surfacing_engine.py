@@ -332,6 +332,53 @@ class TestSurfacingCacheStampede:
         )
 
 
+class TestRelevanceGateConcurrency:
+    """``RelevanceGate.should_surface`` is called at ``surface()`` entry and
+    ``record_surfacing`` is called later inside ``_do_surface_miss`` (after
+    the LTM search ``await``). Concurrent ``surface()`` calls can all pass
+    ``should_surface`` (rate limit + cooldown check) before any of them
+    reaches ``record_surfacing``, so the configured rate limit is bypassed
+    by up to the concurrency level."""
+
+    async def test_concurrent_surface_calls_bypass_rate_limit(self):
+        # Rate-limit config = 1 surfacing per minute. Under the race,
+        # N concurrent calls all observe an empty ``_surfacing_timestamps``
+        # before any writes back, so all N pass the gate.
+        adapter = AsyncMock()
+
+        async def slow_search(**_kwargs):
+            await asyncio.sleep(0.01)
+            return ([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.5)], {})
+
+        adapter.search = AsyncMock(side_effect=slow_search)
+
+        engine = SurfacingEngine(
+            config=_make_config(max_surfacings_per_minute=1),
+            mcp_adapter=adapter,
+        )
+
+        # 5 distinct cache keys so the cache stampede fix doesn't mask the
+        # race (each query has its own ``_do_surface`` miss path).
+        await asyncio.gather(
+            *(
+                engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/f{i}.py", "_context_query": f"query {i}"},
+                    LONG_RESPONSE,
+                )
+                for i in range(5)
+            )
+        )
+
+        assert adapter.search.call_count == 1, (
+            "Rate limit bypassed under concurrency: "
+            f"{adapter.search.call_count} LTM searches fired with "
+            "max_surfacings_per_minute=1 — all should_surface checks "
+            "passed before any record_surfacing wrote back"
+        )
+
+
 class TestSessionContextInjection:
     """Verify include_session_context wires the scratchpad through the MCP adapter."""
 
