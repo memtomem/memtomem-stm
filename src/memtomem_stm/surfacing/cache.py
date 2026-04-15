@@ -12,6 +12,10 @@ class SurfacingCache:
 
     Keyed by query hash. Avoids repeated LTM searches when the same
     tool is called with similar arguments in quick succession.
+
+    Eviction is insertion-ordered FIFO (matching ``InMemoryPendingStore``):
+    overflow drops the first-inserted entry in O(1). Expiry is handled
+    lazily on ``get()``.
     """
 
     def __init__(self, ttl: float = 60.0, max_entries: int = 200) -> None:
@@ -31,22 +35,17 @@ class SurfacingCache:
         return results
 
     def set(self, query: str, results: list[Any]) -> None:
-        if len(self._cache) >= self._max_entries:
-            self._evict()
-        self._cache[self._hash(query)] = (time.monotonic(), results)
+        key = self._hash(query)
+        # Re-insert to move an existing key to the tail (preserves FIFO order).
+        if key in self._cache:
+            del self._cache[key]
+        while len(self._cache) >= self._max_entries:
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[key] = (time.monotonic(), results)
 
     def clear(self) -> None:
         self._cache.clear()
-
-    def _evict(self) -> None:
-        now = time.monotonic()
-        expired = [k for k, (ts, _) in self._cache.items() if now - ts > self._ttl]
-        for k in expired:
-            del self._cache[k]
-        # If still over limit, remove oldest
-        while len(self._cache) >= self._max_entries:
-            oldest = min(self._cache, key=lambda k: self._cache[k][0])
-            del self._cache[oldest]
 
     @staticmethod
     def _hash(query: str) -> str:
