@@ -132,10 +132,12 @@ class ProxyManager:
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
+        self._selective_compressor_cfg: SelectiveConfig | None = None
         self._selective_lock = asyncio.Lock()
         self._extractor: FactExtractor | None = None
         self._extractor_lock = asyncio.Lock()
         self._progressive_store: ProgressiveStoreAdapter | None = None
+        self._progressive_store_cfg: SelectiveConfig | None = None
         self._progressive_lock = asyncio.Lock()
         self._llm_compressor: LLMCompressor | None = None
         self._llm_compressor_cfg: LLMCompressorConfig | None = None
@@ -529,8 +531,9 @@ class ProxyManager:
 
         if compression == CompressionStrategy.SELECTIVE:
             async with self._selective_lock:
-                if self._selective_compressor is None:
+                if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                     self._selective_compressor = self._create_selective(sel_cfg)
+                    self._selective_compressor_cfg = sel_cfg
             return self._selective_compressor.compress(text, max_chars=max_chars), None
 
         if compression == CompressionStrategy.LLM_SUMMARY:
@@ -609,8 +612,9 @@ class ProxyManager:
     ) -> str:
         cfg = hybrid_cfg or HybridConfig()
         async with self._selective_lock:
-            if self._selective_compressor is None:
+            if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                 self._selective_compressor = self._create_selective(sel_cfg)
+                self._selective_compressor_cfg = sel_cfg
 
         compressor = HybridCompressor(
             head_chars=cfg.head_chars,
@@ -686,15 +690,34 @@ class ProxyManager:
             return "Selective compression not active — no pending TOC selections."
         return self._selective_compressor.select(key, sections)
 
-    def _get_progressive_store(self) -> ProgressiveStoreAdapter:
-        if self._progressive_store is None:
-            from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+    def _get_progressive_store(
+        self, sel_cfg: SelectiveConfig | None = None
+    ) -> ProgressiveStoreAdapter:
+        if self._progressive_store is None or (
+            sel_cfg is not None and sel_cfg != self._progressive_store_cfg
+        ):
+            if sel_cfg is not None and sel_cfg.pending_store == "sqlite":
+                from memtomem_stm.proxy.pending_store import SQLitePendingStore
 
-            self._progressive_store = ProgressiveStoreAdapter(InMemoryPendingStore())
+                store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+                store.initialize()
+            else:
+                from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+
+                store = InMemoryPendingStore()
+            self._progressive_store = ProgressiveStoreAdapter(store)
+            self._progressive_store_cfg = sel_cfg
         return self._progressive_store
 
-    def _apply_progressive(self, text: str, cfg: ProgressiveConfig, server: str, tool: str) -> str:
-        store = self._get_progressive_store()
+    def _apply_progressive(
+        self,
+        text: str,
+        cfg: ProgressiveConfig,
+        server: str,
+        tool: str,
+        sel_cfg: SelectiveConfig | None = None,
+    ) -> str:
+        store = self._get_progressive_store(sel_cfg)
         store.evict(cfg.ttl_seconds, cfg.max_stored)
 
         key = uuid.uuid4().hex[:16]
@@ -1102,7 +1125,9 @@ class ProxyManager:
                 # Content fits in one chunk — passthrough
                 compressed = cleaned
             else:
-                compressed = self._apply_progressive(cleaned, pcfg, server, tool)
+                compressed = self._apply_progressive(
+                    cleaned, pcfg, server, tool, sel_cfg=tc.selective
+                )
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(cleaned)
             # Skip surfacing for progressive — injecting memories would shift offsets
@@ -1197,7 +1222,9 @@ class ProxyManager:
                         # (has_more=False, nothing to read_more).
                         if cleaned_len > pcfg.chunk_size:
                             try:
-                                compressed = self._apply_progressive(cleaned, pcfg, server, tool)
+                                compressed = self._apply_progressive(
+                                    cleaned, pcfg, server, tool, sel_cfg=tc.selective
+                                )
                                 metrics_strategy = f"{original_strategy}→progressive_fallback"
                                 progressive_fallback = True
                                 logger.info(

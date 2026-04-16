@@ -464,6 +464,73 @@ class TestReadMore:
         result = mgr.read_more("testkey", 0, 100)
         assert len(result) > 0
 
+    def test_progressive_store_uses_sqlite_when_configured(self, tmp_path):
+        """_get_progressive_store respects SelectiveConfig.pending_store='sqlite'."""
+        from memtomem_stm.proxy.pending_store import SQLitePendingStore
+
+        db_path = tmp_path / "progressive.db"
+        sel_cfg = SelectiveConfig(pending_store="sqlite", pending_store_path=db_path)
+        mgr = _make_manager(tmp_path=tmp_path)
+
+        store = mgr._get_progressive_store(sel_cfg)
+        assert isinstance(store._store, SQLitePendingStore)
+
+    def test_progressive_store_defaults_to_memory(self, tmp_path):
+        """Without sel_cfg, progressive store uses InMemoryPendingStore."""
+        from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        store = mgr._get_progressive_store()
+        assert isinstance(store._store, InMemoryPendingStore)
+
+
+class TestSelectiveHotReload:
+    """Selective compressor must be recreated when config changes via hot-reload."""
+
+    async def test_selective_recreated_on_config_change(self, tmp_path):
+        from memtomem_stm.proxy.compression import SelectiveCompressor
+
+        mgr = _make_manager(
+            tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE
+        )
+        _inject_connection(mgr, "section1\n---\nsection2\n---\nsection3")
+
+        sel_cfg_a = SelectiveConfig(json_depth=1)
+        sel_cfg_b = SelectiveConfig(json_depth=3)
+
+        async with mgr._selective_lock:
+            mgr._selective_compressor = mgr._create_selective(sel_cfg_a)
+            mgr._selective_compressor_cfg = sel_cfg_a
+        comp_a = mgr._selective_compressor
+
+        async with mgr._selective_lock:
+            if mgr._selective_compressor_cfg != sel_cfg_b:
+                mgr._selective_compressor = mgr._create_selective(sel_cfg_b)
+                mgr._selective_compressor_cfg = sel_cfg_b
+        comp_b = mgr._selective_compressor
+
+        assert comp_a is not comp_b
+        assert mgr._selective_compressor_cfg == sel_cfg_b
+
+    async def test_selective_not_recreated_when_config_same(self, tmp_path):
+        mgr = _make_manager(
+            tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE
+        )
+        sel_cfg = SelectiveConfig(json_depth=2)
+
+        async with mgr._selective_lock:
+            mgr._selective_compressor = mgr._create_selective(sel_cfg)
+            mgr._selective_compressor_cfg = sel_cfg
+        comp_first = mgr._selective_compressor
+
+        async with mgr._selective_lock:
+            if mgr._selective_compressor_cfg != sel_cfg:
+                mgr._selective_compressor = mgr._create_selective(sel_cfg)
+                mgr._selective_compressor_cfg = sel_cfg
+        comp_second = mgr._selective_compressor
+
+        assert comp_first is comp_second
+
 
 # ── _auto_index_response ─────────────────────────────────────────────────
 
