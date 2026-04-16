@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shlex
@@ -298,3 +299,107 @@ def remove(name: str, config_path: str, yes: bool) -> None:
     del servers[name]
     _save(path, data)
     click.echo(f"Removed server '{name}'.")
+
+
+# ── health command ──────────────────────────────────────────────────────
+
+
+async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """Probe a single upstream server: connect, initialize, list tools."""
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.client.streamable_http import streamablehttp_client
+
+    transport = cfg.get("transport", "stdio")
+    if transport == "stdio":
+        ctx = stdio_client(
+            StdioServerParameters(
+                command=cfg.get("command", ""),
+                args=cfg.get("args", []),
+                env=cfg.get("env"),
+            )
+        )
+    elif transport == "sse":
+        ctx = sse_client(cfg.get("url", ""))
+    else:
+        ctx = streamablehttp_client(cfg.get("url", ""))
+
+    async with ctx as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await asyncio.wait_for(session.initialize(), timeout=timeout)
+            result = await session.list_tools()
+            return {
+                "connected": True,
+                "tools": len(result.tools),
+                "error": None,
+            }
+
+
+async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, dict[str, Any]]:
+    """Probe all servers in parallel, returning per-server results."""
+
+    async def _safe_probe(name: str, cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        try:
+            result = await _probe_one(cfg, timeout)
+        except asyncio.TimeoutError:
+            result = {
+                "connected": False,
+                "tools": 0,
+                "error": f"timeout ({timeout}s)",
+            }
+        except Exception as exc:
+            err = str(exc) or type(exc).__name__
+            result = {"connected": False, "tools": 0, "error": err}
+        return name, result
+
+    tasks = [_safe_probe(n, c) for n, c in servers.items()]
+    pairs = await asyncio.gather(*tasks)
+    return dict(pairs)
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default=str(_DEFAULT_CONFIG),
+    show_default=True,
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output as JSON for scripting.",
+)
+@click.option(
+    "--timeout",
+    default=10,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Per-server connection timeout in seconds.",
+)
+def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> None:
+    """Check upstream server connectivity."""
+    data = _load(Path(config_path))
+    servers: dict[str, Any] = data.get("upstream_servers", {})
+
+    if not servers:
+        if as_json:
+            click.echo(json.dumps({"servers": {}}))
+        else:
+            click.echo("No upstream servers configured.")
+        return
+
+    results = asyncio.run(_probe_servers(servers, timeout))
+
+    if as_json:
+        click.echo(json.dumps({"servers": results}))
+        return
+
+    click.echo("Upstream Server Health")
+    click.echo("=" * 30)
+    for name, info in results.items():
+        if info["connected"]:
+            click.echo(f"  {name}: connected ({info['tools']} tools)")
+        else:
+            click.echo(f"  {name}: DISCONNECTED — {info['error']}")

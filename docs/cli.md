@@ -28,6 +28,7 @@ Usage: mms [OPTIONS] COMMAND [ARGS]...
 
 Commands:
   add     Add an upstream MCP server to the proxy configuration.
+  health  Check upstream server connectivity.
   list    List configured upstream servers.
   remove  Remove an upstream MCP server from the proxy configuration.
   status  Show proxy gateway configuration and server list.
@@ -89,7 +90,25 @@ mms status
 
 # Remove a server
 mms remove github
+
+# Check upstream connectivity (probes each server)
+mms health
+mms health --json          # machine-readable output
+mms health --timeout 5     # 5s per-server timeout (default: 10)
 ```
+
+### `health`
+
+```
+Usage: mms health [OPTIONS]
+
+Options:
+  --config TEXT          [default: ~/.memtomem/stm_proxy.json]
+  --json                Output as JSON for scripting.
+  --timeout INTEGER     Per-server connection timeout in seconds.  [default: 10]
+```
+
+Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running.
 
 ## MCP Tools (10 + proxied)
 

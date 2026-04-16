@@ -486,3 +486,65 @@ class TestFullFlow:
 
         final_list = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert "No upstream servers configured" in final_list.output
+
+
+# ── health command ──────────────────────────────────────────────────────
+
+
+class TestHealth:
+    def test_health_no_servers(self, runner, config):
+        """Empty config → friendly message, no crash."""
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "No upstream servers configured" in result.output
+
+    def test_health_json_no_servers(self, runner, config):
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data == {"servers": {}}
+
+    def test_health_unreachable_server(self, runner, config):
+        """A server with a nonexistent command → DISCONNECTED."""
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bad",
+                            "transport": "stdio",
+                            "command": "__nonexistent_cmd_12345__",
+                            "args": [],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["health", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "DISCONNECTED" in result.output
+
+    def test_health_json_unreachable(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bad",
+                            "transport": "stdio",
+                            "command": "__nonexistent_cmd_12345__",
+                            "args": [],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["health", "--json", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["servers"]["bad"]["connected"] is False
+        assert data["servers"]["bad"]["error"]
