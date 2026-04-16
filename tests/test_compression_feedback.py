@@ -141,6 +141,26 @@ class TestCompressionFeedbackStore:
             compression.close()
             surfacing.close()
 
+    def test_data_survives_store_reopen(self, tmp_path: Path):
+        db_path = tmp_path / "cfb.db"
+        store = CompressionFeedbackStore(db_path)
+        store.initialize()
+        try:
+            store.record("docfix", "get_document", "truncated", "m1", "t1")
+            store.record("docfix", "search", "missing_example", "m2", None)
+        finally:
+            store.close()
+
+        store2 = CompressionFeedbackStore(db_path)
+        store2.initialize()
+        try:
+            stats = store2.get_stats()
+            assert stats["total_feedback"] == 2
+            assert stats["by_kind"] == {"truncated": 1, "missing_example": 1}
+            assert stats["by_tool"] == {"get_document": 1, "search": 1}
+        finally:
+            store2.close()
+
     def test_close_is_idempotent(self, tmp_path: Path):
         store = CompressionFeedbackStore(tmp_path / "cfb.db")
         store.initialize()
