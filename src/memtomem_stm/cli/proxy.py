@@ -38,10 +38,29 @@ def _load(config_path: Path) -> dict[str, Any]:
     if not resolved.exists():
         return {"enabled": True, "upstream_servers": {}}
     try:
-        return json.loads(resolved.read_text(encoding="utf-8"))
+        data = json.loads(resolved.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError) as exc:
         click.echo(f"Error: Failed to parse {resolved}: {exc}", err=True)
         raise SystemExit(1) from exc
+    # Structural guard: the rest of the CLI assumes top-level dict with a dict
+    # `upstream_servers`. Without this, a valid-but-wrong-shape JSON (e.g. a
+    # list or a string, or `upstream_servers: "oops"`) crashes downstream with
+    # an AttributeError traceback instead of a clean user-facing error.
+    if not isinstance(data, dict):
+        click.echo(
+            f"Error: {resolved} top-level must be a JSON object, got {type(data).__name__}.",
+            err=True,
+        )
+        raise SystemExit(1)
+    servers = data.get("upstream_servers")
+    if servers is not None and not isinstance(servers, dict):
+        click.echo(
+            f"Error: {resolved} 'upstream_servers' must be an object, "
+            f"got {type(servers).__name__}.",
+            err=True,
+        )
+        raise SystemExit(1)
+    return data
 
 
 def _save(config_path: Path, data: dict[str, Any]) -> None:

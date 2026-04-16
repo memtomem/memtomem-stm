@@ -69,6 +69,27 @@ class TestConfigLoad:
         assert result.exit_code == 1
         assert "Failed to parse" in result.output
 
+    @pytest.mark.parametrize(
+        "payload,expected_type",
+        [("[]", "list"), ("null", "NoneType"), ('"oops"', "str"), ("42", "int")],
+    )
+    def test_rejects_non_dict_top_level(self, runner, config, payload, expected_type):
+        """Valid JSON that isn't an object (list/null/string/int) used to crash the
+        CLI with an AttributeError traceback. Guard surfaces a clean error."""
+        config.write_text(payload, encoding="utf-8")
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "top-level must be a JSON object" in result.output
+        assert expected_type in result.output
+
+    def test_rejects_non_dict_upstream_servers(self, runner, config):
+        """`upstream_servers` must be a dict — a list/string here would crash
+        downstream iteration with an AttributeError traceback."""
+        config.write_text(json.dumps({"upstream_servers": "oops"}), encoding="utf-8")
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "'upstream_servers' must be an object" in result.output
+
     def test_list_empty_config(self, runner, config):
         """No config → ``list`` prints the empty-state message and exits 0."""
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
