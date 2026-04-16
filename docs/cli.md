@@ -56,7 +56,14 @@ Options:
                                   'auto' picks strategy per response by
                                   content type.  [default: auto]
   --max-chars INTEGER             [default: 8000]
+  --validate                      Probe the server (MCP initialize +
+                                  list-tools) before saving; abort on
+                                  failure.
+  --timeout INTEGER               Connection timeout (seconds) when
+                                  --validate is set.  [default: 10]
 ```
+
+Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
@@ -81,6 +88,13 @@ mms add docs \
   --transport sse \
   --url https://docs.example.com/mcp \
   --prefix docs
+
+# Validate connectivity at registration time (rejects bad entries up front)
+mms add filesystem \
+  --command npx \
+  --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
+  --prefix fs \
+  --validate
 
 # List configured upstreams
 mms list

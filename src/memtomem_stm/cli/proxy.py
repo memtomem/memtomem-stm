@@ -204,6 +204,20 @@ def list_servers(config_path: str) -> None:
 @click.option(
     "--max-chars", "max_result_chars", type=click.IntRange(min=1), default=8000, show_default=True
 )
+@click.option(
+    "--validate",
+    is_flag=True,
+    default=False,
+    help="Probe the server (MCP initialize + list-tools) before saving; abort on failure.",
+)
+@click.option(
+    "--timeout",
+    "validate_timeout",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Connection timeout (seconds) when --validate is set.",
+)
 def add(
     name: str,
     config_path: str,
@@ -215,6 +229,8 @@ def add(
     env_pairs: tuple[str, ...],
     compression: str,
     max_result_chars: int,
+    validate: bool,
+    validate_timeout: int,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
     path = Path(config_path)
@@ -292,6 +308,14 @@ def add(
                 sys.exit(1)
             env_dict[k] = v
         entry["env"] = env_dict
+
+    if validate:
+        click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
+        probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
+        if not probe["connected"]:
+            click.echo(f"Error: validation failed — {probe['error']}", err=True)
+            sys.exit(1)
+        click.echo(f"Validated: {probe['tools']} tool(s) reachable.")
 
     servers[name] = entry
     _save(path, data)

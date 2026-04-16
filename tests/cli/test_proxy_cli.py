@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.proxy import cli
+
+_FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
 
 
 @pytest.fixture
@@ -458,6 +461,99 @@ class TestAddPersistence:
         )
         assert result.exit_code == 1
         assert "malformed --args" in result.output
+
+
+# ── add --validate (probe before save) ──────────────────────────────────
+
+
+class TestAddValidate:
+    """`add --validate` reuses the health probe to reject unreachable servers
+    at config-write time. The contract is: probe fails → exit 1 and *no*
+    entry written; probe succeeds → entry written and tool count reported."""
+
+    def test_validate_unreachable_aborts_and_skips_write(self, runner, config):
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "bad",
+                "--prefix",
+                "bad",
+                "--command",
+                "__nonexistent_cmd_12345__",
+                "--validate",
+                "--timeout",
+                "3",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "validation failed" in result.output
+
+        # Config file must not carry a partial entry.
+        if config.exists():
+            data = json.loads(config.read_text(encoding="utf-8"))
+            assert "bad" not in data.get("upstream_servers", {})
+
+    def test_validate_success_writes_entry_with_tool_count(self, config):
+        """Probe against the repo's fake MCP server — should report tool count.
+
+        Runs via real subprocess rather than ``CliRunner`` because Click's
+        runner replaces ``sys.stderr`` with a buffer that has no ``fileno()``,
+        and the underlying MCP stdio client passes that stderr to a child
+        ``asyncio.create_subprocess_exec`` call — which requires a real
+        file descriptor. The live ``mms`` binary doesn't hit this."""
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "add",
+                "fake",
+                "--prefix",
+                "fk",
+                "--command",
+                sys.executable,
+                "--args",
+                str(_FAKE_SERVER),
+                "--validate",
+                "--timeout",
+                "15",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "Validated:" in proc.stdout
+        assert "tool(s) reachable" in proc.stdout
+        assert "Added server 'fake'" in proc.stdout
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["upstream_servers"]["fake"]["command"] == sys.executable
+
+    def test_validate_flag_absent_skips_probe(self, runner, config):
+        """Without --validate, a nonexistent command is accepted (probe opt-in)."""
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "lazy",
+                "--prefix",
+                "lz",
+                "--command",
+                "__nonexistent_cmd_12345__",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Validated" not in result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "lazy" in data["upstream_servers"]
 
 
 # ── remove command ───────────────────────────────────────────────────────
