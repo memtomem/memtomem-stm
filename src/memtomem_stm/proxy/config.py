@@ -6,7 +6,8 @@ import json
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Self
+
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
