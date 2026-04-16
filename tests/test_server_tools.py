@@ -137,6 +137,18 @@ class TestReadMore:
         result = await stm_proxy_read_more(key="k1", offset=-1, ctx=ctx)
         assert "offset must be >= 0" in result.lower()
 
+    async def test_negative_limit(self):
+        """Negative limit returns an error message."""
+        ctx = _make_ctx()
+        result = await stm_proxy_read_more(key="k1", offset=0, limit=-1, ctx=ctx)
+        assert "limit must be >= 1" in result.lower()
+
+    async def test_zero_limit(self):
+        """Zero limit returns an error message."""
+        ctx = _make_ctx()
+        result = await stm_proxy_read_more(key="k1", offset=0, limit=0, ctx=ctx)
+        assert "limit must be >= 1" in result.lower()
+
     async def test_delegates(self):
         """stm_proxy_read_more delegates to proxy_manager.read_more."""
         pm = _make_proxy_manager()

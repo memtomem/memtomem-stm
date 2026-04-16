@@ -370,6 +370,8 @@ async def stm_proxy_read_more(
     """
     if offset < 0:
         return "Error: offset must be >= 0"
+    if limit is not None and limit < 1:
+        return "Error: limit must be >= 1"
     app = _get_ctx(ctx)
     return app.proxy_manager.read_more(key, offset, limit)
 
