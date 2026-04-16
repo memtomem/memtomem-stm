@@ -79,6 +79,15 @@ class SurfacingEngine:
         # 10k matches the sibling _surfaced_ids bound.
         self._boosted_event_ids: dict[str, None] = {}
         self._boosted_event_ids_max = 10000
+        # Cache invalidation set — (server, tool, memory_id) tuples the agent
+        # rated ``not_relevant`` or ``already_known``. ``_render_cached``
+        # filters cache hits through this set so a cached query does not
+        # resurface memories the agent already rejected within the cache TTL
+        # window. Scoped in-memory per session (matching ``SurfacingCache``
+        # lifetime); bounded by the same 10k FIFO cap as sibling sets since
+        # invalidations are a strict subset of surfacings.
+        self._invalidated_ids: dict[tuple[str, str, str], None] = {}
+        self._invalidated_ids_max = 10000
         self._background_tasks: set[asyncio.Task] = set()
         # Per-key stampede guard — identical concurrent ``_do_surface`` calls
         # serialize on the same lock so a cache miss triggers one LTM search
@@ -165,11 +174,20 @@ class SurfacingEngine:
         can rank it higher next time. The boost is guarded with an in-memory
         per-event set so multiple "helpful" ratings for the same surfacing
         event only trigger one increment.
+
+        On a ``not_relevant`` or ``already_known`` rating, adds the
+        ``(server, tool, memory_id)`` tuples to ``_invalidated_ids`` so
+        subsequent cache hits for the same ``server/tool/query`` filter
+        them out. Without this, a repeat query inside the ``SurfacingCache``
+        TTL window would resurface the memory the agent just rejected.
         """
         if self._feedback_tracker is None:
             return "Feedback tracking is not enabled."
 
         result = self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+
+        if rating in ("not_relevant", "already_known"):
+            self._invalidate_cache_for_feedback(surfacing_id, memory_id)
 
         if rating == "helpful" and surfacing_id not in self._boosted_event_ids:
             # Claim the guard optimistically BEFORE the increment_access
@@ -212,6 +230,37 @@ class SurfacingEngine:
 
         return result
 
+    def _invalidate_cache_for_feedback(self, surfacing_id: str, memory_id: str | None) -> None:
+        """Populate ``_invalidated_ids`` from a surfacing event.
+
+        Looks up the event's ``(server, tool, memory_ids)`` and adds one
+        tuple per memory id to the filter set. When ``memory_id`` is given
+        only that id is invalidated; otherwise every memory recorded for
+        the surfacing event is invalidated (i.e. a blanket rejection).
+        """
+        if self._feedback_tracker is None:
+            return
+        try:
+            event = self._feedback_tracker.store.get_surfacing_event(surfacing_id)
+        except Exception:
+            logger.debug(
+                "Failed to look up surfacing event for invalidation of %s",
+                surfacing_id,
+                exc_info=True,
+            )
+            return
+        if event is None:
+            return
+        server = event["server"]
+        tool = event["tool"]
+        target_ids = [memory_id] if memory_id else event["memory_ids"]
+        for mid in target_ids:
+            self._invalidated_ids[(server, tool, mid)] = None
+        if len(self._invalidated_ids) > self._invalidated_ids_max:
+            excess = len(self._invalidated_ids) - self._invalidated_ids_max // 2
+            for k in list(self._invalidated_ids)[:excess]:
+                del self._invalidated_ids[k]
+
     def _render_cached(
         self,
         cached: list[Any],
@@ -228,7 +277,25 @@ class SurfacingEngine:
         can submit ``stm_surfacing_feedback`` for the rendered surfacing_id.
         Without this, cached hits generate orphan IDs that the feedback store
         cannot resolve, silently breaking the feedback learning loop.
+
+        Filters out memory IDs in ``_invalidated_ids`` — memories the agent
+        already rated ``not_relevant`` or ``already_known`` within the cache
+        TTL window. A filtered-empty result pass-throughs like the natural
+        empty case.
         """
+        if cached and self._invalidated_ids:
+            original_count = len(cached)
+            cached = [
+                r for r in cached if (server, tool, str(r.chunk.id)) not in self._invalidated_ids
+            ]
+            if len(cached) < original_count:
+                logger.debug(
+                    "Surfacing cache filter: %s/%s %d→%d (invalidated)",
+                    server,
+                    tool,
+                    original_count,
+                    len(cached),
+                )
         if not cached:
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
             return response_text
