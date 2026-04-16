@@ -37,6 +37,8 @@ Commands:
 
 All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
 
+Output is colorized when writing to a terminal; set `NO_COLOR=1` to disable. JSON output (`--json`) and non-TTY streams (pipes, CI) are never colored.
+
 ### `init`
 
 ```

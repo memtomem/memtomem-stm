@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shlex
 import sys
@@ -33,6 +34,44 @@ _DANGEROUS_ENV_KEYS = frozenset(
 )
 
 
+# Style policy — color and bold carry *different* signals so visual weight
+# stays meaningful.
+#
+# * red + bold → abort-worthy errors (``Error:``)
+# * red       → bad-state keywords that shade a line but shouldn't shout
+#   (e.g. ``DISCONNECTED`` in ``mms health``)
+# * yellow    → non-abort warnings (``Warning:``, retry hints)
+# * green     → successful-action verbs/labels (``Added``, ``Saved to:``)
+# * bold      → section / table headers (no color)
+#
+# Click already strips ANSI when the output stream isn't a TTY (pipes, CI,
+# ``CliRunner``), but Click 8.3 does *not* honor ``NO_COLOR`` on real TTYs.
+# We enforce it here so the behavior matches https://no-color.org — presence
+# of the var (even empty) disables color per the spec.
+def _color_on() -> bool:
+    return "NO_COLOR" not in os.environ
+
+
+def _err(s: str) -> str:
+    return click.style(s, fg="red", bold=True) if _color_on() else s
+
+
+def _warn(s: str) -> str:
+    return click.style(s, fg="yellow") if _color_on() else s
+
+
+def _ok(s: str) -> str:
+    return click.style(s, fg="green") if _color_on() else s
+
+
+def _bad(s: str) -> str:
+    return click.style(s, fg="red") if _color_on() else s
+
+
+def _hdr(s: str) -> str:
+    return click.style(s, bold=True) if _color_on() else s
+
+
 def _load(config_path: Path) -> dict[str, Any]:
     resolved = config_path.expanduser().resolve()
     if not resolved.exists():
@@ -40,7 +79,7 @@ def _load(config_path: Path) -> dict[str, Any]:
     try:
         data = json.loads(resolved.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError) as exc:
-        click.echo(f"Error: Failed to parse {resolved}: {exc}", err=True)
+        click.echo(f"{_err('Error:')} Failed to parse {resolved}: {exc}", err=True)
         raise SystemExit(1) from exc
     # Structural guard: the rest of the CLI assumes top-level dict with a dict
     # `upstream_servers`. Without this, a valid-but-wrong-shape JSON (e.g. a
@@ -48,14 +87,15 @@ def _load(config_path: Path) -> dict[str, Any]:
     # an AttributeError traceback instead of a clean user-facing error.
     if not isinstance(data, dict):
         click.echo(
-            f"Error: {resolved} top-level must be a JSON object, got {type(data).__name__}.",
+            f"{_err('Error:')} {resolved} top-level must be a JSON object, "
+            f"got {type(data).__name__}.",
             err=True,
         )
         raise SystemExit(1)
     servers = data.get("upstream_servers")
     if servers is not None and not isinstance(servers, dict):
         click.echo(
-            f"Error: {resolved} 'upstream_servers' must be an object, "
+            f"{_err('Error:')} {resolved} 'upstream_servers' must be an object, "
             f"got {type(servers).__name__}.",
             err=True,
         )
@@ -82,7 +122,10 @@ CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 @click.group(context_settings=CONTEXT_SETTINGS)
 def cli() -> None:
-    """memtomem-stm proxy gateway management."""
+    """memtomem-stm proxy gateway management.
+
+    Output is colorized when writing to a terminal. Set NO_COLOR=1 to disable.
+    """
 
 
 @cli.command()
@@ -159,7 +202,9 @@ def list_servers(config_path: str) -> None:
         click.echo("No upstream servers configured.")
         return
 
-    click.echo(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<12} {'COMPRESSION':<12} COMMAND / URL")
+    click.echo(
+        _hdr(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<12} {'COMPRESSION':<12} COMMAND / URL")
+    )
     click.echo("-" * 80)
     for name, cfg in servers.items():
         transport = cfg.get("transport", "stdio")
@@ -238,13 +283,16 @@ def add(
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
 
     if name in servers:
-        click.echo(f"Error: server '{name}' already exists. Use `remove` first.", err=True)
+        click.echo(
+            f"{_err('Error:')} server '{name}' already exists. Use `remove` first.",
+            err=True,
+        )
         sys.exit(1)
 
     # VAL-1: prefix format validation
     if not _PREFIX_RE.match(prefix) or "__" in prefix:
         click.echo(
-            f"Error: invalid prefix '{prefix}'. "
+            f"{_err('Error:')} invalid prefix '{prefix}'. "
             "Must start with a letter, contain only letters/digits/underscores, "
             "and must not contain '__'.",
             err=True,
@@ -255,7 +303,7 @@ def add(
     for srv_name, srv_cfg in servers.items():
         if srv_cfg.get("prefix") == prefix:
             click.echo(
-                f"Warning: prefix '{prefix}' is already used by server "
+                f"{_warn('Warning:')} prefix '{prefix}' is already used by server "
                 f"'{srv_name}'. Duplicate-named tools will shadow each "
                 f"other at runtime. Proceeding anyway.",
                 err=True,
@@ -264,12 +312,12 @@ def add(
 
     # VAL-3: stdio requires --command
     if transport == "stdio" and not command:
-        click.echo("Error: --command is required for stdio transport.", err=True)
+        click.echo(f"{_err('Error:')} --command is required for stdio transport.", err=True)
         sys.exit(1)
 
     # VAL-4: sse/streamable_http requires --url
     if transport != "stdio" and not url:
-        click.echo(f"Error: --url is required for {transport} transport.", err=True)
+        click.echo(f"{_err('Error:')} --url is required for {transport} transport.", err=True)
         sys.exit(1)
 
     entry: dict[str, Any] = {
@@ -284,7 +332,7 @@ def add(
             try:
                 entry["args"] = shlex.split(args_str)
             except ValueError as exc:
-                click.echo(f"Error: malformed --args: {exc}", err=True)
+                click.echo(f"{_err('Error:')} malformed --args: {exc}", err=True)
                 sys.exit(1)
     else:
         entry["url"] = url
@@ -293,15 +341,18 @@ def add(
         env_dict: dict[str, str] = {}
         for pair in env_pairs:
             if "=" not in pair:
-                click.echo(f"Error: --env must be KEY=VALUE, got: {pair}", err=True)
+                click.echo(f"{_err('Error:')} --env must be KEY=VALUE, got: {pair}", err=True)
                 sys.exit(1)
             k, v = pair.split("=", 1)
             if not k:
-                click.echo(f"Error: --env key must be non-empty, got: {pair}", err=True)
+                click.echo(
+                    f"{_err('Error:')} --env key must be non-empty, got: {pair}",
+                    err=True,
+                )
                 sys.exit(1)
             if k.upper() in _DANGEROUS_ENV_KEYS:
                 click.echo(
-                    f"Error: --env key '{k}' is blocked for security reasons "
+                    f"{_err('Error:')} --env key '{k}' is blocked for security reasons "
                     "(could enable code injection in spawned processes).",
                     err=True,
                 )
@@ -313,13 +364,13 @@ def add(
         click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
         probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
         if not probe["connected"]:
-            click.echo(f"Error: validation failed — {probe['error']}", err=True)
+            click.echo(f"{_err('Error:')} validation failed — {probe['error']}", err=True)
             sys.exit(1)
-        click.echo(f"Validated: {probe['tools']} tool(s) reachable.")
+        click.echo(f"{_ok('Validated:')} {probe['tools']} tool(s) reachable.")
 
     servers[name] = entry
     _save(path, data)
-    click.echo(f"Added server '{name}' (prefix={prefix})")
+    click.echo(f"{_ok('Added')} server '{name}' (prefix={prefix})")
 
 
 # ── init command ────────────────────────────────────────────────────────
@@ -332,7 +383,7 @@ def _prompt_prefix() -> str:
         if _PREFIX_RE.match(value) and "__" not in value:
             return value
         click.echo(
-            "  Invalid: must start with a letter, contain only letters/digits/"
+            f"  {_warn('Invalid:')} must start with a letter, contain only letters/digits/"
             "underscores, and not contain '__'. Try again."
         )
 
@@ -355,19 +406,19 @@ def init(config_path: str, no_validate: bool) -> None:
     resolved = path.expanduser().resolve()
 
     if resolved.exists():
-        click.echo(f"Error: config already exists at {resolved}.", err=True)
+        click.echo(f"{_err('Error:')} config already exists at {resolved}.", err=True)
         click.echo("  Use `mms add` to register another server.", err=True)
         click.echo("  Use `mms list` to see what's already configured.", err=True)
         sys.exit(1)
 
-    click.echo("Guided setup for memtomem-stm")
+    click.echo(_hdr("Guided setup for memtomem-stm"))
     click.echo("=" * 30)
     click.echo(f"Config will be written to: {resolved}")
     click.echo("")
 
     name = click.prompt("Server name (e.g. 'filesystem', 'github')", type=str).strip()
     if not name:
-        click.echo("Error: server name must be non-empty.", err=True)
+        click.echo(f"{_err('Error:')} server name must be non-empty.", err=True)
         sys.exit(1)
 
     prefix = _prompt_prefix()
@@ -389,7 +440,10 @@ def init(config_path: str, no_validate: bool) -> None:
     if transport == "stdio":
         command = click.prompt("Command (e.g. 'npx', 'uvx')", type=str).strip()
         if not command:
-            click.echo("Error: command must be non-empty for stdio transport.", err=True)
+            click.echo(
+                f"{_err('Error:')} command must be non-empty for stdio transport.",
+                err=True,
+            )
             sys.exit(1)
         entry["command"] = command
 
@@ -403,12 +457,15 @@ def init(config_path: str, no_validate: bool) -> None:
             try:
                 entry["args"] = shlex.split(args_str)
             except ValueError as exc:
-                click.echo(f"Error: malformed arguments: {exc}", err=True)
+                click.echo(f"{_err('Error:')} malformed arguments: {exc}", err=True)
                 sys.exit(1)
     else:
         url = click.prompt(f"URL for {transport}", type=str).strip()
         if not url:
-            click.echo(f"Error: URL must be non-empty for {transport} transport.", err=True)
+            click.echo(
+                f"{_err('Error:')} URL must be non-empty for {transport} transport.",
+                err=True,
+            )
             sys.exit(1)
         entry["url"] = url
 
@@ -416,18 +473,18 @@ def init(config_path: str, no_validate: bool) -> None:
         click.echo(f"Validating '{name}' (timeout=10s)...")
         probe = asyncio.run(_probe_servers({name: entry}, 10))[name]
         if probe["connected"]:
-            click.echo(f"  Reachable: {probe['tools']} tool(s) discovered.")
+            click.echo(f"  {_ok('Reachable:')} {probe['tools']} tool(s) discovered.")
         else:
-            click.echo(f"  Warning: probe failed — {probe['error']}", err=True)
+            click.echo(f"  {_warn('Warning:')} probe failed — {probe['error']}", err=True)
             click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
 
     data = {"enabled": True, "upstream_servers": {name: entry}}
     _save(path, data)
 
     click.echo("")
-    click.echo(f"Saved to: {resolved}")
+    click.echo(f"{_ok('Saved to:')} {resolved}")
     click.echo("")
-    click.echo("Configured upstream servers:")
+    click.echo(_hdr("Configured upstream servers:"))
     if transport == "stdio":
         detail = f"{entry['command']} {' '.join(entry.get('args', []))}".strip()
     else:
@@ -435,12 +492,12 @@ def init(config_path: str, no_validate: bool) -> None:
     click.echo(f"  {name:<20} prefix={prefix}  [{transport}] {detail}")
 
     click.echo("")
-    click.echo("Next: connect your MCP client to memtomem-stm.")
+    click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")
     click.echo("")
-    click.echo("  Claude Code (CLI):")
+    click.echo(f"  {_hdr('Claude Code (CLI):')}")
     click.echo("    claude mcp add memtomem-stm -s user -- memtomem-stm")
     click.echo("")
-    click.echo("  Claude Desktop / JSON MCP config:")
+    click.echo(f"  {_hdr('Claude Desktop / JSON MCP config:')}")
     click.echo('    { "mcpServers": { "memtomem-stm": { "command": "memtomem-stm" } } }')
 
 
@@ -455,7 +512,7 @@ def remove(name: str, config_path: str, yes: bool) -> None:
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     if name not in servers:
-        click.echo(f"Error: server '{name}' not found.", err=True)
+        click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
         sys.exit(1)
 
     if not yes:
@@ -463,7 +520,7 @@ def remove(name: str, config_path: str, yes: bool) -> None:
 
     del servers[name]
     _save(path, data)
-    click.echo(f"Removed server '{name}'.")
+    click.echo(f"{_ok('Removed')} server '{name}'.")
 
 
 # ── health command ──────────────────────────────────────────────────────
@@ -561,10 +618,10 @@ def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
         click.echo(json.dumps({"servers": results}))
         return
 
-    click.echo("Upstream Server Health")
+    click.echo(_hdr("Upstream Server Health"))
     click.echo("=" * 30)
     for name, info in results.items():
         if info["connected"]:
-            click.echo(f"  {name}: connected ({info['tools']} tools)")
+            click.echo(f"  {name}: {_ok('connected')} ({info['tools']} tools)")
         else:
-            click.echo(f"  {name}: DISCONNECTED — {info['error']}")
+            click.echo(f"  {name}: {_bad('DISCONNECTED')} — {info['error']}")

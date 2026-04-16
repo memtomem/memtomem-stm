@@ -54,6 +54,39 @@ class TestVersion:
         assert result.output.strip().startswith("memtomem-stm ")
 
 
+# ── style helpers / NO_COLOR contract ───────────────────────────────────
+
+
+class TestStyleHelpers:
+    """The style helpers are tiny but they enforce two contracts that CLI
+    users rely on: (1) each signal uses a distinct SGR combo so a screen-
+    reader / grep user can tell errors from warnings; (2) NO_COLOR disables
+    everything per the https://no-color.org spec, including empty-string.
+
+    Click 8.3 doesn't honor NO_COLOR on real TTYs, so we enforce it in the
+    helpers. A regression here would silently re-break that promise."""
+
+    def test_color_emits_expected_sgr(self, monkeypatch):
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        from memtomem_stm.cli.proxy import _bad, _err, _hdr, _ok, _warn
+
+        assert _err("X") == "\x1b[31m\x1b[1mX\x1b[0m"  # red + bold
+        assert _bad("X") == "\x1b[31mX\x1b[0m"  # red only
+        assert _warn("X") == "\x1b[33mX\x1b[0m"  # yellow
+        assert _ok("X") == "\x1b[32mX\x1b[0m"  # green
+        assert _hdr("X") == "\x1b[1mX\x1b[0m"  # bold only
+
+    @pytest.mark.parametrize("value", ["1", "", "anything"])
+    def test_no_color_any_value_disables(self, monkeypatch, value):
+        """Per no-color.org: presence of NO_COLOR (any value, incl. empty)
+        disables color."""
+        monkeypatch.setenv("NO_COLOR", value)
+        from memtomem_stm.cli.proxy import _bad, _err, _hdr, _ok, _warn
+
+        for fn in (_err, _warn, _ok, _bad, _hdr):
+            assert fn("X") == "X"
+
+
 # ── _load / config-corruption paths ──────────────────────────────────────
 
 
