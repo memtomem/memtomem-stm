@@ -167,6 +167,14 @@ sequenceDiagram
     end
 ```
 
+**Failure guard (S1).**  If `record_surfacing` fails (e.g. SQLite
+contention on `stm_feedback.db`), the engine drops the
+`surfacing_id` — the memory block is still injected but without a
+feedback ID.  The agent cannot submit feedback for that particular
+surfacing event, but the response is never blocked or corrupted.
+Logged at WARNING.  See also
+[Pipeline → Stage 3](pipeline.md#stage-3-surface).
+
 ## LTM Connection
 
 STM connects to the LTM exclusively over the MCP protocol. The surfacing engine spawns (or attaches to) a memtomem MCP server using these settings:

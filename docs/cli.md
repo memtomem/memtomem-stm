@@ -124,3 +124,14 @@ sequenceDiagram
     Agent->>STM: stm_proxy_stats
     STM-->>Agent: token savings · cache hit ratio · latency p50/p95/p99
 ```
+
+## Logging
+
+Log level is controlled via environment variable (no CLI flag):
+
+```bash
+export MEMTOMEM_STM_LOG_LEVEL=DEBUG   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+```
+
+See [Configuration → General](configuration.md#general) and
+[Operations → Logging](operations.md#logging) for details.

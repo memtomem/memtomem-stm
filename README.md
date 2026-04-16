@@ -120,6 +120,7 @@ Want to see STM's behavior without wiring it into Claude Code first? The [`noteb
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 10 MCP tools |
 | [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
+| [Custom Integration](https://github.com/memtomem/memtomem-stm/blob/main/docs/custom-integration.md) | FileIndexer protocol, wiring, and known caveats for auto-index / extraction |
 
 ## Development
 

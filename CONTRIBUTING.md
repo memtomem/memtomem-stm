@@ -33,7 +33,7 @@ uv run mypy src
   - `cli/` — `mms` / `memtomem-stm-proxy` CLI
   - `utils/` — Circuit breaker and shared helpers
 - `tests/` — pytest suite
-- `docs/` — Architecture and operations guides
+- `docs/` — Architecture, operations, and integration guides (incl. `custom-integration.md`)
 
 The LTM core lives in a separate repository: [memtomem/memtomem](https://github.com/memtomem/memtomem). Communication between STM and LTM happens entirely through the MCP protocol — there is no Python-level dependency.
 
