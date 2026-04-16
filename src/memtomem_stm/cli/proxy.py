@@ -66,6 +66,14 @@ def cli() -> None:
 
 
 @cli.command()
+def version() -> None:
+    """Show the installed memtomem-stm version."""
+    from importlib.metadata import version as pkg_version
+
+    click.echo(f"memtomem-stm {pkg_version('memtomem-stm')}")
+
+
+@cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 def status(config_path: str) -> None:
     """Show proxy gateway configuration and server list."""

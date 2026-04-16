@@ -40,6 +40,17 @@ def _cfg_args(config: Path) -> list[str]:
     return ["--config", str(config)]
 
 
+# ── version command ─────────────────────────────────────────────────────
+
+
+class TestVersion:
+    def test_prints_package_version(self, runner):
+        result = runner.invoke(cli, ["version"])
+        assert result.exit_code == 0
+        assert "memtomem-stm" in result.output
+        assert result.output.strip().startswith("memtomem-stm ")
+
+
 # ── _load / config-corruption paths ──────────────────────────────────────
 
 
