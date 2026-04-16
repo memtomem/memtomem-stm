@@ -571,6 +571,33 @@ class TestAutoIndex:
         assert "3 chunks" in result
         mock_indexer.index_file.assert_awaited_once()
 
+    async def test_auto_index_failure_returns_surfaced(self, tmp_path, caplog):
+        """When _auto_index_response raises, call_tool returns the surfaced
+        response — optional stages must not kill the agent response."""
+        from memtomem_stm.proxy.config import AutoIndexConfig
+
+        mock_indexer = AsyncMock()
+        proxy_cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test")},
+            auto_index=AutoIndexConfig(enabled=True, min_chars=10, memory_dir=tmp_path / "idx"),
+        )
+        tracker = TokenTracker()
+        mgr = ProxyManager(proxy_cfg, tracker, index_engine=mock_indexer)
+
+        response_text = "upstream content " * 20
+        _inject_connection(mgr, text=response_text)
+
+        with patch.object(
+            mgr, "_auto_index_response", new_callable=AsyncMock,
+            side_effect=OSError("disk full"),
+        ):
+            result = await mgr.call_tool("srv", "some_tool", {})
+
+        assert isinstance(result, str)
+        assert "upstream content" in result
+        assert "Auto-index failed" in caplog.text
+
 
 # ── _extract_and_store ────────────────────────────────────────────────────
 

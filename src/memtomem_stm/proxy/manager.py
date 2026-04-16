@@ -1331,17 +1331,26 @@ class ProxyManager:
                 "proxy_call_index",
                 metadata={"server": server, "tool": tool},
             ):
-                final_result = await self._auto_index_response(
-                    server,
-                    tool,
-                    upstream_args,
-                    cleaned,
-                    agent_summary=surfaced,
-                    compression_strategy=tc.compression.value,
-                    original_chars=len(original_text),
-                    compressed_chars=len(surfaced),
-                    context_query=context_query,
-                )
+                try:
+                    final_result = await self._auto_index_response(
+                        server,
+                        tool,
+                        upstream_args,
+                        cleaned,
+                        agent_summary=surfaced,
+                        compression_strategy=tc.compression.value,
+                        original_chars=len(original_text),
+                        compressed_chars=len(surfaced),
+                        context_query=context_query,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Auto-index failed for %s/%s — returning unindexed response",
+                        server,
+                        tool,
+                        exc_info=True,
+                    )
+                    final_result = surfaced
         else:
             final_result = surfaced
 
