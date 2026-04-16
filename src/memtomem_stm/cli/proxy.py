@@ -75,19 +75,37 @@ def version() -> None:
 
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
-def status(config_path: str) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
+def status(config_path: str, *, as_json: bool = False) -> None:
     """Show proxy gateway configuration and server list."""
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
     if not resolved.exists():
-        click.echo(f"Config not found: {resolved}")
-        click.echo("Run `memtomem-stm-proxy add` to create a configuration.")
+        if as_json:
+            click.echo(json.dumps({"error": "config_not_found", "path": str(resolved)}))
+        else:
+            click.echo(f"Config not found: {resolved}")
+            click.echo("Run `memtomem-stm-proxy add` to create a configuration.")
         return
 
     data = _load(path)
     enabled = data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "config_path": str(resolved),
+                    "enabled": enabled,
+                    "servers": servers,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return
 
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
