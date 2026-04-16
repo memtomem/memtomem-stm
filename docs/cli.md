@@ -29,12 +29,35 @@ Usage: mms [OPTIONS] COMMAND [ARGS]...
 Commands:
   add     Add an upstream MCP server to the proxy configuration.
   health  Check upstream server connectivity.
+  init    Guided first-time setup for memtomem-stm.
   list    List configured upstream servers.
   remove  Remove an upstream MCP server from the proxy configuration.
   status  Show proxy gateway configuration and server list.
 ```
 
 All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
+
+### `init`
+
+```
+Usage: mms init [OPTIONS]
+
+Options:
+  --config TEXT   [default: ~/.memtomem/stm_proxy.json]
+  --no-validate   Skip the connectivity probe entirely (default: prompt,
+                  probe on yes).
+```
+
+Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then prints an inline summary plus the MCP-client snippet you need to paste into Claude Code / Claude Desktop.
+
+Aborts if the config file already exists — use [`add`](#add) to register additional servers or [`list`](#list) to inspect the current state. This makes `init` safe to run without clobbering existing configuration.
+
+Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
+
+```bash
+mms init                # interactive wizard
+mms init --no-validate  # skip the connectivity probe prompt entirely
+```
 
 ### `add`
 
@@ -56,7 +79,14 @@ Options:
                                   'auto' picks strategy per response by
                                   content type.  [default: auto]
   --max-chars INTEGER             [default: 8000]
+  --validate                      Probe the server (MCP initialize +
+                                  list-tools) before saving; abort on
+                                  failure.
+  --timeout INTEGER               Connection timeout (seconds) when
+                                  --validate is set.  [default: 10]
 ```
+
+Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
@@ -81,6 +111,13 @@ mms add docs \
   --transport sse \
   --url https://docs.example.com/mcp \
   --prefix docs
+
+# Validate connectivity at registration time (rejects bad entries up front)
+mms add filesystem \
+  --command npx \
+  --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
+  --prefix fs \
+  --validate
 
 # List configured upstreams
 mms list

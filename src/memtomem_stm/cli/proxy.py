@@ -204,6 +204,20 @@ def list_servers(config_path: str) -> None:
 @click.option(
     "--max-chars", "max_result_chars", type=click.IntRange(min=1), default=8000, show_default=True
 )
+@click.option(
+    "--validate",
+    is_flag=True,
+    default=False,
+    help="Probe the server (MCP initialize + list-tools) before saving; abort on failure.",
+)
+@click.option(
+    "--timeout",
+    "validate_timeout",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Connection timeout (seconds) when --validate is set.",
+)
 def add(
     name: str,
     config_path: str,
@@ -215,6 +229,8 @@ def add(
     env_pairs: tuple[str, ...],
     compression: str,
     max_result_chars: int,
+    validate: bool,
+    validate_timeout: int,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
     path = Path(config_path)
@@ -293,9 +309,139 @@ def add(
             env_dict[k] = v
         entry["env"] = env_dict
 
+    if validate:
+        click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
+        probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
+        if not probe["connected"]:
+            click.echo(f"Error: validation failed — {probe['error']}", err=True)
+            sys.exit(1)
+        click.echo(f"Validated: {probe['tools']} tool(s) reachable.")
+
     servers[name] = entry
     _save(path, data)
     click.echo(f"Added server '{name}' (prefix={prefix})")
+
+
+# ── init command ────────────────────────────────────────────────────────
+
+
+def _prompt_prefix() -> str:
+    """Prompt for a prefix until it passes the same rules as ``add --prefix``."""
+    while True:
+        value = click.prompt("Tool prefix (letters/digits/underscores, e.g. 'fs')", type=str)
+        if _PREFIX_RE.match(value) and "__" not in value:
+            return value
+        click.echo(
+            "  Invalid: must start with a letter, contain only letters/digits/"
+            "underscores, and not contain '__'. Try again."
+        )
+
+
+@cli.command()
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option(
+    "--no-validate",
+    is_flag=True,
+    default=False,
+    help="Skip the connectivity probe entirely (default: prompt, probe on yes).",
+)
+def init(config_path: str, no_validate: bool) -> None:
+    """Guided first-time setup for memtomem-stm.
+
+    Prompts for a single upstream server and writes the config file. Aborts
+    when the config already exists — use ``mms add`` to append more servers.
+    """
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+
+    if resolved.exists():
+        click.echo(f"Error: config already exists at {resolved}.", err=True)
+        click.echo("  Use `mms add` to register another server.", err=True)
+        click.echo("  Use `mms list` to see what's already configured.", err=True)
+        sys.exit(1)
+
+    click.echo("Guided setup for memtomem-stm")
+    click.echo("=" * 30)
+    click.echo(f"Config will be written to: {resolved}")
+    click.echo("")
+
+    name = click.prompt("Server name (e.g. 'filesystem', 'github')", type=str).strip()
+    if not name:
+        click.echo("Error: server name must be non-empty.", err=True)
+        sys.exit(1)
+
+    prefix = _prompt_prefix()
+
+    transport = click.prompt(
+        "Transport",
+        type=click.Choice(["stdio", "sse", "streamable_http"]),
+        default="stdio",
+        show_default=True,
+    )
+
+    entry: dict[str, Any] = {
+        "prefix": prefix,
+        "transport": transport,
+        "compression": "auto",
+        "max_result_chars": 8000,
+    }
+
+    if transport == "stdio":
+        command = click.prompt("Command (e.g. 'npx', 'uvx')", type=str).strip()
+        if not command:
+            click.echo("Error: command must be non-empty for stdio transport.", err=True)
+            sys.exit(1)
+        entry["command"] = command
+
+        args_str = click.prompt(
+            "Arguments (space-separated, leave empty for none)",
+            type=str,
+            default="",
+            show_default=False,
+        )
+        if args_str.strip():
+            try:
+                entry["args"] = shlex.split(args_str)
+            except ValueError as exc:
+                click.echo(f"Error: malformed arguments: {exc}", err=True)
+                sys.exit(1)
+    else:
+        url = click.prompt(f"URL for {transport}", type=str).strip()
+        if not url:
+            click.echo(f"Error: URL must be non-empty for {transport} transport.", err=True)
+            sys.exit(1)
+        entry["url"] = url
+
+    if not no_validate and click.confirm("Validate connection now?", default=True):
+        click.echo(f"Validating '{name}' (timeout=10s)...")
+        probe = asyncio.run(_probe_servers({name: entry}, 10))[name]
+        if probe["connected"]:
+            click.echo(f"  Reachable: {probe['tools']} tool(s) discovered.")
+        else:
+            click.echo(f"  Warning: probe failed — {probe['error']}", err=True)
+            click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
+
+    data = {"enabled": True, "upstream_servers": {name: entry}}
+    _save(path, data)
+
+    click.echo("")
+    click.echo(f"Saved to: {resolved}")
+    click.echo("")
+    click.echo("Configured upstream servers:")
+    if transport == "stdio":
+        detail = f"{entry['command']} {' '.join(entry.get('args', []))}".strip()
+    else:
+        detail = entry["url"]
+    click.echo(f"  {name:<20} prefix={prefix}  [{transport}] {detail}")
+
+    click.echo("")
+    click.echo("Next: connect your MCP client to memtomem-stm.")
+    click.echo("")
+    click.echo("  Claude Code (CLI):")
+    click.echo("    claude mcp add memtomem-stm -s user -- memtomem-stm")
+    click.echo("")
+    click.echo("  Claude Desktop / JSON MCP config:")
+    click.echo('    { "mcpServers": { "memtomem-stm": { "command": "memtomem-stm" } } }')
 
 
 @cli.command()
