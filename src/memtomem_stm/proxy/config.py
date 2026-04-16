@@ -7,7 +7,7 @@ import logging
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -264,6 +264,15 @@ class UpstreamServerConfig(BaseModel):
     connect_timeout_seconds: float = Field(default=30.0, gt=0.0)
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
+
+    @model_validator(mode="after")
+    def _check_delay_ordering(self) -> Self:
+        if self.reconnect_delay_seconds > self.max_reconnect_delay_seconds:
+            raise ValueError(
+                f"reconnect_delay_seconds ({self.reconnect_delay_seconds}) "
+                f"must be <= max_reconnect_delay_seconds ({self.max_reconnect_delay_seconds})"
+            )
+        return self
 
 
 class CacheConfig(BaseModel):

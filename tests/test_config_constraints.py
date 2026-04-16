@@ -13,6 +13,7 @@ from memtomem_stm.proxy.config import (
     LLMProvider,
     RelevanceScorerConfig,
     SelectiveConfig,
+    UpstreamServerConfig,
 )
 from memtomem_stm.surfacing.config import SurfacingConfig
 
@@ -65,6 +66,14 @@ class TestProxyNumericConstraints:
         with pytest.raises(ValidationError):
             RelevanceScorerConfig(embedding_timeout=-1.0)
 
+    def test_reconnect_delay_must_not_exceed_max(self) -> None:
+        with pytest.raises(ValidationError):
+             UpstreamServerConfig(prefix="x", reconnect_delay_seconds=10, max_reconnect_delay_seconds=5)
+
+    def test_reconnect_delay_equal_to_max_is_valid(self) -> None:
+        cfg = UpstreamServerConfig(prefix="x", reconnect_delay_seconds=5, max_reconnect_delay_seconds=5)
+        assert cfg.reconnect_delay_seconds == 5
+    
 
 class TestLLMCompressorApiKey:
     """``provider=openai|anthropic`` with empty ``api_key`` used to send a
