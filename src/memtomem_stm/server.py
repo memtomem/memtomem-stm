@@ -664,6 +664,11 @@ async def stm_tuning_recommendations(
 
 def main() -> None:
     """Run the STM MCP server."""
+    level = os.environ.get("MEMTOMEM_STM_LOG_LEVEL", "WARNING").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.WARNING),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     mcp.run()
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -37,6 +39,7 @@ class STMConfig(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)

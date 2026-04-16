@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from memtomem_stm.config import LangfuseConfig
+from memtomem_stm.config import LangfuseConfig, STMConfig
 from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     ExtractionConfig,
@@ -193,3 +193,23 @@ class TestLangfuseInterdepValidator:
     def test_disabled_allows_empty_keys(self) -> None:
         cfg = LangfuseConfig(enabled=False)
         assert cfg.public_key == ""
+
+
+class TestLogLevel:
+    def test_default_is_warning(self) -> None:
+        cfg = STMConfig()
+        assert cfg.log_level == "WARNING"
+
+    def test_valid_levels_accepted(self) -> None:
+        for level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            cfg = STMConfig(log_level=level)
+            assert cfg.log_level == level
+
+    def test_invalid_level_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            STMConfig(log_level="TRACE")  # type: ignore[arg-type]
+
+    def test_env_var_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_LOG_LEVEL", "DEBUG")
+        cfg = STMConfig()
+        assert cfg.log_level == "DEBUG"
