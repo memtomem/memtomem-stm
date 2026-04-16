@@ -7,14 +7,16 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![CLA](https://img.shields.io/badge/CLA-required-green)](CLA.md)
 
-Short-term memory proxy gateway with **proactive memory surfacing** for AI agents.
+Spend fewer tokens. Remember more. Ship faster.
 
-Sits between your AI agent and upstream MCP servers. Compresses responses to save tokens, caches results, and automatically surfaces relevant memories from a memtomem LTM server.
+memtomem-stm is an MCP proxy that typically **cuts token usage by 20–80%** and gives your agent **memory across sessions** — with no changes to your upstream MCP servers.
 
-**Built for:**
-- Agents (Claude Code, Cursor, Claude Desktop, etc.) running multiple MCP servers and burning tokens on noisy upstream responses
-- Long-running coding sessions where the agent should *recall* prior decisions instead of re-searching
-- Teams running custom MCP servers that need a proxy layer for compression, caching, and observability — no upstream code changes required
+It sits between your AI agent and its upstream MCP servers, compressing bloated tool responses, caching repeated calls, and automatically surfacing relevant context from prior sessions via a memtomem LTM server.
+
+**You need this if:**
+- Your agent **burns tokens** re-reading the same files and search results — STM compresses and caches them (Claude Code, Cursor, Claude Desktop, or any MCP client)
+- Your coding sessions **lose context** and the agent re-discovers decisions it already made — STM surfaces prior context automatically via memtomem LTM
+- You run custom MCP servers and want **compression, caching, and observability** without changing upstream code — STM is a drop-in proxy layer
 
 ```mermaid
 flowchart TB
@@ -98,29 +100,29 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 
 ## Tutorial notebooks
 
-Want to see STM's behavior without wiring it into Claude Code first? The [`notebooks/`](notebooks/) directory contains six runnable Jupyter notebooks: a CLI-MCP prelude (00), quickstart setup (01), selective compression (02), memory surfacing (03), a LangChain agent integration (04), and observability/Langfuse tracing (05). Clone the repo, run `uv sync`, and `uv run jupyter lab notebooks/` — no external services required for notebooks 00–03 and 05.
+> **Try it without wiring into your AI client first.** Six [runnable Jupyter notebooks](notebooks/) walk through setup, compression, memory surfacing, LangChain integration, and observability. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed for notebooks 00–03 and 05.
 
 ## Key Features
 
-- 🗜️ **10 compression strategies** with auto-selection by content type, query-aware budget allocation, and zero-loss progressive delivery → [docs/compression.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md)
-- 🧠 **Proactive memory surfacing** from a memtomem LTM server, gated by relevance threshold, rate limit, dedup, and circuit breaker → [docs/surfacing.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md)
-- 💾 **Response caching** with TTL and eviction; surfacing re-applied on cache hit so injected memories stay fresh → [docs/caching.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md)
-- 🔍 **Observability** — Langfuse tracing, RPS, latency percentiles (p50/p95/p99), error classification, per-tool metrics → [docs/operations.md#observability](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#observability)
-- 📈 **Horizontal scaling** — `PendingStore` protocol with InMemory (default) or SQLite-shared backend for multi-instance deployments → [docs/operations.md#horizontal-scaling](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#horizontal-scaling)
-- 🛡️ **Safety** — circuit breaker, retry with backoff, write-tool skip, query cooldown, session/cross-session dedup, sensitive content auto-detection → [docs/operations.md#safety--resilience](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#safety--resilience)
+- 🗜️ **Typically 20–80% fewer tokens per tool call** — 10 compression strategies with auto-selection by content type, query-aware budget, and zero-loss progressive delivery → [docs/compression.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md)
+- 🧠 **Your agent remembers** — proactive memory surfacing from prior sessions, gated by relevance threshold, rate limit, dedup, and circuit breaker → [docs/surfacing.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md)
+- 💾 **Repeated calls are free** — response cache with TTL and eviction; surfacing re-applied on cache hit so injected memories stay fresh → [docs/caching.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md)
+- 🔍 **See what's happening** — Langfuse tracing, RPS, latency percentiles (p50/p95/p99), error classification, per-tool metrics → [docs/operations.md#observability](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#observability)
+- 📈 **Scale to teams** — `PendingStore` protocol with InMemory (default) or SQLite-shared backend for multi-instance deployments → [docs/operations.md#horizontal-scaling](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#horizontal-scaling)
+- 🛡️ **Production-safe** — circuit breaker, retry with backoff, write-tool skip, query cooldown, dedup, sensitive content auto-detection → [docs/operations.md#safety--resilience](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#safety--resilience)
 
 ## Documentation
 
 | Guide | Topic |
 |-------|-------|
-| [Pipeline](https://github.com/memtomem/memtomem-stm/blob/main/docs/pipeline.md) | The 4-stage CLEAN → COMPRESS → SURFACE → INDEX flow |
-| [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies, query-aware compression, progressive delivery, model-aware defaults |
-| [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | Memory surfacing engine, relevance gating, feedback loop, auto-tuning |
-| [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Response cache and auto-indexing |
-| [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Environment variables and `stm_proxy.json` reference |
-| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | `mms` (= `memtomem-stm-proxy`) commands and the 10 MCP tools |
-| [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Safety, privacy, horizontal scaling, observability, on-disk state |
-| [Custom Integration](https://github.com/memtomem/memtomem-stm/blob/main/docs/custom-integration.md) | FileIndexer protocol, wiring, and known caveats for auto-index / extraction |
+| [Pipeline](https://github.com/memtomem/memtomem-stm/blob/main/docs/pipeline.md) | How responses flow through the 4-stage pipeline |
+| [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
+| [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | How agents recall prior context automatically |
+| [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
+| [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Tune settings without touching code |
+| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands and the 10 MCP tools |
+| [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Run safely in production — scaling, observability, privacy |
+| [Custom Integration](https://github.com/memtomem/memtomem-stm/blob/main/docs/custom-integration.md) | Extend STM with custom file indexers |
 
 ## Development
 

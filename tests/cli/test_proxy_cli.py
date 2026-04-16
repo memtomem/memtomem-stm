@@ -60,7 +60,7 @@ class TestConfigLoad:
         result = runner.invoke(cli, ["status", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "Config not found" in result.output
-        assert "memtomem-stm-proxy add" in result.output
+        assert "mms add" in result.output
 
     def test_corrupt_json_surfaces_error_not_silent(self, runner, config):
         """Malformed JSON must fail with a message, not return a default dict."""
@@ -154,6 +154,7 @@ class TestListServers:
         assert "NAME" in result.output
         assert "fs" in result.output
         assert "stdio" in result.output
+        assert "1 server(s) configured" in result.output
 
     def test_list_http_server_shows_url(self, runner, config):
         runner.invoke(

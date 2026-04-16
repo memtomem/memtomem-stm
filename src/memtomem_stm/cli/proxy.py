@@ -86,7 +86,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
             click.echo(json.dumps({"error": "config_not_found", "path": str(resolved)}))
         else:
             click.echo(f"Config not found: {resolved}")
-            click.echo("Run `memtomem-stm-proxy add` to create a configuration.")
+            click.echo("Run `mms add` to create a configuration.")
         return
 
     data = _load(path)
@@ -152,6 +152,7 @@ def list_servers(config_path: str) -> None:
         else:
             detail = cfg.get("url", "")
         click.echo(f"{name:<20} {prefix:<10} {transport:<12} {compression:<12} {detail}")
+    click.echo(f"\n{len(servers)} server(s) configured.")
 
 
 @cli.command()
@@ -159,12 +160,17 @@ def list_servers(config_path: str) -> None:
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--command", "command", default="", help="Executable command (stdio).")
 @click.option("--args", "args_str", default="", help="Space-separated arguments.")
-@click.option("--prefix", required=True, help="Tool name prefix (e.g. 'fs').")
+@click.option(
+    "--prefix",
+    required=True,
+    help="Tool namespace (e.g. 'fs' -> tools appear as fs__read_file).",
+)
 @click.option(
     "--transport",
     type=click.Choice(["stdio", "sse", "streamable_http"]),
     default="stdio",
     show_default=True,
+    help="stdio for local processes, sse/streamable_http for remote.",
 )
 @click.option("--url", default="", help="Endpoint URL (SSE / HTTP).")
 @click.option("--env", "env_pairs", multiple=True, metavar="KEY=VALUE")
@@ -173,6 +179,7 @@ def list_servers(config_path: str) -> None:
     type=click.Choice(["auto", "none", "truncate", "selective", "hybrid"]),
     default="auto",
     show_default=True,
+    help="'auto' picks strategy per response by content type.",
 )
 @click.option(
     "--max-chars", "max_result_chars", type=click.IntRange(min=1), default=8000, show_default=True

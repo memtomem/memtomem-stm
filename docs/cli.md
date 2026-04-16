@@ -43,13 +43,17 @@ Usage: mms add [OPTIONS] NAME
 Options:
   --command TEXT                  Executable command (stdio).
   --args TEXT                     Space-separated arguments.
-  --prefix TEXT                   Tool name prefix (e.g. 'fs').  [required]
+  --prefix TEXT                   Tool namespace (e.g. 'fs' -> tools appear
+                                  as fs__read_file).  [required]
   --transport [stdio|sse|streamable_http]
+                                  stdio for local processes,
+                                  sse/streamable_http for remote.
                                   [default: stdio]
   --url TEXT                      Endpoint URL (SSE / HTTP).
   --env KEY=VALUE
   --compression [auto|none|truncate|selective|hybrid]
-                                  [default: auto]
+                                  'auto' picks strategy per response by
+                                  content type.  [default: auto]
   --max-chars INTEGER             [default: 8000]
 ```
 
