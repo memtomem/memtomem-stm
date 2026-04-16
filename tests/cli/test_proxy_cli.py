@@ -556,6 +556,102 @@ class TestAddValidate:
         assert "lazy" in data["upstream_servers"]
 
 
+# ── init command (guided setup) ─────────────────────────────────────────
+
+
+class TestInit:
+    """`mms init` is an interactive one-shot wizard: prompt for the first
+    upstream server, run an optional probe, write config, print paste-targets.
+
+    Prompt order (stdio path): name → prefix → transport → command → args
+    → (optional) validate y/n. ``input=`` feeds one answer per newline."""
+
+    def test_init_happy_path_stdio_no_validate(self, runner, config):
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Saved to:" in result.output
+        assert "Next:" in result.output
+        assert "claude mcp add memtomem-stm" in result.output
+        assert "mcpServers" in result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        srv = data["upstream_servers"]["filesystem"]
+        assert srv["prefix"] == "fs"
+        assert srv["transport"] == "stdio"
+        assert srv["command"] == "npx"
+        assert srv["args"] == ["-y", "@modelcontextprotocol/server-fs"]
+
+    def test_init_aborts_if_config_exists(self, runner, config):
+        """Init is for first-time setup only; `mms add` handles append."""
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["init", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "config already exists" in result.output
+        assert "mms add" in result.output
+        assert "mms list" in result.output
+
+    def test_init_invalid_prefix_reprompts(self, runner, config):
+        """Bad prefix → re-ask instead of aborting; saves on the retry value."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="srv\n1bad\nfs\nstdio\ncmd\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Invalid: must start with a letter" in result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["upstream_servers"]["srv"]["prefix"] == "fs"
+
+    def test_init_sse_transport_prompts_for_url(self, runner, config):
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="docs\ndocs\nsse\nhttps://docs.example.com/mcp\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        srv = data["upstream_servers"]["docs"]
+        assert srv["transport"] == "sse"
+        assert srv["url"] == "https://docs.example.com/mcp"
+        assert "command" not in srv
+
+    def test_init_validate_failure_still_saves_with_warning(self, config):
+        """Validation is advisory: probe failure warns and continues (a flaky
+        network shouldn't block setup). Uses a real subprocess to dodge
+        CliRunner's stderr-fileno interaction (see TestAddValidate)."""
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "init",
+                "--config",
+                str(config),
+            ],
+            # server name, prefix, transport, command, args, validate=y
+            input="bad\nbad\nstdio\n__nonexistent_cmd_12345__\n\ny\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        combined = proc.stdout + proc.stderr
+        assert "Warning: probe failed" in combined
+        assert "Saving config anyway" in combined
+        assert "Saved to:" in proc.stdout
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "bad" in data["upstream_servers"]
+
+
 # ── remove command ───────────────────────────────────────────────────────
 
 

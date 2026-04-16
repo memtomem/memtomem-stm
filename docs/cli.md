@@ -29,12 +29,35 @@ Usage: mms [OPTIONS] COMMAND [ARGS]...
 Commands:
   add     Add an upstream MCP server to the proxy configuration.
   health  Check upstream server connectivity.
+  init    Guided first-time setup for memtomem-stm.
   list    List configured upstream servers.
   remove  Remove an upstream MCP server from the proxy configuration.
   status  Show proxy gateway configuration and server list.
 ```
 
 All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
+
+### `init`
+
+```
+Usage: mms init [OPTIONS]
+
+Options:
+  --config TEXT   [default: ~/.memtomem/stm_proxy.json]
+  --no-validate   Skip the connectivity probe entirely (default: prompt,
+                  probe on yes).
+```
+
+Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then prints an inline summary plus the MCP-client snippet you need to paste into Claude Code / Claude Desktop.
+
+Aborts if the config file already exists — use [`add`](#add) to register additional servers or [`list`](#list) to inspect the current state. This makes `init` safe to run without clobbering existing configuration.
+
+Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
+
+```bash
+mms init                # interactive wizard
+mms init --no-validate  # skip the connectivity probe prompt entirely
+```
 
 ### `add`
 

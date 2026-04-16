@@ -58,6 +58,14 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 
 ### 1. Add an upstream MCP server
 
+For first-time setup, run the guided wizard — it prompts for name/prefix/command, optionally probes the server, and prints the MCP-client snippet you'll need in step 2:
+
+```bash
+mms init
+```
+
+Or add servers non-interactively:
+
 ```bash
 mms add filesystem \
   --command npx \
