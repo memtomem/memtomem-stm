@@ -689,6 +689,246 @@ class TestFeedbackBoost:
         adapter.increment_access.assert_not_called()
 
 
+class TestCacheInvalidationOnNegativeFeedback:
+    """Negative feedback (``not_relevant`` / ``already_known``) must populate
+    ``_invalidated_ids`` so subsequent cache hits for the same
+    ``server/tool/query`` filter out the rejected memory. Without this,
+    repeat queries inside the ``SurfacingCache`` TTL window keep resurfacing
+    memories the agent just rejected (issue #146)."""
+
+    def _make_tracker(
+        self,
+        server: str = "gh",
+        tool: str = "read_file",
+        memory_ids: list[str] | None = None,
+        rating_response: str = "Feedback recorded: not_relevant",
+    ):
+        tracker = MagicMock()
+        tracker.record_feedback = MagicMock(return_value=rating_response)
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.get_surfacing_event = MagicMock(
+            return_value={
+                "server": server,
+                "tool": tool,
+                "memory_ids": list(memory_ids or []),
+            }
+        )
+        tracker.store.mark_surfaced = MagicMock()
+        return tracker
+
+    async def test_not_relevant_adds_tuple_to_invalidation_set(self):
+        adapter = _make_mcp_adapter([])
+        tracker = self._make_tracker(memory_ids=["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-1", "not_relevant", memory_id="mid-A")
+
+        assert ("gh", "read_file", "mid-A") in engine._invalidated_ids
+
+    async def test_already_known_adds_tuple_to_invalidation_set(self):
+        adapter = _make_mcp_adapter([])
+        tracker = self._make_tracker(
+            memory_ids=["mid-A"],
+            rating_response="Feedback recorded: already_known",
+        )
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-1", "already_known", memory_id="mid-A")
+
+        assert ("gh", "read_file", "mid-A") in engine._invalidated_ids
+
+    async def test_helpful_does_not_add_to_invalidation_set(self):
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(
+            memory_ids=["mid-A"],
+            rating_response="Feedback recorded: helpful",
+        )
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-1", "helpful", memory_id="mid-A")
+
+        assert engine._invalidated_ids == {}
+
+    async def test_blanket_invalidation_adds_all_event_memory_ids(self):
+        """handle_feedback with no memory_id invalidates every memory in the event."""
+        adapter = _make_mcp_adapter([])
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B", "mid-C"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-1", "not_relevant")
+
+        assert ("gh", "read_file", "mid-A") in engine._invalidated_ids
+        assert ("gh", "read_file", "mid-B") in engine._invalidated_ids
+        assert ("gh", "read_file", "mid-C") in engine._invalidated_ids
+
+    async def test_cache_hit_filters_invalidated_memory_from_output(self):
+        """After rating a memory not_relevant, the next cache hit for the same
+        query returns the cached results minus that memory. Uses a real
+        ``FeedbackTracker`` so the end-to-end event lookup runs."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        chunk_a = FakeChunk(id="mid-A", content="apple memory")
+        chunk_b = FakeChunk(id="mid-B", content="banana memory")
+        results = [
+            FakeSearchResult(chunk=chunk_a, score=0.5),
+            FakeSearchResult(chunk=chunk_b, score=0.4),
+        ]
+        adapter = _make_mcp_adapter(results)
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "fb.db"
+            tracker = FeedbackTracker(config=_make_config(), db_path=db_path)
+            engine = SurfacingEngine(
+                config=_make_config(cooldown_seconds=0),
+                mcp_adapter=adapter,
+                feedback_tracker=tracker,
+            )
+
+            # First surface — populates cache with [mid-A, mid-B].
+            out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "apple memory" in out1
+            assert "banana memory" in out1
+
+            import re
+
+            match = re.search(r"Surfacing ID: (\w+)", out1)
+            assert match, "surfacing_id not found in first output"
+            first_sid = match.group(1)
+
+            # Rate mid-A as not_relevant.
+            await engine.handle_feedback(first_sid, "not_relevant", memory_id="mid-A")
+
+            # Second surface hits the cache; mid-A must be filtered out.
+            out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "apple memory" not in out2
+            assert "banana memory" in out2
+
+            tracker.close()
+
+    async def test_cache_hit_filtered_to_empty_passes_response_through(self):
+        """If every cached memory is invalidated, ``_render_cached`` returns
+        the original response unchanged (no injection, no orphan event)."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        chunk_a = FakeChunk(id="mid-A", content="apple memory")
+        results = [FakeSearchResult(chunk=chunk_a, score=0.5)]
+        adapter = _make_mcp_adapter(results)
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "fb.db"
+            tracker = FeedbackTracker(config=_make_config(), db_path=db_path)
+            engine = SurfacingEngine(
+                config=_make_config(cooldown_seconds=0),
+                mcp_adapter=adapter,
+                feedback_tracker=tracker,
+            )
+
+            out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            import re
+
+            match = re.search(r"Surfacing ID: (\w+)", out1)
+            assert match
+            first_sid = match.group(1)
+
+            await engine.handle_feedback(first_sid, "not_relevant", memory_id="mid-A")
+
+            out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            # Fully filtered — response unchanged (no surfacing block injected).
+            assert out2 == LONG_RESPONSE
+            assert "apple memory" not in out2
+
+            tracker.close()
+
+    async def test_invalidation_keyed_by_server_tool_not_global(self):
+        """Invalidating (srv-A, tool-X, mid) must not affect (srv-B, tool-X, mid)
+        or (srv-A, tool-Y, mid) — the key is the full triple."""
+        adapter = _make_mcp_adapter([])
+        tracker = self._make_tracker(server="srv-A", tool="tool-X", memory_ids=["mid-1"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-1", "not_relevant", memory_id="mid-1")
+
+        assert ("srv-A", "tool-X", "mid-1") in engine._invalidated_ids
+        assert ("srv-B", "tool-X", "mid-1") not in engine._invalidated_ids
+        assert ("srv-A", "tool-Y", "mid-1") not in engine._invalidated_ids
+
+    async def test_invalidated_ids_fifo_cap_evicts_oldest(self):
+        """When ``_invalidated_ids`` exceeds its cap, oldest entries evict first."""
+        adapter = _make_mcp_adapter([])
+        tracker = self._make_tracker(memory_ids=["mid-X"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+        engine._invalidated_ids_max = 10  # shrink for test speed
+
+        for i in range(15):
+            tracker.store.get_surfacing_event = MagicMock(
+                return_value={
+                    "server": "gh",
+                    "tool": "read_file",
+                    "memory_ids": [f"mid-{i}"],
+                }
+            )
+            await engine.handle_feedback(f"sid-{i}", "not_relevant", memory_id=f"mid-{i}")
+
+        # Overflow triggers bulk prune to half the cap.
+        assert len(engine._invalidated_ids) <= 10
+        # Oldest entries evicted; newest retained.
+        assert ("gh", "read_file", "mid-0") not in engine._invalidated_ids
+        assert ("gh", "read_file", "mid-14") in engine._invalidated_ids
+
+    async def test_missing_event_skips_invalidation(self):
+        """If ``get_surfacing_event`` returns None, handle_feedback does not crash
+        and does not pollute ``_invalidated_ids`` with a phantom tuple."""
+        adapter = _make_mcp_adapter([])
+        tracker = MagicMock()
+        tracker.record_feedback = MagicMock(
+            return_value="Error: surfacing event 'sid-ghost' not found"
+        )
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.get_surfacing_event = MagicMock(return_value=None)
+        tracker.store.mark_surfaced = MagicMock()
+
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-ghost", "not_relevant", memory_id="mid-A")
+
+        assert engine._invalidated_ids == {}
+
+
 class TestConcurrentSurfacedIdsDedup:
     """Dedup invariant: each memory surfaced at most once per session, even
     under concurrency (engine.py:62 / L256 / docstring).

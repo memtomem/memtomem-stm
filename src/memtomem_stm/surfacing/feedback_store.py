@@ -133,6 +133,28 @@ class FeedbackStore:
         except (json.JSONDecodeError, TypeError):
             return []
 
+    def get_surfacing_event(self, surfacing_id: str) -> dict | None:
+        """Return ``{server, tool, memory_ids}`` for a surfacing event.
+
+        Used by cache-invalidation on negative feedback — the feedback
+        handler needs (server, tool) along with memory_ids to key the
+        in-memory invalidation set against ``SurfacingCache`` entries.
+        Returns ``None`` if the event does not exist.
+        """
+        if self._db is None:
+            return None
+        row = self._db.execute(
+            "SELECT server, tool, memory_ids FROM surfacing_events WHERE id = ?",
+            (surfacing_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            memory_ids = json.loads(row[2])
+        except (json.JSONDecodeError, TypeError):
+            memory_ids = []
+        return {"server": row[0], "tool": row[1], "memory_ids": memory_ids}
+
     def get_tool_feedback_summary(self, tool: str | None = None) -> dict:
         """Get feedback summary, optionally filtered by tool."""
         if self._db is None:
