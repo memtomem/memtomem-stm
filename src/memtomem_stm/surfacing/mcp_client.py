@@ -219,7 +219,7 @@ class McpClientSearchAdapter:
 
         try:
             result = await self._session.call_tool("mem_do", {"action": "version"})
-            text_parts = [c.text for c in result.content if c.type == "text"]
+            text_parts = [c.text or "" for c in result.content if c.type == "text"]
             if text_parts:
                 data = json.loads(text_parts[0])
                 formats = data.get("capabilities", {}).get("search_formats", [])
@@ -296,7 +296,7 @@ class McpClientSearchAdapter:
         # Parse text response into results
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
-        text_parts = [c.text for c in (result.content or []) if c.type == "text"]
+        text_parts = [c.text or "" for c in (result.content or []) if c.type == "text"]
         if not text_parts:
             return [], None
 
@@ -371,7 +371,7 @@ class McpClientSearchAdapter:
 
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
-        text_parts = [c.text for c in (result.content or []) if c.type == "text"]
+        text_parts = [c.text or "" for c in (result.content or []) if c.type == "text"]
         if not text_parts:
             return []
 

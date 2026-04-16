@@ -18,6 +18,9 @@ import sqlite3
 BUSY_TIMEOUT_MS = 3000
 # Negative cache_size values are in KiB per SQLite docs; 64000 KiB = 64 MB.
 CACHE_SIZE_KIB = -64000
+# Cap WAL file growth so long-lived daemons don't accumulate unbounded
+# .db-wal files. 64 MB matches the page cache budget above.
+WAL_JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024  # 64 MB
 
 
 def tune_connection(conn: sqlite3.Connection) -> None:
@@ -30,3 +33,4 @@ def tune_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(f"PRAGMA cache_size={CACHE_SIZE_KIB}")
     conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute(f"PRAGMA journal_size_limit={WAL_JOURNAL_SIZE_LIMIT}")

@@ -14,6 +14,7 @@ import pytest
 from memtomem_stm.utils.sqlite_tuning import (
     BUSY_TIMEOUT_MS,
     CACHE_SIZE_KIB,
+    WAL_JOURNAL_SIZE_LIMIT,
     tune_connection,
 )
 
@@ -63,6 +64,11 @@ def test_sets_temp_store_memory(conn):
     assert _pragma(conn, "temp_store") == 2
 
 
+def test_sets_journal_size_limit(conn):
+    tune_connection(conn)
+    assert _pragma(conn, "journal_size_limit") == WAL_JOURNAL_SIZE_LIMIT
+
+
 def test_idempotent(conn):
     """Calling twice leaves PRAGMAs in the same state."""
     tune_connection(conn)
@@ -71,3 +77,4 @@ def test_idempotent(conn):
     assert _pragma(conn, "synchronous") == 1
     assert _pragma(conn, "cache_size") == CACHE_SIZE_KIB
     assert _pragma(conn, "temp_store") == 2
+    assert _pragma(conn, "journal_size_limit") == WAL_JOURNAL_SIZE_LIMIT

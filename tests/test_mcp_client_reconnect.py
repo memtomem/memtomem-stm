@@ -340,3 +340,49 @@ class TestStartCleansUpOnFailure:
         assert session_exited.is_set(), "session context must be aclosed on init failure"
         assert adapter._stack is None
         assert adapter._session is None
+
+
+# ── c.text=None tolerance (PR #114 parity) ──────────────────────────────
+
+
+class TestTextNoneTolerance:
+    """MCP spec requires TextContent.text to be str, but a spec-noncompliant
+    server may return None. manager.py:1042 guards with ``c.text or ""``;
+    the surfacing adapter must do the same."""
+
+    @pytest.mark.asyncio
+    async def test_search_tolerates_none_text(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+
+        none_content = MagicMock()
+        none_content.type = "text"
+        none_content.text = None
+
+        good_content = _text_content("[1] 0.90 | [default] note.md\nreal content")
+
+        result_obj = MagicMock()
+        result_obj.content = [none_content, good_content]
+        mock_session.call_tool = AsyncMock(return_value=result_obj)
+        adapter._session = mock_session
+
+        results, _ = await adapter.search("test query")
+        assert len(results) == 1
+        assert "real content" in results[0].chunk.content
+
+    @pytest.mark.asyncio
+    async def test_search_all_none_text_returns_empty(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+
+        none_content = MagicMock()
+        none_content.type = "text"
+        none_content.text = None
+
+        result_obj = MagicMock()
+        result_obj.content = [none_content]
+        mock_session.call_tool = AsyncMock(return_value=result_obj)
+        adapter._session = mock_session
+
+        results, _ = await adapter.search("test query")
+        assert results == []
