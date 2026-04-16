@@ -222,12 +222,30 @@ class SurfacingEngine:
     ) -> str:
         """Render a cached surfacing result into the response_text, or pass
         the response through unchanged if the cache entry is an empty list
-        (the deliberate "no results for this query" case)."""
+        (the deliberate "no results for this query" case).
+
+        Registers a new surfacing event in the feedback tracker so the agent
+        can submit ``stm_surfacing_feedback`` for the rendered surfacing_id.
+        Without this, cached hits generate orphan IDs that the feedback store
+        cannot resolve, silently breaking the feedback learning loop.
+        """
         if not cached:
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
             return response_text
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
         surfacing_id = uuid.uuid4().hex[:16]
+        if self._feedback_tracker is not None:
+            try:
+                self._feedback_tracker.record_surfacing(
+                    surfacing_id=surfacing_id,
+                    server=server,
+                    tool=tool,
+                    query=query,
+                    memory_ids=[str(r.chunk.id) for r in cached],
+                    scores=[r.score for r in cached],
+                )
+            except Exception:
+                logger.warning("Failed to record cached surfacing event", exc_info=True)
         return self._formatter.inject(
             response_text,
             cached,

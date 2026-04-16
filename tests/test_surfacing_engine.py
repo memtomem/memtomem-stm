@@ -425,6 +425,81 @@ class TestSessionContextInjection:
         assert "Working Memory" not in output
         adapter.scratch_list.assert_awaited_once()
 
+
+class TestCachedSurfacingFeedback:
+    """Cached surfacing hits must record a surfacing event so that agent
+    feedback submitted with the rendered surfacing_id can be resolved by
+    the feedback store."""
+
+    async def test_cache_hit_records_surfacing_event(self):
+        """record_surfacing must be called for both the miss AND the cache hit."""
+        results = [FakeSearchResult(chunk=FakeChunk(id="m1", content="mem"), score=0.7)]
+        adapter = _make_mcp_adapter(results)
+        tracker = MagicMock()
+        tracker.record_surfacing = MagicMock()
+        tracker.store = MagicMock()
+        tracker.store.mark_surfaced = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=[])
+
+        engine = SurfacingEngine(
+            config=_make_config(cooldown_seconds=0),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        # First call — cache miss
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert tracker.record_surfacing.call_count == 1
+
+        # Second call — cache hit
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert tracker.record_surfacing.call_count == 2
+
+        # Both calls should produce distinct surfacing_ids
+        id1 = tracker.record_surfacing.call_args_list[0].kwargs["surfacing_id"]
+        id2 = tracker.record_surfacing.call_args_list[1].kwargs["surfacing_id"]
+        assert id1 != id2
+
+    async def test_cache_hit_feedback_resolvable(self):
+        """End-to-end: feedback on a cached surfacing_id must succeed."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        results = [FakeSearchResult(chunk=FakeChunk(id="m2", content="cached mem"), score=0.6)]
+        adapter = _make_mcp_adapter(results)
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "fb.db"
+            tracker = FeedbackTracker(config=_make_config(), db_path=db_path)
+
+            engine = SurfacingEngine(
+                config=_make_config(cooldown_seconds=0),
+                mcp_adapter=adapter,
+                feedback_tracker=tracker,
+            )
+
+            # Miss → populates cache
+            out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "Surfacing ID:" in out1
+
+            # Cache hit → new surfacing_id recorded
+            out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "Surfacing ID:" in out2
+
+            # Extract the surfacing_id from the second (cached) output
+            import re
+
+            match = re.search(r"Surfacing ID: (\w+)", out2)
+            assert match, "surfacing_id not found in cached output"
+            cached_sid = match.group(1)
+
+            # Feedback for the cached surfacing_id must succeed
+            result = await engine.handle_feedback(cached_sid, "helpful")
+            assert "Error" not in result
+
+            tracker.close()
+
     async def test_empty_scratch_list_omits_section(self):
         results = [FakeSearchResult(chunk=FakeChunk(content="LTM hit content"), score=0.5)]
         adapter = _make_mcp_adapter(results)
