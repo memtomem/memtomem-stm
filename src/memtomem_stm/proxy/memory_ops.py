@@ -75,7 +75,13 @@ async def auto_index_response(
         stats = await index_engine.index_file(file_path, namespace=ns)
         chunks = stats.indexed_chunks
     except Exception as exc:
-        logger.warning("Auto-index failed for %s/%s: %s", server, tool, exc)
+        logger.warning(
+            "Auto-index failed for %s/%s: %s",
+            server,
+            tool,
+            exc,
+            exc_info=True,
+        )
         chunks = 0
 
     return (
@@ -140,7 +146,7 @@ async def extract_and_store(
                 await index_engine.index_file(file_path, namespace=ns)
                 indexed_count += 1
             except Exception as exc:
-                logger.warning("Fact indexing failed: %s", exc)
+                logger.warning("Fact indexing failed: %s", exc, exc_info=True)
 
         if indexed_count:
             logger.info(

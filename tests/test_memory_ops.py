@@ -157,6 +157,8 @@ class TestAutoIndexResponse:
             )
         assert "0 chunks" in summary
         assert any("Auto-index failed" in r.message for r in caplog.records)
+        rec = next(r for r in caplog.records if "Auto-index failed" in r.message)
+        assert rec.exc_info is not None, "exc_info required for traceback diagnosis"
 
     async def test_creates_memory_dir_when_missing(self, tmp_path):
         """``memory_dir`` is created — passing a nested path that doesn't
@@ -339,6 +341,26 @@ class TestExtractAndStore:
 
         assert len(indexer.indexed_paths) == 0
         assert any("Fact extraction failed" in r.message for r in caplog.records)
+
+    async def test_fact_indexing_failure_logs_traceback(self, config, caplog):
+        """Fact indexing failure must include exc_info for root-cause diagnosis."""
+        facts = [self._fact("will fail to index")]
+        extractor = FakeExtractor(facts)
+        indexer = FakeIndexer(raise_on_index=True)
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.proxy.memory_ops"):
+            await extract_and_store(
+                indexer,
+                extractor,
+                config,
+                server="s",
+                tool="t",
+                arguments={},
+                text="body",
+            )
+
+        rec = next(r for r in caplog.records if "Fact indexing failed" in r.message)
+        assert rec.exc_info is not None, "exc_info required for traceback diagnosis"
 
     async def test_empty_facts_does_nothing(self, config):
         extractor = FakeExtractor([])
