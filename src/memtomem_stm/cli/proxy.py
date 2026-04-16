@@ -219,8 +219,9 @@ def add(
     for srv_name, srv_cfg in servers.items():
         if srv_cfg.get("prefix") == prefix:
             click.echo(
-                f"Warning: prefix '{prefix}' is already used by server '{srv_name}'. "
-                "Tools with the same prefixed name will be shadowed at runtime.",
+                f"Warning: prefix '{prefix}' is already used by server "
+                f"'{srv_name}'. Duplicate-named tools will shadow each "
+                f"other at runtime. Proceeding anyway.",
                 err=True,
             )
             break
