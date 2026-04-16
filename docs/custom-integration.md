@@ -18,6 +18,9 @@ Wire a `FileIndexer` when you want the proxy to:
 If you only need compression, surfacing, and caching, skip this — the
 default deployment covers those without a `FileIndexer`.
 
+For auto-indexing configuration (thresholds, namespace templates,
+file format), see [Caching & Auto-Indexing](caching.md#auto-indexing).
+
 ## Protocol
 
 The proxy expects a structural match against `FileIndexer`
@@ -114,6 +117,11 @@ MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=true
 MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED=true
 ```
 
+For the complete env-var reference, see
+[Configuration](configuration.md).  Both stages run as part of the
+pipeline — see [Pipeline → Stage 4](pipeline.md#stage-4-index-optional)
+for the runtime flow and failure guards.
+
 ## Known caveats
 
 These are documented limitations of the current implementation.  All
@@ -177,3 +185,6 @@ set — it does not log exceptions (unlike the webhook pattern in
 4. **Consider `background=false`** for extraction if you need
    guaranteed delivery — it blocks the response but ensures extraction
    completes or raises visibly.
+5. **Log level**: set `MEMTOMEM_STM_LOG_LEVEL=DEBUG` for full
+   auto-index and extraction tracing.  See
+   [Operations → Logging](operations.md#logging).

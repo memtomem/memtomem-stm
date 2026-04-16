@@ -100,3 +100,8 @@ compressed_chars: 8000
 ```
 
 The namespace supports `{server}` and `{tool}` placeholders. Can be toggled per-server via `auto_index: true|false` in `UpstreamServerConfig`.
+
+> **Note:** Auto-indexing requires a `FileIndexer` wired into
+> `ProxyManager`.  The default deployment does not wire one — see
+> [Custom Integration](custom-integration.md) for the protocol,
+> wiring instructions, and known caveats.

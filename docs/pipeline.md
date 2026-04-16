@@ -101,9 +101,24 @@ Proactively injects relevant memories from a memtomem LTM server. See [Surfacing
 
 Surfacing only activates when the compressed response is at least `min_response_chars` (default 5000). For small responses, surfacing is skipped to avoid negative token savings.
 
+**Failure guard (S1).**  If `record_surfacing` fails (e.g. SQLite
+contention), the engine drops the `surfacing_id` — the memory block
+is still injected but without a feedback ID.  The agent cannot
+submit feedback for that event, but the response is never blocked.
+Logged at WARNING.
+
 ## Stage 4: INDEX (optional)
 
-Automatically indexes large responses to memtomem LTM for future retrieval. See [Caching & Auto-Indexing](caching.md#auto-indexing) for the configuration reference.
+Automatically indexes large responses to memtomem LTM for future
+retrieval.  See [Caching & Auto-Indexing](caching.md#auto-indexing)
+for configuration and
+[Custom Integration](custom-integration.md) for `FileIndexer` wiring.
+
+**Failure guard (F1).**  If `_auto_index_response` raises,
+`ProxyManager` catches at `manager.py:1346`, logs WARNING with
+traceback, and returns the pre-index response unchanged.  The agent
+receives a successful result; the response is just not searchable
+in LTM.
 
 ## Stage 4b: Auto Fact Extraction (optional)
 

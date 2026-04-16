@@ -173,6 +173,32 @@ Surfacing: enabled (min_score=0.02)
 
 Metrics are persisted to SQLite (`~/.memtomem/proxy_metrics.db`, max 10K entries) with error category and trace_id columns.
 
+### Logging
+
+STM uses Python's `logging` module.  Format:
+
+```
+LEVEL module_name: message
+```
+
+Set the level via environment variable:
+
+```bash
+export MEMTOMEM_STM_LOG_LEVEL=DEBUG
+```
+
+Default is `WARNING`.  Read once at startup by `server.py:main()`.
+
+| Level | What it shows |
+|-------|---------------|
+| `DEBUG` | Pipeline tracing, strategy selection, cache decisions |
+| `INFO` | Surfacing injections, config reloads, extraction completions |
+| `WARNING` | Failure guards (F1/S1), fallback activations, skips |
+| `ERROR` | Unrecoverable failures (rare — most errors fall back) |
+
+See [Configuration → General](configuration.md#general) for the env
+var reference.
+
 ### Langfuse Tracing (optional)
 
 ```bash

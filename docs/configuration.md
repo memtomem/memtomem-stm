@@ -20,6 +20,16 @@ For most quick-start scenarios you can ignore the config file entirely and use t
 
 All settings use the `MEMTOMEM_STM_` prefix with `__` for nesting.
 
+### General
+
+```bash
+export MEMTOMEM_STM_LOG_LEVEL=WARNING   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+```
+
+Controls `logging.basicConfig()` level for all `memtomem_stm.*`
+loggers.  Default `WARNING`.  Read once at startup — restart to
+apply changes.  See [Operations → Logging](operations.md#logging).
+
 ### Proxy
 
 ```bash
