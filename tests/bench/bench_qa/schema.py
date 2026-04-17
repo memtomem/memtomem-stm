@@ -56,6 +56,11 @@ class BenchFixture(TypedDict, total=False):
     force_tier: int | None
     expected_keywords: list[str]
     qa_probes: list[QAProbe]
+    # Minimum acceptable ``qa_answerable/total`` ratio for this scenario.
+    # The 0.75 global gate in the plan is the *target* after 1–2 weeks of
+    # observation; real compressors drop tail-side keywords so per-scenario
+    # floors start looser and tighten as the suite stabilises.
+    qa_gate_min: float
     surfacing_seeds: list[dict]
     surfacing_eval: SurfacingEval
 

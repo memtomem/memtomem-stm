@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s04",
+  "description": "Python ETL class + a short unified diff touching one method. Risk: function signatures or diff hunks get truncated mid-line.",
+  "content_type": "code",
+  "expected_compressor": "auto",
+  "force_tier": null,
+  "max_result_chars": 3000,
+  "qa_gate_min": 0.66,
+  "expected_keywords": [
+    "class UserActivityETL",
+    "def extract",
+    "def transform",
+    "def load",
+    "def backfill",
+    "ETLConfig",
+    "diff --git"
+  ],
+  "qa_probes": [
+    {
+      "question": "What is the default batch size?",
+      "expected_keywords": ["batch_size", "5000"]
+    },
+    {
+      "question": "What table does load() write to?",
+      "expected_keywords": ["user_daily_metrics"]
+    },
+    {
+      "question": "What change does the diff introduce?",
+      "expected_keywords": ["lookback_days", "14"]
+    }
+  ],
+  "payload": "\"\"\"ETL pipeline for user activity data.\"\"\"\nimport logging\nfrom dataclasses import dataclass\nfrom datetime import datetime, timedelta\nfrom typing import Iterator\n\nimport pandas as pd\nfrom sqlalchemy import create_engine, text\nfrom sqlalchemy.engine import Engine\n\nlogger = logging.getLogger(__name__)\n\n@dataclass\nclass ETLConfig:\n    source_dsn: str\n    target_dsn: str\n    batch_size: int = 5000\n    lookback_days: int = 7\n    max_retries: int = 3\n    timeout_seconds: int = 300\n\nclass UserActivityETL:\n    EXTRACT_QUERY = \"\"\"\n        SELECT user_id, event_type, event_timestamp, metadata\n        FROM raw_events\n        WHERE event_timestamp >= :start_date AND event_timestamp < :end_date\n        ORDER BY event_timestamp\n    \"\"\"\n\n    def __init__(self, config: ETLConfig) -> None:\n        self.config = config\n        self._source: Engine = create_engine(config.source_dsn)\n        self._target: Engine = create_engine(config.target_dsn)\n\n    def extract(self, start: datetime, end: datetime) -> pd.DataFrame:\n        logger.info(\"Extracting events from %s to %s\", start, end)\n        with self._source.connect() as conn:\n            df = pd.read_sql(text(self.EXTRACT_QUERY), conn, params={\"start_date\": start, \"end_date\": end})\n        logger.info(\"Extracted %d rows\", len(df))\n        return df\n\n    def transform(self, df: pd.DataFrame) -> pd.DataFrame:\n        if df.empty:\n            return pd.DataFrame()\n        df[\"date\"] = pd.to_datetime(df[\"event_timestamp\"]).dt.date\n        aggregated = df.groupby([\"user_id\", \"date\", \"event_type\"]).size().reset_index(name=\"event_count\")\n        pivoted = aggregated.pivot_table(index=[\"user_id\", \"date\"], columns=\"event_type\", values=\"event_count\", fill_value=0).reset_index()\n        pivoted.columns = [f\"count_{c}\" if c not in (\"user_id\", \"date\") else c for c in pivoted.columns]\n        pivoted[\"processed_at\"] = datetime.utcnow()\n        return pivoted\n\n    def load(self, df: pd.DataFrame) -> int:\n        if df.empty:\n            return 0\n        rows = len(df)\n        df.to_sql(\"user_daily_metrics\", self._target, if_exists=\"append\", index=False, method=\"multi\", chunksize=self.config.batch_size)\n        logger.info(\"Loaded %d rows into user_daily_metrics\", rows)\n        return rows\n\n    def run(self, target_date: datetime | None = None) -> dict:\n        if target_date is None:\n            target_date = datetime.utcnow() - timedelta(days=1)\n        start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)\n        end = start + timedelta(days=1)\n        raw = self.extract(start, end)\n        transformed = self.transform(raw)\n        loaded = self.load(transformed)\n        return {\"date\": start.isoformat(), \"extracted\": len(raw), \"transformed\": len(transformed), \"loaded\": loaded}\n\n    def backfill(self, days: int | None = None) -> list[dict]:\n        days = days or self.config.lookback_days\n        return [self.run(datetime.utcnow() - timedelta(days=i + 1)) for i in range(days)]\n\n---\ndiff --git a/etl.py b/etl.py\n--- a/etl.py\n+++ b/etl.py\n@@ -16,7 +16,7 @@ class ETLConfig:\n     source_dsn: str\n     target_dsn: str\n     batch_size: int = 5000\n-    lookback_days: int = 7\n+    lookback_days: int = 14\n     max_retries: int = 3\n     timeout_seconds: int = 300\n"
+}
