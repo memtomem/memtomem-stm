@@ -185,6 +185,25 @@ class TestTraceIdPropagation:
         assert len(trace_ids) == 2
         assert trace_ids[0] != trace_ids[1]
 
+    async def test_caller_supplied_trace_id_is_used_verbatim(self):
+        mgr = _make_manager()
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("ok")
+
+        recorded: list[CallMetrics] = []
+        original_record = mgr.tracker.record
+
+        def capture(m):
+            recorded.append(m)
+            original_record(m)
+
+        mgr.tracker.record = capture
+        # bench_qa uses "bench-<sha256[:16]>" — longer than 16, arbitrary string.
+        fixed = "bench-0123456789abcdef"
+        await mgr.call_tool("srv", "tool", {}, trace_id=fixed)
+        await mgr.call_tool("srv", "tool", {}, trace_id=fixed)
+
+        assert [m.trace_id for m in recorded] == [fixed, fixed]
+
 
 # ── MetricsStore trace_id ────────────────────────────────────────────────
 
