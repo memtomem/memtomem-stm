@@ -843,6 +843,14 @@ def build_nb03() -> None:
             See [`docs/surfacing.md`](../docs/surfacing.md) for the
             scoring details.
 
+            > **S1 failure guard.** In production, if `record_surfacing`
+            > fails (e.g. SQLite contention on `stm_feedback.db`), STM
+            > drops the `surfacing_id` — the memory block is still
+            > injected but without a feedback ID. When this happens,
+            > `stm_surfacing_feedback` cannot be called for that event.
+            > The response is never blocked. See
+            > [`docs/pipeline.md → Stage 3`](../docs/pipeline.md#stage-3-surface).
+
             ## 5. Check the surfacing counters
             """
         ),
@@ -1320,20 +1328,46 @@ def build_nb05() -> None:
         ),
         _md(
             """
+            ## 9. Log level configuration
+
+            STM uses Python's `logging` module. Control verbosity via
+            environment variable:
+
+            ```bash
+            export MEMTOMEM_STM_LOG_LEVEL=WARNING   # default
+            export MEMTOMEM_STM_LOG_LEVEL=DEBUG     # full pipeline tracing
+            ```
+
+            | Level | What it shows |
+            |-------|---------------|
+            | `DEBUG` | Pipeline tracing, strategy selection, cache decisions |
+            | `INFO` | Surfacing injections, config reloads, extraction completions |
+            | `WARNING` | Failure guards (F1/S1), fallback activations, skips |
+            | `ERROR` | Unrecoverable failures (rare — most errors fall back) |
+
+            The level is read once at startup — restart the server to
+            apply changes. See
+            [`docs/operations.md → Logging`](../docs/operations.md#logging)
+            for format details.
+            """
+        ),
+        _md(
+            """
             ## Recap
 
             | Layer | What you get | When to use |
             |---|---|---|
             | MCP tools | Live snapshot, agent-accessible | Quick checks |
             | SQLite | Full history, offline analysis | Debugging, tuning |
+            | Logging | `MEMTOMEM_STM_LOG_LEVEL` control | Failure diagnosis (F1/S1) |
             | Langfuse | Nested spans, team-shared UI | Production monitoring |
 
             **Where to next:**
 
             - [`docs/operations.md`](../docs/operations.md) — full
-              observability reference (span table, data storage, safety)
+              observability reference (logging, spans, data storage, safety)
             - [`docs/configuration.md`](../docs/configuration.md) — env
-              vars for Langfuse and all other settings
+              vars for log level, Langfuse, and all other settings
             - [Langfuse docs](https://langfuse.com/docs) — dashboard
               setup and SDK reference
             """
