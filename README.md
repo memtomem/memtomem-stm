@@ -131,6 +131,7 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands and the 10 MCP tools |
 | [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Run safely in production — scaling, observability, privacy |
 | [Custom Integration](https://github.com/memtomem/memtomem-stm/blob/main/docs/custom-integration.md) | Extend STM with custom file indexers |
+| [bench_qa](https://github.com/memtomem/memtomem-stm/blob/main/docs/bench_qa.md) | Scenario harness, advisory LLM judge, and determinism gate |
 
 ## Development
 

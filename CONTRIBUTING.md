@@ -33,6 +33,7 @@ uv run mypy src
   - `cli/` — `mms` / `memtomem-stm-proxy` CLI
   - `utils/` — Circuit breaker and shared helpers
 - `tests/` — pytest suite
+  - `tests/bench/` — `bench_qa` scenario harness (see [docs/bench_qa.md](docs/bench_qa.md))
 - `docs/` — Architecture, operations, and integration guides (incl. `custom-integration.md`)
 
 The LTM core lives in a separate repository: [memtomem/memtomem](https://github.com/memtomem/memtomem). Communication between STM and LTM happens entirely through the MCP protocol — there is no Python-level dependency.
@@ -47,6 +48,36 @@ The LTM core lives in a separate repository: [memtomem/memtomem](https://github.
 6. `uv run mypy src` is advisory but aim to not introduce new errors
 7. Write a clear commit message describing the "why"
 8. Sign the CLA on your first pull request (see below)
+
+## Adding a bench_qa scenario
+
+`bench_qa` is an end-to-end pytest sub-suite that drives the proxy
+pipeline through fixture scenarios and asserts compression +
+answerability gates. See [docs/bench_qa.md](docs/bench_qa.md) for the
+harness reference. When adding a new scenario:
+
+1. Create `tests/bench/fixtures/s{NN}.json` following
+   `tests/bench/bench_qa/schema.py` (`FIXTURE_SCHEMA_VERSION = 1`).
+   Required: `schema_version`, `scenario_id`, `payload`,
+   `expected_compressor`.
+2. Register the scenario:
+   - Normal path → append to `NORMAL_PATH_SCENARIOS` in
+     `tests/bench/test_bench_qa_scenarios.py`.
+   - Fallback ladder (`force_tier` set) → add a test function in
+     `tests/bench/test_bench_qa_fallback.py` mirroring the s01/s06/s08
+     pattern (stub higher tiers to raise).
+3. If the scenario is eligible for the advisory LLM judge, append its
+   ID to `LLM_JUDGE_SCENARIOS` in
+   `tests/bench/test_bench_qa_llm_judge.py`. `force_tier` scenarios
+   are currently excluded — the judge was calibrated on happy paths.
+4. Update `tests/bench/test_bench_qa_meta.py` so the harness self-test
+   proves `bench_qa` actually catches the regression the new scenario
+   is meant to guard against. A green scenario that does not fail on
+   a seeded regression is a silent no-op.
+5. Run both `uv run pytest -m bench_qa` and `-m bench_qa_meta`; they
+   must stay green. If you changed anything the LLM judge touches,
+   also run `OPENAI_API_KEY=… uv run pytest -m bench_qa_llm_judge`
+   and sanity-check the correlation log.
 
 ## Contributor License Agreement (CLA)
 
