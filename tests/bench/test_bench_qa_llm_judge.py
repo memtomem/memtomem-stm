@@ -28,6 +28,17 @@ import os
 
 import pytest
 
+# Optional: load OPENAI_API_KEY / ANTHROPIC_API_KEY from a repo-root .env so
+# contributors don't have to ``export`` before invoking pytest. ``.env`` is
+# gitignored; ``load_dotenv()`` is a no-op when the file is absent and never
+# overrides variables already set in the process environment.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from bench.bench_qa import (
     deterministic_trace_id,
     latest_metrics_row,
