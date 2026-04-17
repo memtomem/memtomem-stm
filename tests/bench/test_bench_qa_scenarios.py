@@ -11,6 +11,11 @@ QA probes must remain answerable after compression.
 
 Fallback-ladder (S1/S6/S8 variants), progressive round-trip, and
 surfacing (S10) assertions live in later PRs.
+
+S7 is a dedicated test: it pins ``compression="selective"`` so the
+SelectiveCompressor's TOC contract can be exercised directly. SELECTIVE
+intentionally skips the fallback ladder (``manager.py:1300-1308``), so it
+can't share the happy-path parametrize body.
 """
 
 from __future__ import annotations
@@ -86,6 +91,80 @@ async def test_bench_qa_normal_path(scenario_id: str, tmp_path, bench_qa_report)
 
         bench_qa_report.record_scenario(
             scenario_id=scenario_id,
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=answerable,
+            qa_total=total,
+            original_chars=len(fixture["payload"]),
+            verdict="pass",
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.bench_qa
+@pytest.mark.asyncio
+async def test_s07_selective_toc_preserves_top_results(tmp_path, bench_qa_report):
+    """50-item ranked search → SELECTIVE TOC must keep top-ranked IDs visible.
+
+    SELECTIVE is a two-phase protocol: the compressor returns a compact TOC,
+    the agent then calls ``stm_proxy_select_chunks`` to retrieve full content.
+    Because the TOC is intentionally compact, the ratio guard does *not*
+    fall back for this strategy — so the scenario-level gate is the demotion
+    guard instead: the qa_probes encode top-ranked identifiers that must all
+    survive inside the 80-char preview window per entry.
+    """
+    fixture = load_fixture("s07")
+    assert fixture.get("force_tier") is None, "s07 is a happy-path scenario"
+    assert fixture["expected_compressor"] == "selective", (
+        "s07 exercises SELECTIVE directly — do not switch it to AUTO"
+    )
+
+    mgr, store, session = make_proxy_manager(
+        tmp_path,
+        compression=fixture["expected_compressor"],
+        max_result_chars=fixture["max_result_chars"],
+    )
+    session.call_tool.return_value = make_tool_result(fixture["payload"])
+
+    expected_trace_id = deterministic_trace_id(fixture["scenario_id"])
+    result = await mgr.call_tool("fake", "tool_s07", {}, trace_id=expected_trace_id)
+
+    row = latest_metrics_row(store)
+    try:
+        assert row, "s07: proxy_metrics row was not written"
+        assert row["trace_id"] == expected_trace_id, (
+            f"s07: trace_id mismatch — got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
+        assert row["compression_strategy"] == "selective", (
+            f"s07: strategy must remain 'selective' (no fallback ladder for this "
+            f"strategy), got {row['compression_strategy']!r}"
+        )
+        assert row["original_chars"] == len(fixture["payload"])
+
+        # TOC shape — `manager.py:1300-1308` documents that SELECTIVE skips the
+        # fallback ladder even under ratio_violation, so the result must still
+        # be the raw TOC envelope.
+        assert '"type": "toc"' in result, (
+            f"s07: result is not a SELECTIVE TOC envelope: {result[:160]!r}"
+        )
+        assert '"selection_key"' in result
+        assert '"entries"' in result
+
+        # Demotion guard: a bug that drops early entries or shrinks the
+        # 80-char preview window would strip top-ranked IDs from the TOC.
+        answerable, total = qa_answerable_ratio(fixture["qa_probes"], result)
+        assert total > 0, "s07: must define at least one qa_probe"
+        ratio = answerable / total
+        gate_min = fixture.get("qa_gate_min", 0.75)
+        assert ratio >= gate_min, (
+            f"s07: demotion guard {answerable}/{total}={ratio:.2f} below "
+            f"{gate_min} gate; top-ranked IDs may have fallen out of the TOC "
+            f"(first 200 chars: {result[:200]!r})"
+        )
+
+        bench_qa_report.record_scenario(
+            scenario_id="s07",
             trace_id=row["trace_id"],
             row=row,
             qa_answerable=answerable,
