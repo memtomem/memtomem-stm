@@ -132,6 +132,29 @@ class CallMetrics:
     ratio_violation: bool = False
     # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call.
     scorer_fallback: bool = False
+    # Memory-pipeline status — populated by Stage 4 (INDEX) and Stage 4b (EXTRACT).
+    #
+    # Before these fields existed, ``auto_index_response`` and
+    # ``extract_and_store`` swallowed failures internally and returned a
+    # pass-through response. Operators watching ``proxy_metrics.db`` therefore
+    # saw a healthy call rate while the memory pipeline was silently broken
+    # (embedding service down, disk full, LTM connection dropped). Record the
+    # outcome so dashboards can surface the break.
+    #
+    # ``None`` means "stage did not run for this call" — e.g. auto-index
+    # disabled, response below ``min_chars`` threshold, or (for the
+    # surfacing_on_progressive fields) the call did not go down the
+    # progressive path. Readers must distinguish ``None`` from ``False``.
+    index_ok: bool | None = None
+    index_error: str | None = None
+    chunks_indexed: int = 0
+    extract_ok: bool | None = None
+    extract_error: str | None = None
+    # Surfacing on the progressive path — pre-provisioned for PR 2 (F6) so
+    # the schema migration ships once. Stays ``None`` until the progressive
+    # surfacing footer lands.
+    surfacing_on_progressive_ok: bool | None = None
+    surface_error: str | None = None
 
 
 class RPSTracker:

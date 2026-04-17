@@ -19,6 +19,8 @@ import pytest
 from memtomem_stm.proxy.config import AutoIndexConfig, ExtractionConfig
 from memtomem_stm.proxy.extraction import ExtractedFact
 from memtomem_stm.proxy.memory_ops import (
+    AutoIndexOutcome,
+    ExtractOutcome,
     auto_index_response,
     extract_and_store,
     format_fact_md,
@@ -84,7 +86,7 @@ class TestAutoIndexResponse:
 
     async def test_writes_markdown_with_frontmatter(self, config):
         indexer = FakeIndexer()
-        summary = await auto_index_response(
+        outcome = await auto_index_response(
             indexer,
             config,
             server="gh",
@@ -98,6 +100,7 @@ class TestAutoIndexResponse:
             context_query="what does app.py do?",
         )
 
+        assert isinstance(outcome, AutoIndexOutcome)
         # Indexer was called with the file path under memory_dir and the
         # namespace formatted from the template.
         assert len(indexer.indexed_paths) == 1
@@ -118,11 +121,15 @@ class TestAutoIndexResponse:
         assert "> what does app.py do?" in body
         assert "file body contents" in body
 
-        # Return value includes compression headline and wraps the agent summary.
-        assert "[Indexed]" in summary
-        assert "gh/read_file" in summary
-        assert "3 chunks" in summary
-        assert "1 paragraph summary" in summary
+        # Summary includes compression headline and wraps the agent summary.
+        assert "[Indexed]" in outcome.summary
+        assert "gh/read_file" in outcome.summary
+        assert "3 chunks" in outcome.summary
+        assert "1 paragraph summary" in outcome.summary
+        # Status fields record the successful index call.
+        assert outcome.ok is True
+        assert outcome.chunks_indexed == 3
+        assert outcome.error is None
 
     async def test_omits_optional_frontmatter_fields(self, config):
         indexer = FakeIndexer()
@@ -142,11 +149,12 @@ class TestAutoIndexResponse:
 
     async def test_index_failure_returns_zero_chunks(self, config, caplog):
         """Indexer raising must not propagate — log a warning, return
-        summary with 0 chunks. Silent failure would make the CLI emit
-        misleading 'indexed' messages."""
+        summary with 0 chunks, and report ``ok=False`` with a populated
+        ``error`` so the operator metrics dashboard sees the failure
+        (previously swallowed silently)."""
         indexer = FakeIndexer(raise_on_index=True)
         with caplog.at_level("WARNING", logger="memtomem_stm.proxy.memory_ops"):
-            summary = await auto_index_response(
+            outcome = await auto_index_response(
                 indexer,
                 config,
                 server="s",
@@ -155,7 +163,14 @@ class TestAutoIndexResponse:
                 text="body",
                 agent_summary="sum",
             )
-        assert "0 chunks" in summary
+        assert "0 chunks" in outcome.summary
+        assert outcome.ok is False
+        assert outcome.chunks_indexed == 0
+        assert outcome.error is not None
+        # Error string carries the exception class + message so dashboards
+        # can distinguish categories (Timeout vs Permission vs …).
+        assert "RuntimeError" in outcome.error
+        assert "simulated indexing failure" in outcome.error
         assert any("Auto-index failed" in r.message for r in caplog.records)
         rec = next(r for r in caplog.records if "Auto-index failed" in r.message)
         assert rec.exc_info is not None, "exc_info required for traceback diagnosis"
@@ -378,6 +393,94 @@ class TestExtractAndStore:
         assert not config.memory_dir.expanduser().resolve().exists() or not list(
             config.memory_dir.expanduser().resolve().glob("*.md")
         )
+
+
+# ── ExtractOutcome contract ──────────────────────────────────────────────
+
+
+class TestExtractOutcome:
+    """Outcomes exist so operators see extraction status in proxy_metrics.db.
+
+    Without these, a broken LLM or disk full would silently drop facts
+    while the metrics row stayed healthy — the gap F2 is closing.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path) -> ExtractionConfig:
+        return ExtractionConfig(
+            enabled=True,
+            memory_dir=tmp_path / "facts",
+            namespace="facts-{server}",
+            max_facts=10,
+            dedup_threshold=0.92,
+        )
+
+    def _fact(self, content: str):
+        return ExtractedFact(content=content, category="c", confidence=0.8, tags=[])
+
+    async def test_success_reports_ok_and_count(self, config):
+        facts = [self._fact("a"), self._fact("b")]
+        outcome = await extract_and_store(
+            FakeIndexer(),
+            FakeExtractor(facts),
+            config,
+            server="s",
+            tool="t",
+            arguments={},
+            text="body",
+        )
+        assert isinstance(outcome, ExtractOutcome)
+        assert outcome.ok is True
+        assert outcome.facts_stored == 2
+        assert outcome.error is None
+
+    async def test_extractor_failure_reports_not_ok_with_error(self, config):
+        outcome = await extract_and_store(
+            FakeIndexer(),
+            FakeExtractor(raises=True),
+            config,
+            server="s",
+            tool="t",
+            arguments={},
+            text="body",
+        )
+        assert outcome.ok is False
+        assert outcome.facts_stored == 0
+        assert outcome.error is not None
+        # Error string carries class + message for dashboard categorization.
+        assert "RuntimeError" in outcome.error
+        assert "simulated extraction failure" in outcome.error
+
+    async def test_partial_indexing_failure_stays_ok(self, config):
+        """Per-fact indexing failures reduce ``facts_stored`` but don't
+        flip ``ok`` — the pre-F2 contract was "partial failure returns
+        normally" and we preserve that."""
+        facts = [self._fact("a"), self._fact("b")]
+        outcome = await extract_and_store(
+            FakeIndexer(raise_on_index=True),
+            FakeExtractor(facts),
+            config,
+            server="s",
+            tool="t",
+            arguments={},
+            text="body",
+        )
+        assert outcome.ok is True  # outer phase completed
+        assert outcome.facts_stored == 0  # every index_file call failed
+        assert outcome.error is None
+
+    async def test_empty_facts_reports_ok_zero(self, config):
+        outcome = await extract_and_store(
+            FakeIndexer(),
+            FakeExtractor([]),
+            config,
+            server="s",
+            tool="t",
+            arguments={},
+            text="body",
+        )
+        assert outcome.ok is True
+        assert outcome.facts_stored == 0
 
 
 # ── format_fact_md ───────────────────────────────────────────────────────
