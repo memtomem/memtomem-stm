@@ -572,8 +572,6 @@ class TestSelectiveHotReload:
     """Selective compressor must be recreated when config changes via hot-reload."""
 
     async def test_selective_recreated_on_config_change(self, tmp_path):
-        from memtomem_stm.proxy.compression import SelectiveCompressor
-
         mgr = _make_manager(
             tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE
         )
