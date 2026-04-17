@@ -48,6 +48,7 @@ from memtomem_stm.proxy.memory_ops import (
     AutoIndexOutcome,
     ExtractOutcome,
     auto_index_response,
+    compose_index_footer,
     extract_and_store,
     format_fact_md,
 )
@@ -1426,19 +1427,26 @@ class ProxyManager:
             and self._index_engine is not None
             and len(cleaned) >= ai_cfg.min_chars
         ):
-            with traced(
-                "proxy_call_index",
-                metadata={"server": server, "tool": tool},
-            ):
-                try:
-                    # A1 fix: pre-surfacing ``compressed_chars_for_metrics``
-                    # matches what we record in the metrics row below, so the
-                    # indexed frontmatter and the dashboards agree on what
-                    # "compressed_chars" means for this call. Pre-A1 the
-                    # frontmatter recorded ``len(surfaced)`` (post-surfacing),
-                    # which drifted from the metrics value whenever surfacing
-                    # added content.
-                    outcome = await self._auto_index_response(
+            if ai_cfg.background:
+                # F4: schedule indexing off the request path. The placeholder
+                # footer ([Indexing…] … · scheduled, namespace dropped) ships
+                # to the agent synchronously while the indexing task runs in
+                # the background. Trade-off: response no longer guarantees
+                # read-your-own-writes for the next tool call — opt-in only
+                # (default ai_cfg.background = False preserves sync contract).
+                ns = ai_cfg.namespace.format(server=server, tool=tool)
+                final_result = compose_index_footer(
+                    server=server,
+                    tool=tool,
+                    original_chars=len(original_text),
+                    compressed_chars=compressed_chars_for_metrics,
+                    text=cleaned,
+                    agent_summary=surfaced,
+                    ns=ns,
+                    chunks=None,
+                )
+                task = asyncio.create_task(
+                    self._auto_index_response(
                         server,
                         tool,
                         upstream_args,
@@ -1449,24 +1457,54 @@ class ProxyManager:
                         compressed_chars=compressed_chars_for_metrics,
                         context_query=context_query,
                     )
-                    final_result = outcome.summary
-                    index_ok = outcome.ok
-                    index_error = outcome.error
-                    chunks_indexed = outcome.chunks_indexed
-                except Exception as exc:
-                    # Reaches here only for failures outside the inner
-                    # ``index_file`` try/except in ``auto_index_response``
-                    # (mkdir / atomic write / unexpected errors). The inner
-                    # indexing failure is already captured in the outcome.
-                    logger.warning(
-                        "Auto-index failed for %s/%s — returning unindexed response",
-                        server,
-                        tool,
-                        exc_info=True,
-                    )
-                    final_result = surfaced
-                    index_ok = False
-                    index_error = f"{type(exc).__name__}: {exc}"
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                # index_ok / index_error / chunks_indexed stay None / None / 0
+                # — tri-state matches background extraction. Dashboards filter
+                # background rows with WHERE index_ok IS NULL.
+            else:
+                with traced(
+                    "proxy_call_index",
+                    metadata={"server": server, "tool": tool},
+                ):
+                    try:
+                        # A1 fix: pre-surfacing ``compressed_chars_for_metrics``
+                        # matches what we record in the metrics row below, so the
+                        # indexed frontmatter and the dashboards agree on what
+                        # "compressed_chars" means for this call. Pre-A1 the
+                        # frontmatter recorded ``len(surfaced)`` (post-surfacing),
+                        # which drifted from the metrics value whenever surfacing
+                        # added content.
+                        outcome = await self._auto_index_response(
+                            server,
+                            tool,
+                            upstream_args,
+                            cleaned,
+                            agent_summary=surfaced,
+                            compression_strategy=tc.compression.value,
+                            original_chars=len(original_text),
+                            compressed_chars=compressed_chars_for_metrics,
+                            context_query=context_query,
+                        )
+                        final_result = outcome.summary
+                        index_ok = outcome.ok
+                        index_error = outcome.error
+                        chunks_indexed = outcome.chunks_indexed
+                    except Exception as exc:
+                        # Reaches here only for failures outside the inner
+                        # ``index_file`` try/except in ``auto_index_response``
+                        # (mkdir / atomic write / unexpected errors). The inner
+                        # indexing failure is already captured in the outcome.
+                        logger.warning(
+                            "Auto-index failed for %s/%s — returning unindexed response",
+                            server,
+                            tool,
+                            exc_info=True,
+                        )
+                        final_result = surfaced
+                        index_ok = False
+                        index_error = f"{type(exc).__name__}: {exc}"
         else:
             final_result = surfaced
 
