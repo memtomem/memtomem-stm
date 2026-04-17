@@ -157,8 +157,9 @@ Two consequences:
    runs, so `SELECT … WHERE trace_id = ?` is a reliable lookup.
 2. The `bench-` prefix lets operators filter bench rows out of
    production dashboards and Langfuse views
-   (`WHERE trace_id LIKE 'bench-%'`). The prefix is code-only today —
-   `docs/operations.md` does not yet cross-link it.
+   (`WHERE trace_id LIKE 'bench-%'`). See
+   [operations.md → Metrics](operations.md#metrics) for the
+   operator-facing cross-link.
 
 `canonicalize_report()` drops wall-clock timings
 (`clean_ms` / `compress_ms` / `surface_ms`), metrics noise that is not
