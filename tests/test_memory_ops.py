@@ -22,6 +22,7 @@ from memtomem_stm.proxy.memory_ops import (
     AutoIndexOutcome,
     ExtractOutcome,
     auto_index_response,
+    compose_index_footer,
     extract_and_store,
     format_fact_md,
 )
@@ -208,6 +209,65 @@ class TestAutoIndexResponse:
         written_path, _ = indexer.indexed_paths[0]
         assert "/" not in written_path.name
         assert "ns_inner" in written_path.name
+
+
+# ── compose_index_footer ─────────────────────────────────────────────────
+
+
+class TestComposeIndexFooter:
+    """Footer composition shared by sync ``auto_index_response`` and the
+    background INDEX branch in ``ProxyManager``. Sync passes the actual
+    chunk count; background passes ``chunks=None`` so the placeholder
+    renders before the indexing task has even run.
+    """
+
+    def test_sync_renders_indexed_with_chunks_and_namespace(self):
+        out = compose_index_footer(
+            server="gh",
+            tool="read_file",
+            original_chars=12000,
+            compressed_chars=3200,
+            text="ignored when original_chars set",
+            agent_summary="summary body",
+            ns="proxy-gh",
+            chunks=5,
+        )
+        assert out.startswith("[Indexed] `gh/read_file` (12000→3200 chars)")
+        assert "· 5 chunks in `proxy-gh` namespace." in out
+        assert out.endswith("\n\nsummary body")
+
+    def test_background_renders_indexing_scheduled_without_namespace(self):
+        out = compose_index_footer(
+            server="gh",
+            tool="read_file",
+            original_chars=12000,
+            compressed_chars=3200,
+            text="t",
+            agent_summary="summary body",
+            ns="proxy-gh",
+            chunks=None,
+        )
+        assert out.startswith("[Indexing…] `gh/read_file` (12000→3200 chars)")
+        assert "· scheduled." in out
+        # Namespace is intentionally dropped — chunk count and final ns
+        # binding are co-uncertain until the background task completes.
+        assert "namespace" not in out
+        assert "proxy-gh" not in out
+        assert out.endswith("\n\nsummary body")
+
+    def test_falls_back_to_text_and_summary_lengths_when_chars_none(self):
+        out = compose_index_footer(
+            server="s",
+            tool="t",
+            original_chars=None,
+            compressed_chars=None,
+            text="x" * 100,
+            agent_summary="y" * 25,
+            ns="ns",
+            chunks=2,
+        )
+        # 100→25 reflect len(text) / len(agent_summary).
+        assert "(100→25 chars)" in out
 
 
 # ── extract_and_store ────────────────────────────────────────────────────

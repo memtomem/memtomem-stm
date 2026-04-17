@@ -38,6 +38,33 @@ class AutoIndexOutcome:
     error: str | None = None
 
 
+def compose_index_footer(
+    server: str,
+    tool: str,
+    original_chars: int | None,
+    compressed_chars: int | None,
+    text: str,
+    agent_summary: str,
+    ns: str,
+    chunks: int | None,
+) -> str:
+    """Compose the ``[Indexed]`` / ``[Indexing…]`` summary footer.
+
+    ``chunks=None`` is the background-scheduled placeholder: emits
+    ``[Indexing…] … · scheduled`` with the namespace dropped, since
+    the chunk count and final namespace binding are both unknown until
+    the background indexing task runs.
+    """
+    size_part = f"{original_chars or len(text)}→{compressed_chars or len(agent_summary)} chars"
+    if chunks is None:
+        tag = "Indexing…"
+        tail = "scheduled"
+    else:
+        tag = "Indexed"
+        tail = f"{chunks} chunks in `{ns}` namespace"
+    return f"[{tag}] `{server}/{tool}` ({size_part}) · {tail}.\n\n{agent_summary}"
+
+
 @dataclass(frozen=True, slots=True)
 class ExtractOutcome:
     """Structured result of a single ``extract_and_store`` call.
@@ -134,11 +161,15 @@ async def auto_index_response(
         ok = False
         error = f"{type(exc).__name__}: {exc}"
 
-    summary = (
-        f"[Indexed] `{server}/{tool}` ({original_chars or len(text)}"
-        f"→{compressed_chars or len(agent_summary)} chars) "
-        f"· {chunks} chunks in `{ns}` namespace.\n\n"
-        f"{agent_summary}"
+    summary = compose_index_footer(
+        server=server,
+        tool=tool,
+        original_chars=original_chars,
+        compressed_chars=compressed_chars,
+        text=text,
+        agent_summary=agent_summary,
+        ns=ns,
+        chunks=chunks,
     )
     return AutoIndexOutcome(summary=summary, ok=ok, chunks_indexed=chunks, error=error)
 

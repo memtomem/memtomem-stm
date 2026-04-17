@@ -144,6 +144,7 @@ class SelectiveConfig(BaseModel):
 
 class AutoIndexConfig(BaseModel):
     enabled: bool = False
+    background: bool = False
     min_chars: int = Field(default=2000, ge=0)
     memory_dir: Path = Path("~/.memtomem/proxy_index")
     namespace: str = "proxy-{server}"
