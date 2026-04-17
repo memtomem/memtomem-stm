@@ -556,7 +556,7 @@ class TestAutoIndex:
                 )
             ),
         ):
-            result = await mgr._auto_index_response(
+            outcome = await mgr._auto_index_response(
                 server="srv",
                 tool="t",
                 arguments={"q": "test"},
@@ -567,8 +567,10 @@ class TestAutoIndex:
                 compressed_chars=100,
             )
 
-        assert "[Indexed]" in result
-        assert "3 chunks" in result
+        assert "[Indexed]" in outcome.summary
+        assert "3 chunks" in outcome.summary
+        assert outcome.ok is True
+        assert outcome.chunks_indexed == 3
         mock_indexer.index_file.assert_awaited_once()
 
     async def test_auto_index_failure_returns_surfaced(self, tmp_path, caplog):

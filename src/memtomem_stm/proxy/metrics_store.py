@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS proxy_metrics (
 _INDEX = "CREATE INDEX IF NOT EXISTS idx_metrics_created ON proxy_metrics(created_at);"
 
 
+def _tristate(value: bool | None) -> int | None:
+    """Map a tri-state bool to SQLite-friendly ``int | None``.
+
+    ``None`` (stage did not run) is preserved as SQL ``NULL``; ``True`` and
+    ``False`` map to ``1`` and ``0``. Readers must distinguish ``NULL`` from
+    ``0`` — the former is "not observed", the latter is "observed failure".
+    """
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
 class MetricsStore:
     """SQLite-backed persistent metrics for proxy calls."""
 
@@ -59,7 +71,21 @@ class MetricsStore:
         self._db = db
 
     def _migrate(self, db: sqlite3.Connection) -> None:
-        """Add columns introduced after initial schema (idempotent)."""
+        """Add columns introduced after initial schema (idempotent).
+
+        Idempotency is guaranteed per-column via ``PRAGMA table_info`` — a
+        column that already exists is skipped, so restarting against an
+        already-migrated DB runs no ALTER statements. This is stronger than
+        a single ``user_version`` gate because adding a new column below
+        doesn't require bumping a version number; the existence check covers
+        all migration states (fresh, pre-migration, already-migrated).
+
+        Boolean columns use ``INTEGER NOT NULL DEFAULT 0`` so existing rows
+        get a deterministic value. Tri-state columns (``index_ok``,
+        ``extract_ok``, ``surfacing_on_progressive_ok``) are nullable
+        ``INTEGER DEFAULT NULL`` — ``NULL`` means "stage did not run", which
+        readers must distinguish from ``0`` (stage ran and failed).
+        """
         existing = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         migrations = {
             "is_error": "ALTER TABLE proxy_metrics ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0",
@@ -74,6 +100,22 @@ class MetricsStore:
             ),
             "scorer_fallback": (
                 "ALTER TABLE proxy_metrics ADD COLUMN scorer_fallback INTEGER NOT NULL DEFAULT 0"
+            ),
+            "index_ok": "ALTER TABLE proxy_metrics ADD COLUMN index_ok INTEGER DEFAULT NULL",
+            "index_error": "ALTER TABLE proxy_metrics ADD COLUMN index_error TEXT DEFAULT NULL",
+            "chunks_indexed": (
+                "ALTER TABLE proxy_metrics ADD COLUMN chunks_indexed INTEGER NOT NULL DEFAULT 0"
+            ),
+            "extract_ok": "ALTER TABLE proxy_metrics ADD COLUMN extract_ok INTEGER DEFAULT NULL",
+            "extract_error": (
+                "ALTER TABLE proxy_metrics ADD COLUMN extract_error TEXT DEFAULT NULL"
+            ),
+            "surfacing_on_progressive_ok": (
+                "ALTER TABLE proxy_metrics ADD COLUMN surfacing_on_progressive_ok "
+                "INTEGER DEFAULT NULL"
+            ),
+            "surface_error": (
+                "ALTER TABLE proxy_metrics ADD COLUMN surface_error TEXT DEFAULT NULL"
             ),
         }
         for col, ddl in migrations.items():
@@ -95,8 +137,11 @@ class MetricsStore:
                 "INSERT INTO proxy_metrics "
                 "(server, tool, original_chars, compressed_chars, cleaned_chars, "
                 "is_error, error_category, error_code, trace_id, "
-                "compression_strategy, ratio_violation, scorer_fallback, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "compression_strategy, ratio_violation, scorer_fallback, "
+                "index_ok, index_error, chunks_indexed, "
+                "extract_ok, extract_error, "
+                "surfacing_on_progressive_ok, surface_error, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -110,6 +155,13 @@ class MetricsStore:
                     metrics.compression_strategy,
                     int(metrics.ratio_violation),
                     int(metrics.scorer_fallback),
+                    _tristate(metrics.index_ok),
+                    metrics.index_error,
+                    metrics.chunks_indexed,
+                    _tristate(metrics.extract_ok),
+                    metrics.extract_error,
+                    _tristate(metrics.surfacing_on_progressive_ok),
+                    metrics.surface_error,
                     now,
                 ),
             )

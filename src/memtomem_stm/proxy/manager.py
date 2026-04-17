@@ -44,7 +44,13 @@ from memtomem_stm.proxy.config import (
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.extraction import FactExtractor
-from memtomem_stm.proxy.memory_ops import auto_index_response, extract_and_store, format_fact_md
+from memtomem_stm.proxy.memory_ops import (
+    AutoIndexOutcome,
+    ExtractOutcome,
+    auto_index_response,
+    extract_and_store,
+    format_fact_md,
+)
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
     distill_schema,
@@ -637,7 +643,7 @@ class ProxyManager:
         original_chars: int | None = None,
         compressed_chars: int | None = None,
         context_query: str | None = None,
-    ) -> str:
+    ) -> AutoIndexOutcome:
         if self._index_engine is None:
             raise RuntimeError("index_engine not available")
         return await auto_index_response(
@@ -668,10 +674,10 @@ class ProxyManager:
         text: str,
         *,
         context_query: str | None = None,
-    ) -> None:
+    ) -> ExtractOutcome:
         """Extract facts from response and store as individual memory entries."""
         extractor = await self._get_extractor()
-        await extract_and_store(
+        return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
             ext_cfg=self._config.extraction,
@@ -1321,6 +1327,13 @@ class ProxyManager:
                     _surface_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stage 4: INDEX (optional) ──
+        # Track outcome for CallMetrics below. ``None`` means "stage did not
+        # run for this call" — either disabled, engine missing, or content
+        # below min_chars. ``False`` means "ran and failed"; dashboards must
+        # distinguish the two.
+        index_ok: bool | None = None
+        index_error: str | None = None
+        chunks_indexed = 0
         ai_cfg = cfg_snap.auto_index
         if (
             tc.auto_index_enabled
@@ -1332,7 +1345,14 @@ class ProxyManager:
                 metadata={"server": server, "tool": tool},
             ):
                 try:
-                    final_result = await self._auto_index_response(
+                    # A1 fix: pre-surfacing ``compressed_chars_for_metrics``
+                    # matches what we record in the metrics row below, so the
+                    # indexed frontmatter and the dashboards agree on what
+                    # "compressed_chars" means for this call. Pre-A1 the
+                    # frontmatter recorded ``len(surfaced)`` (post-surfacing),
+                    # which drifted from the metrics value whenever surfacing
+                    # added content.
+                    outcome = await self._auto_index_response(
                         server,
                         tool,
                         upstream_args,
@@ -1340,10 +1360,18 @@ class ProxyManager:
                         agent_summary=surfaced,
                         compression_strategy=tc.compression.value,
                         original_chars=len(original_text),
-                        compressed_chars=len(surfaced),
+                        compressed_chars=compressed_chars_for_metrics,
                         context_query=context_query,
                     )
-                except Exception:
+                    final_result = outcome.summary
+                    index_ok = outcome.ok
+                    index_error = outcome.error
+                    chunks_indexed = outcome.chunks_indexed
+                except Exception as exc:
+                    # Reaches here only for failures outside the inner
+                    # ``index_file`` try/except in ``auto_index_response``
+                    # (mkdir / atomic write / unexpected errors). The inner
+                    # indexing failure is already captured in the outcome.
                     logger.warning(
                         "Auto-index failed for %s/%s — returning unindexed response",
                         server,
@@ -1351,10 +1379,18 @@ class ProxyManager:
                         exc_info=True,
                     )
                     final_result = surfaced
+                    index_ok = False
+                    index_error = f"{type(exc).__name__}: {exc}"
         else:
             final_result = surfaced
 
         # ── Stage 4b: EXTRACT (optional, background by default) ──
+        # Sync path populates ``extract_ok`` / ``extract_error``; background
+        # path leaves them ``None`` — the outcome arrives after the metrics
+        # row below is committed. Background failures stay visible via
+        # ``memory_ops.extract_and_store``'s WARNING log.
+        extract_ok: bool | None = None
+        extract_error: str | None = None
         ext_cfg = cfg_snap.extraction
         if (
             tc.extraction_enabled
@@ -1374,13 +1410,15 @@ class ProxyManager:
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
             else:
-                await self._extract_and_store(
+                extract_outcome = await self._extract_and_store(
                     server,
                     tool,
                     upstream_args,
                     cleaned,
                     context_query=context_query,
                 )
+                extract_ok = extract_outcome.ok
+                extract_error = extract_outcome.error
 
         # Record metrics (using pre-surfacing compressed size)
         # Approximate token counts: chars / 3.5 (average for mixed en/code/json).
@@ -1407,6 +1445,11 @@ class ProxyManager:
                 scorer_fallback=(
                     getattr(self._relevance_scorer, "fallback_count", 0) > _pre_scorer_fb
                 ),
+                index_ok=index_ok,
+                index_error=index_error,
+                chunks_indexed=chunks_indexed,
+                extract_ok=extract_ok,
+                extract_error=extract_error,
             )
         )
 
