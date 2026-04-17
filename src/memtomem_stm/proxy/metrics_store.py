@@ -47,6 +47,13 @@ class MetricsStore:
         self._db_path = db_path
         self._max_history = max_history
         self._db: sqlite3.Connection | None = None
+        # Readers and writers share ``self._lock`` defensively. Current
+        # callers are all asyncio single-thread, but the connection uses
+        # ``check_same_thread=False`` so any future move to a thread-pool
+        # executor (or another thread-spawning caller) would race reads
+        # against in-flight ``record()`` writes without this guard. The
+        # uncontended acquire cost is negligible given cold-path call
+        # frequency (tuner drift analysis + feedback correlation lookups).
         self._lock = threading.Lock()
 
     def initialize(self) -> None:
@@ -194,76 +201,78 @@ class MetricsStore:
         if self._db is None:
             return []
         cutoff = time.time() - since_seconds
-        # Main aggregation
-        rows = self._db.execute(
-            """
-            SELECT
-                server,
-                tool,
-                COUNT(*)                                          AS call_count,
-                SUM(ratio_violation)                              AS violation_count,
-                AVG(
-                    CASE WHEN cleaned_chars > 0 AND is_error = 0
-                         THEN CAST(compressed_chars AS REAL) / cleaned_chars
-                    END
-                )                                                 AS avg_ratio,
-                SUM(is_error)                                     AS error_count
-            FROM proxy_metrics
-            WHERE created_at >= ?
-            GROUP BY server, tool
-            """,
-            (cutoff,),
-        ).fetchall()
+        with self._lock:
+            # Main aggregation
+            rows = self._db.execute(
+                """
+                SELECT
+                    server,
+                    tool,
+                    COUNT(*)                                          AS call_count,
+                    SUM(ratio_violation)                              AS violation_count,
+                    AVG(
+                        CASE WHEN cleaned_chars > 0 AND is_error = 0
+                             THEN CAST(compressed_chars AS REAL) / cleaned_chars
+                        END
+                    )                                                 AS avg_ratio,
+                    SUM(is_error)                                     AS error_count
+                FROM proxy_metrics
+                WHERE created_at >= ?
+                GROUP BY server, tool
+                """,
+                (cutoff,),
+            ).fetchall()
 
-        profiles: list[dict] = []
-        for server, tool, call_count, violation_count, avg_ratio, error_count in rows:
-            # p95 approximation: pick the value at rank ceil(0.95 * N)
-            p95_row = self._db.execute(
-                """
-                SELECT original_chars FROM proxy_metrics
-                WHERE server = ? AND tool = ? AND created_at >= ?
-                ORDER BY original_chars ASC
-                LIMIT 1 OFFSET MAX(0, CAST(
-                    (SELECT COUNT(*) FROM proxy_metrics
-                     WHERE server = ? AND tool = ? AND created_at >= ?)
-                    * 0.95 AS INTEGER) - 1)
-                """,
-                (server, tool, cutoff, server, tool, cutoff),
-            ).fetchone()
-            # Dominant strategy
-            strat_row = self._db.execute(
-                """
-                SELECT compression_strategy FROM proxy_metrics
-                WHERE server = ? AND tool = ? AND created_at >= ?
-                    AND compression_strategy IS NOT NULL
-                GROUP BY compression_strategy
-                ORDER BY COUNT(*) DESC
-                LIMIT 1
-                """,
-                (server, tool, cutoff),
-            ).fetchone()
-            profiles.append(
-                {
-                    "server": server,
-                    "tool": tool,
-                    "call_count": call_count,
-                    "violation_count": violation_count or 0,
-                    "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
-                    "p95_original_chars": p95_row[0] if p95_row else 0,
-                    "dominant_strategy": strat_row[0] if strat_row else None,
-                    "error_count": error_count or 0,
-                }
-            )
+            profiles: list[dict] = []
+            for server, tool, call_count, violation_count, avg_ratio, error_count in rows:
+                # p95 approximation: pick the value at rank ceil(0.95 * N)
+                p95_row = self._db.execute(
+                    """
+                    SELECT original_chars FROM proxy_metrics
+                    WHERE server = ? AND tool = ? AND created_at >= ?
+                    ORDER BY original_chars ASC
+                    LIMIT 1 OFFSET MAX(0, CAST(
+                        (SELECT COUNT(*) FROM proxy_metrics
+                         WHERE server = ? AND tool = ? AND created_at >= ?)
+                        * 0.95 AS INTEGER) - 1)
+                    """,
+                    (server, tool, cutoff, server, tool, cutoff),
+                ).fetchone()
+                # Dominant strategy
+                strat_row = self._db.execute(
+                    """
+                    SELECT compression_strategy FROM proxy_metrics
+                    WHERE server = ? AND tool = ? AND created_at >= ?
+                        AND compression_strategy IS NOT NULL
+                    GROUP BY compression_strategy
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 1
+                    """,
+                    (server, tool, cutoff),
+                ).fetchone()
+                profiles.append(
+                    {
+                        "server": server,
+                        "tool": tool,
+                        "call_count": call_count,
+                        "violation_count": violation_count or 0,
+                        "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
+                        "p95_original_chars": p95_row[0] if p95_row else 0,
+                        "dominant_strategy": strat_row[0] if strat_row else None,
+                        "error_count": error_count or 0,
+                    }
+                )
         return profiles
 
     def get_history(self, limit: int = 100) -> list[dict]:
         if self._db is None:
             return []
-        rows = self._db.execute(
-            "SELECT server, tool, original_chars, compressed_chars, cleaned_chars, created_at "
-            "FROM proxy_metrics ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT server, tool, original_chars, compressed_chars, cleaned_chars, created_at "
+                "FROM proxy_metrics ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [
             {
                 "server": r[0],
@@ -296,11 +305,12 @@ class MetricsStore:
         if self._db is None:
             return None
         cutoff = time.time() - within_seconds
-        row = self._db.execute(
-            "SELECT trace_id FROM proxy_metrics "
-            "WHERE server = ? AND tool = ? AND created_at >= ? "
-            "AND trace_id IS NOT NULL "
-            "ORDER BY created_at DESC LIMIT 1",
-            (server, tool, cutoff),
-        ).fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT trace_id FROM proxy_metrics "
+                "WHERE server = ? AND tool = ? AND created_at >= ? "
+                "AND trace_id IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (server, tool, cutoff),
+            ).fetchone()
         return row[0] if row else None

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -228,3 +229,84 @@ class TestRecordPersistsNewFields:
         ).fetchone()[0]
         assert failures == 1
         assert unobserved == 1
+
+
+class TestReadPathConcurrency:
+    """Cross-thread reader/writer safety.
+
+    The connection is opened with ``check_same_thread=False``, and
+    ``record()`` / ``_trim()`` serialize via ``self._lock`` against
+    thread-pool writers. Reader paths used to be lockless on the
+    assumption that all callers live on the asyncio single-thread; that
+    assumption is a fragile convention. This test pins the invariant by
+    driving concurrent writers and readers through a thread pool — if a
+    future refactor drops the reader locks and moves a caller to
+    ``run_in_executor``, this test catches it before users do.
+    """
+
+    def test_readers_and_writer_concurrent(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        total_writes = 200
+        reads_per_worker = 100
+
+        def writer() -> None:
+            for i in range(total_writes):
+                store.record(
+                    CallMetrics(
+                        server="s",
+                        tool=f"t{i % 5}",
+                        original_chars=1000,
+                        compressed_chars=400,
+                        cleaned_chars=800,
+                        trace_id=f"tr-{i}",
+                    )
+                )
+
+        def run_get_tool_profiles() -> None:
+            for _ in range(reads_per_worker):
+                result = store.get_tool_profiles(since_seconds=3600.0)
+                assert isinstance(result, list)
+                for row in result:
+                    # If a torn read ever happened the dict would be
+                    # missing keys or carry mismatched values; asserting
+                    # the contract forces a failure rather than silent
+                    # corruption.
+                    assert row["call_count"] >= 1
+                    assert isinstance(row["server"], str)
+
+        def run_get_history() -> None:
+            for _ in range(reads_per_worker):
+                result = store.get_history(limit=50)
+                assert isinstance(result, list)
+                for row in result:
+                    assert row["original_chars"] == 1000
+                    assert row["compressed_chars"] == 400
+
+        def run_lookup_recent_trace_id() -> None:
+            for _ in range(reads_per_worker):
+                trace = store.lookup_recent_trace_id("s", "t0", within_seconds=3600.0)
+                # trace_id is either a valid match or ``None`` if the
+                # writer hasn't produced a ``t0`` row yet. Never an
+                # empty string or malformed value.
+                assert trace is None or trace.startswith("tr-")
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [
+                    pool.submit(writer),
+                    pool.submit(run_get_tool_profiles),
+                    pool.submit(run_get_history),
+                    pool.submit(run_lookup_recent_trace_id),
+                ]
+                # ``f.result()`` re-raises any exception the worker hit,
+                # so a race-induced SQLite error fails the test here.
+                for f in futures:
+                    f.result(timeout=30)
+
+            final_count = store._db.execute(
+                "SELECT COUNT(*) FROM proxy_metrics"
+            ).fetchone()[0]
+            assert final_count == total_writes
+        finally:
+            store.close()
