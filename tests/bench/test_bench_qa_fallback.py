@@ -28,7 +28,12 @@ import pytest
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.config import CleaningConfig
 
-from bench.bench_qa import latest_metrics_row, load_fixture, make_proxy_manager
+from bench.bench_qa import (
+    deterministic_trace_id,
+    latest_metrics_row,
+    load_fixture,
+    make_proxy_manager,
+)
 from bench.bench_qa.progressive import reassemble
 from bench.bench_qa.runner import make_tool_result
 
@@ -58,9 +63,13 @@ async def test_s06_tier1_progressive_round_trip(tmp_path, bench_qa_report):
     # promotes the call to progressive delivery.
     mgr._apply_compression = AsyncMock(return_value=("x" * 50, None))
 
-    first_chunk = await mgr.call_tool("fake", "tool_s06", {})
+    expected_trace_id = deterministic_trace_id("s06")
+    first_chunk = await mgr.call_tool("fake", "tool_s06", {}, trace_id=expected_trace_id)
     row = latest_metrics_row(store)
     try:
+        assert row["trace_id"] == expected_trace_id, (
+            f"s06: trace_id mismatch — got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
         assert row["ratio_violation"] == 1, "Tier-1 should record a violation"
         assert "→progressive_fallback" in (row["compression_strategy"] or ""), (
             f"unexpected strategy: {row['compression_strategy']!r}"
@@ -121,9 +130,13 @@ async def test_s01_tier2_hybrid_fallback(tmp_path, bench_qa_report):
     mgr._apply_compression = AsyncMock(return_value=("x" * 50, None))
     mgr._apply_progressive = _stub_raise  # type: ignore[method-assign]
 
-    result = await mgr.call_tool("fake", "tool_s01", {})
+    expected_trace_id = deterministic_trace_id("s01")
+    result = await mgr.call_tool("fake", "tool_s01", {}, trace_id=expected_trace_id)
     row = latest_metrics_row(store)
     try:
+        assert row["trace_id"] == expected_trace_id, (
+            f"s01: trace_id mismatch — got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
         assert row["ratio_violation"] == 1
         strategy = row["compression_strategy"] or ""
         assert "→hybrid_fallback" in strategy, f"unexpected strategy: {strategy!r}"
@@ -169,9 +182,13 @@ async def test_s08_tier3_truncate_fallback(tmp_path, bench_qa_report):
     mgr._apply_progressive = _stub_raise  # type: ignore[method-assign]
     mgr._apply_hybrid = _stub_raise  # type: ignore[method-assign]
 
-    result = await mgr.call_tool("fake", "tool_s08", {})
+    expected_trace_id = deterministic_trace_id("s08")
+    result = await mgr.call_tool("fake", "tool_s08", {}, trace_id=expected_trace_id)
     row = latest_metrics_row(store)
     try:
+        assert row["trace_id"] == expected_trace_id, (
+            f"s08: trace_id mismatch — got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
         assert row["ratio_violation"] == 1
         strategy = row["compression_strategy"] or ""
         assert "→truncate_fallback" in strategy, f"unexpected strategy: {strategy!r}"

@@ -7,6 +7,7 @@ See ``/Users/pdstudio/.claude/plans/mcp-snug-river.md`` for the design
 
 from .judge import qa_answerable_ratio, surfacing_recall_at_k
 from .loader import fixtures_dir, load_fixture
+from .report import BenchReportCollector, canonicalize_report
 from .runner import (
     deterministic_trace_id,
     latest_metrics_row,
@@ -23,9 +24,11 @@ from .schema import (
 __all__ = [
     "BenchFixture",
     "BenchReport",
+    "BenchReportCollector",
     "QAProbe",
     "ScenarioReport",
     "SurfacingEval",
+    "canonicalize_report",
     "deterministic_trace_id",
     "fixtures_dir",
     "latest_metrics_row",

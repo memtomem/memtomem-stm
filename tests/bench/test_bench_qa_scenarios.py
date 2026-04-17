@@ -49,15 +49,15 @@ async def test_bench_qa_normal_path(scenario_id: str, tmp_path, bench_qa_report)
     session.call_tool.return_value = make_tool_result(fixture["payload"])
 
     expected_trace_id = deterministic_trace_id(fixture["scenario_id"])
-    result = await mgr.call_tool("fake", f"tool_{scenario_id}", {})
+    result = await mgr.call_tool("fake", f"tool_{scenario_id}", {}, trace_id=expected_trace_id)
 
     row = latest_metrics_row(store)
     try:
         assert row, f"{scenario_id}: proxy_metrics row was not written"
-        # ProxyManager.call_tool currently assigns its own uuid-based trace_id;
-        # deterministic injection arrives in the report PR (plan back-fill).
-        assert row["trace_id"], f"{scenario_id}: trace_id column should be populated"
-        assert expected_trace_id.startswith("bench-"), "sanity: hash helper runs"
+        assert row["trace_id"] == expected_trace_id, (
+            f"{scenario_id}: trace_id mismatch — "
+            f"got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
 
         assert row["ratio_violation"] == 0, (
             f"{scenario_id}: unexpected ratio_violation=1 on happy path "

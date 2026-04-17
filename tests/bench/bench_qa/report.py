@@ -7,15 +7,18 @@ configured output dir (default: ``/tmp/stm-qa-<ts>/``).
 
 Determinism: ``report.json`` excludes wall-clock fields that would
 break a two-run diff — latencies, timestamps, and the ``run_timestamp``
-header are canonical strip candidates when diffing.
+header are canonical strip candidates when diffing. Use
+:func:`canonicalize_report` before a deep-equal check.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 from .schema import (
     REPORT_SCHEMA_VERSION,
@@ -29,6 +32,41 @@ from .schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Fields stripped by ``canonicalize_report`` before a determinism diff.
+# All three carry wall-clock stage timings that are inherently non-reproducible
+# across runs; their values belong in the ``totals`` trend (outside the
+# per-scenario gate surface) but must not enter a deep-equal check.
+_STAGE_TIMING_FIELDS: tuple[str, ...] = ("clean_ms", "compress_ms", "surface_ms")
+
+
+def canonicalize_report(report: BenchReport) -> dict[str, Any]:
+    """Return a copy of *report* with non-reproducible fields stripped.
+
+    Use before ``assert canonicalize(a) == canonicalize(b)`` in a
+    two-run determinism check. The original report is unchanged.
+
+    Stripped:
+
+    * ``scenarios[*].metrics.clean_ms`` / ``compress_ms`` / ``surface_ms``
+      — stage latencies differ run-to-run by definition.
+
+    Preserved:
+
+    * ``trace_id`` — deterministic by construction
+      (``bench-<sha256(scenario_id:run_seed)[:16]>``).
+    * All byte-counted fields (``original_chars``, ``cleaned_chars``,
+      ``compressed_chars``) — identical across runs with fixed payload.
+    * ``tier_histogram`` and ``totals`` aggregates — built from the
+      deterministic counts.
+    """
+    canon: dict[str, Any] = copy.deepcopy(dict(report))
+    for scenario in canon.get("scenarios", []):
+        metrics = scenario.get("metrics", {})
+        for field in _STAGE_TIMING_FIELDS:
+            metrics.pop(field, None)
+    return canon
 
 
 def _coerce_metrics(row: dict, original_chars: int) -> MetricSummary:

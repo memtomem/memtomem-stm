@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from memtomem_stm.proxy.config import (
+    CompressionFeedbackConfig,
     CompressionStrategy,
     ProxyConfig,
     UpstreamServerConfig,
@@ -27,6 +28,23 @@ from memtomem_stm.proxy.config import (
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.surfacing.config import SurfacingConfig
+
+
+# Drift detector: ``CompressionFeedbackConfig.db_path`` and
+# ``SurfacingConfig.feedback_db_path`` default to the *same* ``stm_feedback.db``
+# in production (plan §Per-run isolation). Bench harness queries assume this —
+# if a future PR bumps one default without the other, the scenario-level
+# ``SELECT ... WHERE trace_id IN (:ids)`` would silently return empty rows.
+# Fail loudly at import time instead.
+_compression_default = CompressionFeedbackConfig().db_path
+_surfacing_default = SurfacingConfig().feedback_db_path
+assert _compression_default == _surfacing_default, (
+    "bench_qa invariant: CompressionFeedbackConfig.db_path "
+    f"({_compression_default}) must match SurfacingConfig.feedback_db_path "
+    f"({_surfacing_default}); both point at the same stm_feedback.db in "
+    "production. Update both defaults together."
+)
 
 
 _COMPRESSION_STRATEGY_BY_NAME: dict[str, CompressionStrategy] = {
