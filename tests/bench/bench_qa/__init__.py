@@ -5,6 +5,7 @@ See ``/Users/pdstudio/.claude/plans/mcp-snug-river.md`` for the design
 (Context → Goals → Harness → Metrics → Integration).
 """
 
+from .judge import qa_answerable_ratio, surfacing_recall_at_k
 from .loader import fixtures_dir, load_fixture
 from .runner import (
     deterministic_trace_id,
@@ -30,4 +31,6 @@ __all__ = [
     "latest_metrics_row",
     "load_fixture",
     "make_proxy_manager",
+    "qa_answerable_ratio",
+    "surfacing_recall_at_k",
 ]

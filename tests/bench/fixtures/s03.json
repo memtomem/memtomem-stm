@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s03",
+  "description": "Nested event stream (order → payment → inventory → shipment). Risk: losing per-event identifiers when compression flattens nested payloads.",
+  "content_type": "json",
+  "expected_compressor": "auto",
+  "force_tier": null,
+  "max_result_chars": 1500,
+  "qa_gate_min": 0.66,
+  "expected_keywords": [
+    "ORD-7890",
+    "258.09",
+    "FedEx",
+    "WIDGET-A",
+    "GADGET-B",
+    "e-001",
+    "e-002",
+    "e-003",
+    "e-004"
+  ],
+  "qa_probes": [
+    {
+      "question": "What is the order grand total?",
+      "expected_keywords": ["258.09"]
+    },
+    {
+      "question": "Who is the customer?",
+      "expected_keywords": ["Daniela Ferreira"]
+    },
+    {
+      "question": "What carrier shipped the order?",
+      "expected_keywords": ["FedEx", "FEDEX-998877"]
+    }
+  ],
+  "payload": "{\n  \"stream_id\": \"evt-stream-42\",\n  \"events\": [\n    {\n      \"id\": \"e-001\", \"type\": \"order.created\", \"timestamp\": \"2025-06-15T10:00:00Z\",\n      \"payload\": {\n        \"order_id\": \"ORD-7890\",\n        \"customer\": {\"id\": \"cust-555\", \"name\": \"Daniela Ferreira\", \"tier\": \"gold\"},\n        \"items\": [\n          {\"sku\": \"WIDGET-A\", \"qty\": 3, \"unit_price\": 29.99, \"subtotal\": 89.97},\n          {\"sku\": \"GADGET-B\", \"qty\": 1, \"unit_price\": 149.00, \"subtotal\": 149.00}\n        ],\n        \"totals\": {\"subtotal\": 238.97, \"tax\": 19.12, \"shipping\": 0.00, \"grand_total\": 258.09},\n        \"shipping_address\": {\"city\": \"Sao Paulo\", \"country\": \"BR\", \"zip\": \"01310-100\"}\n      }\n    },\n    {\n      \"id\": \"e-002\", \"type\": \"payment.captured\", \"timestamp\": \"2025-06-15T10:00:05Z\",\n      \"payload\": {\"order_id\": \"ORD-7890\", \"payment_method\": \"credit_card\", \"amount\": 258.09, \"currency\": \"USD\", \"processor\": \"stripe\", \"transaction_id\": \"txn_abc123\"}\n    },\n    {\n      \"id\": \"e-003\", \"type\": \"inventory.reserved\", \"timestamp\": \"2025-06-15T10:00:06Z\",\n      \"payload\": {\"order_id\": \"ORD-7890\", \"reservations\": [{\"sku\": \"WIDGET-A\", \"warehouse\": \"WH-EAST\", \"qty\": 3, \"remaining_stock\": 142}, {\"sku\": \"GADGET-B\", \"warehouse\": \"WH-WEST\", \"qty\": 1, \"remaining_stock\": 37}]}\n    },\n    {\n      \"id\": \"e-004\", \"type\": \"fulfillment.shipped\", \"timestamp\": \"2025-06-15T14:30:00Z\",\n      \"payload\": {\"order_id\": \"ORD-7890\", \"carrier\": \"FedEx\", \"tracking_number\": \"FEDEX-998877\", \"estimated_delivery\": \"2025-06-18\", \"packages\": [{\"id\": \"pkg-1\", \"weight_kg\": 1.2, \"dimensions\": \"30x20x15cm\", \"items\": [\"WIDGET-A\"]}, {\"id\": \"pkg-2\", \"weight_kg\": 2.5, \"dimensions\": \"40x30x20cm\", \"items\": [\"GADGET-B\"]}]}\n    }\n  ]\n}\n"
+}

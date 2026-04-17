@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s02",
+  "description": "Paginated JSON API response (users + metadata). Compressor should pick extract_fields/schema_pruning under AUTO and keep keys/roles intact.",
+  "content_type": "json",
+  "expected_compressor": "auto",
+  "force_tier": null,
+  "max_result_chars": 2000,
+  "qa_gate_min": 0.66,
+  "expected_keywords": [
+    "Alice Park",
+    "Bob Chen",
+    "Carla Ruiz",
+    "Diego Torres",
+    "Nguyen Linh",
+    "admin",
+    "developer",
+    "designer"
+  ],
+  "qa_probes": [
+    {
+      "question": "What role does Alice Park have?",
+      "expected_keywords": ["Alice Park", "admin"]
+    },
+    {
+      "question": "Which department is Carla Ruiz in?",
+      "expected_keywords": ["Carla Ruiz", "Product"]
+    },
+    {
+      "question": "What is the next page URL?",
+      "expected_keywords": ["page=2"]
+    }
+  ],
+  "payload": "{\n  \"status\": \"ok\",\n  \"metadata\": {\n    \"request_id\": \"req-8a3f2c\",\n    \"timestamp\": \"2025-06-15T09:22:11Z\",\n    \"processing_ms\": 142,\n    \"region\": \"us-east-1\",\n    \"version\": \"3.4.1\",\n    \"deprecated_fields\": [\"legacy_id\", \"compat_mode\"],\n    \"rate_limit\": {\"remaining\": 847, \"reset_at\": \"2025-06-15T10:00:00Z\"}\n  },\n  \"data\": {\n    \"users\": [\n      {\n        \"id\": \"u-001\", \"name\": \"Alice Park\", \"email\": \"alice@example.com\",\n        \"role\": \"admin\", \"department\": \"Engineering\", \"joined\": \"2023-01-15\",\n        \"last_login\": \"2025-06-14T18:30:00Z\",\n        \"permissions\": [\"read\", \"write\", \"delete\", \"manage_users\"],\n        \"preferences\": {\"theme\": \"dark\", \"locale\": \"en-US\", \"notifications\": true},\n        \"tags\": [\"team-lead\", \"on-call\"]\n      },\n      {\n        \"id\": \"u-002\", \"name\": \"Bob Chen\", \"email\": \"bob@example.com\",\n        \"role\": \"developer\", \"department\": \"Engineering\", \"joined\": \"2023-08-20\",\n        \"last_login\": \"2025-06-15T08:10:00Z\",\n        \"permissions\": [\"read\", \"write\"],\n        \"preferences\": {\"theme\": \"light\", \"locale\": \"zh-CN\", \"notifications\": false},\n        \"tags\": [\"backend\"]\n      },\n      {\n        \"id\": \"u-003\", \"name\": \"Carla Ruiz\", \"email\": \"carla@example.com\",\n        \"role\": \"designer\", \"department\": \"Product\", \"joined\": \"2024-03-01\",\n        \"last_login\": \"2025-06-13T11:45:00Z\",\n        \"permissions\": [\"read\"],\n        \"preferences\": {\"theme\": \"auto\", \"locale\": \"es-MX\", \"notifications\": true},\n        \"tags\": [\"ux\", \"accessibility\"]\n      },\n      {\n        \"id\": \"u-004\", \"name\": \"Diego Torres\", \"email\": \"diego@example.com\",\n        \"role\": \"developer\", \"department\": \"Engineering\", \"joined\": \"2024-05-12\",\n        \"last_login\": \"2025-06-15T06:55:00Z\",\n        \"permissions\": [\"read\", \"write\"],\n        \"preferences\": {\"theme\": \"dark\", \"locale\": \"en-US\", \"notifications\": true},\n        \"tags\": [\"mobile\", \"ios\"]\n      },\n      {\n        \"id\": \"u-005\", \"name\": \"Nguyen Linh\", \"email\": \"linh@example.com\",\n        \"role\": \"developer\", \"department\": \"Platform\", \"joined\": \"2022-11-03\",\n        \"last_login\": \"2025-06-14T21:03:00Z\",\n        \"permissions\": [\"read\", \"write\", \"deploy\"],\n        \"preferences\": {\"theme\": \"auto\", \"locale\": \"vi-VN\", \"notifications\": false},\n        \"tags\": [\"kubernetes\", \"sre\"]\n      }\n    ],\n    \"pagination\": {\"page\": 1, \"per_page\": 5, \"total\": 18, \"total_pages\": 4}\n  },\n  \"links\": {\n    \"self\": \"/api/v3/users?page=1\",\n    \"next\": \"/api/v3/users?page=2\",\n    \"prev\": null,\n    \"docs\": \"https://docs.example.com/api/v3/users\"\n  }\n}\n"
+}
