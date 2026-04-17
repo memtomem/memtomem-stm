@@ -845,7 +845,14 @@ class ProxyManager:
         with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
             return await self._apply_surfacing(server, tool, arguments, cached, trace_id=trace_id)
 
-    async def call_tool(self, server: str, tool: str, arguments: dict[str, Any]) -> str | list:
+    async def call_tool(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        trace_id: str | None = None,
+    ) -> str | list:
         """Forward a tool call to upstream, compress, surface, and return.
 
         Wraps the entire call pipeline in a Langfuse observation span when
@@ -854,10 +861,17 @@ class ProxyManager:
         in ``proxy_metrics.db``. When Langfuse is not configured, ``traced()``
         returns ``nullcontext()`` and the wrapper is a no-op — no perf cost,
         no behavior change for users who don't opt in.
+
+        ``trace_id`` is keyword-only and defaults to a fresh
+        ``uuid.uuid4().hex[:16]``. Callers (e.g. the bench_qa harness) may
+        pass a deterministic value so two runs produce identical
+        ``proxy_metrics``/``surfacing_events`` rows under the same trace,
+        enabling determinism diffs across runs.
         """
         if server not in self._connections:
             raise KeyError(f"Unknown upstream server: '{server}'")
-        trace_id = uuid.uuid4().hex[:16]
+        if trace_id is None:
+            trace_id = uuid.uuid4().hex[:16]
         with traced(
             "proxy_call",
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
