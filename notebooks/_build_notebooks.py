@@ -1204,10 +1204,15 @@ def build_nb05() -> None:
         ),
         _code(
             """
-            fixture_script = str(fixtures_dir() / "echo_mcp.py")
+            fixture_script = fixtures_dir() / "echo_mcp.py"
             subprocess.run(
-                ["mms", "add", "echo", "--command", "uv", "--args",
-                 f"run,python,{fixture_script}", "--prefix", "echo"],
+                [
+                    "uv", "run", "mms", "add", "echo",
+                    "--config", str(config_path),
+                    "--command", "uv",
+                    "--args", f"run python {fixture_script}",
+                    "--prefix", "echo",
+                ],
                 check=True,
                 capture_output=True,
             )
