@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s06",
+  "description": "Mixed log dump (stack traces + JSON + plain lines) forced into Tier-1 progressive_fallback. Verifies zero-loss round-trip byte-identity across stm_proxy_read_more chunks.",
+  "content_type": "text",
+  "expected_compressor": "auto",
+  "force_tier": 1,
+  "max_result_chars": 500,
+  "payload_multiplier": 12,
+  "qa_gate_min": 0.66,
+  "expected_keywords": [
+    "Traceback",
+    "payment-gateway",
+    "INC-2025-0613",
+    "ACCESS EXCLUSIVE"
+  ],
+  "qa_probes": [
+    {
+      "question": "What incident ID is referenced?",
+      "expected_keywords": ["INC-2025-0613"]
+    },
+    {
+      "question": "Which lock type blocked queries?",
+      "expected_keywords": ["ACCESS EXCLUSIVE"]
+    },
+    {
+      "question": "What service was affected?",
+      "expected_keywords": ["payment-gateway"]
+    }
+  ],
+  "payload": "2025-06-13T03:42:01Z ERROR [payment-gateway] connection pool exhausted — pool=payment-db-primary max=50 active=50 waiting=812\n2025-06-13T03:42:02Z ERROR [payment-gateway] {\"event\":\"db.query.blocked\",\"lock\":\"ACCESS EXCLUSIVE\",\"table\":\"transactions\",\"waiting_queries\":812,\"incident\":\"INC-2025-0613\"}\n2025-06-13T03:42:03Z ERROR [payment-gateway] Traceback (most recent call last):\n  File \"/app/payment_gateway/routes.py\", line 142, in charge\n    conn = await pool.acquire(timeout=5.0)\n  File \"/opt/py/asyncpg/pool.py\", line 218, in acquire\n    raise InterfaceError(\"pool exhausted — INC-2025-0613 lock=ACCESS EXCLUSIVE\")\nasyncpg.exceptions.InterfaceError: pool exhausted — INC-2025-0613 lock=ACCESS EXCLUSIVE\n2025-06-13T03:42:04Z WARN  [order-service] upstream payment-gateway returned 503 — correlation=req-abc-1234\n2025-06-13T03:42:05Z INFO  [checkout-ui] retrying payment for order ORD-7890 (attempt 2/3)\n"
+}

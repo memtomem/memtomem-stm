@@ -28,4 +28,9 @@ def load_fixture(scenario_id: str) -> BenchFixture:
             f"fixture {path} declares scenario_id={raw.get('scenario_id')!r}; "
             f"file name implies {scenario_id!r}"
         )
+    multiplier = int(raw.get("payload_multiplier", 1))
+    if multiplier < 1:
+        raise AssertionError(f"fixture {scenario_id}: payload_multiplier={multiplier} must be >= 1")
+    if multiplier > 1:
+        raw["payload"] = raw["payload"] * multiplier
     return raw  # type: ignore[return-value]

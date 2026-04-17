@@ -54,6 +54,9 @@ class BenchFixture(TypedDict, total=False):
     expected_compressor: str
     max_result_chars: int
     force_tier: int | None
+    # Repeat ``payload`` N times on load. Keeps fixture files small when a
+    # scenario only needs a large (10–20 KB) payload with repeating structure.
+    payload_multiplier: int
     expected_keywords: list[str]
     qa_probes: list[QAProbe]
     # Minimum acceptable ``qa_answerable/total`` ratio for this scenario.
