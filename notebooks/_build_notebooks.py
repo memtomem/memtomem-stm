@@ -93,7 +93,7 @@ def build_nb00() -> None:
             This notebook is a prelude to the rest of the series: it
             walks both interfaces end-to-end against a trivial echo
             fixture so you can see the relationship explicitly. Every
-            other notebook (01 through 04) assumes you already have this
+            other notebook (01 through 05) assumes you already have this
             mental model.
 
             **You will learn:**
@@ -1196,7 +1196,7 @@ def build_nb05() -> None:
         ),
         _code(
             """
-            fixture_script = str(fixtures_dir() / "echo_server.py")
+            fixture_script = str(fixtures_dir() / "echo_mcp.py")
             subprocess.run(
                 ["mms", "add", "echo", "--command", "uv", "--args",
                  f"run,python,{fixture_script}", "--prefix", "echo"],
@@ -1206,7 +1206,7 @@ def build_nb05() -> None:
             print("Registered echo fixture.")
 
             async with stm_session() as session:
-                result = await session.call_tool("echo__echo", {"text": "hello observability"})
+                result = await session.call_tool("echo__say", {"text": "hello observability"})
                 print(extract_text(result))
             """
         ),
