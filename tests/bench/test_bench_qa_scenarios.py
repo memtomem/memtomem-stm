@@ -35,7 +35,7 @@ NORMAL_PATH_SCENARIOS = ["s02", "s03", "s04", "s09"]
 @pytest.mark.bench_qa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario_id", NORMAL_PATH_SCENARIOS)
-async def test_bench_qa_normal_path(scenario_id: str, tmp_path):
+async def test_bench_qa_normal_path(scenario_id: str, tmp_path, bench_qa_report):
     fixture = load_fixture(scenario_id)
     assert fixture.get("force_tier") is None, (
         f"{scenario_id} has force_tier set; it belongs to the fallback-ladder suite"
@@ -82,6 +82,16 @@ async def test_bench_qa_normal_path(scenario_id: str, tmp_path):
         assert ratio >= gate_min, (
             f"{scenario_id}: qa_answerable ratio {answerable}/{total}={ratio:.2f} "
             f"below {gate_min} gate; strategy={row['compression_strategy']!r}"
+        )
+
+        bench_qa_report.record_scenario(
+            scenario_id=scenario_id,
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=answerable,
+            qa_total=total,
+            original_chars=len(fixture["payload"]),
+            verdict="pass",
         )
     finally:
         store.close()
