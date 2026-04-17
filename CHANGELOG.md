@@ -3,6 +3,13 @@
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
+## [Unreleased]
+
+### Changed
+
+- **Progressive delivery now surfaces memories when `injection_mode` is `append` or `section`** (F6). Previously surfacing was skipped unconditionally on the progressive path to preserve the `stm_proxy_read_more` offset invariant. `prepend` mode still skips (with a one-time WARNING) because it would shift offsets. Default `injection_mode` is `prepend` so existing deployments see no behavior change until they opt in by switching to `append` or `section`. See `docs/pipeline.md` § Stage 3 and `tests/test_progressive.py::TestProgressiveContentIntegrity::test_concat_invariant_under_surfacing` for the empirical safety proof.
+- `CallMetrics.surfacing_on_progressive_ok` / `surface_error` (schema-provisioned in 0.1.x) now populate on the progressive path: `True`/`False` when surfacing ran, `None` when skipped (non-progressive call, no engine, or `prepend` mode).
+
 ## [0.1.6] — 2026-04-13
 
 ### Observability

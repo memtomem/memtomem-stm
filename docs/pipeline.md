@@ -101,11 +101,33 @@ Proactively injects relevant memories from a memtomem LTM server. See [Surfacing
 
 Surfacing only activates when the compressed response is at least `min_response_chars` (default 5000). For small responses, surfacing is skipped to avoid negative token savings.
 
+**Progressive delivery + surfacing (F6).**  When Stage 2 produces a
+progressive chunk (either directly or as a ratio-guard fallback), the
+`SurfacingFormatter.injection_mode` determines whether Stage 3 runs:
+
+- `append` / `section` — memory block is placed *after* the chunker
+  footer (`\n---\n`), so the `split("\n---\n")[0]` concat rule agents
+  use to stitch sequential `stm_proxy_read_more` calls still recovers
+  the original content byte-for-byte. Surfacing runs normally and the
+  `surfacing_on_progressive_ok` metric is recorded.
+- `prepend` — memory block would be placed *before* the chunk content
+  and shift downstream byte offsets. Stage 3 is skipped, a one-time
+  WARNING is logged, and `surfacing_on_progressive_ok` stays `None`.
+  Users who want progressive surfacing should switch `injection_mode`
+  to `append` or `section`.
+
 **Failure guard (S1).**  If `record_surfacing` fails (e.g. SQLite
 contention), the engine drops the `surfacing_id` — the memory block
 is still injected but without a feedback ID.  The agent cannot
 submit feedback for that event, but the response is never blocked.
 Logged at WARNING.
+
+**Failure guard (F6).**  If surfacing fails on the progressive path
+(LTM outage, timeout, …), `ProxyManager` catches, logs WARNING, and
+returns the compressed progressive chunk unchanged so
+`stm_proxy_read_more` continues to work. `surfacing_on_progressive_ok`
+is recorded `False` and `surface_error` carries the exception class
+name.
 
 ## Stage 4: INDEX (optional)
 
