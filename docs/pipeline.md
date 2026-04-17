@@ -106,15 +106,29 @@ progressive chunk (either directly or as a ratio-guard fallback), the
 `SurfacingFormatter.injection_mode` determines whether Stage 3 runs:
 
 - `append` / `section` — memory block is placed *after* the chunker
-  footer (`\n---\n`), so the `split("\n---\n")[0]` concat rule agents
-  use to stitch sequential `stm_proxy_read_more` calls still recovers
-  the original content byte-for-byte. Surfacing runs normally and the
+  footer, so the canonical concat rule agents use to stitch sequential
+  `stm_proxy_read_more` calls still recovers the original content
+  byte-for-byte. Surfacing runs normally and the
   `surfacing_on_progressive_ok` metric is recorded.
 - `prepend` — memory block would be placed *before* the chunk content
   and shift downstream byte offsets. Stage 3 is skipped, a one-time
   WARNING is logged, and `surfacing_on_progressive_ok` stays `None`.
   Users who want progressive surfacing should switch `injection_mode`
   to `append` or `section`.
+
+**Agent-side split convention (issue #160).**  Agents that reassemble
+progressive chunks MUST split each response on the canonical footer
+token `\n---\n[progressive: chars=`, exported as
+`memtomem_stm.proxy.progressive.PROGRESSIVE_FOOTER_TOKEN`. Do **not**
+split on `\n---\n` alone — that three-char delimiter occurs in
+natural content (markdown horizontal rules, YAML frontmatter fences,
+release notes with section separators) and silently drops bytes when
+it hits inside a chunk. The `[progressive: chars=` suffix is a
+sentinel that does not occur in natural prose; it is the reliable
+boundary. See `tests/test_progressive.py::
+test_dangerous_content_reassembles_with_canonical_token` for the
+empirical proof and the pinned failure mode in
+`test_legacy_split_fails_on_embedded_triple_dash`.
 
 **Failure guard (S1).**  If `record_surfacing` fails (e.g. SQLite
 contention), the engine drops the `surfacing_id` — the memory block

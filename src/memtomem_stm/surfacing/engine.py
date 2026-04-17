@@ -107,8 +107,9 @@ class SurfacingEngine:
         """Formatter injection mode — ``"prepend"``, ``"append"``, or ``"section"``.
 
         Read by ``ProxyManager`` to decide whether progressive-path surfacing
-        is safe: only ``append``/``section`` keep the ``split("\\n---\\n")[0]``
-        concat invariant that ``stm_proxy_read_more`` depends on.
+        is safe: only ``append``/``section`` keep the
+        ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant that
+        ``stm_proxy_read_more`` depends on.
         """
         return self._config.injection_mode
 

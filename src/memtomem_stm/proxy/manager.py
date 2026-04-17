@@ -622,7 +622,7 @@ class ProxyManager:
         trace_id: str | None = None,
     ) -> tuple[str, bool | None, str | None]:
         """Surface on a progressive first-chunk when the formatter mode keeps
-        the ``split("\\n---\\n")[0]`` concat invariant intact.
+        the ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant intact.
 
         Returns ``(text, ok, error)``:
 

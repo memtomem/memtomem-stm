@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"(?:^|\n)#{1,6}\s+(.+)")
 
+# Canonical split token for stitching sequential ``stm_proxy_read_more``
+# chunks. Agents MUST split on this exact prefix — not on ``\n---\n`` alone —
+# to avoid cutting inside content that embeds markdown horizontal rules, YAML
+# frontmatter fences, or other ``---`` sequences. The trailing ``[progressive:
+# chars=`` is a sentinel that does not occur in natural prose. See issue #160
+# and ``docs/pipeline.md`` § Stage 3 for the agent-side contract.
+PROGRESSIVE_FOOTER_TOKEN = "\n---\n[progressive: chars="
+
 
 @dataclass
 class ProgressiveResponse:
@@ -186,7 +194,7 @@ class ProgressiveChunker:
         next_offset: int,
         ttl_seconds: float | None = None,
     ) -> str:
-        parts = [f"\n---\n[progressive: chars={start}-{end}/{total}"]
+        parts = [f"{PROGRESSIVE_FOOTER_TOKEN}{start}-{end}/{total}"]
         parts.append(f" | remaining={remaining} | has_more={has_more}")
         if ttl_seconds is not None and has_more:
             parts.append(f" | ttl={int(ttl_seconds)}s")

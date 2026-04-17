@@ -15,6 +15,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.pending_store import InMemoryPendingStore
 from memtomem_stm.proxy.progressive import (
+    PROGRESSIVE_FOOTER_TOKEN,
     ProgressiveChunker,
     ProgressiveResponse,
     ProgressiveStoreAdapter,
@@ -62,7 +63,7 @@ class TestProgressiveChunkerBoundary:
         chunker = ProgressiveChunker(chunk_size=200)
         result = chunker.first_chunk(text, "key1")
         # The content portion (before footer) should end at a line boundary
-        content_part = result.split("\n---\n")[0]
+        content_part = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
         assert content_part.endswith("\n") or content_part == text[:200]
 
     def test_boundary_prefers_paragraph(self):
@@ -70,7 +71,7 @@ class TestProgressiveChunkerBoundary:
         text = "First paragraph content.\n\nSecond paragraph content.\n\nThird paragraph."
         chunker = ProgressiveChunker(chunk_size=30)
         result = chunker.first_chunk(text, "key1")
-        content_part = result.split("\n---\n")[0]
+        content_part = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
         # Should cut at the paragraph boundary
         assert content_part.strip().endswith("content.")
 
@@ -105,7 +106,7 @@ class TestProgressiveChunkerBoundary:
 
         parts: list[str] = []
         result = chunker.first_chunk(text, "key1")
-        content = result.split("\n---\n")[0]
+        content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
         parts.append(content)
         offset = len(content)
 
@@ -113,7 +114,7 @@ class TestProgressiveChunkerBoundary:
             result = chunker.read_chunk(text, offset)
             if "no more content" in result:
                 break
-            content = result.split("\n---\n")[0]
+            content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
             parts.append(content)
             offset += len(content)
             if "has_more=False" in result:
@@ -183,7 +184,7 @@ class TestProgressiveChunkerReadChunk:
         chunker = ProgressiveChunker(chunk_size=4000)
         result = chunker.read_chunk(text, offset=0, limit=500)
         # Content portion should be approximately 500 chars
-        content_part = result.split("\n---\n")[0]
+        content_part = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
         assert len(content_part) <= 600  # boundary detection may add a bit
 
 
@@ -205,7 +206,7 @@ class TestProgressiveContentIntegrity:
 
         # First chunk
         result = chunker.first_chunk(text, "key1")
-        content = result.split("\n---\n")[0]
+        content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
         parts.append(content)
         offset = len(content)
 
@@ -214,7 +215,7 @@ class TestProgressiveContentIntegrity:
             result = chunker.read_chunk(text, offset)
             if "no more content" in result:
                 break
-            content = result.split("\n---\n")[0]
+            content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
             parts.append(content)
             offset += len(content)
             if "has_more=False" in result:
@@ -241,8 +242,8 @@ class TestProgressiveContentIntegrity:
     )
     def test_concat_invariant_under_surfacing(self, mode, expected_pass):
         """Per-injection-mode offset invariant when surfacing wraps a progressive
-        first chunk. `append` and `section` inject AFTER the chunker footer
-        (``\\n---\\n``) so ``split("\\n---\\n")[0]`` concat still recovers the
+        first chunk. `append` and `section` inject AFTER the chunker footer so
+        ``split(PROGRESSIVE_FOOTER_TOKEN)[0]`` concat still recovers the
         original content; `prepend` injects BEFORE and breaks the invariant.
 
         This pins the per-mode safety so a future reader cannot lift the
@@ -256,14 +257,14 @@ class TestProgressiveContentIntegrity:
         first_response = chunker.first_chunk(text, "key1")
         surfaced_first = formatter.inject(first_response, results, query="q")
 
-        parts: list[str] = [surfaced_first.split("\n---\n")[0]]
+        parts: list[str] = [surfaced_first.split(PROGRESSIVE_FOOTER_TOKEN)[0]]
         offset = len(parts[0])
 
         for _ in range(100):  # safety bound
             result = chunker.read_chunk(text, offset)
             if "no more content" in result:
                 break
-            chunk_content = result.split("\n---\n")[0]
+            chunk_content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
             parts.append(chunk_content)
             offset += len(chunk_content)
             if "has_more=False" in result:
@@ -274,6 +275,93 @@ class TestProgressiveContentIntegrity:
             f"injection_mode={mode!r}: expected concat=={expected_pass}, "
             f"got concat=={concat_matches}"
         )
+
+    @pytest.mark.parametrize(
+        "content_label,text",
+        [
+            (
+                "markdown_horizontal_rule",
+                "Intro paragraph.\n\n---\n\nAfter the rule.\n\n"
+                + "".join(f"Line {i}: filler text here\n" for i in range(80)),
+            ),
+            (
+                "yaml_frontmatter",
+                "---\ntitle: Doc\nauthor: X\n---\n\nBody paragraph.\n\n"
+                + "".join(f"Line {i}: filler text here\n" for i in range(80)),
+            ),
+            (
+                "triple_dash_bracket_not_progressive",
+                "Start.\n\n---\n[note: an annotation block]\n\nMiddle.\n\n"
+                + "".join(f"Line {i}: filler text here\n" for i in range(80)),
+            ),
+            (
+                # Forces a trailing ``\n---\n`` in content so reassembly sees
+                # two consecutive ``\n---\n`` sequences (content's HR + the
+                # footer). Canonical split must land on the footer, not the
+                # trailing content HR.
+                "content_ending_in_triple_dash_before_footer",
+                "".join(f"Line {i}: filler text here\n" for i in range(80))
+                + "\n---\n",
+            ),
+        ],
+    )
+    def test_dangerous_content_reassembles_with_canonical_token(
+        self, content_label, text
+    ):
+        """Content embedding ``\\n---\\n`` sequences (markdown HR, YAML
+        frontmatter, lookalike brackets, trailing HR) must still round-trip
+        byte-for-byte when agents split on :data:`PROGRESSIVE_FOOTER_TOKEN`.
+
+        Regression for issue #160: the older ``split("\\n---\\n")[0]`` rule
+        cut inside content on the first embedded ``\\n---\\n`` and silently
+        dropped the rest of the chunk.
+        """
+        chunker = ProgressiveChunker(chunk_size=250)
+
+        parts: list[str] = []
+        result = chunker.first_chunk(text, f"key-{content_label}")
+        content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
+        parts.append(content)
+        offset = len(content)
+
+        for _ in range(200):  # safety bound
+            result = chunker.read_chunk(text, offset)
+            if "no more content" in result:
+                break
+            chunk_content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
+            parts.append(chunk_content)
+            offset += len(chunk_content)
+            if "has_more=False" in result:
+                break
+
+        assert "".join(parts) == text, (
+            f"{content_label}: reassembled content does not match original"
+        )
+
+    def test_legacy_split_fails_on_embedded_triple_dash(self):
+        """Pins the issue #160 failure mode so a future reader cannot
+        reintroduce the weaker ``split("\\n---\\n")[0]`` convention without
+        noticing: on content containing a markdown horizontal rule, the
+        legacy rule drops bytes while the canonical rule preserves them.
+        """
+        text = (
+            "Intro paragraph.\n\n---\n\nContent after the rule.\n\n"
+            + "x" * 500
+        )
+        chunker = ProgressiveChunker(chunk_size=4000)
+        result = chunker.first_chunk(text, "key-legacy")
+
+        legacy_content = result.split("\n---\n")[0]
+        canonical_content = result.split(PROGRESSIVE_FOOTER_TOKEN)[0]
+
+        # Legacy rule cuts at the first ``\n---\n`` — the markdown HR inside
+        # the content — and drops everything after it, including the
+        # "Content after the rule." paragraph and the 500-char body.
+        assert legacy_content == "Intro paragraph.\n"
+        # Canonical rule preserves the full chunk content intact.
+        assert canonical_content.startswith("Intro paragraph.\n\n---\n\n")
+        assert "Content after the rule." in canonical_content
+        assert len(canonical_content) > len(legacy_content) + 500
 
 
 # ---------------------------------------------------------------------------
