@@ -182,6 +182,102 @@ async def test_s07_selective_toc_preserves_top_results(tmp_path, bench_qa_report
         store.close()
 
 
+@pytest.mark.bench_qa
+@pytest.mark.asyncio
+async def test_s05_skeleton_preserves_turn_speakers(tmp_path, bench_qa_report):
+    """40-turn chat → SKELETON must preserve every ``## Turn N — <speaker>``
+    heading and the sentinel on Turn 17's first body line.
+
+    SKELETON is not auto-selected for chat-shaped markdown (``auto_select_strategy``
+    only picks SKELETON for API-docs with HTTP methods; see ``compression.py:1513-1517``),
+    so this scenario pins ``expected_compressor: "skeleton"`` directly.
+
+    The scenario lowers ``min_retention`` to 0.2 — SKELETON compresses this
+    payload to ~0.27 of cleaned chars, which would otherwise trip the ratio
+    guard at the production 0.65 floor and swap SKELETON for the fallback
+    ladder (progressive / truncate). We want to gate SKELETON itself here.
+
+    Two independent guards cover the "speaker loss" risk:
+    1. **Structural** — every one of the 40 ``## Turn N — user/assistant``
+       headings must appear in the output. A budget regression that drops
+       tail-side sections would fail this guard directly.
+    2. **QA probes** — Turn 1 / Turn 40 heading survival (speaker in
+       heading) and a unique sentinel (``alpha-bravo-17``) planted on
+       Turn 17's first body line (SKELETON keeps heading + first content
+       line per section). The sentinel is the false-positive guard: plain
+       "user"/"Turn N" tokens could match collaterally, but ``alpha-bravo-17``
+       is unique to one turn's first line.
+    """
+    fixture = load_fixture("s05")
+    assert fixture["expected_compressor"] == "skeleton", (
+        "s05 exercises SKELETON directly — do not switch it to AUTO"
+    )
+    assert fixture.get("force_tier") is None, "s05 is a happy-path scenario"
+
+    mgr, store, session = make_proxy_manager(
+        tmp_path,
+        compression=fixture["expected_compressor"],
+        max_result_chars=fixture["max_result_chars"],
+        min_retention=fixture["min_retention"],
+    )
+    session.call_tool.return_value = make_tool_result(fixture["payload"])
+
+    expected_trace_id = deterministic_trace_id(fixture["scenario_id"])
+    result = await mgr.call_tool("fake", "tool_s05", {}, trace_id=expected_trace_id)
+
+    row = latest_metrics_row(store)
+    try:
+        assert row, "s05: proxy_metrics row was not written"
+        assert row["trace_id"] == expected_trace_id, (
+            f"s05: trace_id mismatch — got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
+        assert row["compression_strategy"] == "skeleton", (
+            f"s05: strategy must stay 'skeleton' (min_retention={fixture['min_retention']} "
+            f"keeps the fallback ladder off), got {row['compression_strategy']!r}"
+        )
+        assert row["ratio_violation"] == 0, (
+            f"s05: unexpected ratio_violation=1 — min_retention floor may be too tight "
+            f"(cleaned={row['cleaned_chars']}, compressed={row['compressed_chars']})"
+        )
+        assert row["original_chars"] == len(fixture["payload"])
+
+        # Structural guard — every heading survives. Skeleton's per-section
+        # budget at max_chars=5000 / 40 sections is ~123 chars, easily
+        # covering heading (~22) + first line (≤60). Any regression that
+        # drops late-turn sections (e.g., a bug in the heading enumerator)
+        # would fail this assertion directly.
+        heading_re = re.compile(r"^## Turn (\d+) — (user|assistant)$", re.MULTILINE)
+        headings_found = heading_re.findall(result)
+        assert len(headings_found) == 40, (
+            f"s05: skeleton dropped headings — {len(headings_found)}/40 survived. "
+            f"result tail: {result[-400:]!r}"
+        )
+
+        # QA + sentinel — keyword-match probes (including the unique Turn 17
+        # sentinel ``alpha-bravo-17``). The sentinel catches a regression
+        # where headings survive but first body lines are stripped.
+        answerable, total = qa_answerable_ratio(fixture["qa_probes"], result)
+        assert total > 0, "s05: must define at least one qa_probe"
+        ratio = answerable / total
+        gate_min = fixture.get("qa_gate_min", 0.75)
+        assert ratio >= gate_min, (
+            f"s05: qa_answerable ratio {answerable}/{total}={ratio:.2f} below "
+            f"{gate_min} gate; strategy={row['compression_strategy']!r}"
+        )
+
+        bench_qa_report.record_scenario(
+            scenario_id="s05",
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=answerable,
+            qa_total=total,
+            original_chars=len(fixture["payload"]),
+            verdict="pass",
+        )
+    finally:
+        store.close()
+
+
 _SURFACING_ID_RE = re.compile(r"Surfacing ID:\s*([a-f0-9]{16})")
 
 
