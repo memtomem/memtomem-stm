@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
 
+import pytest
 
 from memtomem_stm.proxy.compression import PendingSelection
 from memtomem_stm.proxy.config import (
@@ -16,6 +19,26 @@ from memtomem_stm.proxy.progressive import (
     ProgressiveResponse,
     ProgressiveStoreAdapter,
 )
+from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.formatter import SurfacingFormatter
+
+
+@dataclass
+class _FakeChunkMeta:
+    source_file: Path = Path("/notes/memory.md")
+    namespace: str = "default"
+
+
+@dataclass
+class _FakeChunk:
+    content: str = "a relevant memory"
+    metadata: _FakeChunkMeta = field(default_factory=_FakeChunkMeta)
+
+
+@dataclass
+class _FakeResult:
+    chunk: _FakeChunk
+    score: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +230,50 @@ class TestProgressiveContentIntegrity:
         result = chunker.first_chunk(text, "key1")
         assert "Hello, world!" in result
         assert "has_more=False" in result
+
+    @pytest.mark.parametrize(
+        "mode,expected_pass",
+        [
+            ("append", True),
+            ("section", True),
+            ("prepend", False),
+        ],
+    )
+    def test_concat_invariant_under_surfacing(self, mode, expected_pass):
+        """Per-injection-mode offset invariant when surfacing wraps a progressive
+        first chunk. `append` and `section` inject AFTER the chunker footer
+        (``\\n---\\n``) so ``split("\\n---\\n")[0]`` concat still recovers the
+        original content; `prepend` injects BEFORE and breaks the invariant.
+
+        This pins the per-mode safety so a future reader cannot lift the
+        `prepend` bypass in ``ProxyManager`` without updating this assertion.
+        """
+        text = "".join(f"Line {i}: {'x' * 80}\n" for i in range(200))
+        chunker = ProgressiveChunker(chunk_size=500)
+        formatter = SurfacingFormatter(SurfacingConfig(injection_mode=mode))
+        results = [_FakeResult(_FakeChunk(content="a relevant memory"))]
+
+        first_response = chunker.first_chunk(text, "key1")
+        surfaced_first = formatter.inject(first_response, results, query="q")
+
+        parts: list[str] = [surfaced_first.split("\n---\n")[0]]
+        offset = len(parts[0])
+
+        for _ in range(100):  # safety bound
+            result = chunker.read_chunk(text, offset)
+            if "no more content" in result:
+                break
+            chunk_content = result.split("\n---\n")[0]
+            parts.append(chunk_content)
+            offset += len(chunk_content)
+            if "has_more=False" in result:
+                break
+
+        concat_matches = "".join(parts) == text
+        assert concat_matches is expected_pass, (
+            f"injection_mode={mode!r}: expected concat=={expected_pass}, "
+            f"got concat=={concat_matches}"
+        )
 
 
 # ---------------------------------------------------------------------------
