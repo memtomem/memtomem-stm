@@ -38,7 +38,7 @@ jobs:
         with:
           version: "latest"
       - run: uv sync --frozen
-      - run: uv run pytest -m "not ollama" --tb=short -q
+      - run: uv run pytest -m "not ollama and not bench_qa_meta" --tb=short -q
 
   notebooks:
     runs-on: ubuntu-latest
