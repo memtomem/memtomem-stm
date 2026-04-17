@@ -21,6 +21,14 @@ class SurfacingFormatter:
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
     ) -> str:
+        """Inject surfaced memories into ``response_text``.
+
+        When ``response_text`` is a progressive first-chunk, only the
+        ``append`` and ``section`` modes preserve the
+        ``split("\\n---\\n")[0]`` concat invariant relied on by
+        ``stm_proxy_read_more``; ``prepend`` would shift offsets and is
+        therefore skipped by ``ProxyManager`` on the progressive path.
+        """
         if not results and not scratch_items:
             return response_text
 

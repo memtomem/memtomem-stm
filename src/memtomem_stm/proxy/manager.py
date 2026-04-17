@@ -158,6 +158,10 @@ class ProxyManager:
         # Named ``_key_locks`` to match the same pattern used by
         # ``SurfacingEngine`` (extractable into a shared helper later).
         self._key_locks: dict[str, asyncio.Lock] = {}
+        # F6: one WARNING on first progressive call when ``injection_mode`` is
+        # ``"prepend"`` — that mode still skips surfacing on progressive to
+        # preserve the ``stm_proxy_read_more`` offset invariant.
+        self._warned_prepend_on_progressive = False
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
@@ -606,6 +610,61 @@ class ProxyManager:
                 exc_info=True,
             )
             return text
+
+    async def _apply_surfacing_on_progressive(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        text: str,
+        *,
+        trace_id: str | None = None,
+    ) -> tuple[str, bool | None, str | None]:
+        """Surface on a progressive first-chunk when the formatter mode keeps
+        the ``split("\\n---\\n")[0]`` concat invariant intact.
+
+        Returns ``(text, ok, error)``:
+
+        - ``ok=None`` — engine missing, or ``injection_mode == "prepend"``
+          which would shift offsets for ``stm_proxy_read_more``. The call
+          returns the compressed response unchanged.
+        - ``ok=True`` — surfacing injected successfully.
+        - ``ok=False`` — surfacing raised; ``error`` carries the exception
+          class name. The call still returns the compressed response.
+
+        ``"prepend"`` users keep pre-F6 behavior. See
+        ``tests/test_progressive.py::TestProgressiveContentIntegrity::
+        test_concat_invariant_under_surfacing`` for the empirical proof of
+        which modes are safe.
+        """
+        if self._surfacing_engine is None:
+            return text, None, None
+        if self._surfacing_engine.injection_mode == "prepend":
+            if not self._warned_prepend_on_progressive:
+                logger.warning(
+                    "Progressive surfacing skipped: injection_mode='prepend' "
+                    "would shift offsets for stm_proxy_read_more. Set "
+                    "injection_mode to 'append' or 'section' to enable it."
+                )
+                self._warned_prepend_on_progressive = True
+            return text, None, None
+        try:
+            surfaced = await self._surfacing_engine.surface(
+                server=server,
+                tool=tool,
+                arguments=arguments,
+                response_text=text,
+                trace_id=trace_id,
+            )
+            return surfaced, True, None
+        except Exception as exc:
+            logger.warning(
+                "Surfacing failed for %s/%s on progressive path, using compressed response",
+                server,
+                tool,
+                exc_info=True,
+            )
+            return text, False, type(exc).__name__
 
     async def _apply_hybrid(
         self,
@@ -1124,6 +1183,11 @@ class ProxyManager:
         # allows — it feeds into metrics for auditing R4 after the fact.
         effective_compression: CompressionStrategy = tc.compression
         ratio_violation = False
+        # F6: populated only when the call runs the progressive surfacing path.
+        # ``None`` elsewhere (non-progressive path, or ``injection_mode='prepend'``
+        # which skips for offset-invariant reasons).
+        surfacing_on_progressive_ok: bool | None = None
+        surface_error: str | None = None
         _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
@@ -1136,9 +1200,18 @@ class ProxyManager:
                 )
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(cleaned)
-            # Skip surfacing for progressive — injecting memories would shift offsets
-            _surface_ms = 0.0
-            surfaced = compressed
+            # F6: surface on progressive when ``injection_mode`` is append/section.
+            # ``prepend`` stays skipped (offset-shift); helper returns ``ok=None``
+            # in that case and logs a one-time WARNING.
+            _t0 = _time.monotonic()
+            (
+                surfaced,
+                surfacing_on_progressive_ok,
+                surface_error,
+            ) = await self._apply_surfacing_on_progressive(
+                server, tool, upstream_args, compressed, trace_id=trace_id
+            )
+            _surface_ms = (_time.monotonic() - _t0) * 1000
         else:
             # Enforce minimum retention: budget must preserve at least N% of cleaned content.
             # Dynamic scaling: shorter content → higher retention (less to gain from cutting).
@@ -1310,11 +1383,24 @@ class ProxyManager:
             compressed_chars_for_metrics = len(compressed)
 
             # ── Stage 3: SURFACE (proactive memory injection) ──
-            # Skip surfacing when progressive fallback fired — injecting
-            # memories would shift character offsets for stm_proxy_read_more.
+            # F6: progressive_fallback now routes through the same
+            # mode-aware helper the PROGRESSIVE branch uses — append/section
+            # surfaces, prepend still skips to preserve offset arithmetic for
+            # ``stm_proxy_read_more``.
             if progressive_fallback:
-                _surface_ms = 0.0
-                surfaced = compressed
+                with traced(
+                    "proxy_call_surface",
+                    metadata={"server": server, "tool": tool, "path": "progressive_fallback"},
+                ):
+                    _t0 = _time.monotonic()
+                    (
+                        surfaced,
+                        surfacing_on_progressive_ok,
+                        surface_error,
+                    ) = await self._apply_surfacing_on_progressive(
+                        server, tool, upstream_args, compressed, trace_id=trace_id
+                    )
+                    _surface_ms = (_time.monotonic() - _t0) * 1000
             else:
                 with traced(
                     "proxy_call_surface",
@@ -1450,6 +1536,8 @@ class ProxyManager:
                 chunks_indexed=chunks_indexed,
                 extract_ok=extract_ok,
                 extract_error=extract_error,
+                surfacing_on_progressive_ok=surfacing_on_progressive_ok,
+                surface_error=surface_error,
             )
         )
 

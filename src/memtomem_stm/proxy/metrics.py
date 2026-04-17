@@ -150,9 +150,11 @@ class CallMetrics:
     chunks_indexed: int = 0
     extract_ok: bool | None = None
     extract_error: str | None = None
-    # Surfacing on the progressive path — pre-provisioned for PR 2 (F6) so
-    # the schema migration ships once. Stays ``None`` until the progressive
-    # surfacing footer lands.
+    # Surfacing on the progressive path (F6). ``None`` when the call did
+    # not go through progressive *or* when ``injection_mode='prepend'``
+    # which still skips surfacing to preserve the
+    # ``stm_proxy_read_more`` offset invariant. ``True``/``False`` once
+    # progressive surfacing ran successfully or failed.
     surfacing_on_progressive_ok: bool | None = None
     surface_error: str | None = None
 

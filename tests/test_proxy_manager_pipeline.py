@@ -409,6 +409,90 @@ class TestApplySurfacing:
         assert "Surfacing failed" in caplog.text
 
 
+# ── _apply_surfacing_on_progressive (F6) ────────────────────────────────
+
+
+def _mock_engine_with_mode(mode: str, *, surface_return: str = "surfaced"):
+    """Return an AsyncMock engine whose ``injection_mode`` property matches *mode*."""
+    eng = AsyncMock()
+    eng.surface.return_value = surface_return
+    # ``injection_mode`` is a sync property on the real engine; set it on the
+    # mock as a plain attribute so attribute access does not return a coroutine.
+    type(eng).injection_mode = property(lambda _self, _m=mode: _m)
+    return eng
+
+
+class TestApplySurfacingOnProgressive:
+    async def test_no_engine_returns_none(self, tmp_path):
+        """Without surfacing engine, returns ``(text, None, None)``."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        mgr._surfacing_engine = None
+        text, ok, err = await mgr._apply_surfacing_on_progressive("srv", "t", {}, "original")
+        assert (text, ok, err) == ("original", None, None)
+
+    async def test_append_mode_surfaces(self, tmp_path):
+        """``append`` mode invokes surface() and returns ``ok=True``."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        mgr._surfacing_engine = _mock_engine_with_mode("append", surface_return="with memories")
+
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "srv", "t", {"q": "x"}, "progressive chunk"
+        )
+
+        assert text == "with memories"
+        assert ok is True
+        assert err is None
+        mgr._surfacing_engine.surface.assert_awaited_once()
+
+    async def test_section_mode_surfaces(self, tmp_path):
+        """``section`` mode invokes surface() and returns ``ok=True``."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        mgr._surfacing_engine = _mock_engine_with_mode("section", surface_return="w/ section")
+
+        text, ok, err = await mgr._apply_surfacing_on_progressive("srv", "t", {}, "chunk")
+
+        assert text == "w/ section"
+        assert ok is True
+        assert err is None
+
+    async def test_prepend_mode_skips_and_warns_once(self, tmp_path, caplog):
+        """``prepend`` mode skips surfacing (offset-invariant guard), logs WARNING
+        once, and subsequent progressive calls do not re-log."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        mgr._surfacing_engine = _mock_engine_with_mode("prepend")
+
+        with caplog.at_level("WARNING"):
+            text_a, ok_a, err_a = await mgr._apply_surfacing_on_progressive(
+                "srv", "t", {}, "first chunk"
+            )
+            text_b, ok_b, err_b = await mgr._apply_surfacing_on_progressive(
+                "srv", "t", {}, "second chunk"
+            )
+
+        assert (text_a, ok_a, err_a) == ("first chunk", None, None)
+        assert (text_b, ok_b, err_b) == ("second chunk", None, None)
+        mgr._surfacing_engine.surface.assert_not_awaited()
+        warnings = [r for r in caplog.records if "injection_mode='prepend'" in r.message]
+        assert len(warnings) == 1, "prepend-on-progressive WARNING must fire exactly once"
+
+    async def test_engine_failure_captured_as_error(self, tmp_path, caplog):
+        """``append`` mode + engine raises → ``ok=False``, ``error`` populated,
+        text falls back to the compressed input (error isolation)."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        engine = _mock_engine_with_mode("append")
+        engine.surface.side_effect = RuntimeError("ltm down")
+        mgr._surfacing_engine = engine
+
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "srv", "t", {}, "progressive chunk"
+        )
+
+        assert text == "progressive chunk"
+        assert ok is False
+        assert err == "RuntimeError"
+        assert "Surfacing failed" in caplog.text
+
+
 # ── select_chunks ────────────────────────────────────────────────────────
 
 

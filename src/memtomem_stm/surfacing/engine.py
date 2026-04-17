@@ -102,6 +102,16 @@ class SurfacingEngine:
         self._cleanup_interval = 3600.0
         self._last_cleanup: float = time.monotonic()
 
+    @property
+    def injection_mode(self) -> str:
+        """Formatter injection mode — ``"prepend"``, ``"append"``, or ``"section"``.
+
+        Read by ``ProxyManager`` to decide whether progressive-path surfacing
+        is safe: only ``append``/``section`` keep the ``split("\\n---\\n")[0]``
+        concat invariant that ``stm_proxy_read_more`` depends on.
+        """
+        return self._config.injection_mode
+
     async def surface(
         self,
         server: str,
