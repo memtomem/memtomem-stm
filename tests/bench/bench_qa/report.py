@@ -23,6 +23,7 @@ from typing import Any
 from .schema import (
     REPORT_SCHEMA_VERSION,
     BenchReport,
+    LLMJudgeResultReport,
     MetricSummary,
     ProgressiveResult,
     QAResult,
@@ -51,6 +52,12 @@ def canonicalize_report(report: BenchReport) -> dict[str, Any]:
 
     * ``scenarios[*].metrics.clean_ms`` / ``compress_ms`` / ``surface_ms``
       — stage latencies differ run-to-run by definition.
+    * ``scenarios[*].llm_judge`` — the whole block. Even at ``temperature=0``
+      the LLM judge is non-reproducible across provider-side model updates,
+      plus ``cached`` / token counts flip between runs. Stripping the block
+      wholesale keeps the determinism diff silent when the marker is off
+      (key absent on both sides) and when it is on (key absent on both
+      sides after stripping).
 
     Preserved:
 
@@ -66,6 +73,7 @@ def canonicalize_report(report: BenchReport) -> dict[str, Any]:
         metrics = scenario.get("metrics", {})
         for field in _STAGE_TIMING_FIELDS:
             metrics.pop(field, None)
+        scenario.pop("llm_judge", None)
     return canon
 
 
@@ -142,6 +150,33 @@ class BenchReportCollector:
         if surfacing is not None:
             entry["surfacing"] = surfacing
         self._rows.append(entry)
+
+    def record_llm_judge(
+        self,
+        *,
+        scenario_id: str,
+        llm_judge: LLMJudgeResultReport,
+    ) -> None:
+        """Attach an LLM-judge result to a scenario row (no-op if absent).
+
+        Enriches an existing row when the LLM judge test runs in the same
+        session as the main ``bench_qa`` suite (``-m "bench_qa or
+        bench_qa_llm_judge"``). When the judge runs alone (no prior
+        ``record_scenario``), the score is still visible via the test's
+        ``logger.info`` but does not make it into ``report.json`` — the
+        scenario row would be missing ``metrics`` / ``qa`` / ``verdict``
+        that ``build_report`` and the summary formatter read
+        unconditionally, so stubbing a partial row would break both.
+        """
+        for entry in self._rows:
+            if entry.get("scenario_id") == scenario_id:
+                entry["llm_judge"] = llm_judge
+                return
+        logger.warning(
+            "record_llm_judge: no scenario row for %r — run with "
+            "-m 'bench_qa or bench_qa_llm_judge' to capture the score in report.json",
+            scenario_id,
+        )
 
     def build_report(self, *, run_seed: int = 0) -> BenchReport:
         tier_hist: Counter[str] = Counter(r["tier"] for r in self._rows)

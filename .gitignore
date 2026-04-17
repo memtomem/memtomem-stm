@@ -32,3 +32,6 @@ coverage.xml
 .claude/
 scripts/
 CLAUDE.local.md
+
+# bench_qa LLM judge cache (<hash>.json per scenario/model; regenerated on demand)
+tests/bench/.llm_judge_cache/

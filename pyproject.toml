@@ -75,6 +75,7 @@ markers = [
     "ollama: requires a running Ollama instance (auto-skipped when unavailable)",
     "bench_qa: end-to-end compression/surfacing regression gate (fake upstream, deterministic)",
     "bench_qa_meta: self-test probes for bench_qa — intentional failures, NOT CI-safe",
+    "bench_qa_llm_judge: LLM-as-judge advisory scoring — requires OPENAI_API_KEY or ANTHROPIC_API_KEY, off in default CI",
 ]
 
 [tool.mypy]

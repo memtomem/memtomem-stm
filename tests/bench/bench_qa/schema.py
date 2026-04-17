@@ -115,6 +115,37 @@ class SurfacingResult(TypedDict):
     expected_ids: list[str]
 
 
+class LLMJudgeProbeResult(TypedDict, total=False):
+    """Per-QA-probe judgment from the LLM judge."""
+
+    question: str
+    answerable: bool
+    confidence: float
+    reasoning: str
+
+
+class LLMJudgeResultReport(TypedDict, total=False):
+    """LLM-as-judge result for a single scenario.
+
+    Scores are normalised to 0.0–1.0 (raw 0–10 from the model divided by 10)
+    so they line up with ``qa.ratio`` and ``rule_judge.score``. Advisory only
+    today — ``canonicalize_report`` strips this whole block before the
+    two-run determinism diff because provider-side model updates can shift
+    scores even with ``temperature=0``.
+    """
+
+    model: str
+    overall: float
+    factual_completeness: float
+    structural_coherence: float
+    answer_sufficiency: float
+    per_probe: list[LLMJudgeProbeResult]
+    cached: bool
+    prompt_tokens: int
+    completion_tokens: int
+    error: str
+
+
 class ScenarioReport(TypedDict, total=False):
     scenario_id: str
     trace_id: str
@@ -123,6 +154,7 @@ class ScenarioReport(TypedDict, total=False):
     qa: QAResult
     progressive: ProgressiveResult
     surfacing: SurfacingResult
+    llm_judge: LLMJudgeResultReport
     tier: str
     verdict: Literal["pass", "fail", "advisory"]
 
