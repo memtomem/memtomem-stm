@@ -17,7 +17,7 @@ uv run pytest -m "not ollama"          # skip Ollama-dependent tests
 uv run pytest                          # full suite (requires running Ollama)
 
 # Lint and format
-uv run ruff check src --fix
+uv run ruff check src
 uv run ruff format src
 
 # Type check

@@ -134,9 +134,10 @@ If `index_file()` raises, the proxy logs a WARNING with traceback and
 returns the unindexed response.  The caller sees a successful result
 but the response is not searchable in LTM.
 
-- **Manager guard**: `manager.py:1327` catches and returns `surfaced`.
-- **Inner handler**: `memory_ops.py:78` catches, logs, returns
-  `chunks=0`.
+- **Manager guard**: `manager.py:1508` catches and returns `surfaced`.
+- **Inner handler**: `auto_index_response` at `memory_ops.py:152-162`
+  catches, logs, returns `chunks=0` with `ok=False` and
+  `error="<ExcType>: <msg>"`.
 - **Fixed in**: `977da4f` (outer guard), traceback logging confirmed.
 
 ### 2. No file-level dedup on auto-index retries
@@ -164,7 +165,8 @@ remain orphaned until manually re-indexed.
 
 When `extraction.background=true` (default), extraction runs as an
 `asyncio.create_task`.  If the task fails internally, the exception is
-caught and logged at WARNING level (`memory_ops.py:159`), but:
+caught and logged at WARNING level by the `extract_and_store` outer
+handler at `memory_ops.py:248-254`, but:
 
 - The caller (agent/user) is not notified.
 - No retry is attempted.

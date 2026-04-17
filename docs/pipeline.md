@@ -151,7 +151,7 @@ for configuration and
 [Custom Integration](custom-integration.md) for `FileIndexer` wiring.
 
 **Failure guard (F1).**  If `_auto_index_response` raises,
-`ProxyManager` catches at `manager.py:1346`, logs WARNING with
+`ProxyManager` catches at `manager.py:1508`, logs WARNING with
 traceback, and returns the pre-index response unchanged.  The agent
 receives a successful result; the response is just not searchable
 in LTM.
