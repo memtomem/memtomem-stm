@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s10",
+  "description": "Surfacing smoke — fake LTM serves fixture-declared seeds; top-2 memory_ids (sha256 of seed content) recorded in surfacing_events must match the fixture's expected ranks, yielding recall@2 == 1.0.",
+  "content_type": "text",
+  "expected_compressor": "none",
+  "force_tier": null,
+  "max_result_chars": 50000,
+  "qa_gate_min": 0.75,
+  "qa_probes": [
+    {
+      "question": "What is the rotation cadence for JWT signing secrets?",
+      "expected_keywords": ["24", "rotation"]
+    },
+    {
+      "question": "Which signing algorithm is used for internal auth tokens?",
+      "expected_keywords": ["HS256"]
+    }
+  ],
+  "surfacing_seeds": [
+    {
+      "rank": 1,
+      "score": 0.92,
+      "source": "auth-rotation.md",
+      "content": "JWT rotation policy: HS256 signing secrets rotate every 24 hours on a staggered per-region schedule; verifiers retain the previous kid for a 90-minute grace window."
+    },
+    {
+      "rank": 2,
+      "score": 0.85,
+      "source": "session-mgmt.md",
+      "content": "Session invalidation is triggered by JWT rotation events flagged as key-compromise; normal rotations let existing tokens live to their natural exp while compromise rotations invalidate all tokens for the affected kid immediately."
+    },
+    {
+      "rank": 3,
+      "score": 0.60,
+      "source": "rate-limit.md",
+      "content": "Rate limits are advertised through X-RateLimit-Limit, X-RateLimit-Remaining, and X-RateLimit-Reset response headers, with per-minute windows aligned to the calendar minute."
+    }
+  ],
+  "surfacing_eval": {
+    "query": "JWT authentication rotation policy",
+    "k": 2,
+    "expected_ids": ["auth-rotation.md", "session-mgmt.md"]
+  },
+  "payload": "JWT AUTHENTICATION — ROTATION POLICY AND OPERATIONAL GUIDE (v3.1)\n\n1. Overview\nThe authentication subsystem uses JSON Web Tokens (JWT) signed with HS256 for all service-to-service and user-to-service authorization paths. This document covers the rotation policy, operational procedures for key compromise scenarios, interaction with the session management layer, and the audit requirements tied to every rotation event.\n\n2. Rotation Policy\nSecrets are rotated every 24 hours on a staggered schedule across regions so that at most one region is in a half-rotation state at any given moment. The rotation window is fixed at 04:00 UTC per region, offset by one hour between adjacent regions to keep error budgets aligned with off-peak traffic patterns. Every rotation produces a new HS256 key identifier (kid) that is embedded in the token header; verifiers track the last two active kid values for a grace period of ninety minutes before the older key is revoked.\n\n3. Key Storage and Distribution\nHS256 secrets live in a hardware security module (HSM) and are never exported in cleartext. Each region's authentication service authenticates to the HSM using a service-account mTLS pair that itself rotates weekly. The distribution path is cached for at most fifteen minutes to bound the blast radius of a compromised cache node; cache invalidation is driven by a signed broadcast from the rotation coordinator.\n\n4. Session Invalidation\nSession invalidation is triggered by any JWT rotation event where a key compromise is declared. In normal rotations, existing tokens remain valid until their natural expiry (default fifteen minutes for user sessions, sixty minutes for service-to-service tokens). In compromise rotations, all tokens signed with the affected kid are immediately invalidated and re-authentication is required. Client libraries handle the 401 response with an automatic refresh token exchange; the refresh path uses a separate key space that is not subject to the standard 24-hour rotation.\n\n5. Rate Limits\nAll authenticated endpoints are protected by rate limits advertised through the X-RateLimit-Limit, X-RateLimit-Remaining, and X-RateLimit-Reset response headers. The default limit is 600 requests per minute per principal, with per-endpoint overrides for latency-sensitive paths. Rate limit windows are aligned to calendar minutes to simplify client-side back-off strategies. Repeated 429 responses within a single rotation window are treated as a potential probe and result in a temporary principal-level quarantine.\n\n6. Observability\nEvery token issuance, verification, and refresh emits a structured log line with the rotation kid, the principal identifier, and the outcome. Traces are correlated through the W3C Trace Context header so that downstream service calls can be joined against the originating authentication event. The metrics pipeline exports p50, p95, and p99 verification latency by kid; a latency regression above the 99th percentile for two consecutive minutes opens an alert routed to the on-call authentication engineer.\n\n7. Rotation Audit\nEach rotation is audited through three independent channels: the HSM's append-only audit log, the rotation coordinator's signed event stream, and the canary verifier's rotation acknowledgment timeline. Quarterly reviews correlate these three channels against the incident response record; any unexplained discrepancy triggers a compliance escalation within two business days.\n\n8. Emergency Rotation\nAn emergency rotation can be triggered by the on-call authentication engineer using a dual-operator workflow: one operator issues the rotation command with a reason code, and a second operator approves within ten minutes. The workflow bypasses the staggered schedule and forces all regions into simultaneous rotation, with session invalidation applied globally. The time-to-rotation for an emergency event has a 99.9th percentile target of four minutes.\n\n9. Client Guidance\nClient libraries should cache tokens only until the exp claim minus thirty seconds to avoid last-mile clock skew issues. Libraries should not persist the raw secret under any circumstances; the expected pattern is to hold only the short-lived access token in memory and keep the refresh token in platform-specific secure storage.\n\n10. Interaction with the Data Access Layer\nThe data access layer does not trust the application-layer authentication directly. A separate data-access token is minted for each persisted session; its sub claim maps to the data-access row-level security policy, and its scope claim declares the maximum privilege that can be exercised within that session. Row-level security enforcement is independent of the application-layer JWT and is not affected by an application-layer rotation event.\n\n11. Appendix — Terminology\nJWT — JSON Web Token, RFC 7519. HS256 — HMAC with SHA-256, used as the signing algorithm for all internal auth tokens. kid — key identifier, embedded in the JOSE header to select the verification secret. Refresh token — a long-lived credential used to acquire new access tokens without re-authenticating the user.\n"
+}
