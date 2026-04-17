@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s01",
+  "description": "Long markdown guide (multiple headings). Forced into Tier-2 hybrid_fallback by stubbing progressive to raise. Verifies head + TOC is preserved.",
+  "content_type": "markdown",
+  "expected_compressor": "auto",
+  "force_tier": 2,
+  "max_result_chars": 500,
+  "payload_multiplier": 4,
+  "qa_gate_min": 0.66,
+  "expected_keywords": [
+    "HNSW",
+    "IVF",
+    "M parameter",
+    "Pinecone"
+  ],
+  "qa_probes": [
+    {
+      "question": "What indexing algorithm is covered?",
+      "expected_keywords": ["HNSW"]
+    },
+    {
+      "question": "What vector databases are compared?",
+      "expected_keywords": ["Pinecone"]
+    }
+  ],
+  "payload": "# Vector Database Performance Guide\n\n## Overview\n\nThis section covers best practices for deploying vector databases in production with high-throughput requirements. We focus on three engines: Pinecone, Weaviate, and Qdrant.\n\n## Indexing Strategies\n\n### HNSW (Hierarchical Navigable Small World)\n\nHNSW is the default indexing algorithm. Key knobs: M parameter (16-64), ef_construction (200+), ef_search (50-200). Higher M improves recall but increases memory usage by ~8 bytes per link.\n\n### IVF (Inverted File Index)\n\nIVF partitions the vector space into Voronoi cells. Knobs: nlist (sqrt(N) to 4*sqrt(N)), nprobe (5-20% of nlist). IVF uses less memory than HNSW but has lower recall at the same latency.\n\n## Memory Planning\n\nFormula: memory_gb = num_vectors * dimensions * 4 / 1e9 * overhead_factor. HNSW overhead 1.5-2.0x; IVF overhead 1.1-1.3x. Plan for 2x the current vector count.\n\n## Production Checklist\n\n- Set up monitoring for recall degradation\n- Configure automatic index rebuilding thresholds\n- Implement request-level timeout (recommend 100ms)\n- Enable WAL for crash recovery\n- Set memory limits to 80% of available RAM\n\n"
+}

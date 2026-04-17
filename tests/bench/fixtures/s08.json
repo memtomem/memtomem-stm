@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s08",
+  "description": "Heading-light plain text (incident narrative). Forced into Tier-3 truncate_fallback by stubbing both progressive and hybrid. Guarantees a lossy but non-empty floor.",
+  "content_type": "text",
+  "expected_compressor": "auto",
+  "force_tier": 3,
+  "max_result_chars": 500,
+  "payload_multiplier": 5,
+  "qa_gate_min": 0.5,
+  "expected_keywords": [
+    "connection pool",
+    "payment-db-primary",
+    "schema migration"
+  ],
+  "qa_probes": [
+    {
+      "question": "What kind of change triggered the issue?",
+      "expected_keywords": ["schema migration"]
+    },
+    {
+      "question": "Which pool was exhausted?",
+      "expected_keywords": ["payment-db-primary"]
+    }
+  ],
+  "payload": "The incident began at 03:42 UTC when the payment-gateway started returning 503s for every charge attempt. Within five minutes the on-call engineer observed that the connection pool to payment-db-primary was saturated: every slot was occupied by a query waiting on an ACCESS EXCLUSIVE lock. The lock had been acquired by a schema migration deployed at 03:30 that was in the middle of creating a B-tree index on the transactions table. With the table holding roughly 890M rows the index build was estimated to require over 45 minutes. The rollback attempt was blocked because the long-running lock itself prevented any metadata change. The team escalated to the database lead who decided to terminate the migration process rather than wait. Even after the process was killed the connection pool remained saturated because more than 800 queries had already queued behind the original blocker. A rolling restart of the payment-gateway pods cleared the queue. The incident resolved at 05:17 UTC after 95 minutes and affected approximately 14,200 customers. The post-mortem captured two preventive actions: set a lock_timeout of 5s for every migration connection, and add a CI check that flags any migration statement acquiring ACCESS EXCLUSIVE. A third action, adding a circuit breaker to the connection pool with a maximum queue of 50 and a 5s timeout, was assigned to the platform team. Retrospective scheduled for the following Tuesday.\n\n"
+}
