@@ -137,7 +137,7 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 
 ```bash
 uv sync                                                    # install dev deps
-uv run pytest -m "not ollama"                              # tests (CI filter)
+uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge"   # tests (CI filter)
 uv run ruff check src && uv run ruff format --check src    # lint (required)
 uv run mypy src                                            # typecheck (advisory)
 ```
