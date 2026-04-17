@@ -1445,7 +1445,7 @@ class ProxyManager:
                     ns=ns,
                     chunks=None,
                 )
-                task = asyncio.create_task(
+                index_task = asyncio.create_task(
                     self._auto_index_response(
                         server,
                         tool,
@@ -1458,8 +1458,8 @@ class ProxyManager:
                         context_query=context_query,
                     )
                 )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                self._background_tasks.add(index_task)
+                index_task.add_done_callback(self._background_tasks.discard)
                 # index_ok / index_error / chunks_indexed stay None / None / 0
                 # — tri-state matches background extraction. Dashboards filter
                 # background rows with WHERE index_ok IS NULL.
