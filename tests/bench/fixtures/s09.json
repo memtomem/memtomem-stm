@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s09",
+  "description": "Short text (budget-fit) — compressor should pick 'none' and ratio_violation must stay 0.",
+  "content_type": "text",
+  "expected_compressor": "auto",
+  "force_tier": null,
+  "max_result_chars": 50000,
+  "expected_keywords": [
+    "data-processor",
+    "TLS 1.3",
+    "AES-256",
+    "RPO 1 hour",
+    "RTO 4 hours"
+  ],
+  "qa_probes": [
+    {
+      "question": "What encryption in transit is required?",
+      "expected_keywords": ["TLS 1.3"]
+    },
+    {
+      "question": "What is the RPO requirement?",
+      "expected_keywords": ["RPO", "1 hour"]
+    },
+    {
+      "question": "What is the breach notification window?",
+      "expected_keywords": ["24 hours"]
+    }
+  ],
+  "payload": "DATA PROCESSING ADDENDUM — SUMMARY SHEET (v1.2)\n\n1. Roles\nThe Client acts as data-controller; the Service Provider acts as data-processor for all Personal Data submitted under the Master Services Agreement. Processing is limited to the purposes described in Schedule A and to the Controller's documented instructions.\n\n2. Security Controls\nAll Personal Data is encrypted in transit using TLS 1.3 (minimum) and at rest using AES-256-GCM. Access to production systems requires hardware-backed MFA. Access reviews occur quarterly; key rotation occurs every 90 days.\n\n3. Availability\nThe Service Provider operates to an RPO 1 hour and an RTO 4 hours for Tier-1 services. Backups are replicated to a second region with an encrypted snapshot taken every 15 minutes.\n\n4. Incident Response\nThe Service Provider notifies the Client within 24 hours of confirming a Personal Data Breach. The notification includes (a) the nature of the breach, (b) categories and approximate count of data subjects affected, (c) the likely consequences, and (d) measures taken or proposed.\n\n5. Sub-processors\nThe current sub-processor list is maintained at the URL in Annex B. The Controller receives 30 days' notice before any addition or replacement. All sub-processors are bound by written terms at least as protective as this Addendum.\n\n6. Data Subject Rights\nThe Service Provider assists the Controller in responding to access, rectification, erasure, restriction, objection, and portability requests within 5 business days, to the extent technically feasible.\n\n7. International Transfers\nPersonal Data is transferred only to jurisdictions covered by a European Commission adequacy decision or under the 2021 Standard Contractual Clauses (Module Two: Controller-to-Processor).\n\n8. Return and Deletion\nUpon termination the Service Provider returns Personal Data in a machine-readable format within 30 days and deletes remaining copies within 90 days. A certificate of deletion is provided on request.\n\n9. Audit\nThe Controller may audit compliance once per 12-month period on 30 days' written notice, during business hours, at the Controller's expense. The Service Provider may provide a current SOC 2 Type II or ISO 27001 report in lieu of on-site audit.\n\n10. Liability\nEach party's aggregate liability for breach of this Addendum is capped at the greater of twelve (12) months of fees paid or EUR 500,000. The cap does not apply to indemnification obligations, willful misconduct, or a party's breach of its confidentiality obligations.\n"
+}
