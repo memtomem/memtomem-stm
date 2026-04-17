@@ -56,3 +56,28 @@ jobs:
             notebooks/02_compression_and_selective.ipynb \
             notebooks/03_memory_surfacing.ipynb \
             --nbmake-timeout=180 --tb=short -q
+
+  bench_qa:
+    # Advisory for the first 1–2 weeks while per-scenario thresholds
+    # settle. Do not promote to a required check until qa_gate_min /
+    # compressed_chars floors have been ratcheted up from observed data.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --frozen
+      - name: Run bench_qa suite
+        env:
+          BENCH_QA_REPORT_DIR: ${{ github.workspace }}/bench-qa-report
+        run: uv run pytest -m bench_qa --tb=short -q
+      - name: Upload bench_qa report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-qa-report
+          path: bench-qa-report/
+          if-no-files-found: warn
+          retention-days: 14

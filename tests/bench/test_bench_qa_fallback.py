@@ -39,7 +39,7 @@ def _stub_raise(*_args, **_kwargs):
 
 @pytest.mark.bench_qa
 @pytest.mark.asyncio
-async def test_s06_tier1_progressive_round_trip(tmp_path):
+async def test_s06_tier1_progressive_round_trip(tmp_path, bench_qa_report):
     fixture = load_fixture("s06")
     assert fixture["force_tier"] == 1
     payload = fixture["payload"]
@@ -83,13 +83,28 @@ async def test_s06_tier1_progressive_round_trip(tmp_path):
             f"lens {len(reassembled.content)} vs {len(cleaned)}; "
             "violates the PR #160/#165 byte-identity invariant"
         )
+
+        bench_qa_report.record_scenario(
+            scenario_id="s06",
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=0,
+            qa_total=0,
+            original_chars=len(payload),
+            verdict="pass",
+            progressive={
+                "round_trip_equal": True,
+                "chunks": reassembled.chunks,
+                "total_chars": len(reassembled.content),
+            },
+        )
     finally:
         store.close()
 
 
 @pytest.mark.bench_qa
 @pytest.mark.asyncio
-async def test_s01_tier2_hybrid_fallback(tmp_path):
+async def test_s01_tier2_hybrid_fallback(tmp_path, bench_qa_report):
     fixture = load_fixture("s01")
     assert fixture["force_tier"] == 2
     payload = fixture["payload"]
@@ -124,13 +139,23 @@ async def test_s01_tier2_hybrid_fallback(tmp_path):
         assert any(kw.lower() in lowered for kw in fixture["expected_keywords"]), (
             f"hybrid_fallback lost every expected_keyword; result[:200]={result[:200]!r}"
         )
+
+        bench_qa_report.record_scenario(
+            scenario_id="s01",
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=0,
+            qa_total=0,
+            original_chars=len(payload),
+            verdict="pass",
+        )
     finally:
         store.close()
 
 
 @pytest.mark.bench_qa
 @pytest.mark.asyncio
-async def test_s08_tier3_truncate_fallback(tmp_path):
+async def test_s08_tier3_truncate_fallback(tmp_path, bench_qa_report):
     fixture = load_fixture("s08")
     assert fixture["force_tier"] == 3
 
@@ -156,6 +181,16 @@ async def test_s08_tier3_truncate_fallback(tmp_path):
         # conservative lower bound that still catches empty-truncate bugs.
         assert row["compressed_chars"] > 500, (
             f"truncate_fallback compressed_chars={row['compressed_chars']} below expected floor"
+        )
+
+        bench_qa_report.record_scenario(
+            scenario_id="s08",
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=0,
+            qa_total=0,
+            original_chars=len(fixture["payload"]),
+            verdict="pass",
         )
     finally:
         store.close()
