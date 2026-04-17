@@ -1,7 +1,8 @@
 """LLM-as-Judge — semantic quality scoring for benchmark evaluation.
 
-Uses a small/fast LLM (Claude Haiku or GPT-4o-mini) to judge whether
-compressed text preserves the meaning and critical information of the original.
+Uses a small/fast LLM (GPT-4.1-nano by default, Claude Haiku alternate) to
+judge whether compressed text preserves the meaning and critical information
+of the original.
 
 Scoring dimensions:
 1. Factual completeness — are key facts preserved?
@@ -9,14 +10,19 @@ Scoring dimensions:
 3. Answer sufficiency — can QA pairs still be answered?
 
 Usage:
-    judge = LLMJudge(provider="anthropic", model="claude-haiku-4-5-20251001")
+    judge = LLMJudge()  # provider="openai", model="gpt-4.1-nano"
     result = await judge.score(task, compressed_text)
     print(result.overall, result.dimensions)
 
+Determinism: both providers are called with ``temperature=0``; the OpenAI
+path additionally sets ``seed=42``. Scores still drift on provider-side
+model updates, so bench_qa strips the whole ``llm_judge`` block before
+running a two-run deep-equal check.
+
 Cost control:
-    - Use @pytest.mark.llm_judge to isolate cost-bearing tests
+    - Use ``@pytest.mark.bench_qa_llm_judge`` to isolate cost-bearing tests
     - Cache results by content hash to avoid re-scoring identical texts
-    - Default to Haiku/mini for <$0.001 per evaluation
+    - Default to nano/Haiku for <$0.001 per evaluation
 """
 
 from __future__ import annotations
@@ -159,6 +165,7 @@ async def _call_anthropic(
         json={
             "model": model,
             "max_tokens": 512,
+            "temperature": 0,
             "system": system,
             "messages": [{"role": "user", "content": user_msg}],
         },
@@ -188,6 +195,8 @@ async def _call_openai(
         json={
             "model": model,
             "max_tokens": 512,
+            "temperature": 0,
+            "seed": 42,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_msg},
@@ -211,24 +220,25 @@ async def _call_openai(
 class LLMJudge:
     """Semantic quality judge using LLM evaluation.
 
-    Providers:
-        - "anthropic": Claude Haiku (default model: claude-haiku-4-5-20251001)
-        - "openai": GPT-4o-mini (default model: gpt-4o-mini)
+    Providers (default: ``openai`` / ``gpt-4.1-nano`` — cheapest cost-per-eval
+    as of early 2026; swap via env):
+        - "openai": default model ``gpt-4.1-nano``
+        - "anthropic": default model ``claude-haiku-4-5-20251001``
 
     Environment variables:
-        - ANTHROPIC_API_KEY or OPENAI_API_KEY
+        - OPENAI_API_KEY or ANTHROPIC_API_KEY
         - BENCH_LLM_JUDGE_PROVIDER (override provider)
         - BENCH_LLM_JUDGE_MODEL (override model)
     """
 
     DEFAULT_MODELS = {
         "anthropic": "claude-haiku-4-5-20251001",
-        "openai": "gpt-4o-mini",
+        "openai": "gpt-4.1-nano",
     }
 
     def __init__(
         self,
-        provider: str = "anthropic",
+        provider: str = "openai",
         model: str | None = None,
         api_key: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -236,7 +246,7 @@ class LLMJudge:
         self._provider = os.environ.get("BENCH_LLM_JUDGE_PROVIDER", provider)
         self._model = os.environ.get(
             "BENCH_LLM_JUDGE_MODEL",
-            model or self.DEFAULT_MODELS.get(self._provider, "claude-haiku-4-5-20251001"),
+            model or self.DEFAULT_MODELS.get(self._provider, "gpt-4.1-nano"),
         )
         self._api_key = api_key or self._resolve_api_key()
         self._client = client  # externally managed client (for testing)
@@ -261,13 +271,9 @@ class LLMJudge:
         client = self._client or httpx.AsyncClient()
         try:
             if self._provider == "anthropic":
-                return await _call_anthropic(
-                    client, self._model, system, user_msg, self._api_key
-                )
+                return await _call_anthropic(client, self._model, system, user_msg, self._api_key)
             elif self._provider == "openai":
-                return await _call_openai(
-                    client, self._model, system, user_msg, self._api_key
-                )
+                return await _call_openai(client, self._model, system, user_msg, self._api_key)
             else:
                 raise ValueError(f"Unknown provider: {self._provider}")
         finally:
@@ -330,21 +336,25 @@ class LLMJudge:
                             if qa_text.endswith("```"):
                                 qa_text = qa_text[:-3]
                         qa_data = json.loads(qa_text.strip())
-                        qa_results.append({
-                            "question": qa.question,
-                            "answerable": qa_data.get("answerable", False),
-                            "confidence": qa_data.get("confidence", 0.0),
-                            "reasoning": qa_data.get("reasoning", ""),
-                            "source": qa.source,
-                        })
+                        qa_results.append(
+                            {
+                                "question": qa.question,
+                                "answerable": qa_data.get("answerable", False),
+                                "confidence": qa_data.get("confidence", 0.0),
+                                "reasoning": qa_data.get("reasoning", ""),
+                                "source": qa.source,
+                            }
+                        )
                     except (json.JSONDecodeError, KeyError):
-                        qa_results.append({
-                            "question": qa.question,
-                            "answerable": False,
-                            "confidence": 0.0,
-                            "reasoning": f"Parse error: {qa_raw[:100]}",
-                            "source": qa.source,
-                        })
+                        qa_results.append(
+                            {
+                                "question": qa.question,
+                                "answerable": False,
+                                "confidence": 0.0,
+                                "reasoning": f"Parse error: {qa_raw[:100]}",
+                                "source": qa.source,
+                            }
+                        )
 
             result = LLMJudgeResult(
                 task_id=task.task_id,
@@ -367,9 +377,7 @@ class LLMJudge:
                 error=str(exc),
             )
 
-    async def score_batch(
-        self, tasks: list[tuple[BenchTask, str]]
-    ) -> list[LLMJudgeResult]:
+    async def score_batch(self, tasks: list[tuple[BenchTask, str]]) -> list[LLMJudgeResult]:
         """Score multiple (task, compressed_text) pairs sequentially.
 
         Sequential to respect rate limits. For parallel, use asyncio.gather externally.
@@ -398,7 +406,10 @@ def compute_correlation(
     n = len(rule_scores)
     if n != len(llm_scores) or n < 2:
         return CorrelationResult(
-            n=n, pearson_r=0.0, spearman_rho=0.0, mean_abs_diff=0.0,
+            n=n,
+            pearson_r=0.0,
+            spearman_rho=0.0,
+            mean_abs_diff=0.0,
             pairs=list(zip(rule_scores, llm_scores)),
         )
 
