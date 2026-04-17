@@ -71,6 +71,7 @@ flowchart LR
 {
   "auto_index": {
     "enabled": true,
+    "background": false,
     "min_chars": 2000,
     "memory_dir": "~/.memtomem/proxy_index",
     "namespace": "proxy-{server}"
@@ -100,6 +101,8 @@ compressed_chars: 8000
 ```
 
 The namespace supports `{server}` and `{tool}` placeholders. Can be toggled per-server via `auto_index: true|false` in `UpstreamServerConfig`.
+
+Setting `background: true` (default `false`) schedules the indexing task off the request path: the agent receives a `[Indexing…] · scheduled` placeholder footer immediately, while indexing runs in the background. Trade-off: read-your-own-writes consistency is no longer guaranteed until the task completes — opt in only if agents tolerate the gap. See `pipeline.md` § Stage 4 for the metrics tri-state semantics.
 
 > **Note:** Auto-indexing requires a `FileIndexer` wired into
 > `ProxyManager`.  The default deployment does not wire one — see

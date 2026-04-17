@@ -201,6 +201,7 @@ Full example with all options:
   },
   "auto_index": {
     "enabled": false,
+    "background": false,
     "min_chars": 2000,
     "memory_dir": "~/.memtomem/proxy_index",
     "namespace": "proxy-{server}"

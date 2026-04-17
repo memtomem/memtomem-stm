@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **Background auto-indexing** (F4) — `auto_index.background` (default `false`). When set `true`, Stage 4 INDEX runs via `asyncio.create_task` off the request path; the agent receives a `[Indexing…] · scheduled` placeholder footer immediately while indexing proceeds in the background. Trade-off: read-your-own-writes consistency is no longer guaranteed until the task completes — opt in only if agents tolerate the gap. Metrics row records `index_ok IS NULL` / `index_error IS NULL` / `chunks_indexed = 0` (tri-state matching background extraction); dashboards filter background rows with `WHERE index_ok IS NULL`. Default `false` preserves the synchronous contract for every existing deployment.
+
 ### Changed
 
 - **Progressive delivery surfaces memories for users who opt in via `injection_mode`** (F6). The default `injection_mode` stays `prepend`, which **continues to bypass surfacing on progressive** (upgrading is a no-op for default deployments). Operators who set `injection_mode` to `append` or `section` now get Stage 3 (SURFACE) on progressive responses; `prepend` would shift `stm_proxy_read_more` offsets and stays skipped with a one-time WARNING. See `docs/pipeline.md` § Stage 3 and `tests/test_progressive.py::TestProgressiveContentIntegrity::test_concat_invariant_under_surfacing` for the empirical safety proof.

@@ -142,6 +142,18 @@ traceback, and returns the pre-index response unchanged.  The agent
 receives a successful result; the response is just not searchable
 in LTM.
 
+**Background mode (F4).**  Setting `auto_index.background = true`
+schedules the indexing task via `asyncio.create_task` off the request
+path. The agent receives a `[Indexing…] · scheduled` placeholder
+footer synchronously — the namespace is intentionally dropped from
+the placeholder because chunk count and final namespace binding are
+unknown until the task runs. `index_ok` / `index_error` /
+`chunks_indexed` stay `NULL` / `NULL` / `0` in `proxy_metrics.db`,
+matching the tri-state used by background extraction; filter
+background rows with `WHERE index_ok IS NULL`. Trade-off:
+read-your-own-writes consistency is no longer guaranteed until the
+task completes. Default `false` preserves the synchronous contract.
+
 ## Stage 4b: Auto Fact Extraction (optional)
 
 Automatically extracts discrete facts from tool responses using an LLM. Strategies: `llm` (default, Ollama qwen3:4b with no-think mode), `heuristic`, `hybrid`, `none`. Each extracted fact is stored as an individual `.md` file and indexed; deduplication via embedding similarity (threshold 0.92).
