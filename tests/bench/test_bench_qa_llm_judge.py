@@ -85,7 +85,7 @@ async def test_llm_judge_scores_scenario(scenario_id: str, tmp_path, bench_qa_re
         answerable, total = qa_answerable_ratio(probes, compressed)
         keyword_ratio = answerable / total if total else 1.0
 
-        judge_result = score_scenario(
+        judge_result = await score_scenario(
             scenario_id=scenario_id,
             description=fixture.get("description", ""),
             original=fixture["payload"],

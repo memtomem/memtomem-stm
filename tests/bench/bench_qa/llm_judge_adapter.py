@@ -15,7 +15,6 @@ Delete the directory to force a refresh.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -103,7 +102,7 @@ def _save_cache(path: Path, result: LLMJudgeResult) -> None:
     )
 
 
-def score_scenario(
+async def score_scenario(
     *,
     scenario_id: str,
     description: str,
@@ -116,6 +115,10 @@ def score_scenario(
     model: str | None = None,
 ) -> LLMJudgeResult | None:
     """Score one compressed scenario output with the LLM judge.
+
+    Async because every current caller (the parametrized bench_qa test)
+    already runs under ``@pytest.mark.asyncio`` — wrapping the ``await`` in
+    a nested ``asyncio.run()`` raises ``RuntimeError``.
 
     Returns ``None`` when no API key is configured — the caller should
     ``pytest.skip``.  Returns an ``LLMJudgeResult`` with ``.error`` populated
@@ -155,7 +158,7 @@ def score_scenario(
     )
 
     judge = LLMJudge(provider=resolved_provider, model=resolved_model, api_key=api_key)
-    result = asyncio.run(judge.score(task, compressed))
+    result = await judge.score(task, compressed)
     _save_cache(path, result)
     return result
 
