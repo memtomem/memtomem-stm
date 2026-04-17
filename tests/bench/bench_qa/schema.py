@@ -64,6 +64,10 @@ class BenchFixture(TypedDict, total=False):
     # observation; real compressors drop tail-side keywords so per-scenario
     # floors start looser and tighten as the suite stabilises.
     qa_gate_min: float
+    # Per-scenario override for ``min_result_retention`` (default 0.65).
+    # S5 lowers this so the SKELETON-only test can exercise the compressor
+    # output directly without triggering the ratio-guard fallback ladder.
+    min_retention: float
     surfacing_seeds: list[dict]
     surfacing_eval: SurfacingEval
 
