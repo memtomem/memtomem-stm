@@ -8,8 +8,8 @@ actions — both returning canned text in **core's real compact format**
 (``[rank] score | source > hierarchy``) so that integration tests validate
 the same parsing path used in production.
 
-**Content must vary per call.** STM's cross-session dedup keys on
-``sha256(content)[:16]`` (see
+**Default mode — content must vary per call.** STM's cross-session dedup
+keys on ``sha256(content)[:16]`` (see
 ``src/memtomem_stm/surfacing/mcp_client.py:34``), so a fixture returning
 identical content across calls gets silently suppressed after the first
 run if the test exercises the ``FeedbackTracker`` path. The current
@@ -19,17 +19,60 @@ future test that *does* hit the dedup path. Assertions here are all
 substring checks (``"JWT authentication"``, ``"current_task"``) so the
 UUID suffixes are invisible to callers.
 
-Run with: `python <path-to-this-file>`
+**bench_qa mode (``--seeds <path>``)** loads a JSON array of search
+results and emits them from ``mem_search`` verbatim — *without* the
+per-call UUID suffix — so ``sha256(content)`` is deterministic and tests
+can assert against pre-computed chunk IDs. The dedup concern does not
+apply here because bench_qa scenarios use an isolated ``tmp_path``
+``stm_feedback.db`` and make a single ``call_tool`` per test.
+
+Run with: ``python <path-to-this-file>`` (default canned hits) or
+``python <path-to-this-file> --seeds <path>`` (fixture-driven).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import uuid
 
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("fake-memtomem")
+
+# Populated once at startup when ``--seeds`` is passed. Reads like a
+# constant after that — ``mem_search`` branches on ``is not None``.
+_SEEDS: list[dict] | None = None
+
+
+def _load_seeds(path: str) -> list[dict]:
+    """Load bench_qa seed array from *path*.
+
+    Each entry must have ``rank``, ``score``, ``source``, and ``content``
+    keys; extras are ignored. Schema validation is owned by the harness
+    that wrote the file, not by this helper.
+    """
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise ValueError(f"--seeds file must contain a JSON array, got {type(data).__name__}")
+    return data
+
+
+def _emit_seeds(seeds: list[dict]) -> str:
+    """Format *seeds* as core's compact ``mem_search`` output.
+
+    Matches the default-mode format (``[rank] score | source > Section``
+    header, content on the next line) but omits the per-call UUID suffix
+    — bench_qa callers require ``sha256(content)`` to be deterministic so
+    pre-computed chunk IDs line up with ``surfacing_events.memory_ids``.
+    """
+    blocks = [f"Found {len(seeds)} results:", ""]
+    for seed in seeds:
+        blocks.append(f"[{seed['rank']}] {seed['score']} | {seed['source']} > Memory")
+        blocks.append(str(seed["content"]))
+        blocks.append("")
+    return "\n".join(blocks).rstrip() + "\n"
 
 
 @mcp.tool()
@@ -39,14 +82,17 @@ async def mem_search(
     namespace: str | list[str] | None = None,
     context_window: int = 0,
 ) -> str:
-    """Return canned search hits in core's compact format.
+    """Return canned search hits, or fixture seeds if ``--seeds`` was given.
 
     Matches the output of ``memtomem.server.formatters._format_compact_result``
-    so integration tests validate the real parsing path.  Each call embeds a
-    fresh UUID in both the source path and the body text so
-    ``sha256(content)`` dedup never collapses repeated calls.
-    See the module docstring for the full rationale.
+    so integration tests validate the real parsing path. In the default
+    (no-seeds) mode each call embeds a fresh UUID in both the source path
+    and the body text so ``sha256(content)`` dedup never collapses repeated
+    calls. See the module docstring for the full rationale.
     """
+    if _SEEDS is not None:
+        return _emit_seeds(_SEEDS)
+
     auth_tag = uuid.uuid4().hex[:8]
     api_tag = uuid.uuid4().hex[:8]
     return (
@@ -88,4 +134,14 @@ async def mem_do(action: str, params: dict | None = None) -> str:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fake memtomem MCP server.")
+    parser.add_argument(
+        "--seeds",
+        metavar="PATH",
+        default=None,
+        help="Optional JSON array of mem_search seeds (bench_qa mode).",
+    )
+    args = parser.parse_args()
+    if args.seeds is not None:
+        _SEEDS = _load_seeds(args.seeds)
     mcp.run()

@@ -20,6 +20,10 @@ can't share the happy-path parametrize body.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+
 import pytest
 
 from bench.bench_qa import (
@@ -28,8 +32,10 @@ from bench.bench_qa import (
     load_fixture,
     make_proxy_manager,
     qa_answerable_ratio,
+    surfacing_recall_at_k,
 )
-from bench.bench_qa.runner import make_tool_result
+from bench.bench_qa.runner import make_surfacing_proxy_manager, make_tool_result
+from bench.bench_qa.schema import SurfacingResult
 
 # Scenarios exercised by this file. Each must live in
 # ``tests/bench/fixtures/<id>.json`` with a ``force_tier: null`` so the
@@ -173,4 +179,128 @@ async def test_s07_selective_toc_preserves_top_results(tmp_path, bench_qa_report
             verdict="pass",
         )
     finally:
+        store.close()
+
+
+_SURFACING_ID_RE = re.compile(r"Surfacing ID:\s*([a-f0-9]{16})")
+
+
+@pytest.mark.bench_qa
+@pytest.mark.asyncio
+async def test_s10_surfacing_recall_at_k(tmp_path, bench_qa_report):
+    """Fake LTM serves 3 fixture-declared seeds; top-2 match the expected ranks.
+
+    The ``path`` argument (not ``_context_query``) drives ``ContextExtractor``
+    because ``ProxyManager.call_tool`` strips ``_context_query`` from
+    ``upstream_args`` before invoking surfacing (see ``manager.py:973``);
+    ``_context_query`` is today a compression hint, not a surfacing hint.
+    ``path`` tokenizes to ``"src auth jwt rotation py"`` which clears
+    ``min_query_tokens=3``. The fake LTM ignores the query and returns
+    fixture seeds verbatim, so query content does not affect recall —
+    the test exercises the pipeline wiring, not query semantics.
+
+    The fake server's per-call UUID suffix exists only in default mode
+    to defeat ``sha256(content)`` dedup — bench_qa ``--seeds`` mode omits
+    it so ``sha256(content)[:16]`` is deterministic, and the expected
+    chunk IDs below (derived from ``fixture["surfacing_seeds"][i].content``)
+    line up with what ``surfacing_events.memory_ids`` records. Future
+    changes to the fake must preserve both properties.
+    """
+    fixture = load_fixture("s10")
+    assert fixture.get("force_tier") is None, "s10 is a happy-path surfacing scenario"
+    assert fixture["surfacing_seeds"], "s10 fixture must declare surfacing_seeds"
+    assert fixture["surfacing_eval"], "s10 fixture must declare surfacing_eval"
+
+    seeds_path = tmp_path / "s10_seeds.json"
+    seeds_path.write_text(json.dumps(fixture["surfacing_seeds"]), encoding="utf-8")
+
+    source_to_chunk_id = {
+        seed["source"]: hashlib.sha256(seed["content"].encode()).hexdigest()[:16]
+        for seed in fixture["surfacing_seeds"]
+    }
+    expected_chunk_ids = [
+        source_to_chunk_id[src] for src in fixture["surfacing_eval"]["expected_ids"]
+    ]
+
+    mgr, store, session, adapter, engine, tracker = make_surfacing_proxy_manager(
+        tmp_path,
+        seeds_path=seeds_path,
+        compression=fixture["expected_compressor"],
+        max_result_chars=fixture["max_result_chars"],
+    )
+    session.call_tool.return_value = make_tool_result(fixture["payload"])
+    expected_trace_id = deterministic_trace_id(fixture["scenario_id"])
+
+    await adapter.start()
+    try:
+        result = await mgr.call_tool(
+            "fake",
+            "tool_s10",
+            {
+                "path": "src/auth/jwt_rotation.py",
+                "_context_query": fixture["surfacing_eval"]["query"],
+            },
+            trace_id=expected_trace_id,
+        )
+
+        row = latest_metrics_row(store)
+        assert row, "s10: proxy_metrics row was not written"
+        assert row["trace_id"] == expected_trace_id, (
+            f"s10: trace_id mismatch — got {row['trace_id']!r}, expected {expected_trace_id!r}"
+        )
+
+        # Text-level reachability: the surfaced block is present AND at
+        # least one seed's content surfaced through the formatter. DB-only
+        # recall could pass while the formatter silently dropped content;
+        # text-only coverage is fragile to formatter changes. Both guards
+        # together cover each failure class.
+        assert "<surfaced-memories>" in result, (
+            f"s10: <surfaced-memories> block missing: {result[-400:]!r}"
+        )
+        assert any(seed["content"][:40] in result for seed in fixture["surfacing_seeds"]), (
+            f"s10: no seed content surfaced into result: {result[-800:]!r}"
+        )
+
+        # DB-level recall@k via the surfacing_id embedded in the formatter's
+        # output. Keying on surfacing_id (not ``ORDER BY created_at DESC``)
+        # ties the assertion to *this* call's row, so the test survives a
+        # future bench scenario writing additional rows into the same DB.
+        id_match = _SURFACING_ID_RE.search(result)
+        assert id_match, f"s10: surfacing_id not found in result: {result[-400:]!r}"
+        surfacing_id = id_match.group(1)
+        returned_ids = tracker.store.get_memory_ids_for_surfacing(surfacing_id)
+        assert returned_ids, f"s10: no memory_ids recorded for surfacing_id={surfacing_id}"
+
+        k = fixture["surfacing_eval"]["k"]
+        recall = surfacing_recall_at_k(returned_ids, expected_chunk_ids, k)
+        assert recall == 1.0, (
+            f"s10: happy-path recall@{k} must be 1.0 — got {recall} "
+            f"(returned_ids[:{k}]={returned_ids[:k]}, expected={expected_chunk_ids})"
+        )
+
+        answerable, total = qa_answerable_ratio(fixture["qa_probes"], result)
+        assert total > 0, "s10: must define at least one qa_probe"
+        ratio = answerable / total
+        gate_min = fixture.get("qa_gate_min", 0.75)
+        assert ratio >= gate_min, (
+            f"s10: qa_answerable ratio {answerable}/{total}={ratio:.2f} below {gate_min} gate"
+        )
+
+        bench_qa_report.record_scenario(
+            scenario_id="s10",
+            trace_id=row["trace_id"],
+            row=row,
+            qa_answerable=answerable,
+            qa_total=total,
+            original_chars=len(fixture["payload"]),
+            verdict="pass",
+            surfacing=SurfacingResult(
+                recall_at_k=recall,
+                returned_ids=returned_ids[:k],
+                expected_ids=expected_chunk_ids,
+            ),
+        )
+    finally:
+        await adapter.stop()
+        tracker.close()
         store.close()

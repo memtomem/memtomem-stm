@@ -15,6 +15,7 @@ module generalizes that pattern for the bench_qa suite:
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -29,6 +30,11 @@ from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.feedback import FeedbackTracker
+from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+_FAKE_LTM_SERVER = Path(__file__).resolve().parents[2] / "_fake_memtomem_server.py"
 
 
 # Drift detector: ``CompressionFeedbackConfig.db_path`` and
@@ -114,6 +120,94 @@ def make_proxy_manager(
         tools=[],
     )
     return mgr, store, session
+
+
+def make_surfacing_proxy_manager(
+    tmp_path: Path,
+    *,
+    seeds_path: Path,
+    compression: str | CompressionStrategy = CompressionStrategy.NONE,
+    max_result_chars: int = 50_000,
+    min_retention: float = 0.65,
+    server_name: str = "fake",
+    tool_prefix: str = "fake",
+) -> tuple[
+    ProxyManager,
+    MetricsStore,
+    AsyncMock,
+    McpClientSearchAdapter,
+    SurfacingEngine,
+    FeedbackTracker,
+]:
+    """Like :func:`make_proxy_manager` but wires a live surfacing pipeline.
+
+    Spawns the stdio fake LTM server (``tests/_fake_memtomem_server.py``)
+    in ``--seeds`` mode so ``mem_search`` emits the JSON array at
+    ``seeds_path`` with deterministic ``sha256(content)`` chunk IDs.
+    ``min_response_chars`` is pinned at 10 so the surfacing gate does not
+    depend on the production default (5000) staying where it is.
+
+    Returns ``(manager, metrics_store, session, adapter, engine, tracker)``.
+    The caller owns the lifecycle of the last three — the helper does
+    **not** call ``adapter.start()`` (stdio connects asynchronously). A
+    typical test body wraps the call in ``try``/``finally``::
+
+        mgr, store, session, adapter, engine, tracker = \
+            make_surfacing_proxy_manager(tmp_path, seeds_path=...)
+        await adapter.start()
+        try:
+            ...                          # mgr.call_tool(...)
+        finally:
+            await adapter.stop()
+            tracker.close()
+            store.close()
+    """
+    if isinstance(compression, str):
+        compression = _resolve_compression(compression)
+
+    store = MetricsStore(tmp_path / "proxy_metrics.db")
+    store.initialize()
+
+    surfacing_cfg = SurfacingConfig(
+        enabled=True,
+        min_response_chars=10,
+        cooldown_seconds=0.0,
+        max_surfacings_per_minute=1000,
+        auto_tune_enabled=False,
+        include_session_context=False,
+        fire_webhook=False,
+        feedback_enabled=True,
+        injection_mode="append",
+        feedback_db_path=tmp_path / "stm_feedback.db",
+        ltm_mcp_command=sys.executable,
+        ltm_mcp_args=[str(_FAKE_LTM_SERVER), "--seeds", str(seeds_path)],
+    )
+    adapter = McpClientSearchAdapter(surfacing_cfg)
+    tracker = FeedbackTracker(surfacing_cfg)
+    engine = SurfacingEngine(surfacing_cfg, mcp_adapter=adapter, feedback_tracker=tracker)
+
+    server_cfg = UpstreamServerConfig(
+        prefix=tool_prefix,
+        compression=compression,
+        max_result_chars=max_result_chars,
+        max_retries=0,
+        reconnect_delay_seconds=0.0,
+    )
+    proxy_cfg = ProxyConfig(
+        config_path=tmp_path / "proxy.json",
+        upstream_servers={server_name: server_cfg},
+        min_result_retention=min_retention,
+    )
+    token_tracker = TokenTracker(metrics_store=store)
+    mgr = ProxyManager(proxy_cfg, token_tracker, surfacing_engine=engine)
+    session = AsyncMock()
+    mgr._connections[server_name] = UpstreamConnection(
+        name=server_name,
+        config=server_cfg,
+        session=session,
+        tools=[],
+    )
+    return mgr, store, session, adapter, engine, tracker
 
 
 def make_tool_result(text: str) -> SimpleNamespace:
