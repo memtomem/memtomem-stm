@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-04-20
+
+### Added
+
+- **`stm_surfacing_stats` MCP tool enriched with parity to `stm_compression_stats`** (#198, closes #197) — output now includes `events_total`, `distinct_tools`, `date_range`, per-tool breakdown (events + average memory count, sorted descending), `rating_distribution`, `total_feedback`, helpfulness percentage, and a DESC-ordered `recent` tail with 80-character query previews. New optional inputs `since` (ISO-8601) and `limit` (default 10) restrict the window. Empty-DB / out-of-range filters return zeros with all collections present, so callers don't branch on shape. Malformed `since` is rejected with a clean error rather than raising. Closes the long-standing observability gap where surfacing analytics required raw SQL against `~/.memtomem/stm_feedback.db` while compression already had an aggregate tool.
+
 ## [0.1.10] — 2026-04-20
 
 ### Added
