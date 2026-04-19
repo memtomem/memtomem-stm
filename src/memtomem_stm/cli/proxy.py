@@ -619,24 +619,45 @@ def _should_use_tui() -> bool:
     return bool(sys.stdin.isatty())
 
 
+def _patch_questionary_indicators() -> None:
+    """Swap questionary's default checkbox glyphs for clearer ones.
+
+    Defaults are ``●`` (checked) vs ``○`` (unchecked), which blur together on
+    thin fonts — users reported genuine ambiguity. ``[v]`` / ``[ ]`` makes
+    the state unmistakable. We mutate ``questionary.prompts.common`` because
+    that module binds the constants at import time (re-assigning
+    ``questionary.constants`` has no effect on an already-imported consumer).
+    Idempotent — calling more than once just re-asserts the same values.
+    """
+    from questionary.prompts import common as qc_common
+
+    qc_common.INDICATOR_SELECTED = "[v]"
+    qc_common.INDICATOR_UNSELECTED = "[ ]"
+
+
 def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
     """Prompt the user to choose which discovered candidates to import.
 
     TTY → ``questionary.checkbox`` (space to toggle, enter to confirm, all
-    pre-checked). Non-TTY → the comma-number prompt from
+    initially unchecked). Non-TTY → the comma-number prompt from
     :func:`_parse_selection`, with a reprompt on parse error so a fat-finger
     entry doesn't silently abort the wizard.
+
+    Defaulting to unchecked matches user feedback: the ~8-candidate lists
+    that come out of a populated Claude Code config usually need 1-2 picks,
+    not 6 unchecks.
     """
     if _should_use_tui():
         import questionary
 
+        _patch_questionary_indicators()
         choices = [
             questionary.Choice(
                 title=(
                     f"{c['name']:<18}  {_format_candidate_detail(c['entry'])}  — from {c['source']}"
                 ),
                 value=i,
-                checked=True,
+                checked=False,
             )
             for i, c in enumerate(candidates)
         ]
@@ -650,17 +671,17 @@ def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
 
     while True:
         raw = click.prompt(
-            "Select servers to import (e.g. '1,3', 'all', or 'none' to add manually)",
+            "Select servers to import (e.g. '1,3', 'all', or empty to skip / add manually)",
             type=str,
-            default="all",
-            show_default=True,
+            default="",
+            show_default=False,
         )
         picks = _parse_selection(raw, len(candidates))
         if picks is not None:
             return picks
         click.echo(
             f"  {_warn('Invalid:')} use comma-separated numbers 1..{len(candidates)}, "
-            "'all', or 'none'."
+            "'all', or leave blank."
         )
 
 

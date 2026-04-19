@@ -1166,10 +1166,25 @@ class TestInitImportFlow:
         assert result.exit_code == 0, result.output
         data = json.loads(config.read_text(encoding="utf-8"))
         assert set(data["upstream_servers"]) == {"a", "c"}  # index 1 ("b") dropped
-        # All choices start pre-checked so 'enter' on the default
-        # selection imports everything (the common case).
-        assert captured["checked"] == [True, True, True]
+        # All choices start unchecked — populated configs usually have 8+
+        # candidates but users typically only import 1-2, so "check what
+        # you want" beats "uncheck what you don't" in friction terms.
+        assert captured["checked"] == [False, False, False]
         assert "space=toggle" in captured["message"]
+
+    def test_questionary_indicator_glyphs_overridden(self):
+        """Default ``●``/``○`` glyphs are visually ambiguous on thin fonts;
+        we replace them with ``[v]``/``[ ]`` at TUI-entry time. This pins
+        that the override is actually applied so a questionary upgrade
+        doesn't silently revert us to the blurry dots."""
+        from memtomem_stm.cli.proxy import _patch_questionary_indicators
+
+        _patch_questionary_indicators()
+
+        from questionary.prompts import common as qc_common
+
+        assert qc_common.INDICATOR_SELECTED == "[v]"
+        assert qc_common.INDICATOR_UNSELECTED == "[ ]"
 
     def test_tui_ctrl_c_returns_empty_falls_to_manual(self, runner, config, monkeypatch):
         """questionary returns None on Ctrl-C / aborted session; we treat
