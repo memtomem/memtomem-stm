@@ -38,11 +38,13 @@ class SurfacingEngine:
         mcp_adapter: Any,
         webhook_manager: Any | None = None,
         feedback_tracker: Any | None = None,
+        token_tracker: Any | None = None,
     ) -> None:
         self._config = config
         self._mcp_adapter = mcp_adapter
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
+        self._token_tracker = token_tracker
         self._auto_tuner = None
         if config.auto_tune_enabled and feedback_tracker is not None:
             from memtomem_stm.surfacing.feedback import AutoTuner
@@ -409,13 +411,27 @@ class SurfacingEngine:
         search_kwargs: dict[str, Any] = {}
         if ctx_win:
             search_kwargs["context_window"] = ctx_win
-        results, _stats = await self._mcp_adapter.search(
+        results, hints = await self._mcp_adapter.search(
             query=query,
             top_k=max_results * 2,
             namespace=namespace,
             trace_id=trace_id,
             **search_kwargs,
         )
+
+        # Parent trust-UX hints (parent PR #231): log at INFO even when results
+        # are empty or get filtered out below, since an operator may want to
+        # see "3 results found before filtering" notices regardless of whether
+        # SURFACE ultimately injects anything. Hints are NOT forwarded to the
+        # downstream agent — that is a prepend-body policy change, out of
+        # scope here. See B3 plan § "forward hints to downstream".
+        if hints:
+            logger.info("LTM hints for %s/%s: %s", server, tool, "; ".join(hints))
+            if self._token_tracker is not None:
+                try:
+                    self._token_tracker.record_hints(hints)
+                except Exception:
+                    logger.debug("token_tracker.record_hints failed", exc_info=True)
 
         # Filter by score, then exclude already-surfaced memories in this session
         scored = [r for r in results if r.score >= min_score]

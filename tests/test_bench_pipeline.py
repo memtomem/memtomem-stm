@@ -196,7 +196,7 @@ def _make_surfacing_config(**overrides) -> SurfacingConfig:
 
 def _make_mcp_adapter(results=None):
     adapter = AsyncMock()
-    adapter.search = AsyncMock(return_value=(results or [], {}))
+    adapter.search = AsyncMock(return_value=(results or [], []))
     return adapter
 
 
@@ -271,7 +271,11 @@ class TestBenchHarness:
 
         h = BenchHarness(cleaner=cleaner, compressor=BrokenCompressor(), judge=judge)
         task = BenchTask(
-            task_id="err", description="err", content="some text", content_type="text", max_chars=100
+            task_id="err",
+            description="err",
+            content="some text",
+            content_type="text",
+            max_chars=100,
         )
         result = h.run_stm(task)
         assert result.error is not None
@@ -318,7 +322,11 @@ class TestStageMetrics:
 
     def test_timing_is_positive(self, harness):
         task = BenchTask(
-            task_id="time", description="timing", content=CODE_FILE, content_type="code", max_chars=500
+            task_id="time",
+            description="timing",
+            content=CODE_FILE,
+            content_type="code",
+            max_chars=500,
         )
         result = harness.run_stm(task)
         m = result.stage_metrics
@@ -343,8 +351,13 @@ class TestStageMetrics:
 
     def test_zero_original_safety(self):
         m = StageMetrics(
-            original_chars=0, cleaned_chars=0, compressed_chars=0, surfaced_chars=0,
-            clean_ms=0, compress_ms=0, surface_ms=0,
+            original_chars=0,
+            cleaned_chars=0,
+            compressed_chars=0,
+            surfaced_chars=0,
+            clean_ms=0,
+            compress_ms=0,
+            surface_ms=0,
         )
         assert m.cleaning_ratio == 1.0
         assert m.total_reduction == 1.0
@@ -368,70 +381,109 @@ class TestStageMetrics:
 class TestQualityJudge:
     def test_perfect_score(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="Hello World", content_type="text",
-            max_chars=100, expected_keywords=["Hello", "World"],
+            task_id="t",
+            description="t",
+            content="Hello World",
+            content_type="text",
+            max_chars=100,
+            expected_keywords=["Hello", "World"],
         )
         assert judge.score(task, "Hello World") == 10.0
 
     def test_missing_keyword_deducts(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="text",
-            max_chars=100, expected_keywords=["alpha", "beta", "gamma"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="text",
+            max_chars=100,
+            expected_keywords=["alpha", "beta", "gamma"],
         )
         assert judge.score(task, "nothing here") == 4.0
 
     def test_partial_keywords(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="text",
-            max_chars=100, expected_keywords=["alpha", "beta"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="text",
+            max_chars=100,
+            expected_keywords=["alpha", "beta"],
         )
         assert judge.score(task, "alpha is present") == 8.0
 
     def test_heading_check(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="markdown",
-            max_chars=100, expect_headings=3,
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="markdown",
+            max_chars=100,
+            expect_headings=3,
         )
         assert judge.score(task, "## H1\n## H2\nno more") == 9.0
 
     def test_code_block_check(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="code",
-            max_chars=100, expect_code_blocks=2,
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="code",
+            max_chars=100,
+            expect_code_blocks=2,
         )
         assert judge.score(task, "```python\ncode\n```\nonly one block") == 9.0
 
     def test_json_validity_bonus(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="json",
-            max_chars=100, expected_keywords=["key"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="json",
+            max_chars=100,
+            expected_keywords=["key"],
         )
         assert judge.score(task, '{"key": "value"}') == 10.0
 
     def test_json_invalid_no_bonus(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="json",
-            max_chars=100, expected_keywords=["key"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="json",
+            max_chars=100,
+            expected_keywords=["key"],
         )
         assert judge.score(task, "key: value") == 10.0
 
     def test_score_floor_at_zero(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="text",
-            max_chars=100, expected_keywords=["a", "b", "c", "d", "e", "f"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="text",
+            max_chars=100,
+            expected_keywords=["a", "b", "c", "d", "e", "f"],
         )
         assert judge.score(task, "nothing") == 0.0
 
     def test_case_insensitive_keywords(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="text",
-            max_chars=100, expected_keywords=["PostgreSQL"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="text",
+            max_chars=100,
+            expected_keywords=["PostgreSQL"],
         )
         assert judge.score(task, "we use postgresql for storage") == 10.0
 
     def test_weighted_keywords(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="text",
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="text",
             max_chars=100,
             expected_keywords=["critical", "optional"],
             keyword_weights=[1.0, 0.3],
@@ -441,8 +493,12 @@ class TestQualityJudge:
 
     def test_keyword_report(self, judge):
         task = BenchTask(
-            task_id="t", description="t", content="x", content_type="text",
-            max_chars=100, expected_keywords=["present", "absent"],
+            task_id="t",
+            description="t",
+            content="x",
+            content_type="text",
+            max_chars=100,
+            expected_keywords=["present", "absent"],
         )
         report = judge.keyword_report(task, "present in text")
         assert report["present"] is True
@@ -667,8 +723,12 @@ class TestCompressionStrategies:
 
     def test_hybrid_preserves_head(self, cleaner, hybrid, judge):
         task = BenchTask(
-            task_id="hybrid_head", description="hybrid head test", content=CODE_FILE,
-            content_type="code", max_chars=800, expected_keywords=["JWT", "Overview"],
+            task_id="hybrid_head",
+            description="hybrid head test",
+            content=CODE_FILE,
+            content_type="code",
+            max_chars=800,
+            expected_keywords=["JWT", "Overview"],
         )
         report = self._run_with(cleaner, hybrid, judge, task)
         assert "Authentication Module" in report.stm.text
@@ -692,12 +752,14 @@ class TestSurfacingIntegration:
         pipeline = _make_mcp_adapter(memories)
         engine = SurfacingEngine(config=config, mcp_adapter=pipeline)
 
-        h = BenchHarness(
-            cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
-        )
+        h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
         task = BenchTask(
-            task_id="surf", description="auth token handling", content=CODE_FILE,
-            content_type="code", max_chars=800, expected_keywords=["JWT"],
+            task_id="surf",
+            description="auth token handling",
+            content=CODE_FILE,
+            content_type="code",
+            max_chars=800,
+            expected_keywords=["JWT"],
         )
         result = await h.run_stm_with_surfacing(task)
         assert result.stage_metrics is not None
@@ -715,12 +777,13 @@ class TestSurfacingIntegration:
         pipeline = _make_mcp_adapter(memories)
         engine = SurfacingEngine(config=config, mcp_adapter=pipeline)
 
-        h = BenchHarness(
-            cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
-        )
+        h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
         task = BenchTask(
-            task_id="overhead", description="test overhead", content=MEETING_NOTES,
-            content_type="markdown", max_chars=600,
+            task_id="overhead",
+            description="test overhead",
+            content=MEETING_NOTES,
+            content_type="markdown",
+            max_chars=600,
         )
         result = await h.run_stm_with_surfacing(task)
         m = result.stage_metrics
@@ -732,8 +795,11 @@ class TestSurfacingIntegration:
         """Without surfacing engine, overhead is zero."""
         h = BenchHarness(cleaner=cleaner, compressor=truncate, judge=judge)
         task = BenchTask(
-            task_id="nosrf", description="no surfacing", content=MEETING_NOTES,
-            content_type="markdown", max_chars=500,
+            task_id="nosrf",
+            description="no surfacing",
+            content=MEETING_NOTES,
+            content_type="markdown",
+            max_chars=500,
         )
         result = await h.run_stm_with_surfacing(task)
         m = result.stage_metrics
@@ -872,8 +938,12 @@ class TestReport:
 
     def test_format_single_task(self, harness):
         task = BenchTask(
-            task_id="rpt", description="report test", content=MEETING_NOTES,
-            content_type="markdown", max_chars=500, expected_keywords=["PostgreSQL"],
+            task_id="rpt",
+            description="report test",
+            content=MEETING_NOTES,
+            content_type="markdown",
+            max_chars=500,
+            expected_keywords=["PostgreSQL"],
         )
         report = harness.run_comparison(task)
         text = format_report([report])
@@ -889,12 +959,21 @@ class TestReport:
         assert "Avg quality preservation" in text
 
     def test_warning_on_low_quality(self):
-        direct = BenchResult(task_id="low", mode="direct", text="x", stage_metrics=None, quality_score=10.0)
+        direct = BenchResult(
+            task_id="low", mode="direct", text="x", stage_metrics=None, quality_score=10.0
+        )
         stm = BenchResult(
-            task_id="low", mode="stm", text="y",
+            task_id="low",
+            mode="stm",
+            text="y",
             stage_metrics=StageMetrics(
-                original_chars=100, cleaned_chars=90, compressed_chars=50, surfaced_chars=50,
-                clean_ms=1, compress_ms=1, surface_ms=0,
+                original_chars=100,
+                cleaned_chars=90,
+                compressed_chars=50,
+                surfaced_chars=50,
+                clean_ms=1,
+                compress_ms=1,
+                surface_ms=0,
             ),
             quality_score=6.0,
         )
@@ -943,22 +1022,44 @@ class TestCallMetrics:
 
     def test_timing_fields_set(self):
         m = CallMetrics(
-            server="s", tool="t", original_chars=1000, compressed_chars=500,
-            clean_ms=1.5, compress_ms=3.2, surface_ms=10.0, surfaced_chars=600,
+            server="s",
+            tool="t",
+            original_chars=1000,
+            compressed_chars=500,
+            clean_ms=1.5,
+            compress_ms=3.2,
+            surface_ms=10.0,
+            surfaced_chars=600,
         )
         assert m.clean_ms == 1.5
         assert m.surfaced_chars == 600
 
     def test_tracker_aggregates_timing(self):
         tracker = TokenTracker(metrics_store=None)
-        tracker.record(CallMetrics(
-            server="a", tool="t1", original_chars=1000, compressed_chars=500,
-            clean_ms=2.0, compress_ms=5.0, surface_ms=10.0, surfaced_chars=600,
-        ))
-        tracker.record(CallMetrics(
-            server="a", tool="t2", original_chars=2000, compressed_chars=800,
-            clean_ms=4.0, compress_ms=7.0, surface_ms=20.0, surfaced_chars=900,
-        ))
+        tracker.record(
+            CallMetrics(
+                server="a",
+                tool="t1",
+                original_chars=1000,
+                compressed_chars=500,
+                clean_ms=2.0,
+                compress_ms=5.0,
+                surface_ms=10.0,
+                surfaced_chars=600,
+            )
+        )
+        tracker.record(
+            CallMetrics(
+                server="a",
+                tool="t2",
+                original_chars=2000,
+                compressed_chars=800,
+                clean_ms=4.0,
+                compress_ms=7.0,
+                surface_ms=20.0,
+                surfaced_chars=900,
+            )
+        )
         summary = tracker.get_summary()
         assert summary["total_calls"] == 2
         assert summary["total_surfaced_chars"] == 1500
@@ -1189,7 +1290,9 @@ class TestProxyManagerIntegration:
         )
         # _context_query should NOT be forwarded to upstream
         call_args = mock_session.call_tool.call_args
-        forwarded_args = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("arguments", {})
+        forwarded_args = (
+            call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("arguments", {})
+        )
         assert "_context_query" not in forwarded_args
 
 
@@ -1236,6 +1339,7 @@ class TestStageBreakdown:
     def test_qa_degrades_with_compression(self, harness):
         """Tight compression may reduce answerable QA pairs."""
         from bench.tasks import get_tight_tasks
+
         tasks = get_tight_tasks()
         task = [t for t in tasks if t.task_id == "code_file_large"][0]
         bd = harness.run_stage_breakdown(task)
@@ -1290,8 +1394,11 @@ class TestQAScoring:
 
     def test_qa_score_all_answerable(self, judge):
         task = BenchTask(
-            task_id="qa", description="qa", content="The sky is blue and water is wet.",
-            content_type="text", max_chars=100,
+            task_id="qa",
+            description="qa",
+            content="The sky is blue and water is wet.",
+            content_type="text",
+            max_chars=100,
             qa_pairs=[
                 QAPair("What color is the sky?", "blue", "content"),
                 QAPair("Is water wet?", "wet", "content"),
@@ -1303,7 +1410,11 @@ class TestQAScoring:
 
     def test_qa_score_partial(self, judge):
         task = BenchTask(
-            task_id="qa", description="qa", content="x", content_type="text", max_chars=100,
+            task_id="qa",
+            description="qa",
+            content="x",
+            content_type="text",
+            max_chars=100,
             qa_pairs=[
                 QAPair("Q1?", "alpha", "content"),
                 QAPair("Q2?", "beta", "content"),
@@ -1315,7 +1426,11 @@ class TestQAScoring:
 
     def test_qa_by_source(self, judge):
         task = BenchTask(
-            task_id="qa", description="qa", content="x", content_type="text", max_chars=100,
+            task_id="qa",
+            description="qa",
+            content="x",
+            content_type="text",
+            max_chars=100,
             qa_pairs=[
                 QAPair("From content?", "original_fact", "content"),
                 QAPair("From memory?", "remembered_fact", "memory"),
@@ -1328,7 +1443,11 @@ class TestQAScoring:
 
     def test_qa_no_pairs(self, judge):
         task = BenchTask(
-            task_id="qa", description="qa", content="x", content_type="text", max_chars=100,
+            task_id="qa",
+            description="qa",
+            content="x",
+            content_type="text",
+            max_chars=100,
         )
         result = judge.qa_score(task, "anything")
         assert result["total"] == 0
@@ -1403,7 +1522,9 @@ class TestSurfacingValue:
             config = _make_surfacing_config()
             pipeline = _make_mcp_adapter(memories)
             engine = SurfacingEngine(config=config, mcp_adapter=pipeline)
-            h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
+            h = BenchHarness(
+                cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
+            )
             value = await h.measure_surfacing_value(task)
             # Surfacing should never reduce quality (it only adds content)
             assert value.quality_delta >= 0, f"{task.task_id}: delta={value.quality_delta}"
@@ -1411,9 +1532,15 @@ class TestSurfacingValue:
     def test_format_surfacing_value(self):
         values = [
             SurfacingValue(
-                task_id="test", without_surfacing=6.0, with_surfacing=8.0,
-                qa_without=2, qa_with=5, qa_total=6, memories_injected=3,
-                quality_delta=2.0, qa_delta=3,
+                task_id="test",
+                without_surfacing=6.0,
+                with_surfacing=8.0,
+                qa_without=2,
+                qa_with=5,
+                qa_total=6,
+                memories_injected=3,
+                quality_delta=2.0,
+                qa_delta=3,
             ),
         ]
         text = format_surfacing_value(values)
@@ -1528,9 +1655,7 @@ class TestDistractorRobustness:
         config = _make_surfacing_config()
         pipeline = _make_mcp_adapter(memories)
         engine = SurfacingEngine(config=config, mcp_adapter=pipeline)
-        h = BenchHarness(
-            cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
-        )
+        h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
         value = await h.measure_surfacing_value(task)
         # The relevant memory (HS256) should be surfaced and add a QA answer
         assert value.qa_with >= value.qa_without
@@ -1543,8 +1668,7 @@ class TestDistractorRobustness:
 
         # Clean memories (all relevant)
         clean_mems = [
-            FakeSearchResult(chunk=FakeChunk(content=m), score=0.8)
-            for m in AUTH_MEMORIES
+            FakeSearchResult(chunk=FakeChunk(content=m), score=0.8) for m in AUTH_MEMORIES
         ]
         config = _make_surfacing_config()
         clean_engine = SurfacingEngine(config=config, mcp_adapter=_make_mcp_adapter(clean_mems))
@@ -1555,6 +1679,7 @@ class TestDistractorRobustness:
 
         # Noisy memories (1 relevant + 3 distractors)
         from bench.tasks import DISTRACTOR_MEMORIES_AUTH
+
         noisy_mems = [
             FakeSearchResult(chunk=FakeChunk(content=m), score=0.5)
             for m in DISTRACTOR_MEMORIES_AUTH
@@ -1606,9 +1731,7 @@ class TestMultihop:
         ]
         config = _make_surfacing_config()
         engine = SurfacingEngine(config=config, mcp_adapter=_make_mcp_adapter(memories))
-        h = BenchHarness(
-            cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
-        )
+        h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
         value = await h.measure_surfacing_value(task)
         assert value.qa_delta > 0  # Memory QA pairs now answerable
         assert value.qa_with > value.qa_without
@@ -1624,9 +1747,7 @@ class TestMultihop:
         ]
         config = _make_surfacing_config()
         engine = SurfacingEngine(config=config, mcp_adapter=_make_mcp_adapter(memories))
-        h = BenchHarness(
-            cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
-        )
+        h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
         bd = await h.run_stage_breakdown_with_surfacing(task)
         assert bd.surfacing_qa_gain > 0  # Surfacing added answerable QA pairs
         assert bd.compress_info_loss >= 0  # Compression may or may not lose info
@@ -1659,6 +1780,7 @@ class TestStructuredDatasets:
 
     def test_json_tasks_are_valid_json(self):
         import json
+
         for task in ds_json_tasks():
             json.loads(task.content)  # should not raise
 
@@ -1728,7 +1850,9 @@ class TestStructuredDatasets:
             ]
             config = _make_surfacing_config()
             engine = SurfacingEngine(config=config, mcp_adapter=_make_mcp_adapter(memories))
-            h = BenchHarness(cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge)
+            h = BenchHarness(
+                cleaner=cleaner, compressor=truncate, surfacing_engine=engine, judge=judge
+            )
             value = await h.measure_surfacing_value(task)
             assert value.qa_delta > 0, f"{task.task_id}: surfacing added no QA answers"
 
@@ -1765,16 +1889,24 @@ class TestLLMJudge:
                 # QA prompt → return answerable
                 if "QUESTION:" in user_msg:
                     resp.json.return_value = {
-                        "content": [{"text": '{"answerable": true, "confidence": 0.9, "reasoning": "found in text"}'}],
+                        "content": [
+                            {
+                                "text": '{"answerable": true, "confidence": 0.9, "reasoning": "found in text"}'
+                            }
+                        ],
                         "usage": {"input_tokens": 100, "output_tokens": 50},
                     }
                 else:
                     # Score prompt
                     resp.json.return_value = {
-                        "content": [{"text": '{"factual_completeness": {"score": 8.5, "reasoning": "most facts preserved"}, '
-                                     '"structural_coherence": {"score": 7.0, "reasoning": "some structure lost"}, '
-                                     '"answer_sufficiency": {"score": 9.0, "reasoning": "key answers available"}, '
-                                     '"overall": 8.2}'}],
+                        "content": [
+                            {
+                                "text": '{"factual_completeness": {"score": 8.5, "reasoning": "most facts preserved"}, '
+                                '"structural_coherence": {"score": 7.0, "reasoning": "some structure lost"}, '
+                                '"answer_sufficiency": {"score": 9.0, "reasoning": "key answers available"}, '
+                                '"overall": 8.2}'
+                            }
+                        ],
                         "usage": {"input_tokens": 500, "output_tokens": 100},
                     }
             resp.raise_for_status = MagicMock()
@@ -1824,8 +1956,11 @@ class TestLLMJudge:
         """Second call with same content returns cached result."""
         judge = LLMJudge(provider="anthropic", api_key="test-key", client=mock_anthropic_client)
         task = BenchTask(
-            task_id="test-cache", description="test",
-            content="Same content", content_type="text", max_chars=100,
+            task_id="test-cache",
+            description="test",
+            content="Same content",
+            content_type="text",
+            max_chars=100,
         )
         r1 = await judge.score(task, "compressed text")
         r2 = await judge.score(task, "compressed text")
@@ -1842,8 +1977,11 @@ class TestLLMJudge:
         bad_client.post = raise_error
         judge = LLMJudge(provider="anthropic", api_key="test-key", client=bad_client)
         task = BenchTask(
-            task_id="test-err", description="test",
-            content="Content", content_type="text", max_chars=100,
+            task_id="test-err",
+            description="test",
+            content="Content",
+            content_type="text",
+            max_chars=100,
         )
         result = await judge.score(task, "compressed")
         assert result.error is not None
@@ -1853,9 +1991,16 @@ class TestLLMJudge:
         """score_batch processes multiple tasks."""
         judge = LLMJudge(provider="anthropic", api_key="test-key", client=mock_anthropic_client)
         tasks = [
-            (BenchTask(task_id=f"batch-{i}", description="test",
-                       content=f"Content {i}", content_type="text", max_chars=100),
-             f"Compressed {i}")
+            (
+                BenchTask(
+                    task_id=f"batch-{i}",
+                    description="test",
+                    content=f"Content {i}",
+                    content_type="text",
+                    max_chars=100,
+                ),
+                f"Compressed {i}",
+            )
             for i in range(3)
         ]
         results = await judge.score_batch(tasks)
@@ -1865,9 +2010,11 @@ class TestLLMJudge:
     def test_parse_markdown_fenced_json(self, mock_anthropic_client):
         """Parser handles markdown code fences around JSON."""
         judge = LLMJudge(provider="anthropic", api_key="test-key", client=mock_anthropic_client)
-        raw = '```json\n{"factual_completeness": {"score": 7.0, "reasoning": "ok"}, ' \
-              '"structural_coherence": {"score": 6.0, "reasoning": "ok"}, ' \
-              '"answer_sufficiency": {"score": 8.0, "reasoning": "ok"}, "overall": 7.0}\n```'
+        raw = (
+            '```json\n{"factual_completeness": {"score": 7.0, "reasoning": "ok"}, '
+            '"structural_coherence": {"score": 6.0, "reasoning": "ok"}, '
+            '"answer_sufficiency": {"score": 8.0, "reasoning": "ok"}, "overall": 7.0}\n```'
+        )
         overall, dims = judge._parse_score_response(raw)
         assert overall == 7.0
         assert len(dims) == 3
@@ -2164,9 +2311,7 @@ class TestExpandedDatasets:
         for t in large_doc_tasks():
             result = harness.run_stm(t)
             if result.stage_metrics:
-                assert result.stage_metrics.total_reduction < 1.0, (
-                    f"{t.task_id}: no compression"
-                )
+                assert result.stage_metrics.total_reduction < 1.0, f"{t.task_id}: no compression"
 
     def test_surfacing_expanded_tasks(self, cleaner, truncate, judge):
         """Expanded surfacing tasks have surfacing memories."""
@@ -2183,12 +2328,12 @@ class TestExpandedDatasets:
                 for i, m in enumerate(task.surfacing_memories)
             ]
             config = _make_surfacing_config()
-            engine = SurfacingEngine(
-                config=config, mcp_adapter=_make_mcp_adapter(memories)
-            )
+            engine = SurfacingEngine(config=config, mcp_adapter=_make_mcp_adapter(memories))
             h = BenchHarness(
-                cleaner=cleaner, compressor=truncate,
-                surfacing_engine=engine, judge=judge,
+                cleaner=cleaner,
+                compressor=truncate,
+                surfacing_engine=engine,
+                judge=judge,
             )
             value = await h.measure_surfacing_value(task)
             assert value.qa_delta > 0, f"{task.task_id}: surfacing added no QA answers"

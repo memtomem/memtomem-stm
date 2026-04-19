@@ -61,10 +61,14 @@ def _make_config(**overrides) -> SurfacingConfig:
     return SurfacingConfig(**defaults)
 
 
-def _make_mcp_adapter(results: list[FakeSearchResult] | None = None):
+def _make_mcp_adapter(
+    results: list[FakeSearchResult] | None = None,
+    *,
+    hints: list[str] | None = None,
+):
     """Build a mock McpClientSearchAdapter that returns the given results."""
     adapter = AsyncMock()
-    adapter.search = AsyncMock(return_value=(results or [], {}))
+    adapter.search = AsyncMock(return_value=(results or [], hints or []))
     return adapter
 
 
@@ -1254,3 +1258,102 @@ class TestWebhookExceptionPaths:
             "Webhook fire-and-forget task failed" in rec.message for rec in caplog.records
         ), "cancelled tasks must not be logged as failures"
         assert len(engine._background_tasks) == 0
+
+
+class TestLtmHintsObservability:
+    """B3 — parent trust-UX hints are surfaced to operators via INFO log and
+    optional TokenTracker snapshot; they are NOT forwarded to the downstream
+    agent (prepend body is unchanged). See B3 plan § 'forward hints'."""
+
+    async def test_hints_logged_at_info_when_non_empty(self, caplog):
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(), score=0.5)],
+                hints=["2 results filtered by namespace"],
+            ),
+        )
+        with caplog.at_level("INFO", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        matching = [r for r in caplog.records if "LTM hints for" in r.message]
+        assert len(matching) == 1
+        assert matching[0].levelname == "INFO"
+        assert "2 results filtered" in matching[0].message
+
+    async def test_no_log_when_hints_empty(self, caplog):
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(), score=0.5)],
+                hints=[],
+            ),
+        )
+        with caplog.at_level("INFO", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert not any("LTM hints for" in r.message for r in caplog.records)
+
+    async def test_hints_logged_even_when_results_empty(self, caplog):
+        """Operator-observability fires independently of result filtering —
+        a "3 filtered before you got here" hint matters even when SURFACE
+        ultimately injects nothing."""
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                results=[],
+                hints=["All 5 candidates below min_score"],
+            ),
+        )
+        with caplog.at_level("INFO", logger="memtomem_stm.surfacing.engine"):
+            out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # Prepend body unchanged — hints are not forwarded to downstream.
+        assert out == LONG_RESPONSE
+        assert any(
+            "LTM hints for" in r.message and "below min_score" in r.message for r in caplog.records
+        )
+
+    async def test_hints_forwarded_to_token_tracker_when_provided(self):
+        tracker = MagicMock()
+        tracker.record_hints = MagicMock()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(), score=0.5)],
+                hints=["notice A", "notice B"],
+            ),
+            token_tracker=tracker,
+        )
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.record_hints.assert_called_once_with(["notice A", "notice B"])
+
+    async def test_token_tracker_absent_is_not_fatal(self, caplog):
+        """Engine must log INFO even when no tracker is wired — observability
+        path degrades open, never crashes a proxy response."""
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(), score=0.5)],
+                hints=["standalone notice"],
+            ),
+            token_tracker=None,
+        )
+        with caplog.at_level("INFO", logger="memtomem_stm.surfacing.engine"):
+            out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # Response still normal, log still fired.
+        assert "Relevant Memories" in out or out == LONG_RESPONSE
+        assert any("LTM hints for" in r.message for r in caplog.records)
+
+    async def test_token_tracker_failure_is_swallowed(self, caplog):
+        """A misbehaving tracker must not break the proxy response path."""
+        tracker = MagicMock()
+        tracker.record_hints = MagicMock(side_effect=RuntimeError("tracker boom"))
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(), score=0.5)],
+                hints=["notice"],
+            ),
+            token_tracker=tracker,
+        )
+        # Must not raise
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out is not None

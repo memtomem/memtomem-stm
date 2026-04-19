@@ -68,14 +68,14 @@ class TestReconnectRetrySuccess:
         # hits the same mock.
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, stats = await adapter.search("anything")
+        results, hints = await adapter.search("anything")
 
         adapter._reconnect.assert_awaited_once()
         assert mock_session.call_tool.await_count == 2
         assert len(results) == 1
         assert "retry worked" in results[0].chunk.content.lower()
         assert results[0].score == 0.95
-        assert stats is None
+        assert hints == []
 
 
 class TestReconnectRetryFailure:
@@ -93,10 +93,10 @@ class TestReconnectRetryFailure:
 
         adapter._reconnect = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
-        results, stats = await adapter.search("q")
+        results, hints = await adapter.search("q")
 
         assert results == []
-        assert stats is None
+        assert hints == []
         adapter._reconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -112,10 +112,10 @@ class TestReconnectRetryFailure:
         adapter._session = mock_session
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, stats = await adapter.search("q")
+        results, hints = await adapter.search("q")
 
         assert results == []
-        assert stats is None
+        assert hints == []
         assert mock_session.call_tool.await_count == 2
 
 
@@ -133,10 +133,10 @@ class TestNonTransportErrorsDoNotReconnect:
         adapter._session = mock_session
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, stats = await adapter.search("q")
+        results, hints = await adapter.search("q")
 
         assert results == []
-        assert stats is None
+        assert hints == []
         adapter._reconnect.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -246,8 +246,9 @@ class TestNegotiationDowngradeAffectsParsing:
 
         # Post: downgraded, and the downgraded parser handles compact text.
         compact = "[1] 0.42 | [default] a/b.md\nHello from compact.\n"
-        results = adapter._parser.parse(compact)
+        results, hints = adapter._parser.parse(compact)
         assert len(results) == 1
+        assert hints == []
         assert results[0].score == 0.42
         assert "Hello from compact" in results[0].chunk.content
 
@@ -271,9 +272,9 @@ class TestNoneContentDefense:
         mock_session.call_tool = AsyncMock(return_value=bad)
         adapter._session = mock_session
 
-        results, stats = await adapter.search("anything")
+        results, hints = await adapter.search("anything")
         assert results == []
-        assert stats is None
+        assert hints == []
 
     @pytest.mark.asyncio
     async def test_scratch_list_returns_empty_when_content_is_none(self):

@@ -42,9 +42,16 @@ class RemoteSearchResult:
 
 
 class ResultParser:
-    """Strategy interface for parsing mem_search text output."""
+    """Strategy interface for parsing mem_search text output.
 
-    def parse(self, text: str) -> list[RemoteSearchResult]:
+    Returns a ``(results, hints)`` tuple. ``hints`` carries parent-side
+    trust-UX annotations (parent commit ``7d184f1``, PR #231) when the
+    structured format is in use; compact format always returns ``[]``.
+    The hints list is opportunistic — parent is alpha, the field may be
+    renamed or removed, so callers must tolerate an empty list silently.
+    """
+
+    def parse(self, text: str) -> tuple[list[RemoteSearchResult], list[str]]:
         raise NotImplementedError
 
 
@@ -56,12 +63,16 @@ _FIRST_TOKEN_RE = re.compile(r"(\S+)")
 
 
 class CompactResultParser(ResultParser):
-    """Parse core's compact format: ``[rank] score | source > hierarchy``."""
+    """Parse core's compact format: ``[rank] score | source > hierarchy``.
 
-    def parse(self, text: str) -> list[RemoteSearchResult]:
+    The compact format carries no hints channel; the second tuple slot is
+    always an empty list.
+    """
+
+    def parse(self, text: str) -> tuple[list[RemoteSearchResult], list[str]]:
         results: list[RemoteSearchResult] = []
         if not text or not text.strip():
-            return results
+            return results, []
 
         blocks = _BLOCK_SPLIT_RE.split(text)
 
@@ -108,25 +119,34 @@ class CompactResultParser(ResultParser):
                     )
                 )
 
-        return results
+        return results, []
 
 
 class StructuredResultParser(ResultParser):
     """Parse core's structured JSON format: ``{"results": [...]}``.
 
-    Each element contains ``rank``, ``score``, ``source``, ``hierarchy``,
-    ``namespace``, ``chunk_id``, and ``content`` fields.
+    Each ``results`` element contains ``rank``, ``score``, ``source``,
+    ``hierarchy``, ``namespace``, ``chunk_id``, and ``content`` fields.
+    An optional top-level ``hints`` list carries parent-side trust-UX
+    annotations (parent commit ``7d184f1``, PR #231). Hints are read
+    opportunistically via ``data.get("hints", [])`` — the field is not
+    asserted on and its absence degrades silently to an empty list.
     """
 
-    def parse(self, text: str) -> list[RemoteSearchResult]:
+    def parse(self, text: str) -> tuple[list[RemoteSearchResult], list[str]]:
         if not text or not text.strip():
-            return []
+            return [], []
 
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, TypeError):
             logger.warning("StructuredResultParser: invalid JSON, falling back to empty")
-            return []
+            return [], []
+
+        raw_hints = data.get("hints", [])
+        hints: list[str] = (
+            [str(h) for h in raw_hints if isinstance(h, str)] if isinstance(raw_hints, list) else []
+        )
 
         raw_results = data.get("results", [])
         results: list[RemoteSearchResult] = []
@@ -152,7 +172,7 @@ class StructuredResultParser(ResultParser):
                 result.chunk.id = chunk_id
             results.append(result)
 
-        return results
+        return results, hints
 
 
 def get_parser(fmt: str = "compact") -> ResultParser:
@@ -260,10 +280,17 @@ class McpClientSearchAdapter:
         *,
         trace_id: str | None = None,
         **kwargs: Any,
-    ) -> tuple[list[RemoteSearchResult], object]:
-        """Call mem_search on the remote server and parse results."""
+    ) -> tuple[list[RemoteSearchResult], list[str]]:
+        """Call mem_search on the remote server and parse results.
+
+        Returns ``(results, hints)``. ``hints`` carries parent-side
+        trust-UX annotations from the structured format (parent PR #231)
+        and is always ``[]`` for the compact format or when the call
+        fails. Callers that do not care about hints should still accept
+        the tuple to stay compatible with mypy's inferred signature.
+        """
         if self._session is None:
-            return [], None
+            return [], []
 
         args: dict[str, Any] = {"query": query}
         if top_k is not None:
@@ -288,20 +315,20 @@ class McpClientSearchAdapter:
                 result = await self._session.call_tool("mem_search", args)  # type: ignore[union-attr]
             except Exception as retry_exc:
                 logger.debug("MCP mem_search failed after reconnect: %s", retry_exc)
-                return [], None
+                return [], []
         except Exception as exc:
             logger.debug("MCP mem_search failed: %s", exc)
-            return [], None
+            return [], []
 
         # Parse text response into results
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
         text_parts = [c.text or "" for c in (result.content or []) if c.type == "text"]
         if not text_parts:
-            return [], None
+            return [], []
 
         text = "\n".join(text_parts)
-        return self._parser.parse(text), None
+        return self._parser.parse(text)
 
     async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:
         """Boost the access_count of the given chunks via mem_do(increment_access).
@@ -455,5 +482,8 @@ class McpClientSearchAdapter:
 
         Delegates to :class:`CompactResultParser`. Kept as a static method
         for backward compatibility with existing tests and callers.
+        Compact parser never emits hints; this helper drops the second
+        tuple slot and returns only the results list.
         """
-        return _compact_parser.parse(text)
+        results, _ = _compact_parser.parse(text)
+        return results

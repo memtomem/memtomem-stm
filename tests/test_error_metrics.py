@@ -44,8 +44,13 @@ class TestCallMetricsErrorFields:
 
     def test_error_fields(self):
         m = CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.PROTOCOL, error_code=-32601,
+            server="s",
+            tool="t",
+            original_chars=0,
+            compressed_chars=0,
+            is_error=True,
+            error_category=ErrorCategory.PROTOCOL,
+            error_code=-32601,
         )
         assert m.is_error is True
         assert m.error_category == ErrorCategory.PROTOCOL
@@ -58,50 +63,136 @@ class TestCallMetricsErrorFields:
 class TestTokenTrackerRecordError:
     def test_record_error_increments_total(self):
         tracker = TokenTracker()
-        tracker.record_error(CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.TRANSPORT,
-        ))
+        tracker.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TRANSPORT,
+            )
+        )
         assert tracker._total_errors == 1
 
     def test_record_error_by_category(self):
         tracker = TokenTracker()
-        tracker.record_error(CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.TRANSPORT,
-        ))
-        tracker.record_error(CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.TRANSPORT,
-        ))
-        tracker.record_error(CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.PROTOCOL,
-        ))
+        tracker.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TRANSPORT,
+            )
+        )
+        tracker.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TRANSPORT,
+            )
+        )
+        tracker.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.PROTOCOL,
+            )
+        )
         assert tracker._errors_by_category["transport"] == 2
         assert tracker._errors_by_category["protocol"] == 1
 
     def test_record_error_by_server(self):
         tracker = TokenTracker()
-        tracker.record_error(CallMetrics(
-            server="srv1", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.TIMEOUT,
-        ))
-        tracker.record_error(CallMetrics(
-            server="srv2", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.TIMEOUT,
-        ))
+        tracker.record_error(
+            CallMetrics(
+                server="srv1",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TIMEOUT,
+            )
+        )
+        tracker.record_error(
+            CallMetrics(
+                server="srv2",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TIMEOUT,
+            )
+        )
         assert tracker._errors_by_server["srv1"] == 1
         assert tracker._errors_by_server["srv2"] == 1
 
     def test_record_error_none_category(self):
         tracker = TokenTracker()
-        tracker.record_error(CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True,
-        ))
+        tracker.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+            )
+        )
         assert tracker._total_errors == 1
         assert len(tracker._errors_by_category) == 0
+
+
+# ── TokenTracker.record_hints (B3 — parent trust-UX forwarding) ──────────
+
+
+class TestTokenTrackerRecordHints:
+    def test_record_hints_increments_events_and_snapshots(self):
+        tracker = TokenTracker()
+        tracker.record_hints(["first notice", "second notice"])
+        assert tracker._total_hint_events == 1
+        assert tracker._last_hints == ["first notice", "second notice"]
+
+    def test_record_hints_empty_is_noop(self):
+        tracker = TokenTracker()
+        tracker.record_hints([])
+        assert tracker._total_hint_events == 0
+        assert tracker._last_hints == []
+
+    def test_record_hints_overwrites_snapshot(self):
+        tracker = TokenTracker()
+        tracker.record_hints(["call 1 hint"])
+        tracker.record_hints(["call 2 hint A", "call 2 hint B"])
+        assert tracker._total_hint_events == 2
+        assert tracker._last_hints == ["call 2 hint A", "call 2 hint B"]
+
+    def test_record_hints_stores_defensive_copy(self):
+        """Caller-owned list mutations must not bleed into the snapshot."""
+        tracker = TokenTracker()
+        hints = ["only hint"]
+        tracker.record_hints(hints)
+        hints.append("mutated after call")
+        assert tracker._last_hints == ["only hint"]
+
+    def test_get_summary_exposes_hints(self):
+        tracker = TokenTracker()
+        tracker.record_hints(["visible"])
+        summary = tracker.get_summary()
+        assert summary["total_hint_events"] == 1
+        assert summary["last_hints"] == ["visible"]
+
+    def test_get_summary_hints_defaults_when_none(self):
+        tracker = TokenTracker()
+        summary = tracker.get_summary()
+        assert summary["total_hint_events"] == 0
+        assert summary["last_hints"] == []
 
 
 # ── get_summary error fields ─────────────────────────────────────────────
@@ -119,12 +210,20 @@ class TestSummaryErrorFields:
         tracker = TokenTracker()
         # 3 successful calls
         for _ in range(3):
-            tracker.record(CallMetrics(server="s", tool="t", original_chars=100, compressed_chars=50))
+            tracker.record(
+                CallMetrics(server="s", tool="t", original_chars=100, compressed_chars=50)
+            )
         # 1 error
-        tracker.record_error(CallMetrics(
-            server="s", tool="t", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.TRANSPORT,
-        ))
+        tracker.record_error(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.TRANSPORT,
+            )
+        )
         s = tracker.get_summary()
         assert s["total_calls"] == 3
         assert s["total_errors"] == 1
@@ -134,10 +233,16 @@ class TestSummaryErrorFields:
     def test_all_errors(self):
         tracker = TokenTracker()
         for _ in range(5):
-            tracker.record_error(CallMetrics(
-                server="s", tool="t", original_chars=0, compressed_chars=0,
-                is_error=True, error_category=ErrorCategory.TIMEOUT,
-            ))
+            tracker.record_error(
+                CallMetrics(
+                    server="s",
+                    tool="t",
+                    original_chars=0,
+                    compressed_chars=0,
+                    is_error=True,
+                    error_category=ErrorCategory.TIMEOUT,
+                )
+            )
         s = tracker.get_summary()
         assert s["error_rate"] == 100.0
         assert s["errors_by_category"] == {"timeout": 5}
@@ -159,6 +264,7 @@ class TestMetricsStoreMigration:
     def test_existing_db_migrated(self, tmp_path):
         """Pre-existing DB without error columns gets migrated."""
         import sqlite3
+
         db_path = tmp_path / "old.db"
         conn = sqlite3.connect(str(db_path))
         conn.execute(
@@ -180,10 +286,17 @@ class TestMetricsStoreMigration:
     def test_record_with_error_fields(self, tmp_path):
         store = MetricsStore(tmp_path / "test.db")
         store.initialize()
-        store.record(CallMetrics(
-            server="srv", tool="tool", original_chars=0, compressed_chars=0,
-            is_error=True, error_category=ErrorCategory.PROTOCOL, error_code=-32601,
-        ))
+        store.record(
+            CallMetrics(
+                server="srv",
+                tool="tool",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.PROTOCOL,
+                error_code=-32601,
+            )
+        )
         row = store._db.execute(
             "SELECT is_error, error_category, error_code FROM proxy_metrics"
         ).fetchone()
@@ -193,9 +306,14 @@ class TestMetricsStoreMigration:
     def test_record_success_has_defaults(self, tmp_path):
         store = MetricsStore(tmp_path / "test.db")
         store.initialize()
-        store.record(CallMetrics(
-            server="srv", tool="tool", original_chars=100, compressed_chars=50,
-        ))
+        store.record(
+            CallMetrics(
+                server="srv",
+                tool="tool",
+                original_chars=100,
+                compressed_chars=50,
+            )
+        )
         row = store._db.execute(
             "SELECT is_error, error_category, error_code FROM proxy_metrics"
         ).fetchone()
@@ -216,8 +334,10 @@ def _make_result(text: str, is_error: bool = False):
 
 def _make_manager(max_retries: int = 0) -> ProxyManager:
     server_cfg = UpstreamServerConfig(
-        prefix="test", compression=CompressionStrategy.NONE,
-        max_result_chars=50000, max_retries=max_retries,
+        prefix="test",
+        compression=CompressionStrategy.NONE,
+        max_result_chars=50000,
+        max_retries=max_retries,
         reconnect_delay_seconds=0.0,
     )
     proxy_cfg = ProxyConfig(
@@ -227,7 +347,10 @@ def _make_manager(max_retries: int = 0) -> ProxyManager:
     mgr = ProxyManager(proxy_cfg, TokenTracker())
     session = AsyncMock()
     mgr._connections["srv"] = UpstreamConnection(
-        name="srv", config=server_cfg, session=session, tools=[],
+        name="srv",
+        config=server_cfg,
+        session=session,
+        tools=[],
     )
     return mgr
 

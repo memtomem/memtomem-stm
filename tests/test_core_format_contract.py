@@ -256,20 +256,21 @@ class TestParserStrategy:
             NO_RESULTS,
             ERROR_RESPONSE,
         ]:
-            strategy_results = parser.parse(text)
+            strategy_results, strategy_hints = parser.parse(text)
             static_results = McpClientSearchAdapter._parse_results(text)
             assert len(strategy_results) == len(static_results)
+            assert strategy_hints == []
             for s, st in zip(strategy_results, static_results):
                 assert s.score == st.score
                 assert s.chunk.content == st.chunk.content
 
     def test_structured_parser_returns_empty_for_invalid_json(self):
-        """StructuredResultParser.parse() returns [] for non-JSON input."""
+        """StructuredResultParser.parse() returns ([], []) for non-JSON input."""
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser
 
         parser = StructuredResultParser()
-        assert parser.parse("not json") == []
-        assert parser.parse("") == []
+        assert parser.parse("not json") == ([], [])
+        assert parser.parse("") == ([], [])
 
     def test_adapter_uses_configured_parser(self):
         """McpClientSearchAdapter respects config.result_format."""
@@ -298,8 +299,9 @@ class TestStructuredFormatSnapshots:
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser
 
         parser = StructuredResultParser()
-        results = parser.parse(STRUCTURED_TWO_RESULTS)
+        results, hints = parser.parse(STRUCTURED_TWO_RESULTS)
         assert len(results) == 2
+        assert hints == []
         assert results[0].score == pytest.approx(0.92)
         assert results[1].score == pytest.approx(0.87)
         assert "auth.md" in str(results[0].chunk.metadata.source_file)
@@ -321,25 +323,136 @@ STRUCTURED_NO_RESULTS_WITH_HINTS = (
     '{"results": [], "hints": ['
     '"No results match your filters (3 results found before filtering). '
     'Try broader filters or remove source_filter/tag_filter."'
-    ']}'
+    "]}"
 )
 
 
 class TestStructuredEmptyResults:
     """StructuredResultParser tolerates parent PR #231's empty-result JSON
-    in both the bare and hints-augmented shapes."""
+    in both the bare and hints-augmented shapes, and exposes hints to
+    callers for operator-visible observability (B3)."""
 
     def test_structured_parser_returns_empty_without_hints(self):
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser
 
         parser = StructuredResultParser()
-        assert parser.parse(STRUCTURED_NO_RESULTS_PLAIN) == []
+        results, hints = parser.parse(STRUCTURED_NO_RESULTS_PLAIN)
+        assert results == []
+        assert hints == []
 
     def test_structured_parser_returns_empty_with_hints(self):
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser
 
         parser = StructuredResultParser()
-        assert parser.parse(STRUCTURED_NO_RESULTS_WITH_HINTS) == []
+        results, hints = parser.parse(STRUCTURED_NO_RESULTS_WITH_HINTS)
+        assert results == []
+        assert len(hints) == 1
+        assert "No results match your filters" in hints[0]
+
+    def test_structured_parser_hints_non_list_is_empty(self):
+        """Alpha tolerance: parent may future-rename ``hints``, emit a
+        dict, or drop the field. Non-list values must degrade silently
+        to an empty list."""
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        parser = StructuredResultParser()
+        for payload in (
+            '{"results": [], "hints": "oops not a list"}',
+            '{"results": [], "hints": {"msg": "still wrong"}}',
+            '{"results": [], "hints": null}',
+            '{"results": []}',
+        ):
+            results, hints = parser.parse(payload)
+            assert results == []
+            assert hints == []
+
+    def test_structured_parser_hints_with_results(self):
+        """Hints can accompany non-empty results too (e.g. "3 filtered")."""
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        payload = (
+            '{"results": ['
+            '  {"rank": 1, "score": 0.5, "source": "a.md", "hierarchy": "X",'
+            '   "namespace": "default", "chunk_id": "c1", "content": "hit"}'
+            '], "hints": ["2 additional results hidden by namespace filter"]}'
+        )
+        parser = StructuredResultParser()
+        results, hints = parser.parse(payload)
+        assert len(results) == 1
+        assert hints == ["2 additional results hidden by namespace filter"]
+
+    def test_structured_parser_drops_non_string_hints(self):
+        """Guard against mixed-type hint arrays (defensive, parent is alpha)."""
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        payload = '{"results": [], "hints": ["ok", 42, null, {"x": 1}, "also ok"]}'
+        parser = StructuredResultParser()
+        results, hints = parser.parse(payload)
+        assert results == []
+        assert hints == ["ok", "also ok"]
+
+
+class TestAdapterHintsFlow:
+    """End-to-end through ``McpClientSearchAdapter.search`` — hints arrive
+    at the caller exactly as the parent emits them (B3)."""
+
+    @pytest.mark.asyncio
+    async def test_search_returns_hints_from_structured_payload(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        mock_session = AsyncMock()
+        mock_content = MagicMock()
+        mock_content.type = "text"
+        mock_content.text = STRUCTURED_NO_RESULTS_WITH_HINTS
+        mock_result = MagicMock()
+        mock_result.content = [mock_content]
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+        adapter._session = mock_session
+
+        results, hints = await adapter.search("q")
+        assert results == []
+        assert len(hints) == 1
+        assert "No results match your filters" in hints[0]
+
+    @pytest.mark.asyncio
+    async def test_search_returns_empty_hints_for_compact_format(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        mock_session = AsyncMock()
+        mock_content = MagicMock()
+        mock_content.type = "text"
+        mock_content.text = COMPACT_TWO_RESULTS
+        mock_result = MagicMock()
+        mock_result.content = [mock_content]
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+        adapter._session = mock_session
+
+        results, hints = await adapter.search("q")
+        assert len(results) == 2
+        assert hints == []
+
+    @pytest.mark.asyncio
+    async def test_search_returns_empty_hints_on_transport_error(self):
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock
+
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        mock_session = AsyncMock()
+        mock_session.call_tool.side_effect = ConnectionError("lost")
+        adapter._session = mock_session
+        adapter.start = AsyncMock(side_effect=_asyncio.TimeoutError())  # type: ignore[method-assign]
+
+        results, hints = await adapter.search("q")
+        assert results == []
+        assert hints == []
 
 
 class TestOutputFormatForwarding:
@@ -397,10 +510,12 @@ class TestFormatNegotiation:
         version_result = MagicMock()
         version_content = MagicMock()
         version_content.type = "text"
-        version_content.text = json.dumps({
-            "version": "0.3.0",
-            "capabilities": {"search_formats": ["compact", "structured"]},
-        })
+        version_content.text = json.dumps(
+            {
+                "version": "0.3.0",
+                "capabilities": {"search_formats": ["compact", "structured"]},
+            }
+        )
         version_result.content = [version_content]
         mock_session.call_tool = AsyncMock(return_value=version_result)
         adapter._session = mock_session
@@ -421,10 +536,12 @@ class TestFormatNegotiation:
         version_result = MagicMock()
         version_content = MagicMock()
         version_content.type = "text"
-        version_content.text = json.dumps({
-            "version": "0.2.0",
-            "capabilities": {"search_formats": ["compact"]},
-        })
+        version_content.text = json.dumps(
+            {
+                "version": "0.2.0",
+                "capabilities": {"search_formats": ["compact"]},
+            }
+        )
         version_result.content = [version_content]
         mock_session.call_tool = AsyncMock(return_value=version_result)
         adapter._session = mock_session

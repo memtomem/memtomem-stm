@@ -138,6 +138,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         config.surfacing,
                         mcp_adapter=mcp_adapter,
                         feedback_tracker=feedback_tracker,
+                        token_tracker=tracker,
                     )
 
             # Response cache
@@ -303,6 +304,14 @@ async def stm_proxy_stats(
     prog_cont = summary.get("progressive_continuations", 0)
     if prog_first > 0:
         lines.append(f"\nProgressive:     {prog_first} first chunks, {prog_cont} continuations")
+
+    # LTM trust-UX hints (parent PR #231). Quiet when the parent never sent any.
+    hint_events = summary.get("total_hint_events", 0)
+    if hint_events > 0:
+        last_hints = summary.get("last_hints", [])
+        lines.append(f"\nLTM hints:       {hint_events} event(s)")
+        for h in last_hints:
+            lines.append(f"  last: {h}")
 
     if summary["by_server"]:
         lines.append("\nBy server:")

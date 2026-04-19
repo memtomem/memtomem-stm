@@ -65,7 +65,7 @@ def _make_config(**overrides) -> SurfacingConfig:
 
 def _make_mcp_adapter(results=None):
     adapter = AsyncMock()
-    adapter.search = AsyncMock(return_value=(results or [], {}))
+    adapter.search = AsyncMock(return_value=(results or [], []))
     return adapter
 
 
@@ -197,9 +197,7 @@ class TestCrossSessionDedup:
         # Simulate previous session: mark chunk_old as seen
         store.mark_surfaced([chunk_old.id])
 
-        tracker = FeedbackTracker(
-            config=_make_config(), db_path=tmp_path / "feedback.db"
-        )
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "feedback.db")
 
         results = [
             FakeSearchResult(chunk=chunk_old, score=0.5),
@@ -225,9 +223,7 @@ class TestCrossSessionDedup:
 
     async def test_engine_persists_new_ids(self, tmp_path):
         """After surfacing, new memory IDs are persisted for future sessions."""
-        tracker = FeedbackTracker(
-            config=_make_config(), db_path=tmp_path / "feedback.db"
-        )
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "feedback.db")
 
         chunk = FakeChunk(content="surfaced now")
         results = [FakeSearchResult(chunk=chunk, score=0.5)]

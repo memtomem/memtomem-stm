@@ -386,9 +386,9 @@ class TestMcpClientSearchAdapter:
         from memtomem_stm.surfacing.config import SurfacingConfig
 
         adapter = McpClientSearchAdapter(SurfacingConfig())
-        results, stats = await adapter.search("test query")
+        results, hints = await adapter.search("test query")
         assert results == []
-        assert stats is None
+        assert hints == []
 
     @pytest.mark.asyncio
     async def test_search_calls_mem_search(self) -> None:
@@ -425,9 +425,9 @@ class TestMcpClientSearchAdapter:
         # Prevent reconnect from hitting a real server
         adapter.start = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
-        results, stats = await adapter.search("query")
+        results, hints = await adapter.search("query")
         assert results == []
-        assert stats is None
+        assert hints == []
 
     @pytest.mark.asyncio
     async def test_search_timeout_triggers_reconnect(self) -> None:
@@ -442,7 +442,8 @@ class TestMcpClientSearchAdapter:
 
         adapter._reconnect = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
-        results, stats = await adapter.search("query")
+        results, hints = await adapter.search("query")
         assert results == []
+        assert hints == []
         # Reconnect was attempted (TimeoutError treated as transport error)
         adapter._reconnect.assert_awaited_once()

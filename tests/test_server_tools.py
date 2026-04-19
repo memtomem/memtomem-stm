@@ -111,6 +111,24 @@ class TestProxyStats:
         result_on = await stm_proxy_stats(ctx=ctx_on)
         assert "Surfacing: enabled" in result_on
 
+    async def test_hints_section_appears_when_events_recorded(self):
+        """B3 — when parent emitted trust-UX hints during the run, the
+        stats output shows an ``LTM hints`` section with the latest
+        snapshot. Quiet when zero events."""
+        tracker = TokenTracker()
+        tracker.record_hints(["2 results filtered by namespace"])
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "LTM hints:" in result
+        assert "1 event(s)" in result
+        assert "2 results filtered by namespace" in result
+
+    async def test_hints_section_omitted_when_no_events(self):
+        tracker = TokenTracker()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "LTM hints:" not in result
+
 
 # ── stm_proxy_select_chunks ──────────────────────────────────────────────
 
