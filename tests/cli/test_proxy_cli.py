@@ -1249,6 +1249,65 @@ class TestInitImportFlow:
         assert "No servers selected" in result.output
         assert not config.exists()
 
+    def test_non_default_config_surfaces_management_hint(self, runner, config, monkeypatch):
+        """When `--config` deviates from ``~/.memtomem/stm_proxy.json``
+        the tail of the output must print ``mms list --config <path>``
+        / ``mms health --config <path>`` so the user doesn't get tripped
+        up by ``mms list`` silently reading the empty default config.
+        Caught during dogfooding with a throwaway ``/tmp/*.json`` test
+        path — the gap was confusing."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "only",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "c"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Manage this config:" in result.output
+        # Hints must name the actual resolved path so the user can copy
+        # them verbatim — no ``{path}`` placeholder leakage.
+        assert f"mms list --config {config.resolve()}" in result.output
+        assert f"mms health --config {config.resolve()}" in result.output
+
+    def test_default_config_does_not_show_management_hint(self, runner, tmp_path, monkeypatch):
+        """Inverse of the above: when the user accepts the default
+        config path, the hint is noise and should not print. We stub
+        ``_DEFAULT_CONFIG`` to a tmp path so this test can match the
+        "default" case without actually writing to the user's real
+        ``~/.memtomem/stm_proxy.json``."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        fake_default = tmp_path / "default_stm_proxy.json"
+        monkeypatch.setattr(proxy_mod, "_DEFAULT_CONFIG", fake_default)
+
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "only",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "c"},
+                },
+            ],
+        )
+        # Invoke without --config so the command picks up the (patched) default.
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--config", str(fake_default)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Manage this config:" not in result.output
+
     def test_import_prompts_prefix_per_pick(self, runner, config, monkeypatch):
         """User-entered prefix overrides the suggested default, and each
         selected server gets its own prompt."""

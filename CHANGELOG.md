@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **`mms init` imports MCP servers from existing clients** (#194) — scans `./.mcp.json`, `~/.claude.json` (user + per-project scope), and Claude Desktop's macOS config, then offers a TUI multi-select (Enter toggles, scroll to Confirm; ↑↓ / j/k / Ctrl+N/P all supported). For each pick the user only confirms a prefix — transport/command/args/url/env are imported as-is. Self-reference filter blocks `mms` / `memtomem-stm` / `memtomem` / `memtomem-server` entries (including `uvx --from memtomem …` shape) so users can't accidentally proxy STM through itself or double-register the LTM companion. Dangerous env keys (`LD_PRELOAD`, `NODE_OPTIONS`, etc.) are stripped during import, matching `mms add --env` policy. Non-TTY / `MMS_NO_TUI=1` / piped stdin fall back to a comma-number prompt so CI and scripted installs still work. Adds `questionary>=2.0` runtime dep.
+- **`mms init` surfaces `--config` management hints on non-default paths** — after saving to a path other than `~/.memtomem/stm_proxy.json`, the output now prints `mms list --config <path>` / `mms health --config <path>` so subsequent management commands don't silently read the empty default config. Reported during dogfooding with throwaway `/tmp/*.json` test paths.
+
 ## [0.1.9] — 2026-04-19
 
 ### Added

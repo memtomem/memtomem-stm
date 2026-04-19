@@ -903,6 +903,16 @@ def init(config_path: str, no_validate: bool) -> None:
     for n, e in imported.items():
         click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
 
+    # Non-default ``--config`` paths: surface the flag in the management
+    # hints so ``mms list`` / ``mms health`` don't silently read the empty
+    # default config and confuse the user (reported after first dogfooding
+    # with a throwaway ``/tmp/*.json`` test path).
+    if resolved != _DEFAULT_CONFIG.expanduser().resolve():
+        click.echo("")
+        click.echo(f"  {_hdr('Manage this config:')}")
+        click.echo(f"    mms list --config {resolved}")
+        click.echo(f"    mms health --config {resolved}")
+
     click.echo("")
     click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")
     click.echo("")
