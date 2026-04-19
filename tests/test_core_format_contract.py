@@ -309,6 +309,39 @@ class TestStructuredFormatSnapshots:
         assert results[1].chunk.id == "def456"
 
 
+# Parent PR #231 (7d184f1, 2026-04-18): mem_search(output_format="structured")
+# now returns JSON on empty results instead of the plain "No results found."
+# text. We pin only ``results == []`` — parent is alpha (Development Status
+# :: 3 - Alpha) and the ``hints`` field is opportunistic, so a future rename
+# or removal upstream must not block STM.
+
+STRUCTURED_NO_RESULTS_PLAIN = '{"results": []}'
+
+STRUCTURED_NO_RESULTS_WITH_HINTS = (
+    '{"results": [], "hints": ['
+    '"No results match your filters (3 results found before filtering). '
+    'Try broader filters or remove source_filter/tag_filter."'
+    ']}'
+)
+
+
+class TestStructuredEmptyResults:
+    """StructuredResultParser tolerates parent PR #231's empty-result JSON
+    in both the bare and hints-augmented shapes."""
+
+    def test_structured_parser_returns_empty_without_hints(self):
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        parser = StructuredResultParser()
+        assert parser.parse(STRUCTURED_NO_RESULTS_PLAIN) == []
+
+    def test_structured_parser_returns_empty_with_hints(self):
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        parser = StructuredResultParser()
+        assert parser.parse(STRUCTURED_NO_RESULTS_WITH_HINTS) == []
+
+
 class TestOutputFormatForwarding:
     """Verify output_format is sent to MCP when using structured parser."""
 
