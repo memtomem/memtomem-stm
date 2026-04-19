@@ -62,8 +62,13 @@ class FeedbackTracker:
 
         return f"Feedback recorded: {rating}"
 
-    def get_stats(self, tool: str | None = None) -> dict:
-        return self._store.get_tool_feedback_summary(tool)
+    def get_stats(
+        self,
+        tool: str | None = None,
+        since: float | None = None,
+        limit: int = 10,
+    ) -> dict:
+        return self._store.get_stats(tool=tool, since=since, limit=limit)
 
 
 class AutoTuner:

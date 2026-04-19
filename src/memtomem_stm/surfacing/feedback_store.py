@@ -187,6 +187,143 @@ class FeedbackStore:
             "by_rating": by_rating,
         }
 
+    def get_stats(
+        self,
+        tool: str | None = None,
+        since: float | None = None,
+        limit: int = 10,
+    ) -> dict:
+        """Aggregate surfacing_events + surfacing_feedback for observability.
+
+        Shape mirrors ``CompressionFeedbackStore.get_stats`` in spirit but
+        is wider because surfacing has a richer event record (query,
+        memory_ids, scores). Empty DB / empty filter range returns zeros
+        with all collections empty — callers can rely on keys always
+        being present.
+
+        Args:
+            tool: If set, restrict to one upstream tool.
+            since: Unix timestamp lower bound for ``created_at``.
+            limit: Max rows in the ``recent`` tail (``<=0`` disables).
+        """
+        empty = {
+            "events_total": 0,
+            "distinct_tools": 0,
+            "date_range": {"first": None, "last": None},
+            "per_tool_breakdown": [],
+            "rating_distribution": {},
+            "total_feedback": 0,
+            "recent": [],
+        }
+        if self._db is None:
+            return empty
+
+        event_filters: list[str] = []
+        event_params: list[object] = []
+        if tool is not None:
+            event_filters.append("tool = ?")
+            event_params.append(tool)
+        if since is not None:
+            event_filters.append("created_at >= ?")
+            event_params.append(since)
+        where_sql = (" WHERE " + " AND ".join(event_filters)) if event_filters else ""
+
+        events_total = self._db.execute(
+            f"SELECT COUNT(*) FROM surfacing_events{where_sql}", event_params
+        ).fetchone()[0]
+
+        if events_total == 0:
+            # Still surface feedback with zero events? No — feedback rows
+            # without their parent event in the filter range aren't
+            # meaningful here. Return empty shape.
+            return empty
+
+        distinct_tools = self._db.execute(
+            f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where_sql}", event_params
+        ).fetchone()[0]
+
+        first, last = self._db.execute(
+            f"SELECT MIN(created_at), MAX(created_at) FROM surfacing_events{where_sql}",
+            event_params,
+        ).fetchone()
+
+        # Per-tool: events + average memory_ids length. Average is computed
+        # in Python because memory_ids is JSON-encoded and SQLite's JSON1
+        # extension isn't universally guaranteed on the shipping wheels.
+        rows = self._db.execute(
+            f"SELECT tool, memory_ids FROM surfacing_events{where_sql}", event_params
+        ).fetchall()
+        per_tool: dict[str, dict[str, float]] = {}
+        for tool_name, memory_ids_json in rows:
+            try:
+                ids = json.loads(memory_ids_json)
+                n = len(ids) if isinstance(ids, list) else 0
+            except (json.JSONDecodeError, TypeError):
+                n = 0
+            bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
+            bucket["events"] += 1
+            bucket["sum_memory_count"] += n
+        per_tool_breakdown: list[dict] = [
+            {
+                "tool": t,
+                "events": int(b["events"]),
+                "avg_memory_count": round(b["sum_memory_count"] / b["events"], 2)
+                if b["events"]
+                else 0.0,
+            }
+            for t, b in sorted(per_tool.items(), key=lambda kv: kv[1]["events"], reverse=True)
+        ]
+
+        # Feedback ratings JOINed against the same event filter.
+        rating_join_filter = " AND ".join(f"e.{f}" for f in event_filters)
+        rating_where = (" WHERE " + rating_join_filter) if rating_join_filter else ""
+        rating_rows = self._db.execute(
+            "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
+            "JOIN surfacing_events e ON f.surfacing_id = e.id"
+            f"{rating_where} GROUP BY f.rating",
+            event_params,
+        ).fetchall()
+        rating_distribution = {r[0]: r[1] for r in rating_rows}
+        total_feedback = sum(rating_distribution.values())
+
+        recent: list[dict] = []
+        if limit > 0:
+            recent_rows = self._db.execute(
+                f"SELECT created_at, tool, query, memory_ids, scores "
+                f"FROM surfacing_events{where_sql} "
+                "ORDER BY created_at DESC LIMIT ?",
+                [*event_params, limit],
+            ).fetchall()
+            for ts, tool_name, query, memory_ids_json, scores_json in recent_rows:
+                try:
+                    memory_ids = json.loads(memory_ids_json)
+                except (json.JSONDecodeError, TypeError):
+                    memory_ids = []
+                try:
+                    scores = json.loads(scores_json)
+                except (json.JSONDecodeError, TypeError):
+                    scores = []
+                preview = query if len(query) <= 80 else query[:77] + "..."
+                recent.append(
+                    {
+                        "ts": ts,
+                        "tool": tool_name,
+                        "query_preview": preview,
+                        "memory_ids": memory_ids,
+                        "scores": scores,
+                    }
+                )
+
+        return {
+            "events_total": events_total,
+            "distinct_tools": distinct_tools,
+            "date_range": {"first": first, "last": last},
+            "per_tool_breakdown": per_tool_breakdown,
+            "rating_distribution": rating_distribution,
+            "total_feedback": total_feedback,
+            "recent": recent,
+        }
+
     # ── Cross-session dedup ────────────────────────────────────────────
 
     def mark_surfaced(self, memory_ids: list[str]) -> None:

@@ -406,9 +406,13 @@ class TestSurfacingToolSpans:
 
         mock_tracker = MagicMock()
         mock_tracker.get_stats.return_value = {
-            "total_surfacings": 5,
+            "events_total": 5,
+            "distinct_tools": 1,
+            "date_range": {"first": None, "last": None},
+            "per_tool_breakdown": [],
+            "rating_distribution": {"helpful": 2},
             "total_feedback": 2,
-            "by_rating": {"helpful": 2},
+            "recent": [],
         }
 
         from memtomem_stm.server import STMContext, stm_surfacing_stats

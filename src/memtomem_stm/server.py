@@ -7,6 +7,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
@@ -490,39 +491,84 @@ async def stm_surfacing_feedback(
 @mcp.tool()
 async def stm_surfacing_stats(
     tool: str | None = None,
+    since: str | None = None,
+    limit: int = 10,
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
     """Show proactive surfacing statistics and feedback ratings.
 
+    Mirrors ``stm_compression_stats`` in spirit: aggregates
+    ``surfacing_events`` and ``surfacing_feedback`` from
+    ``~/.memtomem/stm_feedback.db`` so agents and operators can self-observe
+    what STM surfaced and how it was rated without writing SQL.
+
     Args:
-        tool: Optional filter by tool name.
+        tool:  Optional filter by upstream tool name.
+        since: Optional ISO-8601 timestamp (e.g. ``2026-04-20T00:00:00``) —
+               restricts to events whose ``created_at`` is >= this moment.
+        limit: Tail size for the ``Recent`` section (default 10, 0 hides).
     """
     app = _get_ctx(ctx)
     if app.feedback_tracker is None:
         return "Feedback tracking is not enabled."
 
-    with traced("stm_surfacing_stats", metadata={"tool": tool}):
-        stats = app.feedback_tracker.get_stats(tool)
+    since_ts: float | None = None
+    if since:
+        try:
+            since_ts = datetime.fromisoformat(since).timestamp()
+        except ValueError:
+            return f"Error: invalid 'since' timestamp: {since!r} (expected ISO-8601)"
+
+    with traced(
+        "stm_surfacing_stats",
+        metadata={"tool": tool, "since": since, "limit": limit},
+    ):
+        stats = app.feedback_tracker.get_stats(tool=tool, since=since_ts, limit=limit)
 
         lines = [
             "Surfacing Stats",
             "===============",
-            f"Total surfacings: {stats['total_surfacings']}",
-            f"Total feedback:   {stats['total_feedback']}",
+            f"Events total:    {stats['events_total']}",
+            f"Distinct tools:  {stats['distinct_tools']}",
+            f"Total feedback:  {stats['total_feedback']}",
         ]
 
-        if stats["by_rating"]:
-            lines.append("\nBy rating:")
-            for rating, count in stats["by_rating"].items():
+        dr = stats["date_range"]
+        if dr["first"] is not None and dr["last"] is not None:
+            first_iso = datetime.fromtimestamp(dr["first"]).isoformat(timespec="seconds")
+            last_iso = datetime.fromtimestamp(dr["last"]).isoformat(timespec="seconds")
+            lines.append(f"Date range:      {first_iso} — {last_iso}")
+
+        if stats["per_tool_breakdown"]:
+            lines.append("\nBy tool:")
+            for row in stats["per_tool_breakdown"]:
+                lines.append(
+                    f"  {row['tool']}: {row['events']} events, "
+                    f"avg {row['avg_memory_count']} memories"
+                )
+
+        if stats["rating_distribution"]:
+            lines.append("\nRating distribution:")
+            for rating, count in sorted(stats["rating_distribution"].items()):
                 lines.append(f"  {rating}: {count}")
 
         if stats["total_feedback"] > 0:
-            helpful = stats["by_rating"].get("helpful", 0)
+            helpful = stats["rating_distribution"].get("helpful", 0)
             pct = round(helpful / stats["total_feedback"] * 100, 1)
             lines.append(f"\nHelpfulness: {pct}%")
 
+        if stats["recent"]:
+            lines.append("\nRecent:")
+            for row in stats["recent"]:
+                ts_iso = datetime.fromtimestamp(row["ts"]).isoformat(timespec="seconds")
+                n_mem = len(row["memory_ids"])
+                lines.append(f"  [{ts_iso}] {row['tool']}: {row['query_preview']}")
+                lines.append(f"    memories: {n_mem}")
+
         if tool:
             lines.append(f"\n(filtered by tool: {tool})")
+        if since:
+            lines.append(f"(since: {since})")
 
         return "\n".join(lines)
 

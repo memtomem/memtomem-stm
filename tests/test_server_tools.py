@@ -277,18 +277,47 @@ class TestSurfacingStats:
         """Returns formatted stats when data is available."""
         mock_tracker = MagicMock()
         mock_tracker.get_stats.return_value = {
-            "total_surfacings": 10,
+            "events_total": 10,
+            "distinct_tools": 2,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {"tool": "t", "events": 7, "avg_memory_count": 3.0},
+                {"tool": "u", "events": 3, "avg_memory_count": 2.0},
+            ],
+            "rating_distribution": {"helpful": 3, "not_relevant": 2},
             "total_feedback": 5,
-            "by_rating": {"helpful": 3, "not_relevant": 2},
+            "recent": [
+                {
+                    "ts": 1_700_000_999.0,
+                    "tool": "t",
+                    "query_preview": "hello world",
+                    "memory_ids": ["m1", "m2"],
+                    "scores": [0.9, 0.8],
+                }
+            ],
         }
         ctx = _make_ctx(feedback_tracker=mock_tracker)
         result = await stm_surfacing_stats(tool="t", ctx=ctx)
 
         assert "Surfacing Stats" in result
-        assert "Total surfacings: 10" in result
+        assert "Events total:    10" in result
+        assert "Distinct tools:  2" in result
+        assert "Total feedback:  5" in result
+        assert "By tool:" in result
+        assert "t: 7 events" in result
         assert "helpful: 3" in result
         assert "Helpfulness: 60.0%" in result
+        assert "Recent:" in result
+        assert "hello world" in result
         assert "(filtered by tool: t)" in result
+
+    async def test_invalid_since(self):
+        """Malformed ISO timestamp is rejected cleanly, not raised."""
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(feedback_tracker=mock_tracker)
+        result = await stm_surfacing_stats(since="not-a-date", ctx=ctx)
+        assert "invalid 'since' timestamp" in result
+        mock_tracker.get_stats.assert_not_called()
 
 
 # ── stm_compression_feedback ─────────────────────────────────────────────
