@@ -108,7 +108,7 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 
 ## Tutorial notebooks
 
-> **Try it without wiring into your AI client first.** Six [runnable Jupyter notebooks](notebooks/) walk through setup, compression, memory surfacing, LangChain integration, and observability. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed for notebooks 00–03 and 05.
+> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](notebooks/01_quickstart_proxy_setup.ipynb) registers an upstream MCP server, calls a proxied tool, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
 
 ## Key Features
 

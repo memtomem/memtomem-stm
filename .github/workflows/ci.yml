@@ -48,13 +48,10 @@ jobs:
         with:
           version: "latest"
       - run: uv sync --frozen
-      - name: Run tutorial notebooks (excluding LangChain — no API key in CI)
+      - name: Run tutorial notebook
         run: |
           uv run pytest --nbmake \
-            notebooks/00_cli_and_mcp_hybrid.ipynb \
             notebooks/01_quickstart_proxy_setup.ipynb \
-            notebooks/02_compression_and_selective.ipynb \
-            notebooks/03_memory_surfacing.ipynb \
             --nbmake-timeout=180 --tb=short -q
 
   bench_qa:
