@@ -1133,7 +1133,10 @@ class TestInitImportFlow:
             def ask(self):
                 return self._result
 
-        def fake_select(message, choices, default=None):
+        def fake_select(message, choices, **kwargs):
+            # Accept arbitrary kwargs (style, default, use_arrow_keys,
+            # use_jk_keys, use_emacs_keys) so this stub survives future
+            # param additions without brittle signature drift.
             observed_choice_counts.append(len(choices))
             return _Scripted(next(actions))
 

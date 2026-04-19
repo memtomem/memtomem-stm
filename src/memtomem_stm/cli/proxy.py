@@ -626,6 +626,32 @@ _TUI_CONFIRM = "__confirm__"
 _TUI_CANCEL = "__cancel__"
 
 
+def _tui_style() -> Any:
+    """High-contrast style for the import-selector prompt.
+
+    questionary's built-in palette is conservative and can read as
+    near-default in themed terminals (Ghostty, iTerm2 with custom color
+    schemes, etc.), making the active-row "bar" indistinct. Using
+    ``ansi*`` color names keeps us in the user's own terminal palette —
+    so bright cyan actually IS that terminal's bright cyan, whatever the
+    theme has redefined it to be.
+    """
+    from questionary import Style
+
+    return Style(
+        [
+            ("qmark", "fg:ansibrightblue bold"),
+            ("question", "bold"),
+            ("pointer", "fg:ansibrightcyan bold"),
+            ("highlighted", "fg:ansibrightcyan bold"),
+            ("selected", "fg:ansigreen bold"),
+            ("separator", "fg:ansibrightblack"),
+            ("instruction", "fg:ansibrightblack"),
+            ("answer", "fg:ansigreen bold"),
+        ]
+    )
+
+
 def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
     """Enter-to-toggle select loop with explicit Confirm / Cancel.
 
@@ -667,10 +693,19 @@ def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
         # but the runtime matches on equality against Choice.value, so our
         # int-or-sentinel cursor works fine. Ignore the type mismatch rather
         # than muddy the cursor's declared type to suit the stub.
+        #
+        # ``use_jk_keys`` + ``use_emacs_keys`` are enabled as backup bindings
+        # in case arrow-key events don't reach the TUI (Ghostty keybindings,
+        # tmux prefix collisions, etc.) — j/k and Ctrl-N/Ctrl-P are the
+        # conventional fallbacks and cost nothing to leave on.
         result = questionary.select(
-            "Select servers to import (Enter toggles; scroll to Confirm):",
+            "Select servers to import (↑↓ or j/k to move, Enter toggles, scroll to Confirm):",
             choices=choices,
             default=cursor,  # type: ignore[arg-type]
+            style=_tui_style(),
+            use_arrow_keys=True,
+            use_jk_keys=True,
+            use_emacs_keys=True,
         ).ask()
 
         if result is None or result == _TUI_CANCEL:
