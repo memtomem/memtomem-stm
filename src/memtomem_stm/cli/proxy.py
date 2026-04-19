@@ -635,6 +635,14 @@ def _tui_style() -> Any:
     ``ansi*`` color names keeps us in the user's own terminal palette —
     so bright cyan actually IS that terminal's bright cyan, whatever the
     theme has redefined it to be.
+
+    Deliberately *does not* style ``class:selected``. questionary's
+    ``select()`` applies that class to the choice matching ``default=``
+    (used here to preserve cursor position across re-renders), so
+    colouring it ends up looking like a persistent highlight on the
+    last-toggled row — the exact bug reported. Check-state is already
+    conveyed by the ``[v]``/``[ ]`` marker in the title; we don't need
+    a second visual channel for it.
     """
     from questionary import Style
 
@@ -644,7 +652,6 @@ def _tui_style() -> Any:
             ("question", "bold"),
             ("pointer", "fg:ansibrightcyan bold"),
             ("highlighted", "fg:ansibrightcyan bold"),
-            ("selected", "fg:ansigreen bold"),
             ("separator", "fg:ansibrightblack"),
             ("instruction", "fg:ansibrightblack"),
             ("answer", "fg:ansigreen bold"),
