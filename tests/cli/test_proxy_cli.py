@@ -811,15 +811,31 @@ class TestInitDiscoveryHelpers:
         assert _suggest_prefix("fs", {"fs", "fs2"}) == "fs3"
 
     def test_is_self_reference_blocks_recursion(self):
-        """Importing an `mms`/`memtomem-stm` entry from another client would
-        make STM proxy itself → infinite loop on tool calls."""
+        """STM (mms/memtomem-stm) and the LTM companion (memtomem/
+        memtomem-server) must never be imported as upstream servers.
+
+        STM self-proxy → infinite loop on tool calls.
+        LTM as upstream → double-registered, since STM already reaches LTM
+        via a separate mechanism (CLAUDE.md pipeline invariants)."""
         from memtomem_stm.cli.proxy import _is_self_reference
 
+        # STM itself (command basename).
         assert _is_self_reference({"command": "mms"})
         assert _is_self_reference({"command": "/usr/local/bin/memtomem-stm"})
         assert _is_self_reference({"command": "memtomem-stm-proxy"})
+        # LTM companion (command basename).
+        assert _is_self_reference({"command": "memtomem-server"})
+        assert _is_self_reference({"command": "memtomem"})
+        # LTM via uvx wrapper — the blocked name hides in args, not command.
+        # This is the shape Claude Code writes: `uvx --from memtomem memtomem-server`.
+        assert _is_self_reference(
+            {"command": "uvx", "args": ["--from", "memtomem", "memtomem-server"]}
+        )
+        # Legitimate neighbor names must not be over-matched (substring
+        # collisions would flag user-written `memtomem-foo-bar`).
         assert not _is_self_reference({"command": "npx"})
         assert not _is_self_reference({"url": "http://x"})
+        assert not _is_self_reference({"command": "uvx", "args": ["--from", "memtomem-notes"]})
 
 
 class TestInitDiscoverySources:
@@ -921,8 +937,10 @@ class TestInitDiscoverySources:
         assert cands[0]["duplicate_in"] == ["Claude Code (user)", "Claude Desktop"]
 
     def test_skips_self_reference(self, tmp_path, monkeypatch):
-        """Imports of `mms`/`memtomem-stm` are filtered so users never
-        accidentally configure STM to proxy itself."""
+        """Imports of STM (``mms``) or LTM (``memtomem-server``, either as
+        direct command or under ``uvx --from memtomem``) are filtered so
+        users never accidentally configure STM to proxy itself or to
+        double-register the LTM companion."""
         from memtomem_stm.cli.proxy import _discover_candidates
 
         home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
@@ -931,6 +949,10 @@ class TestInitDiscoverySources:
                 {
                     "mcpServers": {
                         "mms-self": {"command": "mms"},
+                        "memtomem": {
+                            "command": "uvx",
+                            "args": ["--from", "memtomem", "memtomem-server"],
+                        },
                         "real": {"command": "npx", "args": ["x"]},
                     }
                 }
@@ -1084,6 +1106,106 @@ class TestInitImportFlow:
         assert "Invalid:" in result.output
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "one" in data["upstream_servers"]
+
+    def test_tty_delegates_to_questionary_checkbox(self, runner, config, monkeypatch):
+        """When stdin is a TTY we use ``questionary.checkbox`` (space-to-
+        toggle UI). CliRunner can't fake a TTY, so we force
+        ``_should_use_tui`` True and stub ``questionary.checkbox`` to
+        return pre-chosen indices. This pins the contract that the TUI
+        path is actually reached when available."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+
+        captured: dict[str, object] = {}
+
+        class _FakePrompt:
+            def __init__(self, picks):
+                self._picks = picks
+
+            def ask(self):
+                return self._picks
+
+        def fake_checkbox(message, choices):
+            # Record what we were passed so we can assert on the UI shape.
+            captured["message"] = message
+            captured["titles"] = [c.title for c in choices]
+            captured["checked"] = [c.checked for c in choices]
+            # Simulate the user unchecking index 1 (keeps 0 + 2).
+            return _FakePrompt([0, 2])
+
+        import questionary
+
+        monkeypatch.setattr(questionary, "checkbox", fake_checkbox)
+
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "a",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "ca"},
+                },
+                {
+                    "name": "b",
+                    "source": "Y",
+                    "entry": {"transport": "stdio", "command": "cb"},
+                },
+                {
+                    "name": "c",
+                    "source": "Z",
+                    "entry": {"transport": "stdio", "command": "cc"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="\n\n\n",  # accept default prefix for each selected
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert set(data["upstream_servers"]) == {"a", "c"}  # index 1 ("b") dropped
+        # All choices start pre-checked so 'enter' on the default
+        # selection imports everything (the common case).
+        assert captured["checked"] == [True, True, True]
+        assert "space=toggle" in captured["message"]
+
+    def test_tui_ctrl_c_returns_empty_falls_to_manual(self, runner, config, monkeypatch):
+        """questionary returns None on Ctrl-C / aborted session; we treat
+        that as 'skip import, go manual' rather than crashing the wizard."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+
+        class _Aborted:
+            def ask(self):
+                return None
+
+        import questionary
+
+        monkeypatch.setattr(questionary, "checkbox", lambda *a, **kw: _Aborted())
+
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "x",
+                    "source": "src",
+                    "entry": {"transport": "stdio", "command": "xx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            # manual path: name, prefix, transport, command, args
+            input="only\nonly\nstdio\nc\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "x" not in data["upstream_servers"]
+        assert "only" in data["upstream_servers"]
 
     def test_import_prompts_prefix_per_pick(self, runner, config, monkeypatch):
         """User-entered prefix overrides the suggested default, and each

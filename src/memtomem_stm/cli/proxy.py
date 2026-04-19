@@ -466,13 +466,39 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
     return entry
 
 
+# Names that should never appear as STM upstream servers:
+#
+# * ``mms`` / ``memtomem-stm`` / ``memtomem-stm-proxy`` — STM itself. Importing
+#   would proxy STM through STM, recursing on every tool call.
+# * ``memtomem`` / ``memtomem-server`` — the LTM companion. STM reaches LTM via
+#   a separate mechanism (see CLAUDE.md "pipeline" invariants); adding it as
+#   an upstream double-registers it and surfaces LTM tools twice.
+#
+# Detection looks at both the command basename *and* each argv token (exact
+# match, not substring) because ``uvx --from memtomem memtomem-server`` uses
+# ``uvx`` as the command and carries the blocked name only in args.
+_BLOCKED_IMPORT_NAMES = frozenset(
+    {
+        "mms",
+        "memtomem-stm",
+        "memtomem-stm-proxy",
+        "memtomem",
+        "memtomem-server",
+    }
+)
+
+
 def _is_self_reference(entry: dict[str, Any]) -> bool:
-    """Skip entries that would make STM proxy itself, causing recursion."""
+    """Skip entries that would make STM proxy itself or double-register LTM."""
     cmd = (entry.get("command") or "").lower()
-    if not cmd:
-        return False
-    basename = Path(cmd).name
-    return basename in {"mms", "memtomem-stm", "memtomem-stm-proxy"}
+    if cmd and Path(cmd).name in _BLOCKED_IMPORT_NAMES:
+        return True
+    args = entry.get("args") or []
+    if isinstance(args, list):
+        for tok in args:
+            if isinstance(tok, str) and tok.lower() in _BLOCKED_IMPORT_NAMES:
+                return True
+    return False
 
 
 def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
@@ -556,7 +582,8 @@ def _parse_selection(raw: str, count: int) -> list[int] | None:
     """Parse ``"1,3,5"`` / ``"all"`` / ``""`` / ``"none"`` into 0-based indices.
 
     Returns ``None`` on parse error so the caller can reprompt. Empty input
-    and ``"none"`` yield ``[]`` (explicit skip).
+    and ``"none"`` yield ``[]`` (explicit skip). Used as the non-TTY fallback
+    for :func:`_pick_imports`; interactive TTY sessions use the checkbox UI.
     """
     text = raw.strip().lower()
     if text in ("", "none", "skip", "n"):
@@ -576,6 +603,65 @@ def _parse_selection(raw: str, count: int) -> list[int] | None:
         if idx not in picks:
             picks.append(idx)
     return picks
+
+
+def _should_use_tui() -> bool:
+    """Gate for the interactive checkbox UI.
+
+    Disabled when:
+    * stdin isn't a TTY (CliRunner tests, shell pipes, CI) — there's no way
+      to read arrow-key escape sequences, so fall back to comma-number input.
+    * ``MMS_NO_TUI`` is set — explicit opt-out for users who pipe answers
+      from scripts or hit terminal-compatibility issues.
+    """
+    if os.environ.get("MMS_NO_TUI"):
+        return False
+    return bool(sys.stdin.isatty())
+
+
+def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
+    """Prompt the user to choose which discovered candidates to import.
+
+    TTY → ``questionary.checkbox`` (space to toggle, enter to confirm, all
+    pre-checked). Non-TTY → the comma-number prompt from
+    :func:`_parse_selection`, with a reprompt on parse error so a fat-finger
+    entry doesn't silently abort the wizard.
+    """
+    if _should_use_tui():
+        import questionary
+
+        choices = [
+            questionary.Choice(
+                title=(
+                    f"{c['name']:<18}  {_format_candidate_detail(c['entry'])}  — from {c['source']}"
+                ),
+                value=i,
+                checked=True,
+            )
+            for i, c in enumerate(candidates)
+        ]
+        picks = questionary.checkbox(
+            "Import which servers? (space=toggle, enter=confirm, a=all, i=invert)",
+            choices=choices,
+        ).ask()
+        # questionary returns None on Ctrl-C / aborted session; treat as
+        # "skip import, go manual" rather than crashing mid-wizard.
+        return picks or []
+
+    while True:
+        raw = click.prompt(
+            "Select servers to import (e.g. '1,3', 'all', or 'none' to add manually)",
+            type=str,
+            default="all",
+            show_default=True,
+        )
+        picks = _parse_selection(raw, len(candidates))
+        if picks is not None:
+            return picks
+        click.echo(
+            f"  {_warn('Invalid:')} use comma-separated numbers 1..{len(candidates)}, "
+            "'all', or 'none'."
+        )
 
 
 @cli.command()
@@ -611,6 +697,10 @@ def init(config_path: str, no_validate: bool) -> None:
 
     if candidates:
         click.echo(_hdr(f"Found {len(candidates)} MCP server(s) in existing client configs:"))
+        # TUI path uses questionary's own rendering, so the numbered preview
+        # below is only useful for the fallback mode — but printing it
+        # unconditionally helps TTY users see duplicate-source notes that
+        # don't fit inside a questionary Choice title.
         for i, cand in enumerate(candidates, 1):
             dup = cand.get("duplicate_in")
             dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
@@ -619,20 +709,7 @@ def init(config_path: str, no_validate: bool) -> None:
                 f"    — from {cand['source']}{dup_hint}"
             )
         click.echo("")
-        while True:
-            raw = click.prompt(
-                "Select servers to import (e.g. '1,3', 'all', or 'none' to add manually)",
-                type=str,
-                default="all",
-                show_default=True,
-            )
-            picks = _parse_selection(raw, len(candidates))
-            if picks is not None:
-                break
-            click.echo(
-                f"  {_warn('Invalid:')} use comma-separated numbers 1..{len(candidates)}, "
-                "'all', or 'none'."
-            )
+        picks = _pick_imports(candidates)
 
         if picks:
             click.echo("")

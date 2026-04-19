@@ -24,6 +24,7 @@ dependencies = [
     "pydantic-settings>=2.7",
     "httpx>=0.28",
     "click>=8.1",
+    "questionary>=2.0",
 ]
 
 [project.optional-dependencies]
