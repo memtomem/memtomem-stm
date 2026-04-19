@@ -195,5 +195,4 @@ Log level is controlled via environment variable (no CLI flag):
 export MEMTOMEM_STM_LOG_LEVEL=DEBUG   # DEBUG | INFO | WARNING | ERROR | CRITICAL
 ```
 
-See [Configuration → General](configuration.md#general) and
-[Operations → Logging](operations.md#logging) for details.
+See [Configuration → General](configuration.md#general) for details.

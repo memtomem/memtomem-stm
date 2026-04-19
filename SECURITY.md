@@ -45,7 +45,7 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
 - If using the SQLite `PendingStore`, store the DB on local disk (not a shared network drive)
 - Review the list of upstream MCP servers you proxy — memtomem-stm inherits the trust level of each upstream you configure
 - Set conservative relevance thresholds for surfacing to avoid leaking LTM contents into unrelated contexts
-- If using Langfuse tracing, review what data your traces capture and configure redaction accordingly — see [docs/operations.md](docs/operations.md#observability)
+- If using Langfuse tracing, review what data your traces capture and configure redaction accordingly
 
 ## Out of Scope
 

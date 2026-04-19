@@ -86,7 +86,7 @@ sequenceDiagram
 
 Auto-detects format: JSON dicts (parsed by keys), JSON arrays (parsed by index), Markdown (parsed by headings), plain text (parsed by paragraphs).
 
-Pending selections are stored for 5 minutes (max 100 concurrent), then auto-evicted. For multi-instance deployments, switch to SQLite-backed pending storage — see [Operations → Horizontal Scaling](operations.md#horizontal-scaling).
+Pending selections are stored for 5 minutes (max 100 concurrent), then auto-evicted. For multi-instance deployments, switch to SQLite-backed pending storage via the `PendingStore` protocol.
 
 ## Hybrid Compression
 
@@ -244,11 +244,11 @@ Routes through an external LLM for intelligent summarization:
 }
 ```
 
-Providers: `openai`, `anthropic`, `ollama`. Falls back to truncation on API failure (circuit breaker protection — see [Operations → Safety & Resilience](operations.md#safety--resilience)).
+Providers: `openai`, `anthropic`, `ollama`. Falls back to truncation on API failure (circuit breaker protection).
 
-Sensitive content (API keys, passwords, PII) is auto-detected and **never** sent to external LLMs — falls back to local truncation. See [Operations → Privacy](operations.md#privacy) for the patterns.
+Sensitive content (API keys, passwords, PII) is auto-detected and **never** sent to external LLMs — falls back to local truncation.
 
-`LLMCompressor` holds a single `httpx.AsyncClient` for the life of the instance. `ProxyManager` caches one compressor per active `llm` config and swaps it (awaiting `close()` on the old one) whenever the config changes at runtime, so integrators generally do not need to manage it directly. If you construct an `LLMCompressor` standalone, `await compressor.close()` before discarding it to release the client — see [Operations → Shutdown & Lifecycle](operations.md#shutdown--lifecycle).
+`LLMCompressor` holds a single `httpx.AsyncClient` for the life of the instance. `ProxyManager` caches one compressor per active `llm` config and swaps it (awaiting `close()` on the old one) whenever the config changes at runtime, so integrators generally do not need to manage it directly. If you construct an `LLMCompressor` standalone, `await compressor.close()` before discarding it to release the client.
 
 ## Query-Aware Compression
 

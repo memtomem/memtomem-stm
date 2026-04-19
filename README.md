@@ -115,23 +115,17 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 - 🗜️ **Typically 20–80% fewer tokens per tool call** — 10 compression strategies with auto-selection by content type, query-aware budget, and zero-loss progressive delivery → [docs/compression.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md)
 - 🧠 **Your agent remembers** — proactive memory surfacing from prior sessions, gated by relevance threshold, rate limit, dedup, and circuit breaker → [docs/surfacing.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md)
 - 💾 **Repeated calls are free** — response cache with TTL and eviction; surfacing re-applied on cache hit so injected memories stay fresh → [docs/caching.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md)
-- 🔍 **See what's happening** — Langfuse tracing, RPS, latency percentiles (p50/p95/p99), error classification, per-tool metrics → [docs/operations.md#observability](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#observability)
-- 📈 **Scale to teams** — `PendingStore` protocol with InMemory (default) or SQLite-shared backend for multi-instance deployments → [docs/operations.md#horizontal-scaling](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#horizontal-scaling)
-- 🛡️ **Production-safe** — circuit breaker, retry with backoff, write-tool skip, query cooldown, dedup, sensitive content auto-detection → [docs/operations.md#safety--resilience](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md#safety--resilience)
+- 🛡️ **Production-safe** — circuit breaker, retry with backoff, write-tool skip, query cooldown, dedup, sensitive content auto-detection, Langfuse tracing, horizontal scaling via `PendingStore`
 
 ## Documentation
 
 | Guide | Topic |
 |-------|-------|
-| [Pipeline](https://github.com/memtomem/memtomem-stm/blob/main/docs/pipeline.md) | How responses flow through the 4-stage pipeline |
-| [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
 | [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | How agents recall prior context automatically |
+| [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Tune settings without touching code |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands and the 10 MCP tools |
-| [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/operations.md) | Run safely in production — scaling, observability, privacy |
-| [Custom Integration](https://github.com/memtomem/memtomem-stm/blob/main/docs/custom-integration.md) | Extend STM with custom file indexers |
-| [bench_qa](https://github.com/memtomem/memtomem-stm/blob/main/docs/bench_qa.md) | Scenario harness, advisory LLM judge, and determinism gate |
 
 ## Development
 

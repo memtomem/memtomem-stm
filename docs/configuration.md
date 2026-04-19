@@ -28,7 +28,7 @@ export MEMTOMEM_STM_LOG_LEVEL=WARNING   # DEBUG | INFO | WARNING | ERROR | CRITI
 
 Controls `logging.basicConfig()` level for all `memtomem_stm.*`
 loggers.  Default `WARNING`.  Read once at startup — restart to
-apply changes.  See [Operations → Logging](operations.md#logging).
+apply changes.
 
 ### Proxy
 
@@ -65,17 +65,6 @@ export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_BASE_URL=http://localhost
 # Required when embedding_provider="openai" — the scorer reads this from the
 # environment and falls back to BM25 with an HTTP 401 if missing.
 export OPENAI_API_KEY=sk-...
-
-# Extraction (Stage 4b — auto fact extraction)
-export MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED=false
-export MEMTOMEM_STM_PROXY__EXTRACTION__STRATEGY=llm                # "llm", "heuristic", "hybrid", "none"
-export MEMTOMEM_STM_PROXY__EXTRACTION__MAX_FACTS=10
-export MEMTOMEM_STM_PROXY__EXTRACTION__MIN_RESPONSE_CHARS=500
-export MEMTOMEM_STM_PROXY__EXTRACTION__DEDUP_THRESHOLD=0.92
-export MEMTOMEM_STM_PROXY__EXTRACTION__MEMORY_DIR=~/.memtomem/extracted_facts
-export MEMTOMEM_STM_PROXY__EXTRACTION__NAMESPACE=facts-{server}
-export MEMTOMEM_STM_PROXY__EXTRACTION__BACKGROUND=true
-export MEMTOMEM_STM_PROXY__EXTRACTION__MAX_INPUT_CHARS=20000
 
 # Compression feedback (learning signal for auto-tuner)
 export MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__ENABLED=true
@@ -117,7 +106,7 @@ export MEMTOMEM_STM_LANGFUSE__HOST=https://cloud.langfuse.com   # or http://loca
 export MEMTOMEM_STM_LANGFUSE__SAMPLING_RATE=1.0                # 0.0–1.0, fraction of calls to trace
 ```
 
-When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse observation with nested sub-spans for each pipeline stage (clean, compress, surface, index). See [Operations → Langfuse Tracing](operations.md#langfuse-tracing-optional) for the full span table and sampling details.
+When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse observation with nested sub-spans for each pipeline stage (clean, compress, surface, index).
 
 ## Config File: `~/.memtomem/stm_proxy.json`
 
@@ -212,22 +201,6 @@ Full example with all options:
     "embedding_model": "nomic-embed-text",
     "embedding_base_url": null,
     "embedding_timeout": 10.0
-  },
-  "extraction": {
-    "enabled": false,
-    "strategy": "llm",
-    "llm": {
-      "provider": "ollama",
-      "model": "qwen3:4b",
-      "base_url": "http://localhost:11434"
-    },
-    "max_facts": 10,
-    "min_response_chars": 500,
-    "dedup_threshold": 0.92,
-    "memory_dir": "~/.memtomem/extracted_facts",
-    "namespace": "facts-{server}",
-    "background": true,
-    "max_input_chars": 20000
   },
   "metrics": {
     "enabled": true,

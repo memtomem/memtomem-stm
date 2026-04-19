@@ -33,8 +33,8 @@ uv run mypy src
   - `cli/` — `mms` / `memtomem-stm-proxy` CLI
   - `utils/` — Circuit breaker and shared helpers
 - `tests/` — pytest suite
-  - `tests/bench/` — `bench_qa` scenario harness (see [docs/bench_qa.md](docs/bench_qa.md))
-- `docs/` — Architecture, operations, and integration guides (incl. `custom-integration.md`)
+  - `tests/bench/` — `bench_qa` scenario harness (see "Adding a bench_qa scenario" below)
+- `docs/` — User-facing guides (surfacing, compression, caching, configuration, cli)
 
 The LTM core lives in a separate repository: [memtomem/memtomem](https://github.com/memtomem/memtomem). Communication between STM and LTM happens entirely through the MCP protocol — there is no Python-level dependency.
 
@@ -53,8 +53,9 @@ The LTM core lives in a separate repository: [memtomem/memtomem](https://github.
 
 `bench_qa` is an end-to-end pytest sub-suite that drives the proxy
 pipeline through fixture scenarios and asserts compression +
-answerability gates. See [docs/bench_qa.md](docs/bench_qa.md) for the
-harness reference. When adding a new scenario:
+answerability gates. The full harness reference lives in the private
+`memtomem/memtomem-docs` repo (`memtomem-stm/testing/bench_qa.md`); the
+short version follows. When adding a new scenario:
 
 1. Create `tests/bench/fixtures/s{NN}.json` following
    `tests/bench/bench_qa/schema.py` (`FIXTURE_SCHEMA_VERSION = 1`).
