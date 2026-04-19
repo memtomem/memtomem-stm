@@ -5,15 +5,98 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-04-19
+
 ### Added
 
 - **Background auto-indexing** (F4) — `auto_index.background` (default `false`). When set `true`, Stage 4 INDEX runs via `asyncio.create_task` off the request path; the agent receives a `[Indexing…] · scheduled` placeholder footer immediately while indexing proceeds in the background. Trade-off: read-your-own-writes consistency is no longer guaranteed until the task completes — opt in only if agents tolerate the gap. Metrics row records `index_ok IS NULL` / `index_error IS NULL` / `chunks_indexed = 0` (tri-state matching background extraction); dashboards filter background rows with `WHERE index_ok IS NULL`. Default `false` preserves the synchronous contract for every existing deployment.
 - **`PROGRESSIVE_FOOTER_TOKEN` — canonical split token for progressive chunks** (issue #160). Exported from `memtomem_stm.proxy.progressive` as the exact prefix (`"\n---\n[progressive: chars="`) that agents stitching sequential `stm_proxy_read_more` responses should split on, instead of the weaker `"\n---\n"`. The `[progressive: chars=` suffix is a sentinel that does not appear in natural prose; splitting on the three-char delimiter alone silently drops bytes when content contains markdown horizontal rules, YAML frontmatter fences, or other `---` sequences. Non-breaking: the footer wire format is unchanged. Regression tests cover markdown HR, YAML frontmatter, `\n---\n[` lookalike brackets, and content that ends in `\n---\n` immediately before the footer; an additional test pins the exact legacy failure mode so a future refactor cannot silently regress to `split("\n---\n")[0]`. Agent-side contract documented in `docs/pipeline.md` § Stage 3.
+- **CLI: `mms version` + `mms status --json`** (#152) — dedicated version subcommand and scriptable JSON status output for tooling / CI.
+- **CLI: `mms health`** (#155) — per-upstream MCP connectivity checks with actionable diagnostics.
+- **CLI: `mms init` + `mms add --validate`** (#157) — first-time setup workflow (scaffold config, validate upstream on add).
+- **CLI: colorized output** with `NO_COLOR` honored (#158).
+- **INDEX / EXTRACT pipeline outcome metrics** (#159) — per-call success/failure surfaced alongside existing CLEAN/COMPRESS/SURFACE columns.
+- **Optional deterministic `trace_id` on `call_tool`** (#173) — opt-in kwarg for reproducible traces (bench harnesses, golden tests).
+- **Parent LTM hints forwarded to operator observability** (#191) — upstream hint payload exposed on surfacing spans for diagnostics (operator-only; downstream prepend text unchanged).
 
 ### Changed
 
 - **Progressive delivery surfaces memories for users who opt in via `injection_mode`** (F6). The default `injection_mode` stays `prepend`, which **continues to bypass surfacing on progressive** (upgrading is a no-op for default deployments). Operators who set `injection_mode` to `append` or `section` now get Stage 3 (SURFACE) on progressive responses; `prepend` would shift `stm_proxy_read_more` offsets and stays skipped with a one-time WARNING. See `docs/pipeline.md` § Stage 3 and `tests/test_progressive.py::TestProgressiveContentIntegrity::test_concat_invariant_under_surfacing` for the empirical safety proof.
 - `CallMetrics.surfacing_on_progressive_ok` / `surface_error` (schema-provisioned by v0.1.8) now populate on the progressive path: `True`/`False` when surfacing ran, `None` when skipped (non-progressive call, no engine, or `prepend` mode).
+
+### Fixed
+
+- **`metrics_store` read-path defensive lock** (#166) — three read methods wrap the write-path lock so a future move to `run_in_executor` cannot silently introduce torn reads.
+- **CLI: reject non-dict JSON configs** with a clean error (#156); **duplicate prefix warning** now clearly states the operation proceeds (#154).
+- **Notebook 05** — correct `mms add` invocation (#184), echo fixture refs, notebook 00 count (#181); **notebook builder reconciled** with post-commit direct edits from #150 (#182).
+- **README CI pytest filter** aligned with workflow (#185); **pipeline / custom-integration** line references refreshed (#179); **bench trace prefix link** in `operations.md` (#183).
+
+### Testing
+
+- **1465 tests** (up from 1364).
+- **`bench_qa` LLM-behavior harness** (#168-#178) — 10 scenarios (S1-S10) covering happy paths, fallback ladder (S1/S6/S8), progressive round-trip, selective TOC demotion (S7), surfacing recall@k smoke (S10), 40-turn chat skeleton (S5); deterministic `trace_id` two-run gate; LLM-as-judge advisory scoring (opt-in, `gpt-4.1-nano` default); self-test probes; CI advisory job with frozen JSON/Markdown reports. See `tests/bench/bench_qa/README.md` and `docs/bench_qa.md`.
+- **Contract test for empty-structured JSON** from upstream (#190) — alpha-upstream loose pin; stable invariants asserted, new fields read via `data.get()`.
+
+### Docs
+
+- **README rewrite** — user-benefits framing + improved CLI help text (#153).
+- **Alpha banner** above tagline (#188).
+- **Docs restructure** — WIP/internal guides moved to private `memtomem-docs` repo to minimize beginner barrier (#186).
+- **Notebooks slimmed to `01_quickstart` only** — 00 + 02-05 moved to private repo (#187).
+- **`bench_qa` reference + scenario-adding guide** (#180).
+
+### Internal
+
+- **Remove unused `SelectiveCompressor` import** (#163).
+- **Ignore local `.env` + `.mcp.json`** (#192).
+
+## [0.1.8] — 2026-04-16
+
+### Added
+
+- **`MEMTOMEM_STM_LOG_LEVEL` env var** (#149) — proxy-wide log level control documented end-to-end.
+- **`max_upstream_chars` OOM guard** (#118) — reject upstream text exceeding the configured cap before compression.
+- **BM25 multilingual tokenizer** (#94) — Cyrillic, Arabic, Devanagari, Thai added alongside Latin/CJK.
+- **Compression feedback lifecycle** — `stm_surfacing_feedback` invalidates cache on `not_relevant` / `already_known` (#148).
+
+### Changed
+
+- **Centralised SQLite PRAGMA tuning** (#96) across all long-lived stores (shared helper).
+- **SurfacingCache → insertion-ordered FIFO eviction** (#95), matching `_boosted_event_ids` pattern.
+- **Config precedence honoured end-to-end: env > file > defaults** (#106 / #116).
+- **Constants refactored to module-level `_UPPER_SNAKE_CASE`** (#87); hot-path regex hoisted to module level (#112); `atomic_write_text` centralised (#121).
+
+### Fixed
+
+- **Concurrency / lifecycle audit** (15 PRs) — init-failure SQLite connection cleanup (#127, #141), config hot-reload mtime preservation on parse failure (#128), reconnect `conn_stack` unwind (#130), lifespan cleanup when init fails before yield (#131), `MCPClient.start()` context unwind (#129), `FeedbackTracker` degrade-not-crash on SQLite failure (#124), boost-guard race in `handle_feedback` (#133), `_surfaced_ids` dedup-claim race (#134), surfacing cache stampede (#137), proxy `call_tool` cache stampede (#139), `_background_tasks` drain loop (#135), `RelevanceGate` burst race (#138), `LLMCompressor.close()` drain of in-flight `compress()` (#140), `_trace_id` cache-key taint (#136), swallow `cache.set` failures to preserve response (#120), reconnect delay ordering validation (#132).
+- **Upstream Phase 2 robustness** — tolerate spec-noncompliant `result.content=None` (#114) and `result.text=None` (#119); MCP adapter text-None guard + WAL journal growth cap (#145).
+- **Pipeline failure guards (F1/S1)** — auto-index stage failures no longer kill the agent response; untracked `surfacing_id` no longer injected when `record_surfacing` fails; inner handlers now log with `exc_info=True` (#149 cross-link).
+- **Config validation** — pydantic `Field` / `Literal` constraints prevent unsafe values (#109); reject empty `api_key` for openai/anthropic at load time (#123); atomic JSON write for `stm_proxy.json` via temp + `os.replace` (#115).
+- **Privacy detection** — expanded default credential patterns + email TLD regex (#111).
+- **Defensive parsing** — LLM provider response payloads (#126, #67/#80), embedding provider input-order preservation when `index` omitted (#68/#81), numeric parsing of untrusted external input (#66/#79), backward search room for small spans in `_find_boundary` (#69/#82).
+- **Memory caps** — `TokenTracker` per-server/tool counters bounded (#70/#83); `_boosted_event_ids` FIFO eviction (#110/#113).
+- **MCP client** — `asyncio.TimeoutError` added to transport errors (#52); configurable `session.initialize()` timeout (#53).
+- **Metrics** — `INTERNAL_ERROR` row recorded when pipeline raises (#117); demoted expected-fallback warnings away from `exc_info` trace dumps (#102).
+- **Surfacing / compressor lifecycle gaps** — consolidated fixes across store and compressor shutdown paths (#143).
+
+### Testing
+
+- **1364 tests** (up from 1033).
+- New coverage — `CliRunner` for `cli/proxy.py` (#100), privacy invalid-regex / hot-reload / empty-patterns (#97), `SurfacingEngine` webhook exception / cancel (#98), `MCPClient` reconnect + version negotiation edges (#99), `auto_index` / `extract_and_store` / `format_fact_md` (#101), provider-aware `embedding_base_url` defaults (#54/#86), `RelevanceScorer` hot-reload (#62/#85), `LLMCompressor` singleton + close lifecycle (#61/#84), `CircuitBreaker` `time_until_reset` + backward-compat alias (#39), cleaning-stage injection detection.
+
+### Docs
+
+- **Full docs audit — 11 files + 2 notebooks** (#150) — line references, failure-guard cross-links, log-level documentation across operations / configuration / pipeline / surfacing.
+- **Observability verification + custom integration guide** (#149).
+- **Compression before/after examples** for strategy docstrings (#23/#125).
+- **Drift catch-up** for PRs #54-#65 (#72/#105); auto-tune feedback direction clarified (#57/#104); `OPENAI_API_KEY` requirement documented for OpenAI embedding provider (#56/#103).
+
+## [0.1.7] — 2026-04-13
+
+### Added
+
+- **Phase 2 `StructuredResultParser`** — structured JSON surfacing result format activated end-to-end (scaffolded in v0.1.6 behind `SurfacingConfig.result_format="structured"`).
+- **Format negotiation via `mem_do(action="version")`** — surfacing engine negotiates compact vs. structured format with the upstream at start-up based on core server capability.
 
 ## [0.1.6] — 2026-04-13
 
