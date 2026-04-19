@@ -619,59 +619,87 @@ def _should_use_tui() -> bool:
     return bool(sys.stdin.isatty())
 
 
-def _patch_questionary_indicators() -> None:
-    """Swap questionary's default checkbox glyphs for clearer ones.
+# Sentinel values returned by the questionary.select loop in addition to
+# integer indices. Distinct from any valid index so a dict-based toggle set
+# can't collide.
+_TUI_CONFIRM = "__confirm__"
+_TUI_CANCEL = "__cancel__"
 
-    Defaults are ``●`` (checked) vs ``○`` (unchecked), which blur together on
-    thin fonts — users reported genuine ambiguity. ``[v]`` / ``[ ]`` makes
-    the state unmistakable. We mutate ``questionary.prompts.common`` because
-    that module binds the constants at import time (re-assigning
-    ``questionary.constants`` has no effect on an already-imported consumer).
-    Idempotent — calling more than once just re-asserts the same values.
+
+def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
+    """Enter-to-toggle select loop with explicit Confirm / Cancel.
+
+    Chose this over ``questionary.checkbox`` after user feedback:
+    checkbox's space-to-toggle + enter-to-confirm is technically standard
+    but non-obvious on first exposure (and the default ``●``/``○`` glyphs
+    are visually ambiguous). The select-loop instead matches the mental
+    model "press enter on what I want, scroll down to Confirm when done,"
+    with explicit ``[v]``/``[ ]`` markers in the choice titles.
+
+    Returns sorted 0-based indices. ``[]`` on Cancel or empty Confirm —
+    the caller treats either as "user declined to import anything,
+    abort the wizard without saving."
     """
-    from questionary.prompts import common as qc_common
+    import questionary
 
-    qc_common.INDICATOR_SELECTED = "[v]"
-    qc_common.INDICATOR_UNSELECTED = "[ ]"
+    picks: set[int] = set()
+    cursor: object = 0
+
+    while True:
+        choices: list[Any] = []
+        for i, c in enumerate(candidates):
+            marker = "[v]" if i in picks else "[ ]"
+            title = (
+                f"{marker}  {c['name']:<18}  "
+                f"{_format_candidate_detail(c['entry'])}  — from {c['source']}"
+            )
+            choices.append(questionary.Choice(title=title, value=i))
+        choices.append(questionary.Separator())
+        choices.append(
+            questionary.Choice(
+                title=f"Confirm — import {len(picks)} server(s)",
+                value=_TUI_CONFIRM,
+            )
+        )
+        choices.append(questionary.Choice(title="Cancel", value=_TUI_CANCEL))
+
+        # questionary's stubs declare ``default: str | Choice | dict | None``
+        # but the runtime matches on equality against Choice.value, so our
+        # int-or-sentinel cursor works fine. Ignore the type mismatch rather
+        # than muddy the cursor's declared type to suit the stub.
+        result = questionary.select(
+            "Select servers to import (Enter toggles; scroll to Confirm):",
+            choices=choices,
+            default=cursor,  # type: ignore[arg-type]
+        ).ask()
+
+        if result is None or result == _TUI_CANCEL:
+            return []
+        if result == _TUI_CONFIRM:
+            return sorted(picks)
+        # Integer index → toggle and keep the cursor in place so the next
+        # render starts on the row the user just acted on (no disorienting
+        # jump to the top).
+        cursor = result
+        if result in picks:
+            picks.remove(result)
+        else:
+            picks.add(result)
 
 
 def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
     """Prompt the user to choose which discovered candidates to import.
 
-    TTY → ``questionary.checkbox`` (space to toggle, enter to confirm, all
-    initially unchecked). Non-TTY → the comma-number prompt from
-    :func:`_parse_selection`, with a reprompt on parse error so a fat-finger
-    entry doesn't silently abort the wizard.
-
-    Defaulting to unchecked matches user feedback: the ~8-candidate lists
-    that come out of a populated Claude Code config usually need 1-2 picks,
-    not 6 unchecks.
+    TTY → :func:`_pick_imports_tui` (enter-to-toggle loop). Non-TTY → the
+    comma-number prompt below, with reprompt on parse error so a
+    fat-finger entry doesn't silently abort the wizard.
     """
     if _should_use_tui():
-        import questionary
-
-        _patch_questionary_indicators()
-        choices = [
-            questionary.Choice(
-                title=(
-                    f"{c['name']:<18}  {_format_candidate_detail(c['entry'])}  — from {c['source']}"
-                ),
-                value=i,
-                checked=False,
-            )
-            for i, c in enumerate(candidates)
-        ]
-        picks = questionary.checkbox(
-            "Import which servers? (space=toggle, enter=confirm, a=all, i=invert)",
-            choices=choices,
-        ).ask()
-        # questionary returns None on Ctrl-C / aborted session; treat as
-        # "skip import, go manual" rather than crashing mid-wizard.
-        return picks or []
+        return _pick_imports_tui(candidates)
 
     while True:
         raw = click.prompt(
-            "Select servers to import (e.g. '1,3', 'all', or empty to skip / add manually)",
+            "Select servers to import (e.g. '1,3', 'all', or empty to skip)",
             type=str,
             default="",
             show_default=False,
@@ -718,10 +746,9 @@ def init(config_path: str, no_validate: bool) -> None:
 
     if candidates:
         click.echo(_hdr(f"Found {len(candidates)} MCP server(s) in existing client configs:"))
-        # TUI path uses questionary's own rendering, so the numbered preview
-        # below is only useful for the fallback mode — but printing it
-        # unconditionally helps TTY users see duplicate-source notes that
-        # don't fit inside a questionary Choice title.
+        # TUI renders its own list; this preview exists so duplicate-source
+        # notes ("also in: X") stay visible — those don't fit inside a
+        # questionary Choice title and otherwise would be invisible.
         for i, cand in enumerate(candidates, 1):
             dup = cand.get("duplicate_in")
             dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
@@ -732,22 +759,32 @@ def init(config_path: str, no_validate: bool) -> None:
         click.echo("")
         picks = _pick_imports(candidates)
 
-        if picks:
+        # Empty selection when candidates exist = intentional "not this
+        # time" (cancel, or Confirm with nothing toggled). We don't
+        # silently drop into the manual-name prompt, which was confusing
+        # when users just wanted to re-think: nothing is saved, the user
+        # can rerun ``mms init`` fresh or use ``mms add`` explicitly.
+        if not picks:
             click.echo("")
-            used_prefixes: set[str] = set()
-            for idx in picks:
-                cand = candidates[idx]
-                click.echo(_hdr(f"Configuring '{cand['name']}'"))
-                suggested = _suggest_prefix(cand["name"], used_prefixes)
-                prefix = _prompt_prefix(default=suggested)
-                used_prefixes.add(prefix)
-                entry = {"prefix": prefix, **cand["entry"]}
-                imported[cand["name"]] = entry
+            click.echo(
+                f"{_ok('No servers selected.')} Config not written — "
+                "rerun `mms init` to re-select, or use `mms add` to configure one by name."
+            )
+            return
 
-    if not imported:
-        if candidates:
-            click.echo("")
-            click.echo("Adding a server manually:")
+        click.echo("")
+        used_prefixes: set[str] = set()
+        for idx in picks:
+            cand = candidates[idx]
+            click.echo(_hdr(f"Configuring '{cand['name']}'"))
+            suggested = _suggest_prefix(cand["name"], used_prefixes)
+            prefix = _prompt_prefix(default=suggested)
+            used_prefixes.add(prefix)
+            entry = {"prefix": prefix, **cand["entry"]}
+            imported[cand["name"]] = entry
+    else:
+        # Zero discovered candidates → true first-time user without any
+        # existing MCP-client config. Full manual prompt flow.
         name = click.prompt("Server name (e.g. 'filesystem', 'github')", type=str).strip()
         if not name:
             click.echo(f"{_err('Error:')} server name must be non-empty.", err=True)

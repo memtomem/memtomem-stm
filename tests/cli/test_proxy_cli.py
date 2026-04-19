@@ -1059,10 +1059,14 @@ class TestInitImportFlow:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert set(data["upstream_servers"]) == {"a", "c"}
 
-    def test_none_falls_through_to_manual_flow(self, runner, config, monkeypatch):
-        """``none`` signals 'let me type one in instead'. The legacy manual
-        prompts (name → prefix → transport → command → args) run
-        afterwards, and that's what ends up in the config."""
+    def test_empty_selection_exits_without_saving(self, runner, config, monkeypatch):
+        """When candidates are present but the user picks none (``none`` in
+        fallback / Cancel in TUI / Confirm-with-nothing-toggled), we exit
+        cleanly without writing a config. The previous behavior of
+        auto-dropping into a 'Adding a server manually:' prompt was
+        confusing — users who didn't pick anything almost never intended to
+        type a new server inline. They either wanted to re-think (rerun
+        init) or run ``mms add`` explicitly."""
         self._stub_candidates(
             monkeypatch,
             [
@@ -1076,14 +1080,15 @@ class TestInitImportFlow:
         result = runner.invoke(
             cli,
             ["init", "--no-validate", *_cfg_args(config)],
-            # select=none, then manual: name, prefix, transport, command, args
-            input="none\ncustom\ncu\nstdio\nmy-cmd\n\n",
+            input="none\n",
         )
         assert result.exit_code == 0, result.output
-        data = json.loads(config.read_text(encoding="utf-8"))
-        assert "filesystem" not in data["upstream_servers"]
-        assert "custom" in data["upstream_servers"]
-        assert data["upstream_servers"]["custom"]["command"] == "my-cmd"
+        assert "No servers selected" in result.output
+        # The guidance points users at the two legitimate next steps.
+        assert "rerun `mms init`" in result.output
+        assert "mms add" in result.output
+        # Nothing saved — a subsequent `init` should not see a pre-existing config.
+        assert not config.exists()
 
     def test_invalid_selection_reprompts(self, runner, config, monkeypatch):
         """Out-of-range indices don't save garbage; they reprompt."""
@@ -1107,36 +1112,34 @@ class TestInitImportFlow:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "one" in data["upstream_servers"]
 
-    def test_tty_delegates_to_questionary_checkbox(self, runner, config, monkeypatch):
-        """When stdin is a TTY we use ``questionary.checkbox`` (space-to-
-        toggle UI). CliRunner can't fake a TTY, so we force
-        ``_should_use_tui`` True and stub ``questionary.checkbox`` to
-        return pre-chosen indices. This pins the contract that the TUI
-        path is actually reached when available."""
+    def test_tty_select_loop_toggles_and_confirms(self, runner, config, monkeypatch):
+        """TUI path uses ``questionary.select`` in a loop: Enter on an
+        item toggles it, Enter on the Confirm sentinel commits. CliRunner
+        can't fake a TTY, so we force ``_should_use_tui`` True and stub
+        ``questionary.select`` to script a fixed sequence of user actions."""
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
 
-        captured: dict[str, object] = {}
+        # Sequence the fake user will perform: toggle 0, toggle 2, Confirm.
+        # Each questionary.select() call returns the next scripted action.
+        actions = iter([0, 2, proxy_mod._TUI_CONFIRM])
+        observed_choice_counts: list[int] = []
 
-        class _FakePrompt:
-            def __init__(self, picks):
-                self._picks = picks
+        class _Scripted:
+            def __init__(self, result):
+                self._result = result
 
             def ask(self):
-                return self._picks
+                return self._result
 
-        def fake_checkbox(message, choices):
-            # Record what we were passed so we can assert on the UI shape.
-            captured["message"] = message
-            captured["titles"] = [c.title for c in choices]
-            captured["checked"] = [c.checked for c in choices]
-            # Simulate the user unchecking index 1 (keeps 0 + 2).
-            return _FakePrompt([0, 2])
+        def fake_select(message, choices, default=None):
+            observed_choice_counts.append(len(choices))
+            return _Scripted(next(actions))
 
         import questionary
 
-        monkeypatch.setattr(questionary, "checkbox", fake_checkbox)
+        monkeypatch.setattr(questionary, "select", fake_select)
 
         self._stub_candidates(
             monkeypatch,
@@ -1161,45 +1164,32 @@ class TestInitImportFlow:
         result = runner.invoke(
             cli,
             ["init", "--no-validate", *_cfg_args(config)],
-            input="\n\n\n",  # accept default prefix for each selected
+            input="\n\n",  # default prefix for each of the 2 picked servers
         )
         assert result.exit_code == 0, result.output
         data = json.loads(config.read_text(encoding="utf-8"))
-        assert set(data["upstream_servers"]) == {"a", "c"}  # index 1 ("b") dropped
-        # All choices start unchecked — populated configs usually have 8+
-        # candidates but users typically only import 1-2, so "check what
-        # you want" beats "uncheck what you don't" in friction terms.
-        assert captured["checked"] == [False, False, False]
-        assert "space=toggle" in captured["message"]
+        assert set(data["upstream_servers"]) == {"a", "c"}  # index 1 ("b") not toggled
+        # 3 iterations of the select loop: 2 toggles + 1 Confirm.
+        assert len(observed_choice_counts) == 3
+        # Each render shows: 3 candidates + Separator + Confirm + Cancel = 6 items.
+        assert all(n == 6 for n in observed_choice_counts)
 
-    def test_questionary_indicator_glyphs_overridden(self):
-        """Default ``●``/``○`` glyphs are visually ambiguous on thin fonts;
-        we replace them with ``[v]``/``[ ]`` at TUI-entry time. This pins
-        that the override is actually applied so a questionary upgrade
-        doesn't silently revert us to the blurry dots."""
-        from memtomem_stm.cli.proxy import _patch_questionary_indicators
-
-        _patch_questionary_indicators()
-
-        from questionary.prompts import common as qc_common
-
-        assert qc_common.INDICATOR_SELECTED == "[v]"
-        assert qc_common.INDICATOR_UNSELECTED == "[ ]"
-
-    def test_tui_ctrl_c_returns_empty_falls_to_manual(self, runner, config, monkeypatch):
-        """questionary returns None on Ctrl-C / aborted session; we treat
-        that as 'skip import, go manual' rather than crashing the wizard."""
+    def test_tui_cancel_exits_without_saving(self, runner, config, monkeypatch):
+        """Cancel sentinel (or Ctrl-C → None from questionary) exits the
+        wizard cleanly without writing a config. Contrast with the older
+        behavior that silently dropped into a manual name prompt — users
+        found that confusing when they just wanted to bail out."""
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
 
-        class _Aborted:
+        class _Scripted:
             def ask(self):
-                return None
+                return proxy_mod._TUI_CANCEL
 
         import questionary
 
-        monkeypatch.setattr(questionary, "checkbox", lambda *a, **kw: _Aborted())
+        monkeypatch.setattr(questionary, "select", lambda *a, **kw: _Scripted())
 
         self._stub_candidates(
             monkeypatch,
@@ -1214,13 +1204,47 @@ class TestInitImportFlow:
         result = runner.invoke(
             cli,
             ["init", "--no-validate", *_cfg_args(config)],
-            # manual path: name, prefix, transport, command, args
-            input="only\nonly\nstdio\nc\n\n",
+            input="",  # no prompts should fire after Cancel
         )
         assert result.exit_code == 0, result.output
-        data = json.loads(config.read_text(encoding="utf-8"))
-        assert "x" not in data["upstream_servers"]
-        assert "only" in data["upstream_servers"]
+        assert "No servers selected" in result.output
+        assert not config.exists()
+
+    def test_tui_confirm_with_nothing_toggled_exits_without_saving(
+        self, runner, config, monkeypatch
+    ):
+        """Confirm with an empty selection is semantically 'I'm done and
+        I picked nothing' — same outcome as Cancel, since there's nothing
+        to save."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+
+        class _Scripted:
+            def ask(self):
+                return proxy_mod._TUI_CONFIRM
+
+        import questionary
+
+        monkeypatch.setattr(questionary, "select", lambda *a, **kw: _Scripted())
+
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "x",
+                    "source": "src",
+                    "entry": {"transport": "stdio", "command": "xx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "No servers selected" in result.output
+        assert not config.exists()
 
     def test_import_prompts_prefix_per_pick(self, runner, config, monkeypatch):
         """User-entered prefix overrides the suggested default, and each
