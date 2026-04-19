@@ -376,16 +376,206 @@ def add(
 # ── init command ────────────────────────────────────────────────────────
 
 
-def _prompt_prefix() -> str:
+def _prompt_prefix(default: str | None = None) -> str:
     """Prompt for a prefix until it passes the same rules as ``add --prefix``."""
     while True:
-        value = click.prompt("Tool prefix (letters/digits/underscores, e.g. 'fs')", type=str)
+        value = click.prompt(
+            "Tool prefix (letters/digits/underscores, e.g. 'fs')",
+            type=str,
+            default=default,
+            show_default=default is not None,
+        )
         if _PREFIX_RE.match(value) and "__" not in value:
             return value
         click.echo(
             f"  {_warn('Invalid:')} must start with a letter, contain only letters/digits/"
             "underscores, and not contain '__'. Try again."
         )
+
+
+# ── discovery of already-registered MCP servers ─────────────────────────
+#
+# Reading external-client configs is best-effort: files may not exist, may be
+# malformed, or may have shapes that don't translate (e.g. wrapper types we
+# don't support). Discovery never raises — missing/bad sources just yield
+# zero candidates and fall back to the manual prompt flow.
+
+
+def _desktop_config_path() -> Path:
+    """Claude Desktop's macOS config path; Windows/Linux variants skipped."""
+    return Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser()
+
+
+def _read_json_safely(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a client-config MCP entry to an STM upstream-server entry.
+
+    Returns ``None`` if the entry's shape isn't one we can import. STM-shape
+    requires a concrete transport and either ``command`` (stdio) or ``url``
+    (sse/streamable_http); ``prefix`` is intentionally left out so the caller
+    can prompt for it.
+    """
+    # Client configs use `type: "http"|"sse"` (Claude Code) or omit it
+    # entirely (stdio). Desktop config is stdio-only in practice.
+    type_hint = (raw.get("type") or "").lower()
+    command = raw.get("command")
+    url = raw.get("url")
+
+    if type_hint == "sse" and isinstance(url, str) and url:
+        transport = "sse"
+    elif type_hint in ("http", "streamable_http") and isinstance(url, str) and url:
+        transport = "streamable_http"
+    elif isinstance(command, str) and command:
+        transport = "stdio"
+    elif isinstance(url, str) and url:
+        # url but no type → best guess; Claude Code sometimes omits `type`.
+        transport = "streamable_http"
+    else:
+        return None
+
+    entry: dict[str, Any] = {
+        "transport": transport,
+        "compression": "auto",
+        "max_result_chars": 8000,
+    }
+    if transport == "stdio":
+        entry["command"] = command
+        args = raw.get("args")
+        if isinstance(args, list) and all(isinstance(a, str) for a in args):
+            entry["args"] = list(args)
+        env = raw.get("env")
+        if isinstance(env, dict):
+            safe_env = {
+                str(k): str(v)
+                for k, v in env.items()
+                if isinstance(k, str) and k.upper() not in _DANGEROUS_ENV_KEYS
+            }
+            if safe_env:
+                entry["env"] = safe_env
+    else:
+        entry["url"] = url
+    return entry
+
+
+def _is_self_reference(entry: dict[str, Any]) -> bool:
+    """Skip entries that would make STM proxy itself, causing recursion."""
+    cmd = (entry.get("command") or "").lower()
+    if not cmd:
+        return False
+    basename = Path(cmd).name
+    return basename in {"mms", "memtomem-stm", "memtomem-stm-proxy"}
+
+
+def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
+    """Scan known MCP-client configs and return importable candidates.
+
+    Each candidate dict is ``{name, source, entry}`` where ``entry`` is an
+    already-normalized STM upstream-server entry (sans prefix). The first
+    source to claim a name wins; later duplicates are dropped with a
+    ``duplicate_in`` note so the UI can indicate the overlap.
+    """
+    sources: list[tuple[str, dict[str, Any]]] = []
+
+    # 1. Project-scope ``.mcp.json`` in cwd (Claude Code project config).
+    proj = _read_json_safely(cwd / ".mcp.json")
+    if proj and isinstance(proj.get("mcpServers"), dict):
+        sources.append((".mcp.json (project)", proj["mcpServers"]))
+
+    # 2. Claude Code ~/.claude.json user-scope + per-project entries.
+    cc = _read_json_safely(Path("~/.claude.json").expanduser())
+    if cc:
+        if isinstance(cc.get("mcpServers"), dict):
+            sources.append(("Claude Code (user)", cc["mcpServers"]))
+        projects = cc.get("projects")
+        if isinstance(projects, dict):
+            # Match on resolved cwd so we don't duplicate entries across sibling projects.
+            resolved_cwd = str(cwd.resolve())
+            proj_entry = projects.get(resolved_cwd)
+            if isinstance(proj_entry, dict) and isinstance(proj_entry.get("mcpServers"), dict):
+                sources.append(("Claude Code (project)", proj_entry["mcpServers"]))
+
+    # 3. Claude Desktop (macOS path only; non-macOS → file absent → skipped).
+    desktop = _read_json_safely(_desktop_config_path())
+    if desktop and isinstance(desktop.get("mcpServers"), dict):
+        sources.append(("Claude Desktop", desktop["mcpServers"]))
+
+    seen: dict[str, dict[str, Any]] = {}
+    for source_label, servers in sources:
+        if not isinstance(servers, dict):
+            continue
+        for name, raw in servers.items():
+            if not isinstance(name, str) or not isinstance(raw, dict):
+                continue
+            entry = _normalize_client_entry(raw)
+            if entry is None or _is_self_reference(entry):
+                continue
+            if name in seen:
+                seen[name].setdefault("duplicate_in", []).append(source_label)
+                continue
+            seen[name] = {"name": name, "source": source_label, "entry": entry}
+    return list(seen.values())
+
+
+def _format_candidate_detail(entry: dict[str, Any]) -> str:
+    transport = entry.get("transport", "stdio")
+    if transport == "stdio":
+        parts = [entry.get("command", "")]
+        parts.extend(entry.get("args", []))
+        return f"[stdio] {' '.join(p for p in parts if p).strip()}"
+    return f"[{transport}] {entry.get('url', '')}"
+
+
+def _suggest_prefix(name: str, taken: set[str]) -> str:
+    """Derive a valid-ish default prefix from a server name.
+
+    Not authoritative — the user is re-prompted if invalid. Avoids clashing
+    with prefixes already chosen in the current init run.
+    """
+    base = re.sub(r"[^a-zA-Z0-9_]", "_", name).strip("_") or "srv"
+    if not base[0].isalpha():
+        base = "s_" + base
+    base = base.replace("__", "_")
+    candidate = base
+    n = 2
+    while candidate in taken:
+        candidate = f"{base}{n}"
+        n += 1
+    return candidate
+
+
+def _parse_selection(raw: str, count: int) -> list[int] | None:
+    """Parse ``"1,3,5"`` / ``"all"`` / ``""`` / ``"none"`` into 0-based indices.
+
+    Returns ``None`` on parse error so the caller can reprompt. Empty input
+    and ``"none"`` yield ``[]`` (explicit skip).
+    """
+    text = raw.strip().lower()
+    if text in ("", "none", "skip", "n"):
+        return []
+    if text in ("all", "a", "*"):
+        return list(range(count))
+    picks: list[int] = []
+    for tok in text.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if not tok.isdigit():
+            return None
+        idx = int(tok) - 1
+        if idx < 0 or idx >= count:
+            return None
+        if idx not in picks:
+            picks.append(idx)
+    return picks
 
 
 @cli.command()
@@ -416,80 +606,125 @@ def init(config_path: str, no_validate: bool) -> None:
     click.echo(f"Config will be written to: {resolved}")
     click.echo("")
 
-    name = click.prompt("Server name (e.g. 'filesystem', 'github')", type=str).strip()
-    if not name:
-        click.echo(f"{_err('Error:')} server name must be non-empty.", err=True)
-        sys.exit(1)
+    candidates = _discover_candidates(Path.cwd())
+    imported: dict[str, dict[str, Any]] = {}
 
-    prefix = _prompt_prefix()
-
-    transport = click.prompt(
-        "Transport",
-        type=click.Choice(["stdio", "sse", "streamable_http"]),
-        default="stdio",
-        show_default=True,
-    )
-
-    entry: dict[str, Any] = {
-        "prefix": prefix,
-        "transport": transport,
-        "compression": "auto",
-        "max_result_chars": 8000,
-    }
-
-    if transport == "stdio":
-        command = click.prompt("Command (e.g. 'npx', 'uvx')", type=str).strip()
-        if not command:
+    if candidates:
+        click.echo(_hdr(f"Found {len(candidates)} MCP server(s) in existing client configs:"))
+        for i, cand in enumerate(candidates, 1):
+            dup = cand.get("duplicate_in")
+            dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
             click.echo(
-                f"{_err('Error:')} command must be non-empty for stdio transport.",
-                err=True,
+                f"  {i:>2}. {cand['name']:<18} {_format_candidate_detail(cand['entry'])}"
+                f"    — from {cand['source']}{dup_hint}"
             )
-            sys.exit(1)
-        entry["command"] = command
+        click.echo("")
+        while True:
+            raw = click.prompt(
+                "Select servers to import (e.g. '1,3', 'all', or 'none' to add manually)",
+                type=str,
+                default="all",
+                show_default=True,
+            )
+            picks = _parse_selection(raw, len(candidates))
+            if picks is not None:
+                break
+            click.echo(
+                f"  {_warn('Invalid:')} use comma-separated numbers 1..{len(candidates)}, "
+                "'all', or 'none'."
+            )
 
-        args_str = click.prompt(
-            "Arguments (space-separated, leave empty for none)",
-            type=str,
-            default="",
-            show_default=False,
+        if picks:
+            click.echo("")
+            used_prefixes: set[str] = set()
+            for idx in picks:
+                cand = candidates[idx]
+                click.echo(_hdr(f"Configuring '{cand['name']}'"))
+                suggested = _suggest_prefix(cand["name"], used_prefixes)
+                prefix = _prompt_prefix(default=suggested)
+                used_prefixes.add(prefix)
+                entry = {"prefix": prefix, **cand["entry"]}
+                imported[cand["name"]] = entry
+
+    if not imported:
+        if candidates:
+            click.echo("")
+            click.echo("Adding a server manually:")
+        name = click.prompt("Server name (e.g. 'filesystem', 'github')", type=str).strip()
+        if not name:
+            click.echo(f"{_err('Error:')} server name must be non-empty.", err=True)
+            sys.exit(1)
+
+        prefix = _prompt_prefix()
+
+        transport = click.prompt(
+            "Transport",
+            type=click.Choice(["stdio", "sse", "streamable_http"]),
+            default="stdio",
+            show_default=True,
         )
-        if args_str.strip():
-            try:
-                entry["args"] = shlex.split(args_str)
-            except ValueError as exc:
-                click.echo(f"{_err('Error:')} malformed arguments: {exc}", err=True)
+
+        entry = {
+            "prefix": prefix,
+            "transport": transport,
+            "compression": "auto",
+            "max_result_chars": 8000,
+        }
+
+        if transport == "stdio":
+            command = click.prompt("Command (e.g. 'npx', 'uvx')", type=str).strip()
+            if not command:
+                click.echo(
+                    f"{_err('Error:')} command must be non-empty for stdio transport.",
+                    err=True,
+                )
                 sys.exit(1)
-    else:
-        url = click.prompt(f"URL for {transport}", type=str).strip()
-        if not url:
-            click.echo(
-                f"{_err('Error:')} URL must be non-empty for {transport} transport.",
-                err=True,
+            entry["command"] = command
+
+            args_str = click.prompt(
+                "Arguments (space-separated, leave empty for none)",
+                type=str,
+                default="",
+                show_default=False,
             )
-            sys.exit(1)
-        entry["url"] = url
-
-    if not no_validate and click.confirm("Validate connection now?", default=True):
-        click.echo(f"Validating '{name}' (timeout=10s)...")
-        probe = asyncio.run(_probe_servers({name: entry}, 10))[name]
-        if probe["connected"]:
-            click.echo(f"  {_ok('Reachable:')} {probe['tools']} tool(s) discovered.")
+            if args_str.strip():
+                try:
+                    entry["args"] = shlex.split(args_str)
+                except ValueError as exc:
+                    click.echo(f"{_err('Error:')} malformed arguments: {exc}", err=True)
+                    sys.exit(1)
         else:
-            click.echo(f"  {_warn('Warning:')} probe failed — {probe['error']}", err=True)
-            click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
+            url = click.prompt(f"URL for {transport}", type=str).strip()
+            if not url:
+                click.echo(
+                    f"{_err('Error:')} URL must be non-empty for {transport} transport.",
+                    err=True,
+                )
+                sys.exit(1)
+            entry["url"] = url
 
-    data = {"enabled": True, "upstream_servers": {name: entry}}
+        imported[name] = entry
+
+    if not no_validate and click.confirm("Validate connection(s) now?", default=True):
+        probe_map = {n: e for n, e in imported.items()}
+        click.echo(f"Validating {len(probe_map)} server(s) (timeout=10s)...")
+        probes = asyncio.run(_probe_servers(probe_map, 10))
+        for n, probe in probes.items():
+            if probe["connected"]:
+                click.echo(f"  {_ok('Reachable:')} {n} — {probe['tools']} tool(s).")
+            else:
+                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe['error']}", err=True)
+                click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
+
+    data = {"enabled": True, "upstream_servers": imported}
     _save(path, data)
 
     click.echo("")
     click.echo(f"{_ok('Saved to:')} {resolved}")
     click.echo("")
     click.echo(_hdr("Configured upstream servers:"))
-    if transport == "stdio":
-        detail = f"{entry['command']} {' '.join(entry.get('args', []))}".strip()
-    else:
-        detail = entry["url"]
-    click.echo(f"  {name:<20} prefix={prefix}  [{transport}] {detail}")
+    for n, e in imported.items():
+        click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
 
     click.echo("")
     click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")

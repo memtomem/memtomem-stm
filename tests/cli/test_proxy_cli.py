@@ -592,14 +592,29 @@ class TestAddValidate:
 # ── init command (guided setup) ─────────────────────────────────────────
 
 
+@pytest.fixture
+def no_discovery(monkeypatch):
+    """Stub discovery to an empty list so manual-flow tests aren't
+    contaminated by whatever MCP configs happen to exist on the host
+    running the tests (dev machine, CI, etc.)."""
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: [])
+
+
 class TestInit:
-    """`mms init` is an interactive one-shot wizard: prompt for the first
-    upstream server, run an optional probe, write config, print paste-targets.
+    """`mms init` is an interactive wizard. Two entry points:
 
-    Prompt order (stdio path): name → prefix → transport → command → args
-    → (optional) validate y/n. ``input=`` feeds one answer per newline."""
+    * **Import flow:** if discovery finds servers registered in other MCP
+      clients (Claude Code, Claude Desktop, ``.mcp.json``), the user picks
+      from a numbered list and is only prompted for a prefix per pick.
+    * **Manual flow:** discovery empty (or user picks ``none``) → falls
+      back to free-form prompts (name → prefix → transport → command/url).
 
-    def test_init_happy_path_stdio_no_validate(self, runner, config):
+    Tests that only exercise the manual flow use the ``no_discovery``
+    fixture to force an empty candidate list."""
+
+    def test_init_happy_path_stdio_no_validate(self, runner, config, no_discovery):
         result = runner.invoke(
             cli,
             ["init", "--no-validate", *_cfg_args(config)],
@@ -627,7 +642,7 @@ class TestInit:
         assert "mms add" in result.output
         assert "mms list" in result.output
 
-    def test_init_invalid_prefix_reprompts(self, runner, config):
+    def test_init_invalid_prefix_reprompts(self, runner, config, no_discovery):
         """Bad prefix → re-ask instead of aborting; saves on the retry value."""
         result = runner.invoke(
             cli,
@@ -640,7 +655,7 @@ class TestInit:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert data["upstream_servers"]["srv"]["prefix"] == "fs"
 
-    def test_init_sse_transport_prompts_for_url(self, runner, config):
+    def test_init_sse_transport_prompts_for_url(self, runner, config, no_discovery):
         result = runner.invoke(
             cli,
             ["init", "--no-validate", *_cfg_args(config)],
@@ -654,11 +669,20 @@ class TestInit:
         assert srv["url"] == "https://docs.example.com/mcp"
         assert "command" not in srv
 
-    def test_init_validate_failure_still_saves_with_warning(self, config):
+    def test_init_validate_failure_still_saves_with_warning(self, config, tmp_path):
         """Validation is advisory: probe failure warns and continues (a flaky
         network shouldn't block setup). Uses a real subprocess to dodge
-        CliRunner's stderr-fileno interaction (see TestAddValidate)."""
+        CliRunner's stderr-fileno interaction (see TestAddValidate).
+
+        ``HOME``/``cwd`` are redirected to an empty tmp dir so discovery
+        finds no candidates and drops into the manual flow — otherwise the
+        host's real ``~/.claude.json`` would leak in."""
         import subprocess
+
+        isolated_home = tmp_path / "home"
+        isolated_home.mkdir()
+        isolated_cwd = tmp_path / "cwd"
+        isolated_cwd.mkdir()
 
         proc = subprocess.run(
             [
@@ -674,15 +698,420 @@ class TestInit:
             capture_output=True,
             text=True,
             timeout=30,
+            cwd=str(isolated_cwd),
+            env={**os.environ, "HOME": str(isolated_home)},
         )
         assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
         combined = proc.stdout + proc.stderr
-        assert "Warning: probe failed" in combined
+        assert "probe failed" in combined
         assert "Saving config anyway" in combined
         assert "Saved to:" in proc.stdout
 
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "bad" in data["upstream_servers"]
+
+
+# ── init: discovery + import helpers ────────────────────────────────────
+
+
+class TestInitDiscoveryHelpers:
+    """Pure-function tests for discovery building blocks. Keep these fast
+    and source-free (no file I/O) so the import flow can be reasoned about
+    piece by piece."""
+
+    def test_normalize_stdio_entry(self):
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        entry = _normalize_client_entry(
+            {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"]}
+        )
+        assert entry is not None
+        assert entry["transport"] == "stdio"
+        assert entry["command"] == "npx"
+        assert entry["args"] == ["-y", "@modelcontextprotocol/server-filesystem"]
+        # Imported entries get our default compression/max_chars policy.
+        assert entry["compression"] == "auto"
+        assert entry["max_result_chars"] == 8000
+        # Prefix is intentionally absent — the caller prompts per-server.
+        assert "prefix" not in entry
+
+    def test_normalize_http_entry(self):
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        entry = _normalize_client_entry({"type": "http", "url": "https://example.com/mcp"})
+        assert entry is not None
+        assert entry["transport"] == "streamable_http"
+        assert entry["url"] == "https://example.com/mcp"
+
+    def test_normalize_sse_entry(self):
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        entry = _normalize_client_entry({"type": "sse", "url": "https://example.com/sse"})
+        assert entry is not None
+        assert entry["transport"] == "sse"
+
+    def test_normalize_strips_dangerous_env(self):
+        """Same policy as `mms add --env`: never import env keys that could
+        hijack a spawned process."""
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        entry = _normalize_client_entry(
+            {
+                "command": "node",
+                "args": ["srv.js"],
+                "env": {"API_KEY": "ok", "LD_PRELOAD": "/evil.so"},
+            }
+        )
+        assert entry is not None
+        assert entry["env"] == {"API_KEY": "ok"}
+
+    def test_normalize_rejects_unsupported_shape(self):
+        """No command + no url + no recognized type → can't import."""
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        assert _normalize_client_entry({}) is None
+        assert _normalize_client_entry({"type": "http"}) is None  # url missing
+        assert _normalize_client_entry({"command": ""}) is None
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("", []),
+            ("none", []),
+            ("all", [0, 1, 2]),
+            ("ALL", [0, 1, 2]),
+            ("1", [0]),
+            ("1,3", [0, 2]),
+            (" 2 , 1 ", [1, 0]),  # preserves user's ordering
+            ("1,1,2", [0, 1]),  # dedupes
+        ],
+    )
+    def test_parse_selection_valid(self, raw, expected):
+        from memtomem_stm.cli.proxy import _parse_selection
+
+        assert _parse_selection(raw, 3) == expected
+
+    @pytest.mark.parametrize("raw", ["0", "4", "1,4", "abc", "1-3", "1.5"])
+    def test_parse_selection_invalid(self, raw):
+        """Out-of-range, ranges, and non-digit tokens reprompt (None)."""
+        from memtomem_stm.cli.proxy import _parse_selection
+
+        assert _parse_selection(raw, 3) is None
+
+    def test_suggest_prefix_sanitizes_and_dedupes(self):
+        from memtomem_stm.cli.proxy import _suggest_prefix
+
+        assert _suggest_prefix("filesystem", set()) == "filesystem"
+        # dashes / dots → underscores
+        assert _suggest_prefix("my-server.name", set()) == "my_server_name"
+        # leading digit → prefixed so it matches _PREFIX_RE
+        assert _suggest_prefix("123", set()) == "s_123"
+        # collision → numbered suffix
+        assert _suggest_prefix("fs", {"fs"}) == "fs2"
+        assert _suggest_prefix("fs", {"fs", "fs2"}) == "fs3"
+
+    def test_is_self_reference_blocks_recursion(self):
+        """Importing an `mms`/`memtomem-stm` entry from another client would
+        make STM proxy itself → infinite loop on tool calls."""
+        from memtomem_stm.cli.proxy import _is_self_reference
+
+        assert _is_self_reference({"command": "mms"})
+        assert _is_self_reference({"command": "/usr/local/bin/memtomem-stm"})
+        assert _is_self_reference({"command": "memtomem-stm-proxy"})
+        assert not _is_self_reference({"command": "npx"})
+        assert not _is_self_reference({"url": "http://x"})
+
+
+class TestInitDiscoverySources:
+    """`_discover_candidates` reads three source files (project `.mcp.json`,
+    `~/.claude.json`, Claude Desktop config) and dedupes by name in that
+    priority order. Each test sets up a sandbox HOME + cwd to simulate a
+    user with specific configs already present."""
+
+    def _setup_home(self, tmp_path: Path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        # Redirect the macOS-specific Desktop path into our sandbox too.
+        desktop = home / "Library/Application Support/Claude"
+        desktop.mkdir(parents=True)
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod,
+            "_desktop_config_path",
+            lambda: desktop / "claude_desktop_config.json",
+        )
+        return home, cwd, desktop
+
+    def test_discovers_claude_code_user_scope(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "filesystem": {"command": "npx", "args": ["-y", "@fs"]},
+                        "docs": {"type": "http", "url": "https://docs.example/mcp"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        names = {c["name"] for c in cands}
+        assert names == {"filesystem", "docs"}
+        fs = next(c for c in cands if c["name"] == "filesystem")
+        assert fs["source"] == "Claude Code (user)"
+        assert fs["entry"]["transport"] == "stdio"
+
+    def test_discovers_desktop_config(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        _, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps({"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["name"] == "fetch"
+        assert cands[0]["source"] == "Claude Desktop"
+
+    def test_discovers_project_mcp_json_in_cwd(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        _, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"dev-tool": {"command": "node", "args": ["x.js"]}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["source"] == ".mcp.json (project)"
+
+    def test_dedupes_by_name_priority(self, tmp_path, monkeypatch):
+        """Same name in multiple sources → first-priority wins, others
+        recorded in ``duplicate_in`` so the UI can show the overlap."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "a"}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "b"}}}),
+            encoding="utf-8",
+        )
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "c"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["entry"]["command"] == "a"  # .mcp.json wins
+        assert cands[0]["duplicate_in"] == ["Claude Code (user)", "Claude Desktop"]
+
+    def test_skips_self_reference(self, tmp_path, monkeypatch):
+        """Imports of `mms`/`memtomem-stm` are filtered so users never
+        accidentally configure STM to proxy itself."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "mms-self": {"command": "mms"},
+                        "real": {"command": "npx", "args": ["x"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert [c["name"] for c in cands] == ["real"]
+
+    def test_missing_and_malformed_sources_are_silent(self, tmp_path, monkeypatch):
+        """Discovery is best-effort: a malformed JSON file shouldn't crash
+        ``mms init`` — it just yields nothing from that source."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text("{ not json", encoding="utf-8")
+
+        assert _discover_candidates(cwd) == []
+
+
+class TestInitImportFlow:
+    """End-to-end ``mms init`` when discovery finds candidates. We stub
+    ``_discover_candidates`` directly to focus on the select + prefix UI;
+    source parsing is covered in ``TestInitDiscoverySources``."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def test_import_all_imports_every_candidate(self, runner, config, monkeypatch):
+        """Default answer 'all' + accept suggested prefixes → every
+        discovered server is imported with transport/command preserved."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@fs"],
+                        "compression": "auto",
+                        "max_result_chars": 8000,
+                    },
+                },
+                {
+                    "name": "docs",
+                    "source": "Claude Desktop",
+                    "entry": {
+                        "transport": "streamable_http",
+                        "url": "https://docs.example/mcp",
+                        "compression": "auto",
+                        "max_result_chars": 8000,
+                    },
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n\n",  # pick all, accept default prefix for each
+        )
+        assert result.exit_code == 0, result.output
+        assert "Found 2 MCP server" in result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        servers = data["upstream_servers"]
+        assert set(servers) == {"filesystem", "docs"}
+        assert servers["filesystem"]["command"] == "npx"
+        assert servers["filesystem"]["prefix"] == "filesystem"  # default suggestion
+        assert servers["docs"]["url"] == "https://docs.example/mcp"
+
+    def test_import_subset_by_number(self, runner, config, monkeypatch):
+        """Numeric picks only import the chosen servers — not all of them."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "a",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "ca"},
+                },
+                {
+                    "name": "b",
+                    "source": "Y",
+                    "entry": {"transport": "stdio", "command": "cb"},
+                },
+                {
+                    "name": "c",
+                    "source": "Z",
+                    "entry": {"transport": "stdio", "command": "cc"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="1,3\n\n\n",  # pick a + c, default prefixes
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert set(data["upstream_servers"]) == {"a", "c"}
+
+    def test_none_falls_through_to_manual_flow(self, runner, config, monkeypatch):
+        """``none`` signals 'let me type one in instead'. The legacy manual
+        prompts (name → prefix → transport → command → args) run
+        afterwards, and that's what ends up in the config."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "Claude Code",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            # select=none, then manual: name, prefix, transport, command, args
+            input="none\ncustom\ncu\nstdio\nmy-cmd\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "filesystem" not in data["upstream_servers"]
+        assert "custom" in data["upstream_servers"]
+        assert data["upstream_servers"]["custom"]["command"] == "my-cmd"
+
+    def test_invalid_selection_reprompts(self, runner, config, monkeypatch):
+        """Out-of-range indices don't save garbage; they reprompt."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "one",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "x"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="5\n1\n\n",  # bad → retry with "1" → accept default prefix
+        )
+        assert result.exit_code == 0, result.output
+        assert "Invalid:" in result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "one" in data["upstream_servers"]
+
+    def test_import_prompts_prefix_per_pick(self, runner, config, monkeypatch):
+        """User-entered prefix overrides the suggested default, and each
+        selected server gets its own prompt."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "github",
+                    "source": "Y",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\nfs\ngh\n\n",  # custom prefixes for both
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["upstream_servers"]["filesystem"]["prefix"] == "fs"
+        assert data["upstream_servers"]["github"]["prefix"] == "gh"
 
 
 # ── remove command ───────────────────────────────────────────────────────
