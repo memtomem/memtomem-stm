@@ -1608,6 +1608,78 @@ class TestAddFromClients:
         assert len(probe_calls) == 1
         assert set(probe_calls[0].keys()) == {"a"}  # "b" not probed
 
+    def test_prints_source_removal_hint_per_client(self, runner, config, monkeypatch):
+        """After a successful import, the user sees a per-source hint for
+        removing the direct registration from the originating MCP client.
+        Without it, tools are advertised on two paths (direct + STM) and the
+        direct path bypasses compression/caching/LTM surfacing — see #202."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "from-user",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
+                },
+                {
+                    "name": "from-local",
+                    "source": "Claude Code (project)",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@l"]},
+                },
+                {
+                    "name": "from-proj",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@p"]},
+                },
+                {
+                    "name": "from-desktop",
+                    "source": "Claude Desktop",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+                    "duplicate_in": ["Claude Code (user)"],
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="all\n\n\n\n\n",  # pick all + accept suggested prefix for each
+        )
+        assert result.exit_code == 0, result.output
+
+        # Per-source remediation, matching `claude mcp remove -s <scope>` flags.
+        assert "claude mcp remove from-user -s user" in result.output
+        assert "claude mcp remove from-local -s local" in result.output
+        assert "claude mcp remove from-proj -s project" in result.output
+        # Claude Desktop has no CLI analog — print a file-edit hint instead.
+        assert "claude_desktop_config.json" in result.output
+        assert "from-desktop" in result.output
+        # `duplicate_in` yields a second hint line for the same server.
+        assert "claude mcp remove from-desktop -s user" in result.output
+
+    def test_no_removal_hint_when_nothing_imported(self, runner, config, monkeypatch):
+        """Empty selection → no "Added" block, no removal hint either. The
+        warning is scoped to actually-imported servers."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "skipme",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="\n",  # empty selection = decline
+        )
+        assert result.exit_code == 0, result.output
+        assert "No servers selected" in result.output
+        assert "claude mcp remove" not in result.output
+
 
 # ── remove command ───────────────────────────────────────────────────────
 

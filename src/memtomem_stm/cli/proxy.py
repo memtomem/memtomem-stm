@@ -607,6 +607,57 @@ def _format_candidate_detail(entry: dict[str, Any]) -> str:
     return f"[{transport}] {entry.get('url', '')}"
 
 
+def _source_removal_hint(name: str, source: str) -> str:
+    """One informational shell-line telling the user how to remove a server
+    from the client that originated it.
+
+    STM never edits source client configs itself — the hint is copy-paste
+    only. Scope-label mapping matches the ``claude mcp remove -s`` flag:
+    ``Claude Code (project)`` is the per-project entry in ``~/.claude.json``,
+    which the Claude Code CLI calls ``local``.
+    """
+    if source == "Claude Code (user)":
+        return f"claude mcp remove {name} -s user"
+    if source == "Claude Code (project)":
+        return f"claude mcp remove {name} -s local"
+    if source == ".mcp.json (project)":
+        return f"claude mcp remove {name} -s project"
+    if source == "Claude Desktop":
+        return f"# Edit {_desktop_config_path()} and remove '{name}' under mcpServers."
+    return f"# Remove '{name}' from {source}."
+
+
+def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
+    """Print the post-import dual-registration warning, deduped across sources.
+
+    A single server can be discovered in more than one client (e.g. Claude
+    Code and Claude Desktop both list ``playwright``), so each candidate's
+    primary ``source`` plus any ``duplicate_in`` entries all get a line.
+    """
+    if not imported_candidates:
+        return
+    lines: list[str] = []
+    seen: set[str] = set()
+    for cand in imported_candidates:
+        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            line = _source_removal_hint(cand["name"], src)
+            if line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+    if not lines:
+        return
+    click.echo("")
+    click.echo(
+        f"{_warn('Note:')} the server(s) above are still registered in their source MCP client(s)."
+    )
+    click.echo("      Until removed there, tools are advertised on two paths (direct + via STM)")
+    click.echo("      and direct calls bypass STM's compression, caching, and LTM surfacing.")
+    click.echo("      To route through STM only, remove the direct registrations:")
+    for line in lines:
+        click.echo(f"        {line}")
+
+
 def _suggest_prefix(name: str, taken: set[str]) -> str:
     """Derive a valid-ish default prefix from a server name.
 
@@ -925,6 +976,13 @@ def _add_from_clients(
     click.echo(f"{_ok('Added')} {len(imported)} server(s) to {resolved}:")
     for n, e in imported.items():
         click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
+
+    # Imported servers stay registered in their source MCP clients: discovery
+    # is read-only, so removal is the user's call. Until they remove the
+    # direct registrations, tools are surfaced on two paths (client → upstream
+    # and client → STM → upstream) and the direct path bypasses compression,
+    # caching, and LTM surfacing entirely.
+    _print_source_removal_hints([new_candidates[i] for i in picks])
 
 
 @cli.command()
