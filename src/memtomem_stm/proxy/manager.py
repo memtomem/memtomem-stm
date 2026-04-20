@@ -878,14 +878,13 @@ class ProxyManager:
             output = chunker.read_chunk(
                 resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
             )
-            if self._progressive_reads_tracker is not None:
-                # ``chunker.read_chunk`` emits ``(no more content)`` without
-                # the footer when offset >= len(content); split-on-sentinel
-                # still returns the full string in that case, so we log it
-                # as chars=len(output) which correctly records zero-useful-
-                # bytes as the emitted length. Callers using offset past
-                # end is rare and this preserves the invariant that every
-                # read_more invocation produces exactly one row.
+            # Skip telemetry when ``read_chunk`` short-circuits with the
+            # ``(no more content)`` sentinel (offset >= len(content)) —
+            # that response carries no footer and no payload, so logging
+            # it would inflate ``follow_up_rate`` with calls that served
+            # zero new bytes and push ``avg_chars_served`` above
+            # ``total_chars``.
+            if self._progressive_reads_tracker is not None and PROGRESSIVE_FOOTER_TOKEN in output:
                 chunk_chars = len(output.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
                 self._progressive_reads_tracker.record_follow_up(
                     key=key,

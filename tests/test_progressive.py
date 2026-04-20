@@ -731,3 +731,31 @@ class TestProgressiveReadsTelemetry:
             text, ProgressiveConfig(chunk_size=4000), server="s", tool="t", trace_id="tx"
         )
         assert PROGRESSIVE_FOOTER_TOKEN in first
+
+    def test_read_more_past_end_does_not_record_row(self, tmp_path: Path):
+        """``(no more content)`` sentinel must not inflate follow_up_rate."""
+        mgr, tracker = self._build_manager(tmp_path)
+        try:
+            text = "u" * 5000
+            cfg = ProgressiveConfig(chunk_size=4000)
+            mgr._apply_progressive(
+                text, cfg, server="srv", tool="tool_c", trace_id="t3"
+            )
+
+            store = mgr._get_progressive_store()
+            key = next(iter(store._store._data))  # type: ignore[attr-defined]
+
+            # Read past end — chunker returns "(no more content)" without
+            # the progressive footer.
+            output = mgr.read_more(key, offset=len(text) + 1000, limit=4000)
+            assert "no more content" in output
+            assert PROGRESSIVE_FOOTER_TOKEN not in output
+
+            stats = tracker.get_stats()
+            # Only the initial row; the past-end read must not produce
+            # a second row.
+            assert stats["total_reads"] == 1
+            assert stats["total_responses"] == 1
+            assert stats["follow_up_rate"] == 0.0
+        finally:
+            tracker.close()
