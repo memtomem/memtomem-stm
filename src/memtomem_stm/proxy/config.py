@@ -442,6 +442,14 @@ class ProxyConfig(BaseModel):
     """
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
+    # Bounded lock acquisition timeout (#208). Applies to internal state
+    # locks in ``ProxyManager`` (selective compressor, LLM compressor,
+    # extractor). A timeout here raises ``LockTimeoutError`` → recorded as
+    # ``ErrorCategory.LOCK_TIMEOUT`` — distinct from upstream TIMEOUT (#206)
+    # since lock hangs indicate an internal bug (deadlock / stuck holder),
+    # not a slow dependency. Default 30s: anything longer is almost
+    # certainly a bug in the lock-holding code.
+    lock_timeout_seconds: float = Field(default=30.0, gt=0.0)
     consumer_model: str = ""
     context_budget_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
     cache: CacheConfig = Field(default_factory=CacheConfig)

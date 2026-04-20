@@ -68,11 +68,15 @@ class ErrorCategory(StrEnum):
     """Classification of proxy call errors for metrics tracking."""
 
     TRANSPORT = "transport"  # OSError, ConnectionError, EOFError
-    TIMEOUT = "timeout"  # asyncio.TimeoutError on upstream call_tool
+    TIMEOUT = "timeout"  # asyncio.TimeoutError on upstream call_tool (#206)
     PROTOCOL = "protocol"  # JSON-RPC errors (-32600..-32603)
     UPSTREAM_ERROR = "upstream_error"  # result.isError=True from upstream
     PROGRAMMING = "programming"  # TypeError, AttributeError, etc.
     INTERNAL_ERROR = "internal_error"  # raised inside COMPRESS/SURFACE/INDEX pipeline
+    # Internal state lock (#208) acquisition exceeded ``lock_timeout_seconds``;
+    # call propagates as an MCP error since a lock timeout indicates a bug
+    # (deadlock, stuck holder), not a slow external dependency.
+    LOCK_TIMEOUT = "lock_timeout"
     # Note: LLM compression timeout (#207) is NOT an error category — the call
     # succeeds via graceful truncate fallback. The signal lives in the
     # ``compression_strategy`` column as ``"llm_summary→timeout_fallback"``;

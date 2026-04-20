@@ -62,6 +62,7 @@ from memtomem_stm.proxy.progressive import (
     ProgressiveResponse,
     ProgressiveStoreAdapter,
 )
+from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
 from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory, TokenTracker
 from memtomem_stm.observability.tracing import traced
 
@@ -541,7 +542,11 @@ class ProxyManager:
             return result, None
 
         if compression == CompressionStrategy.SELECTIVE:
-            async with self._selective_lock:
+            async with bounded_lock(
+                self._selective_lock,
+                timeout=self._config.lock_timeout_seconds,
+                name="selective_lock",
+            ):
                 if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                     self._selective_compressor = self._create_selective(sel_cfg)
                     self._selective_compressor_cfg = sel_cfg
@@ -549,7 +554,11 @@ class ProxyManager:
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
-                async with self._llm_compressor_lock:
+                async with bounded_lock(
+                    self._llm_compressor_lock,
+                    timeout=self._config.lock_timeout_seconds,
+                    name="llm_compressor_lock",
+                ):
                     if self._llm_compressor is None or self._llm_compressor_cfg != llm_cfg:
                         if self._llm_compressor is not None:
                             await self._llm_compressor.close()
@@ -677,7 +686,11 @@ class ProxyManager:
         context_query: str | None = None,
     ) -> str:
         cfg = hybrid_cfg or HybridConfig()
-        async with self._selective_lock:
+        async with bounded_lock(
+            self._selective_lock,
+            timeout=self._config.lock_timeout_seconds,
+            name="selective_lock",
+        ):
             if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                 self._selective_compressor = self._create_selective(sel_cfg)
                 self._selective_compressor_cfg = sel_cfg
@@ -721,7 +734,11 @@ class ProxyManager:
         )
 
     async def _get_extractor(self) -> FactExtractor:
-        async with self._extractor_lock:
+        async with bounded_lock(
+            self._extractor_lock,
+            timeout=self._config.lock_timeout_seconds,
+            name="extractor_lock",
+        ):
             if self._extractor is None:
                 self._extractor = FactExtractor(self._config.extraction)
             return self._extractor
@@ -912,6 +929,14 @@ class ProxyManager:
                 # Without this guard the metrics row was silently skipped,
                 # leaving operators blind to in-pipeline failures.
                 if not getattr(exc, "_stm_metrics_recorded", False):
+                    # LockTimeoutError (#208) is a subclass of asyncio.TimeoutError
+                    # but distinct from upstream TIMEOUT (#206) — an internal
+                    # lock hang indicates a bug, not a slow dependency.
+                    pipeline_category = (
+                        ErrorCategory.LOCK_TIMEOUT
+                        if isinstance(exc, LockTimeoutError)
+                        else ErrorCategory.INTERNAL_ERROR
+                    )
                     try:
                         self.tracker.record_error(
                             CallMetrics(
@@ -920,11 +945,15 @@ class ProxyManager:
                                 original_chars=0,
                                 compressed_chars=0,
                                 trace_id=trace_id,
-                                error_category=ErrorCategory.INTERNAL_ERROR,
+                                error_category=pipeline_category,
                             )
                         )
                     except Exception:
-                        logger.debug("Failed to record INTERNAL_ERROR metrics row", exc_info=True)
+                        logger.debug(
+                            "Failed to record %s metrics row",
+                            pipeline_category.value,
+                            exc_info=True,
+                        )
                 raise
 
     async def _call_tool_guarded(
