@@ -38,6 +38,11 @@ class ProgressiveResponse:
     created_at: float
     ttl_seconds: float = 1800.0
     access_count: int = 0
+    server: str = ""
+    tool: str = ""
+    # ``None`` only for legacy rows deserialized without the key; the live
+    # ``call_tool`` path always populates ``trace_id`` via auto-gen UUID.
+    trace_id: str | None = None
 
 
 class ProgressiveStoreAdapter:
@@ -58,6 +63,9 @@ class ProgressiveStoreAdapter:
                 "structure_hint": resp.structure_hint,
                 "access_count": resp.access_count,
                 "ttl_seconds": resp.ttl_seconds,
+                "server": resp.server,
+                "tool": resp.tool,
+                "trace_id": resp.trace_id,
             },
             ensure_ascii=False,
         )
@@ -93,6 +101,9 @@ class ProgressiveStoreAdapter:
             created_at=sel.created_at,
             ttl_seconds=meta.get("ttl_seconds", 1800.0),
             access_count=meta.get("access_count", 0),
+            server=meta.get("server", ""),
+            tool=meta.get("tool", ""),
+            trace_id=meta.get("trace_id"),
         )
 
     def touch(self, key: str) -> None:
