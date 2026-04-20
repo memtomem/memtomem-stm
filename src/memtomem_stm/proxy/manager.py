@@ -810,17 +810,38 @@ class ProxyManager:
         return chunker.first_chunk(text, key, ttl_seconds=cfg.ttl_seconds)
 
     def read_more(self, key: str, offset: int, limit: int | None = None) -> str:
-        """Return next chunk from a progressive delivery response."""
+        """Return next chunk from a progressive delivery response.
+
+        Wrapped in a ``proxy_call_read_more`` span (when Langfuse is
+        configured) so that the revisit is filterable in the Langfuse UI
+        as a cohort with the original ``proxy_call``. Correlation is
+        metadata-tag based (both spans carry the same ``trace_id``
+        attribute), not trace-tree merging — the two MCP turns run in
+        separate OTel contexts, so this span is always a root. Other
+        ``stm_proxy_*`` tools lack spans because they are local reads;
+        ``read_more`` is the exception because it is a revisit of a prior
+        upstream call and otherwise loses its link to the originating
+        trace_id.
+        """
         store = self._get_progressive_store()
         resp = store.get(key)
         if resp is None:
             return f"Progressive delivery key '{key}' not found or expired."
-        store.touch(key)
-        chunk_size = limit or 4000
-        chunker = ProgressiveChunker(chunk_size=chunk_size, include_hint=True)
-        return chunker.read_chunk(
-            resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
-        )
+        with traced(
+            "proxy_call_read_more",
+            metadata={
+                "server": resp.server,
+                "tool": resp.tool,
+                "trace_id": resp.trace_id,
+                "key": key,
+            },
+        ):
+            store.touch(key)
+            chunk_size = limit or 4000
+            chunker = ProgressiveChunker(chunk_size=chunk_size, include_hint=True)
+            return chunker.read_chunk(
+                resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
+            )
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool count."""

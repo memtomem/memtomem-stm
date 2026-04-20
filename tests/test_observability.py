@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import re
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from memtomem_stm.proxy.config import CompressionStrategy, ProxyConfig, UpstreamServerConfig
+from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.config import (
+    CompressionStrategy,
+    ProgressiveConfig,
+    ProxyConfig,
+    UpstreamServerConfig,
+)
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import CallMetrics, RPSTracker, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.progressive import ProgressiveChunker
 
 
 # ── RPSTracker ───────────────────────────────────────────────────────────
@@ -203,6 +213,142 @@ class TestTraceIdPropagation:
         await mgr.call_tool("srv", "tool", {}, trace_id=fixed)
 
         assert [m.trace_id for m in recorded] == [fixed, fixed]
+
+
+# ── Progressive delivery trace_id propagation ────────────────────────────
+
+
+_KEY_RE = re.compile(r'key="(?P<key>[^"]+)"')
+
+
+def _extract_key(footer_text: str) -> str:
+    m = _KEY_RE.search(footer_text)
+    assert m is not None, f"no key in footer: {footer_text!r}"
+    return m.group("key")
+
+
+class TestProgressiveTraceIdPropagation:
+    def test_trace_id_reaches_progressive_response(self):
+        mgr = _make_manager()
+        pcfg = ProgressiveConfig(chunk_size=100)
+        text = "x" * 5000
+
+        rendered = mgr._apply_progressive(text, pcfg, "srv", "my-tool", trace_id="tid-deadbeef")
+        key = _extract_key(rendered)
+
+        resp = mgr._get_progressive_store().get(key)
+        assert resp is not None
+        assert resp.trace_id == "tid-deadbeef"
+        assert resp.server == "srv"
+        assert resp.tool == "my-tool"
+
+    def test_read_more_span_uses_original_trace_id(self):
+        mgr = _make_manager()
+        pcfg = ProgressiveConfig(chunk_size=100)
+        text = "x" * 5000
+
+        rendered = mgr._apply_progressive(text, pcfg, "srv", "my-tool", trace_id="tid-deadbeef")
+        key = _extract_key(rendered)
+
+        recorded: list[tuple[str, dict]] = []
+
+        def recording_traced(name, **kwargs):
+            recorded.append((name, kwargs.get("metadata", {})))
+            return nullcontext()
+
+        with patch("memtomem_stm.proxy.manager.traced", recording_traced):
+            mgr.read_more(key, 0)
+
+        assert len(recorded) == 1
+        name, metadata = recorded[0]
+        assert name == "proxy_call_read_more"
+        assert metadata == {
+            "server": "srv",
+            "tool": "my-tool",
+            "trace_id": "tid-deadbeef",
+            "key": key,
+        }
+
+    def test_read_more_backwards_compat_old_row(self):
+        mgr = _make_manager()
+        store = mgr._get_progressive_store()
+
+        # Simulate a row written by a pre-PR version: no server/tool/trace_id
+        # in __meta__. ProgressiveStoreAdapter.get must deserialize this
+        # cleanly via dict.get(..., default), not raise KeyError.
+        legacy_meta = json.dumps(
+            {
+                "total_lines": 1,
+                "content_type": "text",
+                "structure_hint": "",
+                "access_count": 0,
+                "ttl_seconds": 1800.0,
+            }
+        )
+        content = "legacy-" * 100
+        legacy_key = "legacy-key-12345"
+        store._store.put(
+            legacy_key,
+            PendingSelection(
+                chunks={"__content__": content, "__meta__": legacy_meta},
+                format="progressive",
+                created_at=time.monotonic(),
+                total_chars=len(content),
+            ),
+        )
+
+        resp = store.get(legacy_key)
+        assert resp is not None
+        assert resp.server == ""
+        assert resp.tool == ""
+        assert resp.trace_id is None
+
+        # read_more on a legacy row returns a chunk (not the not-found error)
+        # and emits a span with the empty/None defaults rather than crashing.
+        out = mgr.read_more(legacy_key, 0, 100)
+        assert "not found or expired" not in out
+        assert out.startswith("legacy-")
+
+    def test_both_apply_progressive_call_sites_pass_trace_id_kwarg(self):
+        # manager.py has two _apply_progressive call sites: the normal
+        # PROGRESSIVE branch and the hybrid-fallback branch. Both must pass
+        # trace_id=trace_id. This test source-inspects _call_tool_inner,
+        # pins the count of call sites at 2, and asserts each call contains
+        # the trace_id= kwarg — cheap regression insurance against a future
+        # refactor that drops the kwarg at one site (functionally tight:
+        # both sites are currently shape-identical, so a unit-level spy
+        # cannot distinguish them).
+        import inspect
+
+        from memtomem_stm.proxy import manager as manager_module
+
+        src = inspect.getsource(manager_module.ProxyManager._call_tool_inner)
+        calls = re.findall(r"self\._apply_progressive\(\s*.*?\)", src, re.DOTALL)
+        assert len(calls) == 2, f"expected 2 _apply_progressive call sites, found {len(calls)}"
+        for call in calls:
+            assert "trace_id=" in call, f"call site missing trace_id kwarg: {call}"
+
+    def test_read_more_behavior_byte_identical_on_success(self):
+        # Pin the chunker construction params (chunk_size=<limit or 4000>,
+        # include_hint=True) that read_more uses. If a future edit inside
+        # read_more silently flips include_hint to False or swaps the
+        # chunker impl, this test fires. If ProgressiveChunker internals
+        # legitimately evolve, both sides move together — no fixture churn.
+        mgr = _make_manager()
+        pcfg = ProgressiveConfig(chunk_size=100)
+        text = "abcdefghij" * 600  # 6000 chars, plenty for multiple chunks
+
+        rendered = mgr._apply_progressive(text, pcfg, "srv", "tool", trace_id="tid-snapshot")
+        key = _extract_key(rendered)
+        resp = mgr._get_progressive_store().get(key)
+        assert resp is not None
+
+        actual = mgr.read_more(key, 100, 100)
+
+        expected = ProgressiveChunker(chunk_size=100, include_hint=True).read_chunk(
+            resp.content, 100, 100, key=key, ttl_seconds=resp.ttl_seconds
+        )
+        assert actual == expected
 
 
 # ── MetricsStore trace_id ────────────────────────────────────────────────
