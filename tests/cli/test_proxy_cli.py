@@ -1785,6 +1785,48 @@ class TestDetectInstallType:
         assert args == []
 
 
+class TestClaudeDesktopConfigHint:
+    """``_claude_desktop_config_hint`` picks the right Claude Desktop config
+    path per OS. Displayed in the ``mms init`` / ``mms register`` paste-hint
+    block after option 2 (generate .mcp.json)."""
+
+    @pytest.mark.parametrize(
+        "platform,expected_fragment",
+        [
+            ("darwin", "Library/Application Support/Claude"),
+            ("linux", ".config/Claude"),
+            ("linux2", ".config/Claude"),  # older sys.platform label
+            ("freebsd14", ".config/Claude"),  # any non-darwin/non-win32 POSIX
+        ],
+    )
+    def test_posix_variants(self, monkeypatch, platform, expected_fragment):
+        monkeypatch.setattr("sys.platform", platform)
+        from memtomem_stm.cli.proxy import _claude_desktop_config_hint
+
+        assert expected_fragment in _claude_desktop_config_hint()
+
+    def test_windows(self, monkeypatch):
+        """Windows uses ``%APPDATA%`` + backslashes — displayed literally so
+        Windows users can paste the string into PowerShell / Explorer."""
+        monkeypatch.setattr("sys.platform", "win32")
+        from memtomem_stm.cli.proxy import _claude_desktop_config_hint
+
+        hint = _claude_desktop_config_hint()
+        assert "%APPDATA%" in hint
+        assert "\\Claude\\" in hint
+
+    def test_emitted_in_paste_hints(self, monkeypatch, capsys):
+        """Integration-level: ``_emit_mcp_paste_hints`` uses the per-OS path."""
+        monkeypatch.setattr("sys.platform", "linux")
+        from memtomem_stm.cli.proxy import _emit_mcp_paste_hints
+
+        _emit_mcp_paste_hints()
+        out = capsys.readouterr().out
+        assert ".config/Claude/claude_desktop_config.json" in out
+        # macOS-specific path must NOT leak when running on Linux.
+        assert "Library/Application Support" not in out
+
+
 class TestRegisterCommand:
     """``mms register`` is the post-init re-entry path for the MCP-client
     registration flow. It requires that ``mms init`` has been run, so

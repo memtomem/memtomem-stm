@@ -287,14 +287,26 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
     return mcp_path
 
 
+def _claude_desktop_config_hint() -> str:
+    """Return the display path for Claude Desktop's config on the current OS.
+
+    Claude Desktop is the only target in the paste-hint block whose config
+    path is platform-specific — Cursor / Windsurf / Gemini all use the same
+    dot-directory under ``$HOME`` across OSes.
+    """
+    if sys.platform == "darwin":
+        return "~/Library/Application Support/Claude/claude_desktop_config.json"
+    if sys.platform == "win32":
+        return r"%APPDATA%\Claude\claude_desktop_config.json"
+    # Linux and other POSIX: XDG default.
+    return "~/.config/Claude/claude_desktop_config.json"
+
+
 def _emit_mcp_paste_hints() -> None:
     """Per-editor paste targets for the generated ``.mcp.json``."""
     click.echo("    Cursor          → paste into ~/.cursor/mcp.json")
     click.echo("    Windsurf        → paste into ~/.codeium/windsurf/mcp_config.json")
-    click.echo(
-        "    Claude Desktop  → paste into "
-        "~/Library/Application Support/Claude/claude_desktop_config.json"
-    )
+    click.echo(f"    Claude Desktop  → paste into {_claude_desktop_config_hint()}")
     click.echo("    Gemini CLI      → paste into ~/.gemini/settings.json")
     click.echo("  (Claude Code picks up ./.mcp.json in this project automatically.)")
 
