@@ -73,9 +73,10 @@ class ErrorCategory(StrEnum):
     UPSTREAM_ERROR = "upstream_error"  # result.isError=True from upstream
     PROGRAMMING = "programming"  # TypeError, AttributeError, etc.
     INTERNAL_ERROR = "internal_error"  # raised inside COMPRESS/SURFACE/INDEX pipeline
-    # LLM compression exceeded ``llm_timeout_seconds`` (#207); call still
-    # succeeds via truncate fallback, surfaced as ``last_fallback="timeout"``.
-    COMPRESSION_TIMEOUT = "compression_timeout"
+    # Note: LLM compression timeout (#207) is NOT an error category — the call
+    # succeeds via graceful truncate fallback. The signal lives in the
+    # ``compression_strategy`` column as ``"llm_summary→timeout_fallback"``;
+    # dashboards filter via ``WHERE compression_strategy LIKE '%timeout_fallback%'``.
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
