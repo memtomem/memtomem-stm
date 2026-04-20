@@ -1698,6 +1698,92 @@ class TestDetectInstallType:
         assert cmd == "memtomem-stm"
         assert args == []
 
+    def test_detects_optional_dependencies(self, tmp_path, monkeypatch):
+        """A user project that has memtomem-stm in ``optional-dependencies``
+        (e.g. `[project.optional-dependencies].stm = ["memtomem-stm"]`)
+        should also resolve to ``uv run --directory ...``."""
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "my-app"\n'
+            "dependencies = []\n"
+            "[project.optional-dependencies]\n"
+            'stm = ["memtomem-stm>=0.1"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "uv"
+        assert args[-1] == "mms"
+
+    def test_adjacent_package_name_does_not_false_positive(self, tmp_path, monkeypatch):
+        """A project named `memtomem-stm-extension` (or similar dash-suffixed
+        neighbor) must NOT be treated as STM's own source checkout.
+
+        Pre-tightening heuristic matched the prefix string and would have
+        flagged this as an STM dep. The PEP 508 name extraction pins the
+        match to the exact package name."""
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "memtomem-stm-extension"\ndependencies = []\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
+    def test_adjacent_dep_name_does_not_false_positive(self, tmp_path, monkeypatch):
+        """Same invariant for the dependency list: a dep like
+        ``memtomem-stm-adjacent>=0.1`` is a different package."""
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "my-app"\ndependencies = ["memtomem-stm-adjacent>=0.1"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
+    def test_comment_mention_does_not_false_positive(self, tmp_path, monkeypatch):
+        """A pyproject.toml with ``memtomem-stm`` only in a comment or
+        free-form description string must not trigger uv-run mode.
+
+        Old string-match heuristic would false-positive here; the TOML parse
+        + exact-name match catches only real declarations."""
+        (tmp_path / "pyproject.toml").write_text(
+            "# Using memtomem-stm for memory proxying — see README.\n"
+            "[project]\n"
+            'name = "my-app"\n'
+            'description = "Uses memtomem-stm under the hood"\n'
+            'dependencies = ["requests"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
+    def test_malformed_pyproject_falls_through(self, tmp_path, monkeypatch):
+        """A pyproject.toml we can't parse (malformed TOML, I/O error) should
+        break out of the walk and return the default — not crash."""
+        (tmp_path / "pyproject.toml").write_text(
+            "this is = [[not valid toml\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
 
 class TestRegisterCommand:
     """``mms register`` is the post-init re-entry path for the MCP-client

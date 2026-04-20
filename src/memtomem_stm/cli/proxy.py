@@ -9,6 +9,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -138,34 +139,80 @@ def _run_claude_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedPro
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+# PEP 508 dependency specifier: the distribution name is the leading identifier
+# before any extras (`[...]`), version spec (`==`, `>=`, ...), marker (`;`), or
+# whitespace. Pinning the match to the start anchors the regex so `my-memtomem-stm`
+# or `memtomem-stm-extension` can't hide a match inside the name.
+_PEP508_NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _dep_name(spec: str) -> str | None:
+    """Extract the package name from a PEP 508 dependency spec, or None.
+
+    ``"memtomem-stm>=0.1"`` → ``"memtomem-stm"``
+    ``"memtomem-stm[extra]==1.0"`` → ``"memtomem-stm"``
+    ``"memtomem-stm-extension"`` → ``"memtomem-stm-extension"`` (different pkg)
+    """
+    if not isinstance(spec, str):
+        return None
+    match = _PEP508_NAME_RE.match(spec.strip())
+    return match.group(1) if match else None
+
+
+def _pyproject_references_stm(pyp: Path) -> bool:
+    """True if ``pyp`` is STM's own pyproject.toml, or lists memtomem-stm as
+    a dep. Parses the TOML via ``tomllib`` so comments, descriptions, and
+    adjacent-name packages (``memtomem-stm-extension``) can't false-positive.
+    """
+    try:
+        data = tomllib.loads(pyp.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return False
+    if project.get("name") == "memtomem-stm":
+        return True
+    dep_lists: list[list[Any]] = []
+    deps = project.get("dependencies")
+    if isinstance(deps, list):
+        dep_lists.append(deps)
+    optional = project.get("optional-dependencies")
+    if isinstance(optional, dict):
+        dep_lists.extend(v for v in optional.values() if isinstance(v, list))
+    for dep_list in dep_lists:
+        for spec in dep_list:
+            if _dep_name(spec) == "memtomem-stm":
+                return True
+    return False
+
+
 def _detect_install_type() -> tuple[str, list[str]]:
     """Return ``(server_cmd, server_args)`` to register with an MCP client.
 
     Branches:
 
-    * Inside a ``pyproject.toml`` that references ``memtomem-stm`` (STM
-      source checkout, or a user project that ran ``uv add memtomem-stm``)
-      → ``uv run --directory <root> mms``.
-    * Default (global install via ``uv tool install`` or ``pipx``) → bare
-      ``memtomem-stm`` console script on ``PATH``.
+    * Inside a ``pyproject.toml`` that is STM's own source checkout OR a
+      user project that lists ``memtomem-stm`` in ``[project].dependencies``
+      / ``[project].optional-dependencies`` → ``uv run --directory <root> mms``.
+    * Default (global install via ``uv tool install`` / ``pipx``, or a cwd
+      with no relevant pyproject) → bare ``memtomem-stm`` console script.
 
     Parent ``mm init`` keeps source/project as separate branches because
     the parent is a monorepo (``packages/`` subdir is the discriminator).
     STM has a flat layout so the two collapse into one.
+
+    PEP 735 ``dependency-groups`` and tool-specific dev-dep tables (``[tool.uv
+    .dev-dependencies]``, ``[tool.poetry.group.*.dependencies]``) are
+    intentionally **not** matched — a dev-only dep usually means the user
+    wants `uv run --group <name>` which the registration command can't pick.
+    Bare ``memtomem-stm`` is the safer default; users can override manually.
     """
     check = Path.cwd()
     for _ in range(5):
         pyp = check / "pyproject.toml"
         if pyp.exists():
-            try:
-                content = pyp.read_text(encoding="utf-8")
-            except OSError:
-                break
-            # Match STM source checkout (`name = "memtomem-stm"`) and user
-            # projects depending on STM (`"memtomem-stm"`, `"memtomem-stm>=0.1"`,
-            # `'memtomem-stm'`, etc.). Using the open quote + dash-containing
-            # string avoids over-matching on legit neighbor names.
-            if 'name = "memtomem-stm"' in content or '"memtomem-stm' in content:
+            if _pyproject_references_stm(pyp):
                 return ("uv", ["run", "--directory", str(check), "mms"])
             break
         check = check.parent
