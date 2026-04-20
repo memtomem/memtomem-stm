@@ -314,10 +314,14 @@ class McpClientSearchAdapter:
                 await self._reconnect()
                 result = await self._session.call_tool("mem_search", args)  # type: ignore[union-attr]
             except Exception as retry_exc:
-                logger.debug("MCP mem_search failed after reconnect: %s", retry_exc)
+                # Upstream LTM is unreachable; surfacing will return empty.
+                # Bumped debug -> warning so operators can see the symptom at
+                # default log level (P2 partial fix; full propagation via a
+                # distinct error class is a follow-up).
+                logger.warning("MCP mem_search failed after reconnect: %s", retry_exc)
                 return [], []
         except Exception as exc:
-            logger.debug("MCP mem_search failed: %s", exc)
+            logger.warning("MCP mem_search failed: %s", exc)
             return [], []
 
         # Parse text response into results

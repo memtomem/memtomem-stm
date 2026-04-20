@@ -38,6 +38,8 @@ def _make_manager(
     compression: CompressionStrategy = CompressionStrategy.NONE,
     max_result_chars: int = 50000,
     tmp_path: Path | None = None,
+    call_timeout: float = 90.0,
+    overall_deadline: float = 180.0,
 ) -> ProxyManager:
     """Create a ProxyManager with a mocked upstream connection."""
     server_cfg = UpstreamServerConfig(
@@ -47,6 +49,8 @@ def _make_manager(
         max_retries=max_retries,
         reconnect_delay_seconds=reconnect_delay,
         max_reconnect_delay_seconds=max_reconnect_delay,
+        call_timeout_seconds=call_timeout,
+        overall_deadline_seconds=overall_deadline,
     )
     config_path = (tmp_path / "proxy.json") if tmp_path else Path("/tmp/proxy.json")
     proxy_cfg = ProxyConfig(
@@ -856,3 +860,183 @@ class TestCacheWithErrors:
         result = await mgr.call_tool("srv", "tool", {})
         assert "hello world" in result
         cache.set.assert_called_once()
+
+
+# ── P0: call_timeout_seconds + overall_deadline_seconds ──────────────────
+
+
+class TestCallTimeout:
+    """Per-attempt ``call_timeout_seconds`` caps each ``session.call_tool``
+    await; ``overall_deadline_seconds`` caps the sum across retries."""
+
+    async def test_hanging_upstream_is_timed_out_and_retried(self):
+        """A silent upstream must be cut off by ``call_timeout_seconds``; the
+        retry path then calls ``_reconnect_server`` (drops the orphan
+        ``request_id`` in the old session) and a subsequent attempt succeeds.
+        """
+        mgr = _make_manager(
+            max_retries=1,
+            reconnect_delay=0.0,
+            max_reconnect_delay=0.0,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+        )
+        session = _get_session(mgr)
+
+        attempts = 0
+
+        async def hang_once_then_ok(*_a, **_kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await asyncio.sleep(10)  # wait_for cancels this
+            return _make_result("fresh")
+
+        session.call_tool.side_effect = hang_once_then_ok
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert "fresh" in result
+        assert attempts == 2
+        mock_reconnect.assert_awaited_with("srv")
+
+    async def test_hanging_upstream_without_retries_raises_timeout(self):
+        """With ``max_retries=0`` a hanging upstream must surface
+        ``TimeoutError`` instead of hanging forever."""
+        mgr = _make_manager(
+            max_retries=0,
+            call_timeout=0.05,
+            overall_deadline=0.2,
+        )
+        session = _get_session(mgr)
+
+        async def hang_forever(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang_forever
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+
+        # Terminal retry path still reconnects before re-raising so the next
+        # call (if any) starts on a fresh session.
+        mock_reconnect.assert_awaited_with("srv")
+
+    async def test_reconnect_between_attempts_drops_stale_session(self):
+        """After a call times out, the next attempt must run on the freshly
+        reconnected session, not on the one whose request was cancelled.
+        This is the orphan-``request_id`` guard — without the reconnect, a
+        late response from attempt N could be read by attempt N+1."""
+        mgr = _make_manager(
+            max_retries=1,
+            reconnect_delay=0.0,
+            max_reconnect_delay=0.0,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+        )
+        session = _get_session(mgr)
+
+        call_log: list[str] = []
+
+        async def hang_once_then_ok(*_a, **_kw):
+            call_log.append("invoked")
+            if len(call_log) == 1:
+                await asyncio.sleep(10)
+            return _make_result("fresh")
+
+        session.call_tool.side_effect = hang_once_then_ok
+
+        reconnect_timing: list[int] = []
+
+        async def tracking_reconnect(_name):
+            # Record how many call_tool invocations had happened by the time
+            # reconnect fires — must be exactly 1 (post-timeout, pre-retry).
+            reconnect_timing.append(len(call_log))
+
+        with patch.object(mgr, "_reconnect_server", side_effect=tracking_reconnect):
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert "fresh" in result
+        assert reconnect_timing == [1], (
+            "reconnect must fire between the cancelled attempt and the retry "
+            f"(saw {reconnect_timing})"
+        )
+
+    async def test_overall_deadline_aborts_before_max_retries(self):
+        """When the overall deadline is shorter than
+        ``call_timeout × (max_retries+1)``, the loop must abort early with a
+        ``TimeoutError`` referencing ``overall_deadline_seconds`` — not burn
+        through all retries."""
+        mgr = _make_manager(
+            max_retries=10,
+            reconnect_delay=0.0,
+            max_reconnect_delay=0.0,
+            call_timeout=0.02,
+            overall_deadline=0.05,
+        )
+        session = _get_session(mgr)
+
+        async def always_hang(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = always_hang
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError, match="overall_deadline"):
+                await mgr.call_tool("srv", "tool", {})
+
+        # Upper bound: max_retries+1 = 11. Overall_deadline=0.05 with
+        # call_timeout=0.02 permits ~2-3 attempts; well under 11.
+        assert session.call_tool.call_count < 6, (
+            "overall_deadline did not cap the retry loop: "
+            f"saw {session.call_tool.call_count} attempts"
+        )
+
+    async def test_per_attempt_shrinks_to_remaining_deadline(self):
+        """Once prior attempts have consumed most of the deadline, the next
+        attempt's effective timeout must equal the remaining budget (not the
+        full ``call_timeout_seconds``) so the total wall-clock stays within
+        ``overall_deadline_seconds``."""
+        mgr = _make_manager(
+            max_retries=3,
+            reconnect_delay=0.0,
+            max_reconnect_delay=0.0,
+            call_timeout=0.1,
+            overall_deadline=0.12,
+        )
+        session = _get_session(mgr)
+
+        captured_timeouts: list[float] = []
+        real_wait_for = asyncio.wait_for
+
+        async def spy_wait_for(coro, timeout):
+            captured_timeouts.append(timeout)
+            return await real_wait_for(coro, timeout)
+
+        async def hang_forever(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang_forever
+
+        with (
+            patch.object(mgr, "_reconnect_server", new_callable=AsyncMock),
+            patch(
+                "memtomem_stm.proxy.manager.asyncio.wait_for",
+                side_effect=spy_wait_for,
+            ),
+        ):
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+
+        assert len(captured_timeouts) >= 2, (
+            f"expected at least two attempts within 0.12s budget, saw {len(captured_timeouts)}"
+        )
+        # First attempt uses full call_timeout_seconds.
+        assert captured_timeouts[0] == pytest.approx(0.1, abs=0.005)
+        # Second attempt must shrink to the remaining deadline (≈0.02s).
+        assert captured_timeouts[1] < 0.1, (
+            f"second attempt used {captured_timeouts[1]:.4f}s but remaining "
+            "deadline was smaller; shrink logic not applied"
+        )

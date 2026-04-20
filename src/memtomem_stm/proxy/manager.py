@@ -996,9 +996,48 @@ class ProxyManager:
         if trace_id is not None:
             upstream_args["_trace_id"] = trace_id
 
+        # Overall-deadline policy: each attempt uses
+        # ``min(call_timeout_seconds, remaining_deadline)`` as its effective
+        # timeout. ``asyncio.wait_for`` cancels the inner ``call_tool`` on
+        # timeout; the existing TimeoutError handler below runs
+        # ``_reconnect_server``, which tears down the old ``ClientSession``
+        # and its transport. That drops any orphaned ``request_id`` so a late
+        # upstream response from the cancelled attempt cannot be delivered to
+        # a subsequent caller.
+        _call_started_at = _time.monotonic()
+
         for attempt in range(cfg.max_retries + 1):
+            remaining_deadline = cfg.overall_deadline_seconds - (
+                _time.monotonic() - _call_started_at
+            )
+            if remaining_deadline <= 0:
+                deadline_exc = asyncio.TimeoutError(
+                    f"{server}/{tool} exceeded overall_deadline_seconds "
+                    f"({cfg.overall_deadline_seconds}s) after {attempt} attempt(s)"
+                )
+                self.tracker.record_error(
+                    CallMetrics(
+                        server=server,
+                        tool=tool,
+                        original_chars=0,
+                        compressed_chars=0,
+                        is_error=True,
+                        error_category=ErrorCategory.TIMEOUT,
+                        trace_id=trace_id,
+                    )
+                )
+                _mark_recorded(deadline_exc)
+                try:
+                    await self._reconnect_server(server)
+                except Exception:
+                    logger.debug("Post-deadline reconnect failed", exc_info=True)
+                raise deadline_exc
+            per_attempt_timeout = min(cfg.call_timeout_seconds, remaining_deadline)
             try:
-                result = await conn.session.call_tool(tool, upstream_args)
+                result = await asyncio.wait_for(
+                    conn.session.call_tool(tool, upstream_args),
+                    timeout=per_attempt_timeout,
+                )
                 break
             except Exception as exc:
                 err_code = getattr(getattr(exc, "error", None), "code", None)

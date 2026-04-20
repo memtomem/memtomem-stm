@@ -263,15 +263,42 @@ class UpstreamServerConfig(BaseModel):
     reconnect_delay_seconds: float = Field(default=1.0, ge=0.0)
     max_reconnect_delay_seconds: float = Field(default=30.0, ge=0.0)
     connect_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    call_timeout_seconds: float = Field(default=90.0, gt=0.0)
+    """Per-attempt timeout for ``session.call_tool()`` against this upstream.
+
+    Without this bound, a silently-hung upstream blocks the proxy indefinitely
+    and every downstream client blocks on the proxy. On ``TimeoutError`` the
+    session is force-reset (so the orphaned ``request_id`` cannot pollute a
+    future call) and the retry loop proceeds to the next attempt, capped by
+    ``max_retries`` and ``overall_deadline_seconds``.
+
+    Default 90s: most tool calls complete in <30s, LLM-backed tools can take
+    30-60s, 90s leaves headroom without permitting an infinite hang. Lower for
+    known-fast upstreams; raise for upstreams that invoke long-running LLMs.
+    """
+    overall_deadline_seconds: float = Field(default=180.0, gt=0.0)
+    """Total wall-clock budget for a single tool call across all retry attempts.
+
+    Each attempt's effective timeout is ``min(call_timeout_seconds,
+    remaining_deadline)``. When the deadline is exhausted the retry loop aborts
+    and ``TimeoutError`` propagates. This prevents ``call_timeout_seconds ×
+    (max_retries+1)`` worst-case blowout while still allowing multiple attempts
+    within a bounded window. Default 180s = 2× ``call_timeout_seconds``.
+    """
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
 
     @model_validator(mode="after")
-    def _check_delay_ordering(self) -> Self:
+    def _check_ordering(self) -> Self:
         if self.reconnect_delay_seconds > self.max_reconnect_delay_seconds:
             raise ValueError(
                 f"reconnect_delay_seconds ({self.reconnect_delay_seconds}) "
                 f"must be <= max_reconnect_delay_seconds ({self.max_reconnect_delay_seconds})"
+            )
+        if self.call_timeout_seconds > self.overall_deadline_seconds:
+            raise ValueError(
+                f"call_timeout_seconds ({self.call_timeout_seconds}) "
+                f"must be <= overall_deadline_seconds ({self.overall_deadline_seconds})"
             )
         return self
 
