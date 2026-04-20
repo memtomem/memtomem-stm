@@ -260,6 +260,10 @@ class TestListServers:
         data = json.loads(result.output)
         assert "fs" in data["servers"]
         assert str(config) in data["config_path"]
+        # ``enabled`` is proxy-wide state owned by ``status`` — its absence
+        # here is intentional. Pinning it prevents a future copy-paste from
+        # ``status --json`` silently widening the contract.
+        assert "enabled" not in data
 
     def test_json_empty_config(self, runner, config):
         """Empty config → empty ``servers`` object, not text fallback."""
