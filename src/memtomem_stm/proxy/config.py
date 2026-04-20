@@ -336,6 +336,23 @@ class CompressionFeedbackConfig(BaseModel):
     db_path: Path = Path("~/.memtomem/stm_feedback.db")
 
 
+class ProgressiveReadsConfig(BaseModel):
+    """Configuration for progressive-delivery read telemetry.
+
+    Records one row per initial progressive response plus one row per
+    ``stm_proxy_read_more`` follow-up into ``progressive_reads``.
+    Aggregates surface via ``stm_progressive_stats`` and enable
+    stratified analysis of follow-up rate by tool / compression
+    strategy / response size. Shares the user-wide
+    ``~/.memtomem/stm_feedback.db`` file with surfacing and
+    compression feedback (disjoint tables; WAL mode makes concurrent
+    access safe).
+    """
+
+    enabled: bool = True
+    db_path: Path = Path("~/.memtomem/stm_feedback.db")
+
+
 # Static context window sizes (tokens) for known model families.
 # Used by ProxyConfig.effective_max_result_chars() to scale compression budget.
 # Prefix-matched: "claude-sonnet-4-20250514" matches "claude-sonnet-4".
@@ -459,6 +476,7 @@ class ProxyConfig(BaseModel):
     compression_feedback: CompressionFeedbackConfig = Field(
         default_factory=CompressionFeedbackConfig
     )
+    progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
 
     def effective_max_result_chars(self) -> int:
         """Compute max_result_chars scaled by consumer model's context window.
