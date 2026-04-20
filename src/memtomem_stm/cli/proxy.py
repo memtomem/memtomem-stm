@@ -1623,9 +1623,12 @@ def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
     data = _load(Path(config_path))
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
+    # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
+    # ensure_ascii=False) so scripts piping the three commands through the
+    # same formatter don't hit one compact-one-line outlier.
     if not servers:
         if as_json:
-            click.echo(json.dumps({"servers": {}}))
+            click.echo(json.dumps({"servers": {}}, indent=2, ensure_ascii=False))
         else:
             click.echo("No upstream servers configured.")
         return
@@ -1633,7 +1636,7 @@ def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
     results = asyncio.run(_probe_servers(servers, timeout))
 
     if as_json:
-        click.echo(json.dumps({"servers": results}))
+        click.echo(json.dumps({"servers": results}, indent=2, ensure_ascii=False))
         return
 
     click.echo(_hdr("Upstream Server Health"))
