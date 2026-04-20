@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -304,6 +305,89 @@ class TestLLMCompressorFallback:
         # Second call: text fits budget — no compression needed
         await comp.compress("short", max_chars=1000)
         assert comp.last_fallback is None
+
+
+# ---------------------------------------------------------------------------
+# LLMCompressor — llm_timeout_seconds guards a slow/hung LLM endpoint (#207)
+# ---------------------------------------------------------------------------
+
+
+def _make_llm_compressor_with_timeout(timeout: float) -> LLMCompressor:
+    cfg = LLMCompressorConfig(
+        provider=LLMProvider.OLLAMA,
+        base_url="http://localhost:11434",
+        llm_timeout_seconds=timeout,
+    )
+    return LLMCompressor(cfg)
+
+
+class TestLLMCompressorTimeout:
+    """`llm_timeout_seconds` must fire when the LLM hangs past the budget,
+    sending compression through the truncate fallback with
+    ``last_fallback == "timeout"`` and a circuit-breaker failure recorded
+    (so a persistently slow endpoint eventually trips CB)."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_fires_and_falls_back_to_truncate(self):
+        comp = _make_llm_compressor_with_timeout(0.05)
+        text = "Long document content. " * 50
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5.0)
+            return "should never return"
+
+        with patch.object(comp, "_call_api", new=AsyncMock(side_effect=_hang)):
+            result = await comp.compress(text, max_chars=200)
+        assert comp.last_fallback == "timeout"
+        assert len(result) < len(text)
+        # Truncate marker
+        assert "truncated" in result or "original:" in result
+
+    @pytest.mark.asyncio
+    async def test_timeout_counts_as_circuit_breaker_failure(self):
+        """Repeated timeouts must eventually open the breaker so subsequent
+        calls short-circuit to the ``circuit_breaker`` fallback rather than
+        continuing to pay the timeout latency on every call."""
+        comp = _make_llm_compressor_with_timeout(0.02)
+        text = "Long document content. " * 50
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5.0)
+            return "should never return"
+
+        with patch.object(comp, "_call_api", new=AsyncMock(side_effect=_hang)):
+            for _ in range(3):
+                await comp.compress(text, max_chars=200)
+        assert comp._cb.is_open
+
+    @pytest.mark.asyncio
+    async def test_fast_call_does_not_trigger_timeout(self):
+        comp = _make_llm_compressor_with_timeout(10.0)
+        text = "Long document content. " * 50
+
+        async def _fast(*_args, **_kwargs):
+            return "compressed summary"
+
+        with patch.object(comp, "_call_api", new=AsyncMock(side_effect=_fast)):
+            result = await comp.compress(text, max_chars=200)
+        assert result == "compressed summary"
+        assert comp.last_fallback is None
+
+    def test_config_rejects_non_positive_timeout(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            LLMCompressorConfig(
+                provider=LLMProvider.OLLAMA,
+                base_url="http://localhost:11434",
+                llm_timeout_seconds=0.0,
+            )
+        with pytest.raises(ValidationError):
+            LLMCompressorConfig(
+                provider=LLMProvider.OLLAMA,
+                base_url="http://localhost:11434",
+                llm_timeout_seconds=-1.0,
+            )
 
 
 # ---------------------------------------------------------------------------

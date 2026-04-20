@@ -1193,9 +1193,21 @@ class LLMCompressor:
         self._in_flight += 1
         self._idle.clear()
         try:
-            result = await self._call_api(text, max_chars=max_chars)
+            result = await asyncio.wait_for(
+                self._call_api(text, max_chars=max_chars),
+                timeout=self._cfg.llm_timeout_seconds,
+            )
             self._cb.success()
             return result
+        except asyncio.TimeoutError:
+            self._cb.failure()
+            logger.warning(
+                "LLM compression timed out after %.1fs (strategy=llm/%s), falling back to truncate",
+                self._cfg.llm_timeout_seconds,
+                self._cfg.provider.value,
+            )
+            self.last_fallback = "timeout"
+            return TruncateCompressor().compress(text, max_chars=max_chars)
         except Exception as exc:
             self._cb.failure()
             logger.warning(

@@ -100,6 +100,12 @@ class LLMCompressorConfig(BaseModel):
         "Keep the summary under {max_chars} characters."
     )
     max_tokens: int = Field(default=500, gt=0)
+    # Timeout for a single LLM compression call. A slow or hung LLM endpoint
+    # would otherwise freeze the pipeline AFTER the upstream has already
+    # responded — outside the upstream ``call_timeout_seconds`` (#206).
+    # On timeout the compressor falls back to TruncateCompressor (matching
+    # other LLM failure modes: privacy, circuit_breaker, llm_error).
+    llm_timeout_seconds: float = Field(default=60.0, gt=0.0)
 
     @model_validator(mode="after")
     def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:
