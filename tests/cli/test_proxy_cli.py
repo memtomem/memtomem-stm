@@ -53,6 +53,17 @@ class TestVersion:
         assert "memtomem-stm" in result.output
         assert result.output.strip().startswith("memtomem-stm ")
 
+    def test_version_flag_matches_subcommand(self, runner):
+        """``--version`` is the idiomatic Click entry point; the subcommand
+        predates it. Both must emit the identical line so scripts that grep
+        the version don't care which they invoke (CHANGELOG keeps the
+        subcommand for compatibility)."""
+        flag = runner.invoke(cli, ["--version"])
+        sub = runner.invoke(cli, ["version"])
+        assert flag.exit_code == 0
+        assert sub.exit_code == 0
+        assert flag.output.strip() == sub.output.strip()
+
 
 # ── style helpers / NO_COLOR contract ───────────────────────────────────
 

@@ -403,6 +403,11 @@ CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
+@click.version_option(
+    package_name="memtomem-stm",
+    prog_name="memtomem-stm",
+    message="%(prog)s %(version)s",
+)
 def cli() -> None:
     """memtomem-stm proxy gateway management.
 
@@ -410,6 +415,10 @@ def cli() -> None:
     """
 
 
+# ``version`` subcommand predates the ``--version`` flag (CHANGELOG #152) and
+# is kept for backwards compatibility. Both paths must produce the exact same
+# line so scripts that grep the version string don't care which entry point
+# they use.
 @cli.command()
 def version() -> None:
     """Show the installed memtomem-stm version."""

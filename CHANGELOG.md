@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **`mms --version` flag** — idiomatic Click entry point alongside the existing `mms version` subcommand (kept for backwards compatibility). Both paths emit the same `memtomem-stm X.Y.Z` line, so scripts that grep the version string don't care which they invoke.
+
 ## [0.1.12] — 2026-04-20
 
 ### Added
