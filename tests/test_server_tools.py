@@ -629,3 +629,59 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert callable(stm_proxy_stats)
         assert callable(stm_surfacing_stats)
         assert callable(stm_tuning_recommendations)
+
+
+# ── main() exception barrier (#209) ──────────────────────────────────────
+
+
+class TestMainExceptionBarrier:
+    """#209 Part A: unhandled exceptions from ``mcp.run()`` must be logged at
+    ERROR level before the process terminates, so operators have a visible
+    signal instead of only stderr tail output."""
+
+    def test_unhandled_exception_is_logged_then_reraised(self, caplog):
+        import logging
+
+        from memtomem_stm import server
+
+        class _ServerBoom(RuntimeError):
+            pass
+
+        caplog.clear()
+        with (
+            caplog.at_level(logging.ERROR, logger="memtomem_stm.server"),
+            patch.object(server.mcp, "run", side_effect=_ServerBoom("event loop crashed")),
+        ):
+            try:
+                server.main()
+            except _ServerBoom:
+                pass
+            else:
+                import pytest as _pytest
+
+                _pytest.fail("main() must re-raise the underlying exception")
+
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records, "expected at least one ERROR-level log from the barrier"
+        # The logger.exception call must attach the traceback so operators
+        # can diagnose WHY the server died — not just that it did.
+        assert any(r.exc_info is not None for r in error_records)
+        assert any("unhandled exception" in r.getMessage() for r in error_records)
+
+    def test_clean_exit_does_not_log_error(self, caplog):
+        import logging
+
+        from memtomem_stm import server
+
+        caplog.clear()
+        with (
+            caplog.at_level(logging.ERROR, logger="memtomem_stm.server"),
+            patch.object(server.mcp, "run", return_value=None),
+        ):
+            server.main()
+
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not error_records, (
+            f"clean exit should not emit ERROR logs; got: "
+            f"{[r.getMessage() for r in error_records]}"
+        )

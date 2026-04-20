@@ -750,7 +750,16 @@ def main() -> None:
         level=getattr(logging, level, logging.WARNING),
         format="%(levelname)s %(name)s: %(message)s",
     )
-    mcp.run()
+    # Exception barrier (#209): without this, an unhandled exception from
+    # ``mcp.run()`` (e.g. a background task crashing the event loop) ends the
+    # process with only stderr output — operators get no ERROR-level log, and
+    # clients see stdio EOF without any signal about WHY STM died. Re-raise
+    # after logging so the process still terminates; we only add observability.
+    try:
+        mcp.run()
+    except Exception:
+        logger.exception("STM MCP server terminated with an unhandled exception")
+        raise
 
 
 if __name__ == "__main__":
