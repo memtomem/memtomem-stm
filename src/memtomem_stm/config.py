@@ -45,6 +45,17 @@ class STMConfig(BaseSettings):
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
     data_dir: Path = Path("~/.memtomem")
 
+    advertise_observability_tools: bool = True
+    """Whether STM's own observability/admin MCP tools (``stm_proxy_stats``,
+    ``stm_proxy_health``, ``stm_proxy_cache_clear``, ``stm_surfacing_stats``,
+    ``stm_compression_stats``, ``stm_tuning_recommendations``) are advertised
+    to MCP clients. When ``False``, these are hidden from ``tools/list`` but
+    remain callable via the ``mms`` CLI — useful for eager-loading clients
+    (e.g. OpenAI Codex CLI) where every advertised tool pays schema tokens
+    upfront. Claude Code defers tool schemas via its own mechanism so this
+    flag has no effect there. Read via env var
+    ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` at server import time."""
+
     def model_post_init(self, __context: object) -> None:
         # Propagate consumer_model from proxy to surfacing for model-aware defaults
         if self.proxy.consumer_model and not self.surfacing.consumer_model:

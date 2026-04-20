@@ -251,6 +251,32 @@ mcp = FastMCP(
 )
 
 
+def _should_advertise_obs_tools() -> bool:
+    """Read the ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` env-var flag.
+
+    Factored out so tests can monkeypatch this function directly instead of
+    juggling env vars and module reloads. The env read is the source of
+    truth; the matching ``STMConfig`` field exists for documentation and
+    type-checking but is not consulted here — registration happens at
+    module import, before ``app_lifespan`` loads the JSON config file.
+    """
+    return os.environ.get(
+        "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "true"
+    ).strip().lower() not in ("false", "0", "no")
+
+
+def _obs_tool(fn):
+    """Register ``fn`` as an MCP tool only when the flag is on.
+
+    When off, return the function unchanged — it stays importable and
+    callable from Python (tests, CLI paths), but is not surfaced in the
+    MCP ``tools/list``.
+    """
+    if _should_advertise_obs_tools():
+        return mcp.tool()(fn)
+    return fn
+
+
 def _get_ctx(ctx: CtxType) -> STMContext:
     return ctx.request_context.lifespan_context
 
@@ -260,7 +286,7 @@ def _get_ctx(ctx: CtxType) -> STMContext:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_obs_tool
 async def stm_proxy_stats(
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
@@ -391,7 +417,7 @@ async def stm_proxy_read_more(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_obs_tool
 async def stm_proxy_cache_clear(
     server: str | None = None,
     tool: str | None = None,
@@ -423,7 +449,7 @@ async def stm_proxy_cache_clear(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_obs_tool
 async def stm_proxy_health(
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
@@ -488,7 +514,7 @@ async def stm_surfacing_feedback(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_obs_tool
 async def stm_surfacing_stats(
     tool: str | None = None,
     since: str | None = None,
@@ -624,7 +650,7 @@ async def stm_compression_feedback(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_obs_tool
 async def stm_compression_stats(
     tool: str | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
@@ -673,7 +699,7 @@ async def stm_compression_stats(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@_obs_tool
 async def stm_tuning_recommendations(
     since_hours: float = 24.0,
     tool: str | None = None,

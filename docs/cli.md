@@ -196,3 +196,39 @@ export MEMTOMEM_STM_LOG_LEVEL=DEBUG   # DEBUG | INFO | WARNING | ERROR | CRITICA
 ```
 
 See [Configuration → General](configuration.md#general) for details.
+
+## Trimming the advertised MCP tool surface
+
+STM advertises ten MCP tools by default. Six are operator-facing
+(observability / admin) and accessible through this very CLI; the
+remaining four are model-facing (progressive-delivery unlocks and
+feedback channels). On clients that eager-load MCP tool schemas
+into the model context at session start, the six observability
+tools pay schema tokens for calls the model rarely makes.
+
+Set the following to hide them from MCP (they stay callable via
+`mms`):
+
+```bash
+export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false
+```
+
+- **Claude Code**: no effect needed — Claude Code lazy-loads MCP
+  tool schemas via `ToolSearch`, so advertised count is
+  near-free.
+- **OpenAI Codex CLI** and other eager-loading clients: set this
+  to `false`, or use the downstream per-server filter if your
+  client supports one. For Codex:
+
+  ```toml
+  # ~/.codex/config.toml
+  [mcp_servers.memtomem-stm]
+  disabled_tools = [
+    "stm_proxy_stats", "stm_proxy_health", "stm_proxy_cache_clear",
+    "stm_surfacing_stats", "stm_compression_stats",
+    "stm_tuning_recommendations",
+  ]
+  ```
+
+The STM-side flag is a convenience that keeps the list in one
+place; the downstream filter is equivalent at the wire level.

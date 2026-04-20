@@ -30,6 +30,26 @@ Controls `logging.basicConfig()` level for all `memtomem_stm.*`
 loggers.  Default `WARNING`.  Read once at startup — restart to
 apply changes.
 
+```bash
+export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # default
+```
+
+When `false`, hides STM's six observability / admin tools
+(`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
+`stm_surfacing_stats`, `stm_compression_stats`,
+`stm_tuning_recommendations`) from the MCP `tools/list` surface so
+eager-loading clients (e.g. OpenAI Codex CLI) don't pay schema
+tokens for tools the model rarely calls. The hidden tools remain
+fully callable via the [`mms`](cli.md) CLI; only the MCP
+advertisement is suppressed.  The four model-facing tools
+(`stm_proxy_read_more`, `stm_proxy_select_chunks`,
+`stm_surfacing_feedback`, `stm_compression_feedback`) stay
+advertised regardless.  Read once at import — restart to apply
+changes.  Claude Code defers MCP tool schemas via its own
+`ToolSearch` mechanism so this flag has no practical effect
+there; it's primarily useful for eager-loading clients that lack
+a per-server `disabled_tools` filter of their own.
+
 ### Proxy
 
 ```bash

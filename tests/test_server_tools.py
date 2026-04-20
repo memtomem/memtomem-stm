@@ -10,6 +10,7 @@ from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.server import (
     STMContext,
+    _should_advertise_obs_tools,
     stm_compression_feedback,
     stm_compression_stats,
     stm_proxy_cache_clear,
@@ -530,3 +531,101 @@ class TestLifespan:
         # The cleanup block must run even though yield was never reached.
         mock_adapter.stop.assert_awaited_once()
         mock_pm_instance.stop.assert_awaited_once()
+
+
+# ── advertise_observability_tools flag ──────────────────────────────────
+#
+# The flag hides 6 observability tools from the MCP ``tools/list`` surface
+# while keeping them importable from Python. Registration happens at
+# module import, so the end-to-end assertion uses a subprocess to get a
+# fresh interpreter under the intended env var.
+
+
+_FLAG_ENV = "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"
+
+_MODEL_FACING_TOOLS = {
+    "stm_proxy_read_more",
+    "stm_proxy_select_chunks",
+    "stm_surfacing_feedback",
+    "stm_compression_feedback",
+}
+
+_OBSERVABILITY_TOOLS = {
+    "stm_proxy_stats",
+    "stm_proxy_health",
+    "stm_proxy_cache_clear",
+    "stm_surfacing_stats",
+    "stm_compression_stats",
+    "stm_tuning_recommendations",
+}
+
+
+class TestShouldAdvertiseObsTools:
+    """Unit tests for the env-var helper. Monkeypatchable — no module reload."""
+
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv(_FLAG_ENV, raising=False)
+        assert _should_advertise_obs_tools() is True
+
+    def test_false_variants_disable(self, monkeypatch):
+        for value in ("false", "FALSE", "False", "0", "no", "NO", "  false  "):
+            monkeypatch.setenv(_FLAG_ENV, value)
+            assert _should_advertise_obs_tools() is False, f"{value!r} should disable"
+
+    def test_other_values_passthrough(self, monkeypatch):
+        for value in ("true", "yes", "1", "", "anything-else"):
+            monkeypatch.setenv(_FLAG_ENV, value)
+            assert _should_advertise_obs_tools() is True, f"{value!r} should keep default-on"
+
+
+class TestAdvertiseObservabilityFlagEndToEnd:
+    """Subprocess-based — confirms registration-time behavior end-to-end.
+
+    We can't monkeypatch the flag after the current test-process has already
+    imported ``memtomem_stm.server`` (registration runs at import, module
+    is cached). A fresh subprocess gets a clean interpreter.
+    """
+
+    @staticmethod
+    def _list_registered(env_override: str | None) -> list[str]:
+        import json
+        import os
+        import subprocess
+        import sys
+
+        env = {k: v for k, v in os.environ.items() if k != _FLAG_ENV}
+        if env_override is not None:
+            env[_FLAG_ENV] = env_override
+        script = (
+            "import json\n"
+            "from memtomem_stm import server\n"
+            "names = [t.name for t in server.mcp._tool_manager.list_tools()]\n"
+            "print(json.dumps(sorted(names)))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_default_advertises_all_ten(self):
+        names = set(self._list_registered(env_override=None))
+        assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
+        assert len(names) == 10
+
+    def test_flag_false_keeps_only_model_facing(self):
+        names = set(self._list_registered(env_override="false"))
+        assert names == _MODEL_FACING_TOOLS
+        assert _OBSERVABILITY_TOOLS.isdisjoint(names)
+
+    def test_hidden_functions_stay_importable(self):
+        """When flag hides them from MCP, Python import and direct call still work."""
+        # These imports already succeeded at test-file load with flag=True,
+        # but the functions exist unconditionally — the flag only gates the
+        # @_obs_tool registration wrapper, not the `async def`.
+        assert callable(stm_proxy_stats)
+        assert callable(stm_surfacing_stats)
+        assert callable(stm_tuning_recommendations)
