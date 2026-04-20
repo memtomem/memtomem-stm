@@ -8,6 +8,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 ### Added
 
 - **`mms --version` flag** — idiomatic Click entry point alongside the existing `mms version` subcommand (kept for backwards compatibility). Both paths emit the same `memtomem-stm X.Y.Z` line, so scripts that grep the version string don't care which they invoke.
+- **`mms list --json`** — scriptable JSON output for the server list, mirroring the shape of `mms status --json` (`{config_path, servers}`; missing config returns `{error: "config_not_found", path}`). Closes the parity gap where `status` and `health` already supported `--json` but `list` required parsing the text table.
 
 ## [0.1.12] — 2026-04-20
 

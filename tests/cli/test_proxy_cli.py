@@ -242,6 +242,41 @@ class TestListServers:
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert "example.com/mcp" in result.output
 
+    def test_json_output(self, runner, config):
+        """``list --json`` mirrors ``status --json`` shape for scripting."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "fs": {"prefix": "fs", "command": "uvx", "args": ["mcp-server-fs"]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "fs" in data["servers"]
+        assert str(config) in data["config_path"]
+
+    def test_json_empty_config(self, runner, config):
+        """Empty config → empty ``servers`` object, not text fallback."""
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["servers"] == {}
+
+    def test_json_missing_config(self, runner, config):
+        """Missing config → same ``{error, path}`` shape as ``status --json``."""
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["error"] == "config_not_found"
+        assert str(config) in data["path"]
+
 
 # ── add command — validation paths ───────────────────────────────────────
 
