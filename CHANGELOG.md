@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **`mms add --from-clients` (alias `--import`) bulk-imports from MCP clients post-init** — reuses init's discovery + TUI flow so additional servers added to Claude Desktop / Code / project `.mcp.json` after initial setup can be pulled in interactively, without editing JSON by hand or calling `mms add` once per server. Filters candidates two ways before prompting: by name (skips `foo` if a server named `foo` already exists) and by `(transport, command, args)` / `(transport, url)` signature (skips duplicates registered under a different name). When all discovered servers are already registered, exits cleanly with a no-op message instead of an empty selection screen. `--prefix` is suggested from the upstream name and de-duped against prefixes already in the config. Incompatible with `NAME` / `--prefix` / `--command` / `--args` / `--url` / `--env` — those are for the single-server manual path; passing both raises a usage error rather than silently ignoring one. Works with `--validate` and `--timeout` to probe only the selected subset.
+
 ## [0.1.11] — 2026-04-20
 
 ### Added

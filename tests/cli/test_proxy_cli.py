@@ -1337,6 +1337,278 @@ class TestInitImportFlow:
         assert data["upstream_servers"]["github"]["prefix"] == "gh"
 
 
+# ── add --from-clients (bulk import) ────────────────────────────────────
+
+
+class TestAddFromClients:
+    """`mms add --from-clients` (alias `--import`) reuses init's discovery +
+    TUI to bulk-import additional servers. Difference from init: merges into
+    an existing config and filters out servers already registered, so the
+    user only sees *new* candidates."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def _seed_config(self, config: Path, servers: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    def test_from_clients_happy_path_imports_new_server(self, runner, config, monkeypatch):
+        """Fresh candidate + existing server in config → imports candidate,
+        preserves existing entry, and shows the discovery header."""
+        self._seed_config(
+            config, {"existing": {"prefix": "ex", "command": "old", "transport": "stdio"}}
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@fs"],
+                        "compression": "auto",
+                        "max_result_chars": 8000,
+                    },
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="all\n\n",  # pick all + accept suggested prefix
+        )
+        assert result.exit_code == 0, result.output
+        assert "Found 1 new MCP server" in result.output
+        assert "Added 1 server" in result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert set(data["upstream_servers"]) == {"existing", "filesystem"}
+        fs = data["upstream_servers"]["filesystem"]
+        assert fs["command"] == "npx"
+        assert fs["prefix"] == "filesystem"  # default suggestion
+
+    def test_from_clients_import_alias(self, runner, config, monkeypatch):
+        """`--import` is a flag synonym for `--from-clients`; must hit the
+        same code path without any other difference."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx", "args": []},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--import", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "filesystem" in data["upstream_servers"]
+
+    def test_filters_already_registered_by_name(self, runner, config, monkeypatch):
+        """Discovered candidate whose name matches an existing server is
+        dropped with a skip notice — the user isn't forced to re-review or
+        re-pick a prefix for something they've already configured."""
+        self._seed_config(
+            config,
+            {
+                "filesystem": {
+                    "prefix": "fs",
+                    "transport": "stdio",
+                    "command": "different",
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "github",
+                    "source": "Y",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@gh"]},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Skipping: 'filesystem'" in result.output
+        assert "already registered" in result.output
+        assert "Found 1 new MCP server" in result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        # Existing filesystem entry preserved (different command proves it wasn't overwritten).
+        assert data["upstream_servers"]["filesystem"]["command"] == "different"
+        assert "github" in data["upstream_servers"]
+
+    def test_filters_already_registered_by_signature(self, runner, config, monkeypatch):
+        """Same (command, args) under a different name → still dedup'd so
+        users don't end up with two registrations of the same underlying
+        server (would double-surface tools)."""
+        self._seed_config(
+            config,
+            {
+                "my-fs": {
+                    "prefix": "fs",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@fs"],
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",  # different name...
+                    "source": "X",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@fs"],  # ...same command+args
+                    },
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="",  # no prompts expected — exits early
+        )
+        assert result.exit_code == 0, result.output
+        assert "Skipping: 'filesystem'" in result.output
+        assert "matches an existing server" in result.output
+        assert "All discovered servers are already registered." in result.output
+
+        # Nothing was appended.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert set(data["upstream_servers"]) == {"my-fs"}
+
+    def test_all_registered_exits_cleanly(self, runner, config, monkeypatch):
+        """When every discovered candidate is already registered, we exit
+        with a no-op message instead of prompting for an empty selection."""
+        self._seed_config(
+            config,
+            {"filesystem": {"prefix": "fs", "transport": "stdio", "command": "npx"}},
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "x"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "All discovered servers are already registered." in result.output
+
+    def test_no_candidates_discovered_exits_cleanly(self, runner, config, monkeypatch):
+        """No MCP-client configs on the machine → no-op with a pointer to
+        the manual `mms add NAME ...` path."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [])
+
+        result = runner.invoke(cli, ["add", "--from-clients", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "No MCP servers found" in result.output
+        assert "mms add <NAME>" in result.output
+
+    def test_rejects_conflicting_name_and_prefix(self, runner, config, monkeypatch):
+        """Passing NAME or --prefix alongside --from-clients is a usage
+        error — silently ignoring them would be surprising."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [])
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "mysrv",
+                "--from-clients",
+                "--prefix",
+                "fs",
+                "--command",
+                "x",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--from-clients cannot be combined with" in result.output
+        # Lists the conflicting flags by name so the user knows what to drop.
+        assert "NAME" in result.output
+        assert "--prefix" in result.output
+        assert "--command" in result.output
+
+    def test_validate_flag_probes_only_picked_servers(self, runner, config, monkeypatch):
+        """With --validate, the selected subset gets probed; unpicked
+        candidates must not reach _probe_servers (would be surprising
+        perf cost for servers the user declined)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "a",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "ca"},
+                },
+                {
+                    "name": "b",
+                    "source": "Y",
+                    "entry": {"transport": "stdio", "command": "cb"},
+                },
+            ],
+        )
+
+        probe_calls: list[dict] = []
+
+        async def fake_probe_servers(servers, timeout):
+            probe_calls.append(dict(servers))
+            return {n: {"connected": True, "tools": 3, "error": None} for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--validate", *_cfg_args(config)],
+            input="1\n\n",  # pick only index 1 (server "a")
+        )
+        assert result.exit_code == 0, result.output
+        assert "Reachable:" in result.output
+        assert "Validating 1 server" in result.output
+
+        assert len(probe_calls) == 1
+        assert set(probe_calls[0].keys()) == {"a"}  # "b" not probed
+
+
 # ── remove command ───────────────────────────────────────────────────────
 
 

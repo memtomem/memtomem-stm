@@ -221,14 +221,15 @@ def list_servers(config_path: str) -> None:
 
 
 @cli.command()
-@click.argument("name")
+@click.argument("name", required=False)
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--command", "command", default="", help="Executable command (stdio).")
 @click.option("--args", "args_str", default="", help="Space-separated arguments.")
 @click.option(
     "--prefix",
-    required=True,
-    help="Tool namespace (e.g. 'fs' -> tools appear as fs__read_file).",
+    default="",
+    help="Tool namespace (e.g. 'fs' -> tools appear as fs__read_file). "
+    "Required unless --from-clients is used.",
 )
 @click.option(
     "--transport",
@@ -263,8 +264,19 @@ def list_servers(config_path: str) -> None:
     show_default=True,
     help="Connection timeout (seconds) when --validate is set.",
 )
+@click.option(
+    "--from-clients",
+    "--import",
+    "from_clients",
+    is_flag=True,
+    default=False,
+    help="Import additional servers interactively from existing MCP clients "
+    "(Claude Desktop / Code, project .mcp.json). Reuses init's discovery + "
+    "TUI flow. Skips candidates already registered in this config. "
+    "Incompatible with NAME / --prefix / --command / --args / --url / --env.",
+)
 def add(
-    name: str,
+    name: str | None,
     config_path: str,
     command: str,
     args_str: str,
@@ -276,9 +288,44 @@ def add(
     max_result_chars: int,
     validate: bool,
     validate_timeout: int,
+    from_clients: bool,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
     path = Path(config_path)
+
+    if from_clients:
+        # Guard against mixing interactive-import with single-server manual
+        # flags — silently ignoring them would be surprising. `--validate` /
+        # `--timeout` / `--config` are shared with both paths and don't
+        # conflict.
+        conflicts: list[str] = []
+        if name:
+            conflicts.append("NAME")
+        if prefix:
+            conflicts.append("--prefix")
+        if command:
+            conflicts.append("--command")
+        if args_str:
+            conflicts.append("--args")
+        if url:
+            conflicts.append("--url")
+        if env_pairs:
+            conflicts.append("--env")
+        if conflicts:
+            raise click.UsageError(
+                f"--from-clients cannot be combined with: {', '.join(conflicts)}."
+            )
+        _add_from_clients(path, validate=validate, validate_timeout=validate_timeout)
+        return
+
+    # Manual single-server path — NAME and --prefix were previously click-
+    # required. Relaxed to optional above so --from-clients can omit them;
+    # re-enforce here so the manual path still has the same contract.
+    if not name:
+        raise click.UsageError("Missing argument 'NAME' (or pass --from-clients).")
+    if not prefix:
+        raise click.UsageError("Missing option '--prefix' (or pass --from-clients).")
+
     data = _load(path)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
 
@@ -755,6 +802,131 @@ def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
         )
 
 
+def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
+    """Best-effort content signature for dedup between discovered + registered.
+
+    Same ``(transport, command, *args)`` or ``(transport, url)`` → assume
+    the user already imported this server under a different name. Returns
+    ``None`` when the entry is missing the identifying field (caller falls
+    back to name-based match only).
+    """
+    transport = cfg.get("transport", "stdio")
+    if transport == "stdio":
+        cmd = cfg.get("command", "") or ""
+        if not cmd:
+            return None
+        args = cfg.get("args") or []
+        if not isinstance(args, list):
+            args = []
+        return ("stdio", cmd, *(str(a) for a in args))
+    url = cfg.get("url", "") or ""
+    if not url:
+        return None
+    return (transport, url)
+
+
+def _add_from_clients(
+    config_path: Path,
+    *,
+    validate: bool,
+    validate_timeout: int,
+) -> None:
+    """Interactive bulk-import path for ``mms add --from-clients``.
+
+    Reuses init's discovery + selection + prefix-prompt helpers. Difference
+    from init: merges into an existing config (rather than creating one) and
+    filters out candidates that match servers already registered, so the TUI
+    only shows *new* options.
+    """
+    data = _load(config_path)
+    servers: dict[str, Any] = data.setdefault("upstream_servers", {})
+
+    all_candidates = _discover_candidates(Path.cwd())
+    if not all_candidates:
+        click.echo("No MCP servers found in Claude Desktop / Code / .mcp.json.")
+        click.echo("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
+        return
+
+    existing_names = set(servers.keys())
+    existing_signatures = {
+        sig for srv_cfg in servers.values() if (sig := _server_signature(srv_cfg)) is not None
+    }
+
+    new_candidates: list[dict[str, Any]] = []
+    for cand in all_candidates:
+        cand_name = cand["name"]
+        entry = cand["entry"]
+        if cand_name in existing_names:
+            click.echo(
+                f"  {_warn('Skipping:')} '{cand_name}' — already registered.",
+                err=True,
+            )
+            continue
+        sig = _server_signature(entry)
+        if sig is not None and sig in existing_signatures:
+            click.echo(
+                f"  {_warn('Skipping:')} '{cand_name}' — matches an existing server "
+                "by command/url.",
+                err=True,
+            )
+            continue
+        new_candidates.append(cand)
+
+    if not new_candidates:
+        click.echo("All discovered servers are already registered.")
+        return
+
+    resolved = config_path.expanduser().resolve()
+    click.echo(_hdr(f"Found {len(new_candidates)} new MCP server(s) to import:"))
+    for i, cand in enumerate(new_candidates, 1):
+        dup = cand.get("duplicate_in")
+        dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
+        click.echo(
+            f"  {i:>2}. {cand['name']:<18} {_format_candidate_detail(cand['entry'])}"
+            f"    — from {cand['source']}{dup_hint}"
+        )
+    click.echo("")
+    picks = _pick_imports(new_candidates)
+
+    if not picks:
+        click.echo("")
+        click.echo(f"{_ok('No servers selected.')} Config unchanged.")
+        return
+
+    # Seed the "taken prefixes" set with what's already in the config so
+    # suggestions don't collide with prior registrations.
+    used_prefixes: set[str] = {p for srv_cfg in servers.values() if (p := srv_cfg.get("prefix"))}
+    imported: dict[str, dict[str, Any]] = {}
+    click.echo("")
+    for idx in picks:
+        cand = new_candidates[idx]
+        click.echo(_hdr(f"Configuring '{cand['name']}'"))
+        suggested = _suggest_prefix(cand["name"], used_prefixes)
+        prefix = _prompt_prefix(default=suggested)
+        used_prefixes.add(prefix)
+        entry = {"prefix": prefix, **cand["entry"]}
+        imported[cand["name"]] = entry
+
+    if validate:
+        click.echo("")
+        click.echo(f"Validating {len(imported)} server(s) (timeout={validate_timeout}s)...")
+        probes = asyncio.run(_probe_servers(imported, validate_timeout))
+        for n, probe in probes.items():
+            if probe["connected"]:
+                click.echo(f"  {_ok('Reachable:')} {n} — {probe['tools']} tool(s).")
+            else:
+                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe['error']}", err=True)
+                click.echo("  Saving anyway. Run `mms health` later to retry.", err=True)
+
+    servers.update(imported)
+    _save(config_path, data)
+
+    click.echo("")
+    click.echo(f"{_ok('Added')} {len(imported)} server(s) to {resolved}:")
+    for n, e in imported.items():
+        click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option(
@@ -775,6 +947,10 @@ def init(config_path: str, no_validate: bool) -> None:
     if resolved.exists():
         click.echo(f"{_err('Error:')} config already exists at {resolved}.", err=True)
         click.echo("  Use `mms add` to register another server.", err=True)
+        click.echo(
+            "  Use `mms add --import` to bulk-import more from MCP clients.",
+            err=True,
+        )
         click.echo("  Use `mms list` to see what's already configured.", err=True)
         sys.exit(1)
 
@@ -912,6 +1088,7 @@ def init(config_path: str, no_validate: bool) -> None:
         click.echo(f"  {_hdr('Manage this config:')}")
         click.echo(f"    mms list --config {resolved}")
         click.echo(f"    mms health --config {resolved}")
+        click.echo(f"    mms add --import --config {resolved}")
 
     click.echo("")
     click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")
