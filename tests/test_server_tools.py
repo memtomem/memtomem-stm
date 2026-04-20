@@ -13,6 +13,7 @@ from memtomem_stm.server import (
     _should_advertise_obs_tools,
     stm_compression_feedback,
     stm_compression_stats,
+    stm_progressive_stats,
     stm_proxy_cache_clear,
     stm_proxy_health,
     stm_proxy_read_more,
@@ -38,6 +39,7 @@ def _make_ctx(
     surfacing_engine: object | None = None,
     feedback_tracker: object | None = None,
     compression_feedback_tracker: object | None = None,
+    progressive_reads_tracker: object | None = None,
 ) -> SimpleNamespace:
     """Build a fake CtxType that _get_ctx() can unwrap.
 
@@ -57,6 +59,7 @@ def _make_ctx(
         surfacing_engine=surfacing_engine,
         feedback_tracker=feedback_tracker,
         compression_feedback_tracker=compression_feedback_tracker,
+        progressive_reads_tracker=progressive_reads_tracker,
     )
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
 
@@ -384,6 +387,62 @@ class TestCompressionStats:
         assert "By tool:" in result
 
 
+# ── stm_progressive_stats ────────────────────────────────────────────────
+
+
+class TestProgressiveStats:
+    async def test_no_tracker(self):
+        """Without tracker, returns 'not enabled'."""
+        ctx = _make_ctx(progressive_reads_tracker=None)
+        result = await stm_progressive_stats(ctx=ctx)
+        assert "not enabled" in result.lower()
+
+    async def test_with_data(self):
+        """Returns formatted stats with per-tool breakdown."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "total_reads": 12,
+            "total_responses": 5,
+            "follow_up_rate": 0.4,
+            "avg_chars_served": 7200.0,
+            "avg_total_chars": 9500.0,
+            "avg_coverage": 0.76,
+            "by_tool": {
+                "docfix:get_doc": {"responses": 3, "follow_up_rate": 0.667},
+                "next:search": {"responses": 2, "follow_up_rate": 0.0},
+            },
+        }
+        ctx = _make_ctx(progressive_reads_tracker=mock_tracker)
+        result = await stm_progressive_stats(ctx=ctx)
+
+        assert "Progressive Reads Stats" in result
+        assert "Total reads: 12" in result
+        assert "Total responses: 5" in result
+        assert "Follow-up rate: 40.0%" in result
+        assert "Avg coverage: 76.0%" in result
+        assert "By tool:" in result
+        assert "docfix:get_doc" in result
+        assert "responses=3" in result
+
+    async def test_tool_filter_omits_by_tool(self):
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "total_reads": 2,
+            "total_responses": 1,
+            "follow_up_rate": 1.0,
+            "avg_chars_served": 9000.0,
+            "avg_total_chars": 9000.0,
+            "avg_coverage": 1.0,
+            "by_tool": {},
+        }
+        ctx = _make_ctx(progressive_reads_tracker=mock_tracker)
+        result = await stm_progressive_stats(tool="docfix:get_doc", ctx=ctx)
+
+        assert "By tool:" not in result
+        assert "filtered by tool: docfix:get_doc" in result
+        mock_tracker.get_stats.assert_called_once_with("docfix:get_doc")
+
+
 # ── stm_tuning_recommendations ────────────────────────────────────────────
 
 
@@ -468,6 +527,7 @@ class TestLifespan:
             mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
             mock_cfg.proxy.metrics.enabled = False
             mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.progressive_reads.enabled = False
             mock_cfg.proxy.cache.enabled = False
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = True
@@ -517,6 +577,7 @@ class TestLifespan:
             mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
             mock_cfg.proxy.metrics.enabled = False
             mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.progressive_reads.enabled = False
             mock_cfg.proxy.cache.enabled = False
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = True
@@ -556,6 +617,7 @@ _OBSERVABILITY_TOOLS = {
     "stm_proxy_cache_clear",
     "stm_surfacing_stats",
     "stm_compression_stats",
+    "stm_progressive_stats",
     "stm_tuning_recommendations",
 }
 
@@ -611,10 +673,10 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_default_advertises_all_ten(self):
+    def test_default_advertises_all_eleven(self):
         names = set(self._list_registered(env_override=None))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
-        assert len(names) == 10
+        assert len(names) == 11
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))

@@ -17,6 +17,7 @@ from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
@@ -34,6 +35,7 @@ class STMContext:
     surfacing_engine: SurfacingEngine | None
     feedback_tracker: FeedbackTracker | None
     compression_feedback_tracker: CompressionFeedbackTracker | None
+    progressive_reads_tracker: ProgressiveReadsTracker | None
 
 
 CtxType = Context[ServerSession, STMContext]
@@ -67,6 +69,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     mcp_adapter = None
     feedback_tracker: FeedbackTracker | None = None
     compression_feedback_tracker: CompressionFeedbackTracker | None = None
+    progressive_reads_tracker: ProgressiveReadsTracker | None = None
     langfuse_client = None
     tracker = TokenTracker()
     proxy_manager: ProxyManager | None = None
@@ -102,6 +105,22 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         exc_info=True,
                     )
                     compression_feedback_tracker = None
+
+            # Progressive reads telemetry — records one row per
+            # ``_apply_progressive`` initial chunk plus one per
+            # ``stm_proxy_read_more`` follow-up into ``progressive_reads``.
+            # Surfaces via ``stm_progressive_stats``.
+            if config.proxy.progressive_reads.enabled:
+                try:
+                    progressive_reads_tracker = ProgressiveReadsTracker(
+                        config.proxy.progressive_reads.db_path,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Progressive reads tracker init failed — tool will be disabled",
+                        exc_info=True,
+                    )
+                    progressive_reads_tracker = None
 
             # Surfacing engine — LTM access is always remote-only via the
             # MCP client adapter. The adapter spawns (or connects to) a
@@ -169,6 +188,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             surfacing_engine=surfacing_engine,
             cache=proxy_cache,
             env_overrides=proxy_env_overrides,
+            progressive_reads_tracker=progressive_reads_tracker,
         )
 
         if config.proxy.enabled:
@@ -197,6 +217,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             surfacing_engine=surfacing_engine,
             feedback_tracker=feedback_tracker,
             compression_feedback_tracker=compression_feedback_tracker,
+            progressive_reads_tracker=progressive_reads_tracker,
         )
         yield ctx
     finally:
@@ -220,6 +241,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             (metrics_store, "metrics_store"),
             (feedback_tracker, "feedback_tracker"),
             (compression_feedback_tracker, "compression_feedback_tracker"),
+            (progressive_reads_tracker, "progressive_reads_tracker"),
         ]:
             if resource is not None:
                 try:
@@ -687,6 +709,61 @@ async def stm_compression_stats(
             stats["by_tool"].items(), key=lambda kv: kv[1], reverse=True
         ):
             lines.append(f"  {tool_name}: {count}")
+
+    if tool:
+        lines.append(f"\n(filtered by tool: {tool})")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_progressive_stats
+# ---------------------------------------------------------------------------
+
+
+@_obs_tool
+async def stm_progressive_stats(
+    tool: str | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Show progressive-delivery read statistics.
+
+    Reports per-response follow-up rate and coverage across all
+    progressive-compressed calls. Each initial chunk and each
+    follow-up ``stm_proxy_read_more`` appears as a row in
+    ``progressive_reads``; aggregates here collapse to one entry
+    per cache key so a response with five follow-ups is weighted
+    the same as one with none.
+
+    Args:
+        tool: Optional filter by upstream tool name.
+    """
+    app = _get_ctx(ctx)
+    if app.progressive_reads_tracker is None:
+        return "Progressive reads tracking is not enabled."
+
+    stats = app.progressive_reads_tracker.get_stats(tool)
+
+    lines = [
+        "Progressive Reads Stats",
+        "=======================",
+        f"Total reads: {stats['total_reads']}",
+        f"Total responses: {stats['total_responses']}",
+        f"Follow-up rate: {stats['follow_up_rate'] * 100:.1f}%",
+        f"Avg chars served: {stats['avg_chars_served']:.0f}",
+        f"Avg total chars: {stats['avg_total_chars']:.0f}",
+        f"Avg coverage: {stats['avg_coverage'] * 100:.1f}%",
+    ]
+
+    if not tool and stats["by_tool"]:
+        lines.append("\nBy tool:")
+        for tool_name, per_tool in sorted(
+            stats["by_tool"].items(), key=lambda kv: kv[1]["responses"], reverse=True
+        ):
+            lines.append(
+                f"  {tool_name}: responses={per_tool['responses']}, "
+                f"follow_up_rate={per_tool['follow_up_rate'] * 100:.1f}%"
+            )
 
     if tool:
         lines.append(f"\n(filtered by tool: {tool})")

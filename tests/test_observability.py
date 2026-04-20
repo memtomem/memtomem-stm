@@ -531,6 +531,7 @@ class TestSurfacingToolSpans:
             surfacing_engine=mock_engine,
             feedback_tracker=None,
             compression_feedback_tracker=None,
+            progressive_reads_tracker=None,
         )
         ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
 
@@ -572,6 +573,7 @@ class TestSurfacingToolSpans:
             surfacing_engine=None,
             feedback_tracker=mock_tracker,
             compression_feedback_tracker=None,
+            progressive_reads_tracker=None,
         )
         ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
 
