@@ -625,3 +625,109 @@ class TestRemainingHeadings:
 
     def test_empty_when_no_headings(self):
         assert ProgressiveChunker._remaining_headings("plain text only", 0) == ""
+
+
+# ---------------------------------------------------------------------------
+# Integration: ProxyManager hot-path writes into ProgressiveReadsTracker
+# ---------------------------------------------------------------------------
+
+
+class TestProgressiveReadsTelemetry:
+    """_apply_progressive + read_more should persist rows via the tracker."""
+
+    def _build_manager(self, tmp_path: Path):
+        from memtomem_stm.proxy.config import ProxyConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+        from memtomem_stm.proxy.metrics import TokenTracker
+        from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
+
+        tracker = ProgressiveReadsTracker(tmp_path / "stm_feedback.db")
+        mgr = ProxyManager(
+            ProxyConfig(enabled=True),
+            TokenTracker(),
+            progressive_reads_tracker=tracker,
+        )
+        return mgr, tracker
+
+    def test_apply_progressive_records_initial_row(self, tmp_path: Path):
+        mgr, tracker = self._build_manager(tmp_path)
+        try:
+            text = "x" * 10000
+            cfg = ProgressiveConfig(chunk_size=4000)
+            first = mgr._apply_progressive(
+                text, cfg, server="srv", tool="tool_a", trace_id="t1"
+            )
+            assert PROGRESSIVE_FOOTER_TOKEN in first
+
+            stats = tracker.get_stats()
+            assert stats["total_reads"] == 1
+            assert stats["total_responses"] == 1
+            assert stats["follow_up_rate"] == 0.0
+            assert stats["avg_total_chars"] == 10000.0
+        finally:
+            tracker.close()
+
+    def test_read_more_records_follow_up_row(self, tmp_path: Path):
+        mgr, tracker = self._build_manager(tmp_path)
+        try:
+            text = "y" * 12000
+            cfg = ProgressiveConfig(chunk_size=4000)
+            first = mgr._apply_progressive(
+                text, cfg, server="srv", tool="tool_b", trace_id="t2"
+            )
+
+            # Recover the key from the in-memory progressive store
+            store = mgr._get_progressive_store()
+            store_rows = list(store._store._data.keys())  # type: ignore[attr-defined]
+            assert len(store_rows) == 1
+            key = store_rows[0]
+
+            # Follow-up read starting where the initial chunk ended
+            initial_chars = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+            second = mgr.read_more(key, offset=initial_chars, limit=4000)
+            assert PROGRESSIVE_FOOTER_TOKEN in second
+
+            stats = tracker.get_stats()
+            assert stats["total_reads"] == 2
+            assert stats["total_responses"] == 1
+            assert stats["follow_up_rate"] == 1.0
+            # Rows share the same trace_id
+            rows = tracker.store._db.execute(  # type: ignore[union-attr]
+                "SELECT key, trace_id, offset, chars, total_chars "
+                "FROM progressive_reads ORDER BY id"
+            ).fetchall()
+            assert len(rows) == 2
+            assert rows[0][0] == rows[1][0] == key
+            assert rows[0][1] == rows[1][1] == "t2"
+            assert rows[0][2] == 0
+            assert rows[1][2] == initial_chars
+            assert rows[0][4] == rows[1][4] == 12000
+        finally:
+            tracker.close()
+
+    def test_no_tracker_does_not_break_hot_path(self, tmp_path: Path):
+        """progressive_reads_tracker=None → normal chunk, no exception."""
+        from memtomem_stm.proxy.config import ProxyConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+        from memtomem_stm.proxy.metrics import TokenTracker
+
+        mgr = ProxyManager(
+            ProxyConfig(enabled=True),
+            TokenTracker(),
+            progressive_reads_tracker=None,
+        )
+        text = "z" * 8000
+        first = mgr._apply_progressive(
+            text, ProgressiveConfig(chunk_size=4000), server="s", tool="t", trace_id=None
+        )
+        assert PROGRESSIVE_FOOTER_TOKEN in first
+
+    def test_closed_tracker_does_not_break_hot_path(self, tmp_path: Path):
+        """Tracker closed mid-session — writes are swallowed."""
+        mgr, tracker = self._build_manager(tmp_path)
+        tracker.close()  # simulate shutdown race
+        text = "q" * 6000
+        first = mgr._apply_progressive(
+            text, ProgressiveConfig(chunk_size=4000), server="s", tool="t", trace_id="tx"
+        )
+        assert PROGRESSIVE_FOOTER_TOKEN in first

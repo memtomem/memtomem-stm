@@ -58,10 +58,12 @@ from memtomem_stm.proxy.tool_metadata import (
     truncate_description,
 )
 from memtomem_stm.proxy.progressive import (
+    PROGRESSIVE_FOOTER_TOKEN,
     ProgressiveChunker,
     ProgressiveResponse,
     ProgressiveStoreAdapter,
 )
+from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
 from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory, TokenTracker
 from memtomem_stm.observability.tracing import traced
@@ -130,6 +132,7 @@ class ProxyManager:
         surfacing_engine: SurfacingEngine | None = None,
         cache: ProxyCache | None = None,
         env_overrides: dict[str, Any] | None = None,
+        progressive_reads_tracker: ProgressiveReadsTracker | None = None,
     ) -> None:
         self._config_loader = ProxyConfigLoader(config.config_path, env_overrides=env_overrides)
         self._config_loader.seed(config)
@@ -137,6 +140,7 @@ class ProxyManager:
         self._index_engine = index_engine
         self._surfacing_engine = surfacing_engine
         self._cache = cache
+        self._progressive_reads_tracker = progressive_reads_tracker
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
@@ -824,7 +828,22 @@ class ProxyManager:
             chunk_size=cfg.chunk_size,
             include_hint=cfg.include_structure_hint,
         )
-        return chunker.first_chunk(text, key, ttl_seconds=cfg.ttl_seconds)
+        first = chunker.first_chunk(text, key, ttl_seconds=cfg.ttl_seconds)
+        if self._progressive_reads_tracker is not None:
+            # The first_chunk return concatenates ``chunk + footer`` where
+            # the footer starts with PROGRESSIVE_FOOTER_TOKEN; splitting
+            # once on that sentinel recovers the exact chunk length
+            # without duplicating ``_find_boundary``.
+            initial_chars = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+            self._progressive_reads_tracker.record_initial(
+                key=key,
+                trace_id=trace_id,
+                server=server,
+                tool=tool,
+                initial_chars=initial_chars,
+                total_chars=len(text),
+            )
+        return first
 
     def read_more(self, key: str, offset: int, limit: int | None = None) -> str:
         """Return next chunk from a progressive delivery response.
@@ -856,9 +875,28 @@ class ProxyManager:
             store.touch(key)
             chunk_size = limit or 4000
             chunker = ProgressiveChunker(chunk_size=chunk_size, include_hint=True)
-            return chunker.read_chunk(
+            output = chunker.read_chunk(
                 resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
             )
+            if self._progressive_reads_tracker is not None:
+                # ``chunker.read_chunk`` emits ``(no more content)`` without
+                # the footer when offset >= len(content); split-on-sentinel
+                # still returns the full string in that case, so we log it
+                # as chars=len(output) which correctly records zero-useful-
+                # bytes as the emitted length. Callers using offset past
+                # end is rare and this preserves the invariant that every
+                # read_more invocation produces exactly one row.
+                chunk_chars = len(output.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+                self._progressive_reads_tracker.record_follow_up(
+                    key=key,
+                    trace_id=resp.trace_id,
+                    server=resp.server,
+                    tool=resp.tool,
+                    offset=offset,
+                    chars=chunk_chars,
+                    total_chars=resp.total_chars,
+                )
+            return output
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool count."""
