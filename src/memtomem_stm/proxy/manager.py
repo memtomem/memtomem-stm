@@ -782,6 +782,8 @@ class ProxyManager:
         server: str,
         tool: str,
         sel_cfg: SelectiveConfig | None = None,
+        *,
+        trace_id: str | None = None,
     ) -> str:
         store = self._get_progressive_store(sel_cfg)
         store.evict(cfg.ttl_seconds, cfg.max_stored)
@@ -795,6 +797,9 @@ class ProxyManager:
             structure_hint=ProgressiveChunker.structure_hint(text),
             created_at=_time.monotonic(),
             ttl_seconds=cfg.ttl_seconds,
+            server=server,
+            tool=tool,
+            trace_id=trace_id,
         )
         store.put(key, resp)
 
@@ -1211,7 +1216,7 @@ class ProxyManager:
                 compressed = cleaned
             else:
                 compressed = self._apply_progressive(
-                    cleaned, pcfg, server, tool, sel_cfg=tc.selective
+                    cleaned, pcfg, server, tool, sel_cfg=tc.selective, trace_id=trace_id
                 )
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(cleaned)
@@ -1317,7 +1322,12 @@ class ProxyManager:
                         if cleaned_len > pcfg.chunk_size:
                             try:
                                 compressed = self._apply_progressive(
-                                    cleaned, pcfg, server, tool, sel_cfg=tc.selective
+                                    cleaned,
+                                    pcfg,
+                                    server,
+                                    tool,
+                                    sel_cfg=tc.selective,
+                                    trace_id=trace_id,
                                 )
                                 metrics_strategy = f"{original_strategy}→progressive_fallback"
                                 progressive_fallback = True
