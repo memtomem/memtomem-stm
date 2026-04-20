@@ -623,7 +623,7 @@ class TestInit:
     def _stub_mcp_integration(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
 
-        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda: None)
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
 
     def test_init_happy_path_stdio_no_validate(self, runner, config, no_discovery):
         result = runner.invoke(
@@ -996,7 +996,7 @@ class TestInitImportFlow:
     def _stub_mcp_integration(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
 
-        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda: None)
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -1562,6 +1562,87 @@ class TestInitMcpRegistration:
         assert "claude mcp add failed" in result.output
         assert (tmp_path / ".mcp.json").exists()
 
+    # ── --mcp flag (non-interactive path) ────────────────────────────
+
+    def _init_input_without_mcp_choice(self) -> str:
+        """Manual-flow input that STOPS before the 3-way prompt (the flag
+        pre-answers it, so the prompt never fires)."""
+        return "filesystem\nfs\nstdio\nnpx\n-y @mcp/fs\n"
+
+    def test_mcp_flag_skip_bypasses_prompt(self, runner, config, no_discovery, fake_claude):
+        """--mcp skip pre-answers option 3; no stdin consumed past the
+        manual-flow prompts; no subprocess calls."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--mcp", "skip", *_cfg_args(config)],
+            input=self._init_input_without_mcp_choice(),
+        )
+        assert result.exit_code == 0, result.output
+        assert fake_claude["calls"] == []
+        # The interactive prompt header MUST NOT appear.
+        assert "Register memtomem-stm with an MCP client?" not in result.output
+        # Manual hints still printed (option 3 behavior).
+        assert "claude mcp add memtomem-stm" in result.output
+
+    def test_mcp_flag_json_writes_mcp_json_without_shell_out(
+        self, runner, config, no_discovery, fake_claude, tmp_path, monkeypatch
+    ):
+        """--mcp json pre-answers option 2; writes .mcp.json; no claude
+        shell-out."""
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--mcp", "json", *_cfg_args(config)],
+            input=self._init_input_without_mcp_choice(),
+        )
+        assert result.exit_code == 0, result.output
+        assert fake_claude["calls"] == []
+        assert "Register memtomem-stm with an MCP client?" not in result.output
+        assert (tmp_path / ".mcp.json").exists()
+
+    def test_mcp_flag_claude_registers_without_asking(
+        self, runner, config, no_discovery, fake_claude
+    ):
+        """--mcp claude pre-answers option 1; pre-check + add run without
+        the interactive prompt."""
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1),  # pre-check: not registered
+            _FakeClaudeResult(returncode=0),  # add: success
+        ]
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--mcp", "claude", *_cfg_args(config)],
+            input=self._init_input_without_mcp_choice(),
+        )
+        assert result.exit_code == 0, result.output
+        assert "Register memtomem-stm with an MCP client?" not in result.output
+        assert "Registered with Claude Code" in result.output
+        assert len(fake_claude["calls"]) == 2
+
+    def test_mcp_flag_claude_keeps_existing_on_duplicate_noninteractive(
+        self, runner, config, no_discovery, fake_claude
+    ):
+        """--mcp claude hits a duplicate → non-interactive default is
+        'keep'. No keep/replace prompt fires, no ``claude mcp remove`` or
+        ``add`` calls are made beyond the pre-check.
+
+        This is the load-bearing contract for CI callers: scripted runs
+        can re-assert 'register me' without clobbering whatever the user
+        had configured previously."""
+        fake_claude["script"] = [_FakeClaudeResult(returncode=0)]  # already registered
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--mcp", "claude", *_cfg_args(config)],
+            input=self._init_input_without_mcp_choice(),
+        )
+        assert result.exit_code == 0, result.output
+        assert "already registered" in result.output
+        assert "Kept existing registration" in result.output
+        # Prompts must NOT have fired.
+        assert "Keep existing" not in result.output.split("already registered")[1]
+        assert len(fake_claude["calls"]) == 1
+        assert fake_claude["calls"][0][:3] == ["claude", "mcp", "get"]
+
 
 class TestDetectInstallType:
     """``_detect_install_type`` returns ``(server_cmd, server_args)`` for the
@@ -1675,6 +1756,29 @@ class TestRegisterCommand:
         assert "already registered" in result.output
         assert "Kept existing registration" in result.output
         # Only the pre-check ran.
+        assert len(fake_claude["calls"]) == 1
+
+    # ── --mcp flag ─────────────────────────────────────────────────────
+
+    def test_register_mcp_flag_skip_bypasses_prompt(self, runner, config, fake_claude):
+        """--mcp skip skips the interactive prompt entirely. No stdin input
+        required — this is the shape CI callers use to confirm config is
+        set up without asking a human."""
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["register", "--mcp", "skip", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert fake_claude["calls"] == []
+        assert "Register memtomem-stm with an MCP client?" not in result.output
+
+    def test_register_mcp_flag_claude_keeps_on_duplicate(self, runner, config, fake_claude):
+        """Scripted re-assertion of 'register me' when already registered
+        is a no-op — guarantees ``mms register --mcp claude`` is safe to
+        rerun from CI."""
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        fake_claude["script"] = [_FakeClaudeResult(returncode=0)]  # already registered
+        result = runner.invoke(cli, ["register", "--mcp", "claude", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "Kept existing registration" in result.output
         assert len(fake_claude["calls"]) == 1
 
 

@@ -280,13 +280,23 @@ def _prompt_mcp_choice() -> int:
     return click.prompt("  Select", type=click.IntRange(1, 3), default=1, show_default=True)
 
 
-def _run_mcp_integration() -> None:
+_MCP_MODE_TO_CHOICE = {"claude": 1, "json": 2, "skip": 3}
+
+
+def _run_mcp_integration(preselected: int | None = None) -> None:
     """Run the 3-way MCP registration flow.
 
     Called by both ``mms init`` (after config save) and ``mms register``
     (post-init re-entry path).
+
+    ``preselected`` bypasses the interactive 3-way prompt when set (1, 2,
+    or 3) — this is how ``--mcp`` / scripted callers skip stdin. When
+    ``preselected`` is 1 and a duplicate is detected, we default to
+    ``keep`` (non-destructive) rather than prompting, so CI / scripted
+    callers don't hit ``click.Abort`` on EOF.
     """
-    choice = _prompt_mcp_choice()
+    interactive = preselected is None
+    choice = preselected if preselected is not None else _prompt_mcp_choice()
     click.echo("")
 
     if choice == 3:
@@ -298,11 +308,16 @@ def _run_mcp_integration() -> None:
     if choice == 1:
         if _check_already_registered():
             click.echo(f"{_warn('Note:')} memtomem-stm is already registered with Claude Code.")
-            click.echo("    [1] Keep existing (recommended)")
-            click.echo("    [2] Replace (remove + re-add)")
-            action = click.prompt(
-                "  Select", type=click.IntRange(1, 2), default=1, show_default=True
-            )
+            if interactive:
+                click.echo("    [1] Keep existing (recommended)")
+                click.echo("    [2] Replace (remove + re-add)")
+                action = click.prompt(
+                    "  Select", type=click.IntRange(1, 2), default=1, show_default=True
+                )
+            else:
+                # Non-interactive: always keep. Replacing requires an
+                # explicit `claude mcp remove memtomem-stm` first.
+                action = 1
             if action == 1:
                 click.echo(f"  {_ok('Kept existing registration.')}")
                 return
@@ -1201,7 +1216,18 @@ def _add_from_clients(
     default=False,
     help="Skip the connectivity probe entirely (default: prompt, probe on yes).",
 )
-def init(config_path: str, no_validate: bool) -> None:
+@click.option(
+    "--mcp",
+    "mcp_mode",
+    type=click.Choice(["claude", "json", "skip"]),
+    default=None,
+    help=(
+        "Pre-answer the MCP-registration prompt for scripted runs: "
+        "'claude' = `claude mcp add`, 'json' = write .mcp.json, 'skip' = "
+        "no registration. Omit the flag for the interactive prompt."
+    ),
+)
+def init(config_path: str, no_validate: bool, mcp_mode: str | None) -> None:
     """Guided first-time setup for memtomem-stm.
 
     Prompts for a single upstream server and writes the config file. Aborts
@@ -1357,7 +1383,7 @@ def init(config_path: str, no_validate: bool) -> None:
         click.echo(f"    mms add --import --config {resolved}")
 
     click.echo("")
-    _run_mcp_integration()
+    _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
 
 
 @cli.command()
@@ -1368,7 +1394,18 @@ def init(config_path: str, no_validate: bool) -> None:
     show_default=True,
     help="Path to the proxy config (must already exist — run `mms init` first).",
 )
-def register(config_path: str) -> None:
+@click.option(
+    "--mcp",
+    "mcp_mode",
+    type=click.Choice(["claude", "json", "skip"]),
+    default=None,
+    help=(
+        "Pre-answer the registration prompt for scripted runs: "
+        "'claude' = `claude mcp add`, 'json' = write .mcp.json, 'skip' = "
+        "print manual hints. Omit for the interactive prompt."
+    ),
+)
+def register(config_path: str, mcp_mode: str | None) -> None:
     """Register memtomem-stm with an MCP client.
 
     Post-init re-entry path for the 3-way registration flow from ``mms init``:
@@ -1380,7 +1417,7 @@ def register(config_path: str) -> None:
 
     Requires that ``mms init`` has been run so ``~/.memtomem/stm_proxy.json``
     (or the ``--config`` path) exists. Safe to re-run; pre-checks existing
-    Claude Code registration and prompts before replacing.
+    Claude Code registration and defaults to 'keep' when already registered.
     """
     resolved = Path(config_path).expanduser().resolve()
     if not resolved.exists():
@@ -1390,7 +1427,7 @@ def register(config_path: str) -> None:
         )
         click.echo("  Run `mms init` first.", err=True)
         sys.exit(1)
-    _run_mcp_integration()
+    _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
 
 
 @cli.command()
