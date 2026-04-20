@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,213 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     """
     payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     atomic_write_text(config_path, payload, mode=0o600)
+
+
+# ── MCP client registration helpers ─────────────────────────────────────
+#
+# Mirror of the parent ``mm init`` pattern (see
+# ``memtomem/packages/memtomem/src/memtomem/cli/init_cmd.py``
+# lines 55–90, 526–534, 964–1001, 1051–1066). Kept at module top level so
+# tests can ``monkeypatch.setattr`` individual helpers — particularly
+# ``_run_claude_mcp``, which is the sole shell-out seam.
+#
+# Cross-repo note: the parent is the LTM server, STM is the proxy that
+# chains upstream servers. Both register *themselves* (a single MCP
+# server entry) with the downstream client — STM does **not** re-expose
+# its configured upstreams to Claude Code; only the STM proxy itself is
+# visible.
+
+
+def _run_claude_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
+    """Invoke the ``claude`` CLI — isolated so tests replace a single seam."""
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _detect_install_type() -> tuple[str, list[str]]:
+    """Return ``(server_cmd, server_args)`` to register with an MCP client.
+
+    Branches:
+
+    * Inside a ``pyproject.toml`` that references ``memtomem-stm`` (STM
+      source checkout, or a user project that ran ``uv add memtomem-stm``)
+      → ``uv run --directory <root> mms``.
+    * Default (global install via ``uv tool install`` or ``pipx``) → bare
+      ``memtomem-stm`` console script on ``PATH``.
+
+    Parent ``mm init`` keeps source/project as separate branches because
+    the parent is a monorepo (``packages/`` subdir is the discriminator).
+    STM has a flat layout so the two collapse into one.
+    """
+    check = Path.cwd()
+    for _ in range(5):
+        pyp = check / "pyproject.toml"
+        if pyp.exists():
+            try:
+                content = pyp.read_text(encoding="utf-8")
+            except OSError:
+                break
+            # Match STM source checkout (`name = "memtomem-stm"`) and user
+            # projects depending on STM (`"memtomem-stm"`, `"memtomem-stm>=0.1"`,
+            # `'memtomem-stm'`, etc.). Using the open quote + dash-containing
+            # string avoids over-matching on legit neighbor names.
+            if 'name = "memtomem-stm"' in content or '"memtomem-stm' in content:
+                return ("uv", ["run", "--directory", str(check), "mms"])
+            break
+        check = check.parent
+    return ("memtomem-stm", [])
+
+
+def _check_already_registered(name: str = "memtomem-stm") -> bool:
+    """Return True if Claude Code has *name* registered as an MCP server.
+
+    Returns False on any subprocess error — callers should treat False as
+    "safe to proceed with ``claude mcp add``". Pre-check exists because
+    ``claude mcp add`` has no ``--force`` / ``--overwrite`` flag (verified
+    against ``claude mcp add --help`` on 2026-04-21).
+    """
+    try:
+        result = _run_claude_mcp(["claude", "mcp", "get", name])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _register_with_claude_code(
+    server_cmd: str, server_args: list[str], *, name: str = "memtomem-stm"
+) -> tuple[bool, str]:
+    """Run ``claude mcp add``; return ``(success, failure_reason)``.
+
+    ``failure_reason`` is one of ``"not_installed"``, ``"timeout"``,
+    ``"failed"`` — callers map each to a user-facing message and always
+    fall back to ``.mcp.json``.
+    """
+    cmd = ["claude", "mcp", "add", name, "-s", "user", "--", server_cmd, *server_args]
+    try:
+        result = _run_claude_mcp(cmd)
+    except FileNotFoundError:
+        return (False, "not_installed")
+    except subprocess.TimeoutExpired:
+        return (False, "timeout")
+    if result.returncode == 0:
+        return (True, "")
+    return (False, "failed")
+
+
+def _remove_from_claude_code(name: str = "memtomem-stm") -> None:
+    """Best-effort ``claude mcp remove``; swallow errors (caller re-adds next)."""
+    try:
+        _run_claude_mcp(["claude", "mcp", "remove", name, "-s", "user"])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list[str]) -> Path:
+    """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry."""
+    entry: dict[str, Any] = {"command": server_cmd}
+    if server_args:
+        entry["args"] = server_args
+    mcp_path = target_dir / ".mcp.json"
+    existing: dict[str, Any]
+    if mcp_path.exists():
+        try:
+            loaded = json.loads(mcp_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            loaded = None
+        existing = loaded if isinstance(loaded, dict) else {}
+    else:
+        existing = {}
+    servers = existing.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        existing["mcpServers"] = {"memtomem-stm": entry}
+    else:
+        servers["memtomem-stm"] = entry
+    mcp_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    return mcp_path
+
+
+def _emit_mcp_paste_hints() -> None:
+    """Per-editor paste targets for the generated ``.mcp.json``."""
+    click.echo("    Cursor          → paste into ~/.cursor/mcp.json")
+    click.echo("    Windsurf        → paste into ~/.codeium/windsurf/mcp_config.json")
+    click.echo(
+        "    Claude Desktop  → paste into "
+        "~/Library/Application Support/Claude/claude_desktop_config.json"
+    )
+    click.echo("    Gemini CLI      → paste into ~/.gemini/settings.json")
+    click.echo("  (Claude Code picks up ./.mcp.json in this project automatically.)")
+
+
+def _emit_skip_hints() -> None:
+    """Manual-registration cheat sheet shown on option 3 (skip)."""
+    server_cmd, server_args = _detect_install_type()
+    cmd_str = " ".join([server_cmd, *server_args]) if server_args else server_cmd
+    click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")
+    click.echo("")
+    click.echo(f"  {_hdr('Claude Code (CLI):')}")
+    click.echo(f"    claude mcp add memtomem-stm -s user -- {cmd_str}")
+    click.echo("")
+    click.echo(f"  {_hdr('Claude Desktop / JSON MCP config:')}")
+    json_args = f', "args": {json.dumps(server_args)}' if server_args else ""
+    click.echo(
+        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": "{server_cmd}"{json_args} }} }} }}'
+    )
+    click.echo("")
+    click.echo(f"  Or run {_hdr('`mms register`')} later to re-run this wizard.")
+
+
+def _prompt_mcp_choice() -> int:
+    """Interactive 3-way prompt. Returns 1, 2, or 3."""
+    click.echo(_hdr("Register memtomem-stm with an MCP client?"))
+    click.echo("  [1] Add to Claude Code (run `claude mcp add` automatically)")
+    click.echo("  [2] Generate .mcp.json in current directory")
+    click.echo("      (for Cursor / Windsurf / Claude Desktop / Gemini)")
+    click.echo("  [3] Skip — I'll configure it manually")
+    return click.prompt("  Select", type=click.IntRange(1, 3), default=1, show_default=True)
+
+
+def _run_mcp_integration() -> None:
+    """Run the 3-way MCP registration flow.
+
+    Called by both ``mms init`` (after config save) and ``mms register``
+    (post-init re-entry path).
+    """
+    choice = _prompt_mcp_choice()
+    click.echo("")
+
+    if choice == 3:
+        _emit_skip_hints()
+        return
+
+    server_cmd, server_args = _detect_install_type()
+
+    if choice == 1:
+        if _check_already_registered():
+            click.echo(f"{_warn('Note:')} memtomem-stm is already registered with Claude Code.")
+            click.echo("    [1] Keep existing (recommended)")
+            click.echo("    [2] Replace (remove + re-add)")
+            action = click.prompt(
+                "  Select", type=click.IntRange(1, 2), default=1, show_default=True
+            )
+            if action == 1:
+                click.echo(f"  {_ok('Kept existing registration.')}")
+                return
+            _remove_from_claude_code()
+
+        success, reason = _register_with_claude_code(server_cmd, server_args)
+        if success:
+            click.echo(f"  {_ok('Registered with Claude Code (user scope).')}")
+            return
+
+        reason_msg = {
+            "not_installed": "claude CLI not found",
+            "timeout": "claude mcp add timed out",
+        }.get(reason, "claude mcp add failed")
+        click.echo(f"  {_warn(reason_msg)} — falling back to .mcp.json.")
+
+    # choice == 2, or choice == 1 fallback
+    mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args)
+    click.echo(f"  {_ok('Wrote')} {mcp_path}")
+    _emit_mcp_paste_hints()
 
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
@@ -1149,13 +1357,40 @@ def init(config_path: str, no_validate: bool) -> None:
         click.echo(f"    mms add --import --config {resolved}")
 
     click.echo("")
-    click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")
-    click.echo("")
-    click.echo(f"  {_hdr('Claude Code (CLI):')}")
-    click.echo("    claude mcp add memtomem-stm -s user -- memtomem-stm")
-    click.echo("")
-    click.echo(f"  {_hdr('Claude Desktop / JSON MCP config:')}")
-    click.echo('    { "mcpServers": { "memtomem-stm": { "command": "memtomem-stm" } } }')
+    _run_mcp_integration()
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default=str(_DEFAULT_CONFIG),
+    show_default=True,
+    help="Path to the proxy config (must already exist — run `mms init` first).",
+)
+def register(config_path: str) -> None:
+    """Register memtomem-stm with an MCP client.
+
+    Post-init re-entry path for the 3-way registration flow from ``mms init``:
+
+    \b
+    * Add to Claude Code (shell out to ``claude mcp add``)
+    * Generate ``.mcp.json`` in the current directory
+    * Skip and print manual instructions
+
+    Requires that ``mms init`` has been run so ``~/.memtomem/stm_proxy.json``
+    (or the ``--config`` path) exists. Safe to re-run; pre-checks existing
+    Claude Code registration and prompts before replacing.
+    """
+    resolved = Path(config_path).expanduser().resolve()
+    if not resolved.exists():
+        click.echo(
+            f"{_err('Error:')} config not found at {resolved}.",
+            err=True,
+        )
+        click.echo("  Run `mms init` first.", err=True)
+        sys.exit(1)
+    _run_mcp_integration()
 
 
 @cli.command()

@@ -60,7 +60,7 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 
 ### 1. Add an upstream MCP server
 
-For first-time setup, run the guided wizard — it prompts for name/prefix/command, optionally probes the server, and prints the MCP-client snippet you'll need in step 2:
+For first-time setup, run the guided wizard — it prompts for name/prefix/command, optionally probes the server, and then offers to register STM with Claude Code (or generate `.mcp.json`) in the same flow:
 
 ```bash
 mms init
@@ -86,13 +86,19 @@ mms status    # show full config + connectivity
 
 ### 2. Connect your AI client to STM
 
-Point your MCP client at the `memtomem-stm` server instead of the upstream servers directly. For Claude Code:
+`mms init` ends with a 3-way prompt — pick option 1 and it shells out to `claude mcp add` for you. If you skipped that step or want to register with a different client later, run:
+
+```bash
+mms register
+```
+
+To register manually, use `claude` directly:
 
 ```bash
 claude mcp add memtomem-stm -s user -- memtomem-stm
 ```
 
-Or add it to a JSON MCP config:
+Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
 
 ```json
 {

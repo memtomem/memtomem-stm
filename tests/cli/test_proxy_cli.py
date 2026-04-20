@@ -612,7 +612,18 @@ class TestInit:
       back to free-form prompts (name → prefix → transport → command/url).
 
     Tests that only exercise the manual flow use the ``no_discovery``
-    fixture to force an empty candidate list."""
+    fixture to force an empty candidate list.
+
+    The MCP-client registration step (``_run_mcp_integration``) is stubbed
+    out here so existing tests don't shell out to ``claude`` on the test
+    machine. Dedicated coverage for that flow lives in
+    ``TestInitMcpRegistration`` / ``TestRegisterCommand``."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_mcp_integration(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda: None)
 
     def test_init_happy_path_stdio_no_validate(self, runner, config, no_discovery):
         result = runner.invoke(
@@ -622,9 +633,6 @@ class TestInit:
         )
         assert result.exit_code == 0, result.output
         assert "Saved to:" in result.output
-        assert "Next:" in result.output
-        assert "claude mcp add memtomem-stm" in result.output
-        assert "mcpServers" in result.output
 
         data = json.loads(config.read_text(encoding="utf-8"))
         srv = data["upstream_servers"]["filesystem"]
@@ -693,8 +701,10 @@ class TestInit:
                 "--config",
                 str(config),
             ],
-            # server name, prefix, transport, command, args, validate=y
-            input="bad\nbad\nstdio\n__nonexistent_cmd_12345__\n\ny\n",
+            # server name, prefix, transport, command, args, validate=y,
+            # mcp-register choice = 3 (skip, prevents shelling out to the
+            # host's real `claude` CLI / polluting cwd with .mcp.json)
+            input="bad\nbad\nstdio\n__nonexistent_cmd_12345__\n\ny\n3\n",
             capture_output=True,
             text=True,
             timeout=30,
@@ -977,7 +987,16 @@ class TestInitDiscoverySources:
 class TestInitImportFlow:
     """End-to-end ``mms init`` when discovery finds candidates. We stub
     ``_discover_candidates`` directly to focus on the select + prefix UI;
-    source parsing is covered in ``TestInitDiscoverySources``."""
+    source parsing is covered in ``TestInitDiscoverySources``.
+
+    Same ``_run_mcp_integration`` stub as ``TestInit`` — the MCP-client
+    registration step is tested independently in ``TestInitMcpRegistration``."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_mcp_integration(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda: None)
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -1335,6 +1354,328 @@ class TestInitImportFlow:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert data["upstream_servers"]["filesystem"]["prefix"] == "fs"
         assert data["upstream_servers"]["github"]["prefix"] == "gh"
+
+
+# ── MCP client registration (3-way prompt) ──────────────────────────────
+
+
+class _FakeClaudeResult:
+    """Lightweight stand-in for ``subprocess.CompletedProcess[str]``. Using
+    a plain object avoids pinning the test to a specific stdlib version's
+    constructor signature."""
+
+    def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = stderr
+
+
+class TestInitMcpRegistration:
+    """The new 3-way prompt at the end of ``mms init`` (and the re-entry
+    point ``mms register``): Claude Code auto-register / ``.mcp.json``
+    generation / skip.
+
+    These tests exercise the real ``_run_mcp_integration`` flow (no autouse
+    stub) and replace ``_run_claude_mcp`` with an in-process recorder so
+    assertions can check exact argv."""
+
+    @pytest.fixture
+    def no_discovery(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: [])
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        """Record every ``_run_claude_mcp`` call and return scripted results.
+
+        The fixture returns a dict ``{"calls": [...], "script": [...]}``; tests
+        append to ``script`` before the CLI runs and read ``calls`` after.
+        Default scripted result is exit 0 (registration succeeds)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def _init_input(self, mcp_choice: str) -> str:
+        """Build input for the manual-flow init with an explicit MCP choice."""
+        return f"filesystem\nfs\nstdio\nnpx\n-y @mcp/fs\n{mcp_choice}\n"
+
+    def test_choice_1_calls_claude_mcp_add_with_expected_args(
+        self, runner, config, no_discovery, fake_claude
+    ):
+        """Happy path: user picks 1, pre-check returns 'not registered',
+        ``claude mcp add`` runs successfully."""
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1),  # `claude mcp get` → not registered
+            _FakeClaudeResult(returncode=0),  # `claude mcp add` → success
+        ]
+        result = runner.invoke(
+            cli, ["init", "--no-validate", *_cfg_args(config)], input=self._init_input("1")
+        )
+        assert result.exit_code == 0, result.output
+        assert "Registered with Claude Code" in result.output
+        assert len(fake_claude["calls"]) == 2
+        # First call: pre-check
+        assert fake_claude["calls"][0][:4] == ["claude", "mcp", "get", "memtomem-stm"]
+        # Second call: actual add, with -s user and the server command
+        add_cmd = fake_claude["calls"][1]
+        assert add_cmd[:7] == ["claude", "mcp", "add", "memtomem-stm", "-s", "user", "--"]
+
+    def test_choice_2_writes_mcp_json_without_shelling_out(
+        self, runner, config, no_discovery, fake_claude, tmp_path, monkeypatch
+    ):
+        """Option 2 generates ``.mcp.json`` and never touches the ``claude`` CLI."""
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(
+            cli, ["init", "--no-validate", *_cfg_args(config)], input=self._init_input("2")
+        )
+        assert result.exit_code == 0, result.output
+        assert fake_claude["calls"] == []
+        mcp_json = tmp_path / ".mcp.json"
+        assert mcp_json.exists()
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+        assert "memtomem-stm" in data["mcpServers"]
+
+    def test_choice_3_skips_with_manual_hints(self, runner, config, no_discovery, fake_claude):
+        """Option 3 prints the manual cheat sheet; no subprocess, no file write."""
+        result = runner.invoke(
+            cli, ["init", "--no-validate", *_cfg_args(config)], input=self._init_input("3")
+        )
+        assert result.exit_code == 0, result.output
+        assert fake_claude["calls"] == []
+        assert "claude mcp add memtomem-stm" in result.output
+        assert "mcpServers" in result.output
+        assert "mms register" in result.output
+
+    def test_duplicate_pre_check_keeps_existing_when_user_picks_keep(
+        self, runner, config, no_discovery, fake_claude
+    ):
+        """Pre-check finds an existing registration → user picks option 1
+        ('keep') on the replace prompt → no ``remove`` or ``add`` call.
+
+        The 'keep' option is intentionally the default for the prompt but
+        ``click.CliRunner`` aborts on EOF rather than taking defaults, so
+        the test feeds an explicit ``1`` for that prompt too."""
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=0),  # `mcp get` → already exists
+        ]
+        # Extra "1\n" for the keep/replace prompt (pick keep).
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input=self._init_input("1").rstrip("\n") + "\n1\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "already registered" in result.output
+        assert "Kept existing registration" in result.output
+        # Only the pre-check ran — no remove, no add.
+        assert len(fake_claude["calls"]) == 1
+        assert fake_claude["calls"][0][:3] == ["claude", "mcp", "get"]
+
+    def test_duplicate_replace_removes_then_adds(self, runner, config, no_discovery, fake_claude):
+        """Pre-check finds duplicate + user picks 'Replace' → remove, then
+        add are called in that order."""
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=0),  # mcp get → exists
+            _FakeClaudeResult(returncode=0),  # mcp remove
+            _FakeClaudeResult(returncode=0),  # mcp add
+        ]
+        # Extra "2\n" for the keep/replace prompt (pick replace)
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input=self._init_input("1").rstrip("\n") + "\n2\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Registered with Claude Code" in result.output
+        assert len(fake_claude["calls"]) == 3
+        assert fake_claude["calls"][0][:3] == ["claude", "mcp", "get"]
+        assert fake_claude["calls"][1][:3] == ["claude", "mcp", "remove"]
+        assert fake_claude["calls"][2][:3] == ["claude", "mcp", "add"]
+
+    def test_fallback_on_file_not_found_writes_mcp_json(
+        self, runner, config, no_discovery, fake_claude, tmp_path, monkeypatch
+    ):
+        """``claude`` CLI missing → ``FileNotFoundError`` on pre-check and
+        on the add call → falls back to writing ``.mcp.json``."""
+        monkeypatch.chdir(tmp_path)
+        # Both `claude mcp get` (pre-check) and `claude mcp add` raise when the
+        # binary is absent from PATH — the fake must model that, not just
+        # script one exception.
+        fake_claude["script"] = [
+            FileNotFoundError("claude not on PATH"),  # pre-check
+            FileNotFoundError("claude not on PATH"),  # actual add
+        ]
+        result = runner.invoke(
+            cli, ["init", "--no-validate", *_cfg_args(config)], input=self._init_input("1")
+        )
+        assert result.exit_code == 0, result.output
+        assert "claude CLI not found" in result.output
+        assert "falling back to .mcp.json" in result.output
+        assert (tmp_path / ".mcp.json").exists()
+
+    def test_fallback_on_timeout_writes_mcp_json(
+        self, runner, config, no_discovery, fake_claude, tmp_path, monkeypatch
+    ):
+        """``TimeoutExpired`` from the add call (duplicate check already
+        passed) → fallback to ``.mcp.json``."""
+        import subprocess
+
+        monkeypatch.chdir(tmp_path)
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1),  # mcp get → not registered
+            subprocess.TimeoutExpired(cmd="claude", timeout=5),  # mcp add → timeout
+        ]
+        result = runner.invoke(
+            cli, ["init", "--no-validate", *_cfg_args(config)], input=self._init_input("1")
+        )
+        assert result.exit_code == 0, result.output
+        assert "timed out" in result.output
+        assert (tmp_path / ".mcp.json").exists()
+
+    def test_fallback_on_nonzero_exit_writes_mcp_json(
+        self, runner, config, no_discovery, fake_claude, tmp_path, monkeypatch
+    ):
+        """Add exits non-zero for a reason other than pre-check → generic
+        'claude mcp add failed' fallback."""
+        monkeypatch.chdir(tmp_path)
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1),  # mcp get → not registered
+            _FakeClaudeResult(returncode=2, stderr="some unexpected error"),
+        ]
+        result = runner.invoke(
+            cli, ["init", "--no-validate", *_cfg_args(config)], input=self._init_input("1")
+        )
+        assert result.exit_code == 0, result.output
+        assert "claude mcp add failed" in result.output
+        assert (tmp_path / ".mcp.json").exists()
+
+
+class TestDetectInstallType:
+    """``_detect_install_type`` returns ``(server_cmd, server_args)`` for the
+    current install location. Covers the three relevant shapes: STM source
+    checkout, user project that ``uv add``'d memtomem-stm, and global install."""
+
+    def test_detects_stm_source_checkout(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "memtomem-stm"\nversion = "0.0.0"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "uv"
+        assert args[:2] == ["run", "--directory"]
+        assert args[-1] == "mms"
+
+    def test_detects_user_project_with_stm_dep(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "my-app"\ndependencies = ["memtomem-stm>=0.1"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "uv"
+        assert args[-1] == "mms"
+
+    def test_defaults_to_bare_console_script_outside_project(self, tmp_path, monkeypatch):
+        """No pyproject.toml reachable (up to 5 levels) → global install
+        assumed → bare ``memtomem-stm`` command with no args."""
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
+    def test_unrelated_pyproject_still_defaults(self, tmp_path, monkeypatch):
+        """A pyproject.toml that doesn't mention memtomem-stm must NOT be
+        treated as a project install — those users installed STM globally."""
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "unrelated"\ndependencies = ["requests"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
+
+class TestRegisterCommand:
+    """``mms register`` is the post-init re-entry path for the MCP-client
+    registration flow. It requires that ``mms init`` has been run, so
+    ``mms register`` without a config should abort clearly."""
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def test_register_aborts_without_config(self, runner, config):
+        """Running ``mms register`` before ``mms init`` should fail with a
+        clear 'run `mms init` first' message."""
+        assert not config.exists()
+        result = runner.invoke(cli, ["register", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "config not found" in result.output
+        assert "mms init" in result.output
+
+    def test_register_runs_flow_when_config_exists(self, runner, config, fake_claude):
+        """With a config present, ``mms register`` drops straight into the
+        3-way prompt. Option 3 (skip) prints the manual hints."""
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["register", *_cfg_args(config)], input="3\n")
+        assert result.exit_code == 0, result.output
+        assert fake_claude["calls"] == []
+        assert "claude mcp add memtomem-stm" in result.output
+        assert "mms register" in result.output
+
+    def test_register_is_idempotent_when_already_registered(self, runner, config, fake_claude):
+        """Re-running register when STM is already in Claude Code and the
+        user picks 'keep' → no destructive side effects.
+
+        Pins the idempotency contract for the post-init re-entry path
+        (plan Part 2): ``mms register`` can be safely rerun without
+        clobbering an existing Claude Code entry."""
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        fake_claude["script"] = [_FakeClaudeResult(returncode=0)]  # already registered
+        # "1\n" for the 3-way prompt (Claude Code) + "1\n" for keep/replace (keep).
+        result = runner.invoke(cli, ["register", *_cfg_args(config)], input="1\n1\n")
+        assert result.exit_code == 0, result.output
+        assert "already registered" in result.output
+        assert "Kept existing registration" in result.output
+        # Only the pre-check ran.
+        assert len(fake_claude["calls"]) == 1
 
 
 # ── add --from-clients (bulk import) ────────────────────────────────────
