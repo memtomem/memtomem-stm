@@ -2334,6 +2334,324 @@ class TestAddFromClients:
         assert "claude mcp remove" not in result.output
 
 
+class TestAddFromClientsPrune:
+    """`mms add --from-clients --prune` (and the TTY prompt variant) removes
+    the direct registration from each source MCP client after a successful
+    import, closing the dual-path gap #203 left warning-only. See #226."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def _seed_config(self, config: Path, servers: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        """Record `claude mcp remove` invocations; default to exit 0."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def _all_cc_candidates(self):
+        """Candidate set covering every Claude Code scope the writer handles."""
+        return [
+            {
+                "name": "from-user",
+                "source": "Claude Code (user)",
+                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
+            },
+            {
+                "name": "from-local",
+                "source": "Claude Code (project)",
+                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@l"]},
+            },
+            {
+                "name": "from-proj",
+                "source": ".mcp.json (project)",
+                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@p"]},
+            },
+        ]
+
+    def test_prune_flag_shells_out_with_correct_scope_per_source(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """`--prune` invokes ``claude mcp remove <name> -s <scope>`` with the
+        same scope-label mapping `_source_removal_hint` uses for the manual
+        hint: user → user, project → local, .mcp.json → project."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._all_cc_candidates())
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n\n\n",  # pick all + accept each default prefix
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        # One remove call per source. Argv = [claude, mcp, remove, <name>, -s, <scope>].
+        pairs = {(c[3], c[5]) for c in argvs}
+        assert pairs == {
+            ("from-user", "user"),
+            ("from-local", "local"),
+            ("from-proj", "project"),
+        }
+        assert "Removed from source client(s)" in result.output
+
+    def test_prune_flag_writes_desktop_json_atomically(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """Claude Desktop source → atomic JSON rewrite (no `claude` CLI call).
+        Verifies the entry is deleted, the file stays valid JSON, and
+        unrelated entries are preserved."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        desktop_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "from-desktop": {"command": "npx", "args": ["-y", "@d"]},
+                        "keep-me": {"command": "other"},
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "from-desktop",
+                    "source": "Claude Desktop",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+                },
+            ],
+        )
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        # Claude Desktop must not go through `claude mcp remove`.
+        remove_calls = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert remove_calls == []
+
+        updated = json.loads(desktop_path.read_text(encoding="utf-8"))
+        assert "from-desktop" not in updated["mcpServers"]
+        assert "keep-me" in updated["mcpServers"]
+
+    def test_prune_flag_nonfatal_on_failure_falls_back_to_manual_hint(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """A failing `claude mcp remove` must not roll back the import — the
+        proxy config stays updated — and the user sees a warning plus the
+        exact manual command to retry."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "from-user",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
+                },
+            ],
+        )
+        fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        # Import was not rolled back.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "from-user" in data["upstream_servers"]
+
+        # Warning surfaces the failing entry and the manual command.
+        assert "could not remove 1 direct registration" in result.output
+        assert "boom" in result.output
+        assert "claude mcp remove from-user -s user" in result.output
+
+    def test_prune_flag_without_from_clients_is_usage_error(
+        self, runner, config, monkeypatch
+    ):
+        """`--prune` has no imported-candidate set to act on without
+        ``--from-clients``; silently ignoring it would be surprising."""
+        self._seed_config(config, {})
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "mysrv",
+                "--prefix",
+                "fs",
+                "--command",
+                "x",
+                "--prune",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--prune requires --from-clients" in result.output
+
+    def test_tty_prompt_default_no_falls_back_to_hint(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """On TTY without `--prune`, user gets a confirm prompt defaulting to
+        No. Declining must skip the prune entirely and fall through to the
+        #203 hint so the user still has a manual path forward.
+
+        The pick step's questionary UI doesn't work under CliRunner, so we
+        stub ``_pick_imports`` directly and force the TUI gate True — what
+        we actually want to exercise is the prune prompt branch downstream
+        of pick, not pick itself."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda cands: list(range(len(cands))))
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "from-user",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            # Inputs: prefix accept (\n), then decline prune (n\n).
+            input="\nn\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        # No `claude mcp remove` calls — user declined.
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+        # Hint still shown.
+        assert "claude mcp remove from-user -s user" in result.output
+
+    def test_tty_prompt_accept_prunes(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """On TTY, accepting the prompt prunes exactly like `--prune`. Stubs
+        ``_pick_imports`` for the same CliRunner-vs-questionary reason as
+        the default-No test above."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda cands: list(range(len(cands))))
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "from-user",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="\ny\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert argvs == [["claude", "mcp", "remove", "from-user", "-s", "user"]]
+        assert "Removed from source client(s)" in result.output
+
+    def test_non_tty_without_flag_keeps_existing_hint_only_behavior(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """CliRunner stdin is non-TTY by default. Without `--prune` the prompt
+        must not fire and the #203 warning-only behavior must be preserved —
+        regression guard against accidentally flipping the default."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "from-user",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+        assert "claude mcp remove from-user -s user" in result.output
+        # Confirm prompt text must NOT appear — no silent auto-prune.
+        assert "Remove from source(s)?" not in result.output
+
+    def test_prune_acts_on_duplicate_in_sources_too(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """A candidate registered in more than one source is listed with
+        `duplicate_in`; `--prune` must remove it from every source, not just
+        the primary one, otherwise the dual-path survives."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                    "duplicate_in": ["Claude Code (project)"],
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        pairs = {(c[3], c[5]) for c in argvs}
+        assert pairs == {("filesystem", "user"), ("filesystem", "local")}
+
+
 # ── remove command ───────────────────────────────────────────────────────
 
 

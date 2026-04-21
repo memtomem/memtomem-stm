@@ -594,6 +594,16 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     "TUI flow. Skips candidates already registered in this config. "
     "Incompatible with NAME / --prefix / --command / --args / --url / --env.",
 )
+@click.option(
+    "--prune",
+    "prune",
+    is_flag=True,
+    default=False,
+    help="After a successful --from-clients/--import, remove the direct "
+    "registrations from each source MCP client so tools are only reachable "
+    "via STM. Default: interactive prompt on TTY, skip on non-TTY. Only "
+    "valid with --from-clients/--import.",
+)
 def add(
     name: str | None,
     config_path: str,
@@ -608,6 +618,7 @@ def add(
     validate: bool,
     validate_timeout: int,
     from_clients: bool,
+    prune: bool,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
     path = Path(config_path)
@@ -634,8 +645,14 @@ def add(
             raise click.UsageError(
                 f"--from-clients cannot be combined with: {', '.join(conflicts)}."
             )
-        _add_from_clients(path, validate=validate, validate_timeout=validate_timeout)
+        _add_from_clients(path, validate=validate, validate_timeout=validate_timeout, prune=prune)
         return
+
+    if prune:
+        # --prune only has semantics when we know which servers were just
+        # imported from which sources. The manual path has neither, so the
+        # flag would be a silent no-op — surface the mistake instead.
+        raise click.UsageError("--prune requires --from-clients/--import.")
 
     # Manual single-server path — NAME and --prefix were previously click-
     # required. Relaxed to optional above so --from-clients can omit them;
@@ -977,6 +994,190 @@ def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> No
         click.echo(f"        {line}")
 
 
+# ── Source-client prune (#226) ─────────────────────────────────────────────
+#
+# Deliberate, opt-in exception to the otherwise read-only source-client
+# contract (see ``_discover_candidates`` docstring and PR #203 for the hint-
+# only predecessor). Writer surface is kept tight: a ``claude mcp remove``
+# shell-out for Claude Code / ``.mcp.json`` scopes, and an atomic JSON
+# rewrite for Claude Desktop. Any failure is non-fatal — the import stays
+# put and the user is shown the manual-command fallback.
+
+
+def _claude_mcp_remove(name: str, scope: str) -> tuple[bool, str | None]:
+    """Shell out to ``claude mcp remove <name> -s <scope>``.
+
+    Returns ``(ok, error_message_or_None)``. Treats any non-zero exit or
+    subprocess error as a non-fatal failure so the caller can surface the
+    manual command instead of aborting the import.
+    """
+    try:
+        result = _run_claude_mcp(["claude", "mcp", "remove", name, "-s", scope], timeout=5)
+    except FileNotFoundError:
+        return (False, "`claude` CLI not on PATH")
+    except subprocess.TimeoutExpired:
+        return (False, "`claude mcp remove` timed out")
+    except OSError as exc:
+        return (False, f"OS error invoking `claude`: {exc}")
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout or "").strip()
+        return (False, msg or f"`claude mcp remove` exited {result.returncode}")
+    return (True, None)
+
+
+def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
+    """Delete ``mcpServers[name]`` from Claude Desktop's config, atomic write.
+
+    Returns ``(ok, error_message_or_None)``. The atomic write uses
+    :func:`atomic_write_text` for the same reason :func:`_save` does — a
+    running Claude Desktop instance may re-read the file mid-rewrite, and
+    ``os.replace`` is the only way to keep the update coherent.
+    """
+    path = _desktop_config_path()
+    if not path.exists():
+        return (False, f"{path} not found")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return (False, f"read error: {exc}")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return (False, f"parse error: {exc}")
+    if not isinstance(data, dict):
+        return (False, f"{path} top-level is not an object")
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or name not in servers:
+        return (False, f"'{name}' not registered in {path}")
+    del servers[name]
+    try:
+        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        return (False, f"write error: {exc}")
+    return (True, None)
+
+
+def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
+    """Dispatch the prune action per source label used by ``_discover_candidates``.
+
+    Scope-label mapping matches :func:`_source_removal_hint` — the remediation
+    hint and the prune writer agree on which ``claude mcp remove -s <scope>``
+    flag maps to which label. Unknown sources are refused rather than guessed.
+    """
+    if source == "Claude Code (user)":
+        return _claude_mcp_remove(name, "user")
+    if source == "Claude Code (project)":
+        return _claude_mcp_remove(name, "local")
+    if source == ".mcp.json (project)":
+        return _claude_mcp_remove(name, "project")
+    if source == "Claude Desktop":
+        return _desktop_json_remove_entry(name)
+    return (False, f"unknown source label: {source}")
+
+
+def _prune_imported_candidates(
+    imported_candidates: list[dict[str, Any]],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
+    """Prune each imported candidate from every source that registered it.
+
+    A single candidate can show up in multiple sources (primary ``source``
+    plus ``duplicate_in``) — all are pruned so the dual-path collapses.
+    Returns ``(pruned, failed)`` where ``pruned`` is ``[(name, source), ...]``
+    and ``failed`` is ``[(name, source, error), ...]``.
+    """
+    pruned: list[tuple[str, str]] = []
+    failed: list[tuple[str, str, str]] = []
+    for cand in imported_candidates:
+        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            ok, err = _prune_from_source(cand["name"], src)
+            if ok:
+                pruned.append((cand["name"], src))
+            else:
+                failed.append((cand["name"], src, err or "unknown error"))
+    return pruned, failed
+
+
+def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
+    """Post-import prompt offering to prune direct registrations. Default No.
+
+    Only called on TTY (callers gate via :func:`_should_use_tui`). Lists the
+    exact (name, source) pairs so the user can see what would be written
+    before consenting — the prompt is the point where the read-only invariant
+    relaxes and visibility matters.
+    """
+    click.echo("")
+    click.echo("The server(s) above are still registered directly in their source MCP client(s).")
+    click.echo("Removing the direct registrations routes the tools through STM only")
+    click.echo(
+        "(adds compression / caching / LTM surfacing; avoids duplicate tool advertisements)."
+    )
+    click.echo("Affected entries:")
+    seen: set[tuple[str, str]] = set()
+    for cand in imported_candidates:
+        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            key = (cand["name"], src)
+            if key in seen:
+                continue
+            seen.add(key)
+            click.echo(f"    {cand['name']} — {src}")
+    return click.confirm("Remove from source(s)?", default=False)
+
+
+def _handle_source_prune(
+    imported_candidates: list[dict[str, Any]],
+    *,
+    prune: bool,
+) -> None:
+    """Post-import prune + reporting.
+
+    Three paths based on the caller's ``prune`` flag and the TTY gate:
+
+    * ``prune=True`` → prune unconditionally.
+    * ``prune=False`` + TTY → interactive prompt, default No.
+    * ``prune=False`` + non-TTY → skip prune entirely, fall through to the
+      #203 hint-only warning.
+
+    Partial failures (e.g. one source prunes, another fails) surface a
+    per-entry warning plus the manual-command fallback for the failed rows
+    only, so the user always has a path forward even if the writer is
+    degraded.
+    """
+    if not imported_candidates:
+        return
+
+    if prune:
+        should_prune = True
+    elif _should_use_tui():
+        should_prune = _confirm_prune_prompt(imported_candidates)
+    else:
+        should_prune = False
+
+    if not should_prune:
+        _print_source_removal_hints(imported_candidates)
+        return
+
+    pruned, failed = _prune_imported_candidates(imported_candidates)
+
+    if pruned:
+        click.echo("")
+        click.echo(f"{_ok('Removed from source client(s):')}")
+        for name, src in pruned:
+            click.echo(f"  {name} — {src}")
+
+    if failed:
+        click.echo("")
+        click.echo(
+            f"{_warn('Warning:')} could not remove {len(failed)} direct registration(s):",
+            err=True,
+        )
+        for name, src, err in failed:
+            click.echo(f"  {name} ({src}): {err}", err=True)
+        click.echo("", err=True)
+        click.echo("Run the following to remove them manually:", err=True)
+        for name, src, _ in failed:
+            click.echo(f"  {_source_removal_hint(name, src)}", err=True)
+
+
 def _suggest_prefix(name: str, taken: set[str]) -> str:
     """Derive a valid-ish default prefix from a server name.
 
@@ -1200,6 +1401,7 @@ def _add_from_clients(
     *,
     validate: bool,
     validate_timeout: int,
+    prune: bool = False,
 ) -> None:
     """Interactive bulk-import path for ``mms add --from-clients``.
 
@@ -1296,12 +1498,13 @@ def _add_from_clients(
     for n, e in imported.items():
         click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
 
-    # Imported servers stay registered in their source MCP clients: discovery
-    # is read-only, so removal is the user's call. Until they remove the
-    # direct registrations, tools are surfaced on two paths (client → upstream
-    # and client → STM → upstream) and the direct path bypasses compression,
-    # caching, and LTM surfacing entirely.
-    _print_source_removal_hints([new_candidates[i] for i in picks])
+    # Source clients still hold the direct registrations. Without a prune,
+    # tools surface on two paths (client → upstream and client → STM →
+    # upstream) and the direct path bypasses compression, caching, and LTM
+    # surfacing. ``_handle_source_prune`` picks between the --prune flag,
+    # the interactive prompt (TTY), and the hint-only fallback (non-TTY /
+    # user declined).
+    _handle_source_prune([new_candidates[i] for i in picks], prune=prune)
 
 
 @cli.command()
