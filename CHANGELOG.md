@@ -5,14 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.13] — 2026-04-21
+
 ### Added
 
-- **`mms --version` flag** — idiomatic Click entry point alongside the existing `mms version` subcommand (kept for backwards compatibility). Both paths emit the same `memtomem-stm X.Y.Z` line, so scripts that grep the version string don't care which they invoke.
-- **`mms list --json`** — scriptable JSON output for the server list, mirroring the shape of `mms status --json` (`{config_path, servers}`; missing config returns `{error: "config_not_found", path}`). Closes the parity gap where `status` and `health` already supported `--json` but `list` required parsing the text table.
+- **`mms init` auto-registers with Claude Code + new `mms register` command** (#216) — `mms init` now ends with a 3-way MCP registration prompt (Claude Code auto-register / emit `.mcp.json` snippet / skip), mirroring parent `mm init`. The new `mms register` command re-runs the same prompt post-init without re-entering `init` (preserves the bootstrap-only invariant). Install-type detection picks between `uv run --directory <root> mms` (source checkout / `uv add memtomem-stm` project) and bare `memtomem-stm` (global install).
+- **`--mcp claude|json|skip` flag on `mms init` / `mms register`** (#217) — pre-answers the 3-way registration prompt for scripted / CI callers, matching parent `mm init --mcp` shape. Fixes a regression from #216 where piped-stdin callers who didn't feed an extra line hit `click.Abort`. `--mcp claude` on an existing registration defaults to 'keep' (non-destructive, no prompt).
+- **`mms --version` flag** (#220) — idiomatic Click entry point alongside the existing `mms version` subcommand (kept for backwards compatibility). Both paths emit the same `memtomem-stm X.Y.Z` line, so scripts that grep the version string don't care which they invoke.
+- **`mms list --json`** (#220) — scriptable JSON output for the server list, mirroring the shape of `mms status --json` (`{config_path, servers}`; missing config returns `{error: "config_not_found", path}`). Closes the parity gap where `status` and `health` already supported `--json` but `list` required parsing the text table.
 
 ### Changed
 
-- **`mms health --json` now pretty-prints (indent=2, ensure_ascii=False)** to match `mms status --json` and `mms list --json`. Previously emitted compact one-liners, leaving `health` as the odd one out when piping multiple `--json` commands through the same formatter. Shape is unchanged; parsers that ignore whitespace are unaffected.
+- **`_detect_install_type` now does a `tomllib` parse + PEP 508 name extraction** (#218) — replaces the earlier `'"memtomem-stm' in content` prefix match, which would have false-positived on neighbor packages like `memtomem-stm-bundle` or on unrelated comments mentioning the name. Behavior unchanged for the three shipped happy paths; hardening for edge cases before the first incident.
+- **`mms health --json` pretty-prints (indent=2, ensure_ascii=False)** (#222) — matches `mms status --json` and `mms list --json`. Previously emitted compact one-liners, leaving `health` as the odd one out when piping multiple `--json` commands through the same formatter. Shape unchanged; parsers that ignore whitespace are unaffected.
+
+### Fixed
+
+- **OS-appropriate Claude Desktop config path in `mms init` / `mms register` paste hints** (#219) — previously hardcoded the macOS path (`~/Library/Application Support/Claude/claude_desktop_config.json`) for all platforms. Now routes on `sys.platform`: Linux → `~/.config/Claude/claude_desktop_config.json`, Windows → `%APPDATA%\Claude\claude_desktop_config.json`. Cursor / Windsurf / Gemini targets are unchanged (cross-platform by design).
 
 ## [0.1.12] — 2026-04-20
 
