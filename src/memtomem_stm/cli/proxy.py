@@ -194,9 +194,16 @@ def _detect_install_type() -> tuple[str, list[str]]:
 
     * Inside a ``pyproject.toml`` that is STM's own source checkout OR a
       user project that lists ``memtomem-stm`` in ``[project].dependencies``
-      / ``[project].optional-dependencies`` → ``uv run --directory <root> mms``.
+      / ``[project].optional-dependencies`` → ``uv run --directory <root>
+      memtomem-stm``.
     * Default (global install via ``uv tool install`` / ``pipx``, or a cwd
       with no relevant pyproject) → bare ``memtomem-stm`` console script.
+
+    Both branches spawn the ``memtomem-stm`` console script, not ``mms``:
+    ``mms`` is the click CLI group and exits 0 on no-subcommand, which closes
+    the stdio pipe immediately and the MCP client reports "Failed to
+    reconnect". ``memtomem-stm`` is the actual server entrypoint
+    (``memtomem_stm.server:main``).
 
     Parent ``mm init`` keeps source/project as separate branches because
     the parent is a monorepo (``packages/`` subdir is the discriminator).
@@ -213,7 +220,7 @@ def _detect_install_type() -> tuple[str, list[str]]:
         pyp = check / "pyproject.toml"
         if pyp.exists():
             if _pyproject_references_stm(pyp):
-                return ("uv", ["run", "--directory", str(check), "mms"])
+                return ("uv", ["run", "--directory", str(check), "memtomem-stm"])
             break
         check = check.parent
     return ("memtomem-stm", [])

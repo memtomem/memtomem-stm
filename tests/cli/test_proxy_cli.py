@@ -1710,7 +1710,11 @@ class TestDetectInstallType:
         cmd, args = _detect_install_type()
         assert cmd == "uv"
         assert args[:2] == ["run", "--directory"]
-        assert args[-1] == "mms"
+        # The entrypoint must be the ``memtomem-stm`` console script, not the
+        # ``mms`` click group — ``mms`` with no subcommand prints help and
+        # exits 0, which closes the MCP stdio pipe and the client reports
+        # "Failed to reconnect".
+        assert args[-1] == "memtomem-stm"
 
     def test_detects_user_project_with_stm_dep(self, tmp_path, monkeypatch):
         (tmp_path / "pyproject.toml").write_text(
@@ -1722,7 +1726,7 @@ class TestDetectInstallType:
 
         cmd, args = _detect_install_type()
         assert cmd == "uv"
-        assert args[-1] == "mms"
+        assert args[-1] == "memtomem-stm"
 
     def test_defaults_to_bare_console_script_outside_project(self, tmp_path, monkeypatch):
         """No pyproject.toml reachable (up to 5 levels) → global install
@@ -1765,7 +1769,7 @@ class TestDetectInstallType:
 
         cmd, args = _detect_install_type()
         assert cmd == "uv"
-        assert args[-1] == "mms"
+        assert args[-1] == "memtomem-stm"
 
     def test_adjacent_package_name_does_not_false_positive(self, tmp_path, monkeypatch):
         """A project named `memtomem-stm-extension` (or similar dash-suffixed
@@ -1833,6 +1837,32 @@ class TestDetectInstallType:
         cmd, args = _detect_install_type()
         assert cmd == "memtomem-stm"
         assert args == []
+
+    def test_never_emits_click_group_as_mcp_entrypoint(self, tmp_path, monkeypatch):
+        """Regression guard: neither branch may return ``mms`` as the command
+        the MCP client will spawn.
+
+        ``mms`` is the click CLI group (entrypoint
+        ``memtomem_stm.cli.proxy:cli``) — calling it with no subcommand
+        prints help and exits 0, the stdio pipe closes before ``initialize``,
+        and the client reports "Failed to reconnect". The actual server is
+        ``memtomem-stm`` (entrypoint ``memtomem_stm.server:main``). Pinning
+        the non-inclusion here because the three branch-specific tests above
+        could all flip together in a refactor and silently reintroduce the
+        regression."""
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        # Dev-checkout branch.
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "memtomem-stm"\nversion = "0.0.0"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        cmd, args = _detect_install_type()
+        assert "mms" not in [cmd, *args], (
+            "regression: _detect_install_type emits the click group — "
+            "MCP stdio will close on initialize"
+        )
 
 
 class TestClaudeDesktopConfigHint:
