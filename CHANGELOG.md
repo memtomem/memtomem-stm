@@ -5,9 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.15] — 2026-04-22
+
 ### Changed
 
-- **Proxied tool `annotations.title` is tagged with its source server** — MCP clients such as Claude Code's `/mcp` picker display `annotations.title` in place of the tool `name` when it is set. Upstream servers that populate `title` (e.g. Playwright's "Close browser") previously appeared unattributed in the picker, while servers that left it blank fell back to the prefixed `name` (e.g. `Context7__resolve-library-id`) — the same STM-hosted tool looked attributed or unattributed depending purely on whether the upstream author set `title`. The proxy now copy-on-writes `annotations.title` to `"[{server}] {original title}"` (e.g. `"[playwright] Close browser"`) so the source server is always visible in the picker. Invocation `name` (`playwright__browser_close`), input schema, description, and all other annotation hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) are unchanged — this is a display-layer change only, with no effect on how agents call the tool. When upstream `title` is absent/empty or annotations are `None`, the original value is returned unchanged (clients fall back to the already-prefixed `name`, preserving attribution).
+- **Proxied tool `annotations.title` is tagged with its source server** (#231) — MCP clients such as Claude Code's `/mcp` picker display `annotations.title` in place of the tool `name` when it is set. Upstream servers that populate `title` (e.g. Playwright's "Close browser") previously appeared unattributed in the picker, while servers that left it blank fell back to the prefixed `name` (e.g. `Context7__resolve-library-id`) — the same STM-hosted tool looked attributed or unattributed depending purely on whether the upstream author set `title`. The proxy now copy-on-writes `annotations.title` to `"[{server}] {original title}"` (e.g. `"[playwright] Close browser"`) so the source server is always visible in the picker. Invocation `name` (`playwright__browser_close`), input schema, description, and all other annotation hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) are unchanged — this is a display-layer change only, with no effect on how agents call the tool. When upstream `title` is absent/empty or annotations are `None`, the original value is returned unchanged (clients fall back to the already-prefixed `name`, preserving attribution).
 
 ## [0.1.14] — 2026-04-22
 
