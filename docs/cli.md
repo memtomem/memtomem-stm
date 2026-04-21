@@ -26,16 +26,24 @@ Usage: mms [OPTIONS] COMMAND [ARGS]...
 
   memtomem-stm proxy gateway management.
 
+Options:
+  --version   Show the version and exit.
+  -h, --help  Show this message and exit.
+
 Commands:
-  add     Add an upstream MCP server to the proxy configuration.
-  health  Check upstream server connectivity.
-  init    Guided first-time setup for memtomem-stm.
-  list    List configured upstream servers.
-  remove  Remove an upstream MCP server from the proxy configuration.
-  status  Show proxy gateway configuration and server list.
+  add       Add an upstream MCP server to the proxy configuration.
+  health    Check upstream server connectivity.
+  init      Guided first-time setup for memtomem-stm.
+  list      List configured upstream servers.
+  register  Register memtomem-stm with an MCP client.
+  remove    Remove an upstream MCP server from the proxy configuration.
+  status    Show proxy gateway configuration and server list.
+  version   Show the installed memtomem-stm version.
 ```
 
 All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
+
+`mms --version` and `mms version` both print `memtomem-stm X.Y.Z` — the flag is the idiomatic Click form, the subcommand is kept for backwards compatibility.
 
 Output is colorized when writing to a terminal; set `NO_COLOR=1` to disable. JSON output (`--json`) and non-TTY streams (pipes, CI) are never colored.
 
@@ -45,20 +53,58 @@ Output is colorized when writing to a terminal; set `NO_COLOR=1` to disable. JSO
 Usage: mms init [OPTIONS]
 
 Options:
-  --config TEXT   [default: ~/.memtomem/stm_proxy.json]
-  --no-validate   Skip the connectivity probe entirely (default: prompt,
-                  probe on yes).
+  --config TEXT             [default: ~/.memtomem/stm_proxy.json]
+  --no-validate             Skip the connectivity probe entirely (default:
+                            prompt, probe on yes).
+  --mcp [claude|json|skip]  Pre-answer the MCP-registration prompt for
+                            scripted runs: 'claude' = `claude mcp add`,
+                            'json' = write .mcp.json, 'skip' = no
+                            registration. Omit the flag for the interactive
+                            prompt.
 ```
 
-Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then prints an inline summary plus the MCP-client snippet you need to paste into Claude Code / Claude Desktop.
+Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then offers a 3-way MCP-client registration prompt:
 
-Aborts if the config file already exists — use [`add`](#add) to register additional servers or [`list`](#list) to inspect the current state. This makes `init` safe to run without clobbering existing configuration.
+1. **Add to Claude Code** — shells out to `claude mcp add` for you.
+2. **Generate `.mcp.json`** — writes a project-scoped snippet in the current directory.
+3. **Skip** — prints OS-appropriate paste hints (`claude mcp add` one-liner plus the Claude Desktop / Cursor / Windsurf / Gemini JSON snippet) so you can wire it up by hand later.
+
+Use `--mcp claude|json|skip` to pre-answer the prompt from scripts, CI, or any caller where stdin isn't a TTY — interactive callers should omit the flag.
+
+Aborts if the config file already exists — use [`register`](#register) to re-run the registration prompt, [`add`](#add) to register additional servers, or [`list`](#list) to inspect the current state. This makes `init` safe to run without clobbering existing configuration.
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
 ```bash
-mms init                # interactive wizard
-mms init --no-validate  # skip the connectivity probe prompt entirely
+mms init                 # interactive wizard
+mms init --no-validate   # skip the connectivity probe prompt entirely
+mms init --mcp claude    # scripted: auto-register with Claude Code
+mms init --mcp skip      # scripted: write config, print paste hints, exit
+```
+
+### `register`
+
+```
+Usage: mms register [OPTIONS]
+
+Options:
+  --config TEXT             Path to the proxy config (must already exist —
+                            run `mms init` first).  [default:
+                            ~/.memtomem/stm_proxy.json]
+  --mcp [claude|json|skip]  Pre-answer the registration prompt for scripted
+                            runs: 'claude' = `claude mcp add`, 'json' =
+                            write .mcp.json, 'skip' = print manual hints.
+                            Omit for the interactive prompt.
+```
+
+Re-runs the 3-way MCP-client registration prompt from `init` without re-entering the first-time setup wizard. Use this after `mms init` if you initially picked "skip", or when registering the same STM install with a second client.
+
+Requires that `mms init` has already been run so the config file exists — otherwise exits with an error and a hint. Safe to re-run: pre-checks existing Claude Code registration and defaults to **keep** when already registered (no-op — existing registration is preserved even with `--mcp claude`).
+
+```bash
+mms register              # interactive prompt
+mms register --mcp json   # scripted: write .mcp.json in CWD, exit
+mms register --mcp skip   # scripted: print manual paste hints, exit
 ```
 
 ### `add`
@@ -123,6 +169,7 @@ mms add filesystem \
 
 # List configured upstreams
 mms list
+mms list --json            # machine-readable: {config_path, servers}
 
 # Show full status
 mms status
