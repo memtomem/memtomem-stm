@@ -38,18 +38,50 @@ _PASSTHROUGH_METADATA = FuncMetadata(
 )
 
 
+def _tag_annotations_title(annotations: Any, server_name: str) -> Any:
+    """Prepend ``[server_name]`` to ``annotations.title`` for picker disambiguation.
+
+    MCP clients such as Claude Code's ``/mcp`` picker display ``annotations.title``
+    in place of the tool ``name`` when it is set. Upstream servers that populate
+    ``title`` (e.g. Playwright's "Close browser") then appear unattributed in the
+    picker, while servers that leave it blank fall back to the prefixed ``name``
+    (e.g. "Context7__resolve-library-id"). Tagging the title with the source
+    server restores a uniform ``[server] original title`` display without
+    touching the invocation ``name`` or input schema.
+
+    Returns the original annotations unchanged when:
+    - ``annotations`` is ``None`` (clients fall back to the prefixed ``name``),
+    - ``title`` is missing or empty (same fallback path),
+    - the object is not a pydantic model with ``model_copy`` (unknown shape).
+    """
+    if annotations is None:
+        return None
+    title = getattr(annotations, "title", None)
+    if not title:
+        return annotations
+    new_title = f"[{server_name}] {title}"
+    model_copy = getattr(annotations, "model_copy", None)
+    if callable(model_copy):
+        try:
+            return model_copy(update={"title": new_title})
+        except Exception:
+            return annotations
+    return annotations
+
+
 def register_proxy_tool(
     server: FastMCP,
     handler: Any,
     info: Any,  # ProxyToolInfo
 ) -> None:
     """Register a proxy tool with the upstream's actual schema and annotations."""
+    tagged_annotations = _tag_annotations_title(info.annotations, info.server)
     try:
         server.add_tool(
             handler,
             name=info.prefixed_name,
             description=f"[proxied] {info.description}",
-            annotations=info.annotations,
+            annotations=tagged_annotations,
         )
     except Exception:
         import logging

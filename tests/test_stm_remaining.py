@@ -71,6 +71,7 @@ class TestRegisterProxyTool:
             description: str = "does things"
             input_schema: dict = None
             annotations: Any = None
+            server: str = "srv"
 
             def __post_init__(self):
                 if self.input_schema is None:
@@ -103,6 +104,7 @@ class TestRegisterProxyTool:
             description: str = "gone"
             input_schema: dict = None
             annotations: Any = None
+            server: str = "missing"
 
             def __post_init__(self):
                 if self.input_schema is None:
