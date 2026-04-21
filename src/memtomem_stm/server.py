@@ -210,6 +210,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                     info,
                 )
 
+            # Proxied tools are now in front; re-insert STM utility tools at
+            # the end so ``tools/list`` yields domain tools first (#228).
+            _move_stm_tools_to_end(server)
+
         ctx = STMContext(
             config=config,
             proxy_manager=proxy_manager,
@@ -297,6 +301,61 @@ def _obs_tool(fn):
     if _should_advertise_obs_tools():
         return mcp.tool()(fn)
     return fn
+
+
+# STM utility tools exposed over MCP. Kept as an explicit tuple (not a
+# ``stm_*`` prefix sweep) so the set is a deliberate choice and the
+# advertise-order regression test can pin the exact membership. Order
+# inside this tuple does not matter — only position *relative to proxied
+# tools* matters; see ``_move_stm_tools_to_end``.
+_STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
+    "stm_proxy_stats",
+    "stm_proxy_select_chunks",
+    "stm_proxy_read_more",
+    "stm_proxy_cache_clear",
+    "stm_proxy_health",
+    "stm_surfacing_feedback",
+    "stm_surfacing_stats",
+    "stm_compression_feedback",
+    "stm_compression_stats",
+    "stm_progressive_stats",
+    "stm_tuning_recommendations",
+)
+
+
+def _move_stm_tools_to_end(server: FastMCP) -> None:
+    """Re-insert STM utility tools so proxied tools advertise first (#228).
+
+    STM utility tools are registered at module import via ``@_obs_tool`` /
+    ``@mcp.tool()`` decorators, before ``app_lifespan`` runs; proxied tools
+    are registered inside the lifespan once upstream servers are reachable.
+    FastMCP's ``_tool_manager._tools`` is an insertion-ordered dict, so
+    without this step ``tools/list`` yields STM utility tools before the
+    domain tools users are actually reaching for — a picker-UX papercut
+    reported in #228.
+
+    This pops each STM utility entry and reinserts it, moving them to the
+    end of the insertion order without changing their attributes. Missing
+    entries (e.g. observability tools hidden by
+    ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false``) are skipped
+    silently. Touches the same private ``_tool_manager._tools`` the proxy
+    already reaches into in ``_fastmcp_compat.py``; any FastMCP API shift
+    surfaces as a ``AttributeError`` and the reorder is skipped with a
+    warning rather than breaking server startup.
+    """
+    try:
+        tools_dict = server._tool_manager._tools
+    except AttributeError:
+        logger.warning(
+            "Cannot reorder advertise list — FastMCP internal API changed. "
+            "Tools are registered, but STM utility tools may appear before "
+            "proxied tools in the picker (#228)."
+        )
+        return
+    for name in _STM_UTILITY_TOOL_NAMES:
+        tool = tools_dict.pop(name, None)
+        if tool is not None:
+            tools_dict[name] = tool
 
 
 def _get_ctx(ctx: CtxType) -> STMContext:

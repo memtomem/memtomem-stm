@@ -693,6 +693,115 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert callable(stm_tuning_recommendations)
 
 
+# ── advertise order — proxied before STM utility tools (#228) ─────────────
+
+
+class TestAdvertiseOrder:
+    """#228: STM utility tools register at module import; proxied tools
+    register later, inside ``app_lifespan``. Without a reorder step,
+    ``tools/list`` yields STM utility tools first and pushes proxied domain
+    tools to the end of the picker. ``_move_stm_tools_to_end`` pops each
+    STM utility entry from the insertion-ordered ``_tool_manager._tools``
+    dict and reinserts it, placing proxied tools first."""
+
+    def _make_server(self, tool_names):
+        """Build a stand-in FastMCP with an insertion-ordered `_tool_manager._tools`.
+
+        Only the attribute path `_tool_manager._tools` matters — the
+        function pops/inserts string keys and does not touch tool values,
+        so opaque sentinels suffice."""
+        from types import SimpleNamespace
+
+        tools = {name: SimpleNamespace(name=name) for name in tool_names}
+        return SimpleNamespace(_tool_manager=SimpleNamespace(_tools=tools))
+
+    def test_reorder_moves_stm_utility_tools_to_end(self):
+        """Mixed insertion: STM utility tools first, proxied tools second
+        (the production ordering before the fix). After ``_move_stm_tools_to_end``
+        runs, every proxied tool precedes every STM utility tool."""
+        from memtomem_stm.server import _move_stm_tools_to_end
+
+        initial = [
+            # STM utility tools (inserted first at module import)
+            "stm_proxy_stats",
+            "stm_proxy_read_more",
+            "stm_surfacing_feedback",
+            # Proxied tools (inserted later during lifespan)
+            "fs__read_file",
+            "gh__search_repositories",
+            "langchain__search_docs_by_lang_chain",
+        ]
+        server = self._make_server(initial)
+        _move_stm_tools_to_end(server)
+
+        final = list(server._tool_manager._tools.keys())
+        # All proxied tools are now ahead of every STM utility tool.
+        proxied = [n for n in final if "__" in n]
+        util = [n for n in final if n.startswith("stm_") and "__" not in n]
+        assert final[: len(proxied)] == proxied, (
+            f"proxied tools must lead the advertise list, got: {final}"
+        )
+        assert final[len(proxied) :] == util, (
+            f"STM utility tools must trail the advertise list, got: {final}"
+        )
+
+    def test_reorder_skips_missing_stm_tools(self):
+        """When ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`` hides
+        the 7 observability tools, ``_tool_manager._tools`` only holds the
+        4 model-facing STM tools. The reorder helper must not KeyError on
+        the absent names — ``.pop(name, None)`` is the contract."""
+        from memtomem_stm.server import _move_stm_tools_to_end
+
+        # Only the 4 model-facing stm_* tools + proxied.
+        initial = [
+            "stm_proxy_select_chunks",
+            "stm_proxy_read_more",
+            "stm_surfacing_feedback",
+            "stm_compression_feedback",
+            "fs__read_file",
+        ]
+        server = self._make_server(initial)
+        _move_stm_tools_to_end(server)
+
+        final = list(server._tool_manager._tools.keys())
+        assert final[0] == "fs__read_file"
+        assert set(final) == set(initial)  # nothing added or dropped
+
+    def test_reorder_survives_fastmcp_api_shift(self, caplog):
+        """If FastMCP renames/removes the private ``_tool_manager._tools``
+        attribute, the reorder must degrade to a warning-and-skip rather
+        than crashing server startup. Surfacing as a warning gives
+        operators a visible signal in the log."""
+        import logging
+        from types import SimpleNamespace
+
+        from memtomem_stm.server import _move_stm_tools_to_end
+
+        # No ``_tool_manager`` attribute at all → AttributeError branch.
+        server = SimpleNamespace()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
+            _move_stm_tools_to_end(server)  # must not raise
+        assert any(
+            "FastMCP internal API changed" in rec.message for rec in caplog.records
+        ), [r.message for r in caplog.records]
+
+    def test_utility_tool_names_tuple_matches_registered_set(self):
+        """Exhaustiveness guard: every STM utility tool registered by the
+        ``@mcp.tool()`` / ``@_obs_tool`` decorators at module import must
+        be listed in ``_STM_UTILITY_TOOL_NAMES``. A new ``stm_*`` tool
+        that forgets to land in the tuple would silently skip the reorder
+        and slip ahead of proxied tools again."""
+        from memtomem_stm.server import _STM_UTILITY_TOOL_NAMES
+
+        expected = _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
+        assert set(_STM_UTILITY_TOOL_NAMES) == expected, (
+            "_STM_UTILITY_TOOL_NAMES drifted from the actual registered set; "
+            "add the new stm_* tool to the tuple so the advertise-order "
+            "reorder still covers it."
+        )
+
+
 # ── main() exception barrier (#209) ──────────────────────────────────────
 
 
