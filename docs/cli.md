@@ -110,13 +110,15 @@ mms register --mcp skip   # scripted: print manual paste hints, exit
 ### `add`
 
 ```
-Usage: mms add [OPTIONS] NAME
+Usage: mms add [OPTIONS] [NAME]
 
 Options:
+  --config TEXT                   [default: ~/.memtomem/stm_proxy.json]
   --command TEXT                  Executable command (stdio).
   --args TEXT                     Space-separated arguments.
   --prefix TEXT                   Tool namespace (e.g. 'fs' -> tools appear
-                                  as fs__read_file).  [required]
+                                  as fs__read_file). Required unless
+                                  --from-clients is used.
   --transport [stdio|sse|streamable_http]
                                   stdio for local processes,
                                   sse/streamable_http for remote.
@@ -126,15 +128,24 @@ Options:
   --compression [auto|none|truncate|selective|hybrid]
                                   'auto' picks strategy per response by
                                   content type.  [default: auto]
-  --max-chars INTEGER             [default: 8000]
+  --max-chars INTEGER RANGE       [default: 8000; x>=1]
   --validate                      Probe the server (MCP initialize +
                                   list-tools) before saving; abort on
                                   failure.
-  --timeout INTEGER               Connection timeout (seconds) when
-                                  --validate is set.  [default: 10]
+  --timeout INTEGER RANGE         Connection timeout (seconds) when
+                                  --validate is set.  [default: 10; x>=1]
+  --from-clients, --import        Import additional servers interactively
+                                  from existing MCP clients (Claude
+                                  Desktop / Code, project .mcp.json).
+                                  Reuses init's discovery + TUI flow.
+                                  Skips candidates already registered.
+                                  Incompatible with NAME / --prefix /
+                                  --command / --args / --url / --env.
 ```
 
 Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
+
+Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`, and `~/Library/Application Support/Claude/claude_desktop_config.json` (OS-appropriate). This is the post-init equivalent of the `init` discovery step — servers already registered in this config are filtered out by name and by `(transport, command, args)` / `(transport, url)` signature before the selection UI. `--validate` and `--timeout` work on the selected subset.
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
@@ -167,6 +178,9 @@ mms add filesystem \
   --prefix fs \
   --validate
 
+# Bulk-import servers already configured in Claude Desktop / Code / .mcp.json
+mms add --import            # or --from-clients; skips anything already registered
+
 # List configured upstreams
 mms list
 mms list --json            # machine-readable: {config_path, servers}
@@ -189,14 +203,15 @@ mms health --timeout 5     # 5s per-server timeout (default: 10)
 Usage: mms health [OPTIONS]
 
 Options:
-  --config TEXT          [default: ~/.memtomem/stm_proxy.json]
-  --json                Output as JSON for scripting.
-  --timeout INTEGER     Per-server connection timeout in seconds.  [default: 10]
+  --config TEXT            [default: ~/.memtomem/stm_proxy.json]
+  --json                   Output as JSON for scripting.
+  --timeout INTEGER RANGE  Per-server connection timeout in seconds.
+                           [default: 10; x>=1]
 ```
 
 Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running.
 
-## MCP Tools (10 + proxied)
+## MCP Tools (11 + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -211,6 +226,7 @@ These are exposed by the `memtomem-stm` MCP server and become available to your 
 | `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness % |
 | `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
 | `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
+| `stm_progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
 | `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner |
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
@@ -246,11 +262,11 @@ See [Configuration → General](configuration.md#general) for details.
 
 ## Trimming the advertised MCP tool surface
 
-STM advertises ten MCP tools by default. Six are operator-facing
+STM advertises eleven MCP tools by default. Seven are operator-facing
 (observability / admin) and accessible through this very CLI; the
 remaining four are model-facing (progressive-delivery unlocks and
 feedback channels). On clients that eager-load MCP tool schemas
-into the model context at session start, the six observability
+into the model context at session start, the seven observability
 tools pay schema tokens for calls the model rarely makes.
 
 Set the following to hide them from MCP (they stay callable via
@@ -273,7 +289,7 @@ export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false
   disabled_tools = [
     "stm_proxy_stats", "stm_proxy_health", "stm_proxy_cache_clear",
     "stm_surfacing_stats", "stm_compression_stats",
-    "stm_tuning_recommendations",
+    "stm_progressive_stats", "stm_tuning_recommendations",
   ]
   ```
 
