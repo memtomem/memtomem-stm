@@ -66,8 +66,8 @@ Options:
 Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then offers a 3-way MCP-client registration prompt:
 
 1. **Add to Claude Code** — shells out to `claude mcp add` for you.
-2. **Generate `.mcp.json`** — writes a project-scoped snippet in the current directory.
-3. **Skip** — prints OS-appropriate paste hints (`claude mcp add` one-liner plus the Claude Desktop / Cursor / Windsurf / Gemini JSON snippet) so you can wire it up by hand later.
+2. **Generate `.mcp.json`** — writes a project-scoped snippet in the current directory, then prints per-client paste targets for Cursor, Windsurf, Claude Desktop (OS-appropriate path), and Gemini CLI.
+3. **Skip** — prints a manual-registration cheat sheet (`claude mcp add` one-liner plus a generic `mcpServers` JSON stanza) so you can wire it up by hand later.
 
 Use `--mcp claude|json|skip` to pre-answer the prompt from scripts, CI, or any caller where stdin isn't a TTY — interactive callers should omit the flag.
 
