@@ -135,7 +135,7 @@ To check what's happening, ask the agent to call `stm_proxy_stats`.
 | [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Tune settings without touching code |
-| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands and the 10 MCP tools |
+| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands and the 11 MCP tools |
 
 ## Development
 
