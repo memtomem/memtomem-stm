@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-04-22
+
+### Added
+
+- **`mms add --import --prune` + interactive TTY confirm prompt** (#227, closes #226) — after a successful import, prune the direct registration from each source MCP client so tools are reachable via STM only. `--prune` runs unconditionally (scripted callers); without the flag, a TTY prompt (default **No**) lists the exact `(name, source)` pairs before writing. Non-TTY callers without `--prune` keep the existing #203 hint-only behavior — no silent auto-prune. Writer surface: `claude mcp remove <name> -s <scope>` for Claude Code user/local/project scopes, atomic JSON rewrite (`atomic_write_text`) for Claude Desktop. Prune failures are non-fatal: the import stays, a per-entry warning surfaces the error, and the exact manual command from `_source_removal_hint` is printed. `duplicate_in` sources (a candidate registered in more than one client) are pruned from every source, not just the primary. `--prune` without `--from-clients` is a `UsageError` rather than a silent no-op.
+
+### Changed
+
+- **Proxied tools now advertise before STM utility tools in `tools/list`** (#229, #228 phase 1) — STM utility tools register at module import (via `@mcp.tool()` / `@_obs_tool`); proxied tools register later, inside `app_lifespan`. FastMCP's insertion-ordered `_tool_manager._tools` previously yielded STM utility tools first, pushing the domain tools users actually reach for (`fs__…`, `gh__…`, `langchain__…`, etc.) to the bottom of pickers that preserve server order (Claude Code `/mcp`). After proxied registration, `_move_stm_tools_to_end` pops and reinserts each STM utility entry so proxied tools lead the advertise list. Missing entries (obs tools hidden by `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`) are skipped safely. Tool set, names, schemas, annotations, and the flag semantics are unchanged; only the order flips. Phases 2 (flag default flip) and 3 (mem-do-style grouping) from #228 remain open.
+
+### Fixed
+
+- **`_detect_install_type` registers the `memtomem-stm` server entrypoint, not the `mms` click group** (#225) — the dev-checkout / user-project branch emitted `uv run --directory <root> mms`, but `mms` is the click CLI group (`memtomem_stm.cli.proxy:cli`): invoked with no subcommand it printed help and exited 0, closing the MCP stdio pipe before `initialize` and the client reported "Failed to reconnect to memtomem-stm". Both branches now land on the actual server entrypoint (`memtomem_stm.server:main`). `mms init` / `mms register` now produce a working config in source-checkout and `uv add memtomem-stm` project setups out of the box; prior broken configs need to be re-run through `mms register` (or hand-edited) to pick up the fix.
+
 ## [0.1.13] — 2026-04-21
 
 ### Added
