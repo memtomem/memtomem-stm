@@ -596,7 +596,7 @@ class TestLifespan:
 
 # ── advertise_observability_tools flag ──────────────────────────────────
 #
-# The flag hides 6 observability tools from the MCP ``tools/list`` surface
+# The flag hides 7 observability tools from the MCP ``tools/list`` surface
 # while keeping them importable from Python. Registration happens at
 # module import, so the end-to-end assertion uses a subprocess to get a
 # fresh interpreter under the intended env var.

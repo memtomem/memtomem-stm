@@ -34,9 +34,9 @@ apply changes.
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # default
 ```
 
-When `false`, hides STM's six observability / admin tools
+When `false`, hides STM's seven observability / admin tools
 (`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
-`stm_surfacing_stats`, `stm_compression_stats`,
+`stm_surfacing_stats`, `stm_compression_stats`, `stm_progressive_stats`,
 `stm_tuning_recommendations`) from the MCP `tools/list` surface so
 eager-loading clients (e.g. OpenAI Codex CLI) don't pay schema
 tokens for tools the model rarely calls. The hidden tools remain
@@ -127,6 +127,8 @@ export MEMTOMEM_STM_LANGFUSE__SAMPLING_RATE=1.0                # 0.0–1.0, frac
 ```
 
 When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse observation with nested sub-spans for each pipeline stage (clean, compress, surface, index).
+
+Setting `MEMTOMEM_STM_LANGFUSE__ENABLED=true` without first installing the `[langfuse]` extra raises a `ValueError` at startup (fail-fast since v0.1.16) — install the extra first, or leave `enabled=false` / unset. The old silent-disable-with-WARNING behavior is gone, so a typo in your config no longer leaves tracing quietly off.
 
 ## Config File: `~/.memtomem/stm_proxy.json`
 

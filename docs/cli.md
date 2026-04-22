@@ -141,11 +141,20 @@ Options:
                                   Skips candidates already registered.
                                   Incompatible with NAME / --prefix /
                                   --command / --args / --url / --env.
+  --prune                         After a successful --import, remove the
+                                  direct registrations from source MCP
+                                  clients so tools are reachable via STM
+                                  only. TTY callers get a (name, source)
+                                  confirm prompt (default No); non-TTY
+                                  callers must pass the flag explicitly.
+                                  Requires --from-clients / --import.
 ```
 
 Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`, and `~/Library/Application Support/Claude/claude_desktop_config.json` (OS-appropriate). This is the post-init equivalent of the `init` discovery step — servers already registered in this config are filtered out by name and by `(transport, command, args)` / `(transport, url)` signature before the selection UI. `--validate` and `--timeout` work on the selected subset.
+
+To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or Claude Desktop edit to retry. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
@@ -180,6 +189,10 @@ mms add filesystem \
 
 # Bulk-import servers already configured in Claude Desktop / Code / .mcp.json
 mms add --import            # or --from-clients; skips anything already registered
+
+# Import AND prune originals from source clients
+mms add --import --prune    # TTY: per-entry confirm prompt (default No)
+                            # non-TTY: unconditional — pass --prune to opt in
 
 # List configured upstreams
 mms list
@@ -230,6 +243,8 @@ These are exposed by the `memtomem-stm` MCP server and become available to your 
 | `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner |
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
+
+Proxied tool **titles** — the `annotations.title` field rendered by MCP tool-pickers (e.g. Claude Code's `/mcp`) — are automatically prefixed with `[{server}]` for attribution: a `filesystem` server's `Read file` tool appears as `[filesystem] Read file`. This is separate from the `{prefix}__{tool}` name used when calling the tool, and it kicks in only when the upstream tool already provides an `annotations.title`; tools without one are unaffected.
 
 A typical agent session uses a mix of proxied tools and STM-specific control tools:
 
