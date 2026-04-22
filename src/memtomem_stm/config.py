@@ -32,6 +32,20 @@ class LangfuseConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _require_langfuse_package_when_enabled(self) -> "LangfuseConfig":
+        if self.enabled:
+            from importlib.util import find_spec
+
+            if find_spec("langfuse") is None:
+                raise ValueError(
+                    "LangfuseConfig.enabled=true but the 'langfuse' package is not "
+                    "installed. Install the langfuse extra "
+                    "(e.g. `uv tool install --reinstall 'memtomem-stm[langfuse]'` "
+                    "or `pip install 'memtomem-stm[langfuse]'`)."
+                )
+        return self
+
 
 class STMConfig(BaseSettings):
     model_config = SettingsConfigDict(

@@ -68,12 +68,16 @@ class TestProxyNumericConstraints:
 
     def test_reconnect_delay_must_not_exceed_max(self) -> None:
         with pytest.raises(ValidationError):
-             UpstreamServerConfig(prefix="x", reconnect_delay_seconds=10, max_reconnect_delay_seconds=5)
+            UpstreamServerConfig(
+                prefix="x", reconnect_delay_seconds=10, max_reconnect_delay_seconds=5
+            )
 
     def test_reconnect_delay_equal_to_max_is_valid(self) -> None:
-        cfg = UpstreamServerConfig(prefix="x", reconnect_delay_seconds=5, max_reconnect_delay_seconds=5)
+        cfg = UpstreamServerConfig(
+            prefix="x", reconnect_delay_seconds=5, max_reconnect_delay_seconds=5
+        )
         assert cfg.reconnect_delay_seconds == 5
-    
+
 
 class TestLLMCompressorApiKey:
     """``provider=openai|anthropic`` with empty ``api_key`` used to send a
@@ -186,13 +190,64 @@ class TestLangfuseInterdepValidator:
         with pytest.raises(ValidationError, match="public_key and secret_key"):
             LangfuseConfig(enabled=True, secret_key="sk-lf-x")
 
-    def test_enabled_with_both_keys_ok(self) -> None:
+    def test_enabled_with_both_keys_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Stub out the package-availability validator — that axis is covered
+        # separately by ``TestLangfusePackageValidator``.
+        import importlib.util as importlib_util
+
+        real_find_spec = importlib_util.find_spec
+
+        def _fake_find_spec(name: str, package: str | None = None) -> object | None:
+            return object() if name == "langfuse" else real_find_spec(name, package)
+
+        monkeypatch.setattr("importlib.util.find_spec", _fake_find_spec)
         cfg = LangfuseConfig(enabled=True, public_key="pk-lf-x", secret_key="sk-lf-x")
         assert cfg.enabled is True
 
     def test_disabled_allows_empty_keys(self) -> None:
         cfg = LangfuseConfig(enabled=False)
         assert cfg.public_key == ""
+
+
+class TestLangfusePackageValidator:
+    """``LangfuseConfig.enabled=true`` must fail-fast when the langfuse extra is absent."""
+
+    def test_enabled_without_langfuse_package_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import importlib.util as importlib_util
+
+        def _fake_find_spec(name: str, package: str | None = None) -> object | None:
+            return None if name == "langfuse" else importlib_util.find_spec(name, package)
+
+        monkeypatch.setattr("importlib.util.find_spec", _fake_find_spec)
+        with pytest.raises(ValidationError, match="'langfuse' package is not installed"):
+            LangfuseConfig(enabled=True, public_key="pk-lf-x", secret_key="sk-lf-x")
+
+    def test_enabled_with_langfuse_package_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The validator only probes ``find_spec``; any non-None stand-in is
+        # sufficient. We patch rather than relying on the dev env because
+        # the langfuse extra is not included in ``uv sync`` by default.
+        import importlib.util as importlib_util
+
+        real_find_spec = importlib_util.find_spec
+
+        def _fake_find_spec(name: str, package: str | None = None) -> object | None:
+            return object() if name == "langfuse" else real_find_spec(name, package)
+
+        monkeypatch.setattr("importlib.util.find_spec", _fake_find_spec)
+        cfg = LangfuseConfig(enabled=True, public_key="pk-lf-x", secret_key="sk-lf-x")
+        assert cfg.enabled is True
+
+    def test_disabled_skips_package_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[str] = []
+
+        def _tracking_find_spec(name: str, package: str | None = None) -> object | None:
+            calls.append(name)
+            return None
+
+        monkeypatch.setattr("importlib.util.find_spec", _tracking_find_spec)
+        cfg = LangfuseConfig(enabled=False)
+        assert cfg.enabled is False
+        assert "langfuse" not in calls
 
 
 class TestLogLevel:

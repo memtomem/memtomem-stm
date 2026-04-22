@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **`LangfuseConfig.enabled=true` now fails fast when the `langfuse` package is not installed** (#233) — `LangfuseConfig` already rejects `enabled=true` without `public_key` / `secret_key` at config-load time via `_require_keys_when_enabled`. The parallel environment check was missing: a user who had all three fields set but didn't install the `[langfuse]` extra (e.g. after `uv tool install --reinstall memtomem-stm` dropped the extras) hit a silent `except ImportError: pass` branch in `server.py`, so the proxy started cleanly but produced no traces and surfaced no warning. A second `@model_validator(mode="after")` now probes `importlib.util.find_spec("langfuse")` whenever `enabled=true` and raises `ValueError` with an install hint (`uv tool install --reinstall 'memtomem-stm[langfuse]'` or `pip install 'memtomem-stm[langfuse]'`). Symmetric with the existing key-requirement validator — schema and environment are both checked at load time instead of one failing loud and the other failing silent. No behavior change for users with `enabled=false` (the new validator short-circuits before probing), or for users who already have the extra installed.
+
 ## [0.1.15] — 2026-04-22
 
 ### Changed
