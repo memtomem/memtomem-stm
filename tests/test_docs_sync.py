@@ -87,8 +87,27 @@ def test_cli_docs_flag_desktop_discovery_is_macos_only() -> None:
     assert ".config/Claude" not in desktop_func
 
     cli_md = _read("docs/cli.md")
-    assert re.search(r"macOS[- ]only", cli_md, re.IGNORECASE), (
-        "docs/cli.md must call out that Claude Desktop discovery via "
-        "`mms add --import` is macOS-only — Linux/Windows users otherwise "
-        "see a silent zero-result import"
+
+    # Split on blank lines (markdown paragraph boundaries) and scope the
+    # caveat check to paragraphs that actually describe ``--from-clients`` /
+    # ``--import``. Checking the whole file would pass even if someone moved
+    # the warning to an unrelated section (install guide, release notes)
+    # while deleting it from where a reader of ``--import`` docs looks.
+    # Paragraph scope rather than a tight ±N-line window so prose
+    # restructuring inside the same paragraph doesn't false-fail.
+    paragraphs = re.split(r"\n\s*\n", cli_md)
+    import_paragraphs = [p for p in paragraphs if "--from-clients" in p or "--import" in p]
+    if not import_paragraphs:
+        pytest.fail(
+            "docs/cli.md no longer mentions `--from-clients` / `--import` — "
+            "the flag was renamed or removed. Update this test alongside "
+            "the docs change."
+        )
+
+    has_caveat = any(re.search(r"macOS[- ]only", p, re.IGNORECASE) for p in import_paragraphs)
+    assert has_caveat, (
+        "docs/cli.md must call out that Claude Desktop discovery is "
+        "macOS-only in a paragraph that mentions `--from-clients` / "
+        "`--import`. Without this caveat, Linux/Windows callers silently "
+        "see zero Claude Desktop candidates from `mms add --import`."
     )
