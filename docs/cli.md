@@ -158,6 +158,18 @@ To remove the original direct registrations after a successful import, pass `--p
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
+### `list`
+
+```
+Usage: mms list [OPTIONS]
+
+Options:
+  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --json         Output as JSON for scripting.
+```
+
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+
 ### Examples
 
 ```bash
