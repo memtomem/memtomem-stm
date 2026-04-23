@@ -33,12 +33,12 @@ def init_langfuse(config: object, *, service_name: str = _SERVICE_NAME) -> Any:
     _sampling_rate = getattr(config, "sampling_rate", 1.0)
 
     kwargs: dict[str, Any] = {}
-    if getattr(config, "public_key", ""):
-        kwargs["public_key"] = config.public_key  # type: ignore[union-attr]
-    if getattr(config, "secret_key", ""):
-        kwargs["secret_key"] = config.secret_key  # type: ignore[union-attr]
-    if getattr(config, "host", ""):
-        kwargs["host"] = config.host  # type: ignore[union-attr]
+    if public_key := getattr(config, "public_key", ""):
+        kwargs["public_key"] = public_key
+    if secret_key := getattr(config, "secret_key", ""):
+        kwargs["secret_key"] = secret_key
+    if host := getattr(config, "host", ""):
+        kwargs["host"] = host
 
     _langfuse_client = Langfuse(**kwargs)
     return _langfuse_client
