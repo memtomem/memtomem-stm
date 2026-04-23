@@ -1040,13 +1040,17 @@ class TestInitImportFlow:
     source parsing is covered in ``TestInitDiscoverySources``.
 
     Same ``_run_mcp_integration`` stub as ``TestInit`` — the MCP-client
-    registration step is tested independently in ``TestInitMcpRegistration``."""
+    registration step is tested independently in ``TestInitMcpRegistration``.
+    ``_handle_source_prune`` is stubbed for the same reason: this class is
+    about the select + prefix UI, and prune coverage lives in
+    ``TestInitPruneOriginals`` / ``TestPruneCommand``."""
 
     @pytest.fixture(autouse=True)
-    def _stub_mcp_integration(self, monkeypatch):
+    def _stub_post_save(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: None)
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -2650,6 +2654,483 @@ class TestAddFromClientsPrune:
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         pairs = {(c[3], c[5]) for c in argvs}
         assert pairs == {("filesystem", "user"), ("filesystem", "local")}
+
+
+# ── prune command ────────────────────────────────────────────────────────
+
+
+class TestPruneCommand:
+    """``mms prune`` — standalone post-hoc pruner for the ``init``-only dual-reg
+    gap. Covers the same writer surface as ``mms add --import --prune`` (see
+    ``TestAddFromClientsPrune``) plus its own argument/TTY contract."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def _seed_config(self, config: Path, server_names: list[str]) -> None:
+        servers = {
+            n: {"prefix": n, "transport": "stdio", "command": "npx"} for n in server_names
+        }
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def test_no_args_is_usage_error(self, runner, config):
+        """Destructive command with no scope: refuse instead of "everything"."""
+        self._seed_config(config, [])
+        result = runner.invoke(cli, ["prune", *_cfg_args(config)])
+        assert result.exit_code != 0
+        assert "Pass upstream NAMES or --all" in result.output
+
+    def test_all_with_names_is_usage_error(self, runner, config):
+        """``--all`` is the explicit "everything" flag; combining with NAMES
+        is an ambiguous request rather than a silent override."""
+        self._seed_config(config, [])
+        result = runner.invoke(cli, ["prune", "--all", "foo", *_cfg_args(config)])
+        assert result.exit_code != 0
+        assert "--all cannot be combined with explicit NAMES" in result.output
+
+    def test_missing_config_errors_with_init_hint(self, runner, tmp_path):
+        """Pointing at a non-existent config is a cold-start signal — surface
+        the init hint rather than failing on _load's generic empty-dict path."""
+        result = runner.invoke(
+            cli, ["prune", "--all", "--config", str(tmp_path / "nope.json")]
+        )
+        assert result.exit_code != 0
+        assert "config not found" in result.output
+        assert "mms init" in result.output
+
+    def test_no_upstream_servers_early_returns(self, runner, config):
+        """Empty STM config: no-op exit 0, not an error."""
+        self._seed_config(config, [])
+        result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "No upstream servers configured" in result.output
+
+    def test_no_dual_registered_early_returns(self, runner, config, monkeypatch):
+        """STM has upstreams but none are in source clients → clean no-op."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [])  # source clients discovered: none
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "No dual-registered upstreams found" in result.output
+
+    def test_names_filter_prunes_only_requested(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Explicit NAMES must act only on the named subset — unrelated
+        dual-reg servers stay put."""
+        self._seed_config(config, ["docs-langchain", "langfuse-docs", "other"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "langfuse-docs",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "docs-langchain", "--yes", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        names = [c[3] for c in argvs]
+        assert names == ["docs-langchain"]
+
+    def test_unknown_name_errors_before_any_write(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Any NAMES entry that isn't dual-registered fails the whole command
+        up front — half-applied writes are worse than a rejection."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "docs-langchain", "not-a-thing", "--yes", *_cfg_args(config)]
+        )
+        assert result.exit_code != 0
+        assert "not dual-registered" in result.output
+        assert "not-a-thing" in result.output
+        # Safety: docs-langchain was valid, but because one name was invalid
+        # we abort before any prune writes fire.
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_all_prunes_every_dual_registered(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """``--all`` = every (STM upstream ∩ source client) pair pruned from
+        the source that advertises it."""
+        self._seed_config(config, ["a", "b"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "a",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "b",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        pairs = {(c[3], c[5]) for c in argvs}
+        assert pairs == {("a", "user"), ("b", "project")}
+
+    def test_dry_run_shows_preview_without_writes_or_prompt(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """``--dry-run`` must not shell out to ``claude`` or prompt — the
+        preview is for scripts that want to surface what *would* happen."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "--all", "--dry-run", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Dry run" in result.output
+        assert "docs-langchain" in result.output
+        assert "Claude Code (user)" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_non_tty_without_yes_errors(self, runner, config, monkeypatch, fake_claude):
+        """CliRunner stdin is non-TTY; without ``--yes`` we must error out
+        rather than silently accept a destructive default or hang on a
+        prompt that has no way to be answered."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)])
+        assert result.exit_code != 0
+        assert "no TTY" in result.output
+        assert "--yes" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_tty_prompt_accept_prunes(self, runner, config, monkeypatch, fake_claude):
+        """TTY path: prompt fires, default No but explicit ``y`` accepts."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "--all", *_cfg_args(config)], input="y\n"
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
+
+    def test_tty_prompt_decline_no_writes(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """TTY path + No → clean exit, no writes. Default No is load-bearing
+        for destructive opt-in semantics."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "--all", *_cfg_args(config)], input="n\n"
+        )
+        assert result.exit_code == 0, result.output
+        assert "Aborted" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_duplicate_in_sources_all_pruned(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """A name registered in multiple sources (``source`` + ``duplicate_in``)
+        must be removed from every source or the dual-path survives."""
+        self._seed_config(config, ["filesystem"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                    "duplicate_in": ["Claude Code (project)"],
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        pairs = {(c[3], c[5]) for c in argvs}
+        assert pairs == {("filesystem", "user"), ("filesystem", "local")}
+
+    def test_partial_failure_exits_nonzero_with_manual_hint(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Unlike ``mms add --import --prune`` (import stays if prune fails,
+        exit 0), ``mms prune`` is *only* pruning — a failure is the whole
+        job failing and must surface via a non-zero exit for scripting.
+        The manual-command hint is still printed so the user can recover."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
+
+        result = runner.invoke(
+            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
+        )
+        assert result.exit_code != 0
+        assert "could not remove 1 direct registration" in result.output
+        assert "boom" in result.output
+        assert "claude mcp remove docs-langchain -s user" in result.output
+
+
+# ── init --prune-originals integration ───────────────────────────────────
+
+
+class TestInitPruneOriginals:
+    """``mms init --prune-originals`` (and the TTY prompt variant) — the
+    same ``_handle_source_prune`` machinery invoked inside the init flow so
+    onboarding users don't need a separate ``mms prune`` round-trip. Keeps
+    the bootstrap-only invariant: init still writes the STM config once,
+    but now additionally offers to collapse the dual-path it just created."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    @pytest.fixture(autouse=True)
+    def _stub_mcp_integration(self, monkeypatch):
+        """Disable the 3-way client-registration prompt — these tests are
+        only exercising the downstream prune step. ``TestInitMcpRegistration``
+        covers the registration half."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
+
+    def test_flag_prunes_scripted_non_tty(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """``--prune-originals`` in a non-TTY scripted run must fire the prune
+        unconditionally — this is the exact `mms init --mcp claude
+        --prune-originals` path that the bug report called out."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--prune-originals", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
+        assert "Removed from source client(s)" in result.output
+
+    def test_no_flag_non_tty_preserves_hint_only(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Regression guard: the existing ``mms init`` scripted flow (no flag,
+        non-TTY) must not suddenly start pruning. The #203 read-only
+        invariant holds by default; only opt-in flips it."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+        # Hint remains so the user has a manual path.
+        assert "claude mcp remove docs-langchain -s user" in result.output
+        # And no auto-prompt fired.
+        assert "Remove from source(s)?" not in result.output
+
+    def test_tty_prompt_accept_prunes(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """TTY without flag → prompt fires, ``y`` accepts → prune."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        # _pick_imports uses questionary on TTY; stub it the same way the
+        # add-prune tests do — we're exercising the post-pick prune branch,
+        # not the picker itself.
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda cands: list(range(len(cands))))
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            # Inputs: accept default prefix (\n), then accept prune prompt (y\n).
+            input="\ny\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
+
+    def test_tty_prompt_decline_no_prune(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """TTY + decline → no writes, manual hint still shown (same as the
+        non-TTY default path so user behavior is consistent across paths)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda cands: list(range(len(cands))))
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="\nn\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+        assert "claude mcp remove docs-langchain -s user" in result.output
 
 
 # ── remove command ───────────────────────────────────────────────────────

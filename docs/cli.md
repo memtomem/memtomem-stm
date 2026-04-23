@@ -35,6 +35,7 @@ Commands:
   health    Check upstream server connectivity.
   init      Guided first-time setup for memtomem-stm.
   list      List configured upstream servers.
+  prune     Remove dual-registered upstreams from source MCP clients.
   register  Register memtomem-stm with an MCP client.
   remove    Remove an upstream MCP server from the proxy configuration.
   status    Show proxy gateway configuration and server list.
@@ -61,6 +62,11 @@ Options:
                             'json' = write .mcp.json, 'skip' = no
                             registration. Omit the flag for the interactive
                             prompt.
+  --prune-originals         After a successful import + registration, remove
+                            the direct registrations from source MCP clients
+                            so tools route through STM only. TTY callers get
+                            a single y/N prompt (default No); non-TTY
+                            scripted callers must pass the flag explicitly.
 ```
 
 Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then offers a 3-way MCP-client registration prompt:
@@ -75,11 +81,14 @@ Aborts if the config file already exists — use [`register`](#register) to re-r
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
+When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop), `init` leaves the direct registrations in place by default — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
+
 ```bash
-mms init                 # interactive wizard
-mms init --no-validate   # skip the connectivity probe prompt entirely
-mms init --mcp claude    # scripted: auto-register with Claude Code
-mms init --mcp skip      # scripted: write config, print paste hints, exit
+mms init                          # interactive wizard
+mms init --no-validate            # skip the connectivity probe prompt entirely
+mms init --mcp claude             # scripted: auto-register with Claude Code
+mms init --mcp skip               # scripted: write config, print paste hints, exit
+mms init --mcp claude --prune-originals  # scripted: import, register, and remove direct registrations
 ```
 
 ### `register`
@@ -220,6 +229,32 @@ mms remove github
 mms health
 mms health --json          # machine-readable output
 mms health --timeout 5     # 5s per-server timeout (default: 10)
+```
+
+### `prune`
+
+```
+Usage: mms prune [OPTIONS] [NAMES]...
+
+Options:
+  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --all          Prune every dual-registered upstream. Required when no NAMES
+                 given.
+  -y, --yes      Skip the confirm prompt (scripts / CI / non-TTY callers).
+  --dry-run      Print what would be pruned; no writes.
+```
+
+Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
+
+Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
+
+STM's own config (`stm_proxy.json`) is never modified. Only source-client files change. Failures are surfaced via non-zero exit and the exact manual `claude mcp remove` command for each failed entry, so scripting callers can retry.
+
+```bash
+mms prune --all              # remove every dual-registered upstream (TTY: confirm prompt)
+mms prune --all --yes        # same, skip the prompt (CI / scripts)
+mms prune --all --dry-run    # preview without writes
+mms prune docs-langchain     # target specific upstreams
 ```
 
 ### `health`
