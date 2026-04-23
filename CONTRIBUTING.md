@@ -12,9 +12,8 @@ cd memtomem-stm
 # Install (requires Python 3.12+ and uv)
 uv sync
 
-# Run tests
-uv run pytest -m "not ollama"          # skip Ollama-dependent tests
-uv run pytest                          # full suite (requires running Ollama)
+# Run tests (same filter CI uses)
+uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge"
 
 # Lint and format
 uv run ruff check src
