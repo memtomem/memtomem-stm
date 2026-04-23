@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -30,12 +32,27 @@ def test_contributing_pytest_command_matches_ci() -> None:
     ci = _read(".github/workflows/ci.yml")
     contributing = _read("CONTRIBUTING.md")
 
+    # Double-quoted ``pytest -m "…"`` is what the workflow uses today. If the
+    # form ever changes (single quotes, ``run: |`` block, matrix variable),
+    # this regex falls through to zero matches and we want a loud failure
+    # pointing operators back here rather than a cryptic IndexError.
     ci_filters = re.findall(r'pytest -m "([^"]+)"', ci)
     test_job_filters = [f for f in ci_filters if "not ollama" in f]
-    assert test_job_filters, (
-        "No CI `pytest -m \"...\"` filter containing 'not ollama' found — "
-        "update this test if the workflow was refactored"
-    )
+
+    if not test_job_filters:
+        pytest.fail(
+            "Could not locate CI's pytest filter — expected a double-quoted "
+            '`pytest -m "…not ollama…"` in .github/workflows/ci.yml. '
+            "The workflow was likely refactored; update this test and "
+            "CONTRIBUTING.md together."
+        )
+    if len(test_job_filters) > 1:
+        pytest.fail(
+            "Multiple CI jobs now use `not ollama` — this test picks the "
+            "first match, which may not be the one CONTRIBUTING should "
+            f"mirror. Filters found: {test_job_filters!r}. Parse by job "
+            "name or pin the canonical one explicitly."
+        )
     canonical = test_job_filters[0]
 
     contributing_filters = re.findall(r'pytest -m "([^"]+)"', contributing)
