@@ -242,6 +242,37 @@ class TestListServers:
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert "example.com/mcp" in result.output
 
+    def test_list_streamable_http_row_aligns_with_header(self, runner, config):
+        """``streamable_http`` (15 chars) used to overflow the TRANSPORT
+        column and push COMPRESSION + COMMAND/URL out of alignment with
+        the header. Pin the header/row column boundaries so the regression
+        is caught — not just whether the URL appears.
+        """
+        runner.invoke(
+            cli,
+            [
+                "add",
+                "wide",
+                "--prefix",
+                "wd",
+                "--transport",
+                "streamable_http",
+                "--url",
+                "https://example.com/mcp",
+                *_cfg_args(config),
+            ],
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        # Header is the first non-empty styled line; the row immediately
+        # follows the dashed separator.
+        header = next(line for line in lines if "NAME" in line and "TRANSPORT" in line)
+        row = next(line for line in lines if line.startswith("wide"))
+        # The COMPRESSION column starts at the same offset on header
+        # and row — drift used to put them several chars apart.
+        assert header.index("COMPRESSION") == row.index("auto")
+
     def test_json_output(self, runner, config):
         """``list --json`` mirrors ``status --json`` shape for scripting."""
         config.write_text(
