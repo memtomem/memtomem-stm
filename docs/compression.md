@@ -245,7 +245,7 @@ Routes through an external LLM for intelligent summarization:
 }
 ```
 
-Providers: `openai`, `anthropic`, `ollama`. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait — on timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and the strategy label is recorded as `llm_summary→timeout_fallback` / `→privacy_fallback` / `→circuit_breaker_fallback` / `→llm_error_fallback` in `proxy_metrics` so the fallback path is distinguishable in observability tools.
+Providers: `openai`, `anthropic`, `ollama`. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait. On timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and records the strategy as `llm_summary→{timeout,privacy,circuit_breaker,llm_error}_fallback` in `proxy_metrics` for observability.
 
 Sensitive content (API keys, passwords, PII) is auto-detected and **never** sent to external LLMs — falls back to local truncation.
 
