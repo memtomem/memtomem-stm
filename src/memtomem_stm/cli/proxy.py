@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shlex
 import subprocess
 import sys
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -2008,6 +2011,35 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
             }
 
 
+def _root_cause_message(exc: BaseException) -> str:
+    """Walk into ``BaseExceptionGroup`` (anyio TaskGroup wraps probe failures
+    as ``unhandled errors in a TaskGroup (N sub-exception)``) to surface the
+    first non-group leaf so users see the real cause instead of the wrapper.
+    """
+    seen: set[int] = set()
+    cur: BaseException = exc
+    while isinstance(cur, BaseExceptionGroup) and cur.exceptions and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.exceptions[0]
+    return str(cur) or type(cur).__name__
+
+
+@contextmanager
+def _silenced_mcp_sdk_logs() -> Iterator[None]:
+    """Temporarily raise the MCP SDK loggers above ``ERROR`` so probe-time
+    failures (which we already capture + report per-server) don't dump
+    multi-line ``logger.exception`` tracebacks to stderr — those corrupt
+    ``--json`` output for callers piping into ``jq`` / similar.
+    """
+    sdk_logger = logging.getLogger("mcp")
+    prior = sdk_logger.level
+    sdk_logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        sdk_logger.setLevel(prior)
+
+
 async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, dict[str, Any]]:
     """Probe all servers in parallel, returning per-server results."""
 
@@ -2021,12 +2053,17 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, d
                 "error": f"timeout ({timeout}s)",
             }
         except Exception as exc:
-            err = str(exc) or type(exc).__name__
+            # anyio raises ``ExceptionGroup`` when probe failures bubble out
+            # of the TaskGroup; that's already an ``Exception`` subclass,
+            # so the existing catch surface is fine. ``_root_cause_message``
+            # walks the wrapper to surface the real cause.
+            err = _root_cause_message(exc)
             result = {"connected": False, "tools": 0, "error": err}
         return name, result
 
-    tasks = [_safe_probe(n, c) for n, c in servers.items()]
-    pairs = await asyncio.gather(*tasks)
+    with _silenced_mcp_sdk_logs():
+        tasks = [_safe_probe(n, c) for n, c in servers.items()]
+        pairs = await asyncio.gather(*tasks)
     return dict(pairs)
 
 
