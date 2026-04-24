@@ -137,11 +137,32 @@ class TestConfigLoad:
         assert result.exit_code == 1
         assert "'upstream_servers' must be an object" in result.output
 
+    def test_list_missing_config(self, runner, config):
+        """Missing file → ``list`` distinguishes from empty-config (#221)
+        so users troubleshooting wrong --config paths get a clear hint."""
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "Config not found" in result.output
+        assert "mms add" in result.output
+        assert "No upstream servers configured" not in result.output
+
     def test_list_empty_config(self, runner, config):
-        """No config → ``list`` prints the empty-state message and exits 0."""
+        """Empty (but present) config → ``list`` prints the empty-state
+        message — distinct from the missing-config branch above."""
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "No upstream servers configured" in result.output
+        assert "Config not found" not in result.output
+
+    def test_list_json_missing_config(self, runner, config):
+        """``list --json`` already returned ``config_not_found`` since #220;
+        pin it here next to the new text-path test for symmetry."""
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["error"] == "config_not_found"
+        assert str(config) in data["path"]
 
 
 # ── status command ───────────────────────────────────────────────────────
@@ -3281,6 +3302,26 @@ class TestHealth:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data == {"servers": {}}
+
+    def test_health_missing_config(self, runner, config):
+        """Missing file → distinguish from empty-config so a user pointing
+        at the wrong path gets a clear hint instead of a silent no-op
+        (compounding gap from #221, extended to ``health``)."""
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "Config not found" in result.output
+        assert "mms add" in result.output
+        assert "No upstream servers configured" not in result.output
+
+    def test_health_json_missing_config(self, runner, config):
+        """``health --json`` mirrors ``status --json`` / ``list --json`` for
+        missing-config so scripts piping any of the three through the same
+        formatter don't have to branch."""
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["error"] == "config_not_found"
+        assert str(config) in data["path"]
 
     def test_health_unreachable_server(self, runner, config):
         """A server with a nonexistent command → DISCONNECTED."""
