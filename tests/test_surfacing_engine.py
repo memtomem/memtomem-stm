@@ -1357,3 +1357,109 @@ class TestLtmHintsObservability:
         # Must not raise
         out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert out is not None
+
+
+class TestPerToolMinScoreOverride:
+    """Per-tool `ToolSurfacingConfig.min_score` must win over the auto-tuner
+    and over the falsy-check trap on 0.0. Precedence: tool_cfg.min_score >
+    auto-tuned value > global default."""
+
+    def _make_tracker(self, tmp_path: Path, config: SurfacingConfig):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        return FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+
+    async def test_per_tool_override_wins_when_auto_tune_enabled(self, tmp_path: Path):
+        """tool_cfg.min_score=0.1 must filter results with score=0.05 even
+        though global default is 0.02 and auto-tune default min would accept."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        config = _make_config(
+            auto_tune_enabled=True,
+            min_score=0.02,
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.1)},
+        )
+        tracker = self._make_tracker(tmp_path, config)
+        try:
+            engine = SurfacingEngine(
+                config=config,
+                mcp_adapter=_make_mcp_adapter(
+                    [FakeSearchResult(chunk=FakeChunk(content="below override"), score=0.05)]
+                ),
+                feedback_tracker=tracker,
+            )
+            out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert out == LONG_RESPONSE, (
+                "per-tool min_score=0.1 must filter score=0.05; got injection"
+            )
+        finally:
+            tracker.close()
+
+    async def test_per_tool_override_skips_auto_tune_learning(self, tmp_path: Path):
+        """When a per-tool override is set, the auto-tuner must not learn
+        (write to _adjustments) for that tool, even if feedback would
+        otherwise trigger an adjustment. A control tool without override
+        still gets adjusted."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        config = _make_config(
+            auto_tune_enabled=True,
+            auto_tune_min_samples=3,
+            min_score=0.02,
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.1)},
+        )
+        tracker = self._make_tracker(tmp_path, config)
+        try:
+            # Seed feedback that would trigger an auto-tune raise (>60%
+            # not_relevant) for BOTH the overridden tool and a control tool.
+            for i, tool_name in enumerate(["read_file", "list_dir"]):
+                sid = f"seed-{i}"
+                tracker.store.record_surfacing(sid, "gh", tool_name, "q", ["m1"], [0.5])
+                for _ in range(5):
+                    tracker.store.record_feedback(sid, "not_relevant")
+
+            engine = SurfacingEngine(
+                config=config,
+                mcp_adapter=_make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(), score=0.5)]),
+                feedback_tracker=tracker,
+            )
+            # Exercise the overridden tool — should NOT invoke maybe_adjust.
+            await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "read_file" not in engine._auto_tuner._adjustments, (
+                "auto-tuner must not learn for a tool with a per-tool override"
+            )
+
+            # Control: a tool WITHOUT override still gets adjusted.
+            await engine.surface(
+                "gh",
+                "list_dir",
+                {"path": "src/", "_context_query": "Flask architecture"},
+                LONG_RESPONSE,
+            )
+            assert engine._auto_tuner._adjustments.get("list_dir", 0) > 0.02, (
+                "control tool should have been raised above global default"
+            )
+        finally:
+            tracker.close()
+
+    async def test_per_tool_override_zero_respected(self, tmp_path: Path):
+        """Regression for the falsy-check trap: tool_cfg.min_score=0.0 is a
+        valid explicit override (Field ge=0.0). Must NOT fall through to
+        global default."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        config = _make_config(
+            auto_tune_enabled=False,
+            min_score=0.5,  # high global; tool_cfg should lower it to 0.0
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.0)},
+        )
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(content="barely any score"), score=0.01)]
+            ),
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "barely any score" in out, (
+            "per-tool min_score=0.0 must be respected (is-not-None, not truthy)"
+        )

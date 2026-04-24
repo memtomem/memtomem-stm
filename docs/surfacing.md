@@ -125,6 +125,8 @@ Fine-tune surfacing behavior per tool:
 
 Template variables: `{tool_name}`, `{server}`, `{arg.ARGUMENT_NAME}`
 
+**`min_score` precedence (highest wins):** per-tool `context_tools.<name>.min_score` → auto-tuned value (when `auto_tune_enabled=true`) → top-level `min_score`. An explicit per-tool override always wins, even with auto-tune on — set it when you want a fixed threshold that the tuner should not move.
+
 ## End-to-end Surface Call
 
 ```mermaid
@@ -270,6 +272,8 @@ flowchart LR
 ```
 
 Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting. Score is capped between 0.005 and 0.05. **Cold-start fallback**: new tools with insufficient samples use the global ratio across all tools instead of waiting for 20 per-tool samples.
+
+**Per-tool override wins:** if `context_tools.<name>.min_score` is set, auto-tune is skipped for that tool entirely — the tuner is not consulted and does not learn from its feedback (see [`min_score` precedence](#per-tool-templates)).
 
 **Search boost from feedback**: when you rate memories as "helpful", their `access_count` is incremented in the core search index (once per surfacing event, capped at `max_boost=1.5`). This creates a positive feedback loop where useful memories rank higher in future searches.
 
