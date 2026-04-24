@@ -111,3 +111,87 @@ def test_cli_docs_flag_desktop_discovery_is_macos_only() -> None:
         "`--import`. Without this caveat, Linux/Windows callers silently "
         "see zero Claude Desktop candidates from `mms add --import`."
     )
+
+
+def test_configuration_full_example_documents_upstream_timeouts() -> None:
+    """docs/configuration.md's full-example upstream block must list the
+    per-upstream timeout fields added in v0.1.12 (#206).
+
+    ``UpstreamServerConfig`` in ``src/memtomem_stm/proxy/config.py`` exposes
+    ``call_timeout_seconds`` and ``overall_deadline_seconds`` as the
+    bounded-hang knobs for upstream tool calls. If the "Full example"
+    block omits them, users who don't read CHANGELOG have no surface to
+    discover these tuning knobs and a silently-hung upstream looks like
+    a proxy bug rather than a tunable timeout. Scope the assertion to
+    the ``## Config File`` section so moving the fields into release
+    notes or env-var prose cannot satisfy the check.
+    """
+    config_md = _read("docs/configuration.md")
+    section_match = re.search(
+        r"##\s+Config File[^\n]*\n(.*?)(?=\n##\s|\Z)",
+        config_md,
+        re.DOTALL,
+    )
+    if not section_match:
+        pytest.fail(
+            "docs/configuration.md lost its `## Config File` H2 section — "
+            "either restructure the test or restore the section heading."
+        )
+    section_body = section_match.group(1)
+    block_match = re.search(r"```json\n(.*?)\n```", section_body, re.DOTALL)
+    if not block_match:
+        pytest.fail(
+            "docs/configuration.md `## Config File` section lost its "
+            "```json fenced example — either restructure the test or "
+            "restore the full-example block."
+        )
+    example = block_match.group(1)
+
+    required = ("call_timeout_seconds", "overall_deadline_seconds")
+    missing = [field for field in required if field not in example]
+    if missing:
+        pytest.fail(
+            f"docs/configuration.md full-example is missing upstream "
+            f"timeout field(s): {missing!r}. These exist on "
+            "UpstreamServerConfig (src/memtomem_stm/proxy/config.py, "
+            "defaults 90s / 180s) and were added in v0.1.12 (#206) to "
+            "bound silently-hung upstreams. Keep them visible next to "
+            "`max_retries` / `reconnect_delay_seconds` so operators "
+            "discover them when scanning the example."
+        )
+
+
+def test_compression_md_llm_section_documents_timeout_fallback() -> None:
+    """docs/compression.md's ``## LLM Compression`` section must surface
+    ``llm_timeout_seconds`` in the config example or fallback prose.
+
+    ``LLMCompressorConfig.llm_timeout_seconds``
+    (``src/memtomem_stm/proxy/config.py``, default 60.0) bounds the LLM
+    call; on timeout the compressor falls back to ``TruncateCompressor``
+    and records ``llm_summary→timeout_fallback`` in ``proxy_metrics``
+    (v0.1.12, #207/#210). Without this documented, users cannot tune the
+    timeout, cannot interpret the fallback label in metrics, and assume
+    "API failure (circuit breaker protection)" is the only fallback path.
+    """
+    comp_md = _read("docs/compression.md")
+    section_match = re.search(
+        r"##\s+LLM Compression[^\n]*\n(.*?)(?=\n##\s|\Z)",
+        comp_md,
+        re.DOTALL,
+    )
+    if not section_match:
+        pytest.fail(
+            "docs/compression.md lost its `## LLM Compression` H2 section — "
+            "either restructure the test or restore the section heading."
+        )
+    section_body = section_match.group(1)
+    if "llm_timeout_seconds" not in section_body:
+        pytest.fail(
+            "docs/compression.md `## LLM Compression` section must "
+            "mention `llm_timeout_seconds` — either in the JSON example "
+            "or the fallback prose. Without it, the timeout-bound LLM "
+            "compression path introduced in v0.1.12 (#207/#210) is "
+            "invisible to users reading the LLM section, and the "
+            "`llm_summary→timeout_fallback` metric label has no "
+            "documented origin."
+        )

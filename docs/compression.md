@@ -239,12 +239,13 @@ Routes through an external LLM for intelligent summarization:
     "model": "gpt-4.1-mini",
     "api_key": "sk-...",
     "max_tokens": 500,
+    "llm_timeout_seconds": 60.0,
     "system_prompt": "Summarize concisely, preserving key information. Under {max_chars} chars."
   }
 }
 ```
 
-Providers: `openai`, `anthropic`, `ollama`. Falls back to truncation on API failure (circuit breaker protection).
+Providers: `openai`, `anthropic`, `ollama`. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait. On timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and records the strategy as `llm_summary→{timeout,privacy,circuit_breaker,llm_error}_fallback` in `proxy_metrics` for observability.
 
 Sensitive content (API keys, passwords, PII) is auto-detected and **never** sent to external LLMs — falls back to local truncation.
 
