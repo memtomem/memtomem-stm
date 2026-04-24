@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-tool `ToolSurfacingConfig.min_score` now takes precedence over the auto-tuner** — `surfacing.context_tools.<name>.min_score` was silently ignored whenever `auto_tune_enabled=true` (the default), because the engine consulted `AutoTuner.get_effective_min_score(tool)` first and that path only knew about the global `self._config.min_score` or a learned `_adjustments[tool]`, never the per-tool override. An operator who pinned `min_score=0.1` on a noisy tool saw the filter continue to fire at the 0.02 global default (or whatever the tuner had moved to inside `[0.005, 0.05]`). Precedence is now explicit — highest wins: (1) per-tool override, (2) auto-tuned value, (3) global default — and when a per-tool override is set the tuner's `maybe_adjust` is skipped for that tool so it does not learn a value that will never be applied. The same fix changes the truthy check (`tool_cfg.min_score`) to `is not None` on the auto-tune-disabled path, so an explicit `min_score=0.0` override is honored instead of falling through to the global default. New `TestPerToolMinScoreOverride` in `tests/test_surfacing_engine.py` pins all three precedence cases.
+
 ## [0.1.17] — 2026-04-24
 
 ### Added

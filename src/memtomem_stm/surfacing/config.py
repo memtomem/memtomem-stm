@@ -17,6 +17,8 @@ class ToolSurfacingConfig(BaseModel):
     query_template: str = ""
     namespace: str | None = None
     min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Per-tool override. Takes precedence over the auto-tuner when set,
+    even if ``auto_tune_enabled=True``."""
     max_results: int | None = Field(default=None, gt=0)
 
 

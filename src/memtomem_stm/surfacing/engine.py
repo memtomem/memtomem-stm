@@ -386,15 +386,17 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
     ) -> str:
-        # Resolve effective config (auto-tuned if enabled)
+        # min_score precedence: tool_cfg override > auto-tune > global default.
+        # When the operator pins per-tool min_score, skip maybe_adjust so the
+        # tuner doesn't learn a value that will never be applied.
         tool_cfg = self._config.context_tools.get(tool)
-        if self._auto_tuner is not None:
+        if tool_cfg is not None and tool_cfg.min_score is not None:
+            min_score = tool_cfg.min_score
+        elif self._auto_tuner is not None:
             self._auto_tuner.maybe_adjust(tool)
             min_score = self._auto_tuner.get_effective_min_score(tool)
         else:
-            min_score = (
-                tool_cfg.min_score if tool_cfg and tool_cfg.min_score else self._config.min_score
-            )
+            min_score = self._config.min_score
         max_results = (
             tool_cfg.max_results
             if tool_cfg and tool_cfg.max_results
