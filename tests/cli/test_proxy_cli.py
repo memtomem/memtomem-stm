@@ -3324,3 +3324,112 @@ class TestHealth:
         data = json.loads(result.output)
         assert data["servers"]["bad"]["connected"] is False
         assert data["servers"]["bad"]["error"]
+
+    def test_health_error_unwraps_taskgroup_wrapper(self, runner, config):
+        """Probe failures inside an anyio TaskGroup are wrapped as
+        ``BaseExceptionGroup`` and stringify as ``unhandled errors in a
+        TaskGroup (N sub-exception)`` — useless to a user. The CLI must
+        unwrap to the leaf cause.
+
+        Repro path: an upstream that starts cleanly (so ``stdio_client``
+        opens its TaskGroup) but doesn't speak JSON-RPC. ``echo`` exits
+        immediately, so the SDK detects ``Connection closed`` inside the
+        group. Bare ``__nonexistent_cmd__`` fails earlier (``OSError``
+        before the group opens) and so doesn't exercise this path.
+        """
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "echo": {
+                            "prefix": "echo",
+                            "transport": "stdio",
+                            "command": "echo",
+                            "args": ["hello"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["health", "--json", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        err = data["servers"]["echo"]["error"]
+        # The wrapper string was the symptom — explicitly assert it doesn't
+        # leak through. Any non-trivial leaf message is fine.
+        assert "TaskGroup" not in err
+        assert "sub-exception" not in err
+        assert err  # must be non-empty
+
+    def test_health_json_stderr_not_polluted_by_sdk_logs(self, runner, config):
+        """The MCP SDK calls ``logger.exception(...)`` on parse failures,
+        which dumps multi-line tracebacks to stderr. For ``health --json``
+        callers piping into ``jq`` / similar, that noise is just garbage
+        sharing the pipe — silence it for the duration of the probe.
+        """
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "echo": {
+                            "prefix": "echo",
+                            "transport": "stdio",
+                            "command": "echo",
+                            "args": ["hello"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        # ``mix_stderr=False`` was removed in click 8.2 — instead, capture
+        # stderr explicitly via ``CliRunner(catch_exceptions=False)`` plus
+        # ``invoke``'s default behavior of teeing stderr into ``output``.
+        # We assert on the JSON body parse-cleanly: any stderr noise that
+        # was joined into stdout would break ``json.loads``.
+        result = runner.invoke(cli, ["health", "--json", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 0
+        # If logger.exception had fired into the same stream, this would
+        # raise ``json.JSONDecodeError`` because the traceback prefix
+        # corrupts the JSON document.
+        data = json.loads(result.output)
+        assert data["servers"]["echo"]["connected"] is False
+
+
+# ── probe error helpers ──────────────────────────────────────────────────
+
+
+class TestRootCauseMessage:
+    """Unit-test ``_root_cause_message`` directly. Cheaper than driving the
+    whole CLI to exercise edge cases like deeply nested groups or
+    self-referential cycles."""
+
+    def test_returns_str_for_plain_exception(self):
+        from memtomem_stm.cli.proxy import _root_cause_message
+
+        assert _root_cause_message(ValueError("boom")) == "boom"
+
+    def test_falls_back_to_type_name_for_empty_str(self):
+        from memtomem_stm.cli.proxy import _root_cause_message
+
+        # ``str(asyncio.CancelledError())`` is empty; the helper should
+        # surface the type name rather than a useless empty string.
+        import asyncio
+
+        assert _root_cause_message(asyncio.CancelledError()) == "CancelledError"
+
+    def test_unwraps_baseexceptiongroup_to_first_leaf(self):
+        from memtomem_stm.cli.proxy import _root_cause_message
+
+        leaf = RuntimeError("real cause")
+        group = BaseExceptionGroup("unhandled errors in a TaskGroup", [leaf])
+        assert _root_cause_message(group) == "real cause"
+
+    def test_unwraps_nested_groups(self):
+        from memtomem_stm.cli.proxy import _root_cause_message
+
+        leaf = ConnectionError("network down")
+        inner = BaseExceptionGroup("inner", [leaf])
+        outer = BaseExceptionGroup("outer", [inner])
+        assert _root_cause_message(outer) == "network down"
