@@ -155,6 +155,8 @@ Full example with all options:
       "max_retries": 3,
       "reconnect_delay_seconds": 1.0,
       "max_reconnect_delay_seconds": 30.0,
+      "call_timeout_seconds": 90.0,
+      "overall_deadline_seconds": 180.0,
       "max_description_chars": 200,
       "strip_schema_descriptions": false,
       "cleaning": {
