@@ -12,7 +12,12 @@ import pytest
 
 from memtomem_stm.proxy.config import CompressionStrategy, ProxyConfig, UpstreamServerConfig
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
-from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory, TokenTracker
+from memtomem_stm.proxy.metrics import (
+    MAX_ERROR_MESSAGE_CHARS,
+    CallMetrics,
+    ErrorCategory,
+    TokenTracker,
+)
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 
@@ -320,6 +325,56 @@ class TestMetricsStoreMigration:
         assert row == (0, None, None)
         store.close()
 
+    def test_fresh_db_has_error_message_column(self, tmp_path):
+        store = MetricsStore(tmp_path / "test.db")
+        store.initialize()
+        cols = {row[1] for row in store._db.execute("PRAGMA table_info(proxy_metrics)")}
+        assert "error_message" in cols
+        store.close()
+
+    def test_existing_db_migrates_error_message(self, tmp_path):
+        """Pre-existing DB without error_message gets migrated."""
+        import sqlite3
+
+        db_path = tmp_path / "old.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "server TEXT NOT NULL, tool TEXT NOT NULL, "
+            "original_chars INTEGER NOT NULL, compressed_chars INTEGER NOT NULL, "
+            "cleaned_chars INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = MetricsStore(db_path)
+        store.initialize()
+        cols = {row[1] for row in store._db.execute("PRAGMA table_info(proxy_metrics)")}
+        assert "error_message" in cols
+        store.close()
+
+    def test_record_persists_error_message(self, tmp_path):
+        store = MetricsStore(tmp_path / "test.db")
+        store.initialize()
+        store.record(
+            CallMetrics(
+                server="srv",
+                tool="tool",
+                original_chars=0,
+                compressed_chars=0,
+                is_error=True,
+                error_category=ErrorCategory.PROTOCOL,
+                error_code=-32602,
+                error_message="ValueError: Invalid params: page_path",
+            )
+        )
+        row = store._db.execute(
+            "SELECT error_category, error_code, error_message FROM proxy_metrics"
+        ).fetchone()
+        assert row == ("protocol", -32602, "ValueError: Invalid params: page_path")
+        store.close()
+
 
 # ── ProxyManager integration ─────────────────────────────────────────────
 
@@ -413,6 +468,130 @@ class TestManagerErrorRecording:
         s = mgr.tracker.get_summary()
         assert s["total_errors"] == 0
         assert s["total_calls"] == 1
+
+
+# ── error_message persistence (issue #253) ───────────────────────────────
+
+
+def _make_manager_with_store(tmp_path: Path, max_retries: int = 0) -> ProxyManager:
+    """Like ``_make_manager`` but with a real MetricsStore so SQL assertions work."""
+    server_cfg = UpstreamServerConfig(
+        prefix="test",
+        compression=CompressionStrategy.NONE,
+        max_result_chars=50000,
+        max_retries=max_retries,
+        reconnect_delay_seconds=0.0,
+    )
+    proxy_cfg = ProxyConfig(
+        config_path=Path("/tmp/proxy.json"),
+        upstream_servers={"srv": server_cfg},
+    )
+    store = MetricsStore(tmp_path / "metrics.db")
+    store.initialize()
+    tracker = TokenTracker(metrics_store=store)
+    mgr = ProxyManager(proxy_cfg, tracker)
+    mgr._connections["srv"] = UpstreamConnection(
+        name="srv",
+        config=server_cfg,
+        session=AsyncMock(),
+        tools=[],
+    )
+    mgr._test_store = store  # noqa: SLF001 — held for SQL assertions in tests
+    return mgr
+
+
+def _read_error_row(mgr: ProxyManager) -> tuple:
+    return mgr._test_store._db.execute(  # noqa: SLF001
+        "SELECT error_category, error_code, error_message FROM proxy_metrics"
+    ).fetchone()
+
+
+class TestErrorMessagePersistence:
+    """Each ErrorCategory writes ``error_message`` to ``proxy_metrics.db``.
+
+    Without this, post-mortem inspection cannot distinguish (e.g.) a wrong
+    argument name from a rate-limit hit when both surface as ``upstream_error``
+    or ``protocol`` rows. See issue #253.
+    """
+
+    async def test_programming_persists_message(self, tmp_path):
+        mgr = _make_manager_with_store(tmp_path)
+        mgr._connections["srv"].session.call_tool.side_effect = TypeError("bad arg")
+        with pytest.raises(TypeError):
+            await mgr.call_tool("srv", "tool", {})
+        cat, code, msg = _read_error_row(mgr)
+        assert cat == "programming"
+        assert code is None
+        assert msg == "TypeError: bad arg"
+
+    async def test_protocol_persists_message_with_code(self, tmp_path):
+        mgr = _make_manager_with_store(tmp_path)
+        exc = Exception("Invalid params: page_path")
+        exc.error = SimpleNamespace(code=-32602)
+        mgr._connections["srv"].session.call_tool.side_effect = exc
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(Exception):
+                await mgr.call_tool("srv", "tool", {})
+        cat, code, msg = _read_error_row(mgr)
+        assert cat == "protocol"
+        assert code == -32602
+        assert msg is not None and "Invalid params: page_path" in msg
+
+    async def test_transport_persists_message(self, tmp_path):
+        mgr = _make_manager_with_store(tmp_path, max_retries=0)
+        mgr._connections["srv"].session.call_tool.side_effect = ConnectionError("down")
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+        cat, _code, msg = _read_error_row(mgr)
+        assert cat == "transport"
+        assert msg == "ConnectionError: down"
+
+    async def test_timeout_persists_message(self, tmp_path):
+        mgr = _make_manager_with_store(tmp_path, max_retries=0)
+        mgr._connections["srv"].session.call_tool.side_effect = asyncio.TimeoutError()
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+        cat, _code, msg = _read_error_row(mgr)
+        assert cat == "timeout"
+        assert msg is not None and msg.startswith("TimeoutError")
+
+    async def test_upstream_error_persists_original_text(self, tmp_path):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mgr = _make_manager_with_store(tmp_path)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(
+            "Error: page slug 'foo' not found", is_error=True
+        )
+        with pytest.raises(ToolError):
+            await mgr.call_tool("srv", "tool", {})
+        cat, _code, msg = _read_error_row(mgr)
+        assert cat == "upstream_error"
+        assert msg == "Error: page slug 'foo' not found"
+
+    async def test_message_truncated_at_cap(self, tmp_path):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mgr = _make_manager_with_store(tmp_path)
+        long_text = "x" * (MAX_ERROR_MESSAGE_CHARS + 250)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(
+            long_text, is_error=True
+        )
+        with pytest.raises(ToolError):
+            await mgr.call_tool("srv", "tool", {})
+        _cat, _code, msg = _read_error_row(mgr)
+        assert msg is not None
+        assert len(msg) == MAX_ERROR_MESSAGE_CHARS
+
+    async def test_success_persists_null_message(self, tmp_path):
+        mgr = _make_manager_with_store(tmp_path)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("ok")
+        await mgr.call_tool("srv", "tool", {})
+        row = mgr._test_store._db.execute(  # noqa: SLF001
+            "SELECT is_error, error_message FROM proxy_metrics"
+        ).fetchone()
+        assert row == (0, None)
 
 
 # ── CircuitBreaker properties ────────────────────────────────────────────
