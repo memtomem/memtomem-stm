@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --frozen
+      - run: uv run ruff check src
+      - run: uv run ruff format --check src
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --frozen
+      - name: mypy (gradual)
+        run: uv run mypy src
+        continue-on-error: true
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --frozen
+      - run: uv run pytest -m "not ollama" --tb=short -q
+
+  notebooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --frozen
+      - name: Run tutorial notebooks (excluding LangChain — no API key in CI)
+        run: |
+          uv run pytest --nbmake \
+            notebooks/00_cli_and_mcp_hybrid.ipynb \
+            notebooks/01_quickstart_proxy_setup.ipynb \
+            notebooks/02_compression_and_selective.ipynb \
+            notebooks/03_memory_surfacing.ipynb \
+            --nbmake-timeout=180 --tb=short -q
