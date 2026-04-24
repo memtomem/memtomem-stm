@@ -1178,6 +1178,41 @@ def _handle_source_prune(
             click.echo(f"  {_source_removal_hint(name, src)}", err=True)
 
 
+def _find_dual_registered(
+    stm_upstreams: dict[str, dict[str, Any]], cwd: Path
+) -> list[dict[str, Any]]:
+    """Return source-client candidates whose name **and identity** match an STM upstream.
+
+    Name alone isn't enough: a user can register an unrelated server under
+    the same name in a source client (different command / URL / args) and
+    would reasonably expect ``mms prune`` not to touch it. Mirrors the dedup
+    logic :func:`_add_from_clients` uses in the other direction (name +
+    :func:`_server_signature` match), so the two sides of the import↔prune
+    round-trip agree on what "the same server" means.
+
+    An entry with no extractable signature (missing command / URL) is a
+    degraded match: we still include it on a name hit rather than silently
+    dropping it, since refusing to prune would surprise users who onboarded
+    via ``init`` and never edited the entry. The returned shape matches
+    :func:`_discover_candidates` so callers can pass the result directly to
+    :func:`_prune_imported_candidates` / the ``_handle_source_prune`` machinery.
+    """
+    all_candidates = _discover_candidates(cwd)
+    dual: list[dict[str, Any]] = []
+    for cand in all_candidates:
+        name = cand["name"]
+        if name not in stm_upstreams:
+            continue
+        stm_sig = _server_signature(stm_upstreams[name])
+        src_sig = _server_signature(cand["entry"])
+        # Both sides have a signature and they differ → intentionally distinct
+        # servers sharing a name. Skip rather than prune the unrelated entry.
+        if stm_sig is not None and src_sig is not None and stm_sig != src_sig:
+            continue
+        dual.append(cand)
+    return dual
+
+
 def _suggest_prefix(name: str, taken: set[str]) -> str:
     """Derive a valid-ish default prefix from a server name.
 
@@ -1526,7 +1561,24 @@ def _add_from_clients(
         "no registration. Omit the flag for the interactive prompt."
     ),
 )
-def init(config_path: str, no_validate: bool, mcp_mode: str | None) -> None:
+@click.option(
+    "--prune-originals",
+    "prune_originals",
+    is_flag=True,
+    default=False,
+    help=(
+        "After a successful import + registration, remove the direct "
+        "registrations from source MCP clients so tools route through STM "
+        "only. TTY callers get a single y/N prompt (default No); non-TTY "
+        "scripted callers must pass the flag explicitly."
+    ),
+)
+def init(
+    config_path: str,
+    no_validate: bool,
+    mcp_mode: str | None,
+    prune_originals: bool,
+) -> None:
     """Guided first-time setup for memtomem-stm.
 
     Prompts for a single upstream server and writes the config file. Aborts
@@ -1552,6 +1604,10 @@ def init(config_path: str, no_validate: bool, mcp_mode: str | None) -> None:
 
     candidates = _discover_candidates(Path.cwd())
     imported: dict[str, dict[str, Any]] = {}
+    # Parallel list of the source-client candidate dicts for entries we
+    # actually import. Needed so the end-of-flow prune step can address the
+    # exact ``(name, source, duplicate_in)`` triples via ``_handle_source_prune``.
+    imported_candidates: list[dict[str, Any]] = []
 
     if candidates:
         click.echo(_hdr(f"Found {len(candidates)} MCP server(s) in existing client configs:"))
@@ -1591,6 +1647,7 @@ def init(config_path: str, no_validate: bool, mcp_mode: str | None) -> None:
             used_prefixes.add(prefix)
             entry = {"prefix": prefix, **cand["entry"]}
             imported[cand["name"]] = entry
+            imported_candidates.append(cand)
     else:
         # Zero discovered candidates → true first-time user without any
         # existing MCP-client config. Full manual prompt flow.
@@ -1684,6 +1741,14 @@ def init(config_path: str, no_validate: bool, mcp_mode: str | None) -> None:
     click.echo("")
     _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
 
+    # Post-registration prune of source-client originals, opt-in only.
+    # * ``--prune-originals`` → unconditional prune (scripted path).
+    # * TTY + no flag → single y/N confirm, default No.
+    # * non-TTY + no flag → skip; fall through to the #203 hint-only warning.
+    # Matches ``mms add --import --prune`` semantics via ``_handle_source_prune``.
+    if imported_candidates:
+        _handle_source_prune(imported_candidates, prune=prune_originals)
+
 
 @cli.command()
 @click.option(
@@ -1749,6 +1814,163 @@ def remove(name: str, config_path: str, yes: bool) -> None:
     del servers[name]
     _save(path, data)
     click.echo(f"{_ok('Removed')} server '{name}'.")
+
+
+# ── prune command ──────────────────────────────────────────────────────
+#
+# Post-hoc version of the prune step that ``mms add --import --prune`` does
+# inline. Needed because ``mms init`` intentionally leaves source-client
+# registrations untouched (bootstrap-only invariant + read-only discovery
+# contract — see PR #200 and #203), which means anyone who onboarded via
+# ``mms init`` ends up with dual-registered servers and no in-tree way to
+# collapse the dual path without manually running ``claude mcp remove`` per
+# entry. ``mms prune`` is the explicit opt-in command that closes that gap.
+
+
+@cli.command()
+@click.argument("names", nargs=-1)
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option(
+    "--all",
+    "all_servers",
+    is_flag=True,
+    help="Prune every dual-registered upstream. Required when no NAMES given.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    help="Skip the confirm prompt (scripts / CI / non-TTY callers).",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    help="Print what would be pruned; no writes.",
+)
+def prune(
+    names: tuple[str, ...],
+    config_path: str,
+    all_servers: bool,
+    assume_yes: bool,
+    dry_run: bool,
+) -> None:
+    """Remove direct registrations for STM upstreams that are dual-registered.
+
+    Finds every STM upstream that's still directly registered in a source
+    MCP client (``~/.claude.json``, project ``.mcp.json``, Claude Desktop)
+    and removes the direct registration so tool calls route through STM —
+    picking up compression, caching, and LTM surfacing, and collapsing the
+    duplicate tool advertisement. STM's own config is not touched.
+    """
+    if names and all_servers:
+        raise click.UsageError("--all cannot be combined with explicit NAMES.")
+    if not names and not all_servers:
+        raise click.UsageError(
+            "Pass upstream NAMES or --all. Use `mms list` to see what's configured."
+        )
+
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
+        click.echo("  Run `mms init` first.", err=True)
+        sys.exit(1)
+
+    data = _load(resolved)
+    upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
+    if not upstreams:
+        click.echo("No upstream servers configured.")
+        return
+
+    dual = _find_dual_registered(upstreams, Path.cwd())
+
+    if names:
+        # ``not dual-registered`` subsumes three distinct states the user
+        # doesn't need to disambiguate up front: name absent from STM config,
+        # name present in STM but not in any source client, or name in both
+        # but with a divergent identity (``_find_dual_registered`` skipped it
+        # precisely because the source-client entry looks like a different
+        # server). The error surfaces all three branches in one message.
+        dual_names = {c["name"] for c in dual}
+        missing = set(names) - dual_names
+        if missing:
+            click.echo(
+                f"{_err('Error:')} not dual-registered: {', '.join(sorted(missing))}.",
+                err=True,
+            )
+            click.echo(
+                "  These names are either not STM upstreams, not in any source "
+                "client, or registered with a different command/URL in the source.",
+                err=True,
+            )
+            sys.exit(1)
+        requested = set(names)
+        dual = [c for c in dual if c["name"] in requested]
+
+    if not dual:
+        click.echo("No dual-registered upstreams found.")
+        return
+
+    # Preview iteration must cover the same ``source + duplicate_in`` set
+    # that ``_prune_imported_candidates`` acts on — otherwise a user could
+    # approve fewer entries than get written. See
+    # ``test_duplicate_in_sources_all_pruned`` for the contract pin.
+    click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
+    name_width = max((len(c["name"]) for c in dual), default=0)
+    seen: set[tuple[str, str]] = set()
+    for cand in dual:
+        detail = _format_candidate_detail(cand["entry"])
+        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            key = (cand["name"], src)
+            if key in seen:
+                continue
+            seen.add(key)
+            click.echo(f"  {cand['name']:<{name_width}}  {detail}  — {src}")
+
+    if dry_run:
+        click.echo("")
+        click.echo(f"{_ok('Dry run:')} no writes performed.")
+        return
+
+    if assume_yes:
+        proceed = True
+    elif _should_use_tui():
+        click.echo("")
+        proceed = click.confirm("Remove from source(s)?", default=False)
+    else:
+        click.echo(
+            f"{_err('Error:')} no TTY; pass --yes to confirm (or --dry-run to preview).",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not proceed:
+        click.echo("Aborted. No changes made.")
+        return
+
+    pruned, failed = _prune_imported_candidates(dual)
+
+    if pruned:
+        click.echo("")
+        click.echo(f"{_ok('Removed from source client(s):')}")
+        for name, src in pruned:
+            click.echo(f"  {name} — {src}")
+
+    if failed:
+        click.echo("")
+        click.echo(
+            f"{_warn('Warning:')} could not remove {len(failed)} direct registration(s):",
+            err=True,
+        )
+        for name, src, err in failed:
+            click.echo(f"  {name} ({src}): {err}", err=True)
+        click.echo("", err=True)
+        click.echo("Run the following to remove them manually:", err=True)
+        for name, src, _ in failed:
+            click.echo(f"  {_source_removal_hint(name, src)}", err=True)
+        sys.exit(1)
 
 
 # ── health command ──────────────────────────────────────────────────────
