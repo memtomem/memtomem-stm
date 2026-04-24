@@ -115,16 +115,18 @@ def test_cli_docs_flag_desktop_discovery_is_macos_only() -> None:
 
 def test_configuration_full_example_documents_upstream_timeouts() -> None:
     """docs/configuration.md's full-example upstream block must list the
-    per-upstream timeout fields added in v0.1.12 (#206).
+    three per-upstream timeout knobs on ``UpstreamServerConfig``.
 
-    ``UpstreamServerConfig`` in ``src/memtomem_stm/proxy/config.py`` exposes
-    ``call_timeout_seconds`` and ``overall_deadline_seconds`` as the
-    bounded-hang knobs for upstream tool calls. If the "Full example"
-    block omits them, users who don't read CHANGELOG have no surface to
-    discover these tuning knobs and a silently-hung upstream looks like
-    a proxy bug rather than a tunable timeout. Scope the assertion to
-    the ``## Config File`` section so moving the fields into release
-    notes or env-var prose cannot satisfy the check.
+    ``src/memtomem_stm/proxy/config.py`` exposes ``connect_timeout_seconds``
+    (bounds ``session.initialize()``, #53), ``call_timeout_seconds`` (bounds
+    each ``session.call_tool()`` attempt, #206), and
+    ``overall_deadline_seconds`` (wall-clock budget across retries, #206).
+    If the "Full example" block omits any of them, users who don't read
+    CHANGELOG have no surface to discover these tuning knobs and a
+    silently-hung upstream looks like a proxy bug rather than a tunable
+    timeout. Scope the assertion to the ``## Config File`` section so
+    moving the fields into release notes or env-var prose cannot satisfy
+    the check.
     """
     config_md = _read("docs/configuration.md")
     section_match = re.search(
@@ -147,17 +149,21 @@ def test_configuration_full_example_documents_upstream_timeouts() -> None:
         )
     example = block_match.group(1)
 
-    required = ("call_timeout_seconds", "overall_deadline_seconds")
+    required = (
+        "connect_timeout_seconds",
+        "call_timeout_seconds",
+        "overall_deadline_seconds",
+    )
     missing = [field for field in required if field not in example]
     if missing:
         pytest.fail(
             f"docs/configuration.md full-example is missing upstream "
             f"timeout field(s): {missing!r}. These exist on "
             "UpstreamServerConfig (src/memtomem_stm/proxy/config.py, "
-            "defaults 90s / 180s) and were added in v0.1.12 (#206) to "
-            "bound silently-hung upstreams. Keep them visible next to "
-            "`max_retries` / `reconnect_delay_seconds` so operators "
-            "discover them when scanning the example."
+            "defaults 30s / 90s / 180s) and bound silently-hung upstreams "
+            "at the init, per-call, and overall-deadline layers. Keep "
+            "them visible next to `max_retries` / `reconnect_delay_seconds` "
+            "so operators discover them when scanning the example."
         )
 
 
