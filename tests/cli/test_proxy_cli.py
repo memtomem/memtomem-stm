@@ -2944,6 +2944,88 @@ class TestPruneCommand:
         pairs = {(c[3], c[5]) for c in argvs}
         assert pairs == {("filesystem", "user"), ("filesystem", "local")}
 
+    def test_divergent_identity_not_dual_registered(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Same name in STM and source client but different command → the
+        user has two intentionally distinct servers sharing a name, not a
+        dual-reg. Pruning the source entry would clobber unrelated config;
+        ``_find_dual_registered`` must skip it (mirrors the name+signature
+        dedup ``mms add --import`` uses in the other direction)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "docs": {
+                            "prefix": "docs",
+                            "transport": "stdio",
+                            "command": "npx",
+                            "args": ["-y", "@me/stm-imported"],
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        # Source client has a server also called ``docs`` but wired to a
+        # completely different command — treat as a separate registration.
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "python",
+                        "args": ["-m", "unrelated_server"],
+                    },
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_dry_run_with_names_filters_before_preview(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Scope selection (NAMES) and preview-only (--dry-run) compose:
+        the preview must show only the named subset and still make no
+        writes. Lock in the contract so future refactors can't accidentally
+        preview the full set when the user asked for one."""
+        self._seed_config(config, ["a", "b"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "a",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "b",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli, ["prune", "a", "--dry-run", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Dry run" in result.output
+        # Header should reflect the filtered count, not the full 2.
+        assert "Dual-registered upstream(s): 1" in result.output
+        assert "Claude Code (user)" in result.output
+        assert ".mcp.json (project)" not in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
     def test_partial_failure_exits_nonzero_with_manual_hint(
         self, runner, config, monkeypatch, fake_claude
     ):

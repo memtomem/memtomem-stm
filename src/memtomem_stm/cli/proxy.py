@@ -1178,18 +1178,39 @@ def _handle_source_prune(
             click.echo(f"  {_source_removal_hint(name, src)}", err=True)
 
 
-def _find_dual_registered(stm_upstream_names: set[str], cwd: Path) -> list[dict[str, Any]]:
-    """Return source-client candidates whose name is also an STM upstream.
+def _find_dual_registered(
+    stm_upstreams: dict[str, dict[str, Any]], cwd: Path
+) -> list[dict[str, Any]]:
+    """Return source-client candidates whose name **and identity** match an STM upstream.
 
-    The shape matches :func:`_discover_candidates` so callers can pass the
-    result directly to :func:`_prune_imported_candidates` / the
-    ``_handle_source_prune`` machinery. Any upstream that isn't re-discovered
-    (i.e. already pruned, or registered with a different identity) is simply
-    absent from the return value — the caller treats "no dual-registered
-    servers" as a no-op rather than an error.
+    Name alone isn't enough: a user can register an unrelated server under
+    the same name in a source client (different command / URL / args) and
+    would reasonably expect ``mms prune`` not to touch it. Mirrors the dedup
+    logic :func:`_add_from_clients` uses in the other direction (name +
+    :func:`_server_signature` match), so the two sides of the import↔prune
+    round-trip agree on what "the same server" means.
+
+    An entry with no extractable signature (missing command / URL) is a
+    degraded match: we still include it on a name hit rather than silently
+    dropping it, since refusing to prune would surprise users who onboarded
+    via ``init`` and never edited the entry. The returned shape matches
+    :func:`_discover_candidates` so callers can pass the result directly to
+    :func:`_prune_imported_candidates` / the ``_handle_source_prune`` machinery.
     """
     all_candidates = _discover_candidates(cwd)
-    return [c for c in all_candidates if c["name"] in stm_upstream_names]
+    dual: list[dict[str, Any]] = []
+    for cand in all_candidates:
+        name = cand["name"]
+        if name not in stm_upstreams:
+            continue
+        stm_sig = _server_signature(stm_upstreams[name])
+        src_sig = _server_signature(cand["entry"])
+        # Both sides have a signature and they differ → intentionally distinct
+        # servers sharing a name. Skip rather than prune the unrelated entry.
+        if stm_sig is not None and src_sig is not None and stm_sig != src_sig:
+            continue
+        dual.append(cand)
+    return dual
 
 
 def _suggest_prefix(name: str, taken: set[str]) -> str:
@@ -1857,15 +1878,21 @@ def prune(
         click.echo("  Run `mms init` first.", err=True)
         sys.exit(1)
 
-    data = _load(path)
-    stm_names = set(data.get("upstream_servers", {}).keys())
-    if not stm_names:
+    data = _load(resolved)
+    upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
+    if not upstreams:
         click.echo("No upstream servers configured.")
         return
 
-    dual = _find_dual_registered(stm_names, Path.cwd())
+    dual = _find_dual_registered(upstreams, Path.cwd())
 
     if names:
+        # ``not dual-registered`` subsumes three distinct states the user
+        # doesn't need to disambiguate up front: name absent from STM config,
+        # name present in STM but not in any source client, or name in both
+        # but with a divergent identity (``_find_dual_registered`` skipped it
+        # precisely because the source-client entry looks like a different
+        # server). The error surfaces all three branches in one message.
         dual_names = {c["name"] for c in dual}
         missing = set(names) - dual_names
         if missing:
@@ -1875,7 +1902,7 @@ def prune(
             )
             click.echo(
                 "  These names are either not STM upstreams, not in any source "
-                "client, or already pruned.",
+                "client, or registered with a different command/URL in the source.",
                 err=True,
             )
             sys.exit(1)
@@ -1886,15 +1913,21 @@ def prune(
         click.echo("No dual-registered upstreams found.")
         return
 
+    # Preview iteration must cover the same ``source + duplicate_in`` set
+    # that ``_prune_imported_candidates`` acts on — otherwise a user could
+    # approve fewer entries than get written. See
+    # ``test_duplicate_in_sources_all_pruned`` for the contract pin.
     click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
+    name_width = max((len(c["name"]) for c in dual), default=0)
     seen: set[tuple[str, str]] = set()
     for cand in dual:
+        detail = _format_candidate_detail(cand["entry"])
         for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
             key = (cand["name"], src)
             if key in seen:
                 continue
             seen.add(key)
-            click.echo(f"  {cand['name']:<20} — {src}")
+            click.echo(f"  {cand['name']:<{name_width}}  {detail}  — {src}")
 
     if dry_run:
         click.echo("")
