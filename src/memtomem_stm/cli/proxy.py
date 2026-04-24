@@ -528,8 +528,14 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
         click.echo("No upstream servers configured.")
         return
 
+    # ``streamable_http`` is 15 chars — wider than the prior ``<12``
+    # transport column, so rows for HTTP servers used to push the
+    # COMPRESSION and COMMAND/URL columns out of alignment with the
+    # header. ``<16`` fits every Choice value the ``--transport`` flag
+    # accepts (``stdio`` / ``sse`` / ``streamable_http``) with at least
+    # one space of padding.
     click.echo(
-        _hdr(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<12} {'COMPRESSION':<12} COMMAND / URL")
+        _hdr(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<16} {'COMPRESSION':<12} COMMAND / URL")
     )
     click.echo("-" * 80)
     for name, cfg in servers.items():
@@ -542,7 +548,7 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
             detail = f"{cmd} {args_str}".strip()
         else:
             detail = cfg.get("url", "")
-        click.echo(f"{name:<20} {prefix:<10} {transport:<12} {compression:<12} {detail}")
+        click.echo(f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} {detail}")
     click.echo(f"\n{len(servers)} server(s) configured.")
 
 
