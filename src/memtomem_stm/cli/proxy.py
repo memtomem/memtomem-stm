@@ -497,11 +497,15 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
-    # Missing-config handling matches ``status --json`` so scripts can probe
-    # either command without branching on shape. Text path keeps the prior
-    # ``_load`` fallthrough (empty dict → "No upstream servers configured").
-    if as_json and not resolved.exists():
-        click.echo(json.dumps({"error": "config_not_found", "path": str(resolved)}))
+    # Missing-config handling matches ``status`` so a user troubleshooting
+    # "why isn't my server listed?" can tell whether they're pointed at the
+    # wrong path vs. a real-but-empty config (#221).
+    if not resolved.exists():
+        if as_json:
+            click.echo(json.dumps({"error": "config_not_found", "path": str(resolved)}))
+        else:
+            click.echo(f"Config not found: {resolved}")
+            click.echo("Run `mms add` (or `mms init`) to create a configuration.")
         return
 
     data = _load(path)
@@ -2052,7 +2056,21 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, d
 )
 def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> None:
     """Check upstream server connectivity."""
-    data = _load(Path(config_path))
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+
+    # Missing-config handling matches ``status`` / ``list`` so a user
+    # troubleshooting connectivity can tell wrong-path from empty-config
+    # without re-running ``status`` (#221, extended to ``health``).
+    if not resolved.exists():
+        if as_json:
+            click.echo(json.dumps({"error": "config_not_found", "path": str(resolved)}))
+        else:
+            click.echo(f"Config not found: {resolved}")
+            click.echo("Run `mms add` (or `mms init`) to create a configuration.")
+        return
+
+    data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
