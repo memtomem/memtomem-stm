@@ -124,6 +124,9 @@ class MetricsStore:
             "surface_error": (
                 "ALTER TABLE proxy_metrics ADD COLUMN surface_error TEXT DEFAULT NULL"
             ),
+            "error_message": (
+                "ALTER TABLE proxy_metrics ADD COLUMN error_message TEXT DEFAULT NULL"
+            ),
         }
         for col, ddl in migrations.items():
             if col not in existing:
@@ -143,12 +146,12 @@ class MetricsStore:
             self._db.execute(
                 "INSERT INTO proxy_metrics "
                 "(server, tool, original_chars, compressed_chars, cleaned_chars, "
-                "is_error, error_category, error_code, trace_id, "
+                "is_error, error_category, error_code, error_message, trace_id, "
                 "compression_strategy, ratio_violation, scorer_fallback, "
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
                 "surfacing_on_progressive_ok, surface_error, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -158,6 +161,7 @@ class MetricsStore:
                     int(metrics.is_error),
                     metrics.error_category.value if metrics.error_category else None,
                     metrics.error_code,
+                    metrics.error_message,
                     metrics.trace_id,
                     metrics.compression_strategy,
                     int(metrics.ratio_violation),

@@ -65,7 +65,13 @@ from memtomem_stm.proxy.progressive import (
 )
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
-from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory, TokenTracker
+from memtomem_stm.proxy.metrics import (
+    MAX_ERROR_MESSAGE_CHARS,
+    CallMetrics,
+    ErrorCategory,
+    TokenTracker,
+    format_error_message_from_exc,
+)
 from memtomem_stm.observability.tracing import traced
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
@@ -983,6 +989,13 @@ class ProxyManager:
                                 compressed_chars=0,
                                 trace_id=trace_id,
                                 error_category=pipeline_category,
+                                # LOCK_TIMEOUT bubbles out of ``bounded_lock``
+                                # before the per-stage ``index_error`` /
+                                # ``extract_error`` / ``surface_error`` columns
+                                # get populated, so without this the row is
+                                # all-NULL across diagnostic text — same gap
+                                # the rest of #253 closes for upstream errors.
+                                error_message=format_error_message_from_exc(exc),
                             )
                         )
                     except Exception:
@@ -1115,6 +1128,7 @@ class ProxyManager:
                         compressed_chars=0,
                         is_error=True,
                         error_category=ErrorCategory.TIMEOUT,
+                        error_message=format_error_message_from_exc(deadline_exc),
                         trace_id=trace_id,
                     )
                 )
@@ -1148,6 +1162,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=ErrorCategory.PROGRAMMING,
+                            error_message=format_error_message_from_exc(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -1169,6 +1184,7 @@ class ProxyManager:
                             is_error=True,
                             error_category=ErrorCategory.PROTOCOL,
                             error_code=err_code,
+                            error_message=format_error_message_from_exc(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -1197,6 +1213,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=cat,
+                            error_message=format_error_message_from_exc(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -1299,6 +1316,7 @@ class ProxyManager:
                     compressed_chars=len(original_text),
                     is_error=True,
                     error_category=ErrorCategory.UPSTREAM_ERROR,
+                    error_message=original_text[:MAX_ERROR_MESSAGE_CHARS],
                     trace_id=trace_id,
                 )
             )
