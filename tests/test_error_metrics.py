@@ -593,6 +593,45 @@ class TestErrorMessagePersistence:
         ).fetchone()
         assert row == (0, None)
 
+    async def test_internal_error_persists_message(self, tmp_path):
+        """A pipeline-stage exception (CLEAN/COMPRESS/SURFACE/INDEX) escaping
+        ``_call_tool_inner`` is recorded as INTERNAL_ERROR by the outer wrapper.
+        The per-stage error column may not be set on every path — error_message
+        gives a single column to query for any pipeline failure text."""
+        mgr = _make_manager_with_store(tmp_path)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("hello")
+        with patch.object(
+            mgr, "_apply_compression", new_callable=AsyncMock, side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                await mgr.call_tool("srv", "tool", {})
+        cat, _code, msg = _read_error_row(mgr)
+        assert cat == "internal_error"
+        assert msg == "RuntimeError: boom"
+
+    async def test_lock_timeout_persists_message(self, tmp_path):
+        """LockTimeoutError (#208) escapes ``bounded_lock`` *before* the
+        per-stage ``index_error`` / ``extract_error`` / ``surface_error``
+        columns get populated. Without ``error_message`` the lock_timeout row
+        was all-NULL across diagnostic text, defeating the post-mortem use
+        case this PR is meant to enable."""
+        from memtomem_stm.proxy._locks import LockTimeoutError
+
+        mgr = _make_manager_with_store(tmp_path)
+        with patch.object(
+            mgr,
+            "_call_tool_guarded",
+            new_callable=AsyncMock,
+            side_effect=LockTimeoutError("stm_lock", 5.0),
+        ):
+            with pytest.raises(LockTimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+        cat, _code, msg = _read_error_row(mgr)
+        assert cat == "lock_timeout"
+        assert msg is not None
+        assert "stm_lock" in msg
+        assert msg.startswith("LockTimeoutError")
+
 
 # ── CircuitBreaker properties ────────────────────────────────────────────
 

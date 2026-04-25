@@ -70,6 +70,7 @@ from memtomem_stm.proxy.metrics import (
     CallMetrics,
     ErrorCategory,
     TokenTracker,
+    format_error_message_from_exc,
 )
 from memtomem_stm.observability.tracing import traced
 
@@ -988,6 +989,13 @@ class ProxyManager:
                                 compressed_chars=0,
                                 trace_id=trace_id,
                                 error_category=pipeline_category,
+                                # LOCK_TIMEOUT bubbles out of ``bounded_lock``
+                                # before the per-stage ``index_error`` /
+                                # ``extract_error`` / ``surface_error`` columns
+                                # get populated, so without this the row is
+                                # all-NULL across diagnostic text — same gap
+                                # the rest of #253 closes for upstream errors.
+                                error_message=format_error_message_from_exc(exc),
                             )
                         )
                     except Exception:
@@ -1120,9 +1128,7 @@ class ProxyManager:
                         compressed_chars=0,
                         is_error=True,
                         error_category=ErrorCategory.TIMEOUT,
-                        error_message=(f"{type(deadline_exc).__name__}: {deadline_exc}")[
-                            :MAX_ERROR_MESSAGE_CHARS
-                        ],
+                        error_message=format_error_message_from_exc(deadline_exc),
                         trace_id=trace_id,
                     )
                 )
@@ -1156,9 +1162,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=ErrorCategory.PROGRAMMING,
-                            error_message=(f"{type(exc).__name__}: {exc}")[
-                                :MAX_ERROR_MESSAGE_CHARS
-                            ],
+                            error_message=format_error_message_from_exc(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -1180,9 +1184,7 @@ class ProxyManager:
                             is_error=True,
                             error_category=ErrorCategory.PROTOCOL,
                             error_code=err_code,
-                            error_message=(f"{type(exc).__name__}: {exc}")[
-                                :MAX_ERROR_MESSAGE_CHARS
-                            ],
+                            error_message=format_error_message_from_exc(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -1211,9 +1213,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=cat,
-                            error_message=(f"{type(exc).__name__}: {exc}")[
-                                :MAX_ERROR_MESSAGE_CHARS
-                            ],
+                            error_message=format_error_message_from_exc(exc),
                             trace_id=trace_id,
                         )
                     )
