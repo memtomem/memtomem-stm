@@ -19,6 +19,7 @@ from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.observability import SurfacingObservability
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 
@@ -159,6 +160,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         mcp_adapter=mcp_adapter,
                         feedback_tracker=feedback_tracker,
                         token_tracker=tracker,
+                        observability=SurfacingObservability(),
                     )
 
             # Response cache
@@ -672,12 +674,88 @@ async def stm_surfacing_stats(
                 lines.append(f"  [{ts_iso}] {row['tool']}: {row['query_preview']}")
                 lines.append(f"    memories: {n_mem}")
 
+        # Skip-reason / outcome / cache aggregates (in-memory, since process
+        # start). Appended after the existing DB-backed stats so callers that
+        # script against the legacy shape see a strict superset. Suppressed
+        # entirely when surfacing has not been invoked, preserving the
+        # zero-traffic output byte-for-byte.
+        if app.surfacing_engine is not None and app.surfacing_engine.observability is not None:
+            snapshot = app.surfacing_engine.observability.snapshot()
+            if snapshot["any_call"]:
+                lines.extend(_format_observability_sections(snapshot, tool_filter=tool))
+
         if tool:
             lines.append(f"\n(filtered by tool: {tool})")
         if since:
             lines.append(f"(since: {since})")
 
         return "\n".join(lines)
+
+
+def _ordered_tool_keys(per_tool: dict) -> list[str]:
+    """Pin ``__total__`` first regardless of ASCII order.
+
+    ``sorted()`` would put ``__total__`` first only because ``_`` (0x5F)
+    sorts before lowercase letters (0x61+). A PascalCase tool name would
+    sort under ``A`` (0x41) and bury the aggregate row mid-list. Pinning
+    the total explicitly removes the dependency on naming convention.
+    """
+    keys = sorted(t for t in per_tool if t != "__total__")
+    if "__total__" in per_tool:
+        keys.insert(0, "__total__")
+    return keys
+
+
+def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
+    """Render the Skip reasons / Outcomes / Cache sections for stm_surfacing_stats.
+
+    Returns a list of lines starting with a blank separator. When
+    ``tool_filter`` is set, per-tool dicts are restricted to that tool plus
+    the ``__total__`` aggregate so the operator can compare a single tool's
+    counters against the total without re-running the call.
+    """
+    skip_reasons: dict[str, dict[str, int]] = snapshot["skip_reasons"]
+    outcomes: dict[str, dict[str, int]] = snapshot["outcomes"]
+    cache: dict[str, int] = snapshot["cache"]
+
+    if tool_filter is not None:
+        skip_reasons = {
+            t: r for t, r in skip_reasons.items() if t == tool_filter or t == "__total__"
+        }
+        outcomes = {t: o for t, o in outcomes.items() if t == tool_filter or t == "__total__"}
+
+    lines: list[str] = []
+
+    if skip_reasons:
+        lines.append("\nSkip reasons (since process start):")
+        for tool_name in _ordered_tool_keys(skip_reasons):
+            reasons = skip_reasons[tool_name]
+            if not reasons:
+                continue
+            lines.append(f"  {tool_name}:")
+            for reason, count in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {reason}: {count}")
+
+    if outcomes:
+        lines.append("\nOutcomes (since process start):")
+        for tool_name in _ordered_tool_keys(outcomes):
+            tool_outcomes = outcomes[tool_name]
+            if not tool_outcomes:
+                continue
+            lines.append(f"  {tool_name}:")
+            for outcome, count in sorted(tool_outcomes.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {outcome}: {count}")
+
+    hits = cache.get("hit", 0)
+    misses = cache.get("miss", 0)
+    total = hits + misses
+    if total > 0:
+        ratio = round(hits / total * 100, 1)
+        lines.append(
+            f"\nCache (since process start): hits {hits}, misses {misses}, hit ratio {ratio}%"
+        )
+
+    return lines
 
 
 # ---------------------------------------------------------------------------

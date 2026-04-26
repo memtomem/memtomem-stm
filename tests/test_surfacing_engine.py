@@ -1463,3 +1463,154 @@ class TestPerToolMinScoreOverride:
         assert "barely any score" in out, (
             "per-tool min_score=0.0 must be respected (is-not-None, not truthy)"
         )
+
+
+class TestSurfacingEngineObservability:
+    """Engine-level skip/outcome counter wiring.
+
+    Gate-level skip reasons (5 of 9) are covered in
+    ``test_relevance_gate.py::TestRelevanceGateObservability``. This class
+    covers the engine's 4 skip reasons + 4 outcomes + cache hit/miss
+    counters, plus the rule that exactly one skip OR one outcome is
+    recorded per ``surface()`` call (no double-counting).
+    """
+
+    def _engine_with_obs(self, **cfg_overrides):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        results = cfg_overrides.pop("_results", None)
+        if results is None:
+            results = [FakeSearchResult(chunk=FakeChunk(content="m"), score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(**cfg_overrides),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        return engine, obs, adapter
+
+    async def test_disabled_records_skip(self):
+        engine, obs, _ = self._engine_with_obs(enabled=False)
+        await engine.surface("s", "tool", VALID_ARGS, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["tool"] == {"disabled": 1}
+
+    async def test_response_too_short_records_skip(self):
+        engine, obs, _ = self._engine_with_obs(min_response_chars=10000)
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"response_too_short": 1}
+
+    async def test_circuit_open_records_skip(self):
+        engine, obs, _ = self._engine_with_obs()
+        # Force the breaker open by directly calling its failure recorder.
+        for _ in range(engine._circuit_breaker._max_failures):
+            engine._circuit_breaker.record_failure()
+        assert engine._circuit_breaker.is_open
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"circuit_open": 1}
+
+    async def test_no_results_score_records_skip_and_cache_miss(self):
+        results = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
+        engine, obs, _ = self._engine_with_obs(min_score=0.5, _results=results)
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        snap = obs.snapshot()
+        assert snap["skip_reasons"]["read_file"] == {"no_results_score": 1}
+        # First call goes through the miss path, so cache.miss == 1
+        assert snap["cache"] == {"miss": 1}
+
+    async def test_surfaced_cache_miss_then_hit(self):
+        results = [FakeSearchResult(chunk=FakeChunk(content="hit me"), score=0.5)]
+        engine, obs, _ = self._engine_with_obs(_results=results)
+        # Use a query stable across calls so the cache key matches; the
+        # in-memory ``_surfaced_ids`` would normally dedup the second call,
+        # but the cache short-circuits before dedup runs.
+        args = {"_context_query": "stable query for cache hit test"}
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        snap = obs.snapshot()
+        assert snap["outcomes"]["read_file"] == {
+            "surfaced_cache_miss": 1,
+            "surfaced_cache_hit": 1,
+        }
+        assert snap["cache"] == {"miss": 1, "hit": 1}
+
+    async def test_no_results_empty_cache_skip_on_repeat(self):
+        """An empty result populates the cache with []; the second identical
+        query is a cache hit but renders nothing — that's the
+        ``no_results_empty_cache`` bucket."""
+        engine, obs, _ = self._engine_with_obs(_results=[])
+        args = {"_context_query": "query that returns nothing"}
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        snap = obs.snapshot()
+        # First call: miss path → no LTM results → no_results_score
+        # Second call: cache hit (empty) → no_results_empty_cache
+        assert snap["skip_reasons"]["read_file"]["no_results_score"] == 1
+        assert snap["skip_reasons"]["read_file"]["no_results_empty_cache"] == 1
+        assert snap["cache"] == {"miss": 1, "hit": 1}
+
+    async def test_error_other_records_outcome(self):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=RuntimeError("boom"))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_other": 1}
+
+    async def test_error_timeout_records_outcome(self):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def slow_search(*a, **kw):
+            await asyncio.sleep(1.0)
+            return ([], [])
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=slow_search)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+
+    async def test_no_double_counting_per_call(self):
+        """Each surface() invocation records exactly one skip OR one outcome."""
+        engine, obs, _ = self._engine_with_obs()
+        for _ in range(5):
+            await engine.surface(
+                "s",
+                "read_file",
+                {"_context_query": f"q {time.time()}"},  # unique to bypass cooldown+cache
+                LONG_RESPONSE,
+            )
+        snap = obs.snapshot()
+        total_skips = sum(snap["skip_reasons"].get("read_file", {}).values())
+        total_outcomes = sum(snap["outcomes"].get("read_file", {}).values())
+        # 5 unique queries, score=0.5 default, default min_score=0.02 → all
+        # surface successfully; the gate's eager rate-limit claim still
+        # counts in the engine's outcome (surfaced_cache_miss).
+        assert total_skips + total_outcomes == 5
+
+    async def test_observability_omitted_keeps_engine_working(self):
+        """Default ``observability=None`` (existing callers) must not break
+        anything — the engine just doesn't record."""
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(content="ok"), score=0.5)]
+            ),
+        )
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "ok" in out
+        assert engine.observability is None
+

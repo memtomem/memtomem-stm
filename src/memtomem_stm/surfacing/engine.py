@@ -13,6 +13,7 @@ from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
+from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 
@@ -39,19 +40,27 @@ class SurfacingEngine:
         webhook_manager: Any | None = None,
         feedback_tracker: Any | None = None,
         token_tracker: Any | None = None,
+        observability: SurfacingObservability | None = None,
     ) -> None:
         self._config = config
         self._mcp_adapter = mcp_adapter
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
         self._token_tracker = token_tracker
+        # Public ``observability`` property still returns the original
+        # ``SurfacingObservability | None`` so consumers (server.py) can
+        # short-circuit on absence; ``_observability`` is the internal
+        # recording sink and never None — the no-op stand-in lets the call
+        # sites stay unconditional. Same shape inside RelevanceGate.
+        self._observability_public = observability
+        self._observability = observability if observability is not None else _NOOP_OBSERVABILITY
         self._auto_tuner = None
         if config.auto_tune_enabled and feedback_tracker is not None:
             from memtomem_stm.surfacing.feedback import AutoTuner
 
             self._auto_tuner = AutoTuner(config, feedback_tracker.store)
         self._extractor = ContextExtractor()
-        self._gate = RelevanceGate(config)
+        self._gate = RelevanceGate(config, observability=observability)
         self._formatter = SurfacingFormatter(config)
         self._cache = SurfacingCache(ttl=config.cache_ttl_seconds)
         self._circuit_breaker = CircuitBreaker(
@@ -105,6 +114,15 @@ class SurfacingEngine:
         self._last_cleanup: float = time.monotonic()
 
     @property
+    def observability(self) -> SurfacingObservability | None:
+        """Return the observability counter, if wired. Read by
+        ``server.py::stm_surfacing_stats`` to extend its output with
+        per-tool skip/outcome/cache aggregates. Always the value the
+        engine was constructed with — the internal no-op stand-in used
+        for unconditional recording is not exposed here."""
+        return self._observability_public
+
+    @property
     def injection_mode(self) -> str:
         """Formatter injection mode — ``"prepend"``, ``"append"``, or ``"section"``.
 
@@ -133,24 +151,33 @@ class SurfacingEngine:
         - timeout exceeded
         """
         if not self._config.enabled:
+            self._observability.record_skip(tool, "disabled")
             return response_text
 
         self._maybe_cleanup_expired()
 
         if len(response_text) < self._config.min_response_chars:
+            self._observability.record_skip(tool, "response_too_short")
             return response_text
 
         if self._circuit_breaker.is_open:
+            self._observability.record_skip(tool, "circuit_open")
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
             return response_text
 
         query = self._extractor.extract_query(server, tool, arguments, self._config)
-        if query is None or not self._gate.should_surface(server, tool, query):
+        if query is None:
+            self._observability.record_skip(tool, "no_query")
+            logger.debug("Surfacing skipped: no query extracted for %s/%s", server, tool)
+            return response_text
+        if not self._gate.should_surface(server, tool, query):
+            # Gate has already recorded the specific reason internally. Avoid
+            # double-counting by not recording at the engine level here.
             logger.debug(
                 "Surfacing skipped: gate rejected %s/%s (query=%s)",
                 server,
                 tool,
-                query[:50] if query else None,
+                query[:50],
             )
             return response_text
 
@@ -162,6 +189,7 @@ class SurfacingEngine:
             self._circuit_breaker.record_success()
             return result
         except asyncio.TimeoutError:
+            self._observability.record_outcome(tool, "error_timeout")
             logger.warning(
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
@@ -170,6 +198,7 @@ class SurfacingEngine:
             )
             return response_text
         except Exception:
+            self._observability.record_outcome(tool, "error_other")
             logger.warning("Surfacing failed for %s/%s", server, tool, exc_info=True)
             self._circuit_breaker.record_failure()
             return response_text
@@ -296,6 +325,11 @@ class SurfacingEngine:
         TTL window. A filtered-empty result pass-throughs like the natural
         empty case.
         """
+        # Track whether the entry started non-empty so we can distinguish a
+        # ``no_results_invalidated`` outcome (had results, all rejected) from
+        # ``no_results_empty_cache`` (the deliberate "no results" cache entry
+        # written by ``_do_surface_miss`` when LTM returned nothing relevant).
+        was_empty = not cached
         if cached and self._invalidated_ids:
             original_count = len(cached)
             cached = [
@@ -310,8 +344,13 @@ class SurfacingEngine:
                     len(cached),
                 )
         if not cached:
+            if was_empty:
+                self._observability.record_skip(tool, "no_results_empty_cache")
+            else:
+                self._observability.record_skip(tool, "no_results_invalidated")
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
             return response_text
+        self._observability.record_outcome(tool, "surfaced_cache_hit")
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
         surfacing_id: str | None = uuid.uuid4().hex[:16]
         if self._feedback_tracker is not None:
@@ -353,6 +392,7 @@ class SurfacingEngine:
         cache_key = f"{server}/{tool}/{query}"
         cached = self._cache.get(cache_key)
         if cached is not None:
+            self._observability.record_cache("hit")
             return self._render_cached(cached, response_text, query, server, tool)
 
         lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
@@ -362,7 +402,9 @@ class SurfacingEngine:
                 # lock ahead of us may have populated the cache already.
                 cached = self._cache.get(cache_key)
                 if cached is not None:
+                    self._observability.record_cache("hit")
                     return self._render_cached(cached, response_text, query, server, tool)
+                self._observability.record_cache("miss")
                 return await self._do_surface_miss(
                     server,
                     tool,
@@ -449,6 +491,14 @@ class SurfacingEngine:
         self._cache.set(cache_key, relevant)
 
         if not relevant:
+            # Distinguish "score filter killed everything" from "score filter
+            # passed but session-dedup killed everything" so an operator can
+            # tell whether to lower min_score (former) or whether the dedup
+            # is over-aggressive on long sessions (latter).
+            if scored:
+                self._observability.record_skip(tool, "no_results_dedup")
+            else:
+                self._observability.record_skip(tool, "no_results_score")
             logger.debug(
                 "Surfacing: no results above min_score=%.2f for %s/%s", min_score, server, tool
             )
@@ -519,6 +569,8 @@ class SurfacingEngine:
             surfacing_id=surfacing_id,
             scratch_items=scratch_items,
         )
+
+        self._observability.record_outcome(tool, "surfaced_cache_miss")
 
         # Fire webhook (fire-and-forget)
         if self._webhook_manager and self._config.fire_webhook:
