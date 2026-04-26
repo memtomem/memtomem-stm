@@ -167,6 +167,115 @@ def test_configuration_full_example_documents_upstream_timeouts() -> None:
         )
 
 
+def test_surfacing_md_documents_phase_1_observability_sample() -> None:
+    """docs/surfacing.md's ``stm_surfacing_stats`` example must include
+    the Phase 1 ``Skip reasons`` / ``Outcomes`` / ``Cache`` sections.
+
+    The header strings ship in ``server.py::_format_observability_sections``
+    (v0.1.19 / PR #256). If a future operator regenerates the sample
+    output and only captures the legacy event-counts block, readers
+    of `docs/surfacing.md` lose the only operator-facing surface that
+    explains *why* surfacing skipped, and the RFC's "no more
+    DEBUG-log only skips" promise becomes invisible. Scope the
+    assertion to the fenced code block immediately after the
+    "Check effectiveness with `stm_surfacing_stats`" prose so a
+    new section pasted into an unrelated part of the file cannot
+    satisfy the check.
+    """
+    server_src = _read("src/memtomem_stm/server.py")
+    # Pin the exact header literals server.py emits — if they ever
+    # rename, the test fails loudly here rather than silently passing
+    # against stale docs.
+    required_headers = ("Skip reasons", "Outcomes", "Cache (since process start)")
+    missing_in_source = [h for h in required_headers if h not in server_src]
+    if missing_in_source:
+        pytest.fail(
+            f"server.py no longer emits header(s) {missing_in_source!r} — "
+            "_format_observability_sections was likely renamed or its "
+            "literals changed. Update this test and docs/surfacing.md "
+            "together."
+        )
+
+    surfacing_md = _read("docs/surfacing.md")
+    # Locate the fenced sample block right after the "Check
+    # effectiveness" sentence. Splitting on triple-backtick fences and
+    # picking the one preceded by that phrase keeps the check tied to
+    # the operator-facing example, not any other code block in the
+    # file (e.g. a config snippet that happens to mention surfacing).
+    anchor = "Check effectiveness with `stm_surfacing_stats`:"
+    if anchor not in surfacing_md:
+        pytest.fail(
+            f"docs/surfacing.md no longer contains the {anchor!r} "
+            "anchor — the section was renamed or removed. Update this "
+            "test alongside the docs restructure."
+        )
+    after_anchor = surfacing_md.split(anchor, 1)[1]
+    block_match = re.search(r"```\n(.*?)\n```", after_anchor, re.DOTALL)
+    if not block_match:
+        pytest.fail(
+            "docs/surfacing.md no longer has a fenced sample block "
+            "after the 'Check effectiveness' anchor — restore the "
+            "stm_surfacing_stats example or update this test."
+        )
+    block = block_match.group(1)
+
+    missing_in_docs = [h for h in required_headers if h not in block]
+    if missing_in_docs:
+        pytest.fail(
+            f"docs/surfacing.md `stm_surfacing_stats` sample block is "
+            f"missing Phase 1 observability header(s): {missing_in_docs!r}. "
+            "These ship in server.py's _format_observability_sections "
+            "and are the operator-facing surface for skip reasons, "
+            "outcomes, and cache hit ratio (v0.1.19, #256). Without "
+            "them in the sample, readers cannot tell what the new "
+            "sections look like or what counters to expect."
+        )
+
+
+def test_cli_md_describes_surfacing_observability_columns() -> None:
+    """docs/cli.md's ``stm_surfacing_stats`` row in the observability
+    tools table must mention the Phase 1 axes (skip / outcome / cache)
+    in addition to the legacy event/feedback summary.
+
+    The MCP tool keeps its name and arguments shape across v0.1.18 →
+    v0.1.19, so a quick scan of the table description is the only
+    surface that tells an operator "this also reports skip reasons /
+    outcomes / cache hit ratio now." A description frozen at the
+    pre-#256 wording is silent drift — the tool is still listed, the
+    arg is still ``tool?``, but the new axes are invisible to anyone
+    not reading CHANGELOG. Scope the assertion to the row that names
+    `stm_surfacing_stats` to avoid false-passing on prose elsewhere
+    in the file.
+    """
+    cli_md = _read("docs/cli.md")
+    # Markdown table rows are single-line. Match the row that names
+    # ``stm_surfacing_stats`` in a backtick to avoid hitting prose
+    # references that happen to mention the tool.
+    row_match = re.search(r"^\|\s*`stm_surfacing_stats`\s*\|.*$", cli_md, re.MULTILINE)
+    if not row_match:
+        pytest.fail(
+            "docs/cli.md no longer has a `stm_surfacing_stats` row in "
+            "the observability tools table — the table was restructured "
+            "or the tool was renamed. Update this test alongside the "
+            "docs change."
+        )
+    row = row_match.group(0).lower()
+    # All three axes must be reachable from this row. Match
+    # case-insensitively and accept either singular or plural forms so
+    # a prose tweak ("skip reason" vs "skip reasons") doesn't false-fail.
+    required_axes = ("skip", "outcome", "cache")
+    missing_axes = [a for a in required_axes if a not in row]
+    if missing_axes:
+        pytest.fail(
+            f"docs/cli.md `stm_surfacing_stats` row is missing Phase 1 "
+            f"axis keyword(s): {missing_axes!r}. The row description "
+            "must surface skip reasons / outcomes / cache hit ratio "
+            "alongside the legacy event/feedback summary so operators "
+            "scanning the table see all axes the tool reports "
+            "(v0.1.19, #256)."
+        )
+
+
 def test_compression_md_llm_section_documents_timeout_fallback() -> None:
     """docs/compression.md's ``## LLM Compression`` section must surface
     ``llm_timeout_seconds`` in the config example or fallback prose.
