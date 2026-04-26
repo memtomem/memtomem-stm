@@ -291,4 +291,65 @@ By rating:
   already_known: 3
 
 Helpfulness: 73.7%
+
+Skip reasons (since process start):
+  __total__:
+    response_too_short: 142
+    gate_cooldown: 18
+    gate_write_tool: 89
+  read_file:
+    response_too_short: 142
+    gate_cooldown: 18
+  write_file:
+    gate_write_tool: 89
+
+Outcomes (since process start):
+  __total__:
+    surfaced_cache_miss: 14
+    surfaced_cache_hit: 9
+  read_file:
+    surfaced_cache_miss: 14
+    surfaced_cache_hit: 9
+
+Cache (since process start): hits 9, misses 14, hit ratio 39.1%
 ```
+
+The first block (totals + ratings + helpfulness) is read from
+`stm_feedback.db` and persists across restarts. The lower three
+sections — `Skip reasons`, `Outcomes`, `Cache` — are in-memory
+counters from `SurfacingObservability` and reset whenever the
+proxy process restarts. They are suppressed entirely when the
+proxy has not yet attempted any surfacing call, so the legacy
+output stays byte-for-byte for zero-traffic deployments.
+
+Each `surface()` call records exactly one skip reason **or** one
+outcome (no double-counting). Cache hit/miss is incremented on
+every cache lookup independently of what the lookup ultimately
+renders, so the hit ratio reflects raw cache behavior rather
+than post-filter results. A reject path that an operator might
+hit:
+
+- `response_too_short` — tool response below `min_response_chars`
+  (default 5000).
+- `gate_write_tool` / `gate_excluded_tool` / `gate_tool_disabled`
+  / `gate_rate_limit` / `gate_cooldown` — a `RelevanceGate`
+  reject; check the gate config for the offending bucket.
+- `circuit_open` — repeated upstream failures opened the circuit
+  breaker. Surfacing pauses for `circuit_reset_seconds` (default
+  60s) before retrying.
+- `no_query` — `ContextExtractor` could not synthesize a query
+  from the tool arguments and fell below `min_query_tokens`.
+- `no_results_score` — LTM returned results, none above
+  `min_score`. Lower the threshold for that tool via
+  `context_tools.<name>.min_score` if the tool is consistently
+  missed.
+- `no_results_dedup` — every result was already surfaced this
+  session and dropped by `_surfaced_ids`. Distinct from
+  `no_results_score` so an operator can tell whether to lower
+  `min_score` or whether session-dedup is over-aggressive on
+  long sessions.
+- `no_results_invalidated` — every memory in a cache hit was
+  rated `not_relevant` / `already_known` within the cache TTL.
+- `no_results_empty_cache` — the cache stored an empty list
+  (deliberate zero-result entry from a prior LTM miss) and the
+  repeat call hit it.
