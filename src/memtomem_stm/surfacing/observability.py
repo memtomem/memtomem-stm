@@ -54,6 +54,16 @@ Outcome = Literal[
 
 CacheBucket = Literal["hit", "miss"]
 
+# Sentinel string key for the "all tools" aggregate row in per-tool dicts.
+# Stays a string (not an ``object()`` sentinel) so ``snapshot()`` keeps
+# returning a JSON-serializable dict — the consumer
+# (``server.py::stm_surfacing_stats``) renders the dict as text and a
+# downstream JSON wrapper around the same shape would otherwise need a
+# custom encoder. The double-underscore prefix means a real tool name
+# would have to be literally ``__total__`` to collide, which is
+# vanishingly unlikely; the consumer also uses an explicit
+# ``__total__``-first ordering rather than relying on lexicographic sort
+# so even a tool name starting with ``__`` would not bury the aggregate.
 _TOTAL_KEY = "__total__"
 
 
@@ -112,3 +122,35 @@ class SurfacingObservability:
                 "outcomes": {tool: dict(outcomes) for tool, outcomes in self._outcomes.items()},
                 "cache": dict(self._cache),
             }
+
+
+class _NoOpObservability:
+    """No-op stand-in used when the engine/gate is constructed without an
+    explicit observability instance. Lets the recording call sites stay
+    unconditional (``self._observability.record_skip(...)``) instead of
+    18+ ``if self._observability is not None:`` guards across engine.py
+    and relevance.py — the helper-extract threshold from the codebase's
+    "4+ defensive sites recur" rule.
+
+    ``snapshot()`` is intentionally absent — callers asking for a
+    snapshot from a no-op instance is a programming error (the engine
+    exposes ``observability`` as ``SurfacingObservability | None``, so
+    consumers like ``stm_surfacing_stats`` can short-circuit on
+    ``None``). Distinguishing the no-op from a real instance is the job
+    of the engine's ``observability`` property accessor; the no-op is
+    purely an internal recording sink.
+    """
+
+    __slots__ = ()
+
+    def record_skip(self, tool: str, reason: SkipReason) -> None:
+        return None
+
+    def record_outcome(self, tool: str, outcome: Outcome) -> None:
+        return None
+
+    def record_cache(self, bucket: CacheBucket) -> None:
+        return None
+
+
+_NOOP_OBSERVABILITY: _NoOpObservability = _NoOpObservability()

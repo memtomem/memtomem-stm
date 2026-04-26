@@ -7,7 +7,7 @@ from collections import deque
 from fnmatch import fnmatch
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.observability import SurfacingObservability
+from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 
 # Module-level constants
 _MAX_RECENT_QUERIES = 50
@@ -26,7 +26,11 @@ class RelevanceGate:
         observability: SurfacingObservability | None = None,
     ) -> None:
         self._config = config
-        self._observability = observability
+        # Internal recording sink — never None. The public ``observability``
+        # is still ``SurfacingObservability | None`` so consumers can
+        # short-circuit on absence; the no-op stand-in lets the call sites
+        # stay unconditional.
+        self._observability = observability if observability is not None else _NOOP_OBSERVABILITY
         self._recent_queries: deque[tuple[float, str]] = deque(maxlen=_MAX_RECENT_QUERIES)
         self._surfacing_timestamps: deque[float] = deque(maxlen=_MAX_SURFACING_TIMESTAMPS)
 
@@ -60,22 +64,19 @@ class RelevanceGate:
         # Explicit exclusions
         for pattern in self._config.exclude_tools:
             if fnmatch(full_name, pattern) or fnmatch(tool, pattern):
-                if self._observability is not None:
-                    self._observability.record_skip(tool, "gate_excluded_tool")
+                self._observability.record_skip(tool, "gate_excluded_tool")
                 return False
 
         # Write-tool heuristic
         for pattern in self._config.write_tool_patterns:
             if fnmatch(tool, pattern):
-                if self._observability is not None:
-                    self._observability.record_skip(tool, "gate_write_tool")
+                self._observability.record_skip(tool, "gate_write_tool")
                 return False
 
         # Per-tool override
         tool_cfg = self._config.context_tools.get(tool)
         if tool_cfg is not None and not tool_cfg.enabled:
-            if self._observability is not None:
-                self._observability.record_skip(tool, "gate_tool_disabled")
+            self._observability.record_skip(tool, "gate_tool_disabled")
             return False
 
         # Rate limit
@@ -86,8 +87,7 @@ class RelevanceGate:
         ):
             self._surfacing_timestamps.popleft()
         if len(self._surfacing_timestamps) >= self._config.max_surfacings_per_minute:
-            if self._observability is not None:
-                self._observability.record_skip(tool, "gate_rate_limit")
+            self._observability.record_skip(tool, "gate_rate_limit")
             return False
 
         # Cooldown: skip if very similar query was recently surfaced
@@ -95,8 +95,7 @@ class RelevanceGate:
             if now - ts >= self._config.cooldown_seconds:
                 break
             if self._jaccard_similarity(query, prev_query) > _SIMILARITY_THRESHOLD:
-                if self._observability is not None:
-                    self._observability.record_skip(tool, "gate_cooldown")
+                self._observability.record_skip(tool, "gate_cooldown")
                 return False
 
         # Eagerly claim the rate-limit slot. A concurrent ``should_surface``

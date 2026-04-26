@@ -13,7 +13,7 @@ from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
-from memtomem_stm.surfacing.observability import SurfacingObservability
+from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 
@@ -47,7 +47,13 @@ class SurfacingEngine:
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
         self._token_tracker = token_tracker
-        self._observability = observability
+        # Public ``observability`` property still returns the original
+        # ``SurfacingObservability | None`` so consumers (server.py) can
+        # short-circuit on absence; ``_observability`` is the internal
+        # recording sink and never None — the no-op stand-in lets the call
+        # sites stay unconditional. Same shape inside RelevanceGate.
+        self._observability_public = observability
+        self._observability = observability if observability is not None else _NOOP_OBSERVABILITY
         self._auto_tuner = None
         if config.auto_tune_enabled and feedback_tracker is not None:
             from memtomem_stm.surfacing.feedback import AutoTuner
@@ -111,8 +117,10 @@ class SurfacingEngine:
     def observability(self) -> SurfacingObservability | None:
         """Return the observability counter, if wired. Read by
         ``server.py::stm_surfacing_stats`` to extend its output with
-        per-tool skip/outcome/cache aggregates."""
-        return self._observability
+        per-tool skip/outcome/cache aggregates. Always the value the
+        engine was constructed with — the internal no-op stand-in used
+        for unconditional recording is not exposed here."""
+        return self._observability_public
 
     @property
     def injection_mode(self) -> str:
@@ -143,27 +151,23 @@ class SurfacingEngine:
         - timeout exceeded
         """
         if not self._config.enabled:
-            if self._observability is not None:
-                self._observability.record_skip(tool, "disabled")
+            self._observability.record_skip(tool, "disabled")
             return response_text
 
         self._maybe_cleanup_expired()
 
         if len(response_text) < self._config.min_response_chars:
-            if self._observability is not None:
-                self._observability.record_skip(tool, "response_too_short")
+            self._observability.record_skip(tool, "response_too_short")
             return response_text
 
         if self._circuit_breaker.is_open:
-            if self._observability is not None:
-                self._observability.record_skip(tool, "circuit_open")
+            self._observability.record_skip(tool, "circuit_open")
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
             return response_text
 
         query = self._extractor.extract_query(server, tool, arguments, self._config)
         if query is None:
-            if self._observability is not None:
-                self._observability.record_skip(tool, "no_query")
+            self._observability.record_skip(tool, "no_query")
             logger.debug("Surfacing skipped: no query extracted for %s/%s", server, tool)
             return response_text
         if not self._gate.should_surface(server, tool, query):
@@ -185,8 +189,7 @@ class SurfacingEngine:
             self._circuit_breaker.record_success()
             return result
         except asyncio.TimeoutError:
-            if self._observability is not None:
-                self._observability.record_outcome(tool, "error_timeout")
+            self._observability.record_outcome(tool, "error_timeout")
             logger.warning(
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
@@ -195,8 +198,7 @@ class SurfacingEngine:
             )
             return response_text
         except Exception:
-            if self._observability is not None:
-                self._observability.record_outcome(tool, "error_other")
+            self._observability.record_outcome(tool, "error_other")
             logger.warning("Surfacing failed for %s/%s", server, tool, exc_info=True)
             self._circuit_breaker.record_failure()
             return response_text
@@ -342,15 +344,13 @@ class SurfacingEngine:
                     len(cached),
                 )
         if not cached:
-            if self._observability is not None:
-                if was_empty:
-                    self._observability.record_skip(tool, "no_results_empty_cache")
-                else:
-                    self._observability.record_skip(tool, "no_results_invalidated")
+            if was_empty:
+                self._observability.record_skip(tool, "no_results_empty_cache")
+            else:
+                self._observability.record_skip(tool, "no_results_invalidated")
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
             return response_text
-        if self._observability is not None:
-            self._observability.record_outcome(tool, "surfaced_cache_hit")
+        self._observability.record_outcome(tool, "surfaced_cache_hit")
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
         surfacing_id: str | None = uuid.uuid4().hex[:16]
         if self._feedback_tracker is not None:
@@ -392,8 +392,7 @@ class SurfacingEngine:
         cache_key = f"{server}/{tool}/{query}"
         cached = self._cache.get(cache_key)
         if cached is not None:
-            if self._observability is not None:
-                self._observability.record_cache("hit")
+            self._observability.record_cache("hit")
             return self._render_cached(cached, response_text, query, server, tool)
 
         lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
@@ -403,11 +402,9 @@ class SurfacingEngine:
                 # lock ahead of us may have populated the cache already.
                 cached = self._cache.get(cache_key)
                 if cached is not None:
-                    if self._observability is not None:
-                        self._observability.record_cache("hit")
+                    self._observability.record_cache("hit")
                     return self._render_cached(cached, response_text, query, server, tool)
-                if self._observability is not None:
-                    self._observability.record_cache("miss")
+                self._observability.record_cache("miss")
                 return await self._do_surface_miss(
                     server,
                     tool,
@@ -498,11 +495,10 @@ class SurfacingEngine:
             # passed but session-dedup killed everything" so an operator can
             # tell whether to lower min_score (former) or whether the dedup
             # is over-aggressive on long sessions (latter).
-            if self._observability is not None:
-                if scored:
-                    self._observability.record_skip(tool, "no_results_dedup")
-                else:
-                    self._observability.record_skip(tool, "no_results_score")
+            if scored:
+                self._observability.record_skip(tool, "no_results_dedup")
+            else:
+                self._observability.record_skip(tool, "no_results_score")
             logger.debug(
                 "Surfacing: no results above min_score=%.2f for %s/%s", min_score, server, tool
             )
@@ -574,8 +570,7 @@ class SurfacingEngine:
             scratch_items=scratch_items,
         )
 
-        if self._observability is not None:
-            self._observability.record_outcome(tool, "surfaced_cache_miss")
+        self._observability.record_outcome(tool, "surfaced_cache_miss")
 
         # Fire webhook (fire-and-forget)
         if self._webhook_manager and self._config.fire_webhook:

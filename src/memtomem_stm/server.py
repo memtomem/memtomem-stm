@@ -19,6 +19,7 @@ from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.observability import SurfacingObservability
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 
@@ -153,8 +154,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                                 exc_info=True,
                             )
                             feedback_tracker = None
-
-                    from memtomem_stm.surfacing.observability import SurfacingObservability
 
                     surfacing_engine = SurfacingEngine(
                         config.surfacing,
@@ -693,6 +692,20 @@ async def stm_surfacing_stats(
         return "\n".join(lines)
 
 
+def _ordered_tool_keys(per_tool: dict) -> list[str]:
+    """Pin ``__total__`` first regardless of ASCII order.
+
+    ``sorted()`` would put ``__total__`` first only because ``_`` (0x5F)
+    sorts before lowercase letters (0x61+). A PascalCase tool name would
+    sort under ``A`` (0x41) and bury the aggregate row mid-list. Pinning
+    the total explicitly removes the dependency on naming convention.
+    """
+    keys = sorted(t for t in per_tool if t != "__total__")
+    if "__total__" in per_tool:
+        keys.insert(0, "__total__")
+    return keys
+
+
 def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
     """Render the Skip reasons / Outcomes / Cache sections for stm_surfacing_stats.
 
@@ -715,7 +728,7 @@ def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -
 
     if skip_reasons:
         lines.append("\nSkip reasons (since process start):")
-        for tool_name in sorted(skip_reasons.keys()):
+        for tool_name in _ordered_tool_keys(skip_reasons):
             reasons = skip_reasons[tool_name]
             if not reasons:
                 continue
@@ -725,7 +738,7 @@ def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -
 
     if outcomes:
         lines.append("\nOutcomes (since process start):")
-        for tool_name in sorted(outcomes.keys()):
+        for tool_name in _ordered_tool_keys(outcomes):
             tool_outcomes = outcomes[tool_name]
             if not tool_outcomes:
                 continue

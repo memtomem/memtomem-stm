@@ -8,7 +8,7 @@ focused on the standalone counter contract and the stats formatter.
 
 from __future__ import annotations
 
-from memtomem_stm.server import _format_observability_sections
+from memtomem_stm.server import _format_observability_sections, _ordered_tool_keys
 from memtomem_stm.surfacing.observability import SurfacingObservability
 
 
@@ -138,6 +138,27 @@ class TestFormatObservabilitySections:
         joined = "\n".join(lines)
         assert "Skip reasons" in joined
         assert "Cache" not in joined
+
+    def test_total_pinned_first_regardless_of_ascii_order(self):
+        """Reviewer feedback on PR #256: ``sorted()`` happens to put
+        ``__total__`` first because ``_`` (0x5F) sorts before lowercase
+        letters (0x61+), but a PascalCase tool name like ``ReadFile``
+        (0x52 starting) would sort before ``__total__`` and bury the
+        aggregate row mid-list. ``_ordered_tool_keys`` must pin
+        ``__total__`` first explicitly."""
+        per_tool = {
+            "ReadFile": {"disabled": 1},
+            "__total__": {"disabled": 3},
+            "alpha_tool": {"disabled": 2},
+        }
+        ordered = _ordered_tool_keys(per_tool)
+        assert ordered == ["__total__", "ReadFile", "alpha_tool"]
+
+    def test_ordered_tool_keys_no_total_returns_sorted(self):
+        """When the per-tool dict has no aggregate row (zero-traffic edge),
+        the helper must not synthesize one — just return the sorted keys."""
+        per_tool = {"b": {}, "a": {}}
+        assert _ordered_tool_keys(per_tool) == ["a", "b"]
 
     def test_descending_sort_within_a_tool(self):
         """The most frequent reason should appear first under each tool —
