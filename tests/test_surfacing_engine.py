@@ -1614,3 +1614,50 @@ class TestSurfacingEngineObservability:
         assert "ok" in out
         assert engine.observability is None
 
+    async def test_no_query_records_skip(self):
+        """When ``ContextExtractor.extract_query`` returns None — the
+        fallback tool-name token count below ``min_query_tokens`` — the
+        engine records ``no_query``. Force the None return by raising
+        ``min_query_tokens`` above any fallback's token count rather than
+        relying on the default value, so a future default change cannot
+        silently push the test onto a different path."""
+        engine, obs, _ = self._engine_with_obs(min_query_tokens=999)
+        await engine.surface("s", "read_file", {}, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"no_query": 1}
+
+    async def test_no_results_dedup_records_skip(self):
+        """Results pass the score filter but every memory id is already in
+        ``_surfaced_ids`` from an earlier surface — distinct from
+        ``no_results_score`` so an operator can tell whether to lower
+        ``min_score`` (former) or whether session-dedup is over-aggressive
+        on long sessions (latter)."""
+        chunk = FakeChunk(id="dup-id", content="m")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        engine, obs, _ = self._engine_with_obs(_results=results)
+        engine._surfaced_ids["dup-id"] = None
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        snap = obs.snapshot()
+        assert snap["skip_reasons"]["read_file"] == {"no_results_dedup": 1}
+        assert snap["cache"] == {"miss": 1}
+
+    async def test_no_results_invalidated_records_skip(self):
+        """Cache hit returns results but all are in ``_invalidated_ids``
+        (rated ``not_relevant`` / ``already_known`` within the cache TTL) —
+        distinct from ``no_results_empty_cache`` so an operator can tell
+        whether the cache was deliberately seeded empty (LTM had nothing)
+        or whether feedback invalidated everything since."""
+        chunk = FakeChunk(id="inv-id", content="m")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        engine, obs, _ = self._engine_with_obs(_results=results)
+        args = {"_context_query": "stable cache key for invalidation test"}
+        # First call: miss path populates cache with [chunk inv-id].
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        # Mark the surfaced memory invalidated for this server/tool. The
+        # second call hits the cache, runs the invalidation filter, and
+        # falls through to the "had results, all rejected" branch.
+        engine._invalidated_ids[("s", "read_file", "inv-id")] = None
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        snap = obs.snapshot()
+        assert snap["outcomes"]["read_file"] == {"surfaced_cache_miss": 1}
+        assert snap["skip_reasons"]["read_file"] == {"no_results_invalidated": 1}
+        assert snap["cache"] == {"miss": 1, "hit": 1}
