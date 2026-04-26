@@ -1617,11 +1617,13 @@ class TestSurfacingEngineObservability:
     async def test_no_query_records_skip(self):
         """When ``ContextExtractor.extract_query`` returns None — the
         fallback tool-name token count below ``min_query_tokens`` — the
-        engine records ``no_query``. Default ``min_query_tokens=3`` and a
-        1-character tool name with no semantic args triggers the path."""
-        engine, obs, _ = self._engine_with_obs()
-        await engine.surface("s", "t", {}, LONG_RESPONSE)
-        assert obs.snapshot()["skip_reasons"]["t"] == {"no_query": 1}
+        engine records ``no_query``. Force the None return by raising
+        ``min_query_tokens`` above any fallback's token count rather than
+        relying on the default value, so a future default change cannot
+        silently push the test onto a different path."""
+        engine, obs, _ = self._engine_with_obs(min_query_tokens=999)
+        await engine.surface("s", "read_file", {}, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"no_query": 1}
 
     async def test_no_results_dedup_records_skip(self):
         """Results pass the score filter but every memory id is already in
