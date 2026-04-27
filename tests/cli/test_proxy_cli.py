@@ -450,10 +450,15 @@ class TestAddValidation:
             ["add", "s", "--prefix", long_prefix, "--command", "x", *_cfg_args(config)],
         )
         assert result.exit_code == 1
-        assert "exceeds the budget" in result.output or "is 43 chars" in result.output
-        # The error should point to both fixes the user can take.
-        assert "shorter --prefix" in result.output.lower() or "Pick a shorter" in result.output
-        assert "mms" in result.output  # mentions the short-server-name workaround
+        assert "Error:" in result.output
+        # Error names the offending length and the relevant max — both
+        # are pulled from the helper, so this catches drift if either
+        # the message template or the budget arithmetic changes.
+        assert "is 43 chars" in result.output
+        assert "max for client server name 'memtomem-stm' is 42" in result.output
+        # Suggestions surface both fix paths the user can take.
+        assert "Use a shorter --prefix" in result.output
+        assert "Register STM as 'mms'" in result.output
 
     def test_warns_on_prefix_above_soft_threshold(self, runner, config, monkeypatch):
         """Above 21 chars but within hard budget: warn and proceed (it might
@@ -492,8 +497,14 @@ class TestAddValidation:
             cli,
             ["add", "s", "--prefix", prefix, "--command", "x", *_cfg_args(config)],
         )
-        assert result.exit_code == 0  # passes (with a warn since > 21)
-        assert "exceeds the budget" not in result.output
+        assert result.exit_code == 0  # passes — no longer a hard reject
+        # Hard-reject message is gone (the user-visible signal of a real
+        # negative — checking for the actual error template fragment, not
+        # an arbitrary string that happens to be absent everywhere).
+        assert "Error:" not in result.output
+        assert "max for client server name" not in result.output
+        # Should still warn since 43 > the (relaxed) warn threshold of 30.
+        assert "Warning" in result.output
 
     def test_rejects_duplicate_server_name(self, runner, config):
         runner.invoke(

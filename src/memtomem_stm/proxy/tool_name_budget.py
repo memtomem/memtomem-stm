@@ -58,8 +58,14 @@ _FIXED_TEMPLATE_BYTES = 9
 
 
 def client_server_name() -> str:
-    """Effective client-side MCP server name used for budget arithmetic."""
-    return os.environ.get(_OVERRIDE_ENV_VAR, _DEFAULT_CLIENT_SERVER_NAME)
+    """Effective client-side MCP server name used for budget arithmetic.
+
+    Treats an empty env var the same as unset — exporting
+    ``MMS_CLIENT_SERVER_NAME=""`` would otherwise drop the overhead to 9
+    bytes, which never matches a real client config and silently
+    permits overflows the user expected to be rejected.
+    """
+    return os.environ.get(_OVERRIDE_ENV_VAR) or _DEFAULT_CLIENT_SERVER_NAME
 
 
 def overhead() -> int:
@@ -82,12 +88,22 @@ def prefix_hard_limit() -> int:
     return TOOL_NAME_LIMIT - overhead() - 1  # leave 1 char for the tool
 
 
-# Empirically tuned: leaves 22 chars for the upstream tool name, which
-# covers the median observed across public MCP servers (typically 15-25
-# chars). Above this, moderately-named tools start to overflow even for
-# the recommended worst-case client server name.
-_PREFIX_WARN_BYTES = 21
+# Empirically tuned: budget kept aside for the upstream tool name when
+# deciding whether a prefix deserves a warning. Median observed tool
+# name across public MCP servers is 15-25 chars, so 22 leaves room for
+# everything but the longest outliers. Once a prefix eats into this
+# budget, moderately-named tools start to overflow.
+_WARN_TOOL_NAME_BUDGET = 22
 
 
 def prefix_warn_threshold() -> int:
-    return _PREFIX_WARN_BYTES
+    """Soft threshold — above this, prefix + a median-length (~22 char)
+    tool name starts to overflow under the strictest client format.
+
+    Derived from the current ``client_server_name()`` so the threshold
+    follows the same dynamic basis as ``prefix_hard_limit()`` — keeping
+    the helper consistent across the env-var override path. For the
+    default 12-char ``memtomem-stm`` server (overhead 21), this is 21;
+    for ``mms`` (overhead 12), it relaxes to 30.
+    """
+    return TOOL_NAME_LIMIT - overhead() - _WARN_TOOL_NAME_BUDGET

@@ -92,10 +92,20 @@ class TestPrefixThresholds:
         # 64 - (9 + 3) - 1 = 51 — much more room
         assert tool_name_budget.prefix_hard_limit() == 51
 
-    def test_warn_threshold_is_constant(self, monkeypatch):
-        # Empirical heuristic — leaves 22 chars for tool name (median).
+    def test_warn_threshold_for_default_server(self, monkeypatch):
+        # 64 - 21 (overhead) - 22 (median tool budget) = 21
         monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
         assert tool_name_budget.prefix_warn_threshold() == 21
+
+    def test_warn_threshold_loosens_with_short_server_name(self, monkeypatch):
+        # Threshold has to follow ``client_server_name()`` for the same
+        # reason ``prefix_hard_limit()`` does — otherwise users on the
+        # recommended ``mms`` registration get warned at the same prefix
+        # length as users on the default 12-char server even though they
+        # have 9 bytes of extra headroom (overhead 12 vs 21).
+        monkeypatch.setenv("MMS_CLIENT_SERVER_NAME", "mms")
+        # 64 - 12 - 22 = 30
+        assert tool_name_budget.prefix_warn_threshold() == 30
 
 
 class TestClientServerNameLookup:
@@ -106,6 +116,14 @@ class TestClientServerNameLookup:
     def test_env_var_overrides(self, monkeypatch):
         monkeypatch.setenv("MMS_CLIENT_SERVER_NAME", "custom-stm")
         assert tool_name_budget.client_server_name() == "custom-stm"
+
+    def test_empty_env_var_falls_back_to_default(self, monkeypatch):
+        """An exported-but-empty env var (``export MMS_CLIENT_SERVER_NAME=``)
+        would otherwise drop overhead to 9 bytes (no server segment), which
+        matches no real client config — silently permitting overflows the
+        user expected the check to catch. Treat it the same as unset."""
+        monkeypatch.setenv("MMS_CLIENT_SERVER_NAME", "")
+        assert tool_name_budget.client_server_name() == "memtomem-stm"
 
 
 class TestSpecConstant:
