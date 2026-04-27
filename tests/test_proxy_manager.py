@@ -205,7 +205,9 @@ class TestAutoIndexStartupWarning:
             try:
                 await mgr.start()
             except (Exception, asyncio.CancelledError):
-                # See sibling test for why we catch CancelledError here too.
+                # MCP SDK can surface upstream exit as CancelledError
+                # (BaseException); safe to swallow — the warning we assert
+                # on fires before the connect loop runs.
                 pass
         assert not any("permanently lost" in r.message for r in caplog.records)
 
