@@ -269,9 +269,14 @@ Options:
   --json                   Output as JSON for scripting.
   --timeout INTEGER RANGE  Per-server connection timeout in seconds.
                            [default: 10; x>=1]
+  --names                  Also report any upstream tool whose composed
+                           proxied name (`mcp__<server>__<prefix>__<tool>`)
+                           would exceed the 64-char MCP limit.
 ```
 
 Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running.
+
+`--names` re-runs the same composed-name overflow check the proxy applies at boot (#261), so an operator diagnosing "one tool from server X went silently missing after registration" can answer the question without restarting STM. The flag uses the default client server name `memtomem-stm` (12 chars) for the `mcp__<client-server>__…` template; if you registered STM under a shorter alias like `mms`, set `MMS_CLIENT_SERVER_NAME=mms` so the budget calculation matches the surface name your client actually composes.
 
 ## MCP Tools (11 + proxied)
 
