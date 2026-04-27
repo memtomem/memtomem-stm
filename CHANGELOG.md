@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.20] — 2026-04-27
+
 ### Changed
 
 - **`ProxyConfig` now rejects upstreams with empty or whitespace-only `prefix`** (#266) — `UpstreamServerConfig.prefix: str` had no min-length, so `""` validated fine and produced composed tool names like `__list_items` that surfaced in `tools/list` as visually broken entries. The empty prefix also skewed `tool_name_budget.composed_length("", t.name)` (the prefix portion is zero), so the 64-char overflow guard added in #261 underestimated the real surface name a client sees, and a single empty prefix slipped past the duplicate-prefix validator added in #265 (which only fires on collisions). A new `@model_validator(mode="after")` on `ProxyConfig` raises `ValidationError` at config load with every offending upstream key listed together — `Empty upstream prefix in upstreams: ['blank', 'spaces']` — so the user fixes them all in a single round-trip without the uniqueness validator firing as second-iteration noise. Whitespace-only (`"   "`) is treated the same as empty since both are typo classes. **Behavior change:** configs that previously loaded with broken composed names now fail at startup; hot-reload (`ProxyConfigLoader.get`) retains the previous good config on validation failure, matching the behavior introduced for #265.
