@@ -92,6 +92,37 @@ class TestProxyConfigLoader:
         # and now sees the same mtime → skips reload → returns stale config.
         assert loader.get().enabled is True
 
+    def test_duplicate_prefix_reload_keeps_previous_good_config(self, tmp_path):
+        """If a hot-reloaded config violates the duplicate-prefix validator,
+        the loader must keep the previously cached good config rather than
+        reverting to defaults — a running proxy stays serving its last
+        known-good upstreams instead of going dark."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "upstream_servers": {"gh": {"prefix": "gh", "command": "gh-server"}},
+        }))
+        loader = ProxyConfigLoader(cfg_file)
+        good = loader.get()
+        assert good.enabled is True
+        assert "gh" in good.upstream_servers
+
+        # User edits the file, accidentally giving two upstreams the same prefix.
+        time.sleep(0.05)
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "upstream_servers": {
+                "gh": {"prefix": "dup", "command": "gh-server"},
+                "gh2": {"prefix": "dup", "command": "gh-server-2"},
+            },
+        }))
+
+        # Loader must keep the previous good config, not fall back to defaults.
+        reloaded = loader.get()
+        assert reloaded.enabled is True
+        assert reloaded.upstream_servers["gh"].prefix == "gh"
+        assert "gh2" not in reloaded.upstream_servers
+
 
 # ── MetricsStore persistence ─────────────────────────────────────────────
 

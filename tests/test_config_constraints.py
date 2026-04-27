@@ -11,6 +11,7 @@ from memtomem_stm.proxy.config import (
     ExtractionConfig,
     LLMCompressorConfig,
     LLMProvider,
+    ProxyConfig,
     RelevanceScorerConfig,
     SelectiveConfig,
     UpstreamServerConfig,
@@ -248,6 +249,85 @@ class TestLangfusePackageValidator:
         cfg = LangfuseConfig(enabled=False)
         assert cfg.enabled is False
         assert "langfuse" not in calls
+
+
+class TestProxyConfigUniquePrefixes:
+    """Two upstreams sharing a prefix used to load fine and silently drop the
+    second upstream's colliding tools at ``ProxyManager.start()``. Reject at
+    config-load time so the typo surfaces immediately."""
+
+    def test_duplicate_prefix_two_upstreams_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # LLMCompressorConfig has its own env-driven validator; isolate.
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "serverA": UpstreamServerConfig(prefix="mcp1", command="a"),
+                    "serverB": UpstreamServerConfig(prefix="mcp1", command="b"),
+                }
+            )
+        msg = str(exc_info.value)
+        # Both upstream keys AND the colliding prefix value must appear so the
+        # user can locate the typo without re-reading the config.
+        assert "mcp1" in msg
+        assert "serverA" in msg
+        assert "serverB" in msg
+
+    def test_three_way_collision_lists_all_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "a": UpstreamServerConfig(prefix="dup", command="x"),
+                    "b": UpstreamServerConfig(prefix="dup", command="y"),
+                    "c": UpstreamServerConfig(prefix="dup", command="z"),
+                }
+            )
+        msg = str(exc_info.value)
+        # All three upstream keys reported in one error so the user fixes
+        # them in a single round-trip rather than chasing them one at a time.
+        for key in ("a", "b", "c"):
+            assert f"'{key}'" in msg
+
+    def test_unique_prefixes_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        cfg = ProxyConfig(
+            upstream_servers={
+                "gh": UpstreamServerConfig(prefix="gh", command="gh-server"),
+                "fs": UpstreamServerConfig(prefix="fs", command="fs-server"),
+                "slack": UpstreamServerConfig(prefix="slack", command="slack-server"),
+            }
+        )
+        assert set(cfg.upstream_servers) == {"gh", "fs", "slack"}
+
+    def test_single_upstream_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        cfg = ProxyConfig(
+            upstream_servers={"only": UpstreamServerConfig(prefix="only", command="x")}
+        )
+        assert cfg.upstream_servers["only"].prefix == "only"
+
+    def test_two_collision_groups_reported_together(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "a1": UpstreamServerConfig(prefix="alpha", command="x"),
+                    "a2": UpstreamServerConfig(prefix="alpha", command="y"),
+                    "b1": UpstreamServerConfig(prefix="beta", command="x"),
+                    "b2": UpstreamServerConfig(prefix="beta", command="y"),
+                }
+            )
+        msg = str(exc_info.value)
+        # Independent collision groups must surface together so the user
+        # doesn't need a second load to find the second typo.
+        assert "alpha" in msg
+        assert "beta" in msg
 
 
 class TestLogLevel:
