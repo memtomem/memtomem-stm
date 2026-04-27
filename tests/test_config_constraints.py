@@ -384,6 +384,28 @@ class TestProxyConfigNonemptyPrefix:
         # The legitimate upstream is not falsely flagged.
         assert "'ok'" not in msg
 
+    def test_two_empty_prefixes_report_empty_not_duplicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pins validator declaration order: _check_nonempty_upstream_prefixes
+        # must run before _check_unique_upstream_prefixes. If the order
+        # flipped (e.g. an alphabetical reorder, or a refactor that merges
+        # the two), the user would see "Duplicate upstream prefixes
+        # detected: prefix '' used by …" — technically true but the empty
+        # error is the more actionable root cause.
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "a": UpstreamServerConfig(prefix="", command="x"),
+                    "b": UpstreamServerConfig(prefix="", command="y"),
+                }
+            )
+        msg = str(exc_info.value)
+        assert "Empty upstream prefix" in msg
+        assert "Duplicate" not in msg
+
 
 class TestLogLevel:
     def test_default_is_warning(self) -> None:
