@@ -95,7 +95,7 @@ mms register
 To register manually, use `claude` directly:
 
 ```bash
-claude mcp add memtomem-stm -s user -- memtomem-stm
+claude mcp add mms -s user -- mms
 ```
 
 Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
@@ -103,12 +103,23 @@ Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
 ```json
 {
   "mcpServers": {
-    "memtomem-stm": {
-      "command": "memtomem-stm"
+    "mms": {
+      "command": "mms"
     }
   }
 }
 ```
+
+> **Why `mms` and not `memtomem-stm`?** Either name works (the three
+> entry points are interchangeable), but the MCP client composes proxied
+> tool names as `mcp__<server>__<prefix>__<tool>`. The short alias
+> `mms` (3 chars) saves 9 bytes vs `memtomem-stm` (12 chars), which is
+> exactly enough headroom to keep upstreams with long tool names under
+> the 64-char MCP limit. If you registered under a different name and
+> want the `mms add` overflow check (#261) to match exactly, export
+> `MMS_CLIENT_SERVER_NAME=<name>` in your shell — otherwise the default
+> assumption is conservative and at worst causes a few false-positive
+> warnings on borderline prefixes.
 
 ### 3. Use the proxied tools
 

@@ -437,6 +437,64 @@ class TestAddValidation:
         assert result.exit_code == 1
         assert "invalid prefix" in result.output
 
+    def test_rejects_prefix_over_hard_budget(self, runner, config, monkeypatch):
+        """#261: prefix length above ``prefix_hard_limit()`` (42 for the
+        default 12-char client server name) guarantees overflow even for a
+        1-char upstream tool name. Reject at ``add`` time so the user
+        doesn't discover the silent drop only after registering the
+        upstream and watching tools go missing."""
+        monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
+        long_prefix = "a" * 43  # 1 over hard limit
+        result = runner.invoke(
+            cli,
+            ["add", "s", "--prefix", long_prefix, "--command", "x", *_cfg_args(config)],
+        )
+        assert result.exit_code == 1
+        assert "exceeds the budget" in result.output or "is 43 chars" in result.output
+        # The error should point to both fixes the user can take.
+        assert "shorter --prefix" in result.output.lower() or "Pick a shorter" in result.output
+        assert "mms" in result.output  # mentions the short-server-name workaround
+
+    def test_warns_on_prefix_above_soft_threshold(self, runner, config, monkeypatch):
+        """Above 21 chars but within hard budget: warn and proceed (it might
+        be fine if all upstream tool names are short, but flag the risk)."""
+        monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
+        warn_prefix = "a" * 22  # 1 over warn threshold, well under hard limit
+        result = runner.invoke(
+            cli,
+            ["add", "s", "--prefix", warn_prefix, "--command", "x", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0
+        assert "Warning" in result.output
+        assert "silently dropped" in result.output
+
+    def test_silent_at_or_below_warn_threshold(self, runner, config, monkeypatch):
+        """At 21 chars and below: the silent path. No warning noise on
+        every routine ``add`` for typical short prefixes."""
+        monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
+        ok_prefix = "a" * 21
+        result = runner.invoke(
+            cli,
+            ["add", "s", "--prefix", ok_prefix, "--command", "x", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0
+        assert "silently dropped" not in result.output
+
+    def test_hard_budget_loosens_when_client_server_name_short(self, runner, config, monkeypatch):
+        """Setting ``MMS_CLIENT_SERVER_NAME=mms`` mirrors the recommended
+        short-server-name registration in the client config — prefixes that
+        would be rejected for the default 12-char server should now
+        proceed (warn or pass)."""
+        monkeypatch.setenv("MMS_CLIENT_SERVER_NAME", "mms")
+        # Same 43-char prefix that gets hard-rejected with default server:
+        prefix = "a" * 43  # hard limit becomes 51, so 43 is now under
+        result = runner.invoke(
+            cli,
+            ["add", "s", "--prefix", prefix, "--command", "x", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0  # passes (with a warn since > 21)
+        assert "exceeds the budget" not in result.output
+
     def test_rejects_duplicate_server_name(self, runner, config):
         runner.invoke(
             cli,
@@ -3549,6 +3607,132 @@ class TestHealth:
         # corrupts the JSON document.
         data = json.loads(result.output)
         assert data["servers"]["echo"]["connected"] is False
+
+    def test_names_flag_lists_overflowing_tools(self, runner, config, monkeypatch):
+        """``mms health --names`` reports any upstream tool that would be
+        silently dropped by clients due to the 64-char overflow (#261).
+        Without ``--names`` the report stays compact."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "docs": {
+                            "prefix": "docs_langchain",
+                            "transport": "streamable_http",
+                            "url": "https://example/mcp",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "docs": {
+                    "connected": True,
+                    "tools": 2,
+                    "overflowing": ["query_docs_filesystem_docs_by_lang_chain"],
+                    "error": None,
+                }
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        # Without --names: silent on overflow.
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "connected" in result.output
+        assert "overflow" not in result.output.lower()
+
+        # With --names: the offending tool is named.
+        result = runner.invoke(cli, ["health", "--names", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "overflow" in result.output.lower()
+        assert "query_docs_filesystem_docs_by_lang_chain" in result.output
+
+    def test_names_flag_says_all_fit_when_clean(self, runner, config, monkeypatch):
+        """When no tool overflows, ``--names`` confirms positively (lets
+        the user distinguish 'clean check ran' from 'flag was a no-op')."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "ok": {
+                            "prefix": "ok",
+                            "transport": "stdio",
+                            "command": "x",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "ok": {
+                    "connected": True,
+                    "tools": 3,
+                    "overflowing": [],
+                    "error": None,
+                }
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", "--names", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "all tool names fit" in result.output
+
+    def test_names_flag_json_includes_overflowing_array(self, runner, config, monkeypatch):
+        """``--json`` already exposes the per-server probe shape; the
+        new ``overflowing`` field has to round-trip cleanly so callers
+        scripting ``mms health --json --names`` can grep without parsing
+        prose."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "docs": {
+                            "prefix": "docs_langchain",
+                            "transport": "streamable_http",
+                            "url": "https://example/mcp",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "docs": {
+                    "connected": True,
+                    "tools": 2,
+                    "overflowing": ["query_docs_filesystem_docs_by_lang_chain"],
+                    "error": None,
+                }
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", "--json", "--names", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["servers"]["docs"]["overflowing"] == [
+            "query_docs_filesystem_docs_by_lang_chain"
+        ]
+        # ``--json`` must stay schema-stable — these fields are documented as
+        # part of the health contract.
+        assert data["servers"]["docs"]["connected"] is True
+        assert data["servers"]["docs"]["tools"] == 2
 
 
 # ── probe error helpers ──────────────────────────────────────────────────
