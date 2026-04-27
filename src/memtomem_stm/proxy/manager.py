@@ -21,6 +21,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
+from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy.cache import _make_key as _cache_key
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
@@ -251,6 +252,27 @@ class ProxyManager:
             prefixed = f"{cfg.prefix}__{t.name}"
             if prefixed in seen_prefixed:
                 logger.warning("Skipping duplicate tool: %s", prefixed)
+                continue
+            # #261: clients (Claude Code, Antigravity, Anthropic SDK) silently
+            # drop tools whose composed name overflows the 64-char regex. We
+            # skip here so the rest of the upstream's catalogue still
+            # registers — better one missing tool than the whole upstream.
+            if tool_name_budget.overflows(cfg.prefix, t.name):
+                logger.warning(
+                    "Skipping tool '%s' from upstream '%s': composed client "
+                    "name 'mcp__%s__%s__%s' is %d chars, exceeds the %d-char "
+                    "MCP limit. Shorten the '%s' prefix in stm_proxy.json, or "
+                    "register STM under 'mms' (3 chars) in your MCP client "
+                    "config to save 9 chars of overhead.",
+                    t.name,
+                    name,
+                    tool_name_budget.client_server_name(),
+                    cfg.prefix,
+                    t.name,
+                    tool_name_budget.composed_length(cfg.prefix, t.name),
+                    tool_name_budget.TOOL_NAME_LIMIT,
+                    cfg.prefix,
+                )
                 continue
             seen_prefixed.add(prefixed)
             valid_tools.append(t)

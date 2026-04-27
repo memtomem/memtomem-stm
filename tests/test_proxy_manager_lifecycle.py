@@ -214,3 +214,114 @@ class TestConnectTimeout:
             await mgr.start()
 
         assert "Failed to connect to upstream server 'slow'" in caplog.text
+
+
+# ── tool name overflow skip (#261) ───────────────────────────────────────
+
+
+class TestConnectServerOverflowSkip:
+    """Boot-time enforcement: when an upstream returns a tool whose
+    composed name (`mcp__<server>__<prefix>__<tool>`) would exceed the
+    64-char MCP regex, skip *that one tool* and register the rest.
+    Failing the entire upstream would be too aggressive — one bad name
+    shouldn't make every other tool from the same upstream invisible
+    (#261).
+    """
+
+    async def _stub_session(self, tool_names: list[str]) -> AsyncMock:
+        """Build a fake ClientSession returning the given tool names."""
+        from mcp.types import Tool
+
+        tools = [
+            Tool(
+                name=n,
+                description=f"upstream tool {n}",
+                inputSchema={"type": "object", "properties": {}},
+            )
+            for n in tool_names
+        ]
+        list_result = AsyncMock()
+        list_result.tools = tools
+
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.initialize = AsyncMock()
+        session.list_tools = AsyncMock(return_value=list_result)
+        return session
+
+    async def _stub_transport(self) -> AsyncMock:
+        transport = AsyncMock()
+        transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        transport.__aexit__ = AsyncMock(return_value=False)
+        return transport
+
+    async def test_overflowing_tool_is_skipped_others_register(self, caplog, monkeypatch) -> None:
+        """Mixed catalogue: a 40-char tool with the original ``docs_langchain``
+        prefix (14 chars) overflows the 64-char limit, while a short tool from
+        the same upstream fits. Expect: short tool registered, long tool
+        logged + skipped, manager keeps running."""
+        monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
+
+        cfg = UpstreamServerConfig(prefix="docs_langchain")
+        mgr = _make_manager(servers={"docs": cfg})
+
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()  # initialize internal _stack
+
+        session = await self._stub_session(
+            tool_names=[
+                "search",  # composed = mcp__memtomem-stm__docs_langchain__search = 41, fits
+                "query_docs_filesystem_docs_by_lang_chain",  # composed = 75, overflow
+            ]
+        )
+        transport = await self._stub_transport()
+
+        import logging
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=session),
+            caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"),
+        ):
+            await mgr._connect_server("docs", cfg, set())
+
+        # Short tool registered, long tool not registered.
+        registered = [t.name for t in mgr._connections["docs"].tools]
+        assert registered == ["search"]
+        # Warning identifies the overflowing tool by name + composed length.
+        warning_text = caplog.text
+        assert "query_docs_filesystem_docs_by_lang_chain" in warning_text
+        assert "75" in warning_text  # composed length
+        assert "64" in warning_text  # spec limit
+        # Hint surfaces both fix paths user can take.
+        assert "Shorten the" in warning_text  # → narrow the prefix
+        assert "mms" in warning_text  # → shorter client server name alternative
+
+    async def test_short_prefix_lets_long_tool_through(self, caplog, monkeypatch) -> None:
+        """With the recommended ``lc`` prefix the same long tool fits
+        (composed = 61 chars), so the skip path doesn't fire."""
+        monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
+
+        cfg = UpstreamServerConfig(prefix="lc")
+        mgr = _make_manager(servers={"docs": cfg})
+
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+
+        session = await self._stub_session(tool_names=["query_docs_filesystem_docs_by_lang_chain"])
+        transport = await self._stub_transport()
+
+        import logging
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=session),
+            caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"),
+        ):
+            await mgr._connect_server("docs", cfg, set())
+
+        registered = [t.name for t in mgr._connections["docs"].tools]
+        assert registered == ["query_docs_filesystem_docs_by_lang_chain"]
+        # No skip-warning in the log — no overflow happened.
+        assert "Skipping tool" not in caplog.text

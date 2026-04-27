@@ -18,6 +18,7 @@ from typing import Any
 
 import click
 
+from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
 
 _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
@@ -722,6 +723,42 @@ def add(
             err=True,
         )
         sys.exit(1)
+
+    # VAL-1b: prefix length vs the 64-char MCP tool name limit (#261). We
+    # don't have the upstream tool inventory at ``add`` time, so this is a
+    # sanity check on the prefix alone. The boot-time check in
+    # ``ProxyManager._connect_server`` does per-tool enforcement once
+    # ``tools/list`` is available.
+    hard_limit = tool_name_budget.prefix_hard_limit()
+    warn_at = tool_name_budget.prefix_warn_threshold()
+    assumed_server = tool_name_budget.client_server_name()
+    if len(prefix) > hard_limit:
+        click.echo(
+            f"{_err('Error:')} prefix '{prefix}' is {len(prefix)} chars; the "
+            f"max for client server name '{assumed_server}' is {hard_limit}. "
+            f"Even a 1-char upstream tool name would overflow the "
+            f"{tool_name_budget.TOOL_NAME_LIMIT}-char MCP limit.",
+            err=True,
+        )
+        click.echo(
+            "  Fix one of:\n"
+            "    • Use a shorter --prefix.\n"
+            "    • Register STM as 'mms' in your MCP client config (saves "
+            "9 chars), and export MMS_CLIENT_SERVER_NAME=mms so this check\n"
+            "      loosens to match.",
+            err=True,
+        )
+        sys.exit(1)
+    if len(prefix) > warn_at:
+        max_tool = tool_name_budget.TOOL_NAME_LIMIT - tool_name_budget.overhead() - len(prefix)
+        click.echo(
+            f"{_warn('Warning:')} prefix '{prefix}' ({len(prefix)} chars) "
+            f"leaves only {max_tool} chars for upstream tool names — longer "
+            f"ones will be silently dropped by clients. Consider a shorter "
+            f"--prefix, or register STM as 'mms' in your client config. "
+            f"Proceeding.",
+            err=True,
+        )
 
     # VAL-2: duplicate prefix warning
     for srv_name, srv_cfg in servers.items():
@@ -2042,9 +2079,14 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
         async with ClientSession(streams[0], streams[1]) as session:
             await asyncio.wait_for(session.initialize(), timeout=timeout)
             result = await session.list_tools()
+            prefix = cfg.get("prefix", "")
+            overflowing = [
+                t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
+            ]
             return {
                 "connected": True,
                 "tools": len(result.tools),
+                "overflowing": overflowing,
                 "error": None,
             }
 
@@ -2088,6 +2130,7 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, d
             result = {
                 "connected": False,
                 "tools": 0,
+                "overflowing": [],
                 "error": f"timeout ({timeout}s)",
             }
         except Exception as exc:
@@ -2096,7 +2139,7 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, d
             # so the existing catch surface is fine. ``_root_cause_message``
             # walks the wrapper to surface the real cause.
             err = _root_cause_message(exc)
-            result = {"connected": False, "tools": 0, "error": err}
+            result = {"connected": False, "tools": 0, "overflowing": [], "error": err}
         return name, result
 
     with _silenced_mcp_sdk_logs():
@@ -2125,7 +2168,24 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, d
     type=click.IntRange(min=1),
     help="Per-server connection timeout in seconds.",
 )
-def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> None:
+@click.option(
+    "--names",
+    "show_names",
+    is_flag=True,
+    help=(
+        "Also report any upstream tool whose composed proxied name "
+        "(`mcp__<server>__<prefix>__<tool>`) would exceed the 64-char MCP "
+        "limit. Useful when one tool from an upstream silently went missing "
+        "after registration (#261)."
+    ),
+)
+def health(
+    config_path: str,
+    *,
+    as_json: bool = False,
+    timeout: int = 10,
+    show_names: bool = False,
+) -> None:
     """Check upstream server connectivity."""
     path = Path(config_path)
     resolved = path.expanduser().resolve()
@@ -2165,5 +2225,17 @@ def health(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
     for name, info in results.items():
         if info["connected"]:
             click.echo(f"  {name}: {_ok('connected')} ({info['tools']} tools)")
+            if show_names:
+                overflowing = info.get("overflowing", [])
+                if overflowing:
+                    click.echo(
+                        f"    {_warn('overflow:')} {len(overflowing)} tool(s) "
+                        f"would exceed the {tool_name_budget.TOOL_NAME_LIMIT}-char "
+                        f"client limit and will be silently dropped:"
+                    )
+                    for t_name in overflowing:
+                        click.echo(f"      - {t_name}")
+                else:
+                    click.echo("    all tool names fit")
         else:
             click.echo(f"  {name}: {_bad('DISCONNECTED')} — {info['error']}")
