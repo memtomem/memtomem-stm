@@ -330,6 +330,83 @@ class TestProxyConfigUniquePrefixes:
         assert "beta" in msg
 
 
+class TestProxyConfigNonemptyPrefix:
+    """``UpstreamServerConfig.prefix`` is required but had no min-length, so
+    an empty string used to validate fine and produce composed names like
+    ``__list_items``. A single empty prefix also slipped past the
+    uniqueness check (#265). Reject at config-load with the upstream key
+    named so the user can locate the typo."""
+
+    def test_empty_prefix_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "blank": UpstreamServerConfig(prefix="", command="x"),
+                }
+            )
+        msg = str(exc_info.value)
+        assert "blank" in msg
+        assert "Empty upstream prefix" in msg
+
+    def test_whitespace_only_prefix_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Whitespace-only is the same typo class as empty — fail it the same way.
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "spaces": UpstreamServerConfig(prefix="   ", command="x"),
+                }
+            )
+        assert "spaces" in str(exc_info.value)
+
+    def test_multiple_empty_prefixes_listed_together(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "a": UpstreamServerConfig(prefix="", command="x"),
+                    "b": UpstreamServerConfig(prefix="", command="y"),
+                    "ok": UpstreamServerConfig(prefix="real", command="z"),
+                }
+            )
+        msg = str(exc_info.value)
+        # Both offenders surface in one error so the user fixes them both
+        # before the uniqueness validator (which would otherwise also fire
+        # on the empty/empty pair) becomes the second-iteration noise.
+        assert "'a'" in msg
+        assert "'b'" in msg
+        # The legitimate upstream is not falsely flagged.
+        assert "'ok'" not in msg
+
+    def test_two_empty_prefixes_report_empty_not_duplicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pins validator declaration order: _check_nonempty_upstream_prefixes
+        # must run before _check_unique_upstream_prefixes. If the order
+        # flipped (e.g. an alphabetical reorder, or a refactor that merges
+        # the two), the user would see "Duplicate upstream prefixes
+        # detected: prefix '' used by …" — technically true but the empty
+        # error is the more actionable root cause.
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(
+                upstream_servers={
+                    "a": UpstreamServerConfig(prefix="", command="x"),
+                    "b": UpstreamServerConfig(prefix="", command="y"),
+                }
+            )
+        msg = str(exc_info.value)
+        assert "Empty upstream prefix" in msg
+        assert "Duplicate" not in msg
+
+
 class TestLogLevel:
     def test_default_is_warning(self) -> None:
         cfg = STMConfig()

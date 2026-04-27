@@ -479,6 +479,24 @@ class ProxyConfig(BaseModel):
     progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
 
     @model_validator(mode="after")
+    def _check_nonempty_upstream_prefixes(self) -> Self:
+        # Empty / whitespace-only prefix produces composed names like
+        # ``__list_items`` and skews ``tool_name_budget.composed_length``
+        # (the prefix portion is zero), so the 64-char overflow guard
+        # underestimates the real surface name a client sees. A single
+        # empty prefix also slips past the uniqueness check below. Fail
+        # at config load and name the upstream key so the user sees
+        # which entry has the typo.
+        empty = sorted(
+            server_key
+            for server_key, cfg in self.upstream_servers.items()
+            if not cfg.prefix.strip()
+        )
+        if empty:
+            raise ValueError(f"Empty upstream prefix in upstreams: {empty}")
+        return self
+
+    @model_validator(mode="after")
     def _check_unique_upstream_prefixes(self) -> Self:
         # Two upstreams sharing a prefix make composed names <prefix>__<tool>
         # collide. ProxyManager keeps a shared `seen_prefixed` set as
