@@ -271,9 +271,9 @@ Options:
                            [default: 10; x>=1]
   --names                  Also report any upstream tool whose composed
                            proxied name (`mcp__<server>__<prefix>__<tool>`)
-                           would exceed the 64-char MCP limit. Useful when
-                           one tool from an upstream silently went missing
-                           after registration (#261).
+                           would exceed the 64-char MCP limit. Useful when one
+                           tool from an upstream silently went missing after
+                           registration (#261).
 ```
 
 Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running.
