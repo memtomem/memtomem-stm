@@ -478,6 +478,25 @@ class ProxyConfig(BaseModel):
     )
     progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
 
+    @model_validator(mode="after")
+    def _check_unique_upstream_prefixes(self) -> "ProxyConfig":
+        # Two upstreams sharing a prefix make composed names <prefix>__<tool>
+        # collide. ProxyManager keeps a shared `seen_prefixed` set as
+        # defense-in-depth and silently drops the second-loaded duplicate
+        # with a logger.warning, so the user sees mysterious missing tools
+        # instead of a config error. Surface the collision at load time.
+        by_prefix: dict[str, list[str]] = {}
+        for server_key, cfg in self.upstream_servers.items():
+            by_prefix.setdefault(cfg.prefix, []).append(server_key)
+        collisions = {prefix: sorted(keys) for prefix, keys in by_prefix.items() if len(keys) > 1}
+        if collisions:
+            details = "; ".join(
+                f"prefix '{prefix}' used by upstreams: {keys}"
+                for prefix, keys in sorted(collisions.items())
+            )
+            raise ValueError(f"Duplicate upstream prefixes detected: {details}")
+        return self
+
     def effective_max_result_chars(self) -> int:
         """Compute max_result_chars scaled by consumer model's context window.
 

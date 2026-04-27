@@ -212,6 +212,12 @@ class ProxyManager:
                     srv_cfg.compression.value,
                 )
 
+        # Defense-in-depth: prefix uniqueness is the primary check in
+        # ``ProxyConfig._check_unique_upstream_prefixes``. This guard still
+        # runs because ``model_construct()`` and any future config source
+        # could bypass validation, in which case dropping (and logging) the
+        # second-loaded tool is safer than letting FastMCP last-write-wins
+        # silently overwrite a registered handler.
         seen_prefixed: set[str] = set()
         for name, cfg in servers.items():
             try:
