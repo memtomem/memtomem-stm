@@ -479,7 +479,7 @@ class ProxyConfig(BaseModel):
     progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
 
     @model_validator(mode="after")
-    def _check_unique_upstream_prefixes(self) -> "ProxyConfig":
+    def _check_unique_upstream_prefixes(self) -> Self:
         # Two upstreams sharing a prefix make composed names <prefix>__<tool>
         # collide. ProxyManager keeps a shared `seen_prefixed` set as
         # defense-in-depth and silently drops the second-loaded duplicate

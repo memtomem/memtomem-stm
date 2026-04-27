@@ -216,8 +216,9 @@ class ProxyManager:
         # ``ProxyConfig._check_unique_upstream_prefixes``. This guard still
         # runs because ``model_construct()`` and any future config source
         # could bypass validation, in which case dropping (and logging) the
-        # second-loaded tool is safer than letting FastMCP last-write-wins
-        # silently overwrite a registered handler.
+        # second-loaded tool prevents two handlers from racing for the same
+        # composed name (whether the registry overwrites or raises is an
+        # implementation detail of the downstream MCP server).
         seen_prefixed: set[str] = set()
         for name, cfg in servers.items():
             try:
