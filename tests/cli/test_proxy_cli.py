@@ -110,6 +110,42 @@ class TestBareInvocationDispatch:
         assert result.exit_code == 0
         assert "memtomem-stm" in result.output
 
+    def test_unknown_subcommand_does_not_dispatch_server(self, runner, monkeypatch):
+        """An unknown positional (``mms doesnotexist``) under non-TTY stdin
+        must NOT fall through to ``server.main``. Click raises ``UsageError``
+        before the group callback runs, so the dispatch is skipped — but
+        ``invoked_subcommand`` semantics are easy to misremember (set only
+        for *known* subcommands? for any positional?), so pin the invariant
+        here. Regression cost: a stray non-TTY user typo silently boots an
+        MCP server instead of erroring."""
+
+        def boom() -> None:
+            raise AssertionError("server.main reached via an unknown-subcommand path")
+
+        monkeypatch.setattr("memtomem_stm.cli.proxy._stdin_is_tty", lambda: False)
+        monkeypatch.setattr("memtomem_stm.server.main", boom)
+        result = runner.invoke(cli, ["doesnotexist"])
+        assert result.exit_code != 0
+
+    def test_version_flag_with_pipe_does_not_dispatch_server(self, runner, monkeypatch):
+        """``mms --version`` under a piped stdin must short-circuit on the
+        eager ``--version`` option, not boot the MCP server. Click's
+        ``version_option`` is eager and exits before the group callback,
+        so the dispatch never runs — but adding ``invoke_without_command=True``
+        is exactly the kind of change that could shift evaluation order, so
+        pin the contract. Regression cost: anyone scripting ``mms --version``
+        for a quick install check would suddenly hang waiting for stdio
+        JSON-RPC."""
+
+        def boom() -> None:
+            raise AssertionError("--version must short-circuit before dispatch")
+
+        monkeypatch.setattr("memtomem_stm.cli.proxy._stdin_is_tty", lambda: False)
+        monkeypatch.setattr("memtomem_stm.server.main", boom)
+        result = runner.invoke(cli, ["--version"])
+        assert result.exit_code == 0
+        assert "memtomem-stm" in result.output
+
 
 # ── style helpers / NO_COLOR contract ───────────────────────────────────
 
