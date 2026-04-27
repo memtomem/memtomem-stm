@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
@@ -164,8 +165,13 @@ class TestAutoIndexStartupWarning:
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             try:
                 await mgr.start()
-            except Exception:
-                pass  # connection to "echo" will fail — we only care about warnings
+            except (Exception, asyncio.CancelledError):
+                # The "echo" upstream exits before completing the JSON-RPC
+                # handshake, which the MCP SDK's stdio reader can surface as
+                # asyncio.CancelledError (BaseException, not Exception). The
+                # warning we're asserting fires before that connect failure,
+                # so swallowing both connection-error shapes is safe.
+                pass
         assert any("compressed-away content is permanently lost" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -198,7 +204,8 @@ class TestAutoIndexStartupWarning:
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             try:
                 await mgr.start()
-            except Exception:
+            except (Exception, asyncio.CancelledError):
+                # See sibling test for why we catch CancelledError here too.
                 pass
         assert not any("permanently lost" in r.message for r in caplog.records)
 
