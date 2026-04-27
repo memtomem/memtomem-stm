@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **All three console scripts (`memtomem-stm`, `memtomem-stm-proxy`, `mms`) now boot the MCP stdio server when invoked bare with a piped stdin** (#260) — previously only `memtomem-stm` worked as an MCP-server registration target because it pointed straight at `server.main`, while `memtomem-stm-proxy` and `mms` resolved to the Click group whose bare invocation printed help and exited 2. An MCP client config like `{"command": "mms"}` therefore failed with `: calling "initialize": EOF` even though the package documentation calls these names interchangeable. The `cli` Click group now uses `invoke_without_command=True` and dispatches based on `sys.stdin.isatty()`: a TTY still prints the help text (now exit 0, matching Click's default `get_help` flow), and a non-TTY (the MCP-client stdio case, CliRunner, pipes) lazy-imports `memtomem_stm.server.main` and runs it. All three `[project.scripts]` entry points in `pyproject.toml` now resolve to `memtomem_stm.cli.proxy:cli`, so registering any of them in an MCP client's config works identically — closing the parity gap that surprised first-time Antigravity adopters.
+
 ## [0.1.19] — 2026-04-26
 
 ### Added

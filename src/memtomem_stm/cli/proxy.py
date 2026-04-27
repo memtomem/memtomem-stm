@@ -412,17 +412,45 @@ def _run_mcp_integration(preselected: int | None = None) -> None:
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 
-@click.group(context_settings=CONTEXT_SETTINGS)
+def _stdin_is_tty() -> bool:
+    """Indirection so tests can monkeypatch this seam.
+
+    Same pattern as ``_should_use_tui`` (CHANGELOG #143) — Click's CliRunner
+    replaces ``sys.stdin`` with a StringIO whose ``isatty()`` is False, so
+    monkeypatching the function attribute directly doesn't reach the module's
+    bound reference.
+    """
+    return bool(sys.stdin.isatty())
+
+
+@click.group(context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
 @click.version_option(
     package_name="memtomem-stm",
     prog_name="memtomem-stm",
     message="%(prog)s %(version)s",
 )
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """memtomem-stm proxy gateway management.
 
     Output is colorized when writing to a terminal. Set NO_COLOR=1 to disable.
+
+    Bare invocation (no subcommand) dispatches based on stdin: a TTY shows
+    this help text, while a piped stdin (the MCP-client stdio case) boots
+    the proxy as an MCP server. This lets any of the three entry points
+    (``memtomem-stm``, ``memtomem-stm-proxy``, ``mms``) be registered as
+    the MCP server command interchangeably (#260).
     """
+    if ctx.invoked_subcommand is not None:
+        return
+    if _stdin_is_tty():
+        click.echo(ctx.get_help())
+        ctx.exit(0)
+    # Non-TTY stdin → MCP client invocation. Lazy import keeps ``mms list`` /
+    # ``mms add`` etc. from paying the server module's startup cost.
+    from memtomem_stm.server import main as server_main
+
+    server_main()
 
 
 # ``version`` subcommand predates the ``--version`` flag (CHANGELOG #152) and

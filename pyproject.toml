@@ -36,7 +36,12 @@ langchain = [
 ]
 
 [project.scripts]
-memtomem-stm = "memtomem_stm.server:main"
+# All three entry points resolve to the same Click group. The group's
+# ``invoke_without_command=True`` callback dispatches bare invocations to
+# ``server.main`` when stdin isn't a TTY (the MCP-client stdio case),
+# otherwise prints help — so registering any of these three names in an
+# MCP client's config works identically. See #260.
+memtomem-stm = "memtomem_stm.cli.proxy:cli"
 memtomem-stm-proxy = "memtomem_stm.cli.proxy:cli"
 mms = "memtomem_stm.cli.proxy:cli"
 

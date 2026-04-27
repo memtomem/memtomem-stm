@@ -65,6 +65,52 @@ class TestVersion:
         assert flag.output.strip() == sub.output.strip()
 
 
+# ── bare invocation dispatch (#260) ─────────────────────────────────────
+
+
+class TestBareInvocationDispatch:
+    """Bare ``mms`` / ``memtomem-stm-proxy`` / ``memtomem-stm`` (no subcommand)
+    must dispatch on stdin: a TTY prints help so an interactive user discovers
+    the CLI, but a piped stdin (the MCP-client stdio case) boots the proxy
+    MCP server. This lets any of the three entry points be registered
+    interchangeably in an MCP client config — closing the surprise from #260
+    where only ``memtomem-stm`` worked as a registration target."""
+
+    def test_bare_with_tty_prints_help(self, runner, monkeypatch):
+        monkeypatch.setattr("memtomem_stm.cli.proxy._stdin_is_tty", lambda: True)
+        result = runner.invoke(cli, [])
+        assert result.exit_code == 0
+        assert "proxy gateway management" in result.output
+        # Help body should list the subcommands so users can discover them.
+        assert "Commands:" in result.output
+
+    def test_bare_with_pipe_dispatches_to_mcp_server(self, runner, monkeypatch):
+        called: list[bool] = []
+
+        def fake_server_main() -> None:
+            called.append(True)
+
+        monkeypatch.setattr("memtomem_stm.cli.proxy._stdin_is_tty", lambda: False)
+        monkeypatch.setattr("memtomem_stm.server.main", fake_server_main)
+        result = runner.invoke(cli, [])
+        assert result.exit_code == 0
+        assert called == [True], "non-TTY bare invocation must boot server.main"
+
+    def test_subcommand_skips_dispatch(self, runner, monkeypatch):
+        """``mms version`` (or any subcommand) must NOT trip the MCP-server
+        dispatch even if stdin happens to be non-TTY (CI, pipes). The
+        ``invoked_subcommand`` guard in the group callback enforces this."""
+
+        def boom() -> None:
+            raise AssertionError("server.main should not be called when a subcommand runs")
+
+        monkeypatch.setattr("memtomem_stm.cli.proxy._stdin_is_tty", lambda: False)
+        monkeypatch.setattr("memtomem_stm.server.main", boom)
+        result = runner.invoke(cli, ["version"])
+        assert result.exit_code == 0
+        assert "memtomem-stm" in result.output
+
+
 # ── style helpers / NO_COLOR contract ───────────────────────────────────
 
 

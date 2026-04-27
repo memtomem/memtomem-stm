@@ -23,8 +23,13 @@ The `ollama` marker auto-skips when Ollama isn't running; CI always uses
 
 - **No Python-level dependency on `memtomem` core.** STM talks to the LTM
   server only through the MCP protocol. Don't `import memtomem` from `src/`.
-- **`mms` ≡ `memtomem-stm-proxy`.** Both entry points in `pyproject.toml`
-  resolve to the same CLI — keep them in sync, don't diverge behavior.
+- **`mms` ≡ `memtomem-stm-proxy` ≡ `memtomem-stm`.** All three
+  `[project.scripts]` entry points in `pyproject.toml` resolve to
+  `memtomem_stm.cli.proxy:cli` (#260). The Click group's
+  `invoke_without_command=True` callback dispatches bare invocations on
+  `sys.stdin.isatty()`: TTY → help, non-TTY → `server.main` (the MCP stdio
+  server). Don't diverge behavior between the three names — registering
+  any of them as an MCP client's `command` must work identically.
 - **Pipeline order is CLEAN → COMPRESS → SURFACE → INDEX** — comments in
   `src/memtomem_stm/proxy/` are the source of truth for the per-stage
   contracts; full architecture write-up lives in the private
