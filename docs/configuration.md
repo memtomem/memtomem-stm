@@ -291,7 +291,7 @@ This writes:
 - **Proxy-level**: `chars_per_token=1.85`, `min_response_chars=230`, `default_max_result_chars=8500`
 - **Per-imported-server**: `max_result_tokens=2000`, `chars_per_token=1.85`
 
-Equivalent JSON (what ends up in `~/.memtomem/stm_proxy.json`):
+Equivalent JSON (what ends up in `~/.memtomem/stm_proxy.json`). The server key (`<your-server-name>` below) and `prefix` come from whatever `mms init` discovered or you typed in the manual flow — `--lang ko` only adds the four token-aware fields, never invents server names:
 
 ```json
 {
@@ -300,8 +300,8 @@ Equivalent JSON (what ends up in `~/.memtomem/stm_proxy.json`):
   "min_response_chars": 230,
   "default_max_result_chars": 8500,
   "upstream_servers": {
-    "ko_docs": {
-      "prefix": "kr",
+    "<your-server-name>": {
+      "prefix": "<your-prefix>",
       "command": "...",
       "max_result_tokens": 2000,
       "chars_per_token": 1.85
