@@ -127,6 +127,19 @@ Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, e
 
 To check what's happening, ask the agent to call `stm_proxy_stats`.
 
+## What STM proxies — and what it doesn't
+
+STM is an MCP proxy: it sees a tool call only if the client routes that call through the MCP protocol. Coverage depends on **how your client invokes the tool**, not on what the tool does.
+
+**STM sees:** any MCP server you register with `mms add` — every tool under the `mcp__<server>__<prefix>__<tool>` namespace — plus LTM surfacing calls to a configured memtomem server.
+
+**STM does NOT see:**
+- **Claude Code's built-in tools** — `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebFetch`. They run inside the client and never reach an MCP server, so their token spend is invisible to STM and unaffected by compression or caching.
+- **Cursor / Windsurf / Claude Desktop built-ins** — same principle: anything the client provides natively bypasses the MCP layer.
+- **Sub-agent built-in calls** — the parent's MCP wiring is inherited, but built-in tool calls inside an `Agent` / `Task` invocation stay client-internal.
+
+To bring file or shell operations under STM, register an MCP server that exposes them (the [filesystem example](#1-add-an-upstream-mcp-server) above is the most common case) and steer the agent toward the proxied alias instead of the built-in. This is the same boundary every MCP proxy lives within — it's not specific to STM.
+
 ## Tutorial notebooks
 
 > **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](notebooks/01_quickstart_proxy_setup.ipynb) registers an upstream MCP server, calls a proxied tool, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
