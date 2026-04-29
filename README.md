@@ -13,12 +13,12 @@ Spend fewer tokens. Remember more. Ship faster.
 
 memtomem-stm is an MCP proxy that typically **cuts token usage by 20–80%** and gives your agent **memory across sessions** — with no changes to your upstream MCP servers.
 
-It sits between your AI agent and its upstream MCP servers, compressing bloated tool responses, caching repeated calls, and automatically surfacing relevant context from prior sessions via a memtomem LTM server.
+It sits between your AI agent and its upstream MCP servers, compressing tool responses, caching repeated calls, and automatically surfacing relevant context from prior sessions via a memtomem LTM server.
 
-**You need this if:**
-- Your agent **burns tokens** re-reading the same files and search results — STM compresses and caches them (Claude Code, Cursor, Claude Desktop, or any MCP client)
-- Your coding sessions **lose context** and the agent re-discovers decisions it already made — STM surfaces prior context automatically via memtomem LTM
-- You run custom MCP servers and want **compression, caching, and observability** without changing upstream code — STM is a drop-in proxy layer
+**What memtomem-stm does:**
+- **Cuts token spend on repeated reads** — compresses and caches tool responses, so the agent doesn't re-pay for the same file or search result. Works with Claude Code, Cursor, Claude Desktop, or any MCP client.
+- **Carries context across sessions** — surfaces prior decisions from memtomem LTM automatically, so the agent picks up where it left off rather than re-discovering what it already knew.
+- **Drops in front of any MCP server** — adds compression, caching, and observability as a proxy layer, without changes to upstream code.
 
 ```mermaid
 flowchart TB
