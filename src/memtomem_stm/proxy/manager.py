@@ -45,6 +45,7 @@ from memtomem_stm.proxy.config import (
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.extraction import FactExtractor
+from memtomem_stm.proxy.index_observability import IndexObservability
 from memtomem_stm.proxy.memory_ops import (
     AutoIndexOutcome,
     ExtractOutcome,
@@ -155,6 +156,11 @@ class ProxyManager:
         self._selective_lock = asyncio.Lock()
         self._extractor: FactExtractor | None = None
         self._extractor_lock = asyncio.Lock()
+        # In-memory counters for the INDEX (extract_and_store) pipeline.
+        # Always instantiated — ``stm_index_stats`` reads ``any_call`` to
+        # decide whether to render anything for zero-traffic deployments.
+        # See ``proxy/index_observability.py`` for the counter contract.
+        self.index_observability = IndexObservability()
         self._progressive_store: ProgressiveStoreAdapter | None = None
         self._progressive_store_cfg: SelectiveConfig | None = None
         self._progressive_lock = asyncio.Lock()
@@ -802,6 +808,7 @@ class ProxyManager:
             arguments=arguments,
             text=text,
             context_query=context_query,
+            observability=self.index_observability,
         )
 
     # Backward-compatible delegate

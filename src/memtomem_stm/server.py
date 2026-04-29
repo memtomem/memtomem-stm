@@ -318,6 +318,7 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_proxy_health",
     "stm_surfacing_feedback",
     "stm_surfacing_stats",
+    "stm_index_stats",
     "stm_compression_feedback",
     "stm_compression_stats",
     "stm_progressive_stats",
@@ -754,6 +755,98 @@ def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -
         lines.append(
             f"\nCache (since process start): hits {hits}, misses {misses}, hit ratio {ratio}%"
         )
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_index_stats
+# ---------------------------------------------------------------------------
+
+
+@_obs_tool
+async def stm_index_stats(
+    tool: str | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Show STM-driven LTM write statistics (the INDEX pipeline).
+
+    Mirrors ``stm_surfacing_stats`` for the write side. Aggregates
+    in-memory per-tool counters since process start: per-call attempts
+    and per-fact / per-call outcomes
+    (``stored`` / ``dedup_skip`` / ``extracted_zero_facts`` / ``error``).
+
+    **Quality signal absent by design.** SURFACE has surfacing-feedback;
+    INDEX has no equivalent. Adding one would have to choose between
+    two non-equivalent observables (positive-value vs harm-prevented)
+    that conflate distinct questions if bundled — see the
+    ``index_observability`` module docstring for the rationale.
+    Operators reading this tool should treat ``stored`` as the raw
+    mem_add count and ``extracted_zero_facts / attempts`` as the no-op
+    rate — neither is a value-judgment, just a volume distribution.
+
+    Args:
+        tool: Optional filter by upstream tool name. The ``__total__``
+              aggregate row is always included so a single tool's
+              counters can be compared against the total without
+              re-running the call.
+    """
+    app = _get_ctx(ctx)
+    pm = app.proxy_manager
+    if pm is None:
+        return "Proxy is not enabled."
+
+    snapshot = pm.index_observability.snapshot()
+    if not snapshot["any_call"]:
+        return (
+            "No INDEX activity recorded since process start "
+            "(extract_and_store has not been invoked)."
+        )
+
+    with traced("stm_index_stats", metadata={"tool": tool}):
+        lines = ["Index Stats", "==========="]
+        lines.extend(_format_index_observability_sections(snapshot, tool_filter=tool))
+        if tool:
+            lines.append(f"\n(filtered by tool: {tool})")
+        return "\n".join(lines)
+
+
+def _format_index_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
+    """Render Attempts / Outcomes sections for ``stm_index_stats``.
+
+    Returns a list of lines (no leading blank — caller appends to header).
+    When ``tool_filter`` is set, per-tool dicts are restricted to that
+    tool plus the ``__total__`` aggregate so the operator can compare a
+    single tool's counters against the total without re-running.
+
+    Mirror of ``_format_observability_sections`` for surfacing, but with
+    the INDEX shape: an ``attempts`` per-tool int dict (no nested
+    sub-counters) and an ``outcomes`` per-tool dict-of-int. No cache
+    section — INDEX has no caching layer.
+    """
+    attempts: dict[str, int] = snapshot["attempts"]
+    outcomes: dict[str, dict[str, int]] = snapshot["outcomes"]
+
+    if tool_filter is not None:
+        attempts = {t: c for t, c in attempts.items() if t == tool_filter or t == "__total__"}
+        outcomes = {t: o for t, o in outcomes.items() if t == tool_filter or t == "__total__"}
+
+    lines: list[str] = []
+
+    if attempts:
+        lines.append("\nAttempts (since process start):")
+        for tool_name in _ordered_tool_keys(attempts):
+            lines.append(f"  {tool_name}: {attempts[tool_name]}")
+
+    if outcomes:
+        lines.append("\nOutcomes (since process start):")
+        for tool_name in _ordered_tool_keys(outcomes):
+            tool_outcomes = outcomes[tool_name]
+            if not tool_outcomes:
+                continue
+            lines.append(f"  {tool_name}:")
+            for outcome, count in sorted(tool_outcomes.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {outcome}: {count}")
 
     return lines
 

@@ -12,6 +12,11 @@ if TYPE_CHECKING:
 
 from memtomem_stm.proxy.config import AutoIndexConfig, ExtractionConfig
 from memtomem_stm.proxy.extraction import ExtractedFact, FactExtractor
+from memtomem_stm.proxy.index_observability import (
+    _NOOP_INDEX_OBSERVABILITY,
+    IndexObservability,
+    _NoOpIndexObservability,
+)
 from memtomem_stm.utils.fileio import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -184,6 +189,7 @@ async def extract_and_store(
     text: str,
     *,
     context_query: str | None = None,
+    observability: IndexObservability | _NoOpIndexObservability = _NOOP_INDEX_OBSERVABILITY,
 ) -> ExtractOutcome:
     """Extract facts from response and store as individual memory entries.
 
@@ -191,11 +197,19 @@ async def extract_and_store(
     extraction phase itself raises (e.g., ``extractor.extract()`` fails).
     Per-fact indexing failures are logged and counted against
     ``facts_stored`` but do NOT flip ``ok``.
+
+    ``observability`` defaults to a no-op so existing call sites keep
+    working unchanged. When the manager wires a real
+    ``IndexObservability``, this function records one ``attempt`` per
+    invocation plus per-fact / per-call outcome labels (see
+    ``index_observability`` module docstring for the granularity contract).
     """
     indexed_count = 0
+    observability.record_attempt(tool)
     try:
         facts = await extractor.extract(text, server=server, tool=tool)
         if not facts:
+            observability.record_outcome(tool, "extracted_zero_facts")
             return ExtractOutcome(ok=True, facts_stored=0)
 
         memory_dir = ext_cfg.memory_dir.expanduser().resolve()
@@ -218,6 +232,7 @@ async def extract_and_store(
                     )
                     if is_dup:
                         logger.debug("Skipping duplicate fact: %s", fact.content[:60])
+                        observability.record_outcome(tool, "dedup_skip")
                         continue
                 except Exception:
                     pass  # on dedup failure, proceed with indexing
@@ -233,8 +248,10 @@ async def extract_and_store(
             try:
                 await index_engine.index_file(file_path, namespace=ns)
                 indexed_count += 1
+                observability.record_outcome(tool, "stored")
             except Exception as exc:
                 logger.warning("Fact indexing failed: %s", exc, exc_info=True)
+                observability.record_outcome(tool, "error")
 
         if indexed_count:
             logger.info(
@@ -247,6 +264,7 @@ async def extract_and_store(
         return ExtractOutcome(ok=True, facts_stored=indexed_count)
     except Exception as exc:
         logger.warning("Fact extraction failed for %s/%s", server, tool, exc_info=True)
+        observability.record_outcome(tool, "error")
         return ExtractOutcome(
             ok=False,
             facts_stored=indexed_count,
