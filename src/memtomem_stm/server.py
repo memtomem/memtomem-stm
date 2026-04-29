@@ -318,6 +318,7 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_proxy_health",
     "stm_surfacing_feedback",
     "stm_surfacing_stats",
+    "stm_index_stats",
     "stm_compression_feedback",
     "stm_compression_stats",
     "stm_progressive_stats",
@@ -754,6 +755,118 @@ def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -
         lines.append(
             f"\nCache (since process start): hits {hits}, misses {misses}, hit ratio {ratio}%"
         )
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_index_stats
+# ---------------------------------------------------------------------------
+
+
+@_obs_tool
+async def stm_index_stats(
+    tool: str | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Show STM-driven LTM write statistics (both INDEX paths).
+
+    Mirrors ``stm_surfacing_stats`` for the write side. Covers both
+    STM-driven LTM-write code paths: ``auto_index_response`` (verbatim
+    response → markdown chunk) and ``extract_and_store`` (response →
+    LLM-extracted facts → markdown chunks). Both run on the proxy hot
+    path (sequential stages 4 and 4b in ``manager.call_tool``) and both
+    write to LTM via ``index_engine.index_file``.
+
+    Snapshot shape:
+
+    - ``attempts[tool][path]`` per-tool / per-path call counts; path is
+      ``extract`` or ``auto_index``. ``__total__`` aggregates across tools.
+    - ``outcomes[tool][label]`` per-tool 4-label outcomes shared across
+      both paths. ``stored`` and ``error`` fire for both; ``dedup_skip``
+      and ``extracted_zero_facts`` only fire for the extract path
+      (auto_index has no extraction or dedup phase).
+
+    **Quality signal absent by design.** SURFACE has surfacing-feedback;
+    INDEX has no equivalent. Adding one would have to choose between
+    two non-equivalent observables (positive-value vs harm-prevented)
+    that conflate distinct questions if bundled — see the
+    ``index_observability`` module docstring for the rationale.
+    Operators reading this tool should treat
+    ``outcomes[__total__][stored]`` as the raw mem_add count
+    (across both paths) and
+    ``outcomes[__total__][extracted_zero_facts] / attempts[__total__][extract]``
+    as the extract-path no-op rate — neither is a value-judgment, just
+    a volume distribution.
+
+    Args:
+        tool: Optional filter by upstream tool name. The ``__total__``
+              aggregate row is always included so a single tool's
+              counters can be compared against the total without
+              re-running the call.
+    """
+    app = _get_ctx(ctx)
+    pm = app.proxy_manager
+    if pm is None:
+        return "Proxy is not enabled."
+
+    with traced("stm_index_stats", metadata={"tool": tool}):
+        snapshot = pm.index_observability.snapshot()
+        if not snapshot["any_call"]:
+            return (
+                "No INDEX activity recorded since process start "
+                "(neither auto_index_response nor extract_and_store "
+                "has been invoked)."
+            )
+        lines = ["Index Stats", "==========="]
+        lines.extend(_format_index_observability_sections(snapshot, tool_filter=tool))
+        if tool:
+            lines.append(f"\n(filtered by tool: {tool})")
+        return "\n".join(lines)
+
+
+def _format_index_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
+    """Render Attempts / Outcomes sections for ``stm_index_stats``.
+
+    Returns a list of lines (no leading blank — caller appends to header).
+    When ``tool_filter`` is set, per-tool dicts are restricted to that
+    tool plus the ``__total__`` aggregate so the operator can compare a
+    single tool's counters against the total without re-running.
+
+    Mirror of ``_format_observability_sections`` for surfacing, but with
+    the INDEX shape: ``attempts`` is per-tool / per-path
+    (``{tool: {path: count}}``) so operators see the
+    extract / auto_index breakdown; ``outcomes`` is per-tool 4-label.
+    No cache section — INDEX has no caching layer.
+    """
+    attempts: dict[str, dict[str, int]] = snapshot["attempts"]
+    outcomes: dict[str, dict[str, int]] = snapshot["outcomes"]
+
+    if tool_filter is not None:
+        attempts = {t: a for t, a in attempts.items() if t == tool_filter or t == "__total__"}
+        outcomes = {t: o for t, o in outcomes.items() if t == tool_filter or t == "__total__"}
+
+    lines: list[str] = []
+
+    if attempts:
+        lines.append("\nAttempts (since process start):")
+        for tool_name in _ordered_tool_keys(attempts):
+            tool_attempts = attempts[tool_name]
+            if not tool_attempts:
+                continue
+            lines.append(f"  {tool_name}:")
+            for path, count in sorted(tool_attempts.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {path}: {count}")
+
+    if outcomes:
+        lines.append("\nOutcomes (since process start):")
+        for tool_name in _ordered_tool_keys(outcomes):
+            tool_outcomes = outcomes[tool_name]
+            if not tool_outcomes:
+                continue
+            lines.append(f"  {tool_name}:")
+            for outcome, count in sorted(tool_outcomes.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {outcome}: {count}")
 
     return lines
 

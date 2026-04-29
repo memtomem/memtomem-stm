@@ -655,6 +655,55 @@ class TestAutoIndex:
         assert outcome.chunks_indexed == 3
         mock_indexer.index_file.assert_awaited_once()
 
+        # Wire-in pin: removing ``observability=self.index_observability``
+        # from manager._auto_index_response would silently slip past the
+        # standalone counter tests because the free function defaults to
+        # the no-op singleton. Assert auto_index attempt + stored outcome
+        # so the kwarg ties to a red test.
+        snap = mgr.index_observability.snapshot()
+        assert snap["any_call"] is True
+        assert snap["attempts"]["__total__"] == {"auto_index": 1}
+        assert snap["attempts"]["t"] == {"auto_index": 1}
+        assert snap["outcomes"]["__total__"] == {"stored": 1}
+        assert snap["outcomes"]["t"] == {"stored": 1}
+
+    async def test_auto_index_records_error_outcome_on_index_file_failure(self, tmp_path):
+        """When ``index_file`` raises inside ``auto_index_response``, the
+        function catches the exception and returns ``ok=False``. Pin that
+        the observability records ``error`` in this branch — without this
+        assertion, the inner try/except could silently lose its outcome
+        record after a future refactor."""
+        from memtomem_stm.proxy.config import AutoIndexConfig  # noqa: F811
+
+        mock_indexer = AsyncMock()
+        mock_indexer.index_file.side_effect = RuntimeError("simulated index failure")
+
+        mgr = _make_manager(tmp_path=tmp_path, index_engine=mock_indexer)
+
+        with patch.object(
+            type(mgr),
+            "_config",
+            new_callable=lambda: property(
+                lambda self: ProxyConfig(
+                    config_path=tmp_path / "proxy.json",
+                    upstream_servers={"srv": UpstreamServerConfig(prefix="test")},
+                    auto_index=AutoIndexConfig(enabled=True, memory_dir=tmp_path / "index"),
+                )
+            ),
+        ):
+            outcome = await mgr._auto_index_response(
+                server="srv",
+                tool="t",
+                arguments={},
+                text="Full content here",
+                agent_summary="Summary",
+            )
+
+        assert outcome.ok is False
+        snap = mgr.index_observability.snapshot()
+        assert snap["attempts"]["t"] == {"auto_index": 1}
+        assert snap["outcomes"]["t"] == {"error": 1}
+
     async def test_auto_index_failure_returns_surfaced(self, tmp_path, caplog):
         """When _auto_index_response raises, call_tool returns the surfaced
         response — optional stages must not kill the agent response."""
@@ -722,6 +771,18 @@ class TestExtractAndStore:
 
         # index_file should NOT be called because the fact was a duplicate
         mock_indexer.index_file.assert_not_awaited()
+
+        # Wire-in pin: removing ``observability=self.index_observability``
+        # from manager._extract_and_store would silently slip past the
+        # standalone counter tests because the free function defaults to
+        # the no-op singleton. Asserting attempts + per-tool dedup outcome
+        # here ties the kwarg to a red test.
+        snap = mgr.index_observability.snapshot()
+        assert snap["any_call"] is True
+        assert snap["attempts"]["__total__"] == {"extract": 1}
+        assert snap["attempts"]["t"] == {"extract": 1}
+        assert snap["outcomes"]["__total__"] == {"dedup_skip": 1}
+        assert snap["outcomes"]["t"] == {"dedup_skip": 1}
 
 
 # ── get_upstream_health ───────────────────────────────────────────────────

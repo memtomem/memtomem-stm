@@ -616,6 +616,7 @@ _OBSERVABILITY_TOOLS = {
     "stm_proxy_health",
     "stm_proxy_cache_clear",
     "stm_surfacing_stats",
+    "stm_index_stats",
     "stm_compression_stats",
     "stm_progressive_stats",
     "stm_tuning_recommendations",
@@ -673,10 +674,10 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_default_advertises_all_eleven(self):
+    def test_default_advertises_all_twelve(self):
         names = set(self._list_registered(env_override=None))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
-        assert len(names) == 11
+        assert len(names) == 12
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))
