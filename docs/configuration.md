@@ -238,6 +238,37 @@ Full example with all options:
 }
 ```
 
+### Token-equivalent budgets (CJK / non-Latin workloads)
+
+By default, every result-size budget in STM is expressed in **characters** (`max_result_chars`, `default_max_result_chars`, `head_chars`). For Latin-script content this approximates token spend reasonably — English averages ~4 characters per token in modern BPE tokenizers (GPT-3.5/4 cl100k_base, similar for Claude). For Korean, Chinese, and Japanese content it does not: Korean averages ~1.85 chars/token, so the same character budget caps roughly **half** the token spend the operator probably intended, and `min_response_chars`-style gates skip compression on Korean responses that are token-dense but character-light.
+
+Two opt-in fields make budgets token-aware without breaking existing char-based configs:
+
+- **`chars_per_token`** — chars-per-token ratio used to convert a token budget to a char budget. Configurable at `ProxyConfig` (default `3.5`), per upstream server, or per tool. Lower it for non-Latin content (`~2.0` for Korean, `~1.3` for Chinese). Cascading resolution: tool override → server → proxy default.
+- **`max_result_tokens`** — token-equivalent budget on `UpstreamServerConfig` and `ToolOverrideConfig`. When set, takes precedence over `max_result_chars` and is converted to a char budget at gate time via the resolved `chars_per_token`.
+
+Example — a Korean-content upstream (e.g. a Korean documentation MCP server):
+
+```json
+"upstream_servers": {
+  "ko_docs": {
+    "command": "...",
+    "prefix": "kr",
+    "max_result_tokens": 1500,
+    "chars_per_token": 1.85,
+    "tool_overrides": {
+      "summarize": {
+        "max_result_tokens": 500
+      }
+    }
+  }
+}
+```
+
+The default tool gets a `1500 × 1.85 = 2775` char budget; `summarize` inherits the server's `1.85` ratio for `500 × 1.85 = 925`. The same operator on the char path would have used `max_result_chars=8000` and quietly skipped compression on most Korean responses.
+
+The estimator used at gate time is a Unicode-block-weighted approximation in `proxy/token_estimate.py`, calibrated against `cl100k_base` on a 13-pair EN/KO documentation corpus. It over-estimates by ~13% (median, safe direction) and runs ~2× faster than `tiktoken` with zero dependencies.
+
 ### Upstream prefix invariants
 
 Each `upstream_servers.<key>.prefix` must be **non-empty** and **unique across all upstreams** — both are enforced at config load and raise `ValidationError` on violation:

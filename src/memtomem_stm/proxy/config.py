@@ -226,6 +226,15 @@ class ProgressiveConfig(BaseModel):
 class ToolOverrideConfig(BaseModel):
     compression: CompressionStrategy | None = None
     max_result_chars: int | None = Field(default=None, gt=0)
+    max_result_tokens: int | None = Field(default=None, gt=0)
+    """Token-equivalent budget for this tool. When set, takes precedence over
+    ``max_result_chars`` and is converted to a char budget via the resolved
+    ``chars_per_token`` ratio. Useful for non-Latin-script content where a
+    fixed char budget under-triggers compression. See ``token_estimate.py``."""
+    chars_per_token: float | None = Field(default=None, gt=0.0)
+    """Per-tool override for the chars-per-token ratio used to convert
+    ``max_result_tokens`` to a char budget. Falls back to the upstream
+    server's ratio, then ``ProxyConfig.chars_per_token``."""
     retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     """Override the dynamic retention floor for this tool.
 
@@ -255,6 +264,15 @@ class UpstreamServerConfig(BaseModel):
     headers: dict[str, str] | None = None
     compression: CompressionStrategy = CompressionStrategy.AUTO
     max_result_chars: int = Field(default=8000, gt=0)
+    max_result_tokens: int | None = Field(default=None, gt=0)
+    """Token-equivalent budget for this upstream. When set, takes precedence
+    over ``max_result_chars`` and is converted to a char budget via the
+    resolved ``chars_per_token`` ratio. See ``token_estimate.py`` for the
+    estimator used at gate time."""
+    chars_per_token: float | None = Field(default=None, gt=0.0)
+    """Per-server override for the chars-per-token ratio. Falls back to
+    ``ProxyConfig.chars_per_token`` (default 3.5, English-biased). Set to
+    ~2.0 for Korean-dominant content, ~1.3 for Chinese-dominant."""
     retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     """Per-server retention floor override (see ToolOverrideConfig)."""
     llm: LLMCompressorConfig | None = None
@@ -469,6 +487,14 @@ class ProxyConfig(BaseModel):
     lock_timeout_seconds: float = Field(default=30.0, gt=0.0)
     consumer_model: str = ""
     context_budget_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
+    chars_per_token: float = Field(default=3.5, gt=0.0)
+    """Default chars-per-token ratio used to convert token budgets into char
+    budgets. The default ``3.5`` is English-biased (ASCII text averages
+    ~4.0 chars/token for cl100k_base). Set to ~2.0 for Korean-dominant
+    workloads, ~1.3 for Chinese-dominant. Per-server / per-tool overrides
+    are available on ``UpstreamServerConfig`` and ``ToolOverrideConfig``.
+    Also used inside ``effective_max_result_chars()`` to convert the
+    consumer model's context window from tokens to chars."""
     cache: CacheConfig = Field(default_factory=CacheConfig)
     auto_index: AutoIndexConfig = Field(default_factory=AutoIndexConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
@@ -519,8 +545,10 @@ class ProxyConfig(BaseModel):
         """Compute max_result_chars scaled by consumer model's context window.
 
         If ``consumer_model`` is set and matches a known model prefix,
-        the budget is ``context_window * context_budget_ratio * 3.5``
-        (tokens → chars), capped at ``default_max_result_chars``.
+        the budget is ``context_window * context_budget_ratio * chars_per_token``
+        (tokens → chars), capped at ``default_max_result_chars``. The
+        ``chars_per_token`` field defaults to ``3.5`` (English-biased) and
+        is configurable for non-Latin-script workloads.
         """
         if not self.consumer_model:
             return self.default_max_result_chars
@@ -532,7 +560,7 @@ class ProxyConfig(BaseModel):
                 break
         if ctx_tokens is None:
             return self.default_max_result_chars
-        model_budget = int(ctx_tokens * self.context_budget_ratio * 3.5)
+        model_budget = int(ctx_tokens * self.context_budget_ratio * self.chars_per_token)
         return min(model_budget, self.default_max_result_chars)
 
     @staticmethod
