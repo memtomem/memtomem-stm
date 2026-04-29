@@ -54,6 +54,7 @@ from memtomem_stm.proxy.memory_ops import (
     extract_and_store,
     format_fact_md,
 )
+from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
     distill_schema,
@@ -487,9 +488,16 @@ class ProxyManager:
         cfg = conn.config
 
         compression = cfg.compression
-        # Use model-aware budget if server uses default max_result_chars
+        # Token-equivalent budget takes precedence over char budget when set.
+        # Resolution order for chars_per_token: tool override → server → proxy default.
+        # Resolution order for max_result_tokens: tool override → server.
+        # Falls back to existing char-budget paths when neither override is set.
         _default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
-        if cfg.max_result_chars == _default_server_max:
+        server_token_budget = cfg.max_result_tokens
+        if server_token_budget is not None:
+            cpt = cfg.chars_per_token if cfg.chars_per_token is not None else config.chars_per_token
+            max_chars = tokens_to_chars(server_token_budget, cpt)
+        elif cfg.max_result_chars == _default_server_max:
             max_chars = config.effective_max_result_chars()
         else:
             max_chars = cfg.max_result_chars
@@ -513,7 +521,19 @@ class ProxyManager:
         if override is not None:
             if override.compression is not None:
                 compression = override.compression
-            if override.max_result_chars is not None:
+            # Per-tool budget override. Token override wins over char override
+            # if both are set. Resolution order for chars_per_token (when token
+            # budget is used): tool override → server → proxy default.
+            if override.max_result_tokens is not None:
+                cpt = (
+                    override.chars_per_token
+                    if override.chars_per_token is not None
+                    else cfg.chars_per_token
+                    if cfg.chars_per_token is not None
+                    else config.chars_per_token
+                )
+                max_chars = tokens_to_chars(override.max_result_tokens, cpt)
+            elif override.max_result_chars is not None:
                 max_chars = override.max_result_chars
             if override.retention_floor is not None:
                 retention_floor = override.retention_floor
