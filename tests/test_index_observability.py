@@ -1,10 +1,10 @@
 """Tests for IndexObservability counters + stm_index_stats render helper.
 
 The end-to-end wire-in (manager → extract_and_store → counter increment)
-is covered by integration tests in ``test_proxy_manager_*.py`` /
-``test_extract_and_store*.py`` — this file is focused on the standalone
-counter contract and the stats formatter, mirroring
-``test_surfacing_observability.py``.
+is pinned by
+``test_proxy_manager_pipeline.py::TestExtractAndStore::test_dedup_skips_duplicate``
+— this file focuses on the standalone counter contract and the stats
+formatter, mirroring ``test_surfacing_observability.py``.
 """
 
 from __future__ import annotations
@@ -167,16 +167,16 @@ class TestFormatIndexObservabilitySections:
         }
         lines = _format_index_observability_sections(snap, tool_filter=None)
         joined = "\n".join(lines)
-        i_zero = joined.index("extracted_zero_facts")
-        i_dedup = joined.index("dedup_skip")
-        i_stored = joined.index("stored")
-        # The dominant outcome (50 zero) should appear first within the tool block.
-        # Sort key is (-count, label) — equal counts fall back to label asc.
-        # Here counts differ: 50 > 7 > 3 → zero, dedup, stored.
-        # But __total__ appears first overall; check ordering inside the per-tool block by
-        # finding the second occurrence (under ``  t:``).
-        first_block_end = joined.index("  t:")
-        sub = joined[first_block_end:]
+        # __total__ block renders first; per-tool ``t`` block follows. Slice
+        # at the per-tool header so the assertion checks that block alone.
+        # Using ``split`` (not ``index``) makes the slice intent explicit and
+        # tolerant of incidental "  t:" substrings appearing in section
+        # headers — a fragility the pure-``index`` form had.
+        sub = joined.split("\n  t:\n", 1)[1]
+        # Sort key is (-count, label) — counts here are 50 > 7 > 3 so order
+        # within the tool block is zero > dedup > stored.
         assert sub.index("extracted_zero_facts") < sub.index("dedup_skip") < sub.index("stored")
-        # Sanity: ensure the labels show up in __total__ block too.
-        assert i_zero >= 0 and i_dedup >= 0 and i_stored >= 0
+        # Sanity: labels show up in __total__ block too.
+        assert "extracted_zero_facts" in joined
+        assert "dedup_skip" in joined
+        assert "stored" in joined

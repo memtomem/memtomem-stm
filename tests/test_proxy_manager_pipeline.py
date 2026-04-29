@@ -723,6 +723,18 @@ class TestExtractAndStore:
         # index_file should NOT be called because the fact was a duplicate
         mock_indexer.index_file.assert_not_awaited()
 
+        # Wire-in pin: removing ``observability=self.index_observability``
+        # from manager._extract_and_store would silently slip past the
+        # standalone counter tests because the free function defaults to
+        # the no-op singleton. Asserting attempts + per-tool dedup outcome
+        # here ties the kwarg to a red test.
+        snap = mgr.index_observability.snapshot()
+        assert snap["any_call"] is True
+        assert snap["attempts"]["__total__"] == 1
+        assert snap["attempts"]["t"] == 1
+        assert snap["outcomes"]["__total__"] == {"dedup_skip": 1}
+        assert snap["outcomes"]["t"] == {"dedup_skip": 1}
+
 
 # ── get_upstream_health ───────────────────────────────────────────────────
 
