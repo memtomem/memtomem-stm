@@ -796,14 +796,13 @@ async def stm_index_stats(
     if pm is None:
         return "Proxy is not enabled."
 
-    snapshot = pm.index_observability.snapshot()
-    if not snapshot["any_call"]:
-        return (
-            "No INDEX activity recorded since process start "
-            "(extract_and_store has not been invoked)."
-        )
-
     with traced("stm_index_stats", metadata={"tool": tool}):
+        snapshot = pm.index_observability.snapshot()
+        if not snapshot["any_call"]:
+            return (
+                "No INDEX activity recorded since process start "
+                "(extract_and_store has not been invoked)."
+            )
         lines = ["Index Stats", "==========="]
         lines.extend(_format_index_observability_sections(snapshot, tool_filter=tool))
         if tool:
