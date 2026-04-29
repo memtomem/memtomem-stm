@@ -1620,6 +1620,71 @@ def _add_from_clients(
     _handle_source_prune([new_candidates[i] for i in picks], prune=prune)
 
 
+# Token-aware budget presets keyed by primary content language. KO is the
+# only language with empirical calibration shipped here (PR #274's 13-pair
+# EN/KO doc corpus measured against ``cl100k_base``); EN is intentionally
+# empty so the resulting config matches the existing code defaults exactly
+# without per-key noise. ZH/JA placeholders are deliberately omitted until
+# an analogous measurement lands — guessing by typology would defeat the
+# point of the empirical-calibration framing in PR #274.
+_LANG_PRESET_KO = "Korean (chars_per_token=1.85, max_result_tokens=2000 per server)"
+_LANG_PRESET_EN = "English (no language-specific tuning — code defaults)"
+_LANG_PRESETS: dict[str, dict[str, Any]] = {
+    "en": {},
+    "ko": {
+        "chars_per_token": 1.85,
+        "min_response_chars": 230,
+        "default_max_result_chars": 8500,
+        "_per_server": {
+            "max_result_tokens": 2000,
+            "chars_per_token": 1.85,
+        },
+    },
+}
+
+
+def _prompt_language() -> str:
+    """Single-choice language preset prompt with TUI / click fallback.
+
+    Returns ``"en"`` on non-TTY (CliRunner tests, pipes, CI) — the
+    scriptable path is ``--lang``, not stdin emulation. TTY with TUI
+    available → questionary select. TTY with ``MMS_NO_TUI=1`` (or
+    questionary import failure) → ``click.prompt`` with a Choice.
+    """
+    if not sys.stdin.isatty():
+        return "en"
+
+    if _should_use_tui():
+        try:
+            import questionary
+
+            choice = questionary.select(
+                "Primary content language for token-aware budgets:",
+                choices=[
+                    questionary.Choice(title=_LANG_PRESET_EN, value="en"),
+                    questionary.Choice(title=_LANG_PRESET_KO, value="ko"),
+                ],
+                default="en",
+                style=_tui_style(),
+                use_arrow_keys=True,
+                use_jk_keys=True,
+                use_emacs_keys=True,
+            ).ask()
+            return choice if choice in _LANG_PRESETS else "en"
+        except Exception:
+            # Fall through to click prompt if questionary blows up
+            # (terminal incompatibility, etc.). Same defensive pattern as
+            # ``_pick_imports`` already uses.
+            pass
+
+    return click.prompt(
+        "Primary content language",
+        type=click.Choice(list(_LANG_PRESETS)),
+        default="en",
+        show_default=True,
+    )
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option(
@@ -1651,11 +1716,25 @@ def _add_from_clients(
         "scripted callers must pass the flag explicitly."
     ),
 )
+@click.option(
+    "--lang",
+    type=click.Choice(list(_LANG_PRESETS)),
+    default=None,
+    help=(
+        "Primary content language preset for token-aware budgets. "
+        "'en' (default) writes no language-specific fields. 'ko' sets "
+        "chars_per_token=1.85, default_max_result_chars=8500, "
+        "min_response_chars=230, and adds max_result_tokens=2000 + "
+        "chars_per_token=1.85 to each imported server. Omit for the "
+        "interactive prompt; defaults to 'en' on non-TTY callers."
+    ),
+)
 def init(
     config_path: str,
     no_validate: bool,
     mcp_mode: str | None,
     prune_originals: bool,
+    lang: str | None,
 ) -> None:
     """Guided first-time setup for memtomem-stm.
 
@@ -1784,6 +1863,26 @@ def init(
 
         imported[name] = entry
 
+    # Resolve the language preset before validate so the prompt sequence
+    # stays predictable for scripted callers ("which prompt fires next?").
+    # Non-TTY callers without ``--lang`` get "en" silently — see
+    # ``_prompt_language``.
+    selected_lang = lang if lang is not None else _prompt_language()
+    preset = _LANG_PRESETS[selected_lang]
+    proxy_fields = {k: v for k, v in preset.items() if not k.startswith("_")}
+    per_server_fields = preset.get("_per_server", {})
+    if per_server_fields:
+        for entry in imported.values():
+            for key, value in per_server_fields.items():
+                # ``setdefault`` preserves any operator-explicit value the
+                # import flow already produced (an upstream MCP config could
+                # in principle carry these keys). Manual flow's hardcoded
+                # ``max_result_chars=8000`` is left in place; the token
+                # budget wins via ``ProxyManager._resolve_tool_config``
+                # precedence (PR #274), so the char value is dead code in
+                # the resolved budget but kept visible in the saved config.
+                entry.setdefault(key, value)
+
     if not no_validate and click.confirm("Validate connection(s) now?", default=True):
         probe_map = {n: e for n, e in imported.items()}
         click.echo(f"Validating {len(probe_map)} server(s) (timeout=10s)...")
@@ -1795,7 +1894,7 @@ def init(
                 click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe['error']}", err=True)
                 click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
 
-    data = {"enabled": True, "upstream_servers": imported}
+    data: dict[str, Any] = {"enabled": True, **proxy_fields, "upstream_servers": imported}
     _save(path, data)
 
     click.echo("")

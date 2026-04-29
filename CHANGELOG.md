@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **`mms init --lang ko` writes a Korean-tuned token-aware budget preset** — closes the discoverability gap left open by PR #274. PR #274 shipped the mechanism (`max_result_tokens`, `chars_per_token` at proxy/server/tool levels) but required Korean operators to manually transcribe four numeric fields per server. The new `--lang` option (and matching interactive prompt on TTY) writes the calibrated KO preset directly: `chars_per_token=1.85`, `default_max_result_chars=8500`, `min_response_chars=230` at proxy level, and `max_result_tokens=2000` + `chars_per_token=1.85` on every imported upstream. Numbers come from PR #274's empirical 13-pair EN/KO doc-corpus calibration against `cl100k_base` (median 1.85 chars/tok for KO, vs 4.03 for EN). EN (default) is intentionally a no-op — config matches code defaults exactly without per-key noise. ZH/JA placeholders are deliberately omitted until analogous corpus measurements land — guessing by typology would defeat PR #274's empirical-calibration framing. Non-TTY callers without `--lang` get EN silently (load-bearing for backward compat with existing `mms init` tests); explicit `--lang` is the scriptable path. The interactive prompt uses `questionary.select` on a TTY and falls back to `click.prompt` with a `Choice` for `MMS_NO_TUI=1` users.
+
 ## [0.1.20] — 2026-04-27
 
 ### Changed

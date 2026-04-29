@@ -974,6 +974,131 @@ class TestInit:
         assert "bad" in data["upstream_servers"]
 
 
+# ── init: language preset (--lang) ──────────────────────────────────────
+
+
+class TestInitLangPreset:
+    """``mms init --lang`` selects a token-aware budget preset.
+
+    PR #274 ships KO calibration; EN is the empty-default preset. The
+    flag is the scriptable path — non-TTY callers without ``--lang`` get
+    "en" silently, which keeps the entire ``TestInit`` suite (and any
+    third-party scripted caller) from needing to feed an extra prompt
+    line. Existing tests in ``TestInit`` already pin that contract by
+    not supplying any lang input and still passing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_mcp_integration(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
+
+    def test_lang_ko_writes_proxy_and_per_server_fields(self, runner, config, no_discovery):
+        """KO preset writes proxy-level chars_per_token / min_response_chars /
+        default_max_result_chars AND per-server max_result_tokens +
+        chars_per_token. The hardcoded manual-flow ``max_result_chars=8000``
+        stays in place — token budget wins via PR #274 precedence."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--lang", "ko", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+
+        # Proxy-level fields
+        assert data["chars_per_token"] == 1.85
+        assert data["min_response_chars"] == 230
+        assert data["default_max_result_chars"] == 8500
+
+        # Per-server fields
+        srv = data["upstream_servers"]["filesystem"]
+        assert srv["max_result_tokens"] == 2000
+        assert srv["chars_per_token"] == 1.85
+        # Manual-flow hardcode preserved (token wins at resolution time)
+        assert srv["max_result_chars"] == 8000
+
+    def test_lang_en_writes_no_language_specific_fields(self, runner, config, no_discovery):
+        """EN preset is a no-op on the data dict — config matches pre-PR
+        behavior exactly. This is the contract that lets existing TestInit
+        tests pass without supplying a lang prompt."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--lang", "en", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "chars_per_token" not in data
+        assert "min_response_chars" not in data
+        assert "default_max_result_chars" not in data
+
+        srv = data["upstream_servers"]["filesystem"]
+        assert "max_result_tokens" not in srv
+        assert "chars_per_token" not in srv
+
+    def test_no_lang_flag_non_tty_defaults_to_en(self, runner, config, no_discovery):
+        """Non-TTY callers (CliRunner is non-TTY) skip the prompt and get EN.
+
+        This pins the contract that the lang prompt does not consume a
+        stdin line in scripted contexts — load-bearing for backward
+        compat with TestInit."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "chars_per_token" not in data
+        srv = data["upstream_servers"]["filesystem"]
+        assert "max_result_tokens" not in srv
+
+    def test_lang_invalid_choice_rejected(self, runner, config, no_discovery):
+        """Click validates --lang against the preset list; bad value aborts
+        before any prompt fires (no config side-effect)."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--lang", "xx", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n\n",
+        )
+        assert result.exit_code != 0
+        assert not config.exists()
+
+    def test_lang_ko_with_no_servers_imported_writes_nothing(self, runner, config, monkeypatch):
+        """If discovery yields candidates and the user picks none, the wizard
+        returns early before save — no config is written even with --lang.
+        Pins that --lang doesn't sneak past the empty-pick guard."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        # Force discovery to surface a candidate (so the import flow runs)
+        # but stub _pick_imports to return [] (user toggled nothing).
+        monkeypatch.setattr(
+            proxy_mod,
+            "_discover_candidates",
+            lambda _cwd: [
+                {
+                    "name": "fs",
+                    "entry": {"command": "npx", "args": ["-y", "fs"]},
+                    "source": "test",
+                }
+            ],
+        )
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda _c: [])
+
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--lang", "ko", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0
+        assert "No servers selected" in result.output
+        assert not config.exists()
+
+
 # ── init: discovery + import helpers ────────────────────────────────────
 
 

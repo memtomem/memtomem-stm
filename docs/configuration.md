@@ -278,6 +278,42 @@ A token budget caps context spend, not information throughput. Korean content en
 
 If your goal is equal information throughput rather than equal spend, scale KO budgets ~1.5× upward (and CJK-ideograph budgets accordingly).
 
+#### Bootstrap shortcut: `mms init --lang ko`
+
+For first-time setup of a Korean-content STM proxy, `mms init` accepts a `--lang` flag that writes the calibrated KO preset directly so you don't need to transcribe the numeric fields above:
+
+```bash
+mms init --lang ko
+```
+
+This writes:
+
+- **Proxy-level**: `chars_per_token=1.85`, `min_response_chars=230`, `default_max_result_chars=8500`
+- **Per-imported-server**: `max_result_tokens=2000`, `chars_per_token=1.85`
+
+Equivalent JSON (what ends up in `~/.memtomem/stm_proxy.json`). The server key (`<your-server-name>` below) and `prefix` come from whatever `mms init` discovered or you typed in the manual flow — `--lang ko` only adds the four token-aware fields, never invents server names:
+
+```json
+{
+  "enabled": true,
+  "chars_per_token": 1.85,
+  "min_response_chars": 230,
+  "default_max_result_chars": 8500,
+  "upstream_servers": {
+    "<your-server-name>": {
+      "prefix": "<your-prefix>",
+      "command": "...",
+      "max_result_tokens": 2000,
+      "chars_per_token": 1.85
+    }
+  }
+}
+```
+
+Without `--lang`, an interactive prompt fires on a TTY (questionary select; falls back to `click` Choice prompt under `MMS_NO_TUI=1`). Non-TTY callers without `--lang` get EN (no preset) silently — `--lang ko` is the scriptable opt-in. `--lang en` is supported for explicit "no preset" intent and writes nothing language-specific.
+
+Only EN and KO are shipped: KO is the only language with empirical calibration in PR #274's measurement corpus. ZH/JA are intentionally omitted until analogous calibration lands.
+
 ### Upstream prefix invariants
 
 Each `upstream_servers.<key>.prefix` must be **non-empty** and **unique across all upstreams** — both are enforced at config load and raise `ValidationError` on violation:
