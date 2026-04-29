@@ -98,6 +98,7 @@ async def auto_index_response(
     original_chars: int | None = None,
     compressed_chars: int | None = None,
     context_query: str | None = None,
+    observability: IndexObservability | _NoOpIndexObservability = _NOOP_INDEX_OBSERVABILITY,
 ) -> AutoIndexOutcome:
     """Write a response to disk and index it via the file indexer.
 
@@ -107,7 +108,15 @@ async def auto_index_response(
     metrics consume the status fields. Failure is still logged via
     ``logger.warning`` as before — the outcome adds a second observability
     channel for operators who can't scrape logs.
+
+    ``observability`` defaults to a no-op so existing call sites keep
+    working unchanged. When the manager wires a real
+    ``IndexObservability``, this function records one
+    ``record_attempt(tool, "auto_index")`` per invocation plus one of
+    ``stored`` / ``error`` outcomes — auto_index has no extraction or
+    dedup phase so the other two ``IndexOutcome`` labels do not fire here.
     """
+    observability.record_attempt(tool, "auto_index")
     memory_dir = ai_cfg.memory_dir.expanduser().resolve()
     memory_dir.mkdir(parents=True, exist_ok=True)
 
@@ -154,6 +163,7 @@ async def auto_index_response(
     try:
         stats = await index_engine.index_file(file_path, namespace=ns)
         chunks = stats.indexed_chunks
+        observability.record_outcome(tool, "stored")
     except Exception as exc:
         logger.warning(
             "Auto-index failed for %s/%s: %s",
@@ -165,6 +175,7 @@ async def auto_index_response(
         chunks = 0
         ok = False
         error = f"{type(exc).__name__}: {exc}"
+        observability.record_outcome(tool, "error")
 
     summary = compose_index_footer(
         server=server,
@@ -205,7 +216,7 @@ async def extract_and_store(
     ``index_observability`` module docstring for the granularity contract).
     """
     indexed_count = 0
-    observability.record_attempt(tool)
+    observability.record_attempt(tool, "extract")
     try:
         facts = await extractor.extract(text, server=server, tool=tool)
         if not facts:

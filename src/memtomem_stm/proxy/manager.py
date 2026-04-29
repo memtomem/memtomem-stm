@@ -156,10 +156,11 @@ class ProxyManager:
         self._selective_lock = asyncio.Lock()
         self._extractor: FactExtractor | None = None
         self._extractor_lock = asyncio.Lock()
-        # In-memory counters for the INDEX (extract_and_store) pipeline.
-        # Always instantiated — ``stm_index_stats`` reads ``any_call`` to
-        # decide whether to render anything for zero-traffic deployments.
-        # See ``proxy/index_observability.py`` for the counter contract.
+        # In-memory counters for both INDEX-pipeline write paths
+        # (auto_index_response + extract_and_store). Always instantiated —
+        # ``stm_index_stats`` reads ``any_call`` to decide whether to
+        # render anything for zero-traffic deployments. See
+        # ``proxy/index_observability.py`` for the counter contract.
         self.index_observability = IndexObservability()
         self._progressive_store: ProgressiveStoreAdapter | None = None
         self._progressive_store_cfg: SelectiveConfig | None = None
@@ -776,6 +777,7 @@ class ProxyManager:
             original_chars=original_chars,
             compressed_chars=compressed_chars,
             context_query=context_query,
+            observability=self.index_observability,
         )
 
     async def _get_extractor(self) -> FactExtractor:

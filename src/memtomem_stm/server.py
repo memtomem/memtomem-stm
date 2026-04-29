@@ -769,21 +769,35 @@ async def stm_index_stats(
     tool: str | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
-    """Show STM-driven LTM write statistics (the INDEX pipeline).
+    """Show STM-driven LTM write statistics (both INDEX paths).
 
-    Mirrors ``stm_surfacing_stats`` for the write side. Aggregates
-    in-memory per-tool counters since process start: per-call attempts
-    and per-fact / per-call outcomes
-    (``stored`` / ``dedup_skip`` / ``extracted_zero_facts`` / ``error``).
+    Mirrors ``stm_surfacing_stats`` for the write side. Covers both
+    STM-driven LTM-write code paths: ``auto_index_response`` (verbatim
+    response → markdown chunk) and ``extract_and_store`` (response →
+    LLM-extracted facts → markdown chunks). Both run on the proxy hot
+    path (sequential stages 4 and 4b in ``manager.call_tool``) and both
+    write to LTM via ``index_engine.index_file``.
+
+    Snapshot shape:
+
+    - ``attempts[tool][path]`` per-tool / per-path call counts; path is
+      ``extract`` or ``auto_index``. ``__total__`` aggregates across tools.
+    - ``outcomes[tool][label]`` per-tool 4-label outcomes shared across
+      both paths. ``stored`` and ``error`` fire for both; ``dedup_skip``
+      and ``extracted_zero_facts`` only fire for the extract path
+      (auto_index has no extraction or dedup phase).
 
     **Quality signal absent by design.** SURFACE has surfacing-feedback;
     INDEX has no equivalent. Adding one would have to choose between
     two non-equivalent observables (positive-value vs harm-prevented)
     that conflate distinct questions if bundled — see the
     ``index_observability`` module docstring for the rationale.
-    Operators reading this tool should treat ``stored`` as the raw
-    mem_add count and ``extracted_zero_facts / attempts`` as the no-op
-    rate — neither is a value-judgment, just a volume distribution.
+    Operators reading this tool should treat
+    ``outcomes[__total__][stored]`` as the raw mem_add count
+    (across both paths) and
+    ``outcomes[__total__][extracted_zero_facts] / attempts[__total__][extract]``
+    as the extract-path no-op rate — neither is a value-judgment, just
+    a volume distribution.
 
     Args:
         tool: Optional filter by upstream tool name. The ``__total__``
@@ -801,7 +815,8 @@ async def stm_index_stats(
         if not snapshot["any_call"]:
             return (
                 "No INDEX activity recorded since process start "
-                "(extract_and_store has not been invoked)."
+                "(neither auto_index_response nor extract_and_store "
+                "has been invoked)."
             )
         lines = ["Index Stats", "==========="]
         lines.extend(_format_index_observability_sections(snapshot, tool_filter=tool))
@@ -819,15 +834,16 @@ def _format_index_observability_sections(snapshot: dict, *, tool_filter: str | N
     single tool's counters against the total without re-running.
 
     Mirror of ``_format_observability_sections`` for surfacing, but with
-    the INDEX shape: an ``attempts`` per-tool int dict (no nested
-    sub-counters) and an ``outcomes`` per-tool dict-of-int. No cache
-    section — INDEX has no caching layer.
+    the INDEX shape: ``attempts`` is per-tool / per-path
+    (``{tool: {path: count}}``) so operators see the
+    extract / auto_index breakdown; ``outcomes`` is per-tool 4-label.
+    No cache section — INDEX has no caching layer.
     """
-    attempts: dict[str, int] = snapshot["attempts"]
+    attempts: dict[str, dict[str, int]] = snapshot["attempts"]
     outcomes: dict[str, dict[str, int]] = snapshot["outcomes"]
 
     if tool_filter is not None:
-        attempts = {t: c for t, c in attempts.items() if t == tool_filter or t == "__total__"}
+        attempts = {t: a for t, a in attempts.items() if t == tool_filter or t == "__total__"}
         outcomes = {t: o for t, o in outcomes.items() if t == tool_filter or t == "__total__"}
 
     lines: list[str] = []
@@ -835,7 +851,12 @@ def _format_index_observability_sections(snapshot: dict, *, tool_filter: str | N
     if attempts:
         lines.append("\nAttempts (since process start):")
         for tool_name in _ordered_tool_keys(attempts):
-            lines.append(f"  {tool_name}: {attempts[tool_name]}")
+            tool_attempts = attempts[tool_name]
+            if not tool_attempts:
+                continue
+            lines.append(f"  {tool_name}:")
+            for path, count in sorted(tool_attempts.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {path}: {count}")
 
     if outcomes:
         lines.append("\nOutcomes (since process start):")
