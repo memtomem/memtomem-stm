@@ -190,6 +190,31 @@ class TestServerLevelTokenBudget:
         tc = mgr._resolve_tool_config("srv", "any_tool")
         assert tc.max_chars == 2500
 
+    def test_token_budget_bypasses_model_aware_path(self):
+        """Token budget short-circuits ``effective_max_result_chars()``.
+
+        When a server sets ``max_result_tokens``, the resolution must NOT
+        fall through to the model-aware char budget — even if the proxy
+        has ``consumer_model`` set and the server keeps the default
+        ``max_result_chars``. The token budget is the more specific intent.
+        """
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            # default max_result_chars=8000 → would normally trigger
+            # effective_max_result_chars() in the char path
+            max_result_tokens=1000,
+            chars_per_token=2.0,
+        )
+        proxy_cfg = ProxyConfig(
+            upstream_servers={"srv": server_cfg},
+            consumer_model="claude-sonnet-4",  # would yield model-aware budget
+        )
+        mgr = _make_manager(proxy_cfg, server_cfg)
+
+        tc = mgr._resolve_tool_config("srv", "any_tool")
+        # Token path wins: 1000 * 2.0 = 2000 (NOT effective_max_result_chars()).
+        assert tc.max_chars == 2000
+
 
 class TestToolOverrideTokenBudget:
     def test_override_max_result_tokens_wins_over_server(self):

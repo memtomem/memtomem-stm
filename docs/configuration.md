@@ -267,7 +267,16 @@ Example — a Korean-content upstream (e.g. a Korean documentation MCP server):
 
 The default tool gets a `1500 × 1.85 = 2775` char budget; `summarize` inherits the server's `1.85` ratio for `500 × 1.85 = 925`. The same operator on the char path would have used `max_result_chars=8000` and quietly skipped compression on most Korean responses.
 
-The estimator used at gate time is a Unicode-block-weighted approximation in `proxy/token_estimate.py`, calibrated against `cl100k_base` on a 13-pair EN/KO documentation corpus. It over-estimates by ~13% (median, safe direction) and runs ~2× faster than `tiktoken` with zero dependencies.
+Gate decisions multiply the operator-supplied `max_result_tokens` and resolved `chars_per_token` directly — no runtime text inspection happens. A codepoint-weighted approximation lives in `proxy/token_estimate.py` (calibrated against `cl100k_base` on a 13-pair EN/KO corpus, median absolute error ~13% in the over-estimate direction), but it is **not yet wired into the gate path**; it is published for a follow-up that estimates real response token counts at runtime.
+
+#### Token budgets bound spend, not information
+
+A token budget caps context spend, not information throughput. Korean content encodes the same information in roughly **1.57× more tokens** than English at `cl100k_base` (PR-attached corpus measurement: 19,084 EN tokens vs 30,009 KO tokens for the same 13 doc pairs). So setting the same `max_result_tokens` on an EN upstream and a KO upstream:
+
+- bounds context spend equally (both gate at the chosen token count), and
+- delivers **less information** to the KO consumer (≈64% of EN-equivalent information at the same token target).
+
+If your goal is equal information throughput rather than equal spend, scale KO budgets ~1.5× upward (and CJK-ideograph budgets accordingly).
 
 ### Upstream prefix invariants
 

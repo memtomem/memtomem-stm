@@ -1,28 +1,32 @@
-"""Codepoint-weighted token estimator for budget decisions.
+"""Codepoint-weighted token estimator (currently unused at gate time).
 
 STM uses character counts everywhere by default. For users with
 non-Latin-script workloads (Korean, Japanese, Chinese), a fixed char
 budget under-triggers compression — Korean content has roughly 2x more
 tokens per character than English at the same information density. The
-``effective_max_result_chars()`` path uses a hardcoded ``3.5`` chars/token
-multiplier that is English-biased.
+``effective_max_result_chars()`` path historically used a hardcoded
+``3.5`` chars/token multiplier that is English-biased.
 
-This module provides a fast, dependency-free token estimator that
-weights characters by Unicode block. It is calibrated against
-``tiktoken`` ``cl100k_base`` (GPT-3.5/4 tokenizer) on a 13-pair EN/KO
-documentation corpus from ``memtomem-com``. Median absolute error is
-~13% in the over-estimate direction, with zero gate-flip errors at the
-5000-token threshold on the test corpus.
+The current PR introduces an opt-in *operator-supplied* path:
+``ProxyConfig.chars_per_token`` (per-proxy / per-server / per-tool) plus
+``max_result_tokens`` on server / tool. Gate decisions multiply those
+two operator-supplied values via :func:`tokens_to_chars` — no runtime
+text inspection happens. ``approx_tokens`` below is **not yet wired
+into the gate path**; it is published for a follow-up that estimates
+real response token counts at runtime instead of relying on the
+operator's static ratio.
 
-The estimator is suitable for budget gates and threshold decisions; it
-is not suitable for billing or other use cases needing exact token
-counts. The over-estimate bias is intentional — borderline responses
-get compressed slightly earlier rather than slipping past the gate.
+This module provides a fast, dependency-free codepoint-weighted token
+estimator. It was calibrated against ``tiktoken`` ``cl100k_base``
+(GPT-3.5/4 tokenizer) on a 13-pair EN/KO documentation corpus from
+``memtomem-com``. Median absolute error on that corpus is ~13% in the
+over-estimate direction (intentional — borderline responses compress
+slightly earlier rather than slip past the gate). Gate-flip rate is 0
+at the 5000-token threshold on the test corpus.
 
 Coefficients can be re-tuned without API impact: only the
-``approx_tokens`` numeric output changes, which feeds back into existing
-char-budget plumbing through ``tokens_to_chars`` and
-``ProxyConfig.chars_per_token``.
+``approx_tokens`` numeric output changes. Suitable for budget gates and
+threshold decisions, not for billing.
 """
 
 from __future__ import annotations
