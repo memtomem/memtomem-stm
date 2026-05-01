@@ -1,0 +1,334 @@
+"""CliRunner tests for ``mms project ...`` (RFC §7.1)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from memtomem_stm.cli.mms_project import (
+    _REGISTRY_EMPTY_MSG,
+    _show_git_no_marker_text,
+    _show_no_marker_no_git_text,
+    project_group,
+)
+from memtomem_stm.mms import state
+
+
+@pytest.fixture
+def runner() -> CliRunner:
+    return CliRunner()
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    """Pin HOME so ``~/.mms`` is sandboxed; chdir to a fresh project dir.
+
+    Returns a dict with the sandbox HOME and the cwd directory so tests
+    can do path assertions.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    monkeypatch.chdir(proj_dir)
+    return {"home": tmp_path, "cwd": proj_dir}
+
+
+def _seed_registry(*names: str) -> None:
+    cfg = state.RegistryConfig(
+        servers={n: state.RegistryServer(command="echo", prefix=n[:2]) for n in names}
+    )
+    state.save_registry(cfg)
+
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+
+def test_init_creates_marker_and_indexes(runner, sandbox):
+    res = runner.invoke(project_group, ["init"])
+    assert res.exit_code == 0, res.output
+
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    assert marker.is_file()
+
+    cfg = state.load_project_config(marker)
+    assert cfg.project.name == "proj"
+    assert cfg.mcp.enabled == []
+
+    idx = state.load_projects_index()
+    assert len(idx.projects) == 1
+    assert idx.projects[0].name == "proj"
+    assert Path(idx.projects[0].path) == sandbox["cwd"]
+
+
+def test_init_with_explicit_path_and_name(runner, sandbox):
+    other = sandbox["home"] / "other-proj"
+    other.mkdir()
+    res = runner.invoke(project_group, ["init", str(other), "--name", "custom"])
+    assert res.exit_code == 0, res.output
+
+    marker = other / state.PROJECT_MARKER_RELPATH
+    assert marker.is_file()
+    assert state.load_project_config(marker).project.name == "custom"
+
+
+def test_init_aborts_when_marker_exists(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    res = runner.invoke(project_group, ["init"])
+    assert res.exit_code != 0
+    assert "already exists" in res.output
+    assert "--force" in res.output
+
+
+def test_init_force_overwrites(runner, sandbox):
+    runner.invoke(project_group, ["init", "--name", "first"])
+    res = runner.invoke(project_group, ["init", "--name", "second", "--force"])
+    assert res.exit_code == 0, res.output
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    assert state.load_project_config(marker).project.name == "second"
+
+
+def test_init_rejects_nonexistent_path(runner, sandbox):
+    nope = sandbox["home"] / "does-not-exist"
+    res = runner.invoke(project_group, ["init", str(nope)])
+    assert res.exit_code != 0
+    assert "Not a directory" in res.output or "does not exist" in res.output
+
+
+# ---------------------------------------------------------------------------
+# show
+# ---------------------------------------------------------------------------
+
+
+def test_show_no_marker_no_git_friendly_text(runner, sandbox):
+    """RFC §6.1 — pinned literal text used by `mms project show` UX."""
+    res = runner.invoke(project_group, ["show"])
+    assert res.exit_code == 0, res.output
+    expected = _show_no_marker_no_git_text(sandbox["cwd"].resolve())
+    assert res.output == expected
+
+
+def test_show_git_no_marker_friendly_text(runner, sandbox):
+    (sandbox["cwd"] / ".git").mkdir()
+    res = runner.invoke(project_group, ["show"])
+    assert res.exit_code == 0, res.output
+    expected = _show_git_no_marker_text(sandbox["cwd"].resolve())
+    assert res.output == expected
+
+
+def test_show_marker_renders_enabled_list(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    _seed_registry("filesystem", "github")
+    runner.invoke(project_group, ["enable", "filesystem", "github"])
+    res = runner.invoke(project_group, ["show"])
+    assert res.exit_code == 0, res.output
+    assert "Project: proj" in res.output
+    assert "Detected via: marker" in res.output
+    assert "Enabled MCPs: filesystem, github" in res.output
+
+
+def test_show_marker_with_no_enabled(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    res = runner.invoke(project_group, ["show"])
+    assert "Enabled MCPs: (none)" in res.output
+
+
+def test_show_json_marker(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    _seed_registry("filesystem")
+    runner.invoke(project_group, ["enable", "filesystem"])
+    res = runner.invoke(project_group, ["show", "--json"])
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["name"] == "proj"
+    assert payload["source"] == "marker"
+    assert payload["enabled"] == ["filesystem"]
+
+
+def test_show_json_cwd_fallback(runner, sandbox):
+    res = runner.invoke(project_group, ["show", "--json"])
+    payload = json.loads(res.output)
+    assert payload["source"] == "cwd"
+    assert payload["enabled"] == []
+
+
+def test_show_marker_walk_up(runner, sandbox, monkeypatch):
+    runner.invoke(project_group, ["init"])
+    sub = sandbox["cwd"] / "sub" / "deep"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    res = runner.invoke(project_group, ["show"])
+    assert "Detected via: marker" in res.output
+    assert "Project: proj" in res.output
+
+
+def test_show_by_name(runner, sandbox):
+    other = sandbox["home"] / "other-proj"
+    other.mkdir()
+    runner.invoke(project_group, ["init", str(other), "--name", "elsewhere"])
+    res = runner.invoke(project_group, ["show", "elsewhere"])
+    assert res.exit_code == 0
+    assert "Project: elsewhere" in res.output
+
+
+def test_show_by_name_not_found(runner, sandbox):
+    res = runner.invoke(project_group, ["show", "missing"])
+    assert res.exit_code != 0
+    assert "not found" in res.output
+
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+
+def test_list_empty(runner, sandbox):
+    res = runner.invoke(project_group, ["list"])
+    assert res.exit_code == 0
+    assert "No projects indexed" in res.output
+
+
+def test_list_marks_current(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    other = sandbox["home"] / "other-proj"
+    other.mkdir()
+    runner.invoke(project_group, ["init", str(other), "--name", "other"])
+
+    res = runner.invoke(project_group, ["list"])
+    assert res.exit_code == 0, res.output
+    lines = res.output.strip().splitlines()
+    # current cwd is /tmp/.../proj — should be marked with *
+    cwd_line = next(line for line in lines if "proj\t" in line and "other-proj" not in line)
+    assert cwd_line.startswith("*")
+    other_line = next(line for line in lines if "other-proj" in line)
+    assert other_line.startswith(" ")
+
+
+def test_list_json(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    res = runner.invoke(project_group, ["list", "--json"])
+    payload = json.loads(res.output)
+    assert len(payload["projects"]) == 1
+    assert payload["projects"][0]["name"] == "proj"
+    assert payload["projects"][0]["current"] is True
+    assert payload["pruned"] == []
+
+
+def test_list_prune_removes_stale(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+
+    stale_dir = sandbox["home"] / "stale"
+    stale_dir.mkdir()
+    runner.invoke(project_group, ["init", str(stale_dir), "--name", "stale"])
+
+    # Now delete the stale dir on disk; index still has it.
+    import shutil
+
+    shutil.rmtree(stale_dir)
+
+    res = runner.invoke(project_group, ["list", "--prune"])
+    assert res.exit_code == 0, res.output
+    assert "pruned: stale" in res.output
+    assert "Pruned 1" in res.output
+
+    # Index should now have only the live project.
+    idx = state.load_projects_index()
+    names = {e.name for e in idx.projects}
+    assert names == {"proj"}
+
+
+# ---------------------------------------------------------------------------
+# enable / disable
+# ---------------------------------------------------------------------------
+
+
+def test_enable_against_empty_registry_friendly_error(runner, sandbox):
+    """Pinned graceful-error contract from W1 PR1 plan."""
+    runner.invoke(project_group, ["init"])
+    res = runner.invoke(project_group, ["enable", "filesystem"])
+    assert res.exit_code != 0
+    # stderr in CliRunner with mix_stderr=True (default) lands in res.output
+    assert _REGISTRY_EMPTY_MSG.strip() in res.output
+
+
+def test_enable_requires_marker(runner, sandbox):
+    _seed_registry("filesystem")  # registry non-empty so the check passes
+    res = runner.invoke(project_group, ["enable", "filesystem"])
+    assert res.exit_code != 0
+    assert "No project marker" in res.output
+    assert "mms project init" in res.output
+
+
+def test_enable_appends_unique(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    _seed_registry("a", "b", "c")
+    runner.invoke(project_group, ["enable", "a", "b"])
+    runner.invoke(project_group, ["enable", "b", "c"])  # b is dup
+
+    cfg = state.load_project_config(sandbox["cwd"] / state.PROJECT_MARKER_RELPATH)
+    assert cfg.mcp.enabled == ["a", "b", "c"]
+
+
+def test_enable_with_project_flag(runner, sandbox):
+    other = sandbox["home"] / "other-proj"
+    other.mkdir()
+    runner.invoke(project_group, ["init", str(other), "--name", "elsewhere"])
+    _seed_registry("filesystem")
+    res = runner.invoke(project_group, ["enable", "filesystem", "--project", "elsewhere"])
+    assert res.exit_code == 0, res.output
+
+    other_marker = other / state.PROJECT_MARKER_RELPATH
+    assert state.load_project_config(other_marker).mcp.enabled == ["filesystem"]
+
+
+def test_disable_removes_listed(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    _seed_registry("a", "b")
+    runner.invoke(project_group, ["enable", "a", "b"])
+    runner.invoke(project_group, ["disable", "a"])
+
+    cfg = state.load_project_config(sandbox["cwd"] / state.PROJECT_MARKER_RELPATH)
+    assert cfg.mcp.enabled == ["b"]
+
+
+def test_disable_works_with_empty_registry(runner, sandbox):
+    """Disable doesn't require a populated registry — it only mutates project state."""
+    runner.invoke(project_group, ["init"])
+    _seed_registry("a")
+    runner.invoke(project_group, ["enable", "a"])
+    # Now wipe the registry.
+    state.save_registry(state.RegistryConfig())
+
+    res = runner.invoke(project_group, ["disable", "a"])
+    assert res.exit_code == 0, res.output
+    cfg = state.load_project_config(sandbox["cwd"] / state.PROJECT_MARKER_RELPATH)
+    assert cfg.mcp.enabled == []
+
+
+def test_disable_noop_when_not_enabled(runner, sandbox):
+    runner.invoke(project_group, ["init"])
+    res = runner.invoke(project_group, ["disable", "never-enabled"])
+    assert res.exit_code == 0
+    assert "No changes" in res.output
+
+
+# ---------------------------------------------------------------------------
+# Project resolution edge case — --project name with stale index
+# ---------------------------------------------------------------------------
+
+
+def test_enable_project_flag_missing_marker_complains(runner, sandbox):
+    other = sandbox["home"] / "other-proj"
+    other.mkdir()
+    runner.invoke(project_group, ["init", str(other), "--name", "elsewhere"])
+    # Simulate user deleting the marker directly without pruning the index.
+    (other / state.PROJECT_MARKER_RELPATH).unlink()
+    _seed_registry("filesystem")
+    res = runner.invoke(project_group, ["enable", "filesystem", "--project", "elsewhere"])
+    assert res.exit_code != 0
+    assert "marker file is missing" in res.output
+    assert "list --prune" in res.output
