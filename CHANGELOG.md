@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **`mms project` subgroup — W1 of project-scoped MCP management RFC v0.3** — five Click subcommands (`init`, `show`, `list`, `enable`, `disable`) that manage *which MCP servers a given project sees*, separate from the STM proxy gateway config. State lives in a new dotdir, `~/.mms/`, with three TOML files: a global registry (`~/.mms/registry.toml`, secrets in env, gitignored), an auto-managed projects index (`~/.mms/projects.toml`, gitignored), and per-project enabled-MCP lists (`<project>/.mms/project.toml`, commit-recommended). All three start at `schema_version = 1`; `mms upgrade-config` (the migration entry point per RFC §16) is a W2+ separate code path. `~/.mms/` is intentionally separate from `~/.memtomem/` — STM proxy bootstrap (`stm_proxy.json`) and mms project state (`registry.toml`) are *fully disjoint mutation paths* in W1: `mms add` writes only to `stm_proxy.json`, and (W1 PR2's) `mms import --apply` writes only to `registry.toml`. Until PR2 lands the registry stays empty by default; `mms project enable X` against an empty registry surfaces a *friendly error* pointing at `mms import --from <host>` instead of crashing — the literal text is pinned by tests so any rewording is a single-place edit. Project detection (used by `show` / `enable` / `disable` without `--project`) walks parents in fixed order: `.mms/project.toml` marker → `.git` directory or worktree file → cwd fallback (anonymous). A marker beats git even if git is closer to cwd, since markers are explicit declarations and git roots are inference; malformed markers raise rather than silently falling through to git/cwd, per RFC §6.1. Pydantic models reject unknown TOML fields (`extra="forbid"`) so a typo in `[project]` or `[mcp]` fails loud at load time. Adds `tomli-w >= 1.0` to dependencies for writes (reads stay on stdlib `tomllib`); `tomlkit` would have brought a comment-preservation feature with no W1 use case.
+
 ## [0.1.21] — 2026-04-29
 
 ### Added

@@ -35,6 +35,7 @@ Commands:
   health    Check upstream server connectivity.
   init      Guided first-time setup for memtomem-stm.
   list      List configured upstream servers.
+  project   Project-scoped MCP management (RFC §7.1).
   prune     Remove dual-registered upstreams from source MCP clients.
   register  Register memtomem-stm with an MCP client.
   remove    Remove an upstream MCP server from the proxy configuration.
@@ -279,6 +280,80 @@ Options:
 Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running.
 
 `--names` re-runs the same composed-name overflow check the proxy applies at boot (#261), so an operator diagnosing "one tool from server X went silently missing after registration" can answer the question without restarting STM. The flag uses the default client server name `memtomem-stm` (12 chars) for the `mcp__<client-server>__…` template; if you registered STM under a shorter alias like `mms`, set `MMS_CLIENT_SERVER_NAME=mms` so the budget calculation matches the surface name your client actually composes.
+
+## `mms project` — project-scoped MCP management
+
+`mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) — see RFC §5 for the full data model.
+
+W1 ships five subcommands. State lives in three TOML files:
+
+| Path | Purpose | Commit? |
+|------|---------|---------|
+| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import` in W1 PR2; not by `mms add` in W1) | **No** — gitignore |
+| `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
+| `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
+
+```
+Usage: mms project [OPTIONS] COMMAND [ARGS]...
+
+  Project-scoped MCP management (RFC §7.1).
+
+Commands:
+  init     Create <path>/.mms/project.toml (default path = cwd) and add to index.
+  show     Show the detected (or named) project, with init hints when no marker.
+  list     List known projects from the index. Mark current cwd's project with `*`.
+  enable   Add MCP names to the project's enabled list (RFC §7.1).
+  disable  Remove MCP names from the project's enabled list.
+```
+
+### `mms project init`
+
+```
+Usage: mms project init [OPTIONS] [PATH]
+
+Options:
+  --name TEXT   Override project name (default: dir basename).
+  --force       Overwrite an existing .mms/project.toml.
+```
+
+Creates `<PATH>/.mms/project.toml` (default: cwd) and appends the project to `~/.mms/projects.toml`. Aborts if the marker exists, unless `--force` is passed.
+
+### `mms project show`
+
+```
+Usage: mms project show [OPTIONS] [NAME]
+
+Options:
+  --json   Machine-readable output.
+```
+
+Without `NAME`: runs the §6 detection algorithm against cwd (marker walk-up → git walk-up → cwd fallback). With `NAME`: looks up the project in the index and shows its marker. When no marker is detected, prints an init hint pointing at `mms project init`.
+
+### `mms project list`
+
+```
+Usage: mms project list [OPTIONS]
+
+Options:
+  --prune  Remove entries whose path no longer exists.
+  --json   Machine-readable output.
+```
+
+Prints all known projects with the current cwd's project marked `*`. `--prune` removes entries whose `path` no longer points at a directory and reports each pruned entry by name.
+
+### `mms project enable` / `mms project disable`
+
+```
+Usage: mms project enable [OPTIONS] MCPS...
+Usage: mms project disable [OPTIONS] MCPS...
+
+Options:
+  --project TEXT  Target project (default: detect from cwd).
+```
+
+`enable` adds MCP names to the project's `[mcp].enabled` list; `disable` removes them. Both require either a marker at cwd (or up the tree) or an explicit `--project NAME`. `enable` additionally requires a non-empty `~/.mms/registry.toml` — until W1 PR2 (`mms import`) lands, this surfaces as a friendly error pointing at the import command. `disable` works regardless of registry state since it only mutates project state.
+
+The MCP-name validity check (does this name actually exist in the registry?) is intentionally deferred to sync time (W2) per RFC §7.1, so `enable` accepts any name as long as the registry is non-empty.
 
 ## MCP Tools (11 + proxied)
 
