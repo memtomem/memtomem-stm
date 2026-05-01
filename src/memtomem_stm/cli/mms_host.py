@@ -1,15 +1,17 @@
 """``mms host`` Click subgroup — W2 host-sync surfaces (RFC §7.3).
 
-PR3 lands the read-only inspection command:
+PR3 landed the read-only inspection command; PR4 promoted
+``removed_at_host`` from a footer-only count into a main-table row:
 
 * ``mms host status`` — classify every registry entry into one of four
   drift buckets relative to the W2 sidecar baseline, and surface the
   result either as a human table or ``--json``.
 
-The bucket vocabulary is the contract that PR4 (``removed_at_host``
-main-table promotion) and W3+ (``--force`` re-stamp) build on. PR3
-freezes the four state names; PR4 swaps a footer note for a main-table
-row but does not rename anything.
+The bucket vocabulary is the contract that W3+ (``--force`` re-stamp,
+``mms host scan``, ``mms host sync``) builds on. PR3 froze the four
+state names; PR4 changed *where* ``removed_at_host`` renders without
+renaming anything. JSON shape and footer text are backwards-compat
+anchors and stayed frozen across PR4.
 
 The four buckets:
 
@@ -19,8 +21,10 @@ The four buckets:
   differs (host config was edited externally since last
   ``mms import --apply``).
 * ``removed_at_host`` — registry has the entry, sidecar has the
-  baseline, but no host scanner finds it. PR3 surfaces this in the
-  footer as a count + neutral note; PR4 promotes it to the main table.
+  baseline, but no host scanner finds it. PR3 surfaced this as a
+  footer count + neutral note only; PR4 added a main-table row while
+  keeping the footer count as a backwards-compat anchor for downstream
+  tooling that grepped PR3's output.
 * ``no_baseline`` — sidecar lacks a row for this entry, OR the
   sidecar's ``drift_hash_version`` doesn't match the running mms's
   :data:`HASH_VERSION`. Either way the comparison can't be made and
@@ -190,29 +194,47 @@ def _classify(
 def _render_text(rows: list[dict]) -> None:
     """Default human-readable renderer.
 
-    Main table shows ``unchanged`` + ``changed`` rows (the comparable
-    states). ``removed_at_host`` and ``no_baseline`` are footer notes
-    only — they don't have a meaningful current-hash to put in the
-    SOURCE/STATE pair, so dumping them in the table would dilute the
-    comparison signal. Each is conditionally shown when its count > 0.
+    Main table shows ``unchanged`` + ``changed`` + ``removed_at_host``
+    rows — the three states that carry a baseline source attribution
+    and benefit from name-level visibility. ``no_baseline`` stays
+    footer-only: the only meaningful response is ``mms import --apply``
+    to re-stamp, and the footer's hint conveys that more directly than
+    a table row would. (The version-mismatch sub-case does carry a real
+    ``source_label`` and ``baseline_hash``; the missing-sidecar
+    sub-case doesn't — but the user-facing action is the same either
+    way.)
+
+    ``removed_at_host`` rows render with ``current_hash=None`` (no
+    host candidate to canonicalize) but the table only shows NAME +
+    STATE + SOURCE, all of which come from the preserved baseline. The
+    footer count + neutral note still appear after the summary line as
+    a backwards-compat anchor for downstream tooling that grepped
+    PR3's output — duplication with the table row is intentional.
+
+    Rows render in ``registry.servers`` insertion order (registry.toml
+    file order). Stable order > clever sort; if a user reports they
+    missed a single ``removed_at_host`` buried among many ``unchanged``
+    rows, swap in a state-priority sort here.
 
     Column widths follow ``mms project list`` (mms_project.py:285):
     plain f-strings, no rich. Alignment is best-effort — names longer
     than the NAME column overflow rather than truncate. Not a contract;
     swap in textual/rich/whatever when MCP names regularly exceed 20
-    chars in practice.
+    chars in practice. STATE is widened to 16 chars so
+    ``removed_at_host`` (15) fits with one char of padding past the
+    longest state name.
     """
-    main_rows = [r for r in rows if r["state"] in ("unchanged", "changed")]
+    main_rows = [r for r in rows if r["state"] in ("unchanged", "changed", "removed_at_host")]
     n_unchanged = sum(1 for r in main_rows if r["state"] == "unchanged")
     n_changed = sum(1 for r in main_rows if r["state"] == "changed")
     n_removed = sum(1 for r in rows if r["state"] == "removed_at_host")
     n_no_baseline = sum(1 for r in rows if r["state"] == "no_baseline")
 
     if main_rows:
-        click.echo(f" {'NAME':<20} {'STATE':<10} SOURCE")
+        click.echo(f" {'NAME':<20} {'STATE':<16} SOURCE")
         for row in main_rows:
             source = row["source_label"] or ""
-            click.echo(f" {row['name']:<20} {row['state']:<10} {source}")
+            click.echo(f" {row['name']:<20} {row['state']:<16} {source}")
         click.echo("")
     click.echo(f" {n_unchanged} unchanged, {n_changed} changed at host")
     if n_removed:
