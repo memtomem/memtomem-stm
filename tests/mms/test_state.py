@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from memtomem_stm.mms import state
+from memtomem_stm.mms.drift import canonical_form, compute_drift_hash
 
 
 @pytest.fixture
@@ -143,6 +144,28 @@ def test_utc_now_iso_format(sandbox_home):
 # ---------------------------------------------------------------------------
 
 
+def test_save_import_state_creates_directory_on_fresh_home(sandbox_home):
+    """``save_import_state`` must create ``~/.mms`` itself when no prior
+    ``save_registry`` has run. Pinned as the *first* test in this section
+    so a directory-creation regression localizes immediately rather than
+    cascading through every later sidecar test (one-glance diagnosis vs
+    bisect)."""
+    assert not state.mms_home().exists()  # precondition
+    s = state.ImportState(
+        entries={
+            "x": state.ImportStateEntry(
+                drift_hash="sha256:0123456789abcdef",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="test",
+            )
+        }
+    )
+    state.save_import_state(s)
+    assert state.import_state_path().exists()
+    assert state.load_import_state() == s
+
+
 def test_load_import_state_returns_empty_when_missing(sandbox_home):
     s = state.load_import_state()
     assert s.entries == {}
@@ -169,6 +192,44 @@ def test_import_state_round_trip(sandbox_home):
     state.save_import_state(s)
     loaded = state.load_import_state()
     assert loaded == s
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        state.RegistryServer(command="echo", prefix="x"),
+        state.RegistryServer(command="npx", args=["-y", "@mcp/fs"], prefix="fs"),
+        state.RegistryServer(command="npx", env={"TOKEN": "x"}, prefix="t"),
+        state.RegistryServer(command="npx", args=["a"], env={"A": "1", "B": "2"}, prefix="ax"),
+        state.RegistryServer(command="echo", env={"MSG": "héllo 🌍"}, prefix="u"),
+        state.RegistryServer(command="echo", args=[], env={}, prefix="e"),
+    ],
+    ids=["bare", "args", "env", "args+env", "unicode-env", "empty-explicit"],
+)
+def test_save_load_preserves_drift_hash(sandbox_home, server: state.RegistryServer):
+    """Round-trip pin: ``save_registry`` → ``load_registry`` must preserve
+    server identity along three independent axes — pydantic equality,
+    canonical bytes, and the derived drift hash. This test was punted from
+    PR1 review and lands as PR2's first commit *unconditional* (per the
+    22h-late-regression policy); it must be green against current main
+    *before* any wire-in, so the wire-in commit can only stay green by
+    keeping the contract intact.
+
+    The three oracles are deliberately on different layers — pydantic ``==``
+    today implies the other two, but a future ``model_validator`` (e.g.
+    one that strips trailing whitespace from ``command``) could break the
+    implication. Only a separate ``canonical_form`` oracle catches that.
+    The hash is derived from canonical_form, so if its truncation width
+    or algorithm ever swaps, the canonical_form oracle still pins what
+    we actually care about (byte-stable canonical bytes across save/load).
+    """
+    cfg = state.RegistryConfig(servers={"x": server})
+    state.save_registry(cfg)
+    loaded = state.load_registry()
+
+    assert loaded.servers["x"] == server
+    assert canonical_form(loaded.servers["x"]) == canonical_form(server)
+    assert compute_drift_hash(loaded.servers["x"]) == compute_drift_hash(server)
 
 
 def test_save_import_state_uses_0o600(sandbox_home):
