@@ -197,9 +197,12 @@ def _render_text(rows: list[dict]) -> None:
     Main table shows ``unchanged`` + ``changed`` + ``removed_at_host``
     rows — the three states that carry a baseline source attribution
     and benefit from name-level visibility. ``no_baseline`` stays
-    footer-only: re-stamping via ``mms import --apply`` is the only
-    meaningful response, and the row has no ``source_label`` /
-    ``baseline_hash`` to populate the SOURCE column.
+    footer-only: the only meaningful response is ``mms import --apply``
+    to re-stamp, and the footer's hint conveys that more directly than
+    a table row would. (The version-mismatch sub-case does carry a real
+    ``source_label`` and ``baseline_hash``; the missing-sidecar
+    sub-case doesn't — but the user-facing action is the same either
+    way.)
 
     ``removed_at_host`` rows render with ``current_hash=None`` (no
     host candidate to canonicalize) but the table only shows NAME +

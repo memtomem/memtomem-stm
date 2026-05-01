@@ -180,12 +180,10 @@ class TestStates:
         assert "STATE" in res.output
         assert "SOURCE" in res.output
         # Both rows present in the body, each on its own line.
+        # 2 table rows; the footer ("...not present in any host scan")
+        # doesn't contain "removed_at_host".
         lines = res.output.splitlines()
         removed_lines = [line for line in lines if "removed_at_host" in line]
-        # 2 table rows + 1 footer note line that also contains the substring
-        # via the "removed_at_host" classifier name? No — the footer template
-        # ("...not present in any host scan") doesn't say removed_at_host, so
-        # only the 2 table rows match.
         assert len(removed_lines) == 2, res.output
         assert any(" a " in line for line in removed_lines)
         assert any(" b " in line for line in removed_lines)
