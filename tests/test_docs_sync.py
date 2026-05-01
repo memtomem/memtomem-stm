@@ -66,17 +66,21 @@ def test_contributing_pytest_command_matches_ci() -> None:
 def test_cli_docs_flag_desktop_discovery_is_macos_only() -> None:
     """``docs/cli.md`` must warn that Claude Desktop discovery is macOS-only.
 
-    ``_desktop_config_path()`` in ``src/memtomem_stm/cli/proxy.py`` returns
-    only the macOS path (``~/Library/Application Support/Claude/...``);
+    ``_desktop_config_path()`` in ``src/memtomem_stm/mms/import_hosts.py``
+    returns only the macOS path (``~/Library/Application Support/Claude/...``);
     Linux/Windows callers of ``mms add --import`` silently see zero
     Claude Desktop candidates. If that helper ever learns OS-aware
     variants, relax this pin and drop the caveat from the docs.
+
+    The helper used to live in ``cli/proxy.py``; W1 PR2 moved it to
+    ``mms/import_hosts.py`` so both ``mms add --from-clients`` and
+    ``mms import`` share a single definition.
     """
-    proxy_src = _read("src/memtomem_stm/cli/proxy.py")
+    helper_src = _read("src/memtomem_stm/mms/import_hosts.py")
 
     func_match = re.search(
         r"def _desktop_config_path\b.*?(?=\ndef |\nclass |\Z)",
-        proxy_src,
+        helper_src,
         re.DOTALL,
     )
     assert func_match, "_desktop_config_path helper not found — update this test"
