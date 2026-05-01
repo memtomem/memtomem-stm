@@ -134,9 +134,17 @@ class TestStates:
         res = _status(runner)
         assert res.exit_code == 0, res.output
         # Footer count + neutral phrasing (no PR-planning vocab leak).
+        # Backwards-compat anchor — pinned across PR4's main-table promotion.
         assert "1 entry in registry not present in any host scan" in res.output
-        # Main-table presence is asserted via the JSON shape below — the
-        # text split was brittle to footer rewording (PR4 may evolve it).
+        # PR4: removed_at_host now renders as a main-table row, not only a
+        # footer count. Pin the row at line level so a future text-format
+        # refactor that splits NAME and STATE across lines (or drops SOURCE)
+        # fails this test loudly.
+        lines = res.output.splitlines()
+        removed_row = next((line for line in lines if "removed_at_host" in line), None)
+        assert removed_row is not None, res.output
+        assert "filesystem" in removed_row
+        assert "Claude Code (user)" in removed_row
 
         json_res = _status(runner, "--json")
         payload = json.loads(json_res.output)
@@ -148,6 +156,42 @@ class TestStates:
                 assert row["current_hash"] is None
                 assert row["baseline_hash"] is not None  # baseline preserved
                 assert row["source_label"] == "Claude Code (user)"
+
+    def test_status_only_removed_at_host_renders_table(self, runner, sandbox):
+        """PR4 reachable path: only ``removed_at_host`` rows, zero
+        ``unchanged`` / ``changed``. The table must still render
+        (header + each removed row); footer summary + removed-at-host
+        count still appear. Guards against a future refactor that
+        re-narrows the ``if main_rows:`` guard to comparable states
+        only — that would break PR4's promotion silently.
+        """
+        _seed_claude_code(
+            sandbox,
+            {"a": {"command": "npx"}, "b": {"command": "npx"}},
+        )
+        _apply_claude_code(runner)
+        # Drop both entries from the host config — registry/sidecar still have them.
+        _seed_claude_code(sandbox, {})
+
+        res = _status(runner)
+        assert res.exit_code == 0, res.output
+        # Header rendered (table not suppressed by the if-guard).
+        assert "NAME" in res.output
+        assert "STATE" in res.output
+        assert "SOURCE" in res.output
+        # Both rows present in the body, each on its own line.
+        lines = res.output.splitlines()
+        removed_lines = [line for line in lines if "removed_at_host" in line]
+        # 2 table rows + 1 footer note line that also contains the substring
+        # via the "removed_at_host" classifier name? No — the footer template
+        # ("...not present in any host scan") doesn't say removed_at_host, so
+        # only the 2 table rows match.
+        assert len(removed_lines) == 2, res.output
+        assert any(" a " in line for line in removed_lines)
+        assert any(" b " in line for line in removed_lines)
+        # Summary + footer still appear.
+        assert "0 unchanged, 0 changed at host" in res.output
+        assert "2 entries in registry not present in any host scan" in res.output
 
     def test_status_no_baseline_missing_sidecar_entry(self, runner, sandbox):
         """Manual sidecar deletion / pre-PR2 install / atomic-write race —
