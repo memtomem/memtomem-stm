@@ -665,7 +665,8 @@ class TestScan:
         assert " b " in res.output
         assert " a " not in res.output  # claude-code excluded
         assert "Claude Code (user)" not in res.output
-        assert "1 entries across 1 host" in res.output  # singular host phrasing
+        # Pin both singular forms — `entry`/`host` (not `entries`/`hosts`).
+        assert "1 entry across 1 host" in res.output
 
     def test_scan_from_invalid_host_errors(self, runner, sandbox):
         res = _scan(runner, "--from", "foo")
@@ -689,15 +690,44 @@ class TestScan:
             "summary": {"total": 0, "in_registry": 0, "new_at_host": 0},
         }
 
+    def test_scan_empty_filtered_host_message_scoped(self, runner, sandbox):
+        """``--from cursor`` with cursor empty (other hosts populated)
+        must say ``in cursor``, not the misleading ``across host
+        configs``. JSON shape unaffected (always 3-key summary).
+        """
+        _seed_claude_code(sandbox, {"only-claude-code-entry": {"command": "npx"}})
+
+        res = _scan(runner, "--from", "cursor")
+        assert res.exit_code == 0, res.output
+        assert "No MCP entries discovered in cursor." in res.output
+        assert "across host configs" not in res.output
+
+        json_res = _scan(runner, "--from", "cursor", "--json")
+        assert json_res.exit_code == 0, json_res.output
+        assert json.loads(json_res.output) == {
+            "entries": [],
+            "summary": {"total": 0, "in_registry": 0, "new_at_host": 0},
+        }
+
+    def test_scan_from_filter_case_insensitive(self, runner, sandbox):
+        """``--from CLAUDE-CODE`` works the same as ``--from
+        claude-code`` — symmetric with ``mms import --from`` UX. Pins
+        the ``case_sensitive=False`` derivation from ``ALL_HOSTS``.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+
+        res = _scan(runner, "--from", "CLAUDE-CODE")
+        assert res.exit_code == 0, res.output
+        assert " a " in res.output
+        assert "Claude Code (user)" in res.output
+
     def test_scan_json_shape(self, runner, sandbox):
         _seed_claude_code(sandbox, {"registered": {"command": "npx"}})
         _apply_claude_code(runner)
+        # ``mms import --apply`` is read-only on host configs (project
+        # invariant) — the claude-code seed survives the cursor seed and
+        # the apply, so no re-seed needed.
         _seed_cursor_user(sandbox, {"orphan": {"command": "npx"}})
-
-        # Re-seed claude-code so it still has the registered entry after the
-        # cursor seed (the prior _apply_claude_code put it in registry, but
-        # the host scan reads ~/.claude.json on every invocation).
-        _seed_claude_code(sandbox, {"registered": {"command": "npx"}})
 
         res = _scan(runner, "--json")
         assert res.exit_code == 0, res.output
