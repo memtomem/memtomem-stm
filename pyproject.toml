@@ -25,6 +25,7 @@ dependencies = [
     "httpx>=0.28",
     "click>=8.1",
     "questionary>=2.0",
+    "tomli-w>=1.0",
 ]
 
 [project.optional-dependencies]
