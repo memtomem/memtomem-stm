@@ -140,6 +140,17 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 
 To bring file or shell operations under STM, register an MCP server that exposes them (the [filesystem example](#1-add-an-upstream-mcp-server) above is the most common case) and steer the agent toward the proxied alias instead of the built-in. This is the same boundary every MCP proxy lives within — it's not specific to STM.
 
+## Project-scoped MCPs (`mms project` + `mms import`)
+
+A second tier of management lets you decide *which MCP servers a given project sees*, separately from the STM proxy gateway config. State lives in a new dotdir, `~/.mms/`:
+
+- `mms import --from claude-code` — pull existing MCP definitions out of `~/.claude.json`, `~/.cursor/mcp.json`, `~/.codex/config.toml`, or Claude Desktop's config into `~/.mms/registry.toml` (secrets redacted in `--plan`, written verbatim under `--apply`).
+- `mms project init` — create a `<project>/.mms/project.toml` marker (commit-recommended).
+- `mms project enable filesystem github` — declare which MCPs that project wants visible.
+- `mms project list` / `mms project show` — inspect the index and the current project.
+
+`~/.mms/` is intentionally separate from `~/.memtomem/` — STM proxy bootstrap (`stm_proxy.json`) and mms project state (`registry.toml`) are *fully disjoint* in W1: `mms add` writes only `stm_proxy.json`, `mms import --apply` writes only `registry.toml`. See [docs/cli.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) for the full reference.
+
 ## Tutorial notebooks
 
 > **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](notebooks/01_quickstart_proxy_setup.ipynb) registers an upstream MCP server, calls a proxied tool, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
