@@ -71,6 +71,12 @@ _FOOTER_NO_BASELINE_TEMPLATE = (
     "{n} entr{ies_or_y} missing baseline hash — run `mms import --apply` to stamp"
 )
 
+_NO_SCAN_RESULTS_MSG = "No MCP entries discovered across host configs.\n"
+
+# `mms host scan --from` choices. Subset of ALL_HOSTS plus the "all" sentinel
+# that ``import_hosts.discover()`` recognizes natively.
+_SCAN_HOST_CHOICES = click.Choice(["all", "claude-code", "cursor", "codex", "claude-desktop"])
+
 
 def _ies_or_y(n: int) -> str:
     return "y" if n == 1 else "ies"
@@ -306,3 +312,115 @@ def status_cmd(json_output: bool) -> None:
         _render_json(rows)
     else:
         _render_text(rows)
+
+
+# ---------------------------------------------------------------------------
+# scan — host-side discovery surface (W2 PR5)
+# ---------------------------------------------------------------------------
+
+
+def _scan_rows(
+    candidates: list[ImportCandidate],
+    registry: state.RegistryConfig,
+) -> list[dict]:
+    """Project each ImportCandidate into a scan row.
+
+    No deduplication: same name across hosts emits multiple rows — the
+    full host-side inventory is the value scan provides. ``in_registry``
+    is a name match only (``cand.name in registry.servers``); shape
+    comparison is delegated to ``mms host status``.
+    """
+    return [
+        {
+            "name": c.name,
+            "host": c.source_label,
+            "in_registry": c.name in registry.servers,
+        }
+        for c in candidates
+    ]
+
+
+def _render_scan_text(rows: list[dict]) -> None:
+    """Default human-readable scan renderer.
+
+    Empty case: friendly one-liner. Non-empty: 3-column table (NAME /
+    HOST / IN_REGISTRY) followed by a summary line. ``Yes``/``No`` for
+    the boolean column — universal terminal encoding (no ✓/✗
+    glyphs that break on Windows cmd or restrictive SSH clients).
+
+    Same-name multi-host rows are emitted in full — intentional
+    divergence from ``mms host status``'s first-match-wins (scan is
+    *collection*, status is *comparison*; they answer different
+    questions and shouldn't share dedup logic).
+    """
+    if not rows:
+        click.echo(_NO_SCAN_RESULTS_MSG, nl=False)
+        return
+    click.echo(f" {'NAME':<20} {'HOST':<22} IN_REGISTRY")
+    for row in rows:
+        flag = "Yes" if row["in_registry"] else "No"
+        click.echo(f" {row['name']:<20} {row['host']:<22} {flag}")
+    click.echo("")
+    n_total = len(rows)
+    n_in_reg = sum(1 for r in rows if r["in_registry"])
+    n_new = n_total - n_in_reg
+    n_hosts = len({r["host"] for r in rows})
+    click.echo(
+        f" {n_total} entries across {n_hosts} host{'s' if n_hosts != 1 else ''} "
+        f"({n_in_reg} in registry, {n_new} new at host)"
+    )
+
+
+def _render_scan_json(rows: list[dict]) -> None:
+    """JSON scan renderer. Always emits 3-key summary (zero counts explicit)."""
+    n_total = len(rows)
+    n_in_reg = sum(1 for r in rows if r["in_registry"])
+    payload = {
+        "entries": rows,
+        "summary": {
+            "total": n_total,
+            "in_registry": n_in_reg,
+            # ``new_at_host`` is the complementary symmetry to
+            # ``mms host status``'s ``removed_at_host`` (in registry,
+            # not at host vs at host, not in registry).
+            "new_at_host": n_total - n_in_reg,
+        },
+    }
+    click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@host_group.command("scan")
+@click.option(
+    "--from",
+    "from_host",
+    type=_SCAN_HOST_CHOICES,
+    default="all",
+    show_default=True,
+    help="Limit scan to one host config.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+def scan_cmd(from_host: str, json_output: bool) -> None:
+    """List MCP entries discovered across host configs.
+
+    Read-only host-side inventory. Complements ``mms host status``:
+    scan is host-anchored (collection — every host occurrence shown),
+    status is registry-anchored (comparison — one row per registry
+    entry against sidecar baseline). When the same name appears in
+    multiple host configs, scan emits every occurrence; status's
+    first-match-wins is an axis difference, not an inconsistency.
+
+    The ``IN_REGISTRY`` column is a name match only
+    (``cand.name in registry.servers``). A registered entry whose host
+    shape differs still shows ``Yes`` here — shape comparison is
+    delegated to ``mms host status`` (it surfaces shape mismatches as
+    ``changed``).
+
+    Exit code is always 0; this is read-only inspection.
+    """
+    registry = state.load_registry()
+    candidates = discover(from_host, Path.cwd().resolve())
+    rows = _scan_rows(candidates, registry)
+    if json_output:
+        _render_scan_json(rows)
+    else:
+        _render_scan_text(rows)
