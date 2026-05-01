@@ -18,6 +18,7 @@ from typing import Any
 
 import click
 
+from memtomem_stm.cli.mms_project import project_group as _mms_project_group
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
 
@@ -2338,3 +2339,8 @@ def health(
                     click.echo("    all tool names fit")
         else:
             click.echo(f"  {name}: {_bad('DISCONNECTED')} — {info['error']}")
+
+
+# `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py
+# to keep this file from accreting another ~700 lines for the W1 surface.
+cli.add_command(_mms_project_group)
