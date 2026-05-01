@@ -42,6 +42,15 @@ Registry write still precedes sidecar write within a single apply;
 no transaction. A ``--force`` option to re-stamp existing sidecar
 rows (resetting timestamps after a host edit you've already
 acknowledged) lands in W3+.
+
+vs ``mms host sync``:
+  ``mms import`` is the first-time entry point (host → empty
+  registry; additive only). For ongoing reconciliation — adding
+  entries newly appearing at hosts, removing entries no longer at
+  any host, and stamping baselines — see ``mms host sync``. The
+  two have overlapping mutations but distinct intents; collapsing
+  them would mask the "first import" vs "drift reconciliation"
+  decision boundary.
 """
 
 from __future__ import annotations
@@ -86,6 +95,8 @@ def _format_env_summary(
     return "env: " + ", ".join(parts)
 
 
+# Cross-imported by mms_host.sync_cmd as a second caller; promote
+# to mms/sync.py module if a third caller appears (W3+ --force).
 def _classify_against_registry(
     candidates: list[ImportCandidate], registry: state.RegistryConfig
 ) -> tuple[

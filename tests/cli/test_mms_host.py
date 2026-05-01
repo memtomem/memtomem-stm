@@ -784,3 +784,583 @@ class TestScan:
 
         assert Path(state.registry_path()).read_bytes() == registry_before
         assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+
+# ---------------------------------------------------------------------------
+# sync — write-back surface (W2 PR6)
+# ---------------------------------------------------------------------------
+
+
+def _sync(runner, *args: str, **kwargs):
+    return runner.invoke(host_group, ["sync", *args], **kwargs)
+
+
+def _force_tty(monkeypatch) -> None:
+    """Make ``_is_interactive()`` return True under CliRunner.
+
+    CliRunner replaces ``sys.stdin`` with a non-TTY stream, so without
+    this monkeypatch the TTY-confirm code path is unreachable from
+    tests.
+    """
+    from memtomem_stm.cli import mms_host
+
+    monkeypatch.setattr(mms_host, "_is_interactive", lambda: True)
+
+
+class TestSyncPlan:
+    def test_plan_no_op_when_in_sync(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["mode"] == "plan"
+        assert payload["aborted"] is False
+        assert all(payload["plan"][k] == [] for k in payload["plan"])
+        assert payload["summary"] == {
+            "added": 0,
+            "removed": 0,
+            "backfilled": 0,
+            "cleanup": 0,
+            "skipped_changed": 0,
+            "unchanged": 1,
+            "conflicts": 0,
+        }
+
+    def test_plan_add_redacts_secrets_by_default(self, runner, sandbox):
+        # Seed an entry with a secret-classified env key (key contains "TOKEN").
+        _seed_claude_code(
+            sandbox,
+            {"svc": {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_supersecret"}}},
+        )
+
+        res = _sync(runner, "--plan")
+        assert res.exit_code == 0, res.output
+        # The secret value should not appear verbatim.
+        assert "ghp_supersecret" not in res.output
+        # The hint pointing at `mms import --plan --show-imported` must
+        # be visible — sync deliberately omits its own --show-imported.
+        assert "mms import --plan --show-imported" in res.output
+
+    def test_plan_does_not_write(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_cursor_user(sandbox, {"b": {"command": "npx"}})
+
+        registry_before = Path(state.registry_path()).read_bytes()
+        sidecar_before = Path(state.import_state_path()).read_bytes()
+
+        for args in (["--plan"], ["--plan", "--json"]):
+            res = _sync(runner, *args)
+            assert res.exit_code == 0, (args, res.output)
+
+        assert Path(state.registry_path()).read_bytes() == registry_before
+        assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+    def test_plan_changed_footer_text(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx", "args": ["v1"]}})
+        _apply_claude_code(runner)
+        # Mutate host shape — entry surfaces as ``changed``.
+        _seed_claude_code(sandbox, {"a": {"command": "npx", "args": ["v2"]}})
+
+        res = _sync(runner, "--plan")
+        assert res.exit_code == 0, res.output
+        # The W3+ pointer footer fires when ``changed`` count > 0.
+        assert "differ in shape at host" in res.output
+        assert "mms host sync --force" in res.output
+        assert "(W3+)" in res.output
+
+    def test_plan_orphan_no_baseline_footer(self, runner, sandbox):
+        """no_baseline + no matched candidate → footer surfaces it.
+
+        Reachable path: host config drops the entry AND sidecar lacks
+        a baseline (e.g. import_state.toml hand-edited). Sync can't
+        safely act, but silence is the failure mode (Lock-down 3
+        siblings) — surface as a footer note.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Delete the sidecar baseline AND drop the host entry.
+        s = state.load_import_state()
+        s.entries.pop("a")
+        state.save_import_state(s)
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--plan")
+        assert res.exit_code == 0, res.output
+        assert "in registry without baseline and not at any host scan" in res.output
+
+    def test_plan_aborted_field_always_false_in_plan_mode(self, runner, sandbox):
+        # Seed REMOVE-triggering state so the bucket would be visible
+        # in apply mode; --plan must still emit aborted=False.
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["aborted"] is False
+        assert payload["mode"] == "plan"
+
+
+class TestSyncApply:
+    def test_apply_add_writes_registry_and_sidecar(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"alpha": {"command": "npx"}})
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+
+        registry = state.load_registry()
+        assert "alpha" in registry.servers
+
+        sidecar = state.load_import_state()
+        assert "alpha" in sidecar.entries
+        assert sidecar.entries["alpha"].drift_hash == compute_drift_hash(registry.servers["alpha"])
+
+    def test_apply_remove_drops_registry_and_sidecar(self, runner, sandbox):
+        """removed_at_host → REMOVE registry + sidecar entry (orphan cleanup
+        atomic with the registry write)."""
+        _seed_claude_code(sandbox, {"to_remove": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Drop entry from host.
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+
+        registry = state.load_registry()
+        assert "to_remove" not in registry.servers
+        sidecar = state.load_import_state()
+        assert "to_remove" not in sidecar.entries
+
+    def test_apply_backfill_stamps_no_baseline_with_candidate(self, runner, sandbox):
+        """no_baseline + matched candidate → BACKFILL only the sidecar.
+        Registry stays as it was (no add, no remove)."""
+        _seed_claude_code(sandbox, {"x": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Manually delete the sidecar row but leave host + registry intact.
+        s = state.load_import_state()
+        s.entries.pop("x")
+        state.save_import_state(s)
+
+        registry_before = Path(state.registry_path()).read_bytes()
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+
+        # Registry bytes unchanged (BACKFILL never re-writes registry
+        # when there are no add/remove ops).
+        assert Path(state.registry_path()).read_bytes() == registry_before
+        sidecar = state.load_import_state()
+        assert "x" in sidecar.entries
+        assert sidecar.entries["x"].drift_hash_version == HASH_VERSION
+
+    def test_apply_changed_not_re_stamped(self, runner, sandbox):
+        """Lock-down 3: ``changed`` is NOT mutated by sync. The sidecar
+        baseline_hash stays at the original value; W3+ ``--force`` is
+        the only writer.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx", "args": ["v1"]}})
+        _apply_claude_code(runner)
+        original = state.load_import_state().entries["a"].drift_hash
+        _seed_claude_code(sandbox, {"a": {"command": "npx", "args": ["v2"]}})
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+
+        # baseline_hash unchanged after --apply.
+        assert state.load_import_state().entries["a"].drift_hash == original
+
+    def test_apply_orphan_no_baseline_left_alone(self, runner, sandbox):
+        """no_baseline with no matched candidate → SKIP. Sidecar +
+        registry both unchanged; sync can't safely fabricate a baseline.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Drop sidecar baseline AND host entry — registry retains entry.
+        s = state.load_import_state()
+        s.entries.pop("a")
+        state.save_import_state(s)
+        _seed_claude_code(sandbox, {})
+
+        registry_before = Path(state.registry_path()).read_bytes()
+        sidecar_before = Path(state.import_state_path()).read_bytes()
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+
+        # Both unchanged: orphan no_baseline is non-mutating.
+        assert Path(state.registry_path()).read_bytes() == registry_before
+        assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+    def test_apply_atomicity_registry_first(self, runner, sandbox, monkeypatch):
+        """Crash between registry write and sidecar write → second sync
+        recovers via BACKFILL (no_baseline + matched candidate)."""
+        _seed_claude_code(sandbox, {"alpha": {"command": "npx"}})
+
+        # Patch save_import_state to raise, only for the first call.
+        from memtomem_stm.mms import state as state_mod
+
+        original_save = state_mod.save_import_state
+        calls = {"n": 0}
+
+        def flaky_save(s):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("simulated sidecar write failure")
+            return original_save(s)
+
+        monkeypatch.setattr(state_mod, "save_import_state", flaky_save)
+
+        res = _sync(runner, "--apply", "--yes")
+        # Registry was written; sidecar raised → exit non-zero.
+        assert res.exit_code != 0, res.output
+        registry = state.load_registry()
+        assert "alpha" in registry.servers
+        # Sidecar still empty (write failed before any state was saved).
+        assert "alpha" not in state.load_import_state().entries
+
+        # Second sync recovers: alpha now appears as no_baseline +
+        # matched candidate → BACKFILL.
+        res2 = _sync(runner, "--apply", "--yes")
+        assert res2.exit_code == 0, res2.output
+        assert "alpha" in state.load_import_state().entries
+
+    def test_apply_no_sidecar_write_when_registry_fails(self, runner, sandbox, monkeypatch):
+        """Atomicity invariant reverse: if save_registry raises, the
+        sidecar must be untouched (registry-first means sidecar never
+        gets a chance to write)."""
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}, "b": {"command": "npx"}})
+
+        sidecar_before = Path(state.import_state_path()).read_bytes()
+
+        from memtomem_stm.mms import state as state_mod
+
+        def boom(_):
+            raise OSError("simulated registry write failure")
+
+        monkeypatch.setattr(state_mod, "save_registry", boom)
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code != 0, res.output
+        assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+    def test_apply_orphan_cleanup_executes_when_only_orphans_present(self, runner, sandbox):
+        """Orphan-only state (sidecar has row for name not in registry,
+        nothing else pending) must trigger a sidecar write — orphan
+        cleanup is a mutation, not a no-op.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Inject an orphan: sidecar has a row for "ghost" with no
+        # corresponding registry entry.
+        s = state.load_import_state()
+        s.entries["ghost"] = state.ImportStateEntry(
+            drift_hash="sha256:" + "f" * 16,
+            drift_hash_version=HASH_VERSION,
+            last_imported="2026-01-01T00:00:00Z",
+            source_label="Claude Code (user)",
+        )
+        state.save_import_state(s)
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        # Orphan got filtered out.
+        assert "ghost" not in state.load_import_state().entries
+        # NOT the no-op message — orphan cleanup counts as work done.
+        assert "Already synchronized" not in res.output
+        assert "stale sidecar" in res.output
+
+    def test_apply_orphan_cleanup_alongside_other_mutations(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Add orphan + add a new host entry (ADD bucket).
+        s = state.load_import_state()
+        s.entries["ghost"] = state.ImportStateEntry(
+            drift_hash="sha256:" + "f" * 16,
+            drift_hash_version=HASH_VERSION,
+            last_imported="2026-01-01T00:00:00Z",
+            source_label="Claude Code (user)",
+        )
+        state.save_import_state(s)
+        _seed_cursor_user(sandbox, {"b": {"command": "npx"}})
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        assert "b" in state.load_registry().servers
+        assert "ghost" not in state.load_import_state().entries
+
+    def test_apply_already_synchronized_message(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+
+        registry_before = Path(state.registry_path()).read_bytes()
+        sidecar_before = Path(state.import_state_path()).read_bytes()
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        assert "Already synchronized. No changes." in res.output
+
+        # No writes (mtime / contents stable).
+        assert Path(state.registry_path()).read_bytes() == registry_before
+        assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+    def test_apply_first_import_wins_for_new_in_multiple_hosts(self, runner, sandbox):
+        """Same `new` name in two hosts with different shapes:
+        first-import-wins on the ADD path → only one written; the
+        second is a conflict.
+        """
+        _seed_claude_code(sandbox, {"shared": {"command": "claude-cmd"}})
+        _seed_cursor_user(sandbox, {"shared": {"command": "cursor-cmd"}})
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+
+        # Claude Code is iterated first in ALL_HOSTS, so it wins.
+        registry = state.load_registry()
+        assert registry.servers["shared"].command == "claude-cmd"
+
+        # Conflict surfaced in plan output.
+        assert "Conflicts" in res.output
+
+    def test_cross_host_shape_relocation_does_not_replace(self, runner, sandbox):
+        """Load-bearing contract (BLOCKER fix): X baselined to host A,
+        then A drops X and a different host B picks up X with a new
+        shape. ``_classify`` Pass 2 fallback finds B's X → state =
+        ``changed`` (NOT ``removed_at_host``). Sync MUST NOT replace
+        the registry shape; user acknowledges via W3+ ``--force``.
+        """
+        # Step 1: import shared from claude-code (becomes baseline).
+        _seed_claude_code(sandbox, {"shared": {"command": "npx", "args": ["claude-args"]}})
+        _apply_claude_code(runner)
+        original_shape = state.load_registry().servers["shared"]
+        original_hash = state.load_import_state().entries["shared"].drift_hash
+
+        # Step 2: drop from claude-code, add to cursor with a DIFFERENT shape.
+        _seed_claude_code(sandbox, {})
+        _seed_cursor_user(sandbox, {"shared": {"command": "npx", "args": ["cursor-args"]}})
+
+        # Plan: assert X surfaces as `changed` (skipped) — not REMOVE,
+        # not ADD.
+        plan_res = _sync(runner, "--plan", "--json")
+        assert plan_res.exit_code == 0, plan_res.output
+        plan_payload = json.loads(plan_res.output)
+        assert plan_payload["summary"]["skipped_changed"] == 1
+        assert plan_payload["summary"]["removed"] == 0
+        assert plan_payload["summary"]["added"] == 0
+
+        # Apply: registry shape MUST be unchanged.
+        apply_res = _sync(runner, "--apply", "--yes")
+        assert apply_res.exit_code == 0, apply_res.output
+        assert state.load_registry().servers["shared"] == original_shape
+        assert state.load_import_state().entries["shared"].drift_hash == original_hash
+
+
+class TestSyncConfirmation:
+    def test_apply_remove_prompts_in_tty_declines_no_writes(self, runner, sandbox, monkeypatch):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})  # triggers REMOVE
+
+        _force_tty(monkeypatch)
+        registry_before = Path(state.registry_path()).read_bytes()
+        sidecar_before = Path(state.import_state_path()).read_bytes()
+
+        res = _sync(runner, "--apply", input="n\n")
+        assert res.exit_code == 2, res.output
+        assert "Aborted. No changes." in res.output
+        # No writes.
+        assert Path(state.registry_path()).read_bytes() == registry_before
+        assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+    def test_apply_remove_prompts_in_tty_accepts_executes(self, runner, sandbox, monkeypatch):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        _force_tty(monkeypatch)
+
+        res = _sync(runner, "--apply", input="y\n")
+        assert res.exit_code == 0, res.output
+        assert "a" not in state.load_registry().servers
+
+    def test_apply_remove_aborts_in_non_tty_without_yes(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        registry_before = Path(state.registry_path()).read_bytes()
+
+        res = _sync(runner, "--apply")
+        # Non-TTY without --yes → exit 2 + clear error.
+        assert res.exit_code == 2, res.output
+        # CliRunner mixes stdout+stderr; the abort message lands in
+        # res.output regardless.
+        assert "--yes" in res.output
+        # No writes.
+        assert Path(state.registry_path()).read_bytes() == registry_before
+
+    def test_apply_yes_bypasses_prompt_in_non_tty(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        assert "a" not in state.load_registry().servers
+
+    def test_apply_no_remove_no_prompt(self, runner, sandbox):
+        """Only ADD bucket — no REMOVE, no prompt regardless of TTY/--yes."""
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        # No --yes; should still succeed because no removal needs confirmation.
+        res = _sync(runner, "--apply")
+        assert res.exit_code == 0, res.output
+        assert "a" in state.load_registry().servers
+        assert "Aborted" not in res.output
+        assert "--yes" not in res.output
+
+    def test_apply_remove_prompt_lists_each_entry(self, runner, sandbox, monkeypatch):
+        """Confirmation message must list every removed entry by name +
+        source_label + last_imported, plus the tail with other-bucket
+        counts. Pins the inline-disambiguation contract.
+        """
+        _seed_claude_code(sandbox, {"first": {"command": "npx"}, "second": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})  # both → REMOVE
+
+        captured = {"prompt": ""}
+        # Intercept click.confirm to capture the prompt text.
+        import click as _click_mod
+
+        original_confirm = _click_mod.confirm
+
+        def spy_confirm(text, *args, **kwargs):
+            captured["prompt"] = text
+            return False  # decline → no writes
+
+        monkeypatch.setattr(_click_mod, "confirm", spy_confirm)
+        _force_tty(monkeypatch)
+
+        res = _sync(runner, "--apply")
+        assert res.exit_code == 2, res.output
+        prompt = captured["prompt"]
+        assert "first" in prompt
+        assert "second" in prompt
+        assert "Claude Code (user)" in prompt
+        # Tail summary present.
+        assert "Also:" in prompt
+        # Avoid lint-warning for unused alias.
+        del original_confirm
+
+
+class TestSyncJsonShape:
+    _PLAN_PAYLOAD_KEYS = {
+        "add",
+        "remove",
+        "backfill",
+        "cleanup",
+        "skipped_changed",
+        "conflicts",
+    }
+    _SUMMARY_KEYS = {
+        "added",
+        "removed",
+        "backfilled",
+        "cleanup",
+        "skipped_changed",
+        "unchanged",
+        "conflicts",
+    }
+
+    def test_json_shape_plan_mode_all_keys_present(self, runner, sandbox):
+        # Empty registry → still emits full shape with zeros.
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert set(payload.keys()) == {"mode", "aborted", "plan", "summary"}
+        assert payload["mode"] == "plan"
+        assert payload["aborted"] is False
+        assert set(payload["plan"].keys()) == self._PLAN_PAYLOAD_KEYS
+        assert set(payload["summary"].keys()) == self._SUMMARY_KEYS
+
+    def test_json_shape_apply_mode_same_shape(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        res = _sync(runner, "--apply", "--yes", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["mode"] == "apply"
+        assert payload["aborted"] is False
+        assert set(payload["plan"].keys()) == self._PLAN_PAYLOAD_KEYS
+        assert set(payload["summary"].keys()) == self._SUMMARY_KEYS
+
+    def test_json_aborted_true_on_tty_decline(self, runner, sandbox, monkeypatch):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        _force_tty(monkeypatch)
+
+        res = _sync(runner, "--apply", "--json", input="n\n")
+        assert res.exit_code == 2, res.output
+        # JSON is in res.output; the prompt may also be mixed in but
+        # JSON is on its own line. Find it by parsing each candidate
+        # block.
+        # Click writes the JSON via click.echo after the confirm
+        # decision; locate the JSON object.
+        text = res.output
+        start = text.find("{")
+        # Final JSON object — find the *last* well-formed one.
+        end = text.rfind("}")
+        payload = json.loads(text[start : end + 1])
+        assert payload["aborted"] is True
+        assert payload["mode"] == "apply"
+        assert all(payload["plan"][k] == [] for k in payload["plan"])
+        assert all(payload["summary"][k] == 0 for k in payload["summary"])
+
+    def test_json_aborted_true_on_non_tty_abort_with_json_flag(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--apply", "--json")
+        assert res.exit_code == 2, res.output
+        text = res.output
+        start = text.find("{")
+        end = text.rfind("}")
+        payload = json.loads(text[start : end + 1])
+        assert payload["aborted"] is True
+        assert payload["mode"] == "apply"
+
+
+class TestSyncContractPin:
+    def test_classify_against_registry_signature_pinned(self):
+        """Cross-CLI import is brittle by convention; signature change
+        in mms_import.py would silently break sync_cmd. This is the
+        tripwire."""
+        from inspect import signature
+
+        from memtomem_stm.cli.mms_import import _classify_against_registry
+
+        sig = signature(_classify_against_registry)
+        assert list(sig.parameters) == ["candidates", "registry"]
+
+    def test_sync_docstring_mentions_first_time_vs_ongoing(self):
+        """Lock-down 1 anchor: sync's docstring carries the
+        intent-distinction phrase. Future docstring rewrites must
+        preserve it or this test fires."""
+        from memtomem_stm.cli.mms_host import sync_cmd
+
+        # ``sync_cmd.__doc__`` returns Click's command docstring.
+        doc = sync_cmd.__doc__ or ""
+        assert "ongoing-" in doc and "reconciliation" in doc, doc
+
+    def test_import_docstring_mentions_sync_cross_link(self):
+        """Lock-down 1 mirror anchor: mms_import.py module docstring
+        cross-links sync."""
+        from memtomem_stm.cli import mms_import
+
+        assert "mms host sync" in (mms_import.__doc__ or "")
