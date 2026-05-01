@@ -18,6 +18,7 @@ from typing import Any
 
 import click
 
+from memtomem_stm.cli.mms_host import host_group as _mms_host_group
 from memtomem_stm.cli.mms_import import import_command as _mms_import_command
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
 from memtomem_stm.mms.import_hosts import (
@@ -2294,3 +2295,6 @@ cli.add_command(_mms_project_group)
 
 # `mms import ...` — RFC §7.2, lives in src/memtomem_stm/cli/mms_import.py.
 cli.add_command(_mms_import_command)
+
+# `mms host ...` — RFC §7.3, lives in src/memtomem_stm/cli/mms_host.py.
+cli.add_command(_mms_host_group)
