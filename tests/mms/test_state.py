@@ -27,6 +27,7 @@ def test_mms_home_resolves_under_home(sandbox_home):
     assert state.mms_home() == sandbox_home / ".mms"
     assert state.registry_path() == sandbox_home / ".mms" / "registry.toml"
     assert state.projects_index_path() == sandbox_home / ".mms" / "projects.toml"
+    assert state.import_state_path() == sandbox_home / ".mms" / "import_state.toml"
 
 
 def test_project_marker_relpath_is_dot_mms_project_toml():
@@ -135,6 +136,189 @@ def test_utc_now_iso_format(sandbox_home):
     assert len(s) == 20
     assert s.endswith("Z")
     assert s[10] == "T"
+
+
+# ---------------------------------------------------------------------------
+# Import-state sidecar (W2 drift-detection foundation)
+# ---------------------------------------------------------------------------
+
+
+def test_load_import_state_returns_empty_when_missing(sandbox_home):
+    s = state.load_import_state()
+    assert s.entries == {}
+    assert s.schema_version == state.SCHEMA_VERSION
+
+
+def test_import_state_round_trip(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "filesystem": state.ImportStateEntry(
+                drift_hash="sha256:40c96f4ab4762ceb",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Claude Code (user)",
+            ),
+            "github": state.ImportStateEntry(
+                drift_hash="sha256:1234567890abcdef",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Codex CLI",
+            ),
+        }
+    )
+    state.save_import_state(s)
+    loaded = state.load_import_state()
+    assert loaded == s
+
+
+def test_save_import_state_uses_0o600(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "x": state.ImportStateEntry(
+                drift_hash="sha256:0123456789abcdef",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Cursor (user)",
+            )
+        }
+    )
+    state.save_import_state(s)
+    mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
+    assert mode == 0o600
+
+
+def test_import_state_schema_version_mismatch(tmp_path):
+    target = tmp_path / "import_state.toml"
+    target.write_text("schema_version = 2\n[entries]\n", encoding="utf-8")
+    with pytest.raises(state.SchemaVersionMismatch) as exc_info:
+        state.load_import_state(target)
+    assert exc_info.value.found == 2
+    assert exc_info.value.path == target
+    # Error message names the *sidecar* expected version, not the registry's
+    # — proves the SchemaVersionMismatch.expected plumbing reaches the user.
+    assert exc_info.value.expected == state.IMPORT_STATE_SCHEMA_VERSION
+    assert f"this mms supports {state.IMPORT_STATE_SCHEMA_VERSION}" in str(exc_info.value)
+
+
+def test_sidecar_version_decoupled_from_registry(tmp_path, monkeypatch):
+    """Bumping ``SCHEMA_VERSION`` (registry/projects/project) must NOT
+    invalidate sidecars written under ``IMPORT_STATE_SCHEMA_VERSION = 1``.
+    Guards the docstring claim that the two version axes are independent.
+    """
+    # Simulate a future mms where registry shape evolved to v2 but the
+    # sidecar shape stayed at v1.
+    monkeypatch.setattr(state, "SCHEMA_VERSION", 2)
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        "schema_version = 1\n[entries.foo]\n"
+        'drift_hash = "sha256:0123456789abcdef"\n'
+        "drift_hash_version = 1\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
+        encoding="utf-8",
+    )
+    loaded = state.load_import_state(target)
+    assert "foo" in loaded.entries
+    assert loaded.schema_version == 1
+
+
+def test_sidecar_rejects_when_only_sidecar_version_bumps(tmp_path, monkeypatch):
+    """Symmetric to the previous: bumping only the sidecar version must
+    flip sidecar load to mismatch *without* affecting the registry path.
+    """
+    monkeypatch.setattr(state, "IMPORT_STATE_SCHEMA_VERSION", 2)
+    # Old sidecar (v1) under new code (expects v2) → mismatch
+    target = tmp_path / "import_state.toml"
+    target.write_text("schema_version = 1\n[entries]\n", encoding="utf-8")
+    with pytest.raises(state.SchemaVersionMismatch) as exc_info:
+        state.load_import_state(target)
+    assert exc_info.value.expected == 2
+
+    # Registry under same monkeypatched env is unaffected — uses SCHEMA_VERSION (still 1)
+    reg_path = tmp_path / "registry.toml"
+    reg_path.write_text("schema_version = 1\n[servers]\n", encoding="utf-8")
+    assert state.load_registry(reg_path).servers == {}
+
+
+def test_import_state_extra_field_rejected(tmp_path):
+    """Sidecar shape is locked by ``extra="forbid"`` — an unknown column on
+    an entry must be a CorruptedConfig, not a silent accept."""
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        "schema_version = 1\n[entries.foo]\n"
+        'drift_hash = "sha256:0000000000000000"\n'
+        "drift_hash_version = 1\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n'
+        'unknown = "boom"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
+
+
+@pytest.mark.parametrize(
+    "bad_hash",
+    [
+        "garbage",  # no prefix, no hex
+        "sha256:GHIJ567890ABCDEF",  # non-hex chars
+        "sha256:abc123",  # too short
+        "sha256:0123456789abcdef0",  # too long
+        "md5:0123456789abcdef",  # wrong algorithm prefix
+        "0123456789abcdef",  # missing prefix
+    ],
+)
+def test_import_state_rejects_malformed_drift_hash(tmp_path, bad_hash: str):
+    """Pydantic ``Field(pattern=...)`` rejects sidecars with hashes that
+    don't match the format ``compute_drift_hash`` produces. Catches PR2
+    typos / hand-edits at load time instead of at comparison time."""
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        f"schema_version = 1\n[entries.foo]\n"
+        f'drift_hash = "{bad_hash}"\n'
+        "drift_hash_version = 1\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
+
+
+@pytest.mark.parametrize("bad_version", [0, -1])
+def test_import_state_rejects_non_positive_drift_hash_version(tmp_path, bad_version: int):
+    """``Field(ge=1)`` excludes 0 / negative — our ``HASH_VERSION`` starts
+    at 1 and only grows."""
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        f"schema_version = 1\n[entries.foo]\n"
+        'drift_hash = "sha256:0123456789abcdef"\n'
+        f"drift_hash_version = {bad_version}\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
+
+
+def test_import_state_on_disk_shape(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "filesystem": state.ImportStateEntry(
+                drift_hash="sha256:40c96f4ab4762ceb",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Claude Code (user)",
+            )
+        }
+    )
+    state.save_import_state(s)
+    raw = tomllib.loads(state.import_state_path().read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 1
+    assert raw["entries"]["filesystem"]["drift_hash"] == "sha256:40c96f4ab4762ceb"
+    assert raw["entries"]["filesystem"]["drift_hash_version"] == 1
+    assert raw["entries"]["filesystem"]["source_label"] == "Claude Code (user)"
 
 
 # ---------------------------------------------------------------------------

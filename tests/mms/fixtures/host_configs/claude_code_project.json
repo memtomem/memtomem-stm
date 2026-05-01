@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "uvx",
+      "args": ["mcp-server-postgres", "--readonly"],
+      "env": {
+        "PG_CONNECTION_STRING": "postgresql://localhost/dev"
+      }
+    }
+  }
+}

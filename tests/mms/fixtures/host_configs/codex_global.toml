@@ -1,0 +1,15 @@
+# Sample ~/.codex/config.toml fixture for cross-host hash equivalence tests.
+# The `github` entry is the anchor — its command/args/env must match the
+# corresponding entry in claude_code_user.json / cursor_user.json /
+# claude_desktop_macos.json so all four hash to the same drift_hash.
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp_servers.github.env]
+GITHUB_TOKEN = "ghp_PLACEHOLDER_REDACTED_FOR_FIXTURE"
+
+[mcp_servers.fetch]
+command = "uvx"
+args = ["mcp-server-fetch"]
