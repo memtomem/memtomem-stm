@@ -33,6 +33,7 @@ Options:
 Commands:
   add       Add an upstream MCP server to the proxy configuration.
   health    Check upstream server connectivity.
+  import    Import MCP definitions from host configs into the mms registry.
   init      Guided first-time setup for memtomem-stm.
   list      List configured upstream servers.
   project   Project-scoped MCP management (RFC §7.1).
@@ -289,7 +290,7 @@ W1 ships five subcommands. State lives in three TOML files:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
-| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import` in W1 PR2; not by `mms add` in W1) | **No** — gitignore |
+| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add` in W1) | **No** — gitignore |
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
 
@@ -351,9 +352,57 @@ Options:
   --project TEXT  Target project (default: detect from cwd).
 ```
 
-`enable` adds MCP names to the project's `[mcp].enabled` list; `disable` removes them. Both require either a marker at cwd (or up the tree) or an explicit `--project NAME`. `enable` additionally requires a non-empty `~/.mms/registry.toml` — until W1 PR2 (`mms import`) lands, this surfaces as a friendly error pointing at the import command. `disable` works regardless of registry state since it only mutates project state.
+`enable` adds MCP names to the project's `[mcp].enabled` list; `disable` removes them. Both require either a marker at cwd (or up the tree) or an explicit `--project NAME`. `enable` additionally requires a non-empty `~/.mms/registry.toml` — populate it with `mms import` first. `disable` works regardless of registry state since it only mutates project state.
 
 The MCP-name validity check (does this name actually exist in the registry?) is intentionally deferred to sync time (W2) per RFC §7.1, so `enable` accepts any name as long as the registry is non-empty.
+
+## `mms import` — populate the registry from host configs
+
+`mms import` reads MCP definitions out of your existing host configs (Claude Code, Cursor, Codex CLI, Claude Desktop) and writes them to `~/.mms/registry.toml`. This is the **only** W1 path that mutates the registry — `mms add` writes to `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap), not the mms registry.
+
+```
+Usage: mms import [OPTIONS]
+
+Options:
+  --from [claude-code|cursor|codex|claude-desktop|all]
+                          Host config to scan.  [default: all]
+  --plan / --apply        --plan (default) prints what would be imported with
+                          secrets REDACTED. --apply writes ~/.mms/registry.toml.
+  --show-imported         In --plan mode, reveal secret values instead of redacting.
+```
+
+Where each host config lives:
+
+| Host | Path(s) |
+|------|---------|
+| `claude-code` | `~/.claude.json` (user + per-project under `projects.<cwd>.mcpServers`) and `<cwd>/.mcp.json` |
+| `cursor` | `~/.cursor/mcp.json` (user) and `<cwd>/.cursor/mcp.json` (project) |
+| `codex` | `~/.codex/config.toml` under `[mcp_servers.<name>]` |
+| `claude-desktop` | macOS only — `~/Library/Application Support/Claude/claude_desktop_config.json` |
+
+Linux and Windows host paths are out of W1 scope; missing configs are silently treated as "no candidates" so `--from all` always works as long as at least one host has something to import.
+
+### Secret classification
+
+The env block of each entry runs through a two-signal classifier (RFC §7.2.1):
+
+1. **Key pattern** (case-insensitive substring): `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*PASS*`, `*AUTH*`, `*CREDENTIAL*`, `*API_KEY*`. Hits even if the value is short (`API_KEY=test` is still classified — pattern beats value).
+2. **Value heuristic**: length ≥ 32 AND the value is mostly base64- or hex-charset (catches opaque tokens stored under unusual key names).
+
+`--plan` prints `<REDACTED>` for any value matching either signal, with the classification reason next to it (e.g. `GITHUB_TOKEN=<REDACTED> ← secret (matches *TOKEN*)`). `--show-imported` reveals the actual values for the user who wants to verify before `--apply`.
+
+### Conflict resolution
+
+When the same name shows up in two places (two hosts in `--from all`, or already in the registry):
+
+* If the entry is **identical** (same `command`, `args`, `env`), it's an idempotent no-op and `--apply` reports `Already up to date.`
+* If the entry **differs**, **first-import-wins** — the existing registry entry is kept, the new one is reported as a conflict and skipped. The scanner order for `--from all` is `claude-code → cursor → codex → claude-desktop`.
+
+A future `--force` flag for refresh-on-rerun is W2/W3.
+
+### Dangerous env keys
+
+A small set of env keys that could enable code injection through the proxied subprocess (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `PYTHONPATH`, `NODE_OPTIONS`, etc.) are filtered from every imported entry — they never reach `~/.mms/registry.toml` regardless of which host they came from.
 
 ## MCP Tools (11 + proxied)
 
