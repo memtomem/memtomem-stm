@@ -15,6 +15,15 @@ already in the registry): **first-import-wins**. Identical re-imports
 are idempotent (no-op + "already up to date" message); a same-name
 entry with a *different* `command`/`args`/`env` is reported as a
 conflict and skipped.
+
+Atomicity (sidecar): registry write precedes sidecar write. If the
+process crashes between, the sidecar is stale for the entries written.
+Next ``--apply`` with **unchanged host input** re-writes them
+(idempotent recovery). If host input changes between crash and
+recovery, the stale entries persist until manually corrected — a
+``--force`` option lands in W3+; today's mitigation is to re-run
+``--apply`` against the same host snapshot before editing host
+configs further. No transaction.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from pathlib import Path
 import click
 
 from memtomem_stm.mms import state
+from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
 from memtomem_stm.mms.import_hosts import (
     ALL_HOSTS,
     ImportCandidate,
@@ -177,11 +187,28 @@ def import_command(from_host: str, is_plan: bool, show_imported: bool) -> None:
         click.echo("Already up to date. Registry unchanged.")
         return
 
+    # Single timestamp for the whole apply — matches `upsert_project_in_index`
+    # idiom and avoids per-entry skew on slow hosts.
+    now = state.utc_now_iso()
     new_servers = {**registry.servers}
+    new_entries: dict[str, state.ImportStateEntry] = {}
     for cand in new:
         new_servers[cand.name] = cand.server
+        new_entries[cand.name] = state.ImportStateEntry(
+            drift_hash=compute_drift_hash(cand.server),
+            drift_hash_version=HASH_VERSION,
+            last_imported=now,
+            source_label=cand.source_label,
+        )
     new_registry = state.RegistryConfig(schema_version=registry.schema_version, servers=new_servers)
     state.save_registry(new_registry)
+
+    existing_state = state.load_import_state()
+    merged_state = state.ImportState(
+        schema_version=existing_state.schema_version,
+        entries={**existing_state.entries, **new_entries},
+    )
+    state.save_import_state(merged_state)
 
     click.echo("")
     click.echo(
