@@ -19,6 +19,12 @@ from typing import Any
 import click
 
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
+from memtomem_stm.mms.import_hosts import (
+    _DANGEROUS_ENV_KEYS,
+    _desktop_config_path,
+    _is_self_reference,
+    _read_json_safely,
+)
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
 
@@ -26,19 +32,9 @@ _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
 
-# Environment variable names that could enable code injection via subprocess
-_DANGEROUS_ENV_KEYS = frozenset(
-    {
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "PYTHONPATH",
-        "PYTHONSTARTUP",
-        "NODE_OPTIONS",
-    }
-)
+# `_DANGEROUS_ENV_KEYS`, `_BLOCKED_IMPORT_NAMES`, `_desktop_config_path`,
+# `_read_json_safely`, `_is_self_reference` — re-imported from
+# `mms.import_hosts` (single definition, shared with `mms import`).
 
 
 # Style policy — color and bold carry *different* signals so visual weight
@@ -863,21 +859,6 @@ def _prompt_prefix(default: str | None = None) -> str:
 # zero candidates and fall back to the manual prompt flow.
 
 
-def _desktop_config_path() -> Path:
-    """Claude Desktop's macOS config path; Windows/Linux variants skipped."""
-    return Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser()
-
-
-def _read_json_safely(path: Path) -> dict[str, Any] | None:
-    try:
-        if not path.exists():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
     """Map a client-config MCP entry to an STM upstream-server entry.
 
@@ -926,41 +907,6 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
     else:
         entry["url"] = url
     return entry
-
-
-# Names that should never appear as STM upstream servers:
-#
-# * ``mms`` / ``memtomem-stm`` / ``memtomem-stm-proxy`` — STM itself. Importing
-#   would proxy STM through STM, recursing on every tool call.
-# * ``memtomem`` / ``memtomem-server`` — the LTM companion. STM reaches LTM via
-#   a separate mechanism (see CLAUDE.md "pipeline" invariants); adding it as
-#   an upstream double-registers it and surfaces LTM tools twice.
-#
-# Detection looks at both the command basename *and* each argv token (exact
-# match, not substring) because ``uvx --from memtomem memtomem-server`` uses
-# ``uvx`` as the command and carries the blocked name only in args.
-_BLOCKED_IMPORT_NAMES = frozenset(
-    {
-        "mms",
-        "memtomem-stm",
-        "memtomem-stm-proxy",
-        "memtomem",
-        "memtomem-server",
-    }
-)
-
-
-def _is_self_reference(entry: dict[str, Any]) -> bool:
-    """Skip entries that would make STM proxy itself or double-register LTM."""
-    cmd = (entry.get("command") or "").lower()
-    if cmd and Path(cmd).name in _BLOCKED_IMPORT_NAMES:
-        return True
-    args = entry.get("args") or []
-    if isinstance(args, list):
-        for tok in args:
-            if isinstance(tok, str) and tok.lower() in _BLOCKED_IMPORT_NAMES:
-                return True
-    return False
 
 
 def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
