@@ -16,14 +16,27 @@ are idempotent (no-op + "already up to date" message); a same-name
 entry with a *different* `command`/`args`/`env` is reported as a
 conflict and skipped.
 
-Atomicity (sidecar): registry write precedes sidecar write. If the
-process crashes between, the sidecar is stale for the entries written.
-Next ``--apply`` with **unchanged host input** re-writes them
-(idempotent recovery). If host input changes between crash and
-recovery, the stale entries persist until manually corrected — a
-``--force`` option lands in W3+; today's mitigation is to re-run
-``--apply`` against the same host snapshot before editing host
-configs further. No transaction.
+Sidecar population & recovery: every registry entry observed by an
+``--apply`` run that is missing from ``~/.mms/import_state.toml``
+gets stamped during that run. New entries (registry-additive) are
+stamped from their candidate; idempotent entries (registry already
+matches host) are *backfilled* from the same canonical hash. This
+makes sidecar population idempotent-recoverable across:
+
+* a crash between the registry and sidecar writes within one apply,
+* a sidecar deleted out-of-band,
+* a registry imported under a pre-PR2 mms (no wire existed yet).
+
+Backfill timestamps reflect the recovery moment, not the original
+import — the sidecar's ``last_imported`` is "first observation by a
+wired apply", which is the only moment the hash can be authoritatively
+computed. Backfill row hashes are byte-equal to what a fresh
+``--apply`` would compute against the same canonical_form.
+
+Registry write still precedes sidecar write within a single apply;
+no transaction. A ``--force`` option to re-stamp existing sidecar
+rows (resetting timestamps after a host edit you've already
+acknowledged) lands in W3+.
 """
 
 from __future__ import annotations
@@ -182,35 +195,60 @@ def import_command(from_host: str, is_plan: bool, show_imported: bool) -> None:
         return
 
     # --apply
-    if not new:
+    # Load existing sidecar up front — needed to decide whether any
+    # idempotent entries require backfill (sidecar row missing for an
+    # entry that is already in the registry).
+    existing_state = state.load_import_state()
+
+    # Single timestamp captured at the action boundary — shared by every
+    # row written this run (new + backfill) so PR3 can read "all rows
+    # with timestamp T were observed in the same --apply".
+    now = state.utc_now_iso()
+
+    backfill_entries: dict[str, state.ImportStateEntry] = {}
+    for cand in idempotent:
+        if cand.name not in existing_state.entries:
+            backfill_entries[cand.name] = state.ImportStateEntry(
+                drift_hash=compute_drift_hash(cand.server),
+                drift_hash_version=HASH_VERSION,
+                last_imported=now,
+                source_label=cand.source_label,
+            )
+
+    if not new and not backfill_entries:
         click.echo("")
         click.echo("Already up to date. Registry unchanged.")
         return
 
-    # Single timestamp for the whole apply — matches `upsert_project_in_index`
-    # idiom and avoids per-entry skew on slow hosts.
-    now = state.utc_now_iso()
-    new_servers = {**registry.servers}
     new_entries: dict[str, state.ImportStateEntry] = {}
-    for cand in new:
-        new_servers[cand.name] = cand.server
-        new_entries[cand.name] = state.ImportStateEntry(
-            drift_hash=compute_drift_hash(cand.server),
-            drift_hash_version=HASH_VERSION,
-            last_imported=now,
-            source_label=cand.source_label,
+    if new:
+        new_servers = {**registry.servers}
+        for cand in new:
+            new_servers[cand.name] = cand.server
+            new_entries[cand.name] = state.ImportStateEntry(
+                drift_hash=compute_drift_hash(cand.server),
+                drift_hash_version=HASH_VERSION,
+                last_imported=now,
+                source_label=cand.source_label,
+            )
+        new_registry = state.RegistryConfig(
+            schema_version=registry.schema_version, servers=new_servers
         )
-    new_registry = state.RegistryConfig(schema_version=registry.schema_version, servers=new_servers)
-    state.save_registry(new_registry)
+        state.save_registry(new_registry)
 
-    existing_state = state.load_import_state()
     merged_state = state.ImportState(
         schema_version=existing_state.schema_version,
-        entries={**existing_state.entries, **new_entries},
+        entries={**existing_state.entries, **new_entries, **backfill_entries},
     )
     state.save_import_state(merged_state)
 
     click.echo("")
-    click.echo(
-        f"Wrote {len(new)} new entr{'y' if len(new) == 1 else 'ies'} to {state.registry_path()}"
-    )
+    if new:
+        click.echo(
+            f"Wrote {len(new)} new entr{'y' if len(new) == 1 else 'ies'} to {state.registry_path()}"
+        )
+    if backfill_entries:
+        click.echo(
+            f"Backfilled {len(backfill_entries)} sidecar "
+            f"row{'' if len(backfill_entries) == 1 else 's'} to {state.import_state_path()}"
+        )

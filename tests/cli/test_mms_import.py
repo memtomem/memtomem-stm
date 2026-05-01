@@ -253,6 +253,69 @@ class TestApply:
             assert before.replace(microsecond=0) <= ts
             assert (ts - after).total_seconds() <= 300
 
+        # 8. single-timestamp invariant: every row in this --apply shares
+        # one ``last_imported`` value. The production code captures ``now``
+        # once at the action boundary; without this pin a future refactor
+        # moving the capture inside the loop would still pass (1)-(7) since
+        # all per-entry timestamps would still land in the 300s window.
+        # PR3 reads "rows with the same timestamp were observed in one
+        # apply" — break this invariant and that read is wrong.
+        all_timestamps = {entry.last_imported for entry in loaded.entries.values()}
+        assert len(all_timestamps) == 1, f"expected one shared timestamp, got {all_timestamps}"
+
+    def test_apply_backfills_sidecar_when_registry_populated_but_sidecar_missing(
+        self, runner, sandbox
+    ):
+        """Crash-recovery / pre-PR2 path: registry has entries but the
+        sidecar lacks rows for them. The next ``--apply`` with unchanged
+        host input must backfill the missing rows — this is what the
+        module docstring promises as idempotent recovery. Without
+        backfill, the sidecar stays empty forever (idempotent
+        classification short-circuits the write block) and PR3 drift
+        detection has no baseline to compare against.
+        """
+        _seed_claude_code(
+            sandbox,
+            {
+                "filesystem": {"command": "npx", "args": ["-y", "@mcp/fs"]},
+                "github": {"command": "npx"},
+            },
+        )
+        # First apply: both registry and sidecar populated normally.
+        res1 = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res1.exit_code == 0, res1.output
+        assert set(state.load_import_state().entries.keys()) == {"filesystem", "github"}
+
+        # Simulate: crash mid-write, manual sidecar delete, OR a registry
+        # that was imported under a pre-PR2 mms (no sidecar wire existed).
+        state.import_state_path().unlink()
+        assert not state.import_state_path().exists()
+        assert set(state.load_registry().servers.keys()) == {"filesystem", "github"}
+
+        # Re-apply with unchanged host input — registry classifies both as
+        # idempotent, but the backfill pass restores the sidecar.
+        res2 = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res2.exit_code == 0, res2.output
+        assert "Backfilled 2 sidecar rows" in res2.output
+        # Registry message must NOT appear — registry is byte-unchanged.
+        assert "Wrote" not in res2.output
+
+        # Sidecar fully restored, hashes match the canonical implementation.
+        cfg = state.load_registry()
+        loaded = state.load_import_state()
+        assert set(loaded.entries.keys()) == set(cfg.servers.keys())
+        for name, entry in loaded.entries.items():
+            assert entry.drift_hash == compute_drift_hash(cfg.servers[name])
+            assert entry.drift_hash_version == drift.HASH_VERSION
+            assert entry.source_label == "Claude Code (user)"
+        # Backfill rows share the recovery-moment timestamp.
+        assert len({e.last_imported for e in loaded.entries.values()}) == 1
+
+        # Third apply with sidecar now populated — pure no-op.
+        res3 = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res3.exit_code == 0, res3.output
+        assert "Already up to date" in res3.output
+
     def test_apply_preserves_existing_sidecar_entries(self, runner, sandbox):
         """Adding new servers must not overwrite sidecar rows for servers
         that were imported in a previous apply (dict-merge invariant)."""
