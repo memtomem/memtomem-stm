@@ -27,6 +27,7 @@ def test_mms_home_resolves_under_home(sandbox_home):
     assert state.mms_home() == sandbox_home / ".mms"
     assert state.registry_path() == sandbox_home / ".mms" / "registry.toml"
     assert state.projects_index_path() == sandbox_home / ".mms" / "projects.toml"
+    assert state.import_state_path() == sandbox_home / ".mms" / "import_state.toml"
 
 
 def test_project_marker_relpath_is_dot_mms_project_toml():
@@ -135,6 +136,100 @@ def test_utc_now_iso_format(sandbox_home):
     assert len(s) == 20
     assert s.endswith("Z")
     assert s[10] == "T"
+
+
+# ---------------------------------------------------------------------------
+# Import-state sidecar (W2 drift-detection foundation)
+# ---------------------------------------------------------------------------
+
+
+def test_load_import_state_returns_empty_when_missing(sandbox_home):
+    s = state.load_import_state()
+    assert s.entries == {}
+    assert s.schema_version == state.SCHEMA_VERSION
+
+
+def test_import_state_round_trip(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "filesystem": state.ImportStateEntry(
+                drift_hash="sha256:40c96f4ab4762ceb",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Claude Code (user)",
+            ),
+            "github": state.ImportStateEntry(
+                drift_hash="sha256:1234567890abcdef",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Codex CLI",
+            ),
+        }
+    )
+    state.save_import_state(s)
+    loaded = state.load_import_state()
+    assert loaded == s
+
+
+def test_save_import_state_uses_0o600(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "x": state.ImportStateEntry(
+                drift_hash="sha256:0123456789abcdef",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Cursor (user)",
+            )
+        }
+    )
+    state.save_import_state(s)
+    mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
+    assert mode == 0o600
+
+
+def test_import_state_schema_version_mismatch(tmp_path):
+    target = tmp_path / "import_state.toml"
+    target.write_text("schema_version = 2\n[entries]\n", encoding="utf-8")
+    with pytest.raises(state.SchemaVersionMismatch) as exc_info:
+        state.load_import_state(target)
+    assert exc_info.value.found == 2
+    assert exc_info.value.path == target
+
+
+def test_import_state_extra_field_rejected(tmp_path):
+    """Sidecar shape is locked by ``extra="forbid"`` — an unknown column on
+    an entry must be a CorruptedConfig, not a silent accept."""
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        "schema_version = 1\n[entries.foo]\n"
+        'drift_hash = "sha256:0000000000000000"\n'
+        "drift_hash_version = 1\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n'
+        'unknown = "boom"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
+
+
+def test_import_state_on_disk_shape(sandbox_home):
+    s = state.ImportState(
+        entries={
+            "filesystem": state.ImportStateEntry(
+                drift_hash="sha256:40c96f4ab4762ceb",
+                drift_hash_version=1,
+                last_imported="2026-05-01T13:24:03Z",
+                source_label="Claude Code (user)",
+            )
+        }
+    )
+    state.save_import_state(s)
+    raw = tomllib.loads(state.import_state_path().read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 1
+    assert raw["entries"]["filesystem"]["drift_hash"] == "sha256:40c96f4ab4762ceb"
+    assert raw["entries"]["filesystem"]["drift_hash_version"] == 1
+    assert raw["entries"]["filesystem"]["source_label"] == "Claude Code (user)"
 
 
 # ---------------------------------------------------------------------------

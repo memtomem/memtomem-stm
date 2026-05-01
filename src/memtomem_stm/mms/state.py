@@ -1,4 +1,4 @@
-"""Pydantic models + atomic TOML I/O for the three mms config files.
+"""Pydantic models + atomic TOML I/O for the mms config files.
 
 Spec: RFC §5.3 — three TOML files form W1's persistent state:
 
@@ -6,9 +6,16 @@ Spec: RFC §5.3 — three TOML files form W1's persistent state:
 * ``~/.mms/projects.toml`` — auto-managed projects index
 * ``<project>/.mms/project.toml`` — per-project enabled MCP names
 
+W2 adds a fourth, sidecar-only file:
+
+* ``~/.mms/import_state.toml`` — drift-detection baseline; per-server
+  ``drift_hash`` (foundation in PR1, populated by ``mms import`` in PR2).
+
 All three start with ``schema_version = 1``. Loading a higher version
 raises :class:`SchemaVersionMismatch` (W1 has no migration logic — RFC
-§16's ``mms upgrade-config`` is a W2+ separate code path).
+§16's ``mms upgrade-config`` is a W2+ separate code path). The sidecar
+has its own independent ``schema_version`` (also 1) — sidecar evolution
+is decoupled from registry evolution.
 
 Path resolution goes through :func:`mms_home` etc. so tests can
 ``monkeypatch.setenv("HOME", tmp_path)`` and have everything land in a
@@ -30,9 +37,12 @@ SCHEMA_VERSION = 1
 
 # Mode bits — registry holds secrets, projects index holds paths only,
 # per-project file is committed and intentionally world-readable.
+# Import-state sidecar reveals per-server source attribution + timestamps;
+# treat as private even though the hash itself is opaque.
 _REGISTRY_MODE = 0o600
 _PROJECTS_INDEX_MODE = 0o600
 _PROJECT_FILE_MODE: int | None = None  # respect user umask
+_IMPORT_STATE_MODE = 0o600
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +61,11 @@ def registry_path() -> Path:
 
 def projects_index_path() -> Path:
     return mms_home() / "projects.toml"
+
+
+def import_state_path() -> Path:
+    """Drift-detection sidecar (W2). One file per host machine."""
+    return mms_home() / "import_state.toml"
 
 
 PROJECT_MARKER_RELPATH = Path(".mms") / "project.toml"
@@ -156,6 +171,39 @@ class ProjectConfig(BaseModel):
     mcp: ProjectMcp = Field(default_factory=ProjectMcp)
 
 
+class ImportStateEntry(BaseModel):
+    """Drift-detection baseline for one imported MCP server.
+
+    Populated by ``mms import --apply`` (PR2): when an entry is written to
+    ``registry.toml``, the corresponding sidecar row records the
+    :func:`memtomem_stm.mms.drift.compute_drift_hash` value, the import
+    timestamp, and the human-readable host-source label that was shown in
+    the ``--plan`` output. PR3 reads this row to classify the next scan's
+    candidate as idempotent / drift / removed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    drift_hash: str
+    drift_hash_version: int
+    last_imported: str  # ISO 8601 UTC, same shape as ProjectIndexEntry.last_seen
+    source_label: str  # e.g. "Claude Code (user)", "Codex CLI"
+
+
+class ImportState(BaseModel):
+    """Top-level model for ``~/.mms/import_state.toml`` (W2 sidecar).
+
+    Sidecar versioning is independent of the registry's ``SCHEMA_VERSION``:
+    a future drift-hash algorithm change bumps this without touching
+    registry shape, and vice versa.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = SCHEMA_VERSION
+    entries: dict[str, ImportStateEntry] = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Load helpers
 # ---------------------------------------------------------------------------
@@ -217,6 +265,23 @@ def load_project_config(path: Path) -> ProjectConfig:
         raise CorruptedConfig(path, f"schema validation: {e}") from e
 
 
+def load_import_state(path: Path | None = None) -> ImportState:
+    """Load the import-state sidecar. Returns empty state if file is missing.
+
+    Sidecar absence is the normal "no baseline yet" case (e.g. brand-new
+    install, or pre-W2 user upgrading) — same idiom as :func:`load_registry`.
+    """
+    p = path or import_state_path()
+    if not p.is_file():
+        return ImportState()
+    raw = _load_toml_dict(p)
+    _check_schema_version(p, raw)
+    try:
+        return ImportState.model_validate(raw)
+    except ValidationError as e:
+        raise CorruptedConfig(p, f"schema validation: {e}") from e
+
+
 # ---------------------------------------------------------------------------
 # Save helpers
 # ---------------------------------------------------------------------------
@@ -237,6 +302,12 @@ def save_projects_index(index: ProjectsIndex, path: Path | None = None) -> None:
 def save_project_config(config: ProjectConfig, path: Path) -> None:
     """Atomically write a per-project ``project.toml`` (committed file, default mode)."""
     atomic_write_text(path, tomli_w.dumps(config.model_dump()), mode=_PROJECT_FILE_MODE)
+
+
+def save_import_state(state: ImportState, path: Path | None = None) -> None:
+    """Atomically write ``import_state.toml`` with mode 0o600."""
+    p = path or import_state_path()
+    atomic_write_text(p, tomli_w.dumps(state.model_dump()), mode=_IMPORT_STATE_MODE)
 
 
 # ---------------------------------------------------------------------------
