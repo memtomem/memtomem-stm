@@ -194,6 +194,50 @@ def test_import_state_schema_version_mismatch(tmp_path):
         state.load_import_state(target)
     assert exc_info.value.found == 2
     assert exc_info.value.path == target
+    # Error message names the *sidecar* expected version, not the registry's
+    # — proves the SchemaVersionMismatch.expected plumbing reaches the user.
+    assert exc_info.value.expected == state.IMPORT_STATE_SCHEMA_VERSION
+    assert f"this mms supports {state.IMPORT_STATE_SCHEMA_VERSION}" in str(exc_info.value)
+
+
+def test_sidecar_version_decoupled_from_registry(tmp_path, monkeypatch):
+    """Bumping ``SCHEMA_VERSION`` (registry/projects/project) must NOT
+    invalidate sidecars written under ``IMPORT_STATE_SCHEMA_VERSION = 1``.
+    Guards the docstring claim that the two version axes are independent.
+    """
+    # Simulate a future mms where registry shape evolved to v2 but the
+    # sidecar shape stayed at v1.
+    monkeypatch.setattr(state, "SCHEMA_VERSION", 2)
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        "schema_version = 1\n[entries.foo]\n"
+        'drift_hash = "sha256:0123456789abcdef"\n'
+        "drift_hash_version = 1\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
+        encoding="utf-8",
+    )
+    loaded = state.load_import_state(target)
+    assert "foo" in loaded.entries
+    assert loaded.schema_version == 1
+
+
+def test_sidecar_rejects_when_only_sidecar_version_bumps(tmp_path, monkeypatch):
+    """Symmetric to the previous: bumping only the sidecar version must
+    flip sidecar load to mismatch *without* affecting the registry path.
+    """
+    monkeypatch.setattr(state, "IMPORT_STATE_SCHEMA_VERSION", 2)
+    # Old sidecar (v1) under new code (expects v2) → mismatch
+    target = tmp_path / "import_state.toml"
+    target.write_text("schema_version = 1\n[entries]\n", encoding="utf-8")
+    with pytest.raises(state.SchemaVersionMismatch) as exc_info:
+        state.load_import_state(target)
+    assert exc_info.value.expected == 2
+
+    # Registry under same monkeypatched env is unaffected — uses SCHEMA_VERSION (still 1)
+    reg_path = tmp_path / "registry.toml"
+    reg_path.write_text("schema_version = 1\n[servers]\n", encoding="utf-8")
+    assert state.load_registry(reg_path).servers == {}
 
 
 def test_import_state_extra_field_rejected(tmp_path):
@@ -207,6 +251,51 @@ def test_import_state_extra_field_rejected(tmp_path):
         'last_imported = "2026-05-01T13:24:03Z"\n'
         'source_label = "test"\n'
         'unknown = "boom"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
+
+
+@pytest.mark.parametrize(
+    "bad_hash",
+    [
+        "garbage",  # no prefix, no hex
+        "sha256:GHIJ567890ABCDEF",  # non-hex chars
+        "sha256:abc123",  # too short
+        "sha256:0123456789abcdef0",  # too long
+        "md5:0123456789abcdef",  # wrong algorithm prefix
+        "0123456789abcdef",  # missing prefix
+    ],
+)
+def test_import_state_rejects_malformed_drift_hash(tmp_path, bad_hash: str):
+    """Pydantic ``Field(pattern=...)`` rejects sidecars with hashes that
+    don't match the format ``compute_drift_hash`` produces. Catches PR2
+    typos / hand-edits at load time instead of at comparison time."""
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        f"schema_version = 1\n[entries.foo]\n"
+        f'drift_hash = "{bad_hash}"\n'
+        "drift_hash_version = 1\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig):
+        state.load_import_state(target)
+
+
+@pytest.mark.parametrize("bad_version", [0, -1])
+def test_import_state_rejects_non_positive_drift_hash_version(tmp_path, bad_version: int):
+    """``Field(ge=1)`` excludes 0 / negative — our ``HASH_VERSION`` starts
+    at 1 and only grows."""
+    target = tmp_path / "import_state.toml"
+    target.write_text(
+        f"schema_version = 1\n[entries.foo]\n"
+        'drift_hash = "sha256:0123456789abcdef"\n'
+        f"drift_hash_version = {bad_version}\n"
+        'last_imported = "2026-05-01T13:24:03Z"\n'
+        'source_label = "test"\n',
         encoding="utf-8",
     )
     with pytest.raises(state.CorruptedConfig):
