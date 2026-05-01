@@ -18,6 +18,7 @@ from typing import Any
 
 import click
 
+from memtomem_stm.cli.mms_import import import_command as _mms_import_command
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
 from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
@@ -2290,3 +2291,6 @@ def health(
 # `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py
 # to keep this file from accreting another ~700 lines for the W1 surface.
 cli.add_command(_mms_project_group)
+
+# `mms import ...` — RFC §7.2, lives in src/memtomem_stm/cli/mms_import.py.
+cli.add_command(_mms_import_command)
