@@ -95,8 +95,13 @@ def _format_env_summary(
     return "env: " + ", ".join(parts)
 
 
-# Cross-imported by mms_host.sync_cmd as a second caller; promote
-# to mms/sync.py module if a third caller appears (W3+ --force).
+# Cross-imported by mms_host.sync_cmd (along with ``_format_env_summary``
+# above). Two helpers already share the cross-import; the promotion
+# trigger is now "next cross-imported helper joins" rather than "3rd
+# caller of this function" — at that point both should land in
+# ``mms/sync.py``. Signature drift is pinned by
+# ``test_classify_against_registry_signature_pinned`` /
+# ``test_format_env_summary_signature_pinned`` in tests/cli/test_mms_host.py.
 def _classify_against_registry(
     candidates: list[ImportCandidate], registry: state.RegistryConfig
 ) -> tuple[

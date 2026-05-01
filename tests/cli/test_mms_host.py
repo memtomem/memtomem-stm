@@ -824,6 +824,7 @@ class TestSyncPlan:
             "backfilled": 0,
             "cleanup": 0,
             "skipped_changed": 0,
+            "orphan_no_baseline": 0,
             "unchanged": 1,
             "conflicts": 0,
         }
@@ -890,6 +891,24 @@ class TestSyncPlan:
         res = _sync(runner, "--plan")
         assert res.exit_code == 0, res.output
         assert "in registry without baseline and not at any host scan" in res.output
+
+    def test_plan_orphan_no_baseline_in_json_summary(self, runner, sandbox):
+        """JSON parity with the text footer: ``orphan_no_baseline``
+        surfaces in both ``summary`` (count) and ``plan`` (per-entry
+        list). Without this, JSON consumers miss what text users see.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        s = state.load_import_state()
+        s.entries.pop("a")
+        state.save_import_state(s)
+        _seed_claude_code(sandbox, {})
+
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["summary"]["orphan_no_baseline"] == 1
+        assert payload["plan"]["orphan_no_baseline"] == [{"name": "a"}]
 
     def test_plan_aborted_field_always_false_in_plan_mode(self, runner, sandbox):
         # Seed REMOVE-triggering state so the bucket would be visible
@@ -1233,14 +1252,14 @@ class TestSyncConfirmation:
         _seed_claude_code(sandbox, {})  # both → REMOVE
 
         captured = {"prompt": ""}
-        # Intercept click.confirm to capture the prompt text.
+        # Intercept click.confirm to capture the prompt text. The
+        # spy declines so no writes happen; the test asserts on the
+        # captured text rather than dispatching to the real confirm.
         import click as _click_mod
-
-        original_confirm = _click_mod.confirm
 
         def spy_confirm(text, *args, **kwargs):
             captured["prompt"] = text
-            return False  # decline → no writes
+            return False
 
         monkeypatch.setattr(_click_mod, "confirm", spy_confirm)
         _force_tty(monkeypatch)
@@ -1253,8 +1272,6 @@ class TestSyncConfirmation:
         assert "Claude Code (user)" in prompt
         # Tail summary present.
         assert "Also:" in prompt
-        # Avoid lint-warning for unused alias.
-        del original_confirm
 
 
 class TestSyncJsonShape:
@@ -1264,6 +1281,7 @@ class TestSyncJsonShape:
         "backfill",
         "cleanup",
         "skipped_changed",
+        "orphan_no_baseline",
         "conflicts",
     }
     _SUMMARY_KEYS = {
@@ -1272,6 +1290,7 @@ class TestSyncJsonShape:
         "backfilled",
         "cleanup",
         "skipped_changed",
+        "orphan_no_baseline",
         "unchanged",
         "conflicts",
     }
@@ -1297,23 +1316,29 @@ class TestSyncJsonShape:
         assert set(payload["plan"].keys()) == self._PLAN_PAYLOAD_KEYS
         assert set(payload["summary"].keys()) == self._SUMMARY_KEYS
 
-    def test_json_aborted_true_on_tty_decline(self, runner, sandbox, monkeypatch):
+    def test_json_apply_with_remove_requires_yes_even_in_tty(self, runner, sandbox, monkeypatch):
+        """``--json`` + REMOVE forces ``--yes`` regardless of TTY.
+
+        A TTY confirmation prompt cannot be answered programmatically
+        by a JSON consumer, and mixing prompt text with JSON output
+        would corrupt machine parsing — so even with a real TTY we
+        bypass the prompt path and abort like the non-TTY case.
+        """
         _seed_claude_code(sandbox, {"a": {"command": "npx"}})
         _apply_claude_code(runner)
         _seed_claude_code(sandbox, {})
 
         _force_tty(monkeypatch)
 
-        res = _sync(runner, "--apply", "--json", input="n\n")
+        res = _sync(runner, "--apply", "--json")
         assert res.exit_code == 2, res.output
-        # JSON is in res.output; the prompt may also be mixed in but
-        # JSON is on its own line. Find it by parsing each candidate
-        # block.
-        # Click writes the JSON via click.echo after the confirm
-        # decision; locate the JSON object.
+        # No prompt was shown — output is just the stderr abort
+        # message followed by JSON. Pin both halves: prompt absent +
+        # JSON parses cleanly when stripped of the stderr message.
+        assert "Proceed?" not in res.output
+        # Locate the JSON payload (after the stderr abort message).
         text = res.output
         start = text.find("{")
-        # Final JSON object — find the *last* well-formed one.
         end = text.rfind("}")
         payload = json.loads(text[start : end + 1])
         assert payload["aborted"] is True
@@ -1321,7 +1346,10 @@ class TestSyncJsonShape:
         assert all(payload["plan"][k] == [] for k in payload["plan"])
         assert all(payload["summary"][k] == 0 for k in payload["summary"])
 
-    def test_json_aborted_true_on_non_tty_abort_with_json_flag(self, runner, sandbox):
+    def test_json_aborted_true_on_non_tty_abort(self, runner, sandbox):
+        """Non-TTY + REMOVE + no ``--yes`` + ``--json`` → exit 2 with
+        ``aborted: true`` JSON. Symmetric path with the TTY+--json
+        case (see test above)."""
         _seed_claude_code(sandbox, {"a": {"command": "npx"}})
         _apply_claude_code(runner)
         _seed_claude_code(sandbox, {})
@@ -1337,16 +1365,45 @@ class TestSyncJsonShape:
 
 
 class TestSyncContractPin:
-    def test_classify_against_registry_signature_pinned(self):
-        """Cross-CLI import is brittle by convention; signature change
-        in mms_import.py would silently break sync_cmd. This is the
-        tripwire."""
+    def test_classify_against_registry_signature_and_return_shape_pinned(self):
+        """Cross-CLI import is brittle by convention; signature OR
+        return-shape change in mms_import.py would silently break
+        sync_cmd. Pin both — the param-name list AND the runtime
+        contract (3-tuple of lists).
+        """
         from inspect import signature
 
         from memtomem_stm.cli.mms_import import _classify_against_registry
 
         sig = signature(_classify_against_registry)
         assert list(sig.parameters) == ["candidates", "registry"]
+
+        # Smoke: empty inputs → 3-tuple of lists. sync_cmd unpacks
+        # ``new, conflicts, _idempotent = _classify_against_registry(...)``;
+        # if the return type ever changes to a dict / 2-tuple / NamedTuple,
+        # this test fires before the unpack does at runtime.
+        result = _classify_against_registry([], state.RegistryConfig())
+        assert isinstance(result, tuple) and len(result) == 3
+        assert all(isinstance(x, list) for x in result)
+
+    def test_format_env_summary_signature_and_return_shape_pinned(self):
+        """Second cross-imported helper. ``_render_sync_text`` calls
+        ``_format_env_summary(cand.server, cand.env_classification,
+        show_imported=False)``; a kwarg rename or type change would
+        silently break sync's ADD bucket text rendering.
+        """
+        from inspect import signature
+
+        from memtomem_stm.cli.mms_import import _format_env_summary
+        from memtomem_stm.mms.secrets import classify_env
+
+        sig = signature(_format_env_summary)
+        assert list(sig.parameters) == ["server", "env_classification", "show_imported"]
+
+        # Smoke: empty env → returns a string ("no env" path).
+        server = state.RegistryServer(command="npx", args=[], env={}, prefix="x")
+        result = _format_env_summary(server, classify_env({}), show_imported=False)
+        assert isinstance(result, str)
 
     def test_sync_docstring_mentions_first_time_vs_ongoing(self):
         """Lock-down 1 anchor: sync's docstring carries the

@@ -44,6 +44,12 @@ the comparison candidate is chosen by ``baseline.source_label`` match
 first, falling back to first-seen across :data:`ALL_HOSTS`. This keeps
 ``unchanged``/``changed`` stable when the user later mirrors an entry
 into a second host — the import-time host stays the comparison axis.
+
+PR6 added ``mms host sync`` as the write-back counterpart to status's
+read-only inspection. Sync's JSON shape (``mode``/``aborted``/``plan``
+/``summary``) is its own contract independent of status's locked-in
+4-key shape — bucket vocabulary is shared, but the surface that emits
+it is not.
 """
 
 from __future__ import annotations
@@ -512,6 +518,7 @@ def _empty_sync_payload() -> dict:
         "backfill": [],
         "cleanup": [],
         "skipped_changed": [],
+        "orphan_no_baseline": [],
         "conflicts": [],
     }
 
@@ -523,6 +530,7 @@ def _empty_sync_summary() -> dict:
         "backfilled": 0,
         "cleanup": 0,
         "skipped_changed": 0,
+        "orphan_no_baseline": 0,
         "unchanged": 0,
         "conflicts": 0,
     }
@@ -738,6 +746,12 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
     set(registry.servers)`` so a crash between writes self-heals on
     the next run (orphan baselines drop; missing baselines BACKFILL).
 
+    With ``--json``, the REMOVE bucket always requires ``--yes`` —
+    a TTY confirmation prompt cannot be answered programmatically by
+    a JSON consumer, and mixing prompt text with JSON output corrupts
+    machine parsing. Without ``--yes``, ``--json`` REMOVE aborts
+    (exit 2) with ``aborted: true`` in the payload.
+
     See ``mms_import.py`` for the matching docstring at
     ``import_command``.
     """
@@ -757,7 +771,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
     n_unchanged = sum(1 for r in classified if r["state"] == "unchanged")
 
     no_baseline_with_cand = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is not None]
-    n_orphan_no_baseline = sum(1 for r in no_baseline_rows if cand_by_name.get(r["name"]) is None)
+    no_baseline_orphans = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is None]
 
     # Pre-existing orphan sidecar entries: in sidecar but not in registry.
     # ``_classify`` is registry-anchored and never emits these — detect
@@ -789,6 +803,10 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             for name in cleanup_names
         ],
         "skipped_changed": [{"name": r["name"]} for r in changed_rows_classified],
+        # ``orphan_no_baseline``: registry has the entry, sidecar has no
+        # baseline (or version mismatch), and no host scan finds it.
+        # Sync can't safely act — JSON parity with the text footer.
+        "orphan_no_baseline": [{"name": r["name"]} for r in no_baseline_orphans],
         "conflicts": [
             {"name": cand.name, "host": cand.source_label, "reason": reason}
             for cand, reason in conflicts
@@ -800,6 +818,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
         "backfilled": len(plan_payload["backfill"]),
         "cleanup": len(plan_payload["cleanup"]),
         "skipped_changed": len(plan_payload["skipped_changed"]),
+        "orphan_no_baseline": len(plan_payload["orphan_no_baseline"]),
         "unchanged": n_unchanged,
         "conflicts": len(plan_payload["conflicts"]),
     }
@@ -809,14 +828,19 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             _render_sync_json("plan", plan_payload, summary, aborted=False)
         else:
             _render_sync_text("plan", plan_payload, summary, new=new)
-            _render_orphan_no_baseline_footer(n_orphan_no_baseline)
+            _render_orphan_no_baseline_footer(len(no_baseline_orphans))
         return
 
     # ----- --apply -----
 
     # Confirmation gate (only when REMOVE bucket is non-empty).
+    # ``--json`` + REMOVE forces ``--yes``: a TTY prompt cannot be
+    # answered by a JSON consumer, and mixing the prompt text with
+    # JSON output would corrupt machine parsing. So we fall through
+    # to the non-TTY abort path whenever ``--json`` is set, regardless
+    # of the actual TTY status.
     if removed_at_host_rows and not yes:
-        if not _is_interactive():
+        if not _is_interactive() or json_output:
             n = len(removed_at_host_rows)
             click.echo(
                 _SYNC_NON_TTY_ABORT_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n)),
@@ -829,10 +853,6 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             sys.exit(2)
         if not click.confirm(_build_remove_prompt(removed_at_host_rows, summary), default=False):
             click.echo(_SYNC_DECLINE_MSG, err=True)
-            if json_output:
-                _render_sync_json(
-                    "apply", _empty_sync_payload(), _empty_sync_summary(), aborted=True
-                )
             sys.exit(2)
 
     # No-op gate. ``cleanup_names`` non-empty counts as a mutation
@@ -847,7 +867,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             _render_sync_json("apply", plan_payload, summary, aborted=False)
         else:
             _render_sync_text("apply", plan_payload, summary, new=new, apply_outcome="no_op")
-            _render_orphan_no_baseline_footer(n_orphan_no_baseline)
+            _render_orphan_no_baseline_footer(len(no_baseline_orphans))
         return
 
     # Step 1: registry write (ADD inserts + REMOVE deletes).
@@ -898,4 +918,4 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
         _render_sync_json("apply", plan_payload, summary, aborted=False)
     else:
         _render_sync_text("apply", plan_payload, summary, new=new, apply_outcome="mutated")
-        _render_orphan_no_baseline_footer(n_orphan_no_baseline)
+        _render_orphan_no_baseline_footer(len(no_baseline_orphans))
