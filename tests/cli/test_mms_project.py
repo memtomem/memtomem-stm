@@ -321,6 +321,26 @@ def test_disable_noop_when_not_enabled(runner, sandbox):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Wire-in smoke — `mms project ...` is reachable through the top-level cli
+# ---------------------------------------------------------------------------
+
+
+def test_project_group_wired_into_top_level_cli(runner):
+    """`mms project --help` lists all five W1 subcommands.
+
+    Pins the wiring in proxy.py — if the import or `add_command` line is
+    accidentally removed, this test catches it before the §12 e2e
+    acceptance test does (faster signal).
+    """
+    from memtomem_stm.cli.proxy import cli
+
+    res = runner.invoke(cli, ["project", "--help"])
+    assert res.exit_code == 0, res.output
+    for name in ["init", "show", "list", "enable", "disable"]:
+        assert name in res.output, f"subcommand '{name}' missing from `mms project --help`"
+
+
 def test_enable_project_flag_missing_marker_complains(runner, sandbox):
     other = sandbox["home"] / "other-proj"
     other.mkdir()
