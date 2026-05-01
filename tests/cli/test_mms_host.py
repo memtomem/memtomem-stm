@@ -133,14 +133,10 @@ class TestStates:
 
         res = _status(runner)
         assert res.exit_code == 0, res.output
-        # Removed entry stays out of the main table.
-        main_table = res.output.split("0 changed" if "0 changed" in res.output else "1 changed")[0]
-        # filesystem absent from the main-table half, github present.
-        # (Footer note still mentions filesystem? No — neutral phrasing
-        # uses count only, not name. Verified below.)
-        assert "github" in main_table
-        # Footer count + neutral phrasing (no "PR4" / "removed" name leak).
+        # Footer count + neutral phrasing (no PR-planning vocab leak).
         assert "1 entry in registry not present in any host scan" in res.output
+        # Main-table presence is asserted via the JSON shape below — the
+        # text split was brittle to footer rewording (PR4 may evolve it).
 
         json_res = _status(runner, "--json")
         payload = json.loads(json_res.output)
@@ -192,7 +188,9 @@ class TestStates:
                 assert row["baseline_hash"] is None
                 assert row["source_label"] is None
                 assert row["last_imported"] is None
-                # current_hash is computable from registry, so populated.
+                # current_hash reflects the host's view — github is
+                # still in the host config, so the host candidate's
+                # canonical hash is computable.
                 assert row["current_hash"] is not None
 
     def test_status_no_baseline_drift_hash_version_mismatch(self, runner, sandbox):
@@ -303,6 +301,23 @@ class TestSourceLabelMatching:
 
 
 class TestEdges:
+    def test_status_malformed_host_config_exit_0(self, runner, sandbox):
+        """Scanners catch parse errors at the import_hosts level
+        (import_hosts.py:_read_json_safely treats unreadable as "no
+        candidates"). PR3 must inherit that behavior — a malformed
+        host config is the same as missing host config, not a crash.
+        Pins the exit-0 contract against a future scanner refactor
+        that drops the catch.
+        """
+        _seed_claude_code(sandbox, {"x": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Now corrupt the host config — invalid JSON.
+        (sandbox["home"] / ".claude.json").write_text("{ this is not valid json", encoding="utf-8")
+
+        for args in ([], ["--json"]):
+            res = _status(runner, *args)
+            assert res.exit_code == 0, (args, res.output)
+
     def test_status_empty_registry(self, runner, sandbox):
         res = _status(runner)
         assert res.exit_code == 0, res.output
@@ -445,6 +460,66 @@ class TestPlumbing:
         registry = state.load_registry()
         assert payload["entries"][0]["baseline_hash"] == compute_drift_hash(registry.servers["x"])
         assert payload["entries"][0]["current_hash"] == compute_drift_hash(registry.servers["x"])
+
+    def test_current_hash_is_host_view_across_buckets(self, runner, sandbox):
+        """``current_hash`` means "the host's canonical hash, or null
+        if no host has the entry" in every bucket — including
+        ``no_baseline``. Without this, a script that recomputes
+        compute_drift_hash() against the live host config would match
+        for unchanged/changed but diverge for no_baseline whenever
+        registry and host differ (which is the most likely state when
+        the sidecar is stale).
+        """
+        # Apply with the canonical shape, then mutate the host to a
+        # different shape *and* drop the sidecar baseline. The registry
+        # still holds the original shape; the host now holds the new.
+        _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["original"]}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["edited"]}})
+        s = state.load_import_state()
+        s.entries.pop("x")
+        state.save_import_state(s)
+
+        json_res = _status(runner, "--json")
+        payload = json.loads(json_res.output)
+        row = payload["entries"][0]
+        assert row["state"] == "no_baseline"
+
+        # current_hash must reflect the *host's* current canonical form
+        # (the edited shape), not the registry entry. Recomputing
+        # against the host wire gives the same value back.
+        host_view = compute_drift_hash(
+            state.RegistryServer(
+                command="npx",
+                args=["edited"],
+                env={},
+                prefix="x",
+            )
+        )
+        registry_view = compute_drift_hash(state.load_registry().servers["x"])
+        assert row["current_hash"] == host_view
+        assert row["current_hash"] != registry_view  # the asymmetry the reviewer flagged
+
+    def test_current_hash_null_when_host_absent(self, runner, sandbox):
+        """When no host scanner finds the entry (``removed_at_host`` or
+        no_baseline-with-no-host), ``current_hash`` is null — the host
+        view is the empty set.
+        """
+        _seed_claude_code(sandbox, {"x": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # Drop the entry from the host AND drop the sidecar row, so the
+        # row would be no_baseline (sidecar gate fires before host gate)
+        # but with no host candidate to compute current_hash against.
+        _seed_claude_code(sandbox, {})
+        s = state.load_import_state()
+        s.entries.pop("x")
+        state.save_import_state(s)
+
+        json_res = _status(runner, "--json")
+        payload = json.loads(json_res.output)
+        row = payload["entries"][0]
+        assert row["state"] == "no_baseline"
+        assert row["current_hash"] is None
 
     def test_status_does_not_write_anything(self, runner, sandbox):
         """Read-only invariant — running status N times must not

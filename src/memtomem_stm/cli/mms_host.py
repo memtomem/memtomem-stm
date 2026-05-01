@@ -129,8 +129,18 @@ def _classify(
     """
     cand_by_name = _select_candidate_by_name(candidates, import_state)
     rows: list[dict] = []
-    for name, server in registry.servers.items():
+    for name in registry.servers:
         baseline = import_state.entries.get(name)
+        cand = cand_by_name.get(name)
+        # ``current_hash`` is uniformly the host's view: the canonical
+        # hash of the matched candidate, or ``None`` if no host scanner
+        # finds the entry. This keeps the field's meaning the same
+        # across every bucket — downstream tooling that recomputes
+        # against the host config gets the same value back regardless
+        # of whether the row is unchanged / changed / removed / has no
+        # baseline.
+        current_hash = compute_drift_hash(cand.server) if cand is not None else None
+
         if baseline is None or baseline.drift_hash_version != HASH_VERSION:
             # ``no_baseline`` covers both the missing-row case and the
             # version-mismatch case — they both mean "the comparison
@@ -142,12 +152,11 @@ def _classify(
                     "state": "no_baseline",
                     "source_label": baseline.source_label if baseline else None,
                     "baseline_hash": baseline.drift_hash if baseline else None,
-                    "current_hash": compute_drift_hash(server),
+                    "current_hash": current_hash,
                     "last_imported": baseline.last_imported if baseline else None,
                 }
             )
             continue
-        cand = cand_by_name.get(name)
         if cand is None:
             rows.append(
                 {
@@ -160,7 +169,6 @@ def _classify(
                 }
             )
             continue
-        current_hash = compute_drift_hash(cand.server)
         rows.append(
             {
                 "name": name,
@@ -189,7 +197,10 @@ def _render_text(rows: list[dict]) -> None:
     comparison signal. Each is conditionally shown when its count > 0.
 
     Column widths follow ``mms project list`` (mms_project.py:285):
-    plain f-strings, no rich.
+    plain f-strings, no rich. Alignment is best-effort — names longer
+    than the NAME column overflow rather than truncate. Not a contract;
+    swap in textual/rich/whatever when MCP names regularly exceed 20
+    chars in practice.
     """
     main_rows = [r for r in rows if r["state"] in ("unchanged", "changed")]
     n_unchanged = sum(1 for r in main_rows if r["state"] == "unchanged")
