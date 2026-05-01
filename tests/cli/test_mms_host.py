@@ -57,6 +57,10 @@ def _status(runner, *args: str):
     return runner.invoke(host_group, ["status", *args])
 
 
+def _scan(runner, *args: str):
+    return runner.invoke(host_group, ["scan", *args])
+
+
 # ---------------------------------------------------------------------------
 # Core states
 # ---------------------------------------------------------------------------
@@ -577,5 +581,206 @@ class TestPlumbing:
             assert res.exit_code == 0
             res_json = _status(runner, "--json")
             assert res_json.exit_code == 0
+        assert Path(state.registry_path()).read_bytes() == registry_before
+        assert Path(state.import_state_path()).read_bytes() == sidecar_before
+
+
+# ---------------------------------------------------------------------------
+# scan — host-side discovery surface (W2 PR5)
+# ---------------------------------------------------------------------------
+
+
+class TestScan:
+    def test_scan_default_shows_all_hosts(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _seed_cursor_user(sandbox, {"b": {"command": "npx"}})
+
+        res = _scan(runner)
+        assert res.exit_code == 0, res.output
+        assert " a " in res.output
+        assert " b " in res.output
+        assert "Claude Code (user)" in res.output
+        assert "Cursor (user)" in res.output
+        assert "2 entries across 2 hosts" in res.output
+
+    def test_scan_in_registry_yes_after_apply(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"filesystem": {"command": "npx"}})
+        _apply_claude_code(runner)
+
+        res = _scan(runner)
+        assert res.exit_code == 0, res.output
+        # Find the row line; assert it ends with Yes (IN_REGISTRY column).
+        lines = res.output.splitlines()
+        row = next((line for line in lines if "filesystem" in line and "Claude Code" in line), None)
+        assert row is not None, res.output
+        assert row.rstrip().endswith("Yes"), row
+        assert "1 in registry, 0 new at host" in res.output
+
+        json_res = _scan(runner, "--json")
+        payload = json.loads(json_res.output)
+        assert payload["entries"][0]["in_registry"] is True
+        assert payload["summary"] == {"total": 1, "in_registry": 1, "new_at_host": 0}
+
+    def test_scan_in_registry_no_for_orphan(self, runner, sandbox):
+        # Cursor entry, never imported.
+        _seed_cursor_user(sandbox, {"shadcn": {"command": "npx"}})
+
+        res = _scan(runner)
+        assert res.exit_code == 0, res.output
+        lines = res.output.splitlines()
+        row = next((line for line in lines if "shadcn" in line), None)
+        assert row is not None, res.output
+        assert row.rstrip().endswith("No"), row
+        assert "0 in registry, 1 new at host" in res.output
+
+    def test_scan_same_name_multi_host_shows_both(self, runner, sandbox):
+        """Locked-in #1: full inventory. ``mms host status`` does
+        first-match-wins for its registry-comparison axis; ``scan`` has
+        no such axis and shows every host occurrence — intentional
+        divergence so users see real-world same-name mirroring.
+        """
+        _seed_claude_code(sandbox, {"filesystem": {"command": "npx", "args": ["-y", "@a/fs"]}})
+        _seed_cursor_user(sandbox, {"filesystem": {"command": "npx", "args": ["-y", "@b/fs"]}})
+
+        res = _scan(runner)
+        assert res.exit_code == 0, res.output
+        # Two text rows for the same name (one per host).
+        rows = [line for line in res.output.splitlines() if " filesystem " in line]
+        assert len(rows) == 2, res.output
+        assert any("Claude Code (user)" in line for line in rows)
+        assert any("Cursor (user)" in line for line in rows)
+
+        json_res = _scan(runner, "--json")
+        payload = json.loads(json_res.output)
+        fs_entries = [e for e in payload["entries"] if e["name"] == "filesystem"]
+        assert len(fs_entries) == 2, payload
+        assert payload["summary"]["total"] == 2
+
+    def test_scan_from_filter_single_host(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _seed_cursor_user(sandbox, {"b": {"command": "npx"}})
+
+        res = _scan(runner, "--from", "cursor")
+        assert res.exit_code == 0, res.output
+        assert " b " in res.output
+        assert " a " not in res.output  # claude-code excluded
+        assert "Claude Code (user)" not in res.output
+        # Pin both singular forms — `entry`/`host` (not `entries`/`hosts`).
+        assert "1 entry across 1 host" in res.output
+
+    def test_scan_from_invalid_host_errors(self, runner, sandbox):
+        res = _scan(runner, "--from", "foo")
+        # click.Choice rejects with UsageError → exit code 2.
+        assert res.exit_code == 2, res.output
+        assert "foo" in res.output
+        assert "claude-code" in res.output  # choices listed in error
+
+    def test_scan_empty_no_host_configs(self, runner, sandbox):
+        res = _scan(runner)
+        assert res.exit_code == 0, res.output
+        assert "No MCP entries discovered across host configs." in res.output
+
+    def test_scan_empty_no_host_configs_json(self, runner, sandbox):
+        res = _scan(runner, "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        # Locked-in #4: 3-key always-emit summary, zero counts explicit.
+        assert payload == {
+            "entries": [],
+            "summary": {"total": 0, "in_registry": 0, "new_at_host": 0},
+        }
+
+    def test_scan_empty_filtered_host_message_scoped(self, runner, sandbox):
+        """``--from cursor`` with cursor empty (other hosts populated)
+        must say ``in cursor``, not the misleading ``across host
+        configs``. JSON shape unaffected (always 3-key summary).
+        """
+        _seed_claude_code(sandbox, {"only-claude-code-entry": {"command": "npx"}})
+
+        res = _scan(runner, "--from", "cursor")
+        assert res.exit_code == 0, res.output
+        assert "No MCP entries discovered in cursor." in res.output
+        assert "across host configs" not in res.output
+
+        json_res = _scan(runner, "--from", "cursor", "--json")
+        assert json_res.exit_code == 0, json_res.output
+        assert json.loads(json_res.output) == {
+            "entries": [],
+            "summary": {"total": 0, "in_registry": 0, "new_at_host": 0},
+        }
+
+    def test_scan_from_filter_case_insensitive(self, runner, sandbox):
+        """``--from CLAUDE-CODE`` works the same as ``--from
+        claude-code`` — symmetric with ``mms import --from`` UX. Pins
+        the ``case_sensitive=False`` derivation from ``ALL_HOSTS``.
+        """
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+
+        res = _scan(runner, "--from", "CLAUDE-CODE")
+        assert res.exit_code == 0, res.output
+        assert " a " in res.output
+        assert "Claude Code (user)" in res.output
+
+    def test_scan_json_shape(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"registered": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # ``mms import --apply`` is read-only on host configs (project
+        # invariant) — the claude-code seed survives the cursor seed and
+        # the apply, so no re-seed needed.
+        _seed_cursor_user(sandbox, {"orphan": {"command": "npx"}})
+
+        res = _scan(runner, "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+
+        # Per-entry required keys (locked-in shape).
+        required = {"name", "host", "in_registry"}
+        for entry in payload["entries"]:
+            assert set(entry.keys()) == required, entry
+
+        # Summary keys (locked-in #4).
+        assert set(payload["summary"].keys()) == {"total", "in_registry", "new_at_host"}
+
+        states = {e["name"]: e["in_registry"] for e in payload["entries"]}
+        assert states == {"registered": True, "orphan": False}
+        assert payload["summary"] == {"total": 2, "in_registry": 1, "new_at_host": 1}
+
+    def test_scan_in_registry_name_match_only_not_shape(self, runner, sandbox):
+        """Locked-in #2: ``IN_REGISTRY`` is a name match only. Shape
+        comparison is delegated to ``mms host status`` — registered
+        entry whose host shape differs still shows ``Yes`` here.
+        """
+        _seed_claude_code(sandbox, {"filesystem": {"command": "npx", "args": ["-y", "@a/fs"]}})
+        _apply_claude_code(runner)
+
+        # Mutate the host config — same name, different args → "changed"
+        # in status's vocab. scan should still report Yes.
+        _seed_claude_code(sandbox, {"filesystem": {"command": "npx", "args": ["-y", "@b/fs"]}})
+
+        res = _scan(runner, "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["entries"][0]["in_registry"] is True
+
+        # Cross-check: status would call this `changed`, demonstrating the
+        # contrast. scan's `IN_REGISTRY=Yes` and status's `changed` are
+        # both true at once — they're orthogonal axes, not a contradiction.
+        status_res = _status(runner, "--json")
+        status_payload = json.loads(status_res.output)
+        assert status_payload["entries"][0]["state"] == "changed"
+
+    def test_scan_does_not_write_anything(self, runner, sandbox):
+        """Read-only invariant. Mirrors ``test_status_does_not_write_anything``."""
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}, "b": {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_cursor_user(sandbox, {"c": {"command": "npx"}})
+
+        registry_before = Path(state.registry_path()).read_bytes()
+        sidecar_before = Path(state.import_state_path()).read_bytes()
+
+        for args in ([], ["--json"], ["--from", "cursor"], ["--from", "claude-code", "--json"]):
+            res = _scan(runner, *args)
+            assert res.exit_code == 0, (args, res.output)
+
         assert Path(state.registry_path()).read_bytes() == registry_before
         assert Path(state.import_state_path()).read_bytes() == sidecar_before

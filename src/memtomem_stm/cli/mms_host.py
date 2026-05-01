@@ -55,7 +55,7 @@ import click
 
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
-from memtomem_stm.mms.import_hosts import ImportCandidate, discover
+from memtomem_stm.mms.import_hosts import ALL_HOSTS, ImportCandidate, discover
 
 # ---------------------------------------------------------------------------
 # Pinned UX strings — kept as module constants so tests assert against the
@@ -70,6 +70,14 @@ _FOOTER_REMOVED_AT_HOST_TEMPLATE = "{n} entr{ies_or_y} in registry not present i
 _FOOTER_NO_BASELINE_TEMPLATE = (
     "{n} entr{ies_or_y} missing baseline hash — run `mms import --apply` to stamp"
 )
+
+# `mms host scan --from` choices. Derived from canonical ``ALL_HOSTS`` plus
+# the "all" sentinel that ``import_hosts.discover()`` recognizes natively
+# — when a 5th host is added to ``ALL_HOSTS``, scan picks it up automatically
+# without a literal-list drift. ``case_sensitive=False`` matches ``mms
+# import --from``'s contract so users get symmetric UX (``mms host scan
+# --from CLAUDE-CODE`` works the same as ``mms import --from CLAUDE-CODE``).
+_SCAN_HOST_CHOICES = click.Choice([*ALL_HOSTS, "all"], case_sensitive=False)
 
 
 def _ies_or_y(n: int) -> str:
@@ -306,3 +314,127 @@ def status_cmd(json_output: bool) -> None:
         _render_json(rows)
     else:
         _render_text(rows)
+
+
+# ---------------------------------------------------------------------------
+# scan — host-side discovery surface (W2 PR5)
+# ---------------------------------------------------------------------------
+
+
+def _scan_rows(
+    candidates: list[ImportCandidate],
+    registry: state.RegistryConfig,
+) -> list[dict]:
+    """Project each ImportCandidate into a scan row.
+
+    No deduplication: same name across hosts emits multiple rows — the
+    full host-side inventory is the value scan provides. ``in_registry``
+    is a name match only (``cand.name in registry.servers``); shape
+    comparison is delegated to ``mms host status``.
+    """
+    return [
+        {
+            "name": c.name,
+            "host": c.source_label,
+            "in_registry": c.name in registry.servers,
+        }
+        for c in candidates
+    ]
+
+
+def _render_scan_text(rows: list[dict], from_host: str) -> None:
+    """Default human-readable scan renderer.
+
+    Empty case: scoped one-liner — ``across host configs`` when no
+    filter is in play, ``in <host>`` when ``--from <host>`` filters to
+    one scanner. Non-empty: 3-column table (NAME / HOST / IN_REGISTRY)
+    followed by a summary line. ``Yes``/``No`` for the boolean column —
+    universal terminal encoding (no ✓/✗ glyphs that break on Windows
+    cmd or restrictive SSH clients).
+
+    Same-name multi-host rows are emitted in full — intentional
+    divergence from ``mms host status``'s first-match-wins (scan is
+    *collection*, status is *comparison*; they answer different
+    questions and shouldn't share dedup logic).
+
+    Rows render in ``ALL_HOSTS`` × per-scanner-discovery order. When
+    the same name lives in two hosts that aren't iterated back-to-back,
+    its rows may not be visually adjacent. JSON consumers grouping by
+    name should sort their own pass. Reopen trigger for an
+    alphabetical or state-priority sort here = user reports buried
+    duplicates.
+    """
+    if not rows:
+        scope = "across host configs" if from_host == "all" else f"in {from_host}"
+        click.echo(f"No MCP entries discovered {scope}.\n", nl=False)
+        return
+    click.echo(f" {'NAME':<20} {'HOST':<22} IN_REGISTRY")
+    for row in rows:
+        flag = "Yes" if row["in_registry"] else "No"
+        click.echo(f" {row['name']:<20} {row['host']:<22} {flag}")
+    click.echo("")
+    n_total = len(rows)
+    n_in_reg = sum(1 for r in rows if r["in_registry"])
+    n_new = n_total - n_in_reg
+    n_hosts = len({r["host"] for r in rows})
+    entries_word = f"entr{_ies_or_y(n_total)}"
+    hosts_word = "host" if n_hosts == 1 else "hosts"
+    click.echo(
+        f" {n_total} {entries_word} across {n_hosts} {hosts_word} "
+        f"({n_in_reg} in registry, {n_new} new at host)"
+    )
+
+
+def _render_scan_json(rows: list[dict]) -> None:
+    """JSON scan renderer. Always emits 3-key summary (zero counts explicit)."""
+    n_total = len(rows)
+    n_in_reg = sum(1 for r in rows if r["in_registry"])
+    payload = {
+        "entries": rows,
+        "summary": {
+            "total": n_total,
+            "in_registry": n_in_reg,
+            # ``new_at_host`` is the complementary symmetry to
+            # ``mms host status``'s ``removed_at_host`` (in registry,
+            # not at host vs at host, not in registry).
+            "new_at_host": n_total - n_in_reg,
+        },
+    }
+    click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@host_group.command("scan")
+@click.option(
+    "--from",
+    "from_host",
+    type=_SCAN_HOST_CHOICES,
+    default="all",
+    show_default=True,
+    help="Limit scan to one host config.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+def scan_cmd(from_host: str, json_output: bool) -> None:
+    """List MCP entries discovered across host configs.
+
+    Read-only host-side inventory. Complements ``mms host status``:
+    scan is host-anchored (collection — every host occurrence shown),
+    status is registry-anchored (comparison — one row per registry
+    entry against sidecar baseline). When the same name appears in
+    multiple host configs, scan emits every occurrence; status's
+    first-match-wins is an axis difference, not an inconsistency.
+
+    The ``IN_REGISTRY`` column is a name match only
+    (``cand.name in registry.servers``). A registered entry whose host
+    shape differs still shows ``Yes`` here — shape comparison is
+    delegated to ``mms host status`` (it surfaces shape mismatches as
+    ``changed``).
+
+    Exit code is always 0; this is read-only inspection.
+    """
+    registry = state.load_registry()
+    candidates = discover(from_host, Path.cwd().resolve())
+    rows = _scan_rows(candidates, registry)
+    if json_output:
+        _render_scan_json(rows)
+    else:
+        _render_scan_text(rows, from_host)
