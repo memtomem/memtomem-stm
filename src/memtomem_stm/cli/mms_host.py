@@ -44,15 +44,23 @@ the comparison candidate is chosen by ``baseline.source_label`` match
 first, falling back to first-seen across :data:`ALL_HOSTS`. This keeps
 ``unchanged``/``changed`` stable when the user later mirrors an entry
 into a second host — the import-time host stays the comparison axis.
+
+PR6 added ``mms host sync`` as the write-back counterpart to status's
+read-only inspection. Sync's JSON shape (``mode``/``aborted``/``plan``
+/``summary``) is its own contract independent of status's locked-in
+4-key shape — bucket vocabulary is shared, but the surface that emits
+it is not.
 """
 
 from __future__ import annotations
 
 import json as _json
+import sys
 from pathlib import Path
 
 import click
 
+from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
 from memtomem_stm.mms.import_hosts import ALL_HOSTS, ImportCandidate, discover
@@ -79,9 +87,61 @@ _FOOTER_NO_BASELINE_TEMPLATE = (
 # --from CLAUDE-CODE`` works the same as ``mms import --from CLAUDE-CODE``).
 _SCAN_HOST_CHOICES = click.Choice([*ALL_HOSTS, "all"], case_sensitive=False)
 
+# ---------------------------------------------------------------------------
+# sync UX strings — pinned templates so tests assert against the *symbol*.
+# When W3 ships ``mms host sync --force`` for the ``changed`` bucket, drop
+# the trailing " (W3+)" from ``_SYNC_CHANGED_FOOTER_TEMPLATE``.
+# ---------------------------------------------------------------------------
+
+_SYNC_NO_OP_MSG = "Already synchronized. No changes."
+
+_SYNC_CHANGED_FOOTER_TEMPLATE = (
+    "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge (W3+)."
+)
+
+_SYNC_ORPHAN_NO_BASELINE_FOOTER_TEMPLATE = (
+    "{n} entr{ies_or_y} in registry without baseline and not at any host scan."
+)
+
+_SYNC_REMOVE_PROMPT_HEADER_TEMPLATE = (
+    "The following {n} entr{ies_or_y} will be removed from registry:"
+)
+
+_SYNC_REMOVE_PROMPT_TAIL_TEMPLATE = (
+    "Also: {added} added, {backfilled} backfilled, "
+    "{cleanup} stale sidecar entr{cleanup_ies_or_y} cleaned."
+)
+
+_SYNC_NON_TTY_ABORT_TEMPLATE = (
+    "Refusing to remove {n} registry entr{ies_or_y} non-interactively. Pass --yes to confirm."
+)
+
+_SYNC_DECLINE_MSG = "Aborted. No changes."
+
+# Hint inserted under the ADD bucket (text mode) when any new candidate
+# carries secret env. ``mms host sync`` deliberately does not offer
+# ``--show-imported`` itself — escape hatch is ``mms import --plan
+# --show-imported``. Surface it visibly so users don't grep the docs.
+_SYNC_SHOW_IMPORTED_HINT = (
+    "    (Use `mms import --plan --show-imported` to inspect ADD env values before --apply.)"
+)
+
 
 def _ies_or_y(n: int) -> str:
     return "y" if n == 1 else "ies"
+
+
+def _is_interactive() -> bool:
+    """TTY check for ``sync --apply`` confirmation gating.
+
+    Wrapped as a module-level function so tests can flip the value
+    cleanly via ``monkeypatch.setattr(mms_host, "_is_interactive",
+    ...)``. ``CliRunner`` replaces ``sys.stdin`` with a non-TTY
+    stream, so calling ``sys.stdin.isatty()`` directly inside tests
+    would always read False — which would block the TTY-confirm test
+    paths.
+    """
+    return sys.stdin.isatty()
 
 
 # ---------------------------------------------------------------------------
@@ -438,3 +498,424 @@ def scan_cmd(from_host: str, json_output: bool) -> None:
         _render_scan_json(rows)
     else:
         _render_scan_text(rows, from_host)
+
+
+# ---------------------------------------------------------------------------
+# sync — write-back surface (W2 PR6)
+# ---------------------------------------------------------------------------
+
+
+def _empty_sync_payload() -> dict:
+    """Plan payload skeleton with all keys present + arrays empty.
+
+    Used when an ``--apply`` aborts (TTY decline or non-TTY no-`--yes`)
+    so the JSON shape stays uniform — downstream consumers don't have
+    to special-case missing keys on abort.
+    """
+    return {
+        "add": [],
+        "remove": [],
+        "backfill": [],
+        "cleanup": [],
+        "skipped_changed": [],
+        "orphan_no_baseline": [],
+        "conflicts": [],
+    }
+
+
+def _empty_sync_summary() -> dict:
+    return {
+        "added": 0,
+        "removed": 0,
+        "backfilled": 0,
+        "cleanup": 0,
+        "skipped_changed": 0,
+        "orphan_no_baseline": 0,
+        "unchanged": 0,
+        "conflicts": 0,
+    }
+
+
+def _new_has_secret_env(new: list[ImportCandidate]) -> bool:
+    """True when any ADD candidate has at least one secret-classified env key."""
+    return any(cand.env_classification[k].is_secret for cand in new for k in cand.server.env)
+
+
+def _build_remove_prompt(removed_rows: list[dict], summary: dict) -> str:
+    """Compose the inline confirmation message for the REMOVE bucket.
+
+    Lists every entry by name + ``source_label`` + ``last_imported``
+    so the user gives informed consent without a separate ``--plan``
+    invocation. Tail summarizes the other (non-destructive) buckets so
+    decline cost is visible (``Also: A added, B backfilled, ...``).
+    """
+    n = len(removed_rows)
+    lines = [_SYNC_REMOVE_PROMPT_HEADER_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n))]
+    for row in removed_rows:
+        lines.append(
+            f"  - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})"
+        )
+    lines.append("")
+    lines.append(
+        _SYNC_REMOVE_PROMPT_TAIL_TEMPLATE.format(
+            added=summary["added"],
+            backfilled=summary["backfilled"],
+            cleanup=summary["cleanup"],
+            cleanup_ies_or_y=_ies_or_y(summary["cleanup"]),
+        )
+    )
+    lines.append("")
+    lines.append("Proceed?")
+    return "\n".join(lines)
+
+
+def _render_sync_json(mode: str, plan_payload: dict, summary: dict, *, aborted: bool) -> None:
+    """Emit the locked JSON shape — all keys always present.
+
+    NOTE: ``summary.unchanged`` counts registry names (1 per registry
+    name); ``summary.conflicts`` counts candidate occurrences (1 per
+    candidate; multi-host name with shape divergence → multiple). The
+    two report on different units; downstream tooling that sums them
+    is buggy.
+    """
+    payload = {
+        "mode": mode,
+        "aborted": aborted,
+        "plan": plan_payload,
+        "summary": summary,
+    }
+    click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _render_sync_text(
+    mode: str,
+    plan_payload: dict,
+    summary: dict,
+    *,
+    new: list[ImportCandidate],
+    apply_outcome: str | None = None,
+) -> None:
+    """Default human-readable sync renderer.
+
+    ``mode`` is "plan" or "apply"; ``apply_outcome`` is "no_op",
+    "mutated", or None (None = plan mode). The same bucket sections
+    render in every mode so users see consistent surface; only the
+    final footer changes.
+    """
+    add_rows = plan_payload["add"]
+    remove_rows = plan_payload["remove"]
+    backfill_rows = plan_payload["backfill"]
+    cleanup_rows = plan_payload["cleanup"]
+    conflict_rows = plan_payload["conflicts"]
+
+    def w(s: str) -> None:
+        click.echo(s)
+
+    w("Plan:" if mode == "plan" else "Apply:")
+    if add_rows:
+        n = len(add_rows)
+        w(f"  ADD       {n} entr{_ies_or_y(n)} (new at host)")
+        # Mirror import --plan's per-entry render shape, but always redact.
+        cand_by_name = {c.name: c for c in new}
+        for row in add_rows:
+            cand = cand_by_name[row["name"]]
+            env_summary = _format_env_summary(
+                cand.server, cand.env_classification, show_imported=False
+            )
+            w(
+                f"    - {cand.name} [{cand.source_label}]  "
+                f"command={cand.server.command}  {env_summary}"
+            )
+        if _new_has_secret_env(new):
+            w(_SYNC_SHOW_IMPORTED_HINT)
+    if remove_rows:
+        n = len(remove_rows)
+        w(f"  REMOVE    {n} entr{_ies_or_y(n)} (no longer at any host)")
+        for row in remove_rows:
+            w(f"    - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})")
+    if backfill_rows:
+        n = len(backfill_rows)
+        w(f"  BACKFILL  {n} entr{_ies_or_y(n)} (re-stamp drift baseline)")
+        for row in backfill_rows:
+            w(f"    - {row['name']} [{row['host']}]")
+    if cleanup_rows:
+        n = len(cleanup_rows)
+        w(f"  CLEANUP   {n} stale sidecar entr{_ies_or_y(n)} (no registry entry)")
+        for row in cleanup_rows:
+            w(f"    - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})")
+
+    w("")
+    w(f"  {summary['unchanged']} unchanged")
+
+    if conflict_rows:
+        w("")
+        n = len(conflict_rows)
+        w(f"  Conflicts: {n}  (skipped — first-import-wins)")
+        for row in conflict_rows:
+            w(f"    - {row['name']} from {row['host']}: {row['reason']}")
+
+    n_changed = summary["skipped_changed"]
+    if n_changed:
+        w("")
+        w("  " + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_changed, ies_or_y=_ies_or_y(n_changed)))
+
+    if mode == "plan":
+        w("")
+        w("Run `mms host sync --apply` to execute.")
+    elif apply_outcome == "no_op":
+        w("")
+        w(_SYNC_NO_OP_MSG)
+    elif apply_outcome == "mutated":
+        w("")
+        if summary["added"]:
+            w(
+                f"Wrote {summary['added']} new entr{_ies_or_y(summary['added'])} "
+                f"to {state.registry_path()}"
+            )
+        if summary["removed"]:
+            w(
+                f"Removed {summary['removed']} entr{_ies_or_y(summary['removed'])} "
+                f"from {state.registry_path()}"
+            )
+        if summary["backfilled"]:
+            w(
+                f"Backfilled {summary['backfilled']} sidecar "
+                f"row{'' if summary['backfilled'] == 1 else 's'} "
+                f"in {state.import_state_path()}"
+            )
+        if summary["cleanup"]:
+            w(
+                f"Removed {summary['cleanup']} stale sidecar "
+                f"entr{_ies_or_y(summary['cleanup'])} "
+                f"from {state.import_state_path()}"
+            )
+
+
+def _render_orphan_no_baseline_footer(n: int) -> None:
+    """Surface ``no_baseline`` rows that lack a matched candidate.
+
+    These are non-mutating skips (registry entry exists but neither
+    sidecar nor any host knows about it; sync can't safely act on
+    them). Footer-only — they don't go in the plan payload arrays.
+    """
+    if n:
+        click.echo(
+            "  " + _SYNC_ORPHAN_NO_BASELINE_FOOTER_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n))
+        )
+
+
+@host_group.command("sync")
+@click.option(
+    "--plan/--apply",
+    "is_plan",
+    default=True,
+    help="--plan (default) prints what would change; --apply writes registry + sidecar.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Bypass the confirmation prompt before removing registry entries.",
+)
+def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
+    """Reconcile registry + sidecar with the union of host scans.
+
+    vs ``mms import``:
+      ``mms import`` is the first-time entry point (host → empty/sparse
+      registry; additive only). ``mms host sync`` is the ongoing-
+      reconciliation entry point: it adds entries newly appearing at
+      hosts, removes entries no longer at any host, and stamps
+      baselines that PR2's import-time backfill couldn't cover. The
+      two have overlapping mutations but distinct intents; collapsing
+      them would mask the "first import" vs "drift reconciliation"
+      decision boundary.
+
+    Read-only buckets (see ``mms host status`` for definitions):
+      - ``unchanged``: silent no-op (most common case).
+      - ``changed``: NOT mutated by sync; user must acknowledge via
+        W3+ ``--force``. Surfaces as footer note + ``summary.skipped_changed``.
+
+    Mutating buckets:
+      - ``new`` (host candidate not in registry) → ADD.
+      - ``removed_at_host`` (registry entry absent from every host
+        scan) → REMOVE registry + sidecar entry.
+      - ``no_baseline`` with matched host candidate → BACKFILL sidecar.
+
+    Atomicity: registry write first, sidecar write second. The
+    sidecar is filtered to ``set(import_state.entries) ⊆
+    set(registry.servers)`` so a crash between writes self-heals on
+    the next run (orphan baselines drop; missing baselines BACKFILL).
+
+    With ``--json``, the REMOVE bucket always requires ``--yes`` —
+    a TTY confirmation prompt cannot be answered programmatically by
+    a JSON consumer, and mixing prompt text with JSON output corrupts
+    machine parsing. Without ``--yes``, ``--json`` REMOVE aborts
+    (exit 2) with ``aborted: true`` in the payload.
+
+    See ``mms_import.py`` for the matching docstring at
+    ``import_command``.
+    """
+    cwd = Path.cwd().resolve()
+    candidates = discover("all", cwd)
+    registry = state.load_registry()
+    import_state = state.load_import_state()
+
+    # Two orthogonal classifiers (see Action-bucket matrix in the plan).
+    new, conflicts, _idempotent = _classify_against_registry(candidates, registry)
+    classified = _classify(registry, import_state, candidates)
+    cand_by_name = _select_candidate_by_name(candidates, import_state)
+
+    removed_at_host_rows = [r for r in classified if r["state"] == "removed_at_host"]
+    changed_rows_classified = [r for r in classified if r["state"] == "changed"]
+    no_baseline_rows = [r for r in classified if r["state"] == "no_baseline"]
+    n_unchanged = sum(1 for r in classified if r["state"] == "unchanged")
+
+    no_baseline_with_cand = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is not None]
+    no_baseline_orphans = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is None]
+
+    # Pre-existing orphan sidecar entries: in sidecar but not in registry.
+    # ``_classify`` is registry-anchored and never emits these — detect
+    # separately.
+    cleanup_names = sorted(set(import_state.entries.keys()) - set(registry.servers.keys()))
+
+    plan_payload: dict = {
+        "add": [{"name": c.name, "host": c.source_label} for c in new],
+        "remove": [
+            {
+                "name": r["name"],
+                "baseline_hash": r["baseline_hash"],
+                "source_label": r["source_label"],
+                "last_imported": r["last_imported"],
+            }
+            for r in removed_at_host_rows
+        ],
+        "backfill": [
+            {"name": r["name"], "host": cand_by_name[r["name"]].source_label}
+            for r in no_baseline_with_cand
+        ],
+        "cleanup": [
+            {
+                "name": name,
+                "baseline_hash": import_state.entries[name].drift_hash,
+                "source_label": import_state.entries[name].source_label,
+                "last_imported": import_state.entries[name].last_imported,
+            }
+            for name in cleanup_names
+        ],
+        "skipped_changed": [{"name": r["name"]} for r in changed_rows_classified],
+        # ``orphan_no_baseline``: registry has the entry, sidecar has no
+        # baseline (or version mismatch), and no host scan finds it.
+        # Sync can't safely act — JSON parity with the text footer.
+        "orphan_no_baseline": [{"name": r["name"]} for r in no_baseline_orphans],
+        "conflicts": [
+            {"name": cand.name, "host": cand.source_label, "reason": reason}
+            for cand, reason in conflicts
+        ],
+    }
+    summary = {
+        "added": len(plan_payload["add"]),
+        "removed": len(plan_payload["remove"]),
+        "backfilled": len(plan_payload["backfill"]),
+        "cleanup": len(plan_payload["cleanup"]),
+        "skipped_changed": len(plan_payload["skipped_changed"]),
+        "orphan_no_baseline": len(plan_payload["orphan_no_baseline"]),
+        "unchanged": n_unchanged,
+        "conflicts": len(plan_payload["conflicts"]),
+    }
+
+    if is_plan:
+        if json_output:
+            _render_sync_json("plan", plan_payload, summary, aborted=False)
+        else:
+            _render_sync_text("plan", plan_payload, summary, new=new)
+            _render_orphan_no_baseline_footer(len(no_baseline_orphans))
+        return
+
+    # ----- --apply -----
+
+    # Confirmation gate (only when REMOVE bucket is non-empty).
+    # ``--json`` + REMOVE forces ``--yes``: a TTY prompt cannot be
+    # answered by a JSON consumer, and mixing the prompt text with
+    # JSON output would corrupt machine parsing. So we fall through
+    # to the non-TTY abort path whenever ``--json`` is set, regardless
+    # of the actual TTY status.
+    if removed_at_host_rows and not yes:
+        if not _is_interactive() or json_output:
+            n = len(removed_at_host_rows)
+            click.echo(
+                _SYNC_NON_TTY_ABORT_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n)),
+                err=True,
+            )
+            if json_output:
+                _render_sync_json(
+                    "apply", _empty_sync_payload(), _empty_sync_summary(), aborted=True
+                )
+            sys.exit(2)
+        if not click.confirm(_build_remove_prompt(removed_at_host_rows, summary), default=False):
+            click.echo(_SYNC_DECLINE_MSG, err=True)
+            sys.exit(2)
+
+    # No-op gate. ``cleanup_names`` non-empty counts as a mutation
+    # (orphan sidecar entries get filtered on the next save). Without
+    # this, orphans would never be cleaned up by a "boring" sync and
+    # the post-condition ``sidecar.keys() ⊆ registry.servers.keys()``
+    # would not self-heal.
+    no_mutations = not (new or removed_at_host_rows or no_baseline_with_cand)
+    no_orphans = not cleanup_names
+    if no_mutations and no_orphans:
+        if json_output:
+            _render_sync_json("apply", plan_payload, summary, aborted=False)
+        else:
+            _render_sync_text("apply", plan_payload, summary, new=new, apply_outcome="no_op")
+            _render_orphan_no_baseline_footer(len(no_baseline_orphans))
+        return
+
+    # Step 1: registry write (ADD inserts + REMOVE deletes).
+    registry_changed = bool(new) or bool(removed_at_host_rows)
+    if registry_changed:
+        new_servers = {**registry.servers}
+        for cand in new:
+            new_servers[cand.name] = cand.server
+        for row in removed_at_host_rows:
+            new_servers.pop(row["name"], None)
+        new_registry = state.RegistryConfig(
+            schema_version=registry.schema_version, servers=new_servers
+        )
+        state.save_registry(new_registry)
+    else:
+        new_servers = dict(registry.servers)
+
+    # Step 2: sidecar write. Filter to names surviving in new_servers
+    # (orphan cleanup), then add ADD baselines + BACKFILL stamps. The
+    # filter enforces the post-condition atomically with the rest of
+    # the write; PR2's "registry first, sidecar second" extends here.
+    now = state.utc_now_iso()
+    new_state_entries: dict[str, state.ImportStateEntry] = {}
+    for name, entry in import_state.entries.items():
+        if name in new_servers:
+            new_state_entries[name] = entry
+    for cand in new:
+        new_state_entries[cand.name] = state.ImportStateEntry(
+            drift_hash=compute_drift_hash(cand.server),
+            drift_hash_version=HASH_VERSION,
+            last_imported=now,
+            source_label=cand.source_label,
+        )
+    for row in no_baseline_with_cand:
+        cand_for_row = cand_by_name[row["name"]]
+        new_state_entries[row["name"]] = state.ImportStateEntry(
+            drift_hash=compute_drift_hash(cand_for_row.server),
+            drift_hash_version=HASH_VERSION,
+            last_imported=now,
+            source_label=cand_for_row.source_label,
+        )
+    new_import_state = state.ImportState(
+        schema_version=import_state.schema_version, entries=new_state_entries
+    )
+    state.save_import_state(new_import_state)
+
+    if json_output:
+        _render_sync_json("apply", plan_payload, summary, aborted=False)
+    else:
+        _render_sync_text("apply", plan_payload, summary, new=new, apply_outcome="mutated")
+        _render_orphan_no_baseline_footer(len(no_baseline_orphans))
