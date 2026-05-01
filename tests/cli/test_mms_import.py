@@ -316,6 +316,109 @@ class TestApply:
         assert res3.exit_code == 0, res3.output
         assert "Already up to date" in res3.output
 
+    def test_apply_writes_new_and_backfills_in_one_invocation(self, runner, sandbox):
+        """Mixed path: one ``--apply`` both writes a genuinely new entry
+        AND backfills a sidecar row for an entry already in the registry
+        but missing from the sidecar (pre-PR2 / crash-recovery shape).
+
+        Pins two contracts the empirical smoke test exercised but no unit
+        test had locked:
+        * Output contract — both ``Wrote N new entry`` and
+          ``Backfilled M sidecar row[s]`` lines are emitted in one run.
+        * Single-timestamp invariant holds *across* the new and backfill
+          paths (not just within either alone).
+
+        Note: ``source_label`` provenance under cross-host recovery
+        (original import from host A, recovery via host B) is its own
+        edge case — pinned in
+        ``test_backfill_source_label_uses_current_observing_host``.
+        """
+        # Step 1: first apply registers `existing` via the real scanner —
+        # this is the only reliable way to get a candidate shape that the
+        # subsequent apply will classify as idempotent. (Pre-seeding the
+        # registry directly via ``save_registry`` doesn't work: the host
+        # scanner derives ``prefix`` independently and the shapes diverge,
+        # producing a conflict instead of an idempotent classification.)
+        _seed_claude_code(sandbox, {"existing": {"command": "echo"}})
+        res1 = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res1.exit_code == 0, res1.output
+        assert "existing" in state.load_import_state().entries
+
+        # Step 2: wipe sidecar — simulates crash mid-write or a pre-PR2
+        # registry. Registry intact, sidecar gone.
+        state.import_state_path().unlink()
+
+        # Step 3: host config grows — ``existing`` still there (idempotent
+        # against registry but missing from sidecar → backfill candidate)
+        # AND ``newcomer`` (genuinely new).
+        _seed_claude_code(
+            sandbox,
+            {
+                "existing": {"command": "echo"},
+                "newcomer": {"command": "ls"},
+            },
+        )
+        res2 = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res2.exit_code == 0, res2.output
+
+        # Output contract — both lines present in the same run. Reviewers
+        # care that neither is silently swallowed; ordering is informational.
+        assert "Wrote 1 new entry" in res2.output
+        assert "Backfilled 1 sidecar row" in res2.output
+
+        # Sidecar carries both entries with hashes matching the canonical
+        # implementation.
+        loaded = state.load_import_state()
+        cfg = state.load_registry()
+        assert set(loaded.entries.keys()) == {"existing", "newcomer"}
+        assert set(cfg.servers.keys()) == {"existing", "newcomer"}
+        for name, entry in loaded.entries.items():
+            assert entry.drift_hash == compute_drift_hash(cfg.servers[name])
+            assert entry.drift_hash_version == drift.HASH_VERSION
+            assert entry.source_label == "Claude Code (user)"
+
+        # Single-timestamp invariant — holds across both code paths in one
+        # apply. Production captures ``now`` once at the action boundary;
+        # without this pin a refactor that re-captured for backfill would
+        # still pass the per-entry timestamp window check in #7.
+        assert len({e.last_imported for e in loaded.entries.values()}) == 1
+
+    def test_backfill_source_label_uses_current_observing_host(self, runner, sandbox):
+        """Edge: registry has ``foo`` from an original claude-code import,
+        sidecar is wiped, and by the time recovery runs the user has moved
+        ``foo`` to cursor (claude-code config no longer mentions it). The
+        backfill must stamp the row with **cursor**'s label, not the
+        registry-resident original — the host scanner only sees what's
+        there now, and "original import host" isn't recorded anywhere
+        recoverable. Documented in module docstring; pinned here.
+        """
+        # Step 1: original import via claude-code populates registry+sidecar.
+        _seed_claude_code(sandbox, {"foo": {"command": "echo"}})
+        runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert state.load_import_state().entries["foo"].source_label == "Claude Code (user)"
+
+        # Step 2: wipe sidecar AND remove ``foo`` from claude-code; user
+        # has moved the same MCP definition to cursor.
+        state.import_state_path().unlink()
+        (sandbox["home"] / ".claude.json").write_text(
+            json.dumps({"mcpServers": {}}), encoding="utf-8"
+        )
+        cursor_dir = sandbox["home"] / ".cursor"
+        cursor_dir.mkdir()
+        (cursor_dir / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"foo": {"command": "echo"}}}),
+            encoding="utf-8",
+        )
+
+        # Step 3: recovery via cursor — registry shape matches → idempotent
+        # → backfill. The candidate seen by ``--apply`` is from cursor.
+        res = runner.invoke(import_command, ["--from", "cursor", "--apply"])
+        assert res.exit_code == 0, res.output
+        assert "Backfilled 1 sidecar row" in res.output
+
+        # Source_label reflects the *current* observation, not the original.
+        assert state.load_import_state().entries["foo"].source_label == "Cursor (user)"
+
     def test_apply_preserves_existing_sidecar_entries(self, runner, sandbox):
         """Adding new servers must not overwrite sidecar rows for servers
         that were imported in a previous apply (dict-merge invariant)."""

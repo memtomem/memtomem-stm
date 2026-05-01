@@ -33,6 +33,11 @@ wired apply", which is the only moment the hash can be authoritatively
 computed. Backfill row hashes are byte-equal to what a fresh
 ``--apply`` would compute against the same canonical_form.
 
+Backfill row attribution (``source_label``) reflects the apply that
+observed the entry, not the original import — the host scanner only
+sees what's there now, and "original import host" isn't recorded
+anywhere we can recover from.
+
 Registry write still precedes sidecar write within a single apply;
 no transaction. A ``--force`` option to re-stamp existing sidecar
 rows (resetting timestamps after a host edit you've already
