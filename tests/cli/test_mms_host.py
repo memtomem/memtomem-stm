@@ -1489,6 +1489,29 @@ class TestSyncForcePlan:
         # The key should still appear.
         assert "GITHUB_TOKEN" in res.output
 
+    def test_plan_force_env_value_only_drift_renders_changed_note(self, runner, sandbox):
+        """Edge case: command + args + env keys all match; only env
+        values changed (e.g. token rotation). The diff renderer
+        collapses to a single observable-shape line + an explicit
+        "(env values redacted; values changed)" note so the user knows
+        *something* changed without the values leaking.
+        """
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "env": {"API_KEY": "k1"}},
+            drifted={"command": "npx", "env": {"API_KEY": "k2"}},
+        )
+        res = _sync(runner, "--plan", "--force")
+        assert res.exit_code == 0, res.output
+        # Both values redacted, key visible.
+        assert "k1" not in res.output
+        assert "k2" not in res.output
+        assert "API_KEY" in res.output
+        # The clarifying note fires — user sees *why* re-stamp will run
+        # even though Old/New rows would have looked identical.
+        assert "(env values redacted; values changed)" in res.output
+
 
 class TestSyncForceApply:
     def test_apply_force_yes_re_stamps_registry_and_sidecar(self, runner, sandbox):
@@ -1728,6 +1751,51 @@ class TestSyncForceCrossHostLockdown6:
         assert len(skipped) == 1
         assert skipped[0]["host_relocation"] is False
 
+    def test_json_skipped_changed_does_not_leak_render_only_keys(self, runner, sandbox):
+        """The diff renderer enriches ``changed_rows_classified`` rows
+        in-place with underscore-prefixed keys (``_old_server``,
+        ``_new_server``, ``_new_source_label``). These are
+        render-only — a future refactor that accidentally builds
+        ``plan_payload["skipped_changed"]`` from the enriched rows
+        would silently leak ``RegistryServer`` objects into JSON
+        (TypeError at serialization, or worse, a custom serializer
+        that succeeds and exposes secret env values).
+
+        Pin the invariant explicitly: no key in the JSON
+        ``skipped_changed`` entries starts with ``_``.
+        """
+        # --plan --force triggers the enrichment loop; --json reads
+        # the JSON payload after enrichment ran.
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"], "env": {"API_KEY": "secret"}},
+            drifted={"command": "npx", "args": ["v2"], "env": {"API_KEY": "secret"}},
+        )
+        res = _sync(runner, "--plan", "--force", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        # Force surfaced the entry into RESTAMP, so skipped_changed is
+        # empty in --force mode. Make the leak check robust by also
+        # exercising the no-force path where skipped_changed has rows.
+        for row in payload["plan"]["skipped_changed"]:
+            for key in row:
+                assert not key.startswith("_"), (
+                    f"render-only key {key!r} leaked into JSON: {row}"
+                )
+
+        res2 = _sync(runner, "--plan", "--json")
+        payload2 = json.loads(res2.output)
+        assert len(payload2["plan"]["skipped_changed"]) == 1
+        for row in payload2["plan"]["skipped_changed"]:
+            for key in row:
+                assert not key.startswith("_"), (
+                    f"render-only key {key!r} leaked into JSON: {row}"
+                )
+        # Also assert the secret value didn't leak via any route.
+        assert "secret" not in res.output
+        assert "secret" not in res2.output
+
     def test_apply_force_only_eligible_when_mixed(self, runner, sandbox):
         """Mixed bucket: one in-place drift (eligible) + one cross-host
         drift (ineligible). ``--force`` re-stamps only the eligible one;
@@ -1768,9 +1836,14 @@ class TestSyncForceCrossHostLockdown6:
         # footer fire after we just re-stamped them.
         assert payload["summary"]["skipped_changed"] == 1
 
-    def test_cross_host_footer_renders_in_text_mode(self, runner, sandbox):
-        """Without ``--force``, text-mode CHANGED footer extends with a
-        cross-host sub-line when any shape-relocations exist."""
+    def test_all_cross_host_suppresses_standard_pointer(self, runner, sandbox):
+        """When *every* changed entry is cross-host, the standard
+        "use --force to acknowledge" pointer is wrong — --force won't
+        adopt any of them. Suppress it; render only the cross-host
+        manual-review footer as the primary message. A user reading
+        only the first footer line should walk away with the right
+        action.
+        """
         _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["v1"]}})
         _apply_claude_code(runner)
         _seed_claude_code(sandbox, {})
@@ -1778,10 +1851,37 @@ class TestSyncForceCrossHostLockdown6:
 
         res = _sync(runner, "--plan")
         assert res.exit_code == 0, res.output
-        # Top-line CHANGED footer present.
-        assert "differ in shape at host" in res.output
-        # Cross-host sub-line present.
+        # Standard pointer suppressed.
+        assert "differ in shape at host" not in res.output
+        # Cross-host manual-review footer fires as primary.
         assert "shape-relocated to a different host than baseline source" in res.output
+        assert "manual review" in res.output
+
+    def test_mixed_cross_host_renders_both_pointer_and_subline(self, runner, sandbox):
+        """When changed entries are a *mix* of in-place + cross-host,
+        the standard pointer fires (it helps the in-place subset) and
+        the cross-host sub-line clarifies that --force will skip the
+        relocated subset.
+        """
+        _seed_claude_code(
+            sandbox,
+            {
+                "in_place": {"command": "npx", "args": ["v1"]},
+                "moves": {"command": "npx", "args": ["origA"]},
+            },
+        )
+        _apply_claude_code(runner)
+        # in_place drifts at claude-code; moves shape-relocates to cursor.
+        _seed_claude_code(sandbox, {"in_place": {"command": "npx", "args": ["v2"]}})
+        _seed_cursor_user(sandbox, {"moves": {"command": "npx", "args": ["cursorB"]}})
+
+        res = _sync(runner, "--plan")
+        assert res.exit_code == 0, res.output
+        # Both lines fire.
+        assert "differ in shape at host" in res.output
+        assert "shape-relocated to a different host than baseline source" in res.output
+        # Pointer first (helps the in_place subset), sub-line after.
+        assert res.output.index("differ in shape") < res.output.index("shape-relocated"), res.output
 
     def test_apply_force_does_not_print_changed_footer_for_restamped(
         self, runner, sandbox

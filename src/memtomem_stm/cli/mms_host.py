@@ -593,8 +593,12 @@ def _format_server_diff_lines(row: dict) -> list[str]:
     lines = [f"  - {row['name']}"]
     same_command = old.command == new.command
     same_args = list(old.args or []) == list(new.args or [])
-    same_env = sorted(old.env.keys()) == sorted(new.env.keys())
-    if same_command and same_args and same_env:
+    same_env_keys = sorted(old.env.keys()) == sorted(new.env.keys())
+    # Env values may differ even when keys match (e.g. token rotation).
+    # Treat that as a *visible* drift signal even though the values
+    # themselves stay redacted, so users see *why* re-stamp is firing.
+    same_env_values = old.env == new.env
+    if same_command and same_args and same_env_keys and same_env_values:
         # Edge case: hash differs but every observable surface matches.
         # Fall through to a single-line "unchanged surface" note —
         # users can still re-stamp (e.g. drift_hash_version bump).
@@ -602,6 +606,18 @@ def _format_server_diff_lines(row: dict) -> list[str]:
             f"    command={new.command}  args={list(new.args or [])}  "
             f"env={_format_env_keys_redacted(new)}"
         )
+    elif same_command and same_args and same_env_keys:
+        # Surface looks identical but env values changed (redacted).
+        # Without this branch the "Old:" / "New:" lines would render
+        # twice with the same string — confusing — so collapse to one
+        # line + an explicit "(env values redacted; values changed)"
+        # note. User has informed consent that *something* changed,
+        # without leaking secrets.
+        lines.append(
+            f"    command={new.command}  args={list(new.args or [])}  "
+            f"env={_format_env_keys_redacted(new)}"
+        )
+        lines.append("    (env values redacted; values changed)")
     else:
         lines.append(
             f"    Old: command={old.command}  args={list(old.args or [])}  "
@@ -773,12 +789,15 @@ def _render_sync_text(
     n_skipped = summary["skipped_changed"]
     if n_skipped:
         w("")
-        if force_active:
-            # ``--force`` was set; the only entries left in
-            # skipped_changed are the cross-host slice (eligible got
-            # re-stamped). Use the cross-host footer as the primary
-            # message — the standard "use --force" pointer would be
-            # wrong here since --force already declined to adopt these.
+        # Cross-host primary footer fires when (a) ``--force`` was set
+        # so eligible got re-stamped — the slice left is only cross-
+        # host, OR (b) every changed row is cross-host so the standard
+        # "use --force" pointer is wrong (--force won't help them
+        # anyway). A user reading only the first line should walk away
+        # with the right action — don't lead with "use --force" when
+        # --force won't help.
+        all_skipped_are_cross_host = n_skipped == cross_host_count
+        if force_active or all_skipped_are_cross_host:
             w(
                 "  "
                 + _SYNC_CROSS_HOST_FOOTER_TEMPLATE.format(
@@ -786,9 +805,9 @@ def _render_sync_text(
                 )
             )
         else:
-            # No --force. Standard "use --force" pointer + optional
-            # cross-host sub-line so users know --force won't help
-            # those.
+            # Mixed (some in-place that --force could help). Standard
+            # "use --force" pointer + cross-host sub-line so users
+            # know --force won't help that subset.
             w(
                 "  "
                 + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_skipped, ies_or_y=_ies_or_y(n_skipped))
@@ -1047,11 +1066,14 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
     # the live ``RegistryServer`` references the prompt + plan-mode
     # RESTAMP section need — kept off the JSON payload (underscore-
     # prefixed keys are an in-process convention for "render-only").
-    for row in restamp_eligible_rows:
-        cand = cand_by_name[row["name"]]
-        row["_old_server"] = registry.servers[row["name"]]
-        row["_new_server"] = cand.server
-        row["_new_source_label"] = cand.source_label
+    # Guarded by ``force`` so non-force runs don't quietly mutate
+    # ``changed_rows_classified`` dicts that the renderer never reads.
+    if force:
+        for row in restamp_eligible_rows:
+            cand = cand_by_name[row["name"]]
+            row["_old_server"] = registry.servers[row["name"]]
+            row["_new_server"] = cand.server
+            row["_new_source_label"] = cand.source_label
 
     if is_plan:
         if json_output:
