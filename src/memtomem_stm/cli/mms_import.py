@@ -39,9 +39,9 @@ sees what's there now, and "original import host" isn't recorded
 anywhere we can recover from.
 
 Registry write still precedes sidecar write within a single apply;
-no transaction. A ``--force`` option to re-stamp existing sidecar
-rows (resetting timestamps after a host edit you've already
-acknowledged) lands in W3+.
+no transaction. To re-stamp existing sidecar rows (after a host edit
+you've already acknowledged), use ``mms host sync --force`` — the
+ongoing-reconciliation entry point, not ``mms import``.
 
 vs ``mms host sync``:
   ``mms import`` is the first-time entry point (host → empty

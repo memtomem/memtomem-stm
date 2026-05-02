@@ -7,8 +7,8 @@ PR3 landed the read-only inspection command; PR4 promoted
   drift buckets relative to the W2 sidecar baseline, and surface the
   result either as a human table or ``--json``.
 
-The bucket vocabulary is the contract that W3+ (``--force`` re-stamp,
-``mms host scan``, ``mms host sync``) builds on. PR3 froze the four
+The bucket vocabulary is the contract that ``mms host scan``,
+``mms host sync``, and ``mms host sync --force`` build on. PR3 froze the four
 state names; PR4 changed *where* ``removed_at_host`` renders without
 renaming anything. JSON shape and footer text are backwards-compat
 anchors and stayed frozen across PR4.
@@ -89,14 +89,28 @@ _SCAN_HOST_CHOICES = click.Choice([*ALL_HOSTS, "all"], case_sensitive=False)
 
 # ---------------------------------------------------------------------------
 # sync UX strings — pinned templates so tests assert against the *symbol*.
-# When W3 ships ``mms host sync --force`` for the ``changed`` bucket, drop
-# the trailing " (W3+)" from ``_SYNC_CHANGED_FOOTER_TEMPLATE``.
 # ---------------------------------------------------------------------------
 
 _SYNC_NO_OP_MSG = "Already synchronized. No changes."
 
 _SYNC_CHANGED_FOOTER_TEMPLATE = (
-    "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge (W3+)."
+    "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge."
+)
+
+# Cross-host drift footer (Lock-down 6). Used in two contexts:
+#   - Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when ``--force``
+#     is *not* set and some changed entries are cross-host (so users
+#     know ``--force`` won't help these).
+#   - Standalone footer when ``--force`` *is* set and only cross-host
+#     entries remain in ``skipped_changed`` (the eligible subset got
+#     re-stamped, so the original "use --force" footer would be wrong).
+# ``--force`` deliberately skips cross-host entries because adopting a
+# Pass-2 fallback candidate would silently relocate the entry's
+# host-of-record — exactly the failure the W2 PR6 "no silent reshape"
+# contract guards.
+_SYNC_CROSS_HOST_FOOTER_TEMPLATE = (
+    "{n} entr{ies_or_y} shape-relocated to a different host than baseline source — "
+    "`--force` will not adopt these (manual review via `mms host status`)."
 )
 
 _SYNC_ORPHAN_NO_BASELINE_FOOTER_TEMPLATE = (
@@ -107,13 +121,17 @@ _SYNC_REMOVE_PROMPT_HEADER_TEMPLATE = (
     "The following {n} entr{ies_or_y} will be removed from registry:"
 )
 
+_SYNC_RESTAMP_PROMPT_HEADER_TEMPLATE = (
+    "The following {n} entr{ies_or_y} will be re-stamped (registry shape updated to current host):"
+)
+
 _SYNC_REMOVE_PROMPT_TAIL_TEMPLATE = (
     "Also: {added} added, {backfilled} backfilled, "
     "{cleanup} stale sidecar entr{cleanup_ies_or_y} cleaned."
 )
 
 _SYNC_NON_TTY_ABORT_TEMPLATE = (
-    "Refusing to remove {n} registry entr{ies_or_y} non-interactively. Pass --yes to confirm."
+    "Refusing to apply {n} registry mutation{s_suffix} non-interactively. Pass --yes to confirm."
 )
 
 _SYNC_DECLINE_MSG = "Aborted. No changes."
@@ -129,6 +147,11 @@ _SYNC_SHOW_IMPORTED_HINT = (
 
 def _ies_or_y(n: int) -> str:
     return "y" if n == 1 else "ies"
+
+
+def _s_suffix(n: int) -> str:
+    """Plural helper for words like ``mutation`` (no -y/-ies vowel shift)."""
+    return "" if n == 1 else "s"
 
 
 def _is_interactive() -> bool:
@@ -531,6 +554,7 @@ def _empty_sync_summary() -> dict:
         "cleanup": 0,
         "skipped_changed": 0,
         "orphan_no_baseline": 0,
+        "restamped": 0,
         "unchanged": 0,
         "conflicts": 0,
     }
@@ -541,21 +565,111 @@ def _new_has_secret_env(new: list[ImportCandidate]) -> bool:
     return any(cand.env_classification[k].is_secret for cand in new for k in cand.server.env)
 
 
-def _build_remove_prompt(removed_rows: list[dict], summary: dict) -> str:
-    """Compose the inline confirmation message for the REMOVE bucket.
+def _format_env_keys_redacted(server: state.RegistryServer) -> str:
+    """Render env as ``{key1, key2, ...}`` with keys sorted (diff-stable).
+
+    Values redacted; ``mms host sync --force`` confirmation must show
+    *what changed* without leaking secrets. Sorted ordering ensures
+    two semantically-identical env dicts don't appear "different" just
+    because their insertion order differs across host scanners.
+    """
+    if not server.env:
+        return "{}"
+    return "{" + ", ".join(sorted(server.env.keys())) + "}"
+
+
+def _format_server_diff_lines(row: dict) -> list[str]:
+    """Render Old/New shape for one re-stamp entry.
+
+    Identical fields collapse to a single line so the prompt stays
+    readable. Env values are redacted (key set only); ``command`` and
+    ``args`` render verbatim. ``row`` carries the in-process keys
+    ``_old_server`` and ``_new_server`` (excluded from the JSON
+    payload — see ``sync_cmd``).
+    """
+    old: state.RegistryServer = row["_old_server"]
+    new: state.RegistryServer = row["_new_server"]
+    new_source = row["_new_source_label"]
+    lines = [f"  - {row['name']}"]
+    same_command = old.command == new.command
+    same_args = list(old.args or []) == list(new.args or [])
+    same_env_keys = sorted(old.env.keys()) == sorted(new.env.keys())
+    # Env values may differ even when keys match (e.g. token rotation).
+    # Treat that as a *visible* drift signal even though the values
+    # themselves stay redacted, so users see *why* re-stamp is firing.
+    same_env_values = old.env == new.env
+    if same_command and same_args and same_env_keys and same_env_values:
+        # Edge case: hash differs but every observable surface matches.
+        # Fall through to a single-line "unchanged surface" note —
+        # users can still re-stamp (e.g. drift_hash_version bump).
+        lines.append(
+            f"    command={new.command}  args={list(new.args or [])}  "
+            f"env={_format_env_keys_redacted(new)}"
+        )
+    elif same_command and same_args and same_env_keys:
+        # Surface looks identical but env values changed (redacted).
+        # Without this branch the "Old:" / "New:" lines would render
+        # twice with the same string — confusing — so collapse to one
+        # line + an explicit "(env values redacted; values changed)"
+        # note. User has informed consent that *something* changed,
+        # without leaking secrets.
+        lines.append(
+            f"    command={new.command}  args={list(new.args or [])}  "
+            f"env={_format_env_keys_redacted(new)}"
+        )
+        lines.append("    (env values redacted; values changed)")
+    else:
+        lines.append(
+            f"    Old: command={old.command}  args={list(old.args or [])}  "
+            f"env={_format_env_keys_redacted(old)}"
+        )
+        lines.append(
+            f"    New: command={new.command}  args={list(new.args or [])}  "
+            f"env={_format_env_keys_redacted(new)}"
+        )
+    lines.append(f"    Source: {new_source}")
+    return lines
+
+
+def _build_apply_prompt(
+    removed_rows: list[dict],
+    restamp_rows: list[dict],
+    summary: dict,
+) -> str:
+    """Compose the inline confirmation message for ``--apply`` mutations.
 
     Lists every entry by name + ``source_label`` + ``last_imported``
     so the user gives informed consent without a separate ``--plan``
     invocation. Tail summarizes the other (non-destructive) buckets so
     decline cost is visible (``Also: A added, B backfilled, ...``).
+
+    Section order is intentional: REMOVE first (most destructive — entry
+    disappears from registry), RESTAMP second (entry shape changes but
+    name persists), summary tail last (additive buckets). Destructive-
+    first lets users review the most reversibility-critical changes
+    before fatigue. PRs that want to reorder must justify against this.
+
+    ``restamp_rows`` is empty when ``--force`` is absent; the RE-STAMP
+    section is skipped entirely. The W3 ``--force`` apply path fills it
+    after the Lock-down 6 cross-host partition drops shape-relocated
+    entries (re-stamping a candidate from a non-baseline host would
+    silently relocate the entry's host-of-record).
     """
-    n = len(removed_rows)
-    lines = [_SYNC_REMOVE_PROMPT_HEADER_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n))]
-    for row in removed_rows:
-        lines.append(
-            f"  - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})"
-        )
-    lines.append("")
+    lines: list[str] = []
+    if removed_rows:
+        n = len(removed_rows)
+        lines.append(_SYNC_REMOVE_PROMPT_HEADER_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n)))
+        for row in removed_rows:
+            lines.append(
+                f"  - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})"
+            )
+        lines.append("")
+    if restamp_rows:
+        n = len(restamp_rows)
+        lines.append(_SYNC_RESTAMP_PROMPT_HEADER_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n)))
+        for row in restamp_rows:
+            lines.extend(_format_server_diff_lines(row))
+        lines.append("")
     lines.append(
         _SYNC_REMOVE_PROMPT_TAIL_TEMPLATE.format(
             added=summary["added"],
@@ -593,6 +707,9 @@ def _render_sync_text(
     summary: dict,
     *,
     new: list[ImportCandidate],
+    restamp_rows: list[dict] | None = None,
+    cross_host_count: int = 0,
+    force_active: bool = False,
     apply_outcome: str | None = None,
 ) -> None:
     """Default human-readable sync renderer.
@@ -601,12 +718,21 @@ def _render_sync_text(
     "mutated", or None (None = plan mode). The same bucket sections
     render in every mode so users see consistent surface; only the
     final footer changes.
+
+    ``restamp_rows`` (W3 ``--force``) renders as a RESTAMP section
+    with an old/new diff per entry. Empty list (or default ``None``)
+    skips the section. ``cross_host_count`` is the size of the
+    Lock-down 6 cross-host partition; ``force_active`` flips the
+    changed-bucket footer wording — without ``--force`` we point at
+    ``--force`` as the remedy, with ``--force`` we point at manual
+    review (``--force`` deliberately doesn't help cross-host).
     """
     add_rows = plan_payload["add"]
     remove_rows = plan_payload["remove"]
     backfill_rows = plan_payload["backfill"]
     cleanup_rows = plan_payload["cleanup"]
     conflict_rows = plan_payload["conflicts"]
+    restamp_rows = restamp_rows or []
 
     def w(s: str) -> None:
         click.echo(s)
@@ -643,6 +769,12 @@ def _render_sync_text(
         w(f"  CLEANUP   {n} stale sidecar entr{_ies_or_y(n)} (no registry entry)")
         for row in cleanup_rows:
             w(f"    - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})")
+    if restamp_rows:
+        n = len(restamp_rows)
+        w(f"  RESTAMP   {n} entr{_ies_or_y(n)} (registry shape updated to current host)")
+        for row in restamp_rows:
+            for line in _format_server_diff_lines(row):
+                w(line)
 
     w("")
     w(f"  {summary['unchanged']} unchanged")
@@ -654,10 +786,39 @@ def _render_sync_text(
         for row in conflict_rows:
             w(f"    - {row['name']} from {row['host']}: {row['reason']}")
 
-    n_changed = summary["skipped_changed"]
-    if n_changed:
+    n_skipped = summary["skipped_changed"]
+    if n_skipped:
         w("")
-        w("  " + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_changed, ies_or_y=_ies_or_y(n_changed)))
+        # Cross-host primary footer fires when (a) ``--force`` was set
+        # so eligible got re-stamped — the slice left is only cross-
+        # host, OR (b) every changed row is cross-host so the standard
+        # "use --force" pointer is wrong (--force won't help them
+        # anyway). A user reading only the first line should walk away
+        # with the right action — don't lead with "use --force" when
+        # --force won't help.
+        all_skipped_are_cross_host = n_skipped == cross_host_count
+        if force_active or all_skipped_are_cross_host:
+            w(
+                "  "
+                + _SYNC_CROSS_HOST_FOOTER_TEMPLATE.format(
+                    n=n_skipped, ies_or_y=_ies_or_y(n_skipped)
+                )
+            )
+        else:
+            # Mixed (some in-place that --force could help). Standard
+            # "use --force" pointer + cross-host sub-line so users
+            # know --force won't help that subset.
+            w(
+                "  "
+                + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_skipped, ies_or_y=_ies_or_y(n_skipped))
+            )
+            if cross_host_count:
+                w(
+                    "  "
+                    + _SYNC_CROSS_HOST_FOOTER_TEMPLATE.format(
+                        n=cross_host_count, ies_or_y=_ies_or_y(cross_host_count)
+                    )
+                )
 
     if mode == "plan":
         w("")
@@ -689,6 +850,11 @@ def _render_sync_text(
                 f"entr{_ies_or_y(summary['cleanup'])} "
                 f"from {state.import_state_path()}"
             )
+        if summary["restamped"]:
+            w(
+                f"Re-stamped {summary['restamped']} entr{_ies_or_y(summary['restamped'])} "
+                f"(registry + sidecar) — {state.registry_path()}, {state.import_state_path()}"
+            )
 
 
 def _render_orphan_no_baseline_footer(n: int) -> None:
@@ -715,9 +881,19 @@ def _render_orphan_no_baseline_footer(n: int) -> None:
 @click.option(
     "--yes",
     is_flag=True,
-    help="Bypass the confirmation prompt before removing registry entries.",
+    help="Bypass the confirmation prompt before applying mutations.",
 )
-def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Adopt host shape for entries flagged 'changed' (registry + sidecar). "
+        "Skips entries that have shape-relocated to a different host than the "
+        "baseline source. Orthogonal to --yes (which bypasses the confirmation "
+        "prompt)."
+    ),
+)
+def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
     """Reconcile registry + sidecar with the union of host scans.
 
     vs ``mms import``:
@@ -732,25 +908,42 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
 
     Read-only buckets (see ``mms host status`` for definitions):
       - ``unchanged``: silent no-op (most common case).
-      - ``changed``: NOT mutated by sync; user must acknowledge via
-        W3+ ``--force``. Surfaces as footer note + ``summary.skipped_changed``.
+      - ``changed``: non-mutating without ``--force``; user must
+        acknowledge via ``--force`` to adopt the host shape. Surfaces
+        as footer note + ``summary.skipped_changed``.
 
     Mutating buckets:
       - ``new`` (host candidate not in registry) → ADD.
       - ``removed_at_host`` (registry entry absent from every host
         scan) → REMOVE registry + sidecar entry.
       - ``no_baseline`` with matched host candidate → BACKFILL sidecar.
+      - ``changed`` (with ``--force``) → RESTAMP registry + sidecar
+        with current host shape. Lock-down 6: re-stamp candidate must
+        come from the baseline source host. Cross-host (Pass-2)
+        candidates are excluded — re-stamping from a non-baseline host
+        would silently relocate the entry's host-of-record. Excluded
+        entries surface in the extended CHANGED footer for manual
+        review (``mms host status``).
+
+    ``--force`` and ``--yes`` are orthogonal:
+      - ``--force`` activates the ``changed`` bucket as a mutator
+        (without it, ``changed`` stays non-mutating).
+      - ``--yes`` bypasses the interactive confirmation prompt.
+      ``--force`` alone still prompts; ``--force --yes`` is the
+      non-interactive combination. ``--force --json`` without
+      ``--yes`` aborts (exit 2, ``aborted: true``) — same gate REMOVE
+      uses, since mixing prompt text with JSON corrupts parsing.
 
     Atomicity: registry write first, sidecar write second. The
     sidecar is filtered to ``set(import_state.entries) ⊆
     set(registry.servers)`` so a crash between writes self-heals on
     the next run (orphan baselines drop; missing baselines BACKFILL).
 
-    With ``--json``, the REMOVE bucket always requires ``--yes`` —
-    a TTY confirmation prompt cannot be answered programmatically by
-    a JSON consumer, and mixing prompt text with JSON output corrupts
-    machine parsing. Without ``--yes``, ``--json`` REMOVE aborts
-    (exit 2) with ``aborted: true`` in the payload.
+    With ``--json``, REMOVE and RESTAMP both require ``--yes`` — a TTY
+    confirmation prompt cannot be answered programmatically by a JSON
+    consumer, and mixing prompt text with JSON output corrupts machine
+    parsing. Without ``--yes``, ``--json`` aborts (exit 2) with
+    ``aborted: true`` in the payload.
 
     See ``mms_import.py`` for the matching docstring at
     ``import_command``.
@@ -772,6 +965,25 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
 
     no_baseline_with_cand = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is not None]
     no_baseline_orphans = [r for r in no_baseline_rows if cand_by_name.get(r["name"]) is None]
+
+    # Lock-down 6: partition ``changed`` by candidate host. Only entries
+    # whose Pass-1 candidate matches the baseline source are valid
+    # ``--force`` re-stamp targets; Pass-2 fallbacks to a different host
+    # would silently relocate the entry's host-of-record (see
+    # ``_select_candidate_by_name`` doc + W3 plan §Lock-down 6). The
+    # cross-host slice surfaces as a sub-line in the CHANGED footer so
+    # users can review via ``mms host status`` instead of having
+    # ``--force`` adopt a non-baseline shape.
+    restamp_eligible_rows = [
+        r
+        for r in changed_rows_classified
+        if cand_by_name[r["name"]].source_label == r["source_label"]
+    ]
+    cross_host_changed_rows = [
+        r
+        for r in changed_rows_classified
+        if cand_by_name[r["name"]].source_label != r["source_label"]
+    ]
 
     # Pre-existing orphan sidecar entries: in sidecar but not in registry.
     # ``_classify`` is registry-anchored and never emits these — detect
@@ -802,7 +1014,30 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             }
             for name in cleanup_names
         ],
-        "skipped_changed": [{"name": r["name"]} for r in changed_rows_classified],
+        # ``skipped_changed`` lists changed entries that this run does
+        # *not* re-stamp. Without ``--force``, that's every changed
+        # entry (the bucket stays non-mutating per W2 PR6). With
+        # ``--force``, only the cross-host slice remains skipped — the
+        # eligible subset moves to RESTAMP. Counting both would
+        # double-report and make the "use ``--force`` to acknowledge"
+        # footer fire even after we just re-stamped them.
+        #
+        # Gains 5 fields in W3 (was minimal ``{"name": ...}`` in PR6).
+        # Existing downstream parsers reading ``[i]["name"]`` keep
+        # working — additive change at the entry-field level, not a
+        # new top-level key. ``host_relocation`` flags the Lock-down 6
+        # cross-host partition.
+        "skipped_changed": [
+            {
+                "name": r["name"],
+                "source_label": r["source_label"],
+                "baseline_hash": r["baseline_hash"],
+                "current_hash": r["current_hash"],
+                "last_imported": r["last_imported"],
+                "host_relocation": (cand_by_name[r["name"]].source_label != r["source_label"]),
+            }
+            for r in (cross_host_changed_rows if force else changed_rows_classified)
+        ],
         # ``orphan_no_baseline``: registry has the entry, sidecar has no
         # baseline (or version mismatch), and no host scan finds it.
         # Sync can't safely act — JSON parity with the text footer.
@@ -812,6 +1047,8 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             for cand, reason in conflicts
         ],
     }
+    # ``restamped`` always present (default 0); incremented only on
+    # ``--apply --force`` over baseline-source-matched entries.
     summary = {
         "added": len(plan_payload["add"]),
         "removed": len(plan_payload["remove"]),
@@ -819,31 +1056,60 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
         "cleanup": len(plan_payload["cleanup"]),
         "skipped_changed": len(plan_payload["skipped_changed"]),
         "orphan_no_baseline": len(plan_payload["orphan_no_baseline"]),
+        "restamped": len(restamp_eligible_rows) if force else 0,
         "unchanged": n_unchanged,
         "conflicts": len(plan_payload["conflicts"]),
     }
+
+    # In-process row enrichment for the diff renderer (Lock-down 2).
+    # ``_old_server`` / ``_new_server`` / ``_new_source_label`` carry
+    # the live ``RegistryServer`` references the prompt + plan-mode
+    # RESTAMP section need — kept off the JSON payload (underscore-
+    # prefixed keys are an in-process convention for "render-only").
+    # Guarded by ``force`` so non-force runs don't quietly mutate
+    # ``changed_rows_classified`` dicts that the renderer never reads.
+    if force:
+        for row in restamp_eligible_rows:
+            cand = cand_by_name[row["name"]]
+            row["_old_server"] = registry.servers[row["name"]]
+            row["_new_server"] = cand.server
+            row["_new_source_label"] = cand.source_label
 
     if is_plan:
         if json_output:
             _render_sync_json("plan", plan_payload, summary, aborted=False)
         else:
-            _render_sync_text("plan", plan_payload, summary, new=new)
+            _render_sync_text(
+                "plan",
+                plan_payload,
+                summary,
+                new=new,
+                restamp_rows=restamp_eligible_rows if force else [],
+                cross_host_count=len(cross_host_changed_rows),
+                force_active=force,
+            )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
         return
 
     # ----- --apply -----
 
-    # Confirmation gate (only when REMOVE bucket is non-empty).
-    # ``--json`` + REMOVE forces ``--yes``: a TTY prompt cannot be
-    # answered by a JSON consumer, and mixing the prompt text with
-    # JSON output would corrupt machine parsing. So we fall through
-    # to the non-TTY abort path whenever ``--json`` is set, regardless
-    # of the actual TTY status.
-    if removed_at_host_rows and not yes:
+    # ``--force`` activates the ``changed`` bucket as a mutator
+    # (Lock-down 3). The cross-host slice (Lock-down 6) is excluded —
+    # surfaced in the CHANGED footer for manual review only.
+    restamp_rows = restamp_eligible_rows if force else []
+
+    # Confirmation gate (REMOVE or RESTAMP non-empty).
+    # ``--json`` + any destructive bucket forces ``--yes``: a TTY prompt
+    # cannot be answered by a JSON consumer, and mixing prompt text with
+    # JSON output would corrupt machine parsing. So we fall through to
+    # the non-TTY abort path whenever ``--json`` is set, regardless of
+    # the actual TTY status.
+    needs_confirmation = bool(removed_at_host_rows) or bool(restamp_rows)
+    if needs_confirmation and not yes:
         if not _is_interactive() or json_output:
-            n = len(removed_at_host_rows)
+            n_total = len(removed_at_host_rows) + len(restamp_rows)
             click.echo(
-                _SYNC_NON_TTY_ABORT_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n)),
+                _SYNC_NON_TTY_ABORT_TEMPLATE.format(n=n_total, s_suffix=_s_suffix(n_total)),
                 err=True,
             )
             if json_output:
@@ -851,7 +1117,10 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
                     "apply", _empty_sync_payload(), _empty_sync_summary(), aborted=True
                 )
             sys.exit(2)
-        if not click.confirm(_build_remove_prompt(removed_at_host_rows, summary), default=False):
+        if not click.confirm(
+            _build_apply_prompt(removed_at_host_rows, restamp_rows, summary),
+            default=False,
+        ):
             click.echo(_SYNC_DECLINE_MSG, err=True)
             sys.exit(2)
 
@@ -860,24 +1129,43 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
     # this, orphans would never be cleaned up by a "boring" sync and
     # the post-condition ``sidecar.keys() ⊆ registry.servers.keys()``
     # would not self-heal.
-    no_mutations = not (new or removed_at_host_rows or no_baseline_with_cand)
+    no_mutations = not (new or removed_at_host_rows or no_baseline_with_cand or restamp_rows)
     no_orphans = not cleanup_names
     if no_mutations and no_orphans:
         if json_output:
             _render_sync_json("apply", plan_payload, summary, aborted=False)
         else:
-            _render_sync_text("apply", plan_payload, summary, new=new, apply_outcome="no_op")
+            _render_sync_text(
+                "apply",
+                plan_payload,
+                summary,
+                new=new,
+                restamp_rows=restamp_rows,
+                cross_host_count=len(cross_host_changed_rows),
+                force_active=force,
+                apply_outcome="no_op",
+            )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
         return
 
-    # Step 1: registry write (ADD inserts + REMOVE deletes).
-    registry_changed = bool(new) or bool(removed_at_host_rows)
+    # Step 1: registry write (ADD inserts + REMOVE deletes + RESTAMP
+    # replacements). Sequential passes, single ``save_registry`` —
+    # cross-bucket name collision is impossible by construction (RESTAMP
+    # rows require registry membership AND a host candidate; REMOVE
+    # requires no candidate; ADD requires no registry membership).
+    registry_changed = bool(new) or bool(removed_at_host_rows) or bool(restamp_rows)
     if registry_changed:
         new_servers = {**registry.servers}
         for cand in new:
             new_servers[cand.name] = cand.server
         for row in removed_at_host_rows:
             new_servers.pop(row["name"], None)
+        # RESTAMP: replace the existing registry entry with the candidate's
+        # server. Lock-down 1 (full reconciliation): registry shape adopts
+        # the host's shape. Lock-down 6 has already filtered cross-host
+        # candidates out of ``restamp_rows`` upstream.
+        for row in restamp_rows:
+            new_servers[row["name"]] = cand_by_name[row["name"]].server
         new_registry = state.RegistryConfig(
             schema_version=registry.schema_version, servers=new_servers
         )
@@ -886,9 +1174,10 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
         new_servers = dict(registry.servers)
 
     # Step 2: sidecar write. Filter to names surviving in new_servers
-    # (orphan cleanup), then add ADD baselines + BACKFILL stamps. The
-    # filter enforces the post-condition atomically with the rest of
-    # the write; PR2's "registry first, sidecar second" extends here.
+    # (orphan cleanup), then add ADD baselines + BACKFILL stamps + RESTAMP
+    # refreshes. The filter enforces the post-condition atomically with
+    # the rest of the write; PR2's "registry first, sidecar second"
+    # extends here.
     now = state.utc_now_iso()
     new_state_entries: dict[str, state.ImportStateEntry] = {}
     for name, entry in import_state.entries.items():
@@ -909,6 +1198,14 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
             last_imported=now,
             source_label=cand_for_row.source_label,
         )
+    for row in restamp_rows:
+        cand_for_row = cand_by_name[row["name"]]
+        new_state_entries[row["name"]] = state.ImportStateEntry(
+            drift_hash=compute_drift_hash(cand_for_row.server),
+            drift_hash_version=HASH_VERSION,
+            last_imported=now,
+            source_label=cand_for_row.source_label,
+        )
     new_import_state = state.ImportState(
         schema_version=import_state.schema_version, entries=new_state_entries
     )
@@ -917,5 +1214,14 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool) -> None:
     if json_output:
         _render_sync_json("apply", plan_payload, summary, aborted=False)
     else:
-        _render_sync_text("apply", plan_payload, summary, new=new, apply_outcome="mutated")
+        _render_sync_text(
+            "apply",
+            plan_payload,
+            summary,
+            new=new,
+            restamp_rows=restamp_rows,
+            cross_host_count=len(cross_host_changed_rows),
+            force_active=force,
+            apply_outcome="mutated",
+        )
         _render_orphan_no_baseline_footer(len(no_baseline_orphans))
