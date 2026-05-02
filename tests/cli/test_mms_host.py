@@ -825,6 +825,7 @@ class TestSyncPlan:
             "cleanup": 0,
             "skipped_changed": 0,
             "orphan_no_baseline": 0,
+            "restamped": 0,
             "unchanged": 1,
             "conflicts": 0,
         }
@@ -1291,6 +1292,7 @@ class TestSyncJsonShape:
         "cleanup",
         "skipped_changed",
         "orphan_no_baseline",
+        "restamped",
         "unchanged",
         "conflicts",
     }
@@ -1421,3 +1423,348 @@ class TestSyncContractPin:
         from memtomem_stm.cli import mms_import
 
         assert "mms host sync" in (mms_import.__doc__ or "")
+
+
+# ---------------------------------------------------------------------------
+# sync --force — re-stamp surface (W3)
+# ---------------------------------------------------------------------------
+
+
+def _drift_changed(sandbox, runner, *, original: dict, drifted: dict, name: str = "x") -> None:
+    """Helper: import ``original`` from claude-code, then mutate host
+    config to ``drifted`` so the entry surfaces as ``changed`` on the
+    next sync.
+    """
+    _seed_claude_code(sandbox, {name: original})
+    _apply_claude_code(runner)
+    _seed_claude_code(sandbox, {name: drifted})
+
+
+class TestSyncForcePlan:
+    def test_plan_force_renders_restamp_section_with_diff(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner, "--plan", "--force")
+        assert res.exit_code == 0, res.output
+        # RESTAMP section header.
+        assert "RESTAMP" in res.output
+        # Diff renderer shows old/new args.
+        assert "v1" in res.output
+        assert "v2" in res.output
+        assert "Old:" in res.output
+        assert "New:" in res.output
+
+    def test_plan_force_no_changed_renders_no_restamp_section(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+        # No drift — `changed` bucket empty, RESTAMP must NOT render
+        # even with --force.
+        res = _sync(runner, "--plan", "--force")
+        assert res.exit_code == 0, res.output
+        assert "RESTAMP" not in res.output
+
+    def test_plan_force_diff_redacts_secret_env_values(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "env": {"GITHUB_TOKEN": "ghp_old"}},
+            drifted={"command": "npx", "env": {"GITHUB_TOKEN": "ghp_new"}},
+        )
+        res = _sync(runner, "--plan", "--force")
+        assert res.exit_code == 0, res.output
+        # Secret values must NOT leak in either Old or New.
+        assert "ghp_old" not in res.output
+        assert "ghp_new" not in res.output
+        # The key should still appear.
+        assert "GITHUB_TOKEN" in res.output
+
+
+class TestSyncForceApply:
+    def test_apply_force_yes_re_stamps_registry_and_sidecar(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        original_baseline = state.load_import_state().entries["x"].drift_hash
+
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 0, res.output
+
+        # Registry adopted host shape (Lock-down 1).
+        assert list(state.load_registry().servers["x"].args) == ["v2"]
+        # Sidecar baseline refreshed.
+        new_baseline = state.load_import_state().entries["x"].drift_hash
+        assert new_baseline != original_baseline
+        # And matches current canonical hash.
+        from memtomem_stm.mms.drift import compute_drift_hash
+
+        assert new_baseline == compute_drift_hash(state.load_registry().servers["x"])
+
+    def test_apply_no_force_does_not_mutate_changed(self, runner, sandbox):
+        """Lock-down 3 sibling: without ``--force``, ``changed`` stays
+        non-mutating even on ``--apply``."""
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        original_baseline = state.load_import_state().entries["x"].drift_hash
+        original_shape = state.load_registry().servers["x"]
+
+        res = _sync(runner, "--apply", "--yes")
+        assert res.exit_code == 0, res.output
+        # Both registry and sidecar untouched.
+        assert state.load_registry().servers["x"] == original_shape
+        assert state.load_import_state().entries["x"].drift_hash == original_baseline
+
+    def test_apply_force_no_changed_is_no_op(self, runner, sandbox):
+        """``--apply --force`` with empty ``changed`` and no other
+        mutations → no-op message, exit 0."""
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}})
+        _apply_claude_code(runner)
+
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 0, res.output
+        assert "Already synchronized" in res.output
+
+    def test_apply_force_summary_emits_restamped_count(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner, "--apply", "--force", "--yes", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["summary"]["restamped"] == 1
+        # Default-0 invariant for non-force runs is pinned by
+        # ``TestSyncJsonShape._SUMMARY_KEYS`` + the no-op test in
+        # TestSyncPlan.
+
+    def test_apply_force_no_force_keeps_restamped_zero(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        # Without --force, restamped stays 0 even when changed > 0.
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert payload["summary"]["restamped"] == 0
+        assert payload["summary"]["skipped_changed"] == 1
+
+
+class TestSyncForceConfirmation:
+    def test_apply_force_prompts_in_tty_and_declines(self, runner, sandbox, monkeypatch):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        original_shape = state.load_registry().servers["x"]
+        _force_tty(monkeypatch)
+
+        res = _sync(runner, "--apply", "--force", input="n\n")
+        assert res.exit_code == 2, res.output
+        assert "Aborted" in res.output
+        # No mutation on decline.
+        assert state.load_registry().servers["x"] == original_shape
+
+    def test_apply_force_non_tty_aborts_without_yes(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        original_shape = state.load_registry().servers["x"]
+
+        res = _sync(runner, "--apply", "--force")
+        assert res.exit_code == 2, res.output
+        assert "--yes" in res.output
+        assert state.load_registry().servers["x"] == original_shape
+
+    def test_apply_force_json_without_yes_aborts_with_payload(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner, "--apply", "--force", "--json")
+        assert res.exit_code == 2, res.output
+        # Output is stderr abort message + JSON payload (CliRunner
+        # mixes streams). Locate the JSON payload bounds — same
+        # pattern as the REMOVE-only abort tests.
+        text = res.output
+        start = text.find("{")
+        end = text.rfind("}")
+        payload = json.loads(text[start : end + 1])
+        assert payload["aborted"] is True
+        assert payload["mode"] == "apply"
+
+    def test_apply_force_yes_bypasses_prompt(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        # --yes alongside --force skips confirmation entirely.
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 0, res.output
+        assert list(state.load_registry().servers["x"].args) == ["v2"]
+
+    def test_apply_force_combined_remove_and_restamp_single_prompt(
+        self, runner, sandbox, monkeypatch
+    ):
+        """REMOVE + RESTAMP both pending → one combined prompt with
+        REMOVE section before RESTAMP section (Lock-down 2 / MEDIUM 3
+        section order)."""
+        _seed_claude_code(
+            sandbox,
+            {
+                "to_remove": {"command": "npx"},
+                "to_restamp": {"command": "npx", "args": ["v1"]},
+            },
+        )
+        _apply_claude_code(runner)
+        # Drop ``to_remove`` (REMOVE) and mutate ``to_restamp`` (RESTAMP).
+        _seed_claude_code(sandbox, {"to_restamp": {"command": "npx", "args": ["v2"]}})
+
+        captured = {"prompt": ""}
+        import click as _click_mod
+
+        def spy_confirm(text, *args, **kwargs):
+            captured["prompt"] = text
+            return False
+
+        monkeypatch.setattr(_click_mod, "confirm", spy_confirm)
+        _force_tty(monkeypatch)
+
+        res = _sync(runner, "--apply", "--force")
+        assert res.exit_code == 2, res.output
+        prompt = captured["prompt"]
+        # Both sections present.
+        assert "removed from registry" in prompt
+        assert "re-stamped" in prompt
+        # Section order: REMOVE first (most destructive), RESTAMP second.
+        # Pin the relative order so future PRs that flip them must
+        # justify against the Lock-down 2 anchor.
+        assert prompt.index("removed from registry") < prompt.index("re-stamped"), prompt
+
+
+class TestSyncForceCrossHostLockdown6:
+    def test_apply_force_does_not_re_stamp_cross_host_drift(
+        self, runner, sandbox
+    ):
+        """Lock-down 6 BLOCKER: baseline source = claude-code; only
+        cursor has the entry now; ``--force`` MUST NOT adopt cursor's
+        shape. The entry stays in the changed bucket; registry +
+        sidecar unchanged.
+        """
+        # Step 1: import shared from claude-code (baseline).
+        _seed_claude_code(sandbox, {"shared": {"command": "npx", "args": ["claude-args"]}})
+        _apply_claude_code(runner)
+        original_shape = state.load_registry().servers["shared"]
+        original_hash = state.load_import_state().entries["shared"].drift_hash
+
+        # Step 2: drop from claude-code, add to cursor with a different shape.
+        _seed_claude_code(sandbox, {})
+        _seed_cursor_user(sandbox, {"shared": {"command": "npx", "args": ["cursor-args"]}})
+
+        # --apply --force --yes: still must NOT replace registry shape.
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 0, res.output
+        assert state.load_registry().servers["shared"] == original_shape
+        assert state.load_import_state().entries["shared"].drift_hash == original_hash
+
+    def test_skipped_changed_payload_marks_host_relocation(self, runner, sandbox):
+        """Lock-down 6 JSON shape: cross-host drift → ``host_relocation:
+        true``; in-place drift → ``host_relocation: false``."""
+        # Cross-host drift case.
+        _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["v1"]}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+        _seed_cursor_user(sandbox, {"x": {"command": "npx", "args": ["v2"]}})
+
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        skipped = payload["plan"]["skipped_changed"]
+        assert len(skipped) == 1
+        assert skipped[0]["name"] == "x"
+        assert skipped[0]["host_relocation"] is True
+
+    def test_skipped_changed_in_place_drift_host_relocation_false(self, runner, sandbox):
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner, "--plan", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        skipped = payload["plan"]["skipped_changed"]
+        assert len(skipped) == 1
+        assert skipped[0]["host_relocation"] is False
+
+    def test_apply_force_only_eligible_when_mixed(self, runner, sandbox):
+        """Mixed bucket: one in-place drift (eligible) + one cross-host
+        drift (ineligible). ``--force`` re-stamps only the eligible one;
+        cross-host stays in skipped_changed."""
+        _seed_claude_code(
+            sandbox,
+            {
+                "in_place": {"command": "npx", "args": ["v1"]},
+                "moves": {"command": "npx", "args": ["origA"]},
+            },
+        )
+        _apply_claude_code(runner)
+
+        # in_place drifts at claude-code; moves disappears from claude-
+        # code and re-appears at cursor with a different shape.
+        _seed_claude_code(sandbox, {"in_place": {"command": "npx", "args": ["v2"]}})
+        _seed_cursor_user(sandbox, {"moves": {"command": "npx", "args": ["cursorB"]}})
+
+        original_moves_shape = state.load_registry().servers["moves"]
+
+        res = _sync(runner, "--apply", "--force", "--yes", "--json")
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+
+        # Eligible re-stamped.
+        assert payload["summary"]["restamped"] == 1
+        assert list(state.load_registry().servers["in_place"].args) == ["v2"]
+
+        # Cross-host untouched, still in skipped_changed.
+        assert state.load_registry().servers["moves"] == original_moves_shape
+        skipped_names = {row["name"] for row in payload["plan"]["skipped_changed"]}
+        assert "moves" in skipped_names
+
+    def test_cross_host_footer_renders_in_text_mode(self, runner, sandbox):
+        """Text-mode CHANGED footer extends with a sub-line when any
+        cross-host shape-relocations exist."""
+        _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["v1"]}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+        _seed_cursor_user(sandbox, {"x": {"command": "npx", "args": ["v2"]}})
+
+        res = _sync(runner, "--plan")
+        assert res.exit_code == 0, res.output
+        # Top-line CHANGED footer present.
+        assert "differ in shape at host" in res.output
+        # Cross-host sub-line present.
+        assert "different host than baseline source" in res.output
