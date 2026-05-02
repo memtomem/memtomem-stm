@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ProxyConfig.default_compression` is now read** (#292) — the field was previously declared but never consulted by `_resolve_tool_config`, so an operator who set `default_compression: selective` in `stm_proxy.json` saw no effect on any upstream — every server fell back to `UpstreamServerConfig.compression`'s own AUTO default. Resolution now uses `UpstreamServerConfig.model_fields_set` to distinguish "operator omitted compression" (→ honour the global default) from "operator explicitly typed `compression: auto`" (→ honour their explicit choice). The `model_fields_set` approach is load-bearing because `compression` has no None sentinel; a plain default-equality check would silently override a user's explicit `compression: auto` when the global is something else. Behavior change: configs that already set `default_compression` but had no per-server `compression:` keys now flip those servers to the global default. Configs that did not set `default_compression` keep the unchanged AUTO behavior. Four regression tests in `test_default_compression_fallback.py` pin all four corners (default+omit / default+explicit-auto / global+omit / global+explicit).
+
 ## [0.1.22] — 2026-05-02
 
 This release lands the full **mms host-config management surface** (RFC v0.3 Workstreams 1–3) — `mms project`, `mms import`, and the `mms host` subgroup (`status`/`scan`/`sync`). Together they form the read→reconcile→write-back loop for keeping host MCP configs in sync with the mms registry.
