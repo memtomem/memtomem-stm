@@ -7,8 +7,8 @@ PR3 landed the read-only inspection command; PR4 promoted
   drift buckets relative to the W2 sidecar baseline, and surface the
   result either as a human table or ``--json``.
 
-The bucket vocabulary is the contract that W3+ (``--force`` re-stamp,
-``mms host scan``, ``mms host sync``) builds on. PR3 froze the four
+The bucket vocabulary is the contract that ``mms host scan``,
+``mms host sync``, and ``mms host sync --force`` build on. PR3 froze the four
 state names; PR4 changed *where* ``removed_at_host`` renders without
 renaming anything. JSON shape and footer text are backwards-compat
 anchors and stayed frozen across PR4.
@@ -89,14 +89,12 @@ _SCAN_HOST_CHOICES = click.Choice([*ALL_HOSTS, "all"], case_sensitive=False)
 
 # ---------------------------------------------------------------------------
 # sync UX strings — pinned templates so tests assert against the *symbol*.
-# When W3 ships ``mms host sync --force`` for the ``changed`` bucket, drop
-# the trailing " (W3+)" from ``_SYNC_CHANGED_FOOTER_TEMPLATE``.
 # ---------------------------------------------------------------------------
 
 _SYNC_NO_OP_MSG = "Already synchronized. No changes."
 
 _SYNC_CHANGED_FOOTER_TEMPLATE = (
-    "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge (W3+)."
+    "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge."
 )
 
 # Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when any of those
@@ -864,8 +862,8 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
     Read-only buckets (see ``mms host status`` for definitions):
       - ``unchanged``: silent no-op (most common case).
       - ``changed``: non-mutating without ``--force``; user must
-        acknowledge via ``mms host sync --force`` to adopt the host
-        shape. Surfaces as footer note + ``summary.skipped_changed``.
+        acknowledge via ``--force`` to adopt the host shape. Surfaces
+        as footer note + ``summary.skipped_changed``.
 
     Mutating buckets:
       - ``new`` (host candidate not in registry) → ADD.

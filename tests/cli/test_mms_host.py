@@ -868,10 +868,13 @@ class TestSyncPlan:
 
         res = _sync(runner, "--plan")
         assert res.exit_code == 0, res.output
-        # The W3+ pointer footer fires when ``changed`` count > 0.
+        # The pointer footer fires when ``changed`` count > 0 and now
+        # references a real flag (W3 shipped ``--force``).
         assert "differ in shape at host" in res.output
         assert "mms host sync --force" in res.output
-        assert "(W3+)" in res.output
+        # The ``(W3+)`` qualifier is gone — `--force` is now a real
+        # working flag, not a future promise.
+        assert "(W3+)" not in res.output
 
     def test_plan_orphan_no_baseline_footer(self, runner, sandbox):
         """no_baseline + no matched candidate → footer surfaces it.
@@ -978,9 +981,10 @@ class TestSyncApply:
         assert sidecar.entries["x"].drift_hash_version == HASH_VERSION
 
     def test_apply_changed_not_re_stamped(self, runner, sandbox):
-        """Lock-down 3: ``changed`` is NOT mutated by sync. The sidecar
-        baseline_hash stays at the original value; W3+ ``--force`` is
-        the only writer.
+        """Lock-down 3: without ``--force``, ``changed`` is NOT mutated
+        by sync. The sidecar baseline_hash stays at the original value;
+        ``--force`` is the only writer (pinned by
+        ``TestSyncForceApply.test_apply_force_yes_re_stamps_registry_and_sidecar``).
         """
         _seed_claude_code(sandbox, {"a": {"command": "npx", "args": ["v1"]}})
         _apply_claude_code(runner)
@@ -1152,7 +1156,10 @@ class TestSyncApply:
         then A drops X and a different host B picks up X with a new
         shape. ``_classify`` Pass 2 fallback finds B's X → state =
         ``changed`` (NOT ``removed_at_host``). Sync MUST NOT replace
-        the registry shape; user acknowledges via W3+ ``--force``.
+        the registry shape; user can acknowledge via ``--force`` only
+        when the candidate matches the baseline source — see W3
+        Lock-down 6 + ``TestSyncForceCrossHostLockdown6`` for the
+        ``--force`` behavior on cross-host drift.
         """
         # Step 1: import shared from claude-code (becomes baseline).
         _seed_claude_code(sandbox, {"shared": {"command": "npx", "args": ["claude-args"]}})
