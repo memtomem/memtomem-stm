@@ -97,14 +97,20 @@ _SYNC_CHANGED_FOOTER_TEMPLATE = (
     "{n} entr{ies_or_y} differ in shape at host. Use `mms host sync --force` to acknowledge."
 )
 
-# Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when any of those
-# changed entries are shape-relocated to a non-baseline host (Lock-down
-# 6). ``--force`` deliberately skips these because adopting a Pass-2
-# fallback candidate would silently relocate the entry's host-of-record
-# — exactly the failure the W2 PR6 "no silent reshape" contract guards.
+# Cross-host drift footer (Lock-down 6). Used in two contexts:
+#   - Sub-line under ``_SYNC_CHANGED_FOOTER_TEMPLATE`` when ``--force``
+#     is *not* set and some changed entries are cross-host (so users
+#     know ``--force`` won't help these).
+#   - Standalone footer when ``--force`` *is* set and only cross-host
+#     entries remain in ``skipped_changed`` (the eligible subset got
+#     re-stamped, so the original "use --force" footer would be wrong).
+# ``--force`` deliberately skips cross-host entries because adopting a
+# Pass-2 fallback candidate would silently relocate the entry's
+# host-of-record — exactly the failure the W2 PR6 "no silent reshape"
+# contract guards.
 _SYNC_CROSS_HOST_FOOTER_TEMPLATE = (
-    "{n} of those entr{ies_or_y} appear at a different host than baseline source — "
-    "`--force` will skip these (manual review via `mms host status`)."
+    "{n} entr{ies_or_y} shape-relocated to a different host than baseline source — "
+    "`--force` will not adopt these (manual review via `mms host status`)."
 )
 
 _SYNC_ORPHAN_NO_BASELINE_FOOTER_TEMPLATE = (
@@ -687,6 +693,7 @@ def _render_sync_text(
     new: list[ImportCandidate],
     restamp_rows: list[dict] | None = None,
     cross_host_count: int = 0,
+    force_active: bool = False,
     apply_outcome: str | None = None,
 ) -> None:
     """Default human-readable sync renderer.
@@ -698,9 +705,11 @@ def _render_sync_text(
 
     ``restamp_rows`` (W3 ``--force``) renders as a RESTAMP section
     with an old/new diff per entry. Empty list (or default ``None``)
-    skips the section. ``cross_host_count`` extends the CHANGED footer
-    with a sub-line when the Lock-down 6 partition flagged any
-    shape-relocated entries.
+    skips the section. ``cross_host_count`` is the size of the
+    Lock-down 6 cross-host partition; ``force_active`` flips the
+    changed-bucket footer wording — without ``--force`` we point at
+    ``--force`` as the remedy, with ``--force`` we point at manual
+    review (``--force`` deliberately doesn't help cross-host).
     """
     add_rows = plan_payload["add"]
     remove_rows = plan_payload["remove"]
@@ -761,17 +770,36 @@ def _render_sync_text(
         for row in conflict_rows:
             w(f"    - {row['name']} from {row['host']}: {row['reason']}")
 
-    n_changed = summary["skipped_changed"]
-    if n_changed:
+    n_skipped = summary["skipped_changed"]
+    if n_skipped:
         w("")
-        w("  " + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_changed, ies_or_y=_ies_or_y(n_changed)))
-        if cross_host_count:
+        if force_active:
+            # ``--force`` was set; the only entries left in
+            # skipped_changed are the cross-host slice (eligible got
+            # re-stamped). Use the cross-host footer as the primary
+            # message — the standard "use --force" pointer would be
+            # wrong here since --force already declined to adopt these.
             w(
                 "  "
                 + _SYNC_CROSS_HOST_FOOTER_TEMPLATE.format(
-                    n=cross_host_count, ies_or_y=_ies_or_y(cross_host_count)
+                    n=n_skipped, ies_or_y=_ies_or_y(n_skipped)
                 )
             )
+        else:
+            # No --force. Standard "use --force" pointer + optional
+            # cross-host sub-line so users know --force won't help
+            # those.
+            w(
+                "  "
+                + _SYNC_CHANGED_FOOTER_TEMPLATE.format(n=n_skipped, ies_or_y=_ies_or_y(n_skipped))
+            )
+            if cross_host_count:
+                w(
+                    "  "
+                    + _SYNC_CROSS_HOST_FOOTER_TEMPLATE.format(
+                        n=cross_host_count, ies_or_y=_ies_or_y(cross_host_count)
+                    )
+                )
 
     if mode == "plan":
         w("")
@@ -967,13 +995,19 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
             }
             for name in cleanup_names
         ],
-        # ``skipped_changed`` is registry-anchored and gains 5 fields
-        # in W3 (was minimal ``{"name": ...}`` in PR6). Existing
-        # downstream parsers reading ``[i]["name"]`` keep working —
-        # this is an *additive* change at the entry-field level, not a
+        # ``skipped_changed`` lists changed entries that this run does
+        # *not* re-stamp. Without ``--force``, that's every changed
+        # entry (the bucket stays non-mutating per W2 PR6). With
+        # ``--force``, only the cross-host slice remains skipped — the
+        # eligible subset moves to RESTAMP. Counting both would
+        # double-report and make the "use ``--force`` to acknowledge"
+        # footer fire even after we just re-stamped them.
+        #
+        # Gains 5 fields in W3 (was minimal ``{"name": ...}`` in PR6).
+        # Existing downstream parsers reading ``[i]["name"]`` keep
+        # working — additive change at the entry-field level, not a
         # new top-level key. ``host_relocation`` flags the Lock-down 6
-        # cross-host partition: ``True`` when the only host candidate
-        # is at a non-baseline source (``--force`` will skip these).
+        # cross-host partition.
         "skipped_changed": [
             {
                 "name": r["name"],
@@ -983,7 +1017,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
                 "last_imported": r["last_imported"],
                 "host_relocation": (cand_by_name[r["name"]].source_label != r["source_label"]),
             }
-            for r in changed_rows_classified
+            for r in (cross_host_changed_rows if force else changed_rows_classified)
         ],
         # ``orphan_no_baseline``: registry has the entry, sidecar has no
         # baseline (or version mismatch), and no host scan finds it.
@@ -1030,6 +1064,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
                 new=new,
                 restamp_rows=restamp_eligible_rows if force else [],
                 cross_host_count=len(cross_host_changed_rows),
+                force_active=force,
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
         return
@@ -1085,6 +1120,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
                 new=new,
                 restamp_rows=restamp_rows,
                 cross_host_count=len(cross_host_changed_rows),
+                force_active=force,
                 apply_outcome="no_op",
             )
             _render_orphan_no_baseline_footer(len(no_baseline_orphans))
@@ -1163,6 +1199,7 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
             new=new,
             restamp_rows=restamp_rows,
             cross_host_count=len(cross_host_changed_rows),
+            force_active=force,
             apply_outcome="mutated",
         )
         _render_orphan_no_baseline_footer(len(no_baseline_orphans))

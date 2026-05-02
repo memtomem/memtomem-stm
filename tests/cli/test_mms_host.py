@@ -1731,7 +1731,9 @@ class TestSyncForceCrossHostLockdown6:
     def test_apply_force_only_eligible_when_mixed(self, runner, sandbox):
         """Mixed bucket: one in-place drift (eligible) + one cross-host
         drift (ineligible). ``--force`` re-stamps only the eligible one;
-        cross-host stays in skipped_changed."""
+        cross-host stays in skipped_changed; in-place is removed from
+        skipped_changed (it was just re-stamped, no longer 'skipped').
+        """
         _seed_claude_code(
             sandbox,
             {
@@ -1759,11 +1761,16 @@ class TestSyncForceCrossHostLockdown6:
         # Cross-host untouched, still in skipped_changed.
         assert state.load_registry().servers["moves"] == original_moves_shape
         skipped_names = {row["name"] for row in payload["plan"]["skipped_changed"]}
-        assert "moves" in skipped_names
+        assert skipped_names == {"moves"}, skipped_names
+        # Smoke-discovered fix: in-place must NOT be reported as
+        # 'skipped' once --force has re-stamped it. Counting both in
+        # skipped_changed would make the "use --force to acknowledge"
+        # footer fire after we just re-stamped them.
+        assert payload["summary"]["skipped_changed"] == 1
 
     def test_cross_host_footer_renders_in_text_mode(self, runner, sandbox):
-        """Text-mode CHANGED footer extends with a sub-line when any
-        cross-host shape-relocations exist."""
+        """Without ``--force``, text-mode CHANGED footer extends with a
+        cross-host sub-line when any shape-relocations exist."""
         _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["v1"]}})
         _apply_claude_code(runner)
         _seed_claude_code(sandbox, {})
@@ -1774,4 +1781,46 @@ class TestSyncForceCrossHostLockdown6:
         # Top-line CHANGED footer present.
         assert "differ in shape at host" in res.output
         # Cross-host sub-line present.
-        assert "different host than baseline source" in res.output
+        assert "shape-relocated to a different host than baseline source" in res.output
+
+    def test_apply_force_does_not_print_changed_footer_for_restamped(
+        self, runner, sandbox
+    ):
+        """Smoke-discovered fix: after ``--force --apply`` re-stamps an
+        entry, the "differ in shape at host. Use --force to acknowledge."
+        footer must NOT fire for it. The footer's ``--force`` pointer
+        would be misleading — the entry is already re-stamped.
+        """
+        _drift_changed(
+            sandbox,
+            runner,
+            original={"command": "npx", "args": ["v1"]},
+            drifted={"command": "npx", "args": ["v2"]},
+        )
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 0, res.output
+        # The standard "differ" pointer footer must NOT fire — the
+        # only entry in changed bucket got re-stamped.
+        assert "differ in shape at host" not in res.output
+        assert "use `mms host sync --force` to acknowledge" not in res.output.lower()
+
+    def test_apply_force_prints_cross_host_only_footer_when_only_cross_host_left(
+        self, runner, sandbox
+    ):
+        """When ``--force --apply`` only had cross-host entries to deal
+        with (no eligible re-stamps), the changed-bucket footer renders
+        as the cross-host manual-review message — not the standard
+        ``--force`` pointer (which is wrong for cross-host)."""
+        _seed_claude_code(sandbox, {"x": {"command": "npx", "args": ["v1"]}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {})
+        _seed_cursor_user(sandbox, {"x": {"command": "npx", "args": ["v2"]}})
+
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 0, res.output
+        # Standard pointer suppressed — --force already declined to
+        # adopt cross-host candidates.
+        assert "differ in shape at host" not in res.output
+        # Cross-host manual-review footer fires instead.
+        assert "shape-relocated to a different host than baseline source" in res.output
+        assert "manual review" in res.output
