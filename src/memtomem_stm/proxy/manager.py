@@ -54,6 +54,7 @@ from memtomem_stm.proxy.memory_ops import (
     extract_and_store,
     format_fact_md,
 )
+from memtomem_stm.proxy.privacy import DEFAULT_PATTERNS as PRIVACY_DEFAULT_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
@@ -634,7 +635,16 @@ class ProxyManager:
                     # concurrent config swap can't re-bind ``self._llm_compressor``
                     # before we read ``.last_fallback`` below.
                     compressor = self._llm_compressor
-                result = await compressor.compress(text, max_chars=max_chars)
+                # #289: scan for API keys / JWT / private keys before sending
+                # the response to the LLM provider. Default-on; operators
+                # disable per-config when the upstream is known sensitive-free
+                # or the provider is local/trusted.
+                privacy_patterns = (
+                    PRIVACY_DEFAULT_PATTERNS if llm_cfg.privacy_scan_enabled else None
+                )
+                result = await compressor.compress(
+                    text, max_chars=max_chars, privacy_patterns=privacy_patterns
+                )
                 return result, compressor.last_fallback
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",

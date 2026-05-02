@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **LLM compression now scans for sensitive content before sending the response to the provider** (#289) — `LLMCompressorConfig` gains `privacy_scan_enabled: bool = True`, and `ProxyManager._apply_compression` passes `proxy/privacy.py` `DEFAULT_PATTERNS` (API keys, JWT, password assignments, AWS keys, GitHub/Slack tokens, PEM private keys) into `LLMCompressor.compress()` whenever the operator picks `compression: llm_summary`. On a hit, the compressor short-circuits to `TruncateCompressor` with `last_fallback="privacy"` instead of an outbound call. Default-on so flipping `compression: llm_summary` is safe without remembering a second knob; opt out per `llm_summary` config when the upstream is known sensitive-free or the provider is local/trusted (e.g. self-hosted Ollama). The privacy module and the wiring point on `LLMCompressor.compress()` already existed (per the non-standard `base_url` warning) — this PR closes the missing wire-in step in `_apply_compression`. Two regression tests pin both directions: enabled + sensitive content asserts `_call_api` is never reached and `last_fallback == "privacy"`; disabled asserts `_call_api` is reached.
+
 ## [0.1.22] — 2026-05-02
 
 This release lands the full **mms host-config management surface** (RFC v0.3 Workstreams 1–3) — `mms project`, `mms import`, and the `mms host` subgroup (`status`/`scan`/`sync`). Together they form the read→reconcile→write-back loop for keeping host MCP configs in sync with the mms registry.
