@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Surfacing adapter heals MCP session after outer-timeout cancellation** (#290) — `SurfacingEngine.surface()` wraps the LTM call in `asyncio.wait_for(..., timeout=...)`. When that outer timeout fires, the inner `mem_search` `call_tool` is cancelled mid-RPC and the MCP session is left in a half-read state. The adapter's existing `_TRANSPORT_ERRORS` tuple deliberately does not catch `asyncio.CancelledError` (cooperative cancellation must propagate so `wait_for` can surface its `TimeoutError`), so a cancelled call previously left the session unhealthy with no recovery path — the next surfacing cycle would hang or see out-of-order responses on the same stream. `McpClientSearchAdapter` now sets a `_needs_reconnect` flag in `except asyncio.CancelledError` and re-raises; the next call to `search()` / `increment_access()` / `scratch_list()` calls a new `_heal_if_needed()` helper that lazily reconnects before issuing the fresh RPC. If the lazy reconnect itself fails, the call returns empty (matching the existing `_session is None` path) and the flag is preserved so a later attempt can retry. Five regression tests in `test_mcp_client_reconnect.py::TestOuterCancellationLazyReconnect` pin the round-trip: `wait_for` cancellation marks the flag (search / increment_access / scratch_list each separately), the next call lazy-reconnects exactly once and clears the flag, and a failing heal returns empty without clearing the flag.
+
 ## [0.1.22] — 2026-05-02
 
 This release lands the full **mms host-config management surface** (RFC v0.3 Workstreams 1–3) — `mms project`, `mms import`, and the `mms host` subgroup (`status`/`scan`/`sync`). Together they form the read→reconcile→write-back loop for keeping host MCP configs in sync with the mms registry.

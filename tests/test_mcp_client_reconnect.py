@@ -387,3 +387,113 @@ class TestTextNoneTolerance:
 
         results, _ = await adapter.search("test query")
         assert results == []
+
+
+# ── Outer wait_for cancellation (#290) ──────────────────────────────────
+
+
+class TestOuterCancellationLazyReconnect:
+    """``SurfacingEngine`` wraps adapter calls in ``asyncio.wait_for``. When the
+    outer timeout fires, the inner ``call_tool`` is cancelled mid-RPC and the
+    MCP session is left in a half-read state. ``_TRANSPORT_ERRORS`` must NOT
+    catch ``CancelledError`` (cooperative cancellation must propagate), but
+    the next adapter call must heal the connection lazily before issuing a
+    fresh RPC — otherwise the next surfacing cycle hangs or sees out-of-order
+    responses on the same stream."""
+
+    @pytest.mark.asyncio
+    async def test_mid_rpc_cancellation_marks_for_reconnect(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        async def hang(*_args, **_kwargs):
+            # Never returns on its own — outer wait_for must cancel us.
+            await asyncio.sleep(10)
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=hang)
+        adapter._session = mock_session
+        adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        # Flag set so the next caller heals the session before issuing an RPC.
+        assert adapter._needs_reconnect is True
+        # The cancellation alone does not synchronously trigger reconnect —
+        # heal is lazy on the next call.
+        adapter._reconnect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_next_call_lazy_reconnects_after_cancellation(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        adapter._needs_reconnect = True  # simulate prior cancellation
+
+        compact_output = "[1] 0.90 | [default] note.md\nhealed result\n"
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=_result_with_text(compact_output))
+        adapter._session = mock_session
+        adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
+
+        results, _ = await adapter.search("q")
+
+        adapter._reconnect.assert_awaited_once()
+        assert adapter._needs_reconnect is False
+        assert len(results) == 1
+        assert "healed result" in results[0].chunk.content
+
+    @pytest.mark.asyncio
+    async def test_failed_lazy_reconnect_returns_empty_and_keeps_flag(self):
+        """If the heal itself fails, the call returns empty (matching the
+        ``_session is None`` path) and the flag stays so a future call can
+        try again — the adapter must not get stuck pretending it's healthy."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        adapter._needs_reconnect = True
+
+        mock_session = AsyncMock()
+        adapter._session = mock_session
+        adapter._reconnect = AsyncMock(side_effect=ConnectionError("still down"))  # type: ignore[method-assign]
+
+        results, hints = await adapter.search("q")
+
+        assert results == []
+        assert hints == []
+        # Flag preserved so a later call retries the heal rather than
+        # silently accepting the broken state.
+        assert adapter._needs_reconnect is True
+        # call_tool was never reached because heal failed.
+        mock_session.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_increment_access_cancellation_marks_for_reconnect(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        async def hang(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=hang)
+        adapter._session = mock_session
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                adapter.increment_access(["chunk-1"]),
+                timeout=0.05,
+            )
+
+        assert adapter._needs_reconnect is True
+
+    @pytest.mark.asyncio
+    async def test_scratch_list_cancellation_marks_for_reconnect(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        async def hang(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=hang)
+        adapter._session = mock_session
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.scratch_list(), timeout=0.05)
+
+        assert adapter._needs_reconnect is True
