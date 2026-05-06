@@ -109,11 +109,24 @@ class TestAtomicWriteText:
         stop = threading.Event()
 
         def reader():
-            while not stop.is_set():
-                try:
-                    seen.append(target.read_text(encoding="utf-8"))
-                except FileNotFoundError:
-                    pass
+            # On Windows, `os.replace()` opens a brief sharing-violation window
+            # where the reader's `open()` is denied even though the file exists.
+            # Catch `PermissionError` at the *outer* level — i.e. let the first
+            # violation cleanly stop the reader — rather than swallowing it in
+            # the inner loop. Continuing the read loop hammers the file and
+            # starves the writer's P1d (#307) retry budget (10 × 5 ms), which
+            # then surfaces as a real test failure. Voluntarily standing down
+            # preserves the test's invariant (every observed sample is one of
+            # the two complete payloads) without producing an unhandled-thread
+            # warning at teardown.
+            try:
+                while not stop.is_set():
+                    try:
+                        seen.append(target.read_text(encoding="utf-8"))
+                    except FileNotFoundError:
+                        pass
+            except PermissionError:
+                pass
 
         t = threading.Thread(target=reader)
         t.start()
