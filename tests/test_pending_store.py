@@ -37,7 +37,10 @@ class TestInMemoryPendingStore:
         sel = _make_selection()
         original_time = sel.created_at
         store.put("k1", sel)
-        time.sleep(0.01)
+        # Windows time.monotonic() falls back to GetTickCount64 with ~15.6 ms
+        # resolution; sleep at least one tick + headroom so the second sample
+        # is guaranteed to advance.
+        time.sleep(0.05)
         store.touch("k1")
         assert store.get("k1").created_at > original_time
 
