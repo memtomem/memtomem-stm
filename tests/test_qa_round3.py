@@ -164,7 +164,7 @@ class TestParseResultsRegex:
 class TestDocsToolCount:
     def test_cli_md_has_11_tools(self):
         cli_md = Path(__file__).parent.parent / "docs" / "cli.md"
-        content = cli_md.read_text()
+        content = cli_md.read_text(encoding="utf-8")
         assert "11 + proxied" in content
         assert "stm_proxy_health" in content
         assert "stm_compression_feedback" in content
@@ -173,7 +173,7 @@ class TestDocsToolCount:
 
     def test_readme_has_11_tools(self):
         readme = Path(__file__).parent.parent / "README.md"
-        content = readme.read_text()
+        content = readme.read_text(encoding="utf-8")
         assert "11 MCP tools" in content
 
 
@@ -428,7 +428,7 @@ class TestCacheStatsLock:
 class TestCompressionDocsFlowchart:
     def test_selective_not_in_auto_flowchart(self):
         doc = Path(__file__).parent.parent / "docs" / "compression.md"
-        content = doc.read_text()
+        content = doc.read_text(encoding="utf-8")
         # The flowchart should not show selective as an auto-selection target
         lines = content.split("\n")
         in_flowchart = False
@@ -442,7 +442,7 @@ class TestCompressionDocsFlowchart:
 
     def test_note_mentions_selective_opt_in(self):
         doc = Path(__file__).parent.parent / "docs" / "compression.md"
-        content = doc.read_text()
+        content = doc.read_text(encoding="utf-8")
         assert "selective" in content.lower()
         assert "opt-in" in content.lower() or "never" in content.lower()
 
@@ -456,7 +456,7 @@ class TestFeedbackTrackerPosition:
     def test_feedback_not_created_when_adapter_fails(self):
         """feedback_tracker should only be created when mcp_adapter succeeds."""
         server_py = Path(__file__).parent.parent / "src" / "memtomem_stm" / "server.py"
-        source = server_py.read_text()
+        source = server_py.read_text(encoding="utf-8")
 
         # Simple text check: "if mcp_adapter is not None:" should appear
         # before the surfacing FeedbackTracker constructor in the code.
