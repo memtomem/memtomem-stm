@@ -10,12 +10,13 @@ import pytest
 
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import canonical_form, compute_drift_hash
+from helpers import set_home
 
 
 @pytest.fixture
 def sandbox_home(tmp_path, monkeypatch):
     """Repoint ``~/.mms`` at a sandbox dir; yield it."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     return tmp_path
 
 
