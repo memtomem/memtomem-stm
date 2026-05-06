@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -109,22 +110,26 @@ class TestAtomicWriteText:
         stop = threading.Event()
 
         def reader():
-            # On Windows, `os.replace()` opens a brief sharing-violation window
-            # where the reader's `open()` is denied even though the file exists.
-            # Catch `PermissionError` at the *outer* level — i.e. let the first
-            # violation cleanly stop the reader — rather than swallowing it in
-            # the inner loop. Continuing the read loop hammers the file and
-            # starves the writer's P1d (#307) retry budget (10 × 5 ms), which
-            # then surfaces as a real test failure. Voluntarily standing down
-            # preserves the test's invariant (every observed sample is one of
-            # the two complete payloads) without producing an unhandled-thread
-            # warning at teardown.
+            # On Windows, two distinct sharing-violation races can fire here:
+            # (a) the reader's `open()` is denied during `os.replace()`'s rename
+            # window — we let `PermissionError` propagate out of the inner loop
+            # so the reader voluntarily stands down on the first hit; (b) the
+            # writer's `os.replace()` itself fails because the reader still
+            # holds a file handle, which the P1d (#307) retry loop tries to
+            # ride out across 10 × 5 ms. The 1 ms yield below is what makes
+            # case (b) survivable — without it, the reader re-opens the file
+            # so quickly that every retry slot lands on a held handle and the
+            # writer exhausts its budget. 1 ms is small enough to keep the
+            # stress test (≈80 reads per writer flip on macOS) but large
+            # enough that at least one of the writer's retries falls in a gap
+            # where the reader is sleeping rather than holding a handle.
             try:
                 while not stop.is_set():
                     try:
                         seen.append(target.read_text(encoding="utf-8"))
                     except FileNotFoundError:
                         pass
+                    time.sleep(0.001)
             except PermissionError:
                 pass
 
