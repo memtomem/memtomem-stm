@@ -139,7 +139,16 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
 
 def _run_claude_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
     """Invoke the ``claude`` CLI — isolated so tests replace a single seam."""
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # ``encoding="utf-8"`` is explicit so non-ASCII bytes from the child don't
+    # hit the platform default codec (cp1252/cp949 on Windows). See #302 P0.
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 # PEP 508 dependency specifier: the distribution name is the leading identifier

@@ -1741,6 +1741,38 @@ class TestInitImportFlow:
 # ── MCP client registration (3-way prompt) ──────────────────────────────
 
 
+class TestRunClaudeMcp:
+    """The single shell-out seam ``_run_claude_mcp`` must pin
+    ``encoding="utf-8"`` so non-ASCII output from the ``claude`` CLI
+    (em-dash, localized error strings, box drawing) doesn't crash on
+    Windows consoles whose default codec is cp1252/cp949. Regression
+    for memtomem-stm#302 P0."""
+
+    def test_passes_explicit_utf8_encoding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        captured: dict[str, object] = {}
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=list(args[0]) if args else [], returncode=0, stdout="", stderr=""
+            )
+
+        monkeypatch.setattr(proxy_mod.subprocess, "run", fake_run)
+        proxy_mod._run_claude_mcp(["claude", "mcp", "list"])
+
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+        assert kwargs.get("text") is True
+        assert kwargs.get("capture_output") is True
+
+
 class _FakeClaudeResult:
     """Lightweight stand-in for ``subprocess.CompletedProcess[str]``. Using
     a plain object avoids pinning the test to a specific stdlib version's
