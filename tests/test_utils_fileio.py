@@ -114,6 +114,14 @@ class TestAtomicWriteText:
                     seen.append(target.read_text(encoding="utf-8"))
                 except FileNotFoundError:
                     pass
+                except PermissionError:
+                    # Symmetric to the P1d (#307) writer-side retry: on Windows
+                    # `os.replace()` opens a brief sharing-violation window
+                    # where the reader's `open()` is denied even though the
+                    # file exists. The writer rides it out via the retry loop;
+                    # the reader simply skips the sample — never observing a
+                    # partial payload, which is what the assertion checks.
+                    pass
 
         t = threading.Thread(target=reader)
         t.start()
