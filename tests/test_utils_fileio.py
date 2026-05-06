@@ -8,6 +8,7 @@ proper cleanup of the temp file on failure.
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -118,6 +119,59 @@ class TestAtomicWriteText:
         # Every observation must be one of the two complete payloads.
         bad = [s for s in seen if s not in (small, big)]
         assert not bad, f"observed {len(bad)} partial reads, e.g. len={len(bad[0])}"
+
+    def test_windows_retries_transient_permission_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On Windows, ``MoveFileEx`` raises ``PermissionError`` (``WinError 5``)
+        when a concurrent reader holds a transient handle on the destination.
+        The retry loop must ride out a short burst of failures and succeed
+        without surfacing the error to the caller. Pinned cross-platform by
+        forcing ``sys.platform == "win32"`` so the POSIX CI leg also exercises
+        the retry path."""
+        monkeypatch.setattr("memtomem_stm.utils.fileio.sys.platform", "win32")
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise PermissionError(5, "Access is denied", str(dst))
+            real_replace(src, dst)
+
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", flaky)
+
+        target = tmp_path / "out.txt"
+        atomic_write_text(target, "payload")
+
+        assert target.read_text(encoding="utf-8") == "payload"
+        assert calls["n"] == 4, f"expected 3 retries + 1 success, got {calls['n']} calls"
+
+    def test_windows_retry_gives_up_after_ten_attempts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Bound on the retry loop — if ``os.replace`` keeps failing with
+        ``PermissionError``, surface it to the caller rather than stalling
+        forever. 50 ms ceiling (10 × 5 ms) is short enough to not visibly
+        slow a test run."""
+        monkeypatch.setattr("memtomem_stm.utils.fileio.sys.platform", "win32")
+
+        calls = {"n": 0}
+
+        def always_locked(src, dst):
+            calls["n"] += 1
+            raise PermissionError(5, "Access is denied", str(dst))
+
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", always_locked)
+
+        target = tmp_path / "out.txt"
+        with pytest.raises(PermissionError):
+            atomic_write_text(target, "payload")
+
+        assert calls["n"] == 10, f"expected 10 attempts, got {calls['n']}"
+        # Temp must still be cleaned up despite the exhaustion path.
+        assert list(tmp_path.glob(target.name + ".*.tmp")) == []
 
 
 class TestSaveProxyConfigStillAtomic:

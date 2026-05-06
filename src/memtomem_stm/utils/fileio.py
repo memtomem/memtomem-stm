@@ -8,7 +8,9 @@ pattern keeps the third re-implementation of it from showing up.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -64,7 +66,33 @@ def atomic_write_text(
                 tmp.chmod(mode)
             except OSError:
                 pass
-        os.replace(tmp, resolved)
+        _replace_with_windows_retry(tmp, resolved)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _replace_with_windows_retry(src: Path, dst: Path) -> None:
+    """``os.replace`` with a brief retry loop on Windows.
+
+    On Windows, ``MoveFileEx`` (the syscall behind ``os.replace``) raises
+    ``PermissionError`` (``WinError 5``) when another process has ``dst``
+    open without ``FILE_SHARE_DELETE`` — and Python's ``open()`` does not
+    pass that flag. A concurrent reader (e.g. the auto-index watcher
+    re-reading the same file ``atomic_write_text`` is replacing) holds a
+    sub-millisecond handle that briefly blocks the rename. The rename
+    itself stays NTFS-atomic; we just ride out the transient conflict.
+    50 ms ceiling — ten attempts, 5 ms apart — keeps a hot-path write
+    from stalling if ``dst`` is genuinely locked by another process.
+    """
+    if sys.platform != "win32":
+        os.replace(src, dst)
+        return
+    for attempt in range(10):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.005)
