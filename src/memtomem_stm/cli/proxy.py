@@ -77,6 +77,25 @@ def _hdr(s: str) -> str:
     return click.style(s, bold=True) if _color_on() else s
 
 
+def _split_args(args_str: str) -> list[str]:
+    """Tokenize a stdio-server ``--args`` / prompt-args string.
+
+    POSIX: plain ``shlex.split``. Windows: same POSIX-style quoting, but with
+    backslash-escape disabled so ``D:\\a\\repo\\tests\\_x.py`` round-trips —
+    default ``shlex.split`` would chew ``\\a``, ``\\t``, ``\\_`` as escapes
+    and emit ``D:arepotests_x.py``, which would later be passed to the child
+    interpreter as a (mangled, relative) path. Raises ``ValueError`` on
+    unclosed quotes, matching ``shlex.split``'s contract.
+    """
+    if sys.platform == "win32":
+        lex = shlex.shlex(args_str, posix=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        lex.escape = ""
+        return list(lex)
+    return shlex.split(args_str)
+
+
 def _load(config_path: Path) -> dict[str, Any]:
     resolved = config_path.expanduser().resolve()
     if not resolved.exists():
@@ -799,7 +818,7 @@ def add(
         entry["command"] = command
         if args_str:
             try:
-                entry["args"] = shlex.split(args_str)
+                entry["args"] = _split_args(args_str)
             except ValueError as exc:
                 click.echo(f"{_err('Error:')} malformed --args: {exc}", err=True)
                 sys.exit(1)
@@ -1805,7 +1824,7 @@ def init(
             )
             if args_str.strip():
                 try:
-                    entry["args"] = shlex.split(args_str)
+                    entry["args"] = _split_args(args_str)
                 except ValueError as exc:
                     click.echo(f"{_err('Error:')} malformed arguments: {exc}", err=True)
                     sys.exit(1)
