@@ -23,6 +23,7 @@ import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.proxy import cli
+from helpers import set_home
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
 
@@ -1237,7 +1238,7 @@ class TestInitDiscoverySources:
         home.mkdir()
         cwd = tmp_path / "cwd"
         cwd.mkdir()
-        monkeypatch.setenv("HOME", str(home))
+        set_home(monkeypatch, home)
         # Redirect the macOS-specific Desktop path into our sandbox too.
         desktop = home / "Library/Application Support/Claude"
         desktop.mkdir(parents=True)

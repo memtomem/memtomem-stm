@@ -10,6 +10,7 @@ import pytest
 from memtomem_stm.mms import import_hosts as ih
 from memtomem_stm.mms.secrets import Kind
 from memtomem_stm.mms.state import RegistryServer
+from helpers import set_home
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +161,7 @@ class TestDerivePrefix:
 
 @pytest.fixture
 def sandbox_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     return tmp_path
 
 

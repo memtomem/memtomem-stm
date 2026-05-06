@@ -14,6 +14,7 @@ from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.drift import compute_drift_hash
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
+from helpers import set_home
 
 
 @pytest.fixture
@@ -24,7 +25,7 @@ def runner() -> CliRunner:
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
     """Pin HOME so ``~/.mms`` and ``~/.claude.json`` etc. land in tmp."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     cwd = tmp_path / "proj"
     cwd.mkdir()
     monkeypatch.chdir(cwd)

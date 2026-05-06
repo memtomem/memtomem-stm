@@ -15,6 +15,7 @@ from memtomem_stm.cli.mms_project import (
     project_group,
 )
 from memtomem_stm.mms import state
+from helpers import set_home
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def sandbox(tmp_path, monkeypatch):
     Returns a dict with the sandbox HOME and the cwd directory so tests
     can do path assertions.
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     proj_dir = tmp_path / "proj"
     proj_dir.mkdir()
     monkeypatch.chdir(proj_dir)
