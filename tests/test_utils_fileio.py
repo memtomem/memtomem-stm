@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from memtomem_stm.utils.fileio import atomic_write_text
+from memtomem_stm.utils.fileio import _WIN_REPLACE_ATTEMPTS, atomic_write_text
 
 
 class TestAtomicWriteText:
@@ -148,13 +148,14 @@ class TestAtomicWriteText:
         assert target.read_text(encoding="utf-8") == "payload"
         assert calls["n"] == 4, f"expected 3 retries + 1 success, got {calls['n']} calls"
 
-    def test_windows_retry_gives_up_after_ten_attempts(
+    def test_windows_retry_gives_up_after_bounded_attempts(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """Bound on the retry loop — if ``os.replace`` keeps failing with
         ``PermissionError``, surface it to the caller rather than stalling
-        forever. 50 ms ceiling (10 × 5 ms) is short enough to not visibly
-        slow a test run."""
+        forever. The exact attempt count is sourced from
+        ``_WIN_REPLACE_ATTEMPTS`` so a future tuning of the budget keeps
+        this test honest."""
         monkeypatch.setattr("memtomem_stm.utils.fileio.sys.platform", "win32")
 
         calls = {"n": 0}
@@ -169,7 +170,9 @@ class TestAtomicWriteText:
         with pytest.raises(PermissionError):
             atomic_write_text(target, "payload")
 
-        assert calls["n"] == 10, f"expected 10 attempts, got {calls['n']}"
+        assert calls["n"] == _WIN_REPLACE_ATTEMPTS, (
+            f"expected {_WIN_REPLACE_ATTEMPTS} attempts, got {calls['n']}"
+        )
         # Temp must still be cleaned up despite the exhaustion path.
         assert list(tmp_path.glob(target.name + ".*.tmp")) == []
 

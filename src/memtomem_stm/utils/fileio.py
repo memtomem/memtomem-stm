@@ -13,6 +13,14 @@ import tempfile
 import time
 from pathlib import Path
 
+# Windows ``MoveFileEx`` retry budget. The wall-clock ceiling is approximate —
+# Windows' default timer resolution is ~15.6 ms, so each ``time.sleep(0.005)``
+# typically rounds up to one tick. Real worst case is closer to 150 ms than
+# 50 ms; treat the budget as "low enough to not stall a hot-path write" rather
+# than a hard SLA.
+_WIN_REPLACE_ATTEMPTS = 10
+_WIN_REPLACE_BACKOFF_S = 0.005
+
 
 def atomic_write_text(
     path: Path,
@@ -82,17 +90,20 @@ def _replace_with_windows_retry(src: Path, dst: Path) -> None:
     re-reading the same file ``atomic_write_text`` is replacing) holds a
     sub-millisecond handle that briefly blocks the rename. The rename
     itself stays NTFS-atomic; we just ride out the transient conflict.
-    50 ms ceiling — ten attempts, 5 ms apart — keeps a hot-path write
-    from stalling if ``dst`` is genuinely locked by another process.
+
+    Scope intentionally narrow: only ``PermissionError`` (``WinError 5``)
+    is retried. ``WinError 32`` (sharing violation under AV scans, etc.)
+    has a similar transient pattern but isn't observed in CI today; widen
+    the catch only when a concrete failure appears.
     """
     if sys.platform != "win32":
         os.replace(src, dst)
         return
-    for attempt in range(10):
+    for attempt in range(_WIN_REPLACE_ATTEMPTS):
         try:
             os.replace(src, dst)
             return
         except PermissionError:
-            if attempt == 9:
+            if attempt == _WIN_REPLACE_ATTEMPTS - 1:
                 raise
-            time.sleep(0.005)
+            time.sleep(_WIN_REPLACE_BACKOFF_S)
