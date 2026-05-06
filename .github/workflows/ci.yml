@@ -7,18 +7,19 @@ on:
     branches: [main]
 
 jobs:
-  # Windows runs on lint/typecheck/test are informational only while the
-  # Windows-support triage in #302 is in flight. Ubuntu remains the gating
-  # required check; the Windows leg is a `continue-on-error` signal so
-  # P1b/P2/P3 fixes can be observed without blocking merges. Flip to
-  # required once the matrix is consistently green.
+  # Windows runs on lint/typecheck/test are gating required checks alongside
+  # ubuntu-latest. The matrix was introduced in #304 (P1a) with a
+  # `continue-on-error` escape hatch while the #302 Windows-support triage
+  # was in flight; with #314–#319 merged the matrix is consistently green
+  # so the escape hatch is gone. The mypy *step* keeps its own
+  # `continue-on-error: true` because typecheck is still advisory project-wide
+  # (CLAUDE.md), independent of the OS matrix.
   lint:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -34,7 +35,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -51,7 +51,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
