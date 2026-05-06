@@ -30,12 +30,25 @@ def test_set_home_path_home_resolves_to_sandbox(tmp_path: Path, monkeypatch):
 
 def test_set_home_is_undone_after_test(tmp_path: Path, monkeypatch):
     """monkeypatch must restore both env vars when the test exits — otherwise
-    the next test in the same session inherits the sandbox HOME."""
-    original_home = os.environ.get("HOME")
-    original_userprofile = os.environ.get("USERPROFILE")
+    the next test in the same session inherits the sandbox HOME.
+
+    Note that ``os.environ.get("VAR") == None`` would silently pass even if
+    monkeypatch had failed to *delete* a previously-absent key (since both
+    cases ``get`` returns ``None``). When the original is absent, assert
+    the key is not in ``os.environ`` so a regression that left a None-string
+    behind would still trip — important for bare CI shells where ``HOME``
+    or ``USERPROFILE`` may not be pre-populated.
+    """
+    snapshots = {
+        var: ("HAS" if var in os.environ else "ABSENT", os.environ.get(var))
+        for var in ("HOME", "USERPROFILE")
+    }
 
     set_home(monkeypatch, tmp_path)
     monkeypatch.undo()
 
-    assert os.environ.get("HOME") == original_home
-    assert os.environ.get("USERPROFILE") == original_userprofile
+    for var, (state, original) in snapshots.items():
+        if state == "HAS":
+            assert os.environ.get(var) == original, f"{var} not restored"
+        else:
+            assert var not in os.environ, f"{var} key not deleted"
