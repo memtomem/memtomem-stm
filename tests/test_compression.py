@@ -143,7 +143,13 @@ class TestSelectiveCompressor:
 
         import time
 
-        time.sleep(0.01)
+        # `evict_expired` uses ``(now - created_at) > ttl`` with ttl=0.0, so
+        # any non-zero monotonic delta marks the entry expired. Windows
+        # ``time.monotonic()`` falls back to ``GetTickCount64`` with ~15.6 ms
+        # resolution; sleeping 10 ms could land inside a single tick, leave
+        # ``now == created_at``, and skip eviction. Sleep ≥ 1 tick + headroom
+        # so the delta is guaranteed positive.
+        time.sleep(0.05)
         result = c.select(key, ["a"])
         assert "not found or expired" in result
 
