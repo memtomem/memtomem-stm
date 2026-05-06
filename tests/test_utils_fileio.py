@@ -8,7 +8,7 @@ proper cleanup of the temp file on failure.
 
 from __future__ import annotations
 
-import os
+import sys
 import threading
 from pathlib import Path
 
@@ -36,7 +36,8 @@ class TestAtomicWriteText:
         assert target.read_text(encoding="utf-8") == payload
 
     @pytest.mark.skipif(
-        os.name == "nt", reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive"
+        sys.platform == "win32",
+        reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
     )
     def test_mode_applied(self, tmp_path: Path):
         target = tmp_path / "secret.json"
@@ -45,7 +46,8 @@ class TestAtomicWriteText:
         assert (target.stat().st_mode & 0o777) == 0o600
 
     @pytest.mark.skipif(
-        os.name == "nt", reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive"
+        sys.platform == "win32",
+        reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
     )
     def test_no_mode_inherits_mkstemp_default(self, tmp_path: Path):
         """When ``mode`` is None we don't ``chmod`` — the file keeps the
@@ -196,7 +198,7 @@ class TestSaveProxyConfigStillAtomic:
         target = tmp_path / "stm_proxy.json"
         _save(target, {"enabled": True, "upstream_servers": {"x": {"prefix": "x"}}})
 
-        if os.name != "nt":
+        if sys.platform != "win32":
             # NTFS doesn't expose POSIX mode bits; ACL is the right primitive.
             assert (target.stat().st_mode & 0o777) == 0o600
         assert "upstream_servers" in target.read_text(encoding="utf-8")
