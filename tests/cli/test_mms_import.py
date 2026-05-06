@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import stat
+import sys
 from datetime import datetime, timezone
 
 import pytest
@@ -231,7 +231,7 @@ class TestApply:
 
         # 1. file + permissions
         assert state.import_state_path().exists()
-        if os.name != "nt":
+        if sys.platform != "win32":
             # NTFS doesn't expose POSIX mode bits; ACL is the right primitive.
             mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
             assert mode == 0o600
