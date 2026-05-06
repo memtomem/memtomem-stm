@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 from datetime import datetime, timezone
@@ -230,8 +231,10 @@ class TestApply:
 
         # 1. file + permissions
         assert state.import_state_path().exists()
-        mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
-        assert mode == 0o600
+        if os.name != "nt":
+            # NTFS doesn't expose POSIX mode bits; ACL is the right primitive.
+            mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
+            assert mode == 0o600
 
         # 2. counter assertion: cardinality AND identity, both axes
         cfg = state.load_registry()

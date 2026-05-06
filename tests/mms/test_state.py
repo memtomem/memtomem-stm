@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import tomllib
 from pathlib import Path
@@ -67,6 +68,9 @@ def test_registry_round_trip(sandbox_home):
     assert loaded == cfg
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive"
+)
 def test_save_registry_uses_0o600(sandbox_home):
     cfg = state.RegistryConfig(servers={"foo": state.RegistryServer(command="echo", prefix="f")})
     state.save_registry(cfg)
@@ -232,6 +236,9 @@ def test_save_load_preserves_drift_hash(sandbox_home, server: state.RegistryServ
     assert compute_drift_hash(loaded.servers["x"]) == compute_drift_hash(server)
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive"
+)
 def test_save_import_state_uses_0o600(sandbox_home):
     s = state.ImportState(
         entries={
