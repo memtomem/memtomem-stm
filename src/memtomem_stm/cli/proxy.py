@@ -86,6 +86,11 @@ def _split_args(args_str: str) -> list[str]:
     and emit ``D:arepotests_x.py``, which would later be passed to the child
     interpreter as a (mangled, relative) path. Raises ``ValueError`` on
     unclosed quotes, matching ``shlex.split``'s contract.
+
+    Trade-off: with ``escape=""`` an embedded quote-escape (``\\"`` inside a
+    double-quoted token) is no longer recognized on Windows. Acceptable
+    because Windows-native ``cmd.exe`` quoting uses ``^`` rather than ``\\``,
+    and backslash-as-path-separator is the dominant case in this surface.
     """
     if sys.platform == "win32":
         lex = shlex.shlex(args_str, posix=True)

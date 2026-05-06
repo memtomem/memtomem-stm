@@ -230,6 +230,18 @@ class TestSplitArgs:
             "hello world",
         ]
 
+    def test_windows_honors_single_quoted_whitespace(self, monkeypatch):
+        """POSIX-style single quoting is preserved on Windows too — only
+        the backslash-escape (``\\X``) is suppressed by ``escape=""``."""
+        from memtomem_stm.cli.proxy import _split_args
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _split_args(r"C:\bin\x.py --msg 'hello world'") == [
+            r"C:\bin\x.py",
+            "--msg",
+            "hello world",
+        ]
+
     def test_windows_unclosed_quote_raises_valueerror(self, monkeypatch):
         """Match ``shlex.split``'s contract so the existing
         ``except ValueError`` blocks in ``add`` / ``init`` keep working."""
