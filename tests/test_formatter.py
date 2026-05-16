@@ -105,3 +105,47 @@ class TestFormatterInjection:
         results = [FakeResult(FakeChunk(), 0.5)]
         output = fmt.inject("response", results, "query")
         assert "## 관련 기억" in output
+
+
+class TestPreviewMaxCharsKnob:
+    """F3 — ``preview_max_chars`` controls the per-result preview slice.
+
+    Default (300) preserves prior behavior; operators can shorten or
+    lengthen the preview per deployment.
+    """
+
+    def test_default_preview_caps_at_300(self):
+        """Regression guard: existing 300-cap behavior must survive when
+        ``preview_max_chars`` is not overridden."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        long_content = "a" * 800
+        results = [FakeResult(FakeChunk(content=long_content), 0.5)]
+        output = fmt.inject("response", results, "query")
+        # The preview is the slice that follows the "score=X.XX): " marker
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) <= 300
+        assert "a" * 250 in preview_line  # well within the cap
+
+    def test_lower_preview_max_chars_truncates(self):
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=50))
+        results = [FakeResult(FakeChunk(content="b" * 800), 0.5)]
+        output = fmt.inject("response", results, "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) <= 50
+        # Tighter check: exactly 50 'b's then nothing more on that line
+        assert preview_line.startswith("b" * 50)
+        assert "b" * 51 not in preview_line
+
+    def test_higher_preview_max_chars_allows_longer_preview(self):
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=600, max_injection_chars=10000))
+        results = [FakeResult(FakeChunk(content="c" * 800), 0.5)]
+        output = fmt.inject("response", results, "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) >= 600
+        assert "c" * 600 in preview_line
