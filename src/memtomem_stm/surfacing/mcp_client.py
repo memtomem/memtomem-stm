@@ -196,6 +196,13 @@ class McpClientSearchAdapter:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._parser = get_parser(getattr(config, "result_format", "compact"))
+        # #290: SurfacingEngine wraps adapter calls in ``asyncio.wait_for``;
+        # an outer-timeout cancellation interrupts ``call_tool`` mid-RPC and
+        # leaves the MCP session in a mid-message state. ``_TRANSPORT_ERRORS``
+        # below intentionally does not catch ``CancelledError`` (cooperative
+        # cancellation must propagate), so we mark the session here and let
+        # the next caller heal the connection lazily before issuing an RPC.
+        self._needs_reconnect = False
 
     async def start(self) -> None:
         """Connect to the memtomem MCP server."""
@@ -271,6 +278,26 @@ class McpClientSearchAdapter:
         await self.start()
         logger.info("MCP adapter reconnected successfully")
 
+    async def _heal_if_needed(self) -> bool:
+        """Reconnect lazily if a prior RPC was cancelled mid-message (#290).
+
+        Returns ``True`` when the session is ready to issue a new RPC,
+        ``False`` when no session was ever started or the reconnect failed.
+        Callers treat ``False`` the same as a missing session: return empty
+        results and let the next surfacing cycle retry.
+        """
+        if self._session is None:
+            return False
+        if not self._needs_reconnect:
+            return True
+        try:
+            await self._reconnect()
+        except Exception as exc:
+            logger.warning("Lazy reconnect after mid-RPC cancellation failed: %s", exc)
+            return False
+        self._needs_reconnect = False
+        return True
+
     async def search(
         self,
         query: str,
@@ -289,7 +316,7 @@ class McpClientSearchAdapter:
         fails. Callers that do not care about hints should still accept
         the tuple to stay compatible with mypy's inferred signature.
         """
-        if self._session is None:
+        if not await self._heal_if_needed():
             return [], []
 
         args: dict[str, Any] = {"query": query}
@@ -320,6 +347,13 @@ class McpClientSearchAdapter:
                 # distinct error class is a follow-up).
                 logger.warning("MCP mem_search failed after reconnect: %s", retry_exc)
                 return [], []
+        except asyncio.CancelledError:
+            # #290: outer wait_for cancelled us mid-RPC. Mark for lazy
+            # reconnect on the next call (the session's read/write streams
+            # are now in a half-read state) and propagate the cancellation
+            # so the caller's wait_for can surface its TimeoutError.
+            self._needs_reconnect = True
+            raise
         except Exception as exc:
             logger.warning("MCP mem_search failed: %s", exc)
             return [], []
@@ -342,7 +376,9 @@ class McpClientSearchAdapter:
         only) — feedback recording itself must never depend on the boost
         round trip succeeding.
         """
-        if self._session is None or not chunk_ids:
+        if not chunk_ids:
+            return
+        if not await self._heal_if_needed():
             return
 
         call_args: dict[str, Any] = {
@@ -361,6 +397,11 @@ class McpClientSearchAdapter:
                 await self._session.call_tool("mem_do", call_args)  # type: ignore[union-attr]
             except Exception as retry_exc:
                 logger.debug("MCP mem_do(increment_access) failed after reconnect: %s", retry_exc)
+        except asyncio.CancelledError:
+            # #290: see search() — mid-RPC cancellation marks the session
+            # for lazy reconnect; propagate per the cooperative model.
+            self._needs_reconnect = True
+            raise
         except Exception as exc:
             logger.debug("MCP mem_do(increment_access) failed: %s", exc)
 
@@ -377,7 +418,7 @@ class McpClientSearchAdapter:
         able to silently skip session-context injection without losing
         the LTM hits.
         """
-        if self._session is None:
+        if not await self._heal_if_needed():
             return []
 
         call_args: dict[str, Any] = {"action": "scratch_get", "params": {}}
@@ -396,6 +437,11 @@ class McpClientSearchAdapter:
                 )
             except Exception:
                 return []
+        except asyncio.CancelledError:
+            # #290: see search() — mid-RPC cancellation marks the session
+            # for lazy reconnect; propagate per the cooperative model.
+            self._needs_reconnect = True
+            raise
         except Exception as exc:
             logger.debug("MCP mem_do(scratch_get) failed: %s", exc)
             return []
