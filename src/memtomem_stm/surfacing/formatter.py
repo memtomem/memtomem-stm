@@ -49,7 +49,10 @@ class SurfacingFormatter:
                 parts.append(chunk.content[:preview_cap].replace("\n", " "))
                 if ctx.window_after:
                     parts.append(ctx.window_after[0].content[:150].replace("\n", " ") + "...")
-                preview = " | ".join(parts)
+                # ``preview_max_chars`` is a hard ceiling on the per-result
+                # preview — without this, joining ±150-char window snippets
+                # would push a single result past the documented cap.
+                preview = " | ".join(parts)[:preview_cap]
             else:
                 preview = chunk.content[:preview_cap].replace("\n", " ")
 
