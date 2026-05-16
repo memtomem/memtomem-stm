@@ -275,6 +275,19 @@ class TestLLMCompressorFallback:
         assert len(result) < len(text)
 
     @pytest.mark.asyncio
+    async def test_privacy_fallback_scans_full_payload_before_provider_call(self):
+        comp = _make_llm_compressor()
+        text = ("safe content " * 900) + "password: hunter2"
+        assert len(text) > 10_000
+
+        with patch.object(comp, "_call_api", new_callable=AsyncMock) as call_api:
+            result = await comp.compress(text, max_chars=100, privacy_patterns=[r"password\s*:"])
+
+        call_api.assert_not_called()
+        assert comp.last_fallback == "privacy"
+        assert len(result) < len(text)
+
+    @pytest.mark.asyncio
     async def test_circuit_breaker_fallback(self):
         comp = _make_llm_compressor()
         # Trip the circuit breaker

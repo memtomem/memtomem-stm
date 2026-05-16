@@ -39,13 +39,9 @@ def _compile_patterns(patterns: tuple[str, ...]) -> list[re.Pattern[str]]:
 
 
 def contains_sensitive_content(text: str, patterns: list[str] | None = None) -> bool:
-    """Check if text contains any sensitive patterns.
-
-    Scans only the first 10K chars for performance.
-    """
+    """Check if text contains any sensitive patterns."""
     effective = patterns if patterns else DEFAULT_PATTERNS
     if not effective:
         return False
-    sample = text[:10_000]
     compiled = _compile_patterns(tuple(effective))
-    return any(p.search(sample) for p in compiled)
+    return any(p.search(text) for p in compiled)
