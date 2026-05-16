@@ -23,6 +23,7 @@ import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.proxy import cli
+from helpers import set_home
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
 
@@ -178,6 +179,100 @@ class TestStyleHelpers:
 
         for fn in (_err, _warn, _ok, _bad, _hdr):
             assert fn("X") == "X"
+
+
+# ── _split_args tokenization (Windows backslash-safe) ───────────────────
+
+
+class TestSplitArgs:
+    """``_split_args`` must round-trip Windows paths supplied via ``--args``
+    and the interactive prompt. POSIX-mode ``shlex.split`` (the previous
+    implementation) consumed ``\\a``, ``\\t``, ``\\_`` etc. as escape
+    sequences and emitted ``D:arepotests_x.py`` for
+    ``D:\\a\\repo\\tests\\_x.py`` — the mangled string was then handed to
+    ``asyncio.create_subprocess_exec`` as a (relative) script path,
+    surfacing as ``[Errno 2] No such file`` on the windows-latest CI
+    matrix added in #304.
+
+    Tested against monkeypatched ``sys.platform`` so the Windows branch
+    runs on POSIX runners too; the live Windows leg covers the real
+    interpreter on top.
+    """
+
+    def test_posix_uses_shlex_split(self, monkeypatch):
+        from memtomem_stm.cli.proxy import _split_args
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert _split_args("/usr/bin/python script.py --flag x") == [
+            "/usr/bin/python",
+            "script.py",
+            "--flag",
+            "x",
+        ]
+
+    def test_windows_preserves_backslash_paths(self, monkeypatch):
+        """The exact CI repro: a GitHub-Actions Windows-runner path under
+        ``D:\\a\\<repo>\\<repo>\\tests\\_fake_memtomem_server.py`` must
+        survive tokenization unmodified."""
+        from memtomem_stm.cli.proxy import _split_args
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        path = r"D:\a\memtomem-stm\memtomem-stm\tests\_fake_memtomem_server.py"
+        assert _split_args(path) == [path]
+
+    def test_windows_still_honors_quoted_whitespace(self, monkeypatch):
+        from memtomem_stm.cli.proxy import _split_args
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _split_args(r'C:\bin\x.py --msg "hello world"') == [
+            r"C:\bin\x.py",
+            "--msg",
+            "hello world",
+        ]
+
+    def test_windows_honors_single_quoted_whitespace(self, monkeypatch):
+        """POSIX-style single quoting is preserved on Windows too — only
+        the backslash-escape (``\\X``) is suppressed by ``escape=""``."""
+        from memtomem_stm.cli.proxy import _split_args
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _split_args(r"C:\bin\x.py --msg 'hello world'") == [
+            r"C:\bin\x.py",
+            "--msg",
+            "hello world",
+        ]
+
+    def test_windows_unclosed_quote_raises_valueerror(self, monkeypatch):
+        """Match ``shlex.split``'s contract so the existing
+        ``except ValueError`` blocks in ``add`` / ``init`` keep working."""
+        from memtomem_stm.cli.proxy import _split_args
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(ValueError):
+            _split_args(r'C:\bin\x.py "open ended')
+
+    def test_add_persists_unmangled_args_on_windows(self, runner, config, monkeypatch):
+        """End-to-end: ``mms add --args <win path>`` must round-trip into
+        the saved JSON config without backslash-escape damage."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        win_path = r"D:\a\memtomem-stm\memtomem-stm\tests\_fake_memtomem_server.py"
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "fake",
+                "--prefix",
+                "fk",
+                "--command",
+                sys.executable,
+                "--args",
+                win_path,
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["upstream_servers"]["fake"]["args"] == [win_path]
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────
@@ -1237,7 +1332,7 @@ class TestInitDiscoverySources:
         home.mkdir()
         cwd = tmp_path / "cwd"
         cwd.mkdir()
-        monkeypatch.setenv("HOME", str(home))
+        set_home(monkeypatch, home)
         # Redirect the macOS-specific Desktop path into our sandbox too.
         desktop = home / "Library/Application Support/Claude"
         desktop.mkdir(parents=True)
@@ -1739,6 +1834,38 @@ class TestInitImportFlow:
 
 
 # ── MCP client registration (3-way prompt) ──────────────────────────────
+
+
+class TestRunClaudeMcp:
+    """The single shell-out seam ``_run_claude_mcp`` must pin
+    ``encoding="utf-8"`` so non-ASCII output from the ``claude`` CLI
+    (em-dash, localized error strings, box drawing) doesn't crash on
+    Windows consoles whose default codec is cp1252/cp949. Regression
+    for memtomem-stm#302 P0."""
+
+    def test_passes_explicit_utf8_encoding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        captured: dict[str, object] = {}
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=list(args[0]) if args else [], returncode=0, stdout="", stderr=""
+            )
+
+        monkeypatch.setattr(proxy_mod.subprocess, "run", fake_run)
+        proxy_mod._run_claude_mcp(["claude", "mcp", "list"])
+
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+        assert kwargs.get("text") is True
+        assert kwargs.get("capture_output") is True
 
 
 class _FakeClaudeResult:

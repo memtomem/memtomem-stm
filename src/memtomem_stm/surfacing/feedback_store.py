@@ -291,7 +291,7 @@ class FeedbackStore:
             recent_rows = self._db.execute(
                 f"SELECT created_at, tool, query, memory_ids, scores "
                 f"FROM surfacing_events{where_sql} "
-                "ORDER BY created_at DESC LIMIT ?",
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 [*event_params, limit],
             ).fetchall()
             for ts, tool_name, query, memory_ids_json, scores_json in recent_rows:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import sys
 import tomllib
 from pathlib import Path
 
@@ -10,12 +11,13 @@ import pytest
 
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import canonical_form, compute_drift_hash
+from helpers import set_home
 
 
 @pytest.fixture
 def sandbox_home(tmp_path, monkeypatch):
     """Repoint ``~/.mms`` at a sandbox dir; yield it."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     return tmp_path
 
 
@@ -67,6 +69,10 @@ def test_registry_round_trip(sandbox_home):
     assert loaded == cfg
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
+)
 def test_save_registry_uses_0o600(sandbox_home):
     cfg = state.RegistryConfig(servers={"foo": state.RegistryServer(command="echo", prefix="f")})
     state.save_registry(cfg)
@@ -232,6 +238,10 @@ def test_save_load_preserves_drift_hash(sandbox_home, server: state.RegistryServ
     assert compute_drift_hash(loaded.servers["x"]) == compute_drift_hash(server)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
+)
 def test_save_import_state_uses_0o600(sandbox_home):
     s = state.ImportState(
         entries={

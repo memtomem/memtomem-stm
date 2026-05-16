@@ -13,6 +13,7 @@ import pytest
 
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.progressive_reads_store import ProgressiveReadsStore
+from helpers import set_home
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,7 @@ class TestProgressiveReadsTracker:
 
     def test_path_expansion(self, tmp_path: Path, monkeypatch):
         """``~`` in db_path should be expanded to ``$HOME``."""
-        monkeypatch.setenv("HOME", str(tmp_path))
+        set_home(monkeypatch, tmp_path)
         tracker = ProgressiveReadsTracker(Path("~/pr_expand.db"))
         try:
             assert (tmp_path / "pr_expand.db").exists()
