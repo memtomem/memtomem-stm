@@ -488,7 +488,17 @@ class ProxyManager:
         conn = self._connections[server]
         cfg = conn.config
 
-        compression = cfg.compression
+        # #292: ``ProxyConfig.default_compression`` was previously unread, so
+        # an operator setting it in ``stm_proxy.json`` saw no effect on any
+        # upstream — every server fell back to its own default of AUTO. Use
+        # ``model_fields_set`` to distinguish "operator omitted compression"
+        # (→ honour the global default) from "operator explicitly typed
+        # compression: auto" (→ honour their explicit choice). The pattern
+        # mirrors the auto_index / extraction overrides above and below.
+        if "compression" in cfg.model_fields_set:
+            compression = cfg.compression
+        else:
+            compression = config.default_compression
         # Token-equivalent budget takes precedence over char budget when set.
         # Resolution order for chars_per_token: tool override → server → proxy default.
         # Resolution order for max_result_tokens: tool override → server.
