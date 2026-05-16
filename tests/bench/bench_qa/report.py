@@ -106,9 +106,25 @@ class BenchReportCollector:
 
     def __init__(self) -> None:
         self._rows: list[ScenarioReport] = []
+        # Sidecar curves keyed by sweep name. Emitted as ``sweep_{name}.json``
+        # next to ``report.json`` so a measurement run lands in the same
+        # ``$BENCH_QA_REPORT_DIR`` artifact as a scenario run, without
+        # forcing a ``BenchReport`` schema bump for every scenario row.
+        self._sweeps: dict[str, list[dict[str, Any]]] = {}
 
     def has_data(self) -> bool:
-        return bool(self._rows)
+        return bool(self._rows) or bool(self._sweeps)
+
+    def record_sweep(self, name: str, rows: list[dict[str, Any]]) -> None:
+        """Attach a sidecar curve flushed alongside ``report.json``.
+
+        Sweep tests (e.g. F2 min_score curve) aren't regression gates and
+        don't fit the per-scenario ``record_scenario`` shape. Each call
+        produces one ``sweep_{name}.json`` in the output dir at session
+        end; later calls with the same ``name`` overwrite earlier ones
+        within the session.
+        """
+        self._sweeps[name] = rows
 
     def record_scenario(
         self,
@@ -204,15 +220,27 @@ class BenchReportCollector:
         """Write ``report.json`` and ``summary.md`` under *out_dir*.
 
         Creates the directory if missing. Returns the output directory so
-        callers can log it for CI artifact upload.
+        callers can log it for CI artifact upload. Sweep sidecars
+        recorded via :meth:`record_sweep` are flushed as
+        ``sweep_{name}.json`` in the same dir.
         """
         out_dir.mkdir(parents=True, exist_ok=True)
-        report = self.build_report(run_seed=run_seed)
-        (out_dir / "report.json").write_text(
-            json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+        if self._rows:
+            report = self.build_report(run_seed=run_seed)
+            (out_dir / "report.json").write_text(
+                json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            (out_dir / "summary.md").write_text(_format_summary_md(report), encoding="utf-8")
+        for name, rows in self._sweeps.items():
+            (out_dir / f"sweep_{name}.json").write_text(
+                json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        logger.info(
+            "bench_qa report written to %s (%d scenarios, %d sweeps)",
+            out_dir,
+            len(self._rows),
+            len(self._sweeps),
         )
-        (out_dir / "summary.md").write_text(_format_summary_md(report), encoding="utf-8")
-        logger.info("bench_qa report written to %s (%d scenarios)", out_dir, len(self._rows))
         return out_dir
 
 

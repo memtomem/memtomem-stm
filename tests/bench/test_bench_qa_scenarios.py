@@ -397,3 +397,123 @@ async def test_s10_surfacing_recall_at_k(tmp_path, bench_qa_report):
         await adapter.stop()
         tracker.close()
         store.close()
+
+
+# F2 prep — min_score sweep harness. Measurement only, off in default and
+# advisory CI (bench_qa_sweep marker). One fresh proxy per threshold; the
+# curve is emitted as ``sweep_s11_min_score.json`` in ``$BENCH_QA_REPORT_DIR``.
+_S11_THRESHOLDS: list[float] = [0.005, 0.010, 0.020, 0.030, 0.050, 0.070]
+
+
+def _f1(precision: float, recall: float) -> float:
+    if precision + recall == 0.0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+@pytest.mark.bench_qa
+@pytest.mark.bench_qa_sweep
+@pytest.mark.asyncio
+async def test_s11_min_score_sweep(tmp_path, bench_qa_report):
+    """Sweep ``min_score`` across ``_S11_THRESHOLDS`` and emit a curve.
+
+    The fixture (s11) declares 8 labeled seeds spanning 0.003..0.065. The
+    helper sets ``max_results=len(seeds)`` so the threshold is the sole
+    gate — the curve measures pure ``min_score`` sensitivity, not
+    production top-K truncation behavior. The top threshold (0.070) is
+    above every seed score, so no ``<surfaced-memories>`` block is
+    emitted and no surfacing_id is recorded — the test treats that as
+    ``returned_ids = []`` rather than a failure, validating the
+    upper-bound shape of the curve.
+
+    Assertions are deliberately minimal: this is a measurement run for
+    the F2 follow-up PR, not a regression gate.
+    """
+    fixture = load_fixture("s11")
+    seeds = fixture["surfacing_seeds"]
+    seed_count = len(seeds)
+    assert seed_count >= 4, "s11: sweep needs at least 4 labeled seeds"
+
+    source_to_chunk_id = {
+        seed["source"]: hashlib.sha256(seed["content"].encode()).hexdigest()[:16] for seed in seeds
+    }
+    chunk_id_to_source = {chunk_id: src for src, chunk_id in source_to_chunk_id.items()}
+    positives = set(fixture["surfacing_eval"]["expected_ids"])
+    positive_count = len(positives)
+    assert 0 < positive_count < seed_count, (
+        "s11: fixture must declare a strict subset of seeds as positives — "
+        "otherwise precision/recall degenerate"
+    )
+
+    seeds_path = tmp_path / "s11_seeds.json"
+    seeds_path.write_text(json.dumps(seeds), encoding="utf-8")
+
+    curve: list[dict] = []
+    for threshold in _S11_THRESHOLDS:
+        sub_dir = tmp_path / f"th_{threshold:.3f}"
+        sub_dir.mkdir()
+        mgr, store, session, adapter, engine, tracker = make_surfacing_proxy_manager(
+            sub_dir,
+            seeds_path=seeds_path,
+            compression=fixture["expected_compressor"],
+            max_result_chars=fixture["max_result_chars"],
+            min_score=threshold,
+            max_results=seed_count,
+        )
+        session.call_tool.return_value = make_tool_result(fixture["payload"])
+        await adapter.start()
+        try:
+            result = await mgr.call_tool(
+                "fake",
+                "tool_s11",
+                {"_context_query": fixture["surfacing_eval"]["query"]},
+                trace_id=deterministic_trace_id(f"s11:{threshold:.3f}"),
+            )
+            id_match = _SURFACING_ID_RE.search(result)
+            if id_match:
+                returned_chunk_ids = tracker.store.get_memory_ids_for_surfacing(id_match.group(1))
+            else:
+                # Threshold above every seed score: no surfaced block,
+                # engine writes ``no_results_score`` and emits no
+                # surfacing_id. Treat as an empty result list.
+                returned_chunk_ids = []
+
+            returned_sources = [
+                chunk_id_to_source[cid] for cid in returned_chunk_ids if cid in chunk_id_to_source
+            ]
+            tp = sum(1 for src in returned_sources if src in positives)
+            fp = len(returned_sources) - tp
+            fn = positive_count - tp
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            curve.append(
+                {
+                    "threshold": threshold,
+                    "tp": tp,
+                    "fp": fp,
+                    "fn": fn,
+                    "precision": round(precision, 4),
+                    "recall": round(recall, 4),
+                    "f1": round(_f1(precision, recall), 4),
+                    "returned": len(returned_sources),
+                }
+            )
+        finally:
+            await adapter.stop()
+            tracker.close()
+            store.close()
+
+    assert len(curve) == len(_S11_THRESHOLDS), (
+        f"s11 sweep: expected {len(_S11_THRESHOLDS)} curve rows, got {len(curve)}"
+    )
+    recalls = [row["recall"] for row in curve]
+    assert recalls == sorted(recalls, reverse=True), (
+        f"s11 sweep: recall must be non-increasing as threshold rises — "
+        f"got {recalls}. Harness likely failed to apply min_score."
+    )
+    assert any(row["f1"] > 0.0 for row in curve), (
+        f"s11 sweep: no threshold produced F1 > 0 — fixture has no surfaced "
+        f"positives. Curve: {curve}"
+    )
+
+    bench_qa_report.record_sweep("s11_min_score", curve)
