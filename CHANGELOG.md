@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **LLM compression now scans for sensitive content before sending the response to the provider** (#289) — `LLMCompressorConfig` gains `privacy_scan_enabled: bool = True`, and `ProxyManager._apply_compression` passes `proxy/privacy.py` `DEFAULT_PATTERNS` (API keys, JWT, password assignments, AWS keys, GitHub/Slack tokens, PEM private keys) into `LLMCompressor.compress()` whenever the operator picks `compression: llm_summary`. On a hit, the compressor short-circuits to `TruncateCompressor` with `last_fallback="privacy"` instead of an outbound call. Default-on so flipping `compression: llm_summary` is safe without remembering a second knob; opt out per `llm_summary` config when the upstream is known sensitive-free or the provider is local/trusted (e.g. self-hosted Ollama). The privacy module and the wiring point on `LLMCompressor.compress()` already existed (per the non-standard `base_url` warning) — this PR closes the missing wire-in step in `_apply_compression`. Two regression tests pin both directions: enabled + sensitive content asserts `_call_api` is never reached and `last_fallback == "privacy"`; disabled asserts `_call_api` is reached.
+
 ## [0.1.23] — 2026-05-06
 
 This release lights up **Windows as a gating CI platform**. Issue #302 ran a multi-week ladder (#303–#319, #321) shaking out Windows-specific bugs across the cli, the file-IO utilities, the surfacing feedback store, and ~10 test sites that assumed POSIX-shaped HOME / file-mode / monotonic-clock semantics. With every rung green, #320 PATCHed `main`'s required-status-checks to require `lint (windows-latest)` and `test (windows-latest)` — Windows is now a first-class supported platform, not an informational matrix axis. There are no new features; v0.1.23 is the first wheel published with Windows officially under CI gate.

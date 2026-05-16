@@ -169,6 +169,71 @@ class TestApplyCompression:
         )
         assert len(result) <= len(text)
 
+    async def test_llm_summary_blocks_sensitive_content_when_scan_enabled(self, tmp_path):
+        """#289: privacy_scan_enabled=True (default) routes API keys / JWT to
+        truncate fallback before any outbound LLM call."""
+        from memtomem_stm.proxy import compression as compression_mod
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        llm_cfg = LLMCompressorConfig(
+            provider=LLMProvider.OPENAI,
+            api_key="k",
+            # default privacy_scan_enabled = True
+        )
+        # Real LLMCompressor instance — privacy scan runs against real
+        # DEFAULT_PATTERNS. Patch _call_api to fail loudly if reached.
+        with patch.object(
+            compression_mod.LLMCompressor,
+            "_call_api",
+            new_callable=AsyncMock,
+            side_effect=AssertionError("privacy scan must short-circuit before network"),
+        ):
+            text = "user record: api_key=sk-secret1234567890 " * 30
+            result, fallback = await mgr._apply_compression(
+                text,
+                CompressionStrategy.LLM_SUMMARY,
+                max_chars=200,
+                sel_cfg=None,
+                llm_cfg=llm_cfg,
+                hybrid_cfg=None,
+                server="srv",
+                tool="t",
+            )
+        assert fallback == "privacy"
+        assert len(result) <= len(text)
+
+    async def test_llm_summary_skips_privacy_scan_when_disabled(self, tmp_path):
+        """#289: privacy_scan_enabled=False reaches the LLM provider — opt-in
+        for trusted/local providers."""
+        from memtomem_stm.proxy import compression as compression_mod
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        llm_cfg = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA,
+            base_url="http://localhost:11434",
+            privacy_scan_enabled=False,
+        )
+        with patch.object(
+            compression_mod.LLMCompressor,
+            "_call_api",
+            new_callable=AsyncMock,
+            return_value="llm-output",
+        ) as mock_call:
+            text = "user record: api_key=sk-secret1234567890 " * 30
+            result, fallback = await mgr._apply_compression(
+                text,
+                CompressionStrategy.LLM_SUMMARY,
+                max_chars=200,
+                sel_cfg=None,
+                llm_cfg=llm_cfg,
+                hybrid_cfg=None,
+                server="srv",
+                tool="t",
+            )
+        assert fallback is None
+        assert result == "llm-output"
+        mock_call.assert_awaited_once()
+
 
 # ── LLMCompressor lifecycle (regression for #61) ────────────────────────
 
