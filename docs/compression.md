@@ -178,7 +178,7 @@ Each call to `stm_proxy_read_more` resets the TTL. The `ttl` field is omitted on
 
 Progressive is **opt-in only** — `auto` strategy never selects it because it changes the agent interaction pattern (requires calling `stm_proxy_read_more`). When configured, the proxied tool description includes a convention suffix (`| Chunked: use stm_proxy_read_more for more`) so the agent knows to expect chunked delivery.
 
-> **Note**: Memory surfacing (Stage 3) on progressive delivery is **mode-aware**. It runs on the first chunk when `injection_mode` is `append` or `section` — both modes preserve the `PROGRESSIVE_FOOTER_TOKEN` concat invariant that `stm_proxy_read_more` relies on. It is **skipped only for `prepend`**, which would shift character offsets for subsequent `stm_proxy_read_more` calls.
+> **Note**: Memory surfacing (Stage 3) is **skipped** for progressive delivery responses. Injecting memories into the first chunk would shift character offsets for subsequent `stm_proxy_read_more` calls.
 
 ## Progressive Fallback Ladder
 
@@ -192,7 +192,7 @@ flowchart TD
     S -->|no| Size{"content ><br/>chunk_size?"}
     Size -->|yes| T1["Tier 1: progressive<br/>(zero-loss, best-effort)"]
     Size -->|no| H{"≥ 3 headings?"}
-    T1 -->|success| Done["progressive_fallback<br/>+ mode-aware surfacing"]
+    T1 -->|success| Done["progressive_fallback<br/>+ skip surfacing"]
     T1 -->|failure| H
     H -->|yes| T2["Tier 2: hybrid<br/>(structure-preserving)"]
     H -->|no| T3["Tier 3: truncate<br/>(guaranteed floor)"]
