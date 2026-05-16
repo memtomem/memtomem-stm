@@ -51,7 +51,12 @@ class ResultParser:
     renamed or removed, so callers must tolerate an empty list silently.
     """
 
-    def parse(self, text: str) -> tuple[list[RemoteSearchResult], list[str]]:
+    def parse(
+        self,
+        text: str,
+        *,
+        max_content_chars: int = 500,
+    ) -> tuple[list[RemoteSearchResult], list[str]]:
         raise NotImplementedError
 
 
@@ -69,7 +74,12 @@ class CompactResultParser(ResultParser):
     always an empty list.
     """
 
-    def parse(self, text: str) -> tuple[list[RemoteSearchResult], list[str]]:
+    def parse(
+        self,
+        text: str,
+        *,
+        max_content_chars: int = 500,
+    ) -> tuple[list[RemoteSearchResult], list[str]]:
         results: list[RemoteSearchResult] = []
         if not text or not text.strip():
             return results, []
@@ -104,15 +114,16 @@ class CompactResultParser(ResultParser):
 
             content = rest.strip() if rest else ""
             if content:
-                if len(content) > 500:
+                if len(content) > max_content_chars:
                     logger.debug(
-                        "Truncating search result content from %d to 500 chars (source=%s)",
+                        "Truncating search result content from %d to %d chars (source=%s)",
                         len(content),
+                        max_content_chars,
                         source,
                     )
                 results.append(
                     RemoteSearchResult(
-                        content=content[:500],
+                        content=content[:max_content_chars],
                         score=score,
                         source=source,
                         namespace=namespace,
@@ -133,7 +144,12 @@ class StructuredResultParser(ResultParser):
     asserted on and its absence degrades silently to an empty list.
     """
 
-    def parse(self, text: str) -> tuple[list[RemoteSearchResult], list[str]]:
+    def parse(
+        self,
+        text: str,
+        *,
+        max_content_chars: int = 500,
+    ) -> tuple[list[RemoteSearchResult], list[str]]:
         if not text or not text.strip():
             return [], []
 
@@ -154,14 +170,15 @@ class StructuredResultParser(ResultParser):
             content = item.get("content", "")
             if not content:
                 continue
-            if len(content) > 500:
+            if len(content) > max_content_chars:
                 logger.debug(
-                    "Truncating search result content from %d to 500 chars (source=%s)",
+                    "Truncating search result content from %d to %d chars (source=%s)",
                     len(content),
+                    max_content_chars,
                     item.get("source", "unknown"),
                 )
             result = RemoteSearchResult(
-                content=content[:500],
+                content=content[:max_content_chars],
                 score=safe_float(item.get("score", 0.0), 0.0),
                 source=item.get("source", "unknown"),
                 namespace=item.get("namespace", "default"),
@@ -366,7 +383,7 @@ class McpClientSearchAdapter:
             return [], []
 
         text = "\n".join(text_parts)
-        return self._parser.parse(text)
+        return self._parser.parse(text, max_content_chars=self._config.result_content_max_chars)
 
     async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:
         """Boost the access_count of the given chunks via mem_do(increment_access).

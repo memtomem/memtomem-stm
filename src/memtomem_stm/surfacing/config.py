@@ -70,6 +70,11 @@ class SurfacingConfig(BaseModel):
     max_injection_chars: int = Field(default=3000, gt=0)
     context_window_size: int = Field(default=0, ge=0)
     """0=disabled; >0 expands ±N adjacent chunks."""
+    result_content_max_chars: int = Field(default=500, gt=0)
+    """Max chars retained per LTM result by the parser. Trims long content
+    before it reaches the formatter."""
+    preview_max_chars: int = Field(default=300, gt=0)
+    """Max chars rendered per result preview in the injected memory block."""
     dedup_ttl_seconds: float = Field(default=604800.0, ge=0.0)
     """7 days default; 0 disables cross-session dedup."""
     consumer_model: str = ""
