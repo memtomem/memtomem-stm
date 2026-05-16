@@ -131,6 +131,8 @@ def make_surfacing_proxy_manager(
     min_retention: float = 0.65,
     server_name: str = "fake",
     tool_prefix: str = "fake",
+    min_score: float | None = None,
+    max_results: int | None = None,
 ) -> tuple[
     ProxyManager,
     MetricsStore,
@@ -168,6 +170,15 @@ def make_surfacing_proxy_manager(
     store = MetricsStore(tmp_path / "proxy_metrics.db")
     store.initialize()
 
+    # min_score / max_results stay at SurfacingConfig defaults unless the
+    # caller pins them — the F2 sweep harness (s11) overrides both so the
+    # threshold becomes the sole gate; production-shape callers like s10
+    # leave them None to exercise the live defaults.
+    surfacing_kwargs: dict[str, object] = {}
+    if min_score is not None:
+        surfacing_kwargs["min_score"] = min_score
+    if max_results is not None:
+        surfacing_kwargs["max_results"] = max_results
     surfacing_cfg = SurfacingConfig(
         enabled=True,
         min_response_chars=10,
@@ -181,6 +192,7 @@ def make_surfacing_proxy_manager(
         feedback_db_path=tmp_path / "stm_feedback.db",
         ltm_mcp_command=sys.executable,
         ltm_mcp_args=[str(_FAKE_LTM_SERVER), "--seeds", str(seeds_path)],
+        **surfacing_kwargs,
     )
     adapter = McpClientSearchAdapter(surfacing_cfg)
     tracker = FeedbackTracker(surfacing_cfg)

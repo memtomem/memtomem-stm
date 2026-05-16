@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "scenario_id": "s11",
+  "description": "F2 min_score sweep harness — 8 labeled seeds (4 positives / 4 negatives) with scores distributed across the AutoTuner clamp band (0.003..0.065). The sweep test (bench_qa_sweep marker) sets min_score per iteration and emits a recall/precision/F1 curve. The fixture is mostly signal-aligned with one noise inversion (one positive sits below one negative) so the F1 curve has a non-trivial peak — informs the F2 follow-up PR's choice of default.",
+  "content_type": "text",
+  "expected_compressor": "none",
+  "force_tier": null,
+  "max_result_chars": 50000,
+  "qa_gate_min": 0.0,
+  "qa_probes": [],
+  "surfacing_seeds": [
+    {
+      "rank": 1,
+      "score": 0.065,
+      "source": "auth-jwt-rotation-policy.md",
+      "content": "JWT rotation policy overview: HS256 signing keys rotate every 24 hours on a staggered per-region schedule; the rotation coordinator broadcasts a signed event when each kid is retired."
+    },
+    {
+      "rank": 2,
+      "score": 0.048,
+      "source": "auth-jwt-kid-rotation.md",
+      "content": "Key identifier (kid) rotation: each rotation produces a fresh kid embedded in the JOSE header; verifiers track the last two active kid values to keep the rotation seam invisible to clients."
+    },
+    {
+      "rank": 3,
+      "score": 0.035,
+      "source": "auth-jwt-signing-secrets.md",
+      "content": "Signing secret cadence: HS256 secrets live in the HSM and are exported to regional auth services on a 24h cadence aligned to the rotation policy; cache TTL is bounded at 15 minutes."
+    },
+    {
+      "rank": 4,
+      "score": 0.025,
+      "source": "ratelimit-headers.md",
+      "content": "Rate limit headers: clients should respect X-RateLimit-Limit, X-RateLimit-Remaining, and X-RateLimit-Reset; per-minute windows align to the calendar minute."
+    },
+    {
+      "rank": 5,
+      "score": 0.018,
+      "source": "auth-jwt-grace-window.md",
+      "content": "Grace window: the previous kid stays valid for a 90-minute grace period after rotation; tokens signed with the older kid verify successfully during this window and are not re-issued."
+    },
+    {
+      "rank": 6,
+      "score": 0.012,
+      "source": "session-refresh-tokens.md",
+      "content": "Refresh tokens: long-lived credentials used to obtain new access tokens without re-authenticating; refresh tokens live in a separate key space not subject to the standard 24h rotation."
+    },
+    {
+      "rank": 7,
+      "score": 0.008,
+      "source": "cache-invalidation.md",
+      "content": "Cache invalidation strategies: prefer signed-broadcast invalidation over TTL-only expiry when cache freshness matters more than tail latency; document the invalidation path in the runbook."
+    },
+    {
+      "rank": 8,
+      "score": 0.003,
+      "source": "audit-log-format.md",
+      "content": "Audit log line format: structured JSON with timestamp (RFC3339), actor, action, resource, outcome, and trace_id; rotated daily and retained for 90 days."
+    }
+  ],
+  "surfacing_eval": {
+    "query": "JWT authentication rotation policy",
+    "k": 4,
+    "expected_ids": [
+      "auth-jwt-rotation-policy.md",
+      "auth-jwt-kid-rotation.md",
+      "auth-jwt-signing-secrets.md",
+      "auth-jwt-grace-window.md"
+    ]
+  },
+  "payload": "F2 sweep harness payload — content is intentionally short. The bench loops mgr.call_tool() once per threshold; the fake LTM returns surfacing_seeds verbatim and min_score is the only gate. The proxy emits a compressed result but the sweep test does not assert on compression or QA probes."
+}
