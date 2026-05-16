@@ -106,6 +106,15 @@ class LLMCompressorConfig(BaseModel):
     # On timeout the compressor falls back to TruncateCompressor (matching
     # other LLM failure modes: privacy, circuit_breaker, llm_error).
     llm_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    # When true, scan the upstream response for API keys / passwords / JWT /
+    # private keys before sending it to the LLM provider; on a hit, skip the
+    # outbound call and fall back to TruncateCompressor (last_fallback="privacy").
+    # Default-on: an operator who flips ``compression: llm_summary`` should not
+    # have to remember a second knob to avoid leaking credentials to OpenAI /
+    # Anthropic / a custom ``base_url``. Set to false only when the response
+    # body is known to be sensitive-free or you are using a self-hosted
+    # provider you trust (e.g. local Ollama). See #289.
+    privacy_scan_enabled: bool = True
 
     @model_validator(mode="after")
     def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:

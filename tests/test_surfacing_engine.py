@@ -109,6 +109,60 @@ class TestSurfacingBasic:
         assert output == LONG_RESPONSE
 
 
+class TestExplicitContextQueryKwarg:
+    """``surface(context_query=...)`` threads through to the LTM query.
+
+    Behavioral pin — the proxy forwards the agent-provided ``_context_query``
+    via this kwarg instead of leaving it in ``arguments``. The query reaching
+    ``adapter.search`` must be the explicit value, not the heuristic.
+    """
+
+    async def test_explicit_kwarg_drives_adapter_search_query(self):
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.5)])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "/unrelated/path.py"},
+            LONG_RESPONSE,
+            context_query="find authentication code",
+        )
+        assert adapter.search.await_args is not None
+        kwargs = adapter.search.await_args.kwargs
+        assert kwargs["query"] == "find authentication code"
+
+    async def test_explicit_kwarg_wins_over_legacy_in_arguments(self):
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.5)])
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=adapter)
+        await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "/x.py", "_context_query": "loser"},
+            LONG_RESPONSE,
+            context_query="winner",
+        )
+        assert adapter.search.await_args.kwargs["query"] == "winner"
+
+    async def test_per_tool_template_still_wins_over_kwarg(self):
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.5)])
+        engine = SurfacingEngine(
+            config=_make_config(
+                context_tools={"read_file": ToolSurfacingConfig(query_template="file {arg.path}")}
+            ),
+            mcp_adapter=adapter,
+        )
+        await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "/src/main.py"},
+            LONG_RESPONSE,
+            context_query="ignored because template wins",
+        )
+        assert adapter.search.await_args.kwargs["query"] == "file /src/main.py"
+
+
 class TestSurfacingGating:
     async def test_short_response_skipped(self):
         engine = SurfacingEngine(

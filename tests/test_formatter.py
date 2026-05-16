@@ -105,3 +105,168 @@ class TestFormatterInjection:
         results = [FakeResult(FakeChunk(), 0.5)]
         output = fmt.inject("response", results, "query")
         assert "## 관련 기억" in output
+
+
+class TestPreviewMaxCharsKnob:
+    """F3 — ``preview_max_chars`` controls the per-result preview slice.
+
+    Default (300) preserves prior behavior; operators can shorten or
+    lengthen the preview per deployment.
+    """
+
+    def test_default_preview_caps_at_300(self):
+        """Regression guard: existing 300-cap behavior must survive when
+        ``preview_max_chars`` is not overridden."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        long_content = "a" * 800
+        results = [FakeResult(FakeChunk(content=long_content), 0.5)]
+        output = fmt.inject("response", results, "query")
+        # The preview is the slice that follows the "score=X.XX): " marker
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) <= 300
+        assert "a" * 250 in preview_line  # well within the cap
+
+    def test_lower_preview_max_chars_truncates(self):
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=50))
+        results = [FakeResult(FakeChunk(content="b" * 800), 0.5)]
+        output = fmt.inject("response", results, "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) <= 50
+        # Tighter check: exactly 50 'b's then nothing more on that line
+        assert preview_line.startswith("b" * 50)
+        assert "b" * 51 not in preview_line
+
+    def test_higher_preview_max_chars_allows_longer_preview(self):
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=600, max_injection_chars=10000))
+        results = [FakeResult(FakeChunk(content="c" * 800), 0.5)]
+        output = fmt.inject("response", results, "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) >= 600
+        assert "c" * 600 in preview_line
+
+    def test_cap_bounds_assembled_preview_with_context_windows(self):
+        """Regression: when ``context_window_size > 0`` the formatter joins
+        ±150-char window snippets around the matched chunk. The cap must
+        apply to the **assembled** preview AND must preserve the matched
+        chunk — a front-slice can drop the hit entirely when ``window_before``
+        exceeds the cap."""
+
+        @dataclass
+        class _FakeWindowChunk:
+            content: str
+
+        @dataclass
+        class _FakeContext:
+            window_before: list
+            window_after: list
+
+        @dataclass
+        class _FakeResultWithCtx:
+            chunk: FakeChunk
+            score: float
+            context: _FakeContext
+
+        result = _FakeResultWithCtx(
+            chunk=FakeChunk(content="m" * 800),
+            score=0.5,
+            context=_FakeContext(
+                window_before=[_FakeWindowChunk(content="b" * 400)],
+                window_after=[_FakeWindowChunk(content="a" * 400)],
+            ),
+        )
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=50))
+        output = fmt.inject("response", [result], "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) <= 50, (
+            f"preview_max_chars=50 must bound the assembled preview, "
+            f"got len={len(preview_line)}: {preview_line!r}"
+        )
+        # The matched chunk MUST appear in the preview; the cap is hit-first,
+        # so when window_before+chunk would exceed the cap, window_before is
+        # trimmed or dropped rather than the chunk.
+        assert "m" in preview_line, (
+            f"matched chunk content (the hit) must be preserved, "
+            f"got: {preview_line!r}"
+        )
+
+    def test_default_cap_with_context_windows_keeps_chunk_and_trims_windows(self):
+        """At default ``preview_max_chars=300`` with context windows, the
+        chunk fills the cap budget first and any leftover goes to windows.
+        No silent overflow past the documented per-result cap."""
+
+        @dataclass
+        class _FakeWindowChunk:
+            content: str
+
+        @dataclass
+        class _FakeContext:
+            window_before: list
+            window_after: list
+
+        @dataclass
+        class _FakeResultWithCtx:
+            chunk: FakeChunk
+            score: float
+            context: _FakeContext
+
+        result = _FakeResultWithCtx(
+            chunk=FakeChunk(content="m" * 80),  # short chunk leaves room for windows
+            score=0.5,
+            context=_FakeContext(
+                window_before=[_FakeWindowChunk(content="b" * 400)],
+                window_after=[_FakeWindowChunk(content="a" * 400)],
+            ),
+        )
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=300))
+        output = fmt.inject("response", [result], "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert len(preview_line) <= 300
+        assert "m" * 80 in preview_line  # full chunk fits
+        assert "b" in preview_line  # window_before included
+        assert "a" in preview_line  # window_after included
+
+    def test_tiny_cap_drops_windows_keeps_chunk(self):
+        """When the cap is smaller than the chunk slice, windows are dropped
+        entirely (no budget left for them) but the chunk is still rendered."""
+
+        @dataclass
+        class _FakeWindowChunk:
+            content: str
+
+        @dataclass
+        class _FakeContext:
+            window_before: list
+            window_after: list
+
+        @dataclass
+        class _FakeResultWithCtx:
+            chunk: FakeChunk
+            score: float
+            context: _FakeContext
+
+        result = _FakeResultWithCtx(
+            chunk=FakeChunk(content="m" * 800),
+            score=0.5,
+            context=_FakeContext(
+                window_before=[_FakeWindowChunk(content="b" * 400)],
+                window_after=[_FakeWindowChunk(content="a" * 400)],
+            ),
+        )
+        fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=20))
+        output = fmt.inject("response", [result], "query")
+        marker = "score=0.50): "
+        idx = output.index(marker) + len(marker)
+        preview_line = output[idx:].split("\n", 1)[0]
+        assert preview_line == "m" * 20, (
+            f"tiny cap must yield chunk-only preview, got: {preview_line!r}"
+        )

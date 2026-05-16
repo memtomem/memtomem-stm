@@ -85,6 +85,8 @@ The injection mode is configurable: `prepend` (default), `append`, or `section`.
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
 | `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
+| `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
+| `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `cache_ttl_seconds` | `60.0` | Internal surfacing result cache TTL |

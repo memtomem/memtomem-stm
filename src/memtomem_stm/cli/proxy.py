@@ -77,6 +77,30 @@ def _hdr(s: str) -> str:
     return click.style(s, bold=True) if _color_on() else s
 
 
+def _split_args(args_str: str) -> list[str]:
+    """Tokenize a stdio-server ``--args`` / prompt-args string.
+
+    POSIX: plain ``shlex.split``. Windows: same POSIX-style quoting, but with
+    backslash-escape disabled so ``D:\\a\\repo\\tests\\_x.py`` round-trips —
+    default ``shlex.split`` would chew ``\\a``, ``\\t``, ``\\_`` as escapes
+    and emit ``D:arepotests_x.py``, which would later be passed to the child
+    interpreter as a (mangled, relative) path. Raises ``ValueError`` on
+    unclosed quotes, matching ``shlex.split``'s contract.
+
+    Trade-off: with ``escape=""`` an embedded quote-escape (``\\"`` inside a
+    double-quoted token) is no longer recognized on Windows. Acceptable
+    because Windows-native ``cmd.exe`` quoting uses ``^`` rather than ``\\``,
+    and backslash-as-path-separator is the dominant case in this surface.
+    """
+    if sys.platform == "win32":
+        lex = shlex.shlex(args_str, posix=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        lex.escape = ""
+        return list(lex)
+    return shlex.split(args_str)
+
+
 def _load(config_path: Path) -> dict[str, Any]:
     resolved = config_path.expanduser().resolve()
     if not resolved.exists():
@@ -139,7 +163,16 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
 
 def _run_claude_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
     """Invoke the ``claude`` CLI — isolated so tests replace a single seam."""
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # ``encoding="utf-8"`` is explicit so non-ASCII bytes from the child don't
+    # hit the platform default codec (cp1252/cp949 on Windows). See #302 P0.
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 # PEP 508 dependency specifier: the distribution name is the leading identifier
@@ -790,7 +823,7 @@ def add(
         entry["command"] = command
         if args_str:
             try:
-                entry["args"] = shlex.split(args_str)
+                entry["args"] = _split_args(args_str)
             except ValueError as exc:
                 click.echo(f"{_err('Error:')} malformed --args: {exc}", err=True)
                 sys.exit(1)
@@ -1796,7 +1829,7 @@ def init(
             )
             if args_str.strip():
                 try:
-                    entry["args"] = shlex.split(args_str)
+                    entry["args"] = _split_args(args_str)
                 except ValueError as exc:
                     click.echo(f"{_err('Error:')} malformed arguments: {exc}", err=True)
                     sys.exit(1)

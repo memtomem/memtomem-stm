@@ -9,19 +9,19 @@ from memtomem_stm.surfacing.context_extractor import ContextExtractor
 def _extract(
     tool: str = "read_file",
     arguments: dict | None = None,
+    *,
+    context_query: str | None = None,
     **config_kwargs,
 ) -> str | None:
     ext = ContextExtractor()
     cfg = SurfacingConfig(**config_kwargs)
-    return ext.extract_query("server", tool, arguments or {}, cfg)
+    return ext.extract_query("server", tool, arguments or {}, cfg, context_query=context_query)
 
 
 class TestQueryTemplate:
     def test_template_substitution(self):
         cfg_kwargs = {
-            "context_tools": {
-                "read_file": ToolSurfacingConfig(query_template="file {arg.path}")
-            }
+            "context_tools": {"read_file": ToolSurfacingConfig(query_template="file {arg.path}")}
         }
         result = _extract("read_file", {"path": "/src/main.py"}, **cfg_kwargs)
         assert result == "file /src/main.py"
@@ -47,6 +47,76 @@ class TestContextQuery:
         assert "/src/main.py" in result
 
 
+class TestExplicitContextQueryKwarg:
+    """Priority-2 branch: explicit ``context_query`` kwarg from the proxy.
+
+    The proxy strips ``_context_query`` out of ``arguments`` before invoking
+    surfacing and forwards it via this kwarg. The legacy in-arguments branch
+    stays as a fallback for direct engine callers and tests.
+    """
+
+    def test_explicit_kwarg_wins(self):
+        result = _extract(
+            "any_tool",
+            {"path": "/unrelated.py"},
+            context_query="find authentication code",
+        )
+        assert result == "find authentication code"
+
+    def test_explicit_kwarg_wins_over_legacy_in_arguments(self):
+        result = _extract(
+            "any_tool",
+            {"_context_query": "loser", "path": "/unrelated.py"},
+            context_query="winner",
+        )
+        assert result == "winner"
+
+    def test_empty_explicit_kwarg_falls_through_to_legacy(self):
+        result = _extract(
+            "any_tool",
+            {"_context_query": "from arguments", "path": "/x.py"},
+            context_query="",
+        )
+        assert result == "from arguments"
+
+    def test_whitespace_explicit_kwarg_falls_through_to_legacy(self):
+        result = _extract(
+            "any_tool",
+            {"_context_query": "from arguments", "path": "/x.py"},
+            context_query="   \n\t  ",
+        )
+        assert result == "from arguments"
+
+    def test_none_explicit_kwarg_falls_through_to_heuristic(self):
+        result = _extract(
+            "any_tool",
+            {"path": "/src/main.py is a test file"},
+            context_query=None,
+        )
+        assert result is not None
+        assert "main.py" in result
+
+    def test_template_still_wins_over_explicit_kwarg(self):
+        cfg_kwargs = {
+            "context_tools": {"read_file": ToolSurfacingConfig(query_template="file {arg.path}")}
+        }
+        result = _extract(
+            "read_file",
+            {"path": "/src/main.py"},
+            context_query="ignored because template wins",
+            **cfg_kwargs,
+        )
+        assert result == "file /src/main.py"
+
+    def test_explicit_kwarg_is_stripped(self):
+        result = _extract(
+            "any_tool",
+            {"path": "/unrelated.py"},
+            context_query="  padded query  ",
+        )
+        assert result == "padded query"
+
+
 class TestHeuristicExtraction:
     def test_semantic_string_args(self):
         result = _extract("tool", {"path": "/src/main.py", "query": "search term"})
@@ -63,10 +133,13 @@ class TestHeuristicExtraction:
             assert "main" in result
 
     def test_skips_identifiers(self):
-        result = _extract("tool", {
-            "id": "550e8400-e29b-41d4-a716-446655440000",
-            "name": "actual content with enough words",
-        })
+        result = _extract(
+            "tool",
+            {
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "name": "actual content with enough words",
+            },
+        )
         assert "550e8400" not in (result or "")
         assert "actual content" in result
 

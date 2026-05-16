@@ -280,6 +280,72 @@ class TestParserStrategy:
         assert isinstance(adapter._parser, CompactResultParser)
 
 
+class TestParserMaxContentChars:
+    """F3 — ``parse(max_content_chars=N)`` caps per-result content at N.
+
+    Default (500) preserves prior behavior so existing callers and the
+    module-level ``_compact_parser`` singleton keep working unchanged.
+    """
+
+    def test_compact_parser_honors_max_content_chars(self):
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser
+
+        long_line = "x" * 800
+        text = f"[1] 0.50 | doc.md\n{long_line}\n"
+        results, _ = CompactResultParser().parse(text, max_content_chars=100)
+        assert len(results) == 1
+        assert len(results[0].chunk.content) == 100
+
+    def test_compact_parser_default_caps_at_500(self):
+        """Regression guard: kwarg default must stay at 500 so the
+        module-level singleton and any unaware callers keep current behavior."""
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser
+
+        long_line = "x" * 800
+        text = f"[1] 0.50 | doc.md\n{long_line}\n"
+        results, _ = CompactResultParser().parse(text)
+        assert len(results) == 1
+        assert len(results[0].chunk.content) == 500
+
+    def test_structured_parser_honors_max_content_chars(self):
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        long_content = "y" * 800
+        text = (
+            '{"results": ['
+            '  {"rank": 1, "score": 0.5, "source": "doc.md", "hierarchy": "X",'
+            '   "namespace": "default", "chunk_id": "abc",'
+            f'   "content": "{long_content}"}}'
+            "]}"
+        )
+        results, _ = StructuredResultParser().parse(text, max_content_chars=200)
+        assert len(results) == 1
+        assert len(results[0].chunk.content) == 200
+
+    def test_structured_parser_default_caps_at_500(self):
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        long_content = "y" * 800
+        text = (
+            '{"results": ['
+            '  {"rank": 1, "score": 0.5, "source": "doc.md", "hierarchy": "X",'
+            '   "namespace": "default", "chunk_id": "abc",'
+            f'   "content": "{long_content}"}}'
+            "]}"
+        )
+        results, _ = StructuredResultParser().parse(text)
+        assert len(results) == 1
+        assert len(results[0].chunk.content) == 500
+
+    def test_short_content_unaffected_by_max_content_chars(self):
+        """Sanity: content shorter than the cap stays intact regardless."""
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser
+
+        text = "[1] 0.50 | doc.md\nshort\n"
+        results, _ = CompactResultParser().parse(text, max_content_chars=100)
+        assert results[0].chunk.content == "short"
+
+
 # ── Phase 2 structured format snapshots ──────────────────────────────────
 
 STRUCTURED_TWO_RESULTS = (

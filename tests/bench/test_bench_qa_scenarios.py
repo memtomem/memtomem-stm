@@ -286,14 +286,14 @@ _SURFACING_ID_RE = re.compile(r"Surfacing ID:\s*([a-f0-9]{16})")
 async def test_s10_surfacing_recall_at_k(tmp_path, bench_qa_report):
     """Fake LTM serves 3 fixture-declared seeds; top-2 match the expected ranks.
 
-    The ``path`` argument (not ``_context_query``) drives ``ContextExtractor``
-    because ``ProxyManager.call_tool`` strips ``_context_query`` from
-    ``upstream_args`` before invoking surfacing (see ``manager.py:973``);
-    ``_context_query`` is today a compression hint, not a surfacing hint.
-    ``path`` tokenizes to ``"src auth jwt rotation py"`` which clears
-    ``min_query_tokens=3``. The fake LTM ignores the query and returns
-    fixture seeds verbatim, so query content does not affect recall —
-    the test exercises the pipeline wiring, not query semantics.
+    Post-F1: ``_context_query`` drives ``ContextExtractor`` via the explicit
+    ``context_query`` kwarg threaded through ``SurfacingEngine.surface()``.
+    The proxy still strips ``_context_query`` from ``upstream_args`` to keep
+    the control signal out of the upstream tool's argument bag, but the
+    extractor receives it via the kwarg at priority 2 (above the legacy
+    in-arguments branch). The fake LTM ignores the query and returns fixture
+    seeds verbatim, so query content does not affect recall — the test
+    exercises the pipeline wiring, not query semantics.
 
     The fake server's per-call UUID suffix exists only in default mode
     to defeat ``sha256(content)`` dedup — bench_qa ``--seeds`` mode omits
@@ -332,10 +332,7 @@ async def test_s10_surfacing_recall_at_k(tmp_path, bench_qa_report):
         result = await mgr.call_tool(
             "fake",
             "tool_s10",
-            {
-                "path": "src/auth/jwt_rotation.py",
-                "_context_query": fixture["surfacing_eval"]["query"],
-            },
+            {"_context_query": fixture["surfacing_eval"]["query"]},
             trace_id=expected_trace_id,
         )
 

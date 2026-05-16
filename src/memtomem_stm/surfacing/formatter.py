@@ -41,16 +41,22 @@ class SurfacingFormatter:
             source = str(meta.source_file.name) if meta.source_file else ""
 
             ctx = getattr(r, "context", None)
-            if ctx and (ctx.window_before or ctx.window_after):
-                parts = []
-                if ctx.window_before:
-                    parts.append("..." + ctx.window_before[-1].content[-150:].replace("\n", " "))
-                parts.append(chunk.content[:300].replace("\n", " "))
-                if ctx.window_after:
-                    parts.append(ctx.window_after[0].content[:150].replace("\n", " ") + "...")
-                preview = " | ".join(parts)
-            else:
-                preview = chunk.content[:300].replace("\n", " ")
+            preview_cap = self._config.preview_max_chars
+            # Hit-first budgeting: the matched chunk is always rendered (up to
+            # the cap); ±150-char window snippets fill whatever budget remains.
+            # A naive front-slice of the joined preview can drop the chunk
+            # entirely when window_before is large.
+            preview = chunk.content[:preview_cap].replace("\n", " ")
+            if ctx and ctx.window_before:
+                budget = min(150, preview_cap - len(preview) - len(" | ") - len("..."))
+                if budget > 0:
+                    snippet = ctx.window_before[-1].content[-budget:].replace("\n", " ")
+                    preview = "..." + snippet + " | " + preview
+            if ctx and ctx.window_after:
+                budget = min(150, preview_cap - len(preview) - len(" | ") - len("..."))
+                if budget > 0:
+                    snippet = ctx.window_after[0].content[:budget].replace("\n", " ")
+                    preview = preview + " | " + snippet + "..."
 
             lines.append(f"- **{source}**{ns_badge} (score={r.score:.2f}): {preview}")
 

@@ -54,6 +54,7 @@ from memtomem_stm.proxy.memory_ops import (
     extract_and_store,
     format_fact_md,
 )
+from memtomem_stm.proxy.privacy import DEFAULT_PATTERNS as PRIVACY_DEFAULT_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
@@ -644,7 +645,16 @@ class ProxyManager:
                     # concurrent config swap can't re-bind ``self._llm_compressor``
                     # before we read ``.last_fallback`` below.
                     compressor = self._llm_compressor
-                result = await compressor.compress(text, max_chars=max_chars)
+                # #289: scan for API keys / JWT / private keys before sending
+                # the response to the LLM provider. Default-on; operators
+                # disable per-config when the upstream is known sensitive-free
+                # or the provider is local/trusted.
+                privacy_patterns = (
+                    PRIVACY_DEFAULT_PATTERNS if llm_cfg.privacy_scan_enabled else None
+                )
+                result = await compressor.compress(
+                    text, max_chars=max_chars, privacy_patterns=privacy_patterns
+                )
                 return result, compressor.last_fallback
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",
@@ -676,6 +686,7 @@ class ProxyManager:
         text: str,
         *,
         trace_id: str | None = None,
+        context_query: str | None = None,
     ) -> str:
         """Apply proactive memory surfacing if eligible."""
         if self._surfacing_engine is None:
@@ -687,6 +698,7 @@ class ProxyManager:
                 arguments=arguments,
                 response_text=text,
                 trace_id=trace_id,
+                context_query=context_query,
             )
         except Exception:
             logger.warning(
@@ -705,6 +717,7 @@ class ProxyManager:
         text: str,
         *,
         trace_id: str | None = None,
+        context_query: str | None = None,
     ) -> tuple[str, bool | None, str | None]:
         """Surface on a progressive first-chunk when the formatter mode keeps
         the ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant intact.
@@ -741,6 +754,7 @@ class ProxyManager:
                 arguments=arguments,
                 response_text=text,
                 trace_id=trace_id,
+                context_query=context_query,
             )
             return surfaced, True, None
         except Exception as exc:
@@ -996,8 +1010,16 @@ class ProxyManager:
         through the same hit pipeline as a single call would.
         """
         self.tracker.record_cache_hit()
+        context_query = arguments.get("_context_query") if arguments else None
         with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
-            return await self._apply_surfacing(server, tool, arguments, cached, trace_id=trace_id)
+            return await self._apply_surfacing(
+                server,
+                tool,
+                arguments,
+                cached,
+                trace_id=trace_id,
+                context_query=context_query if isinstance(context_query, str) else None,
+            )
 
     async def call_tool(
         self,
@@ -1441,7 +1463,12 @@ class ProxyManager:
                 surfacing_on_progressive_ok,
                 surface_error,
             ) = await self._apply_surfacing_on_progressive(
-                server, tool, upstream_args, compressed, trace_id=trace_id
+                server,
+                tool,
+                upstream_args,
+                compressed,
+                trace_id=trace_id,
+                context_query=context_query,
             )
             _surface_ms = (_time.monotonic() - _t0) * 1000
         else:
@@ -1635,7 +1662,12 @@ class ProxyManager:
                         surfacing_on_progressive_ok,
                         surface_error,
                     ) = await self._apply_surfacing_on_progressive(
-                        server, tool, upstream_args, compressed, trace_id=trace_id
+                        server,
+                        tool,
+                        upstream_args,
+                        compressed,
+                        trace_id=trace_id,
+                        context_query=context_query,
                     )
                     _surface_ms = (_time.monotonic() - _t0) * 1000
             else:
@@ -1645,7 +1677,12 @@ class ProxyManager:
                 ):
                     _t0 = _time.monotonic()
                     surfaced = await self._apply_surfacing(
-                        server, tool, upstream_args, compressed, trace_id=trace_id
+                        server,
+                        tool,
+                        upstream_args,
+                        compressed,
+                        trace_id=trace_id,
+                        context_query=context_query,
                     )
                     _surface_ms = (_time.monotonic() - _t0) * 1000
 
