@@ -180,3 +180,8 @@ class TestDefaultPatternCoverage:
     )
     def test_default_patterns_do_not_match_benign_strings(self, sample: str) -> None:
         assert privacy.contains_sensitive_content(sample) is False
+
+    def test_scans_beyond_ten_kilobytes(self) -> None:
+        text = ("safe content " * 900) + "password: hunter2"
+        assert len(text) > 10_000
+        assert privacy.contains_sensitive_content(text) is True
