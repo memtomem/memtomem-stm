@@ -8,8 +8,18 @@ pattern keeps the third re-implementation of it from showing up.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
+
+# Windows ``MoveFileEx`` retry budget. The wall-clock ceiling is approximate —
+# Windows' default timer resolution is ~15.6 ms, so each ``time.sleep(0.005)``
+# typically rounds up to one tick. Real worst case is closer to 150 ms than
+# 50 ms; treat the budget as "low enough to not stall a hot-path write" rather
+# than a hard SLA.
+_WIN_REPLACE_ATTEMPTS = 10
+_WIN_REPLACE_BACKOFF_S = 0.005
 
 
 def atomic_write_text(
@@ -64,7 +74,36 @@ def atomic_write_text(
                 tmp.chmod(mode)
             except OSError:
                 pass
-        os.replace(tmp, resolved)
+        _replace_with_windows_retry(tmp, resolved)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _replace_with_windows_retry(src: Path, dst: Path) -> None:
+    """``os.replace`` with a brief retry loop on Windows.
+
+    On Windows, ``MoveFileEx`` (the syscall behind ``os.replace``) raises
+    ``PermissionError`` (``WinError 5``) when another process has ``dst``
+    open without ``FILE_SHARE_DELETE`` — and Python's ``open()`` does not
+    pass that flag. A concurrent reader (e.g. the auto-index watcher
+    re-reading the same file ``atomic_write_text`` is replacing) holds a
+    sub-millisecond handle that briefly blocks the rename. The rename
+    itself stays NTFS-atomic; we just ride out the transient conflict.
+
+    Scope intentionally narrow: only ``PermissionError`` (``WinError 5``)
+    is retried. ``WinError 32`` (sharing violation under AV scans, etc.)
+    has a similar transient pattern but isn't observed in CI today; widen
+    the catch only when a concrete failure appears.
+    """
+    if sys.platform != "win32":
+        os.replace(src, dst)
+        return
+    for attempt in range(_WIN_REPLACE_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _WIN_REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_WIN_REPLACE_BACKOFF_S)

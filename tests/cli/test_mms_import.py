@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import stat
+import sys
 from datetime import datetime, timezone
 
 import pytest
@@ -14,6 +15,7 @@ from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.mms import drift, state
 from memtomem_stm.mms.drift import compute_drift_hash
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
+from helpers import set_home
 
 
 @pytest.fixture
@@ -24,7 +26,7 @@ def runner() -> CliRunner:
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
     """Pin HOME so ``~/.mms`` and ``~/.claude.json`` etc. land in tmp."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     cwd = tmp_path / "proj"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
@@ -230,8 +232,10 @@ class TestApply:
 
         # 1. file + permissions
         assert state.import_state_path().exists()
-        mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
-        assert mode == 0o600
+        if sys.platform != "win32":
+            # NTFS doesn't expose POSIX mode bits; ACL is the right primitive.
+            mode = stat.S_IMODE(state.import_state_path().stat().st_mode)
+            assert mode == 0o600
 
         # 2. counter assertion: cardinality AND identity, both axes
         cfg = state.load_registry()

@@ -141,6 +141,7 @@ class SurfacingEngine:
         response_text: str,
         *,
         trace_id: str | None = None,
+        context_query: str | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -165,7 +166,9 @@ class SurfacingEngine:
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
             return response_text
 
-        query = self._extractor.extract_query(server, tool, arguments, self._config)
+        query = self._extractor.extract_query(
+            server, tool, arguments, self._config, context_query=context_query
+        )
         if query is None:
             self._observability.record_skip(tool, "no_query")
             logger.debug("Surfacing skipped: no query extracted for %s/%s", server, tool)

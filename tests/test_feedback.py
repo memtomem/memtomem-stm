@@ -143,9 +143,25 @@ class TestFeedbackStore:
         assert row_s1["query_preview"].endswith("...")
         assert len(row_s1["query_preview"]) == 80
 
-    def test_get_stats_tool_filter_excludes_other_ratings(
+    def test_get_stats_recent_tied_created_at_breaks_by_insert_order(
         self, feedback_store: FeedbackStore
     ):
+        for i in range(1, 6):
+            feedback_store.record_surfacing(f"s{i}", "srv", "t", f"q{i}", ["m"], [0.5])
+        # Force a tie on created_at — Windows time.time() resolution can collapse
+        # rapid inserts onto identical timestamps; without a secondary sort key,
+        # SQLite's tie-break is unspecified and "recent" becomes nondeterministic.
+        feedback_store._db.executemany(  # type: ignore[union-attr]
+            "UPDATE surfacing_events SET created_at = ? WHERE id = ?",
+            [(1000.0, f"s{i}") for i in range(1, 6)],
+        )
+        feedback_store._db.commit()  # type: ignore[union-attr]
+
+        stats = feedback_store.get_stats(limit=3)
+        previews = [r["query_preview"] for r in stats["recent"]]
+        assert previews == ["q5", "q4", "q3"]
+
+    def test_get_stats_tool_filter_excludes_other_ratings(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s_a", "srv", "tool_a", "q", ["m1"], [0.9])
         feedback_store.record_surfacing("s_b", "srv", "tool_b", "q", ["m2"], [0.9])
         feedback_store.record_feedback("s_a", "helpful")
@@ -211,9 +227,7 @@ class TestFeedbackTracker:
 
 
 class TestAutoTuner:
-    def _make_tuner(
-        self, feedback_store: FeedbackStore, min_score: float = 0.02
-    ) -> AutoTuner:
+    def _make_tuner(self, feedback_store: FeedbackStore, min_score: float = 0.02) -> AutoTuner:
         cfg = SurfacingConfig(
             auto_tune_enabled=True,
             auto_tune_min_samples=5,
@@ -222,9 +236,7 @@ class TestAutoTuner:
         )
         return AutoTuner(cfg, feedback_store)
 
-    def _seed_feedback(
-        self, store: FeedbackStore, tool: str, not_relevant: int, helpful: int
-    ):
+    def _seed_feedback(self, store: FeedbackStore, tool: str, not_relevant: int, helpful: int):
         store.record_surfacing("s1", "sv", tool, "q", ["m1"], [0.5])
         for _ in range(not_relevant):
             store.record_feedback("s1", "not_relevant")

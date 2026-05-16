@@ -15,8 +15,9 @@ path:
 6. `mms project show` from proj-a — enabled list correct, source = marker.
 7. Re-run `mms import --apply` — idempotent, "Already up to date."
 
-Sandboxed via `monkeypatch.setenv("HOME", tmp_path)`. The registry,
-projects index, and per-project markers all land in tmp.
+Sandboxed via `set_home(monkeypatch, tmp_path)` — patches HOME and
+USERPROFILE so `Path.home()` is hermetic on every platform. The
+registry, projects index, and per-project markers all land in tmp.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from click.testing import CliRunner
 from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.cli.mms_project import project_group
 from memtomem_stm.mms import state
+from helpers import set_home
 
 
 @pytest.fixture
@@ -40,7 +42,7 @@ def runner() -> CliRunner:
 def test_w1_acceptance_path_b_and_common_path(runner, tmp_path, monkeypatch):
     """Full §12 walk-through. Tagged via the test name; runs in CI default."""
     # ── Step 0: sandbox HOME, chdir into a clean dir, seed fake claude-code ────
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
     # The import scanner's claude-code path also reads <cwd>/.mcp.json; make sure
     # we're not standing in the actual repo (which has no .mcp.json today, but
     # any future commit that adds one would silently inflate this test's count).
@@ -139,7 +141,7 @@ def test_w1_acceptance_path_b_and_common_path(runner, tmp_path, monkeypatch):
 
 def test_w1_acceptance_marker_walk_up_from_subdirectory(runner, tmp_path, monkeypatch):
     """RFC §6 — `mms project show` from a subdirectory finds the parent marker."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
 
     project_root = tmp_path / "monorepo"
     project_root.mkdir()
@@ -161,7 +163,7 @@ def test_w1_acceptance_marker_walk_up_from_subdirectory(runner, tmp_path, monkey
 def test_w1_acceptance_empty_registry_friendly_error(runner, tmp_path, monkeypatch):
     """PR1's graceful contract surfaces in the W1 acceptance test —
     a user who runs enable before importing gets a friendly hint."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, tmp_path)
 
     proj = tmp_path / "proj"
     proj.mkdir()

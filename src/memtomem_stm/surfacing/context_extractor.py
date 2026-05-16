@@ -23,13 +23,22 @@ class ContextExtractor:
         tool: str,
         arguments: dict[str, Any],
         config: SurfacingConfig,
+        *,
+        context_query: str | None = None,
     ) -> str | None:
         # 1. Per-tool template
         tool_cfg = config.context_tools.get(tool)
         if tool_cfg and tool_cfg.query_template:
             return self._apply_template(tool_cfg.query_template, server, tool, arguments)
 
-        # 2. Agent-provided context
+        # 2. Explicit context_query parameter (preferred path from the proxy,
+        # which extracts ``_context_query`` from upstream args and forwards it
+        # via this kwarg without re-inserting it into ``arguments``).
+        if isinstance(context_query, str) and context_query.strip():
+            return context_query.strip()
+
+        # 3. Agent-provided context (legacy: kept for direct engine callers
+        # and tests that still pass ``_context_query`` inside ``arguments``).
         if "_context_query" in arguments:
             cq = arguments["_context_query"]
             if isinstance(cq, str) and cq.strip():

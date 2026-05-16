@@ -460,6 +460,7 @@ class TestApplySurfacing:
             arguments={"q": "x"},
             response_text="original",
             trace_id=None,
+            context_query=None,
         )
 
     async def test_engine_failure_returns_original(self, tmp_path, caplog):
@@ -557,6 +558,79 @@ class TestApplySurfacingOnProgressive:
         assert ok is False
         assert err == "RuntimeError"
         assert "Surfacing failed" in caplog.text
+
+
+# ── F1: context_query plumbing through proxy helpers ───────────────────
+
+
+class TestContextQueryPlumbing:
+    """F1 — proxy strips ``_context_query`` from ``upstream_args`` and forwards
+    it via the explicit ``context_query`` kwarg on both surfacing helpers
+    and the cache-hit path."""
+
+    async def test_apply_surfacing_forwards_context_query(self, tmp_path):
+        mgr = _make_manager(tmp_path=tmp_path)
+        mock_engine = AsyncMock()
+        mock_engine.surface.return_value = "surfaced"
+        mgr._surfacing_engine = mock_engine
+
+        await mgr._apply_surfacing("srv", "t", {"q": "x"}, "text", context_query="find auth")
+
+        mock_engine.surface.assert_awaited_once_with(
+            server="srv",
+            tool="t",
+            arguments={"q": "x"},
+            response_text="text",
+            trace_id=None,
+            context_query="find auth",
+        )
+
+    async def test_apply_surfacing_on_progressive_forwards_context_query(self, tmp_path):
+        mgr = _make_manager(tmp_path=tmp_path)
+        engine = _mock_engine_with_mode("append", surface_return="with memories")
+        mgr._surfacing_engine = engine
+
+        await mgr._apply_surfacing_on_progressive(
+            "srv", "t", {"q": "x"}, "chunk", context_query="find auth"
+        )
+
+        kwargs = engine.surface.await_args.kwargs
+        assert kwargs["context_query"] == "find auth"
+
+    async def test_on_cache_hit_extracts_and_forwards_context_query(self, tmp_path):
+        """``_on_cache_hit`` pulls ``_context_query`` from ``arguments`` and
+        passes it explicitly to ``_apply_surfacing`` without mutating args."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        mock_engine = AsyncMock()
+        mock_engine.surface.return_value = "cached + surfaced"
+        mgr._surfacing_engine = mock_engine
+
+        args = {"path": "/x.py", "_context_query": "find auth"}
+        await mgr._on_cache_hit("cached body", "srv", "t", args, trace_id="abc")
+
+        # The cache-hit path forwards ``arguments`` as-is (without stripping)
+        # so the legacy in-args branch keeps working for direct callers; the
+        # explicit kwarg wins via priority-2.
+        mock_engine.surface.assert_awaited_once_with(
+            server="srv",
+            tool="t",
+            arguments=args,
+            response_text="cached body",
+            trace_id="abc",
+            context_query="find auth",
+        )
+        # arguments dict was not mutated by ``_on_cache_hit``.
+        assert args == {"path": "/x.py", "_context_query": "find auth"}
+
+    async def test_on_cache_hit_no_context_query_passes_none(self, tmp_path):
+        mgr = _make_manager(tmp_path=tmp_path)
+        mock_engine = AsyncMock()
+        mock_engine.surface.return_value = "ok"
+        mgr._surfacing_engine = mock_engine
+
+        await mgr._on_cache_hit("body", "srv", "t", {"q": "x"}, trace_id="abc")
+
+        assert mock_engine.surface.await_args.kwargs["context_query"] is None
 
 
 # ── select_chunks ────────────────────────────────────────────────────────

@@ -8,12 +8,15 @@ proper cleanup of the temp file on failure.
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from memtomem_stm.utils.fileio import atomic_write_text
+from memtomem_stm.utils.fileio import _WIN_REPLACE_ATTEMPTS, atomic_write_text
 
 
 class TestAtomicWriteText:
@@ -34,12 +37,20 @@ class TestAtomicWriteText:
         atomic_write_text(target, payload)
         assert target.read_text(encoding="utf-8") == payload
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
+    )
     def test_mode_applied(self, tmp_path: Path):
         target = tmp_path / "secret.json"
         atomic_write_text(target, "{}", mode=0o600)
         # Bottom 9 bits = permission bits.
         assert (target.stat().st_mode & 0o777) == 0o600
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
+    )
     def test_no_mode_inherits_mkstemp_default(self, tmp_path: Path):
         """When ``mode`` is None we don't ``chmod`` — the file keeps the
         mode ``tempfile.mkstemp`` assigned, which is ``0o600`` on POSIX.
@@ -99,11 +110,28 @@ class TestAtomicWriteText:
         stop = threading.Event()
 
         def reader():
-            while not stop.is_set():
-                try:
-                    seen.append(target.read_text(encoding="utf-8"))
-                except FileNotFoundError:
-                    pass
+            # On Windows, two distinct sharing-violation races can fire here:
+            # (a) the reader's `open()` is denied during `os.replace()`'s rename
+            # window — we let `PermissionError` propagate out of the inner loop
+            # so the reader voluntarily stands down on the first hit; (b) the
+            # writer's `os.replace()` itself fails because the reader still
+            # holds a file handle, which the P1d (#307) retry loop tries to
+            # ride out across 10 × 5 ms. The 1 ms yield below is what makes
+            # case (b) survivable — without it, the reader re-opens the file
+            # so quickly that every retry slot lands on a held handle and the
+            # writer exhausts its budget. 1 ms is small enough to keep the
+            # stress test (≈80 reads per writer flip on macOS) but large
+            # enough that at least one of the writer's retries falls in a gap
+            # where the reader is sleeping rather than holding a handle.
+            try:
+                while not stop.is_set():
+                    try:
+                        seen.append(target.read_text(encoding="utf-8"))
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.001)
+            except PermissionError:
+                pass
 
         t = threading.Thread(target=reader)
         t.start()
@@ -119,6 +147,62 @@ class TestAtomicWriteText:
         bad = [s for s in seen if s not in (small, big)]
         assert not bad, f"observed {len(bad)} partial reads, e.g. len={len(bad[0])}"
 
+    def test_windows_retries_transient_permission_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On Windows, ``MoveFileEx`` raises ``PermissionError`` (``WinError 5``)
+        when a concurrent reader holds a transient handle on the destination.
+        The retry loop must ride out a short burst of failures and succeed
+        without surfacing the error to the caller. Pinned cross-platform by
+        forcing ``sys.platform == "win32"`` so the POSIX CI leg also exercises
+        the retry path."""
+        monkeypatch.setattr("memtomem_stm.utils.fileio.sys.platform", "win32")
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise PermissionError(5, "Access is denied", str(dst))
+            real_replace(src, dst)
+
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", flaky)
+
+        target = tmp_path / "out.txt"
+        atomic_write_text(target, "payload")
+
+        assert target.read_text(encoding="utf-8") == "payload"
+        assert calls["n"] == 4, f"expected 3 retries + 1 success, got {calls['n']} calls"
+
+    def test_windows_retry_gives_up_after_bounded_attempts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Bound on the retry loop — if ``os.replace`` keeps failing with
+        ``PermissionError``, surface it to the caller rather than stalling
+        forever. The exact attempt count is sourced from
+        ``_WIN_REPLACE_ATTEMPTS`` so a future tuning of the budget keeps
+        this test honest."""
+        monkeypatch.setattr("memtomem_stm.utils.fileio.sys.platform", "win32")
+
+        calls = {"n": 0}
+
+        def always_locked(src, dst):
+            calls["n"] += 1
+            raise PermissionError(5, "Access is denied", str(dst))
+
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", always_locked)
+
+        target = tmp_path / "out.txt"
+        with pytest.raises(PermissionError):
+            atomic_write_text(target, "payload")
+
+        assert calls["n"] == _WIN_REPLACE_ATTEMPTS, (
+            f"expected {_WIN_REPLACE_ATTEMPTS} attempts, got {calls['n']}"
+        )
+        # Temp must still be cleaned up despite the exhaustion path.
+        assert list(tmp_path.glob(target.name + ".*.tmp")) == []
+
 
 class TestSaveProxyConfigStillAtomic:
     """Regression for PR #115: the CLI's ``_save`` was migrated to use
@@ -133,7 +217,9 @@ class TestSaveProxyConfigStillAtomic:
         target = tmp_path / "stm_proxy.json"
         _save(target, {"enabled": True, "upstream_servers": {"x": {"prefix": "x"}}})
 
-        assert (target.stat().st_mode & 0o777) == 0o600
+        if sys.platform != "win32":
+            # NTFS doesn't expose POSIX mode bits; ACL is the right primitive.
+            assert (target.stat().st_mode & 0o777) == 0o600
         assert "upstream_servers" in target.read_text(encoding="utf-8")
         # No leftover tempfile.
         assert list(target.parent.glob("stm_proxy.json.*.tmp")) == []
