@@ -24,7 +24,7 @@ It sits between your AI agent and its upstream MCP servers, compressing tool res
 flowchart TB
     Agent["Agent<br/>(Claude Code, Cursor, …)"]
     subgraph STM["memtomem-stm (STM)"]
-        Pipe["CLEAN → COMPRESS → SURFACE → INDEX"]
+        Pipe["CLEAN → COMPRESS → SURFACE → (INDEX)"]
     end
     LTM[("memtomem LTM<br/>(MCP server)")]
     FS["filesystem<br/>MCP server"]
@@ -37,6 +37,13 @@ flowchart TB
     STM <-->|MCP| Other
     STM <-.->|surfacing<br/>via MCP| LTM
 ```
+
+> The **INDEX** stage requires a `FileIndexer` engine. The standalone
+> `mms` server does not wire one today, so `auto_index` and `extraction`
+> config is inert in the default deployment — enabling them logs an
+> `inert` warning at startup but does not write back to LTM. See
+> [#288](https://github.com/memtomem/memtomem-stm/issues/288) for the
+> tracking issue on a future MCP-protocol-only adapter.
 
 ## Installation
 
@@ -123,7 +130,7 @@ Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
 
 ### 3. Use the proxied tools
 
-Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, etc.). Every call goes through the 4-stage pipeline automatically — responses are cleaned, compressed, cached, and (when an LTM server is configured) enriched with relevant memories.
+Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, etc.). The CLEAN / COMPRESS / SURFACE stages run automatically — responses are cleaned, compressed, cached, and (when an LTM server is configured) enriched with relevant memories. The INDEX stage (auto_index / extraction) is currently inactive in the standalone server; see [#288](https://github.com/memtomem/memtomem-stm/issues/288).
 
 To check what's happening, ask the agent to call `stm_proxy_stats`.
 
@@ -137,6 +144,8 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 - **Claude Code's built-in tools** — `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebFetch`. They run inside the client and never reach an MCP server, so their token spend is invisible to STM and unaffected by compression or caching.
 - **Cursor / Windsurf / Claude Desktop built-ins** — same principle: anything the client provides natively bypasses the MCP layer.
 - **Sub-agent built-in calls** — the parent's MCP wiring is inherited, but built-in tool calls inside an `Agent` / `Task` invocation stay client-internal.
+
+**STM does NOT write back to LTM at runtime today.** The standalone `mms` server constructs the proxy without a `FileIndexer` engine, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are tracked in [#288](https://github.com/memtomem/memtomem-stm/issues/288) and require an MCP-protocol-only adapter that doesn't exist yet.
 
 To bring file or shell operations under STM, register an MCP server that exposes them (the [filesystem example](#1-add-an-upstream-mcp-server) above is the most common case) and steer the agent toward the proxied alias instead of the built-in. This is the same boundary every MCP proxy lives within — it's not specific to STM.
 

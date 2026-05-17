@@ -30,9 +30,13 @@ The `ollama` marker auto-skips when Ollama isn't running; CI always uses
   `sys.stdin.isatty()`: TTY → help, non-TTY → `server.main` (the MCP stdio
   server). Don't diverge behavior between the three names — registering
   any of them as an MCP client's `command` must work identically.
-- **Pipeline order is CLEAN → COMPRESS → SURFACE → INDEX** — comments in
-  `src/memtomem_stm/proxy/` are the source of truth for the per-stage
-  contracts; full architecture write-up lives in the private
+- **Pipeline order is CLEAN → COMPRESS → SURFACE → (INDEX)** — INDEX
+  only runs when `ProxyManager` is constructed with an `index_engine`;
+  the standalone `mms` server does not wire one today (see #288), so
+  `auto_index` / `extraction` config is inert in that path and logs an
+  `inert` warning at startup. Comments in `src/memtomem_stm/proxy/`
+  remain the source of truth for the per-stage contracts; full
+  architecture write-up lives in the private
   `memtomem-docs/memtomem-stm/guides-archived/pipeline.md`.
 - **Line length 100**, target `py312` (`tool.ruff`, `tool.mypy`).
 - `.claude/` and `scripts/` are gitignored — don't commit anything under them,
