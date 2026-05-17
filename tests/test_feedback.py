@@ -51,6 +51,30 @@ class TestFeedbackStore:
         assert status["initialized"] is True
         assert status["missing_tables"] == []
 
+    def test_inspect_feedback_db_pre_auto_tune_schema(self, tmp_path: Path):
+        # Regression: pre-#332 DBs with only the three original tables must
+        # report not-initialized so AutoTuner SQL errors don't follow a
+        # "ready" signal from the inspector.
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.executescript(
+                "CREATE TABLE surfacing_events (id TEXT PRIMARY KEY);"
+                "CREATE TABLE surfacing_feedback (id INTEGER PRIMARY KEY);"
+                "CREATE TABLE seen_memories (memory_id TEXT PRIMARY KEY);"
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        status = inspect_feedback_db(db_path)
+
+        assert status["exists"] is True
+        assert status["initialized"] is False
+        assert status["missing_tables"] == ["auto_tune_adjustments"]
+
     def test_record_and_retrieve_surfacing(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing(
             "surf1", "server", "tool", "query", ["mem1", "mem2"], [0.9, 0.8]
