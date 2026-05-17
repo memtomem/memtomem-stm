@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS seen_memories (
     seen_count      INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS auto_tune_adjustments (
+    tool        TEXT    PRIMARY KEY,
+    min_score   REAL    NOT NULL,
+    updated_at  REAL    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
@@ -418,6 +424,35 @@ class FeedbackStore:
                 "SELECT COUNT(*) FROM surfacing_feedback WHERE rating = 'not_relevant'"
             ).fetchone()[0]
         return not_relevant / total if total > 0 else 0.0
+
+    # ── AutoTuner persistence ──────────────────────────────────────────
+
+    def load_adjustments(self) -> dict[str, float]:
+        """Return persisted per-tool min_score adjustments.
+
+        Lets ``AutoTuner`` resume after a process restart instead of
+        losing every tuning decision the moment the server bounces.
+        Returns ``{}`` when the store is closed or empty.
+        """
+        if self._db is None:
+            return {}
+        rows = self._db.execute("SELECT tool, min_score FROM auto_tune_adjustments").fetchall()
+        return {tool: score for tool, score in rows}
+
+    def save_adjustment(self, tool: str, min_score: float) -> None:
+        """Upsert one per-tool min_score adjustment."""
+        if self._db is None:
+            return
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO auto_tune_adjustments (tool, min_score, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(tool) DO UPDATE SET "
+                "min_score = excluded.min_score, "
+                "updated_at = excluded.updated_at",
+                (tool, min_score, time.time()),
+            )
+            self._db.commit()
 
     def get_per_tool_feedback_counts(self) -> dict[str, int]:
         """Return total feedback rows per tool, ignoring any time window.

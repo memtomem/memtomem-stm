@@ -416,3 +416,33 @@ class TestAutoTuner:
         tuner.maybe_adjust("t")
         score = tuner.get_effective_min_score("t")
         assert score > 0.02
+
+    def test_adjustment_persists_across_restart(self, tmp_path: Path):
+        db_path = tmp_path / "fb.db"
+        store1 = FeedbackStore(db_path)
+        store1.initialize()
+        try:
+            self._seed_feedback(store1, "t", not_relevant=8, helpful=0)
+            tuner1 = self._make_tuner(store1)
+            adjusted = tuner1.maybe_adjust("t")
+            assert adjusted is not None
+        finally:
+            store1.close()
+
+        # Simulate restart: fresh store + tuner on same DB file.
+        store2 = FeedbackStore(db_path)
+        store2.initialize()
+        try:
+            tuner2 = self._make_tuner(store2)
+            # The previously-persisted tuning is visible without any
+            # further feedback being recorded.
+            assert tuner2.adjustments == {"t": adjusted}
+            assert tuner2.get_effective_min_score("t") == adjusted
+        finally:
+            store2.close()
+
+    def test_save_and_load_adjustments_roundtrip(self, feedback_store: FeedbackStore):
+        feedback_store.save_adjustment("tool_a", 0.025)
+        feedback_store.save_adjustment("tool_b", 0.015)
+        feedback_store.save_adjustment("tool_a", 0.030)  # upsert overwrites
+        assert feedback_store.load_adjustments() == {"tool_a": 0.030, "tool_b": 0.015}
