@@ -384,6 +384,52 @@ class TestSurfacingStats:
         assert "negative 73.3%" in result  # tuned: 22/30
         assert "negative 20.0%" in result  # ready: 5/25
 
+    async def test_cold_start_tuned_tool_reported_as_tuned(self):
+        """AutoTuner's cold-start fallback (feedback.py::maybe_adjust) can
+        tune a tool from the global feedback pool even when the tool's own
+        feedback count is below ``min_samples``. Such a tool appears in
+        ``adjusted`` despite low per-tool feedback — the formatter must
+        report it as ``auto-tuned``, not ``need N more for auto-tune``."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "cold_but_tuned",
+                    "events": 4,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 3,  # below the 20-sample threshold
+                    "not_relevant_count": 0,
+                },
+            ],
+            "rating_distribution": {"helpful": 3},
+            "total_feedback": 3,
+            "recent": [],
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            # AutoTuner has already adjusted this tool from the global pool.
+            "adjusted": {"cold_but_tuned": 0.026},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        row = next(
+            line
+            for line in result.splitlines()
+            if "cold_but_tuned:" in line and "events" in line
+        )
+        assert "auto-tuned" in row
+        assert "need" not in row
+        assert "auto-tune ready" not in row
+
     async def test_readiness_labels_suppressed_for_overridden_tools(self):
         """Tools pinned via context_tools.<tool>.min_score bypass the tuner
         entirely (engine.py:458-460). Stats output must show the pinned value

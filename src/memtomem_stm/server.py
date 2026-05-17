@@ -700,11 +700,17 @@ async def stm_surfacing_stats(
                 if tool_name in overrides:
                     detail_parts.append(f"pinned {overrides[tool_name]:.3f}")
                 elif auto_tune_active and min_samples_required > 0:
-                    if fb >= min_samples_required:
-                        if tool_name in adjusted_scores:
-                            detail_parts.append("auto-tuned")
-                        else:
-                            detail_parts.append("auto-tune ready")
+                    # Check ``adjusted_scores`` first: AutoTuner has a documented
+                    # cold-start fallback (feedback.py::maybe_adjust) that tunes a
+                    # tool from the global feedback pool even when the tool's own
+                    # feedback count is below ``min_samples``. So an "auto-tuned"
+                    # row can have fb < min_samples — gating on fb first would
+                    # contradict both the per-tool adjustment block and the
+                    # effective threshold the engine actually used.
+                    if tool_name in adjusted_scores:
+                        detail_parts.append("auto-tuned")
+                    elif fb >= min_samples_required:
+                        detail_parts.append("auto-tune ready")
                     else:
                         detail_parts.append(f"need {min_samples_required - fb} more for auto-tune")
                 lines.append(f"  {tool_name}: {', '.join(detail_parts)}")
