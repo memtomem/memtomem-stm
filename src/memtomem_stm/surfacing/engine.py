@@ -133,6 +133,27 @@ class SurfacingEngine:
         """
         return self._config.injection_mode
 
+    def get_min_score_snapshot(self) -> dict:
+        """Return the current min_score state for observability.
+
+        Read by ``server.py::stm_surfacing_stats`` to render which tools
+        have been auto-tuned away from the default and which are still
+        accumulating samples. ``adjusted`` only contains tools whose
+        ``AutoTuner.maybe_adjust`` has fired this process; an empty dict
+        with ``enabled=True`` means auto-tuning is on but no tool has
+        moved off the default yet (either insufficient samples or ratio
+        inside the [0.2, 0.6] no-op band).
+        """
+        adjusted: dict[str, float] = (
+            self._auto_tuner.adjustments if self._auto_tuner is not None else {}
+        )
+        return {
+            "default": self._config.min_score,
+            "auto_tune_enabled": self._config.auto_tune_enabled and self._auto_tuner is not None,
+            "auto_tune_min_samples": self._config.auto_tune_min_samples,
+            "adjusted": adjusted,
+        }
+
     async def surface(
         self,
         server: str,

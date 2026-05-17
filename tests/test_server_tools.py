@@ -285,8 +285,20 @@ class TestSurfacingStats:
             "distinct_tools": 2,
             "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
             "per_tool_breakdown": [
-                {"tool": "t", "events": 7, "avg_memory_count": 3.0},
-                {"tool": "u", "events": 3, "avg_memory_count": 2.0},
+                {
+                    "tool": "t",
+                    "events": 7,
+                    "avg_memory_count": 3.0,
+                    "feedback_count": 5,
+                    "not_relevant_count": 2,
+                },
+                {
+                    "tool": "u",
+                    "events": 3,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 0,
+                    "not_relevant_count": 0,
+                },
             ],
             "rating_distribution": {"helpful": 3, "not_relevant": 2},
             "total_feedback": 5,
@@ -314,6 +326,63 @@ class TestSurfacingStats:
         assert "Recent:" in result
         assert "hello world" in result
         assert "(filtered by tool: t)" in result
+
+    async def test_min_score_block_when_engine_present(self):
+        """With a surfacing engine, output includes the min_score snapshot
+        and per-tool auto-tune readiness annotations."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 2,
+            "distinct_tools": 2,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "ready_tool",
+                    "events": 25,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 25,
+                    "not_relevant_count": 5,
+                },
+                {
+                    "tool": "tuned_tool",
+                    "events": 30,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 30,
+                    "not_relevant_count": 22,
+                },
+                {
+                    "tool": "cold_tool",
+                    "events": 3,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 4,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 25, "not_relevant": 28},
+            "total_feedback": 59,
+            "recent": [],
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {"tuned_tool": 0.038},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        assert "Min score:       0.030 (auto-tune on, min 20 samples)" in result
+        assert "Per-tool adjustments:" in result
+        assert "tuned_tool: 0.038" in result
+        # Auto-tune readiness annotations:
+        assert "tuned_tool: 30 events" in result and "auto-tuned" in result
+        assert "ready_tool: 25 events" in result and "auto-tune ready" in result
+        assert "need 16 more for auto-tune" in result  # cold_tool: 20 - 4
+        # Negative ratio rendered where feedback exists.
+        assert "negative 73.3%" in result  # tuned: 22/30
+        assert "negative 20.0%" in result  # ready: 5/25
 
     async def test_invalid_since(self):
         """Malformed ISO timestamp is rejected cleanly, not raised."""
@@ -783,9 +852,9 @@ class TestAdvertiseOrder:
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
             _move_stm_tools_to_end(server)  # must not raise
-        assert any(
-            "FastMCP internal API changed" in rec.message for rec in caplog.records
-        ), [r.message for r in caplog.records]
+        assert any("FastMCP internal API changed" in rec.message for rec in caplog.records), [
+            r.message for r in caplog.records
+        ]
 
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
@@ -854,6 +923,5 @@ class TestMainExceptionBarrier:
 
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert not error_records, (
-            f"clean exit should not emit ERROR logs; got: "
-            f"{[r.getMessage() for r in error_records]}"
+            f"clean exit should not emit ERROR logs; got: {[r.getMessage() for r in error_records]}"
         )
