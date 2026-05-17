@@ -384,6 +384,54 @@ class TestSurfacingStats:
         assert "negative 73.3%" in result  # tuned: 22/30
         assert "negative 20.0%" in result  # ready: 5/25
 
+    async def test_readiness_labels_suppressed_when_auto_tune_off(self):
+        """With auto_tune_enabled=False, the per-tool readiness labels must
+        NOT render — otherwise output contradicts its own "auto-tune off"
+        header for configs that have disabled tuning."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "ready_tool",
+                    "events": 25,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 25,
+                    "not_relevant_count": 5,
+                },
+                {
+                    "tool": "cold_tool",
+                    "events": 3,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 4,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 20, "not_relevant": 9},
+            "total_feedback": 29,
+            "recent": [],
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        assert "Min score:       0.030 (auto-tune off, min 20 samples)" in result
+        # Negative ratio still rendered — orthogonal to auto-tune state.
+        assert "negative 20.0%" in result
+        # No readiness labels of any flavor:
+        assert "auto-tuned" not in result
+        assert "auto-tune ready" not in result
+        assert "for auto-tune" not in result
+
     async def test_invalid_since(self):
         """Malformed ISO timestamp is rejected cleanly, not raised."""
         mock_tracker = MagicMock()

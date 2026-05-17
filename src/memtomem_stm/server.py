@@ -655,11 +655,13 @@ async def stm_surfacing_stats(
         # "feedback N (negative R%)" against the auto-tune readiness threshold.
         min_samples_required = 0
         adjusted_scores: dict[str, float] = {}
+        auto_tune_active = False
         if app.surfacing_engine is not None:
             snap = app.surfacing_engine.get_min_score_snapshot()
             adjusted_scores = snap["adjusted"]
             min_samples_required = snap["auto_tune_min_samples"]
-            auto_state = "on" if snap["auto_tune_enabled"] else "off"
+            auto_tune_active = snap["auto_tune_enabled"]
+            auto_state = "on" if auto_tune_active else "off"
             lines.append(
                 f"\nMin score:       {snap['default']:.3f} "
                 f"(auto-tune {auto_state}, min {min_samples_required} samples)"
@@ -674,8 +676,10 @@ async def stm_surfacing_stats(
             for row in stats["per_tool_breakdown"]:
                 fb = row.get("feedback_count", 0)
                 neg = row.get("not_relevant_count", 0)
-                # negative ratio only meaningful with feedback; readiness signal
-                # compares feedback count to AutoTuner min_samples.
+                # Readiness annotations only render when auto-tune is actually
+                # active; otherwise they'd contradict the "auto-tune off" header
+                # (operators with auto_tune_enabled=False would see "ready" /
+                # "need N more" labels for a tuner that will never fire).
                 detail_parts = [
                     f"{row['events']} events",
                     f"avg {row['avg_memory_count']} memories",
@@ -685,7 +689,7 @@ async def stm_surfacing_stats(
                     detail_parts.append(f"feedback {fb} (negative {ratio_pct}%)")
                 else:
                     detail_parts.append("feedback 0")
-                if min_samples_required > 0:
+                if auto_tune_active and min_samples_required > 0:
                     if fb >= min_samples_required:
                         if row["tool"] in adjusted_scores:
                             detail_parts.append("auto-tuned")
