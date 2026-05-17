@@ -65,7 +65,9 @@ def _make_config(**overrides) -> SurfacingConfig:
 
 def _make_mcp_adapter(results=None):
     adapter = AsyncMock()
-    adapter.search = AsyncMock(return_value=(results or [], []))
+    res = results or []
+    outcome = "ok" if res else "empty_results"
+    adapter.search = AsyncMock(return_value=(res, [], outcome))
     return adapter
 
 

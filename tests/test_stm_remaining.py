@@ -388,9 +388,10 @@ class TestMcpClientSearchAdapter:
         from memtomem_stm.surfacing.config import SurfacingConfig
 
         adapter = McpClientSearchAdapter(SurfacingConfig())
-        results, hints = await adapter.search("test query")
+        results, hints, outcome = await adapter.search("test query")
         assert results == []
         assert hints == []
+        assert outcome == "no_session"
 
     @pytest.mark.asyncio
     async def test_search_calls_mem_search(self) -> None:
@@ -409,12 +410,13 @@ class TestMcpClientSearchAdapter:
         mock_session.call_tool.return_value = mock_result
         adapter._session = mock_session
 
-        results, _ = await adapter.search("what is X", top_k=5)
+        results, _, outcome = await adapter.search("what is X", top_k=5)
         mock_session.call_tool.assert_awaited_once_with(
             "mem_search", {"query": "what is X", "top_k": 5}
         )
         assert len(results) == 1
         assert results[0].score == 0.9
+        assert outcome == "ok"
 
     @pytest.mark.asyncio
     async def test_search_handles_exception(self) -> None:
@@ -427,9 +429,10 @@ class TestMcpClientSearchAdapter:
         # Prevent reconnect from hitting a real server
         adapter.start = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("query")
+        results, hints, outcome = await adapter.search("query")
         assert results == []
         assert hints == []
+        assert outcome == "transport_error"
 
     @pytest.mark.asyncio
     async def test_search_timeout_triggers_reconnect(self) -> None:
@@ -444,8 +447,9 @@ class TestMcpClientSearchAdapter:
 
         adapter._reconnect = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("query")
+        results, hints, outcome = await adapter.search("query")
         assert results == []
         assert hints == []
+        assert outcome == "transport_error"
         # Reconnect was attempted (TimeoutError treated as transport error)
         adapter._reconnect.assert_awaited_once()

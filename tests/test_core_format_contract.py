@@ -478,10 +478,13 @@ class TestAdapterHintsFlow:
         mock_session.call_tool = AsyncMock(return_value=mock_result)
         adapter._session = mock_session
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
         assert results == []
         assert len(hints) == 1
         assert "No results match your filters" in hints[0]
+        # Parser returned no result rows from a non-empty text response —
+        # call OK + parsed empty list is ``empty_results`` (#295).
+        assert outcome == "empty_results"
 
     @pytest.mark.asyncio
     async def test_search_returns_empty_hints_for_compact_format(self):
@@ -499,9 +502,10 @@ class TestAdapterHintsFlow:
         mock_session.call_tool = AsyncMock(return_value=mock_result)
         adapter._session = mock_session
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
         assert len(results) == 2
         assert hints == []
+        assert outcome == "ok"
 
     @pytest.mark.asyncio
     async def test_search_returns_empty_hints_on_transport_error(self):
@@ -516,9 +520,10 @@ class TestAdapterHintsFlow:
         adapter._session = mock_session
         adapter.start = AsyncMock(side_effect=_asyncio.TimeoutError())  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
         assert results == []
         assert hints == []
+        assert outcome == "transport_error"
 
 
 class TestOutputFormatForwarding:

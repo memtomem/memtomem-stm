@@ -80,7 +80,11 @@ class TestFullPipeline:
                 include_session_context=False,
                 fire_webhook=False,
             ),
-            mcp_adapter=AsyncMock(search=AsyncMock(return_value=(results, {}))),
+            mcp_adapter=AsyncMock(
+                search=AsyncMock(
+                    return_value=(results, [], "ok" if results else "empty_results"),
+                )
+            ),
         )
         final = await engine.surface(
             "api", "read_file",

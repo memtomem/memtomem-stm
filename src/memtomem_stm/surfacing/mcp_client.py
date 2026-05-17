@@ -10,7 +10,7 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -19,6 +19,21 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
+
+# #295: outcome typing for ``McpClientSearchAdapter.search`` — five
+# different failure modes used to collapse to ``([], [])`` and looked
+# identical to a healthy empty namespace at the engine's observability
+# layer. The engine consumes this enum to record distinct skip labels
+# (``ltm_unavailable`` / ``ltm_call_failed`` / ``ltm_parse_empty``) so
+# operators can tell why surfacing is not firing.
+SearchOutcome = Literal[
+    "ok",
+    "no_session",
+    "transport_error",
+    "call_error",
+    "empty_content",
+    "empty_results",
+]
 
 
 @dataclass
@@ -324,17 +339,22 @@ class McpClientSearchAdapter:
         *,
         trace_id: str | None = None,
         **kwargs: Any,
-    ) -> tuple[list[RemoteSearchResult], list[str]]:
+    ) -> tuple[list[RemoteSearchResult], list[str], SearchOutcome]:
         """Call mem_search on the remote server and parse results.
 
-        Returns ``(results, hints)``. ``hints`` carries parent-side
+        Returns ``(results, hints, outcome)``. ``hints`` carries parent-side
         trust-UX annotations from the structured format (parent PR #231)
         and is always ``[]`` for the compact format or when the call
-        fails. Callers that do not care about hints should still accept
-        the tuple to stay compatible with mypy's inferred signature.
+        fails. ``outcome`` lets the engine distinguish "LTM unavailable"
+        from "LTM call failed" from "parser hit an empty response" from
+        "call OK, zero hits" (#295) — every failure path used to collapse
+        to ``([], [])`` and looked identical to a healthy empty
+        namespace. Callers that don't care about hints/outcome should
+        still accept the tuple to stay compatible with mypy's inferred
+        signature.
         """
         if not await self._heal_if_needed():
-            return [], []
+            return [], [], "no_session"
 
         args: dict[str, Any] = {"query": query}
         if top_k is not None:
@@ -359,11 +379,8 @@ class McpClientSearchAdapter:
                 result = await self._session.call_tool("mem_search", args)  # type: ignore[union-attr]
             except Exception as retry_exc:
                 # Upstream LTM is unreachable; surfacing will return empty.
-                # Bumped debug -> warning so operators can see the symptom at
-                # default log level (P2 partial fix; full propagation via a
-                # distinct error class is a follow-up).
                 logger.warning("MCP mem_search failed after reconnect: %s", retry_exc)
-                return [], []
+                return [], [], "transport_error"
         except asyncio.CancelledError:
             # #290: outer wait_for cancelled us mid-RPC. Mark for lazy
             # reconnect on the next call (the session's read/write streams
@@ -373,17 +390,21 @@ class McpClientSearchAdapter:
             raise
         except Exception as exc:
             logger.warning("MCP mem_search failed: %s", exc)
-            return [], []
+            return [], [], "call_error"
 
         # Parse text response into results
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
         text_parts = [c.text or "" for c in (result.content or []) if c.type == "text"]
         if not text_parts:
-            return [], []
+            return [], [], "empty_content"
 
         text = "\n".join(text_parts)
-        return self._parser.parse(text, max_content_chars=self._config.result_content_max_chars)
+        results, hints = self._parser.parse(
+            text, max_content_chars=self._config.result_content_max_chars
+        )
+        outcome: SearchOutcome = "ok" if results else "empty_results"
+        return results, hints, outcome
 
     async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:
         """Boost the access_count of the given chunks via mem_do(increment_access).

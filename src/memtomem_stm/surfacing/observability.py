@@ -43,6 +43,13 @@ SkipReason = Literal[
     "no_results_dedup",
     "no_results_invalidated",
     "no_results_empty_cache",
+    # #295: LTM adapter outcome typing — distinguish unreachable from
+    # call_failed from parse_empty so operators can tell "session never
+    # opened / transport down" from "core raised mid-call" from "core
+    # returned no text content" without grepping logs.
+    "ltm_unavailable",
+    "ltm_call_failed",
+    "ltm_parse_empty",
 ]
 
 Outcome = Literal[

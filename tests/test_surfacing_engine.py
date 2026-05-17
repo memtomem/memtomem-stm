@@ -65,10 +65,21 @@ def _make_mcp_adapter(
     results: list[FakeSearchResult] | None = None,
     *,
     hints: list[str] | None = None,
+    outcome: str | None = None,
 ):
-    """Build a mock McpClientSearchAdapter that returns the given results."""
+    """Build a mock McpClientSearchAdapter that returns the given results.
+
+    ``outcome`` defaults to ``"ok"`` when results are non-empty and
+    ``"empty_results"`` when they are — the two fall-through paths that
+    keep the existing engine flow intact (#295). Pass it explicitly to
+    drive the new failure-outcome dispatch (``no_session``,
+    ``transport_error``, ``call_error``, ``empty_content``).
+    """
+    res_list = results or []
+    if outcome is None:
+        outcome = "ok" if res_list else "empty_results"
     adapter = AsyncMock()
-    adapter.search = AsyncMock(return_value=(results or [], hints or []))
+    adapter.search = AsyncMock(return_value=(res_list, hints or [], outcome))
     return adapter
 
 
@@ -252,7 +263,7 @@ class TestSurfacingTimeout:
     async def test_timeout_returns_original(self):
         async def slow_search(*args, **kwargs):
             await asyncio.sleep(10)
-            return [], {}
+            return [], [], "empty_results"
 
         adapter = AsyncMock()
         adapter.search = slow_search
@@ -348,7 +359,7 @@ class TestSurfacingCacheStampede:
 
         async def slow_search(**_kwargs):
             await asyncio.sleep(0.01)
-            return (results, {})
+            return (results, [], "ok")
 
         adapter.search = AsyncMock(side_effect=slow_search)
 
@@ -406,7 +417,7 @@ class TestRelevanceGateConcurrency:
 
         async def slow_search(**_kwargs):
             await asyncio.sleep(0.01)
-            return ([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.5)], {})
+            return ([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.5)], [], "ok")
 
         adapter.search = AsyncMock(side_effect=slow_search)
 
@@ -1623,7 +1634,7 @@ class TestSurfacingEngineObservability:
 
         async def slow_search(*a, **kw):
             await asyncio.sleep(1.0)
-            return ([], [])
+            return ([], [], "empty_results")
 
         adapter = _make_mcp_adapter()
         adapter.search = AsyncMock(side_effect=slow_search)
@@ -1715,3 +1726,83 @@ class TestSurfacingEngineObservability:
         assert snap["outcomes"]["read_file"] == {"surfaced_cache_miss": 1}
         assert snap["skip_reasons"]["read_file"] == {"no_results_invalidated": 1}
         assert snap["cache"] == {"miss": 1, "hit": 1}
+
+
+class TestSurfacingLtmOutcomeDispatch:
+    """#295: adapter ``SearchOutcome`` → distinct engine skip label.
+
+    Five different failure modes used to collapse to ``([], [])`` and look
+    identical to a healthy empty namespace. The engine now reads the
+    adapter's outcome and records ``ltm_unavailable`` / ``ltm_call_failed``
+    / ``ltm_parse_empty`` so an operator looking at the surfacing stats
+    table can tell which of "session never opened", "core raised
+    mid-call", "core returned no text content", and "core returned no
+    rows" is happening. ``ok`` / ``empty_results`` still fall through to
+    the existing min_score / dedup path so the no_results_score signal an
+    operator uses to tune min_score is preserved.
+    """
+
+    def _engine(self, *, outcome: str, results: list | None = None):
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        adapter = _make_mcp_adapter(results, outcome=outcome)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        return engine, obs
+
+    async def test_no_session_outcome_records_ltm_unavailable(self):
+        engine, obs = self._engine(outcome="no_session")
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
+
+    async def test_transport_error_outcome_records_ltm_unavailable(self):
+        engine, obs = self._engine(outcome="transport_error")
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        # Same bucket as ``no_session`` — both indicate "LTM not currently
+        # answering"; an operator just needs to know to look at LTM, not
+        # which of the two specific causes it was.
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
+
+    async def test_call_error_outcome_records_ltm_call_failed(self):
+        engine, obs = self._engine(outcome="call_error")
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"ltm_call_failed": 1}
+
+    async def test_empty_content_outcome_records_ltm_parse_empty(self):
+        engine, obs = self._engine(outcome="empty_content")
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["skip_reasons"]["read_file"] == {"ltm_parse_empty": 1}
+
+    async def test_empty_results_outcome_falls_through_to_no_results_score(self):
+        """A genuine empty-namespace ``mem_search`` still records
+        ``no_results_score`` so operators tuning min_score see the same
+        signal they did before the outcome refactor."""
+        engine, obs = self._engine(outcome="empty_results", results=[])
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        skips = obs.snapshot()["skip_reasons"]["read_file"]
+        assert "ltm_unavailable" not in skips
+        assert "ltm_call_failed" not in skips
+        assert "ltm_parse_empty" not in skips
+        assert skips == {"no_results_score": 1}
+
+    async def test_failure_outcomes_do_not_populate_cache(self):
+        """An ``ltm_unavailable`` early return must NOT poison the cache
+        with an empty entry — the next call should retry LTM rather than
+        silently serving the empty cached result."""
+        engine, obs = self._engine(outcome="transport_error")
+        args = {"_context_query": "transport-error retry probe"}
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        await engine.surface("s", "read_file", args, LONG_RESPONSE)
+        snap = obs.snapshot()
+        # Two LTM attempts, two ``ltm_unavailable`` skips, no cache hits.
+        assert snap["skip_reasons"]["read_file"] == {"ltm_unavailable": 2}
+        assert snap["cache"].get("hit", 0) == 0
