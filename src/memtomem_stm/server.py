@@ -665,12 +665,17 @@ async def stm_surfacing_stats(
         # eligibility for a tool with enough historical samples but only a
         # handful of recent events. Falls back to the row's filtered fb only
         # when the unfiltered counts aren't available (e.g. tracker missing).
+        # ``readiness_total_fb`` mirrors the global pool AutoTuner consults
+        # via the documented cold-start fallback: a tool with too few of
+        # its own samples still becomes eligible once total feedback across
+        # all tools reaches ``min_samples`` (feedback.py::maybe_adjust).
         readiness_counts: dict[str, int] = {}
         if app.feedback_tracker is not None:
             try:
                 readiness_counts = app.feedback_tracker.store.get_per_tool_feedback_counts()
             except Exception:
                 readiness_counts = {}
+        readiness_total_fb = sum(readiness_counts.values())
         if app.surfacing_engine is not None:
             snap = app.surfacing_engine.get_min_score_snapshot()
             adjusted_scores = snap["adjusted"]
@@ -732,15 +737,27 @@ async def stm_surfacing_stats(
                     if tool_name in adjusted_scores:
                         detail_parts.append("auto-tuned")
                     else:
-                        # Use unfiltered count for readiness — see ``readiness_counts``
-                        # comment above. Falls back to the windowed fb when the
-                        # store didn't supply a count for this tool (closed/missing).
+                        # AutoTuner is eligible when either the tool's own
+                        # feedback or the global pool has hit ``min_samples``
+                        # (cold-start fallback). Reporting only the per-tool
+                        # gate would label a tool "need N more" even when the
+                        # very next surfacing would tune it from the global
+                        # pool with ratio outside the [0.2, 0.6] no-op band.
+                        # Falls back to the windowed fb when the store didn't
+                        # supply a count for this tool (closed/missing).
                         eligible_fb = readiness_counts.get(tool_name, fb)
-                        if eligible_fb >= min_samples_required:
+                        if (
+                            eligible_fb >= min_samples_required
+                            or readiness_total_fb >= min_samples_required
+                        ):
                             detail_parts.append("auto-tune ready")
                         else:
+                            # Cold-start gap is the smaller of the two — once
+                            # the global pool reaches min_samples, any tool
+                            # becomes eligible regardless of its own count.
                             detail_parts.append(
-                                f"need {min_samples_required - eligible_fb} more for auto-tune"
+                                f"need {min_samples_required - readiness_total_fb} "
+                                "more for auto-tune"
                             )
                 lines.append(f"  {tool_name}: {', '.join(detail_parts)}")
 

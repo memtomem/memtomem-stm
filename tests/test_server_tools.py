@@ -385,10 +385,68 @@ class TestSurfacingStats:
         # Auto-tune readiness annotations:
         assert "tuned_tool: 30 events" in result and "auto-tuned" in result
         assert "ready_tool: 25 events" in result and "auto-tune ready" in result
-        assert "need 16 more for auto-tune" in result  # cold_tool: 20 - 4
+        # cold_tool has only 4 of its own samples, but the global pool here
+        # has 59 (25 + 30 + 4) — past the 20-sample threshold — so the
+        # tuner's cold-start fallback would fire on the next surfacing.
+        # Readiness label reflects that, not the per-tool count alone.
+        cold_row = next(
+            line
+            for line in result.splitlines()
+            if "cold_tool:" in line and "events" in line
+        )
+        assert "auto-tune ready" in cold_row
+        assert "need" not in cold_row
         # Negative ratio rendered where feedback exists.
         assert "negative 73.3%" in result  # tuned: 22/30
         assert "negative 20.0%" in result  # ready: 5/25
+
+    async def test_need_more_uses_global_gap_when_pool_also_below_threshold(self):
+        """When *both* the tool's own and the global pool are below
+        ``min_samples``, the "need N more" message must reflect the
+        cold-start gap — the global shortfall — since that's the smaller
+        of the two gates and is what the tuner is actually waiting on."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "lonely_tool",
+                    "events": 3,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 2,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 1, "not_relevant": 1},
+            "total_feedback": 2,
+            "recent": [],
+        }
+        # Per-tool 2 + one other tool 5 → global 7, both well below 20.
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "lonely_tool": 2,
+            "other_tool": 5,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        row = next(
+            line
+            for line in result.splitlines()
+            if "lonely_tool:" in line and "events" in line
+        )
+        # Gap reported against global pool (20 - 7 = 13), not per-tool (20 - 2 = 18).
+        assert "need 13 more for auto-tune" in row
 
     async def test_cold_start_tuned_tool_reported_as_tuned(self):
         """AutoTuner's cold-start fallback (feedback.py::maybe_adjust) can
