@@ -558,9 +558,12 @@ async def stm_proxy_health(
     app = _get_ctx(ctx)
     pm = app.proxy_manager
 
+    bootstrap_lines = _surfacing_bootstrap_lines(app)
+
     health = pm.get_upstream_health()
     if not health:
-        return "No upstream servers configured."
+        head = "No upstream servers configured."
+        return "\n".join([head, *bootstrap_lines]) if bootstrap_lines else head
 
     lines = ["Upstream Server Health", "====================="]
     for name, info in health.items():
@@ -573,7 +576,41 @@ async def stm_proxy_health(
         cb_state = "open (failing)" if cb.is_open else "closed (healthy)"
         lines.append(f"\nSurfacing circuit breaker: {cb_state}")
 
+    lines.extend(bootstrap_lines)
     return "\n".join(lines)
+
+
+def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:
+    # Mirrors mms health's bootstrap section: lets agents see surfacing
+    # readiness via MCP without shelling out to the CLI.
+    surfacing_cfg = app.config.surfacing
+    if not surfacing_cfg.enabled:
+        return []
+
+    lines = ["", "Surfacing Bootstrap", "==================="]
+    tracker = app.feedback_tracker
+    if tracker is None:
+        if surfacing_cfg.feedback_enabled:
+            lines.append("  feedback tracking: enabled in config — runtime init failed")
+        else:
+            lines.append("  feedback tracking: disabled")
+        return lines
+
+    db = tracker.bootstrap_status()
+    lines.append("  feedback tracking: enabled")
+    lines.append(f"  feedback db: {db['path']}")
+    if db.get("error"):
+        lines.append(f"  feedback tables: error — {db['error']}")
+    elif not db.get("exists"):
+        lines.append("  feedback tables: missing (DB has not been created)")
+    elif db.get("initialized"):
+        lines.append("  feedback tables: ready")
+    else:
+        missing = ", ".join(str(t) for t in db.get("missing_tables", []))
+        lines.append(
+            f"  feedback tables: missing ({missing}) — surfacing has not initialized this DB"
+        )
+    return lines
 
 
 # ---------------------------------------------------------------------------

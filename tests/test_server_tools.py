@@ -233,6 +233,66 @@ class TestHealth:
         result = await stm_proxy_health(ctx=ctx)
         assert "srv: connected (2 tools)" in result
 
+    async def test_bootstrap_block_tracker_ready(self):
+        """Bootstrap section reports ready when tracker.bootstrap_status() says so."""
+        tracker = MagicMock()
+        tracker.bootstrap_status.return_value = {
+            "path": "/tmp/stm_feedback.db",
+            "exists": True,
+            "initialized": True,
+            "missing_tables": [],
+            "error": None,
+        }
+        ctx = _make_ctx(feedback_tracker=tracker)
+        result = await stm_proxy_health(ctx=ctx)
+        assert "Surfacing Bootstrap" in result
+        assert "feedback tracking: enabled" in result
+        assert "feedback db: /tmp/stm_feedback.db" in result
+        assert "feedback tables: ready" in result
+
+    async def test_bootstrap_block_tracker_missing_tables(self):
+        """Bootstrap section lists missing tables when the inspector flags them."""
+        tracker = MagicMock()
+        tracker.bootstrap_status.return_value = {
+            "path": "/tmp/stm_feedback.db",
+            "exists": True,
+            "initialized": False,
+            "missing_tables": ["auto_tune_adjustments"],
+            "error": None,
+        }
+        ctx = _make_ctx(feedback_tracker=tracker)
+        result = await stm_proxy_health(ctx=ctx)
+        assert "feedback tables: missing (auto_tune_adjustments)" in result
+
+    async def test_bootstrap_block_init_failed(self):
+        """When feedback_enabled but tracker is None, surface the runtime-init failure."""
+        ctx = _make_ctx(feedback_tracker=None)
+        # Default STMConfig has surfacing.enabled=True and feedback_enabled=True,
+        # so a None tracker means the lifespan init path failed.
+        result = await stm_proxy_health(ctx=ctx)
+        assert "Surfacing Bootstrap" in result
+        assert "runtime init failed" in result
+
+    async def test_bootstrap_block_absent_when_surfacing_disabled(self):
+        """No bootstrap section when surfacing is config-disabled."""
+        cfg = STMConfig()
+        cfg.surfacing.enabled = False
+        tracker_handle = TokenTracker()
+        proxy_cfg = ProxyConfig(config_path="/tmp/p.json", upstream_servers={})
+        pm = ProxyManager(proxy_cfg, tracker_handle)
+        app = STMContext(
+            config=cfg,
+            proxy_manager=pm,
+            tracker=tracker_handle,
+            surfacing_engine=None,
+            feedback_tracker=None,
+            compression_feedback_tracker=None,
+            progressive_reads_tracker=None,
+        )
+        ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+        result = await stm_proxy_health(ctx=ctx)
+        assert "Surfacing Bootstrap" not in result
+
 
 # ── stm_surfacing_feedback ───────────────────────────────────────────────
 
