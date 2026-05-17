@@ -348,6 +348,20 @@ class McpClientSearchAdapter:
                 self._start_attempted = True
                 try:
                     await self.start()
+                except asyncio.CancelledError:
+                    # Outer wait_for / timeout cancelled us mid-init
+                    # (SurfacingEngine wraps adapter calls in
+                    # ``asyncio.wait_for``). ``start()``'s BaseException
+                    # handler already cleared ``_session`` and unwound
+                    # the AsyncExitStack — without resetting
+                    # ``_start_attempted`` here, every subsequent cycle
+                    # would short-circuit on the sticky flag and
+                    # surfacing would stay permanently off in exactly
+                    # the slow-startup environments this patch targets.
+                    # Propagate per the cooperative cancellation
+                    # contract (#290).
+                    self._start_attempted = False
+                    raise
                 except Exception as exc:
                     logger.warning("Lazy MCP adapter start failed — surfacing disabled: %s", exc)
                     return False

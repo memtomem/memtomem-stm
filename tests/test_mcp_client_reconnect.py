@@ -613,3 +613,60 @@ class TestLazyStart:
         # All three callers see the same healthy session.
         for r in results:
             assert r[2] in {"ok", "empty_content", "empty_results"}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_resets_flag_and_propagates(self):
+        """If ``start()`` is cancelled mid-init (outer wait_for timeout),
+        the sticky flag must reset so a later cycle can retry — otherwise
+        a single timeout permanently disables surfacing in exactly the
+        slow-startup environments lazy-start was meant to help.
+        Cancellation must propagate (cooperative cancellation, #290)."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        async def slow_start():
+            # Simulate a long-running LTM handshake that an outer
+            # wait_for will cancel before it completes.
+            await asyncio.sleep(10)
+
+        adapter.start = AsyncMock(side_effect=slow_start)  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        # Flag reset → next caller can retry.
+        assert adapter._start_attempted is False
+        # No session ever materialized.
+        assert adapter._session is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_allows_retry_on_next_call(self):
+        """End-to-end: cancellation on attempt 1 must not block attempt 2.
+        Pairs with the unit test above — proves the reset actually
+        un-sticks the path rather than just clearing a flag in isolation."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=_result_with_text(""))
+
+        attempt = 0
+
+        async def start_impl():
+            nonlocal attempt
+            attempt += 1
+            if attempt == 1:
+                # First attempt: hang until outer wait_for cancels us.
+                await asyncio.sleep(10)
+            # Second attempt: succeed instantly.
+            adapter._session = mock_session
+
+        adapter.start = AsyncMock(side_effect=start_impl)  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q1"), timeout=0.05)
+
+        # Second call must reach start() again (not short-circuit on the
+        # sticky flag) and succeed.
+        results, _, outcome = await adapter.search("q2")
+        assert attempt == 2
+        assert outcome in {"ok", "empty_content", "empty_results"}
+        assert adapter._session is mock_session
