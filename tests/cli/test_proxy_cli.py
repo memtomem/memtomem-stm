@@ -3723,19 +3723,43 @@ class TestFullFlow:
 
 
 class TestHealth:
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, monkeypatch, tmp_path):
+        set_home(monkeypatch, tmp_path / "home")
+
     def test_health_no_servers(self, runner, config):
         """Empty config → friendly message, no crash."""
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "No upstream servers configured" in result.output
+        assert "Surfacing Bootstrap" in result.output
+        assert "feedback tables: missing" in result.output
 
     def test_health_json_no_servers(self, runner, config):
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert result.exit_code == 0
         data = json.loads(result.output)
-        assert data == {"servers": {}}
+        assert data["servers"] == {}
+        assert data["surfacing"]["enabled"] is True
+        assert data["surfacing"]["feedback_enabled"] is True
+        assert data["surfacing"]["feedback_db"]["exists"] is False
+        assert data["surfacing"]["feedback_db"]["initialized"] is False
+
+    def test_health_flags_existing_uninitialized_surfacing_db(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "stm_feedback.db"
+        db_path.touch()
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(db_path))
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+
+        assert result.exit_code == 0
+        assert f"feedback db: {db_path.resolve()}" in result.output
+        assert "surfacing has not initialized this DB" in result.output
 
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
@@ -3799,6 +3823,7 @@ class TestHealth:
         data = json.loads(result.output)
         assert data["servers"]["bad"]["connected"] is False
         assert data["servers"]["bad"]["error"]
+        assert "surfacing" in data
 
     def test_health_error_unwraps_taskgroup_wrapper(self, runner, config):
         """Probe failures inside an anyio TaskGroup are wrapped as
@@ -3908,7 +3933,7 @@ class TestHealth:
         result = runner.invoke(cli, ["health", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "connected" in result.output
-        assert "overflow" not in result.output.lower()
+        assert "overflow:" not in result.output.lower()
 
         # With --names: the offending tool is named.
         result = runner.invoke(cli, ["health", "--names", *_cfg_args(config)])

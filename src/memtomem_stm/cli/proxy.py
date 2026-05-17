@@ -2185,6 +2185,60 @@ def _root_cause_message(exc: BaseException) -> str:
     return str(cur) or type(cur).__name__
 
 
+def _surfacing_bootstrap_status() -> dict[str, Any]:
+    """Return surfacing feedback DB readiness without starting the proxy."""
+    try:
+        from memtomem_stm.config import STMConfig
+        from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
+
+        surfacing = STMConfig().surfacing
+        db_status = inspect_feedback_db(surfacing.feedback_db_path)
+        return {
+            "enabled": surfacing.enabled,
+            "feedback_enabled": surfacing.feedback_enabled,
+            "feedback_db": db_status,
+        }
+    except Exception as exc:
+        return {
+            "enabled": None,
+            "feedback_enabled": None,
+            "feedback_db": None,
+            "error": str(exc) or type(exc).__name__,
+        }
+
+
+def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
+    lines = [_hdr("Surfacing Bootstrap"), "=" * 30]
+    if status.get("error"):
+        lines.append(f"  {_bad('ERROR')} — {status['error']}")
+        return lines
+
+    lines.append(f"  config: {'enabled' if status['enabled'] else 'disabled'}")
+    lines.append(
+        f"  feedback tracking: {'enabled' if status['feedback_enabled'] else 'disabled'}"
+    )
+
+    db = status.get("feedback_db")
+    if not isinstance(db, dict):
+        lines.append("  feedback db: unavailable")
+        return lines
+
+    lines.append(f"  feedback db: {db['path']}")
+    if db.get("error"):
+        lines.append(f"  feedback tables: {_bad('error')} — {db['error']}")
+    elif not db.get("exists"):
+        lines.append("  feedback tables: missing (DB has not been created)")
+    elif db.get("initialized"):
+        lines.append(f"  feedback tables: {_ok('ready')}")
+    else:
+        missing = ", ".join(str(t) for t in db.get("missing_tables", []))
+        lines.append(
+            f"  feedback tables: {_warn('missing')} ({missing}) — "
+            "surfacing has not initialized this DB"
+        )
+    return lines
+
+
 @contextmanager
 def _silenced_mcp_sdk_logs() -> Iterator[None]:
     """Temporarily raise the MCP SDK loggers above ``ERROR`` so probe-time
@@ -2284,21 +2338,37 @@ def health(
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
+    surfacing_status = _surfacing_bootstrap_status()
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
     # ensure_ascii=False) so scripts piping the three commands through the
     # same formatter don't hit one compact-one-line outlier.
     if not servers:
         if as_json:
-            click.echo(json.dumps({"servers": {}}, indent=2, ensure_ascii=False))
+            click.echo(
+                json.dumps(
+                    {"servers": {}, "surfacing": surfacing_status},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
         else:
             click.echo("No upstream servers configured.")
+            click.echo("")
+            for line in _format_surfacing_bootstrap(surfacing_status):
+                click.echo(line)
         return
 
     results = asyncio.run(_probe_servers(servers, timeout))
 
     if as_json:
-        click.echo(json.dumps({"servers": results}, indent=2, ensure_ascii=False))
+        click.echo(
+            json.dumps(
+                {"servers": results, "surfacing": surfacing_status},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return
 
     click.echo(_hdr("Upstream Server Health"))
@@ -2320,6 +2390,9 @@ def health(
                     click.echo("    all tool names fit")
         else:
             click.echo(f"  {name}: {_bad('DISCONNECTED')} — {info['error']}")
+    click.echo("")
+    for line in _format_surfacing_bootstrap(surfacing_status):
+        click.echo(line)
 
 
 # `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py

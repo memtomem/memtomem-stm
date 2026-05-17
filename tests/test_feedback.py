@@ -8,7 +8,7 @@ from pathlib import Path
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
-from memtomem_stm.surfacing.feedback_store import FeedbackStore
+from memtomem_stm.surfacing.feedback_store import FeedbackStore, inspect_feedback_db
 
 
 # ---------------------------------------------------------------------------
@@ -17,6 +17,40 @@ from memtomem_stm.surfacing.feedback_store import FeedbackStore
 
 
 class TestFeedbackStore:
+    def test_inspect_feedback_db_missing(self, tmp_path: Path):
+        status = inspect_feedback_db(tmp_path / "missing.db")
+
+        assert status["exists"] is False
+        assert status["initialized"] is False
+        assert status["missing_tables"] == [
+            "surfacing_events",
+            "surfacing_feedback",
+            "seen_memories",
+        ]
+
+    def test_inspect_feedback_db_existing_without_surfacing_tables(self, tmp_path: Path):
+        db_path = tmp_path / "stm_feedback.db"
+        db_path.touch()
+
+        status = inspect_feedback_db(db_path)
+
+        assert status["exists"] is True
+        assert status["initialized"] is False
+        assert "surfacing_events" in status["missing_tables"]
+
+    def test_inspect_feedback_db_initialized(self, tmp_path: Path):
+        db_path = tmp_path / "stm_feedback.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        try:
+            status = inspect_feedback_db(db_path)
+        finally:
+            store.close()
+
+        assert status["exists"] is True
+        assert status["initialized"] is True
+        assert status["missing_tables"] == []
+
     def test_record_and_retrieve_surfacing(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing(
             "surf1", "server", "tool", "query", ["mem1", "mem2"], [0.9, 0.8]
