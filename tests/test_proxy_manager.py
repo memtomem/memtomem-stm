@@ -11,6 +11,7 @@ from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     CleaningConfig,
     CompressionStrategy,
+    ExtractionConfig,
     ProxyConfig,
     RelevanceScorerConfig,
     SelectiveConfig,
@@ -184,7 +185,88 @@ class TestAutoIndexStartupWarning:
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             await mgr.start()
-        assert any("no index engine configured" in r.message for r in caplog.records)
+        assert any(
+            "auto_index enabled" in r.message
+            and "auto_index.enabled" in r.message
+            and "no index engine configured" in r.message
+            and "inert" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_warns_extraction_enabled_but_no_engine(self, caplog):
+        """extraction.enabled=true but index_engine=None → startup warning (#288)."""
+        config = ProxyConfig(
+            enabled=True,
+            extraction=ExtractionConfig(enabled=True),
+        )
+        mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr.start()
+        assert any(
+            "extraction enabled" in r.message
+            and "extraction.enabled" in r.message
+            and "no index engine configured" in r.message
+            and "inert" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_warns_per_server_auto_index_without_engine(self, caplog):
+        """Per-upstream auto_index=true with no engine → warning names the server (#288)."""
+        config = ProxyConfig(
+            enabled=True,
+            upstream_servers={
+                "github": UpstreamServerConfig(
+                    prefix="gh",
+                    command="echo",
+                    auto_index=True,
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except (Exception, asyncio.CancelledError):
+                # "echo" upstream exits before completing the JSON-RPC
+                # handshake; the warning fires before that connect failure.
+                pass
+        assert any(
+            "auto_index enabled" in r.message
+            and "server 'github'" in r.message
+            and "inert" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_warns_per_tool_override_extraction_without_engine(self, caplog):
+        """Per-tool-override extraction=true with no engine → warning names server+tool (#288)."""
+        config = ProxyConfig(
+            enabled=True,
+            upstream_servers={
+                "github": UpstreamServerConfig(
+                    prefix="gh",
+                    command="echo",
+                    tool_overrides={
+                        "search_code": ToolOverrideConfig(extraction=True),
+                    },
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except (Exception, asyncio.CancelledError):
+                pass
+        assert any(
+            "extraction enabled" in r.message
+            and "server 'github'" in r.message
+            and "tool 'search_code'" in r.message
+            and "inert" in r.message
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_no_warning_when_compression_none(self, caplog):

@@ -71,6 +71,16 @@ export MEMTOMEM_STM_PROXY__METRICS__DB_PATH=~/.memtomem/proxy_metrics.db
 export MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY=10000
 
 # Auto-indexing (Stage 4 — save large responses to LTM)
+# NOTE: In the standalone `mms` server today, `auto_index` and
+# `extraction` are inert — `ProxyManager` is constructed without an
+# `index_engine`, so Stage 4 is silently skipped. This covers every
+# enable-path: the global ENABLED flag below, the per-upstream
+# `auto_index: true` knob on `UpstreamServerConfig`, and the per-tool
+# `auto_index: true` override on `ToolOverrideConfig`. All three are
+# valid config but currently have no runtime effect; the proxy logs a
+# "config is enabled but inert" warning at startup naming each site.
+# Tracking issue for the MCP-protocol-only adapter that will unblock
+# this: #288.
 export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=false
 export MEMTOMEM_STM_PROXY__AUTO_INDEX__MIN_CHARS=2000
 export MEMTOMEM_STM_PROXY__AUTO_INDEX__MEMORY_DIR=~/.memtomem/proxy_index
