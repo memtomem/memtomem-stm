@@ -96,7 +96,9 @@ class AutoTuner:
     def __init__(self, config: SurfacingConfig, store: FeedbackStore) -> None:
         self._config = config
         self._store = store
-        self._adjustments: dict[str, float] = {}
+        # Resume tunings persisted from a previous process — without this
+        # every restart silently throws away the AutoTuner's view.
+        self._adjustments: dict[str, float] = dict(store.load_adjustments())
 
     def maybe_adjust(self, tool: str) -> float | None:
         """Check feedback ratio and adjust min_score for a tool.
@@ -130,6 +132,7 @@ class AutoTuner:
             new_score = min(current + increment, 0.05)
             if new_score != current:
                 self._adjustments[tool] = new_score
+                self._store.save_adjustment(tool, new_score)
                 logger.info(
                     "AutoTune: %s min_score %.2f → %.2f (not_relevant ratio: %.0f%%)",
                     tool,
@@ -143,6 +146,7 @@ class AutoTuner:
             new_score = max(current - increment, 0.005)
             if new_score != current:
                 self._adjustments[tool] = new_score
+                self._store.save_adjustment(tool, new_score)
                 logger.info(
                     "AutoTune: %s min_score %.2f → %.2f (not_relevant ratio: %.0f%%)",
                     tool,
