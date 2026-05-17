@@ -33,6 +33,7 @@ from memtomem_stm.utils.fileio import atomic_write_text
 _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
+logger = logging.getLogger(__name__)
 
 # `_DANGEROUS_ENV_KEYS`, `_BLOCKED_IMPORT_NAMES`, `_desktop_config_path`,
 # `_read_json_safely`, `_is_self_reference` — re-imported from
@@ -2199,6 +2200,7 @@ def _surfacing_bootstrap_status() -> dict[str, Any]:
             "feedback_db": db_status,
         }
     except Exception as exc:
+        logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
         return {
             "enabled": None,
             "feedback_enabled": None,
@@ -2214,9 +2216,7 @@ def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
         return lines
 
     lines.append(f"  config: {'enabled' if status['enabled'] else 'disabled'}")
-    lines.append(
-        f"  feedback tracking: {'enabled' if status['feedback_enabled'] else 'disabled'}"
-    )
+    lines.append(f"  feedback tracking: {'enabled' if status['feedback_enabled'] else 'disabled'}")
 
     db = status.get("feedback_db")
     if not isinstance(db, dict):

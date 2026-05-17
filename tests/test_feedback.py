@@ -8,7 +8,11 @@ from pathlib import Path
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
-from memtomem_stm.surfacing.feedback_store import FeedbackStore, inspect_feedback_db
+from memtomem_stm.surfacing.feedback_store import (
+    FeedbackStore,
+    _REQUIRED_TABLES,
+    inspect_feedback_db,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -22,11 +26,7 @@ class TestFeedbackStore:
 
         assert status["exists"] is False
         assert status["initialized"] is False
-        assert status["missing_tables"] == [
-            "surfacing_events",
-            "surfacing_feedback",
-            "seen_memories",
-        ]
+        assert status["missing_tables"] == list(_REQUIRED_TABLES)
 
     def test_inspect_feedback_db_existing_without_surfacing_tables(self, tmp_path: Path):
         db_path = tmp_path / "stm_feedback.db"
@@ -350,6 +350,17 @@ class TestFeedbackStoreCoexistence:
 
 
 class TestFeedbackTracker:
+    def test_bootstrap_status(self, tmp_path: Path):
+        tracker = FeedbackTracker(SurfacingConfig(), db_path=tmp_path / "fb.db")
+        try:
+            status = tracker.bootstrap_status()
+        finally:
+            tracker.close()
+
+        assert status["exists"] is True
+        assert status["initialized"] is True
+        assert status["missing_tables"] == []
+
     def test_invalid_rating_rejected(self, tmp_path: Path):
         tracker = FeedbackTracker(SurfacingConfig(), db_path=tmp_path / "fb.db")
         try:

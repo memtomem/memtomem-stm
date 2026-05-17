@@ -22,15 +22,11 @@ class FeedbackTracker:
         before = inspect_feedback_db(resolved)
         self._store = FeedbackStore(resolved)
         self._store.initialize()
-        after = inspect_feedback_db(resolved)
-        tables = "ready"
-        if after["missing_tables"]:
-            tables = "missing " + ", ".join(str(t) for t in after["missing_tables"])
         logger.info(
             "Surfacing feedback store initialized at %s (tables=%s, created_schema=%s)",
-            after["path"],
-            tables,
-            not before["initialized"] and after["initialized"],
+            self._store.db_path.expanduser().resolve(),
+            "ready",
+            not before["initialized"],
         )
 
     @property

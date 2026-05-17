@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -50,7 +51,9 @@ CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 """
 
-_REQUIRED_TABLES = ("surfacing_events", "surfacing_feedback", "seen_memories")
+_REQUIRED_TABLES = tuple(
+    re.findall(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", _SCHEMA)
+)
 
 
 def inspect_feedback_db(db_path: Path) -> dict[str, object]:
@@ -67,14 +70,15 @@ def inspect_feedback_db(db_path: Path) -> dict[str, object]:
         return status
 
     try:
-        db = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:
         status["error"] = str(exc)
         return status
 
     try:
+        placeholders = ", ".join("?" for _ in _REQUIRED_TABLES)
         rows = db.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+            f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
             _REQUIRED_TABLES,
         ).fetchall()
     except sqlite3.Error as exc:

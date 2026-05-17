@@ -170,8 +170,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         feedback_tables = (
                             "ready"
                             if db_status["initialized"]
-                            else "missing "
-                            + ", ".join(str(t) for t in db_status["missing_tables"])
+                            else "missing " + ", ".join(str(t) for t in db_status["missing_tables"])
                         )
                     logger.info(
                         "Surfacing path wired: engine=enabled feedback=%s "
