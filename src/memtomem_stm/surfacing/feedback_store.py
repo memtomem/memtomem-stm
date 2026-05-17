@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -50,6 +51,48 @@ CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 """
 
+_REQUIRED_TABLES = tuple(
+    re.findall(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", _SCHEMA)
+)
+
+
+def inspect_feedback_db(db_path: Path) -> dict[str, object]:
+    """Inspect surfacing feedback DB schema without creating or migrating it."""
+    resolved = db_path.expanduser().resolve()
+    status: dict[str, object] = {
+        "path": str(resolved),
+        "exists": resolved.exists(),
+        "initialized": False,
+        "missing_tables": list(_REQUIRED_TABLES),
+        "error": None,
+    }
+    if not resolved.exists():
+        return status
+
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        status["error"] = str(exc)
+        return status
+
+    try:
+        placeholders = ", ".join("?" for _ in _REQUIRED_TABLES)
+        rows = db.execute(
+            f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
+            _REQUIRED_TABLES,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        status["error"] = str(exc)
+        return status
+    finally:
+        db.close()
+
+    present = {row[0] for row in rows}
+    missing = [name for name in _REQUIRED_TABLES if name not in present]
+    status["missing_tables"] = missing
+    status["initialized"] = not missing
+    return status
+
 
 class FeedbackStore:
     """SQLite store for surfacing events and feedback ratings."""
@@ -58,6 +101,10 @@ class FeedbackStore:
         self._db_path = db_path
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

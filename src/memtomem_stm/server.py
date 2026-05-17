@@ -162,6 +162,23 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         token_tracker=tracker,
                         observability=SurfacingObservability(),
                     )
+                    feedback_db = "disabled"
+                    feedback_tables = "disabled"
+                    if feedback_tracker is not None:
+                        db_status = feedback_tracker.bootstrap_status()
+                        feedback_db = str(db_status["path"])
+                        feedback_tables = (
+                            "ready"
+                            if db_status["initialized"]
+                            else "missing " + ", ".join(str(t) for t in db_status["missing_tables"])
+                        )
+                    logger.info(
+                        "Surfacing path wired: engine=enabled feedback=%s "
+                        "feedback_db=%s feedback_tables=%s",
+                        "enabled" if feedback_tracker is not None else "disabled",
+                        feedback_db,
+                        feedback_tables,
+                    )
 
             # Response cache
             if config.proxy.cache.enabled:

@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.feedback_store import FeedbackStore
+from memtomem_stm.surfacing.feedback_store import FeedbackStore, inspect_feedback_db
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +19,22 @@ class FeedbackTracker:
     def __init__(self, config: SurfacingConfig, db_path: Path | None = None) -> None:
         self._config = config
         resolved = db_path if db_path is not None else config.feedback_db_path.expanduser()
+        before = inspect_feedback_db(resolved)
         self._store = FeedbackStore(resolved)
         self._store.initialize()
+        logger.info(
+            "Surfacing feedback store initialized at %s (tables=%s, created_schema=%s)",
+            self._store.db_path.expanduser().resolve(),
+            "ready",
+            not before["initialized"],
+        )
 
     @property
     def store(self) -> FeedbackStore:
         return self._store
+
+    def bootstrap_status(self) -> dict[str, object]:
+        return inspect_feedback_db(self._store.db_path)
 
     def close(self) -> None:
         self._store.close()
