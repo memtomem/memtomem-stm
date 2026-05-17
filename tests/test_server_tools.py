@@ -40,6 +40,7 @@ def _make_ctx(
     feedback_tracker: object | None = None,
     compression_feedback_tracker: object | None = None,
     progressive_reads_tracker: object | None = None,
+    config: STMConfig | None = None,
 ) -> SimpleNamespace:
     """Build a fake CtxType that _get_ctx() can unwrap.
 
@@ -51,9 +52,11 @@ def _make_ctx(
     if proxy_manager is None:
         cfg = ProxyConfig(config_path="/tmp/proxy.json", upstream_servers={})
         proxy_manager = ProxyManager(cfg, tracker)
+    if config is None:
+        config = STMConfig()
 
     app = STMContext(
-        config=STMConfig(),
+        config=config,
         proxy_manager=proxy_manager,
         tracker=tracker,
         surfacing_engine=surfacing_engine,
@@ -233,6 +236,12 @@ class TestHealth:
         result = await stm_proxy_health(ctx=ctx)
         assert "srv: connected (2 tools)" in result
 
+    @staticmethod
+    def _proxy_enabled_config() -> STMConfig:
+        cfg = STMConfig()
+        cfg.proxy.enabled = True
+        return cfg
+
     async def test_bootstrap_block_tracker_ready(self):
         """Bootstrap section reports ready when tracker.bootstrap_status() says so."""
         tracker = MagicMock()
@@ -243,7 +252,7 @@ class TestHealth:
             "missing_tables": [],
             "error": None,
         }
-        ctx = _make_ctx(feedback_tracker=tracker)
+        ctx = _make_ctx(feedback_tracker=tracker, config=self._proxy_enabled_config())
         result = await stm_proxy_health(ctx=ctx)
         assert "Surfacing Bootstrap" in result
         assert "feedback tracking: enabled" in result
@@ -260,36 +269,33 @@ class TestHealth:
             "missing_tables": ["auto_tune_adjustments"],
             "error": None,
         }
-        ctx = _make_ctx(feedback_tracker=tracker)
+        ctx = _make_ctx(feedback_tracker=tracker, config=self._proxy_enabled_config())
         result = await stm_proxy_health(ctx=ctx)
         assert "feedback tables: missing (auto_tune_adjustments)" in result
 
     async def test_bootstrap_block_init_failed(self):
-        """When feedback_enabled but tracker is None, surface the runtime-init failure."""
-        ctx = _make_ctx(feedback_tracker=None)
-        # Default STMConfig has surfacing.enabled=True and feedback_enabled=True,
-        # so a None tracker means the lifespan init path failed.
+        """When proxy is up + feedback_enabled but tracker is None, surface runtime-init failure."""
+        ctx = _make_ctx(feedback_tracker=None, config=self._proxy_enabled_config())
         result = await stm_proxy_health(ctx=ctx)
         assert "Surfacing Bootstrap" in result
         assert "runtime init failed" in result
+
+    async def test_bootstrap_block_proxy_disabled(self):
+        """When proxy.enabled=false the lifespan skips surfacing init entirely —
+        a None tracker is expected, not a runtime failure. Report it as such.
+        """
+        # Default STMConfig has proxy.enabled=False, so _make_ctx() suffices.
+        ctx = _make_ctx(feedback_tracker=None)
+        result = await stm_proxy_health(ctx=ctx)
+        assert "Surfacing Bootstrap" in result
+        assert "feedback tracking: inactive (proxy disabled)" in result
+        assert "runtime init failed" not in result
 
     async def test_bootstrap_block_absent_when_surfacing_disabled(self):
         """No bootstrap section when surfacing is config-disabled."""
         cfg = STMConfig()
         cfg.surfacing.enabled = False
-        tracker_handle = TokenTracker()
-        proxy_cfg = ProxyConfig(config_path="/tmp/p.json", upstream_servers={})
-        pm = ProxyManager(proxy_cfg, tracker_handle)
-        app = STMContext(
-            config=cfg,
-            proxy_manager=pm,
-            tracker=tracker_handle,
-            surfacing_engine=None,
-            feedback_tracker=None,
-            compression_feedback_tracker=None,
-            progressive_reads_tracker=None,
-        )
-        ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+        ctx = _make_ctx(config=cfg)
         result = await stm_proxy_health(ctx=ctx)
         assert "Surfacing Bootstrap" not in result
 

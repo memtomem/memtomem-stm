@@ -588,6 +588,13 @@ def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:
         return []
 
     lines = ["", "Surfacing Bootstrap", "==================="]
+    # app_lifespan skips the entire surfacing init block when
+    # proxy.enabled=false (the default control-only mode), so a None
+    # tracker there is expected — not a runtime failure.
+    if not app.config.proxy.enabled:
+        lines.append("  feedback tracking: inactive (proxy disabled)")
+        return lines
+
     tracker = app.feedback_tracker
     if tracker is None:
         if surfacing_cfg.feedback_enabled:
