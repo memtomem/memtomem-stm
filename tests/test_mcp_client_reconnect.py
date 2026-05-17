@@ -68,7 +68,7 @@ class TestReconnectRetrySuccess:
         # hits the same mock.
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("anything")
+        results, hints, outcome = await adapter.search("anything")
 
         adapter._reconnect.assert_awaited_once()
         assert mock_session.call_tool.await_count == 2
@@ -76,6 +76,7 @@ class TestReconnectRetrySuccess:
         assert "retry worked" in results[0].chunk.content.lower()
         assert results[0].score == 0.95
         assert hints == []
+        assert outcome == "ok"
 
 
 class TestReconnectRetryFailure:
@@ -93,10 +94,11 @@ class TestReconnectRetryFailure:
 
         adapter._reconnect = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
 
         assert results == []
         assert hints == []
+        assert outcome == "transport_error"
         adapter._reconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -112,10 +114,11 @@ class TestReconnectRetryFailure:
         adapter._session = mock_session
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
 
         assert results == []
         assert hints == []
+        assert outcome == "transport_error"
         assert mock_session.call_tool.await_count == 2
 
 
@@ -133,10 +136,11 @@ class TestNonTransportErrorsDoNotReconnect:
         adapter._session = mock_session
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
 
         assert results == []
         assert hints == []
+        assert outcome == "call_error"
         adapter._reconnect.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -272,9 +276,12 @@ class TestNoneContentDefense:
         mock_session.call_tool = AsyncMock(return_value=bad)
         adapter._session = mock_session
 
-        results, hints = await adapter.search("anything")
+        results, hints, outcome = await adapter.search("anything")
         assert results == []
         assert hints == []
+        # ``result.content is None`` is treated as a missing-text response,
+        # not a transport error — outcome is ``empty_content`` (#295).
+        assert outcome == "empty_content"
 
     @pytest.mark.asyncio
     async def test_scratch_list_returns_empty_when_content_is_none(self):
@@ -367,9 +374,10 @@ class TestTextNoneTolerance:
         mock_session.call_tool = AsyncMock(return_value=result_obj)
         adapter._session = mock_session
 
-        results, _ = await adapter.search("test query")
+        results, _, outcome = await adapter.search("test query")
         assert len(results) == 1
         assert "real content" in results[0].chunk.content
+        assert outcome == "ok"
 
     @pytest.mark.asyncio
     async def test_search_all_none_text_returns_empty(self):
@@ -385,8 +393,13 @@ class TestTextNoneTolerance:
         mock_session.call_tool = AsyncMock(return_value=result_obj)
         adapter._session = mock_session
 
-        results, _ = await adapter.search("test query")
+        results, _, outcome = await adapter.search("test query")
         assert results == []
+        # All-None text → ``text_parts`` was non-empty but stringified to
+        # empty content; the parser still ran and returned ``[]`` →
+        # ``empty_results`` (#295). The all-None-string case is parser-empty,
+        # not adapter-empty.
+        assert outcome == "empty_results"
 
 
 # ── Outer wait_for cancellation (#290) ──────────────────────────────────
@@ -434,12 +447,13 @@ class TestOuterCancellationLazyReconnect:
         adapter._session = mock_session
         adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
 
-        results, _ = await adapter.search("q")
+        results, _, outcome = await adapter.search("q")
 
         adapter._reconnect.assert_awaited_once()
         assert adapter._needs_reconnect is False
         assert len(results) == 1
         assert "healed result" in results[0].chunk.content
+        assert outcome == "ok"
 
     @pytest.mark.asyncio
     async def test_failed_lazy_reconnect_returns_empty_and_keeps_flag(self):
@@ -453,10 +467,14 @@ class TestOuterCancellationLazyReconnect:
         adapter._session = mock_session
         adapter._reconnect = AsyncMock(side_effect=ConnectionError("still down"))  # type: ignore[method-assign]
 
-        results, hints = await adapter.search("q")
+        results, hints, outcome = await adapter.search("q")
 
         assert results == []
         assert hints == []
+        # Failed lazy heal leaves the adapter in the same surface state as
+        # ``_session is None`` — both report ``no_session`` so the engine
+        # records ``ltm_unavailable`` instead of a no-results bucket (#295).
+        assert outcome == "no_session"
         # Flag preserved so a later call retries the heal rather than
         # silently accepting the broken state.
         assert adapter._needs_reconnect is True

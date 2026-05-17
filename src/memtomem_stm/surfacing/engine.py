@@ -492,13 +492,31 @@ class SurfacingEngine:
         search_kwargs: dict[str, Any] = {}
         if ctx_win:
             search_kwargs["context_window"] = ctx_win
-        results, hints = await self._mcp_adapter.search(
+        results, hints, outcome = await self._mcp_adapter.search(
             query=query,
             top_k=max_results * 2,
             namespace=namespace,
             trace_id=trace_id,
             **search_kwargs,
         )
+
+        # #295: branch on the adapter outcome before doing any further work
+        # so the operator-facing skip label distinguishes "LTM unavailable"
+        # (``no_session``/``transport_error``) from "LTM call raised"
+        # (``call_error``) from "core returned no text" (``empty_content``).
+        # ``ok`` and ``empty_results`` both fall through to the existing
+        # min_score / dedup / ``no_results_score`` path so that operators
+        # tuning min_score keep seeing the same signal for the genuine
+        # empty-namespace case.
+        if outcome in ("no_session", "transport_error"):
+            self._observability.record_skip(tool, "ltm_unavailable")
+            return response_text
+        if outcome == "call_error":
+            self._observability.record_skip(tool, "ltm_call_failed")
+            return response_text
+        if outcome == "empty_content":
+            self._observability.record_skip(tool, "ltm_parse_empty")
+            return response_text
 
         # Parent trust-UX hints (parent PR #231): log at INFO even when results
         # are empty or get filtered out below, since an operator may want to
