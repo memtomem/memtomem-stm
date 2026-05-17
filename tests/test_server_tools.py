@@ -362,6 +362,11 @@ class TestSurfacingStats:
             "total_feedback": 59,
             "recent": [],
         }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "ready_tool": 25,
+            "tuned_tool": 30,
+            "cold_tool": 4,
+        }
         mock_engine = MagicMock()
         mock_engine.observability = None
         mock_engine.get_min_score_snapshot.return_value = {
@@ -369,6 +374,7 @@ class TestSurfacingStats:
             "auto_tune_enabled": True,
             "auto_tune_min_samples": 20,
             "adjusted": {"tuned_tool": 0.038},
+            "overrides": {},
         }
         ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
         result = await stm_surfacing_stats(ctx=ctx)
@@ -408,6 +414,7 @@ class TestSurfacingStats:
             "total_feedback": 3,
             "recent": [],
         }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {"cold_but_tuned": 3}
         mock_engine = MagicMock()
         mock_engine.observability = None
         mock_engine.get_min_score_snapshot.return_value = {
@@ -459,6 +466,10 @@ class TestSurfacingStats:
             "rating_distribution": {"helpful": 30, "not_relevant": 35},
             "total_feedback": 65,
             "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "pinned_tool": 40,
+            "tunable_tool": 25,
         }
         mock_engine = MagicMock()
         mock_engine.observability = None
@@ -523,6 +534,10 @@ class TestSurfacingStats:
             "total_feedback": 29,
             "recent": [],
         }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "ready_tool": 25,
+            "cold_tool": 4,
+        }
         mock_engine = MagicMock()
         mock_engine.observability = None
         mock_engine.get_min_score_snapshot.return_value = {
@@ -530,6 +545,7 @@ class TestSurfacingStats:
             "auto_tune_enabled": False,
             "auto_tune_min_samples": 20,
             "adjusted": {},
+            "overrides": {},
         }
         ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
         result = await stm_surfacing_stats(ctx=ctx)
@@ -541,6 +557,105 @@ class TestSurfacingStats:
         assert "auto-tuned" not in result
         assert "auto-tune ready" not in result
         assert "for auto-tune" not in result
+
+    async def test_readiness_uses_unfiltered_count_under_since_window(self):
+        """``since=`` filters the stats rows but AutoTuner sees the full
+        history; readiness must reflect unfiltered counts or it will
+        under-report eligibility for tools with sparse recent activity."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "historic_tool",
+                    "events": 2,
+                    "avg_memory_count": 1.0,
+                    # Only 3 feedback rows fell in the since window — the row
+                    # count would otherwise drive a "need 17 more" label.
+                    "feedback_count": 3,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 2, "not_relevant": 1},
+            "total_feedback": 3,
+            "recent": [],
+        }
+        # The full history has 50 samples — well past the 20-sample threshold —
+        # but not yet adjusted (ratio in [0.2, 0.6] no-op band).
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {"historic_tool": 50}
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(since="2026-04-01T00:00:00", ctx=ctx)
+
+        row = next(
+            line
+            for line in result.splitlines()
+            if "historic_tool:" in line and "events" in line
+        )
+        assert "auto-tune ready" in row
+        # Windowed feedback count is still reported for the operator's audit,
+        # but the readiness gate honors the unfiltered total.
+        assert "feedback 3" in row
+        assert "need" not in row
+
+    async def test_min_score_lists_honor_tool_filter(self):
+        """When ``tool=`` is set, the per-tool adjustment / pinned sublists
+        must restrict to that tool — otherwise they contradict the trailing
+        ``(filtered by tool: ...)`` marker by leaking unrelated thresholds."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "alpha",
+                    "events": 10,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 10,
+                    "not_relevant_count": 0,
+                },
+            ],
+            "rating_distribution": {"helpful": 10},
+            "total_feedback": 10,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "alpha": 10,
+            "beta": 30,
+            "gamma": 30,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {"beta": 0.038},
+            "overrides": {"gamma": 0.045},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(tool="alpha", ctx=ctx)
+
+        # Neither beta (adjusted) nor gamma (pinned) belong in an alpha-filtered
+        # report — the sublists must drop them entirely.
+        assert "beta:" not in result
+        assert "gamma:" not in result
+        # Without any alpha-specific adjustment/override, the sublists collapse.
+        assert "Per-tool adjustments:" not in result
+        assert "Per-tool pinned" not in result
+        # Filter marker still present.
+        assert "(filtered by tool: alpha)" in result
 
     async def test_invalid_since(self):
         """Malformed ISO timestamp is rejected cleanly, not raised."""

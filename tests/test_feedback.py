@@ -177,6 +177,28 @@ class TestFeedbackStore:
         assert stats["rating_distribution"] == {"helpful": 1}
         assert all(r["tool"] == "tool_a" for r in stats["recent"])
 
+    def test_get_per_tool_feedback_counts_is_unfiltered(self, feedback_store: FeedbackStore):
+        """Powers the auto-tune readiness gate in ``stm_surfacing_stats`` —
+        must always return the full history, not honor any time window."""
+        feedback_store.record_surfacing("s_old", "sv", "t1", "q", ["m1"], [0.9])
+        feedback_store._db.execute(  # type: ignore[union-attr]
+            "UPDATE surfacing_events SET created_at = ? WHERE id = ?",
+            (time.time() - 7200, "s_old"),
+        )
+        feedback_store._db.commit()  # type: ignore[union-attr]
+        feedback_store.record_feedback("s_old", "helpful")
+        feedback_store.record_feedback("s_old", "not_relevant")
+
+        feedback_store.record_surfacing("s_new", "sv", "t2", "q", ["m2"], [0.9])
+        feedback_store.record_feedback("s_new", "helpful")
+
+        counts = feedback_store.get_per_tool_feedback_counts()
+        # Both tools present despite t1's feedback being well before "now".
+        assert counts == {"t1": 2, "t2": 1}
+
+    def test_get_per_tool_feedback_counts_empty(self, feedback_store: FeedbackStore):
+        assert feedback_store.get_per_tool_feedback_counts() == {}
+
     def test_not_relevant_ratio_computed(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
         for i in range(20):

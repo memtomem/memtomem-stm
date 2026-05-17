@@ -653,10 +653,24 @@ async def stm_surfacing_stats(
         # per-tool adjustments AutoTuner has made this process. Surfaced before
         # the per-tool breakdown so the reader can interpret the breakdown's
         # "feedback N (negative R%)" against the auto-tune readiness threshold.
+        # When ``tool=`` is set we restrict the per-tool sublists to that tool
+        # only — otherwise the lists would contradict the trailing
+        # "(filtered by tool: ...)" marker by leaking unrelated thresholds.
         min_samples_required = 0
         adjusted_scores: dict[str, float] = {}
         overrides: dict[str, float] = {}
         auto_tune_active = False
+        # Readiness must be computed against the same unfiltered sample set
+        # AutoTuner sees — a ``since=`` window would otherwise under-report
+        # eligibility for a tool with enough historical samples but only a
+        # handful of recent events. Falls back to the row's filtered fb only
+        # when the unfiltered counts aren't available (e.g. tracker missing).
+        readiness_counts: dict[str, int] = {}
+        if app.feedback_tracker is not None:
+            try:
+                readiness_counts = app.feedback_tracker.store.get_per_tool_feedback_counts()
+            except Exception:
+                readiness_counts = {}
         if app.surfacing_engine is not None:
             snap = app.surfacing_engine.get_min_score_snapshot()
             adjusted_scores = snap["adjusted"]
@@ -668,13 +682,21 @@ async def stm_surfacing_stats(
                 f"\nMin score:       {snap['default']:.3f} "
                 f"(auto-tune {auto_state}, min {min_samples_required} samples)"
             )
-            if adjusted_scores:
+            visible_adjusted = (
+                {t: s for t, s in adjusted_scores.items() if t == tool}
+                if tool is not None
+                else adjusted_scores
+            )
+            visible_overrides = (
+                {t: s for t, s in overrides.items() if t == tool} if tool is not None else overrides
+            )
+            if visible_adjusted:
                 lines.append("  Per-tool adjustments:")
-                for t, s in sorted(adjusted_scores.items()):
+                for t, s in sorted(visible_adjusted.items()):
                     lines.append(f"    {t}: {s:.3f}")
-            if overrides:
+            if visible_overrides:
                 lines.append("  Per-tool pinned (bypass auto-tune):")
-                for t, s in sorted(overrides.items()):
+                for t, s in sorted(visible_overrides.items()):
                     lines.append(f"    {t}: {s:.3f}")
 
         if stats["per_tool_breakdown"]:
@@ -709,10 +731,17 @@ async def stm_surfacing_stats(
                     # effective threshold the engine actually used.
                     if tool_name in adjusted_scores:
                         detail_parts.append("auto-tuned")
-                    elif fb >= min_samples_required:
-                        detail_parts.append("auto-tune ready")
                     else:
-                        detail_parts.append(f"need {min_samples_required - fb} more for auto-tune")
+                        # Use unfiltered count for readiness — see ``readiness_counts``
+                        # comment above. Falls back to the windowed fb when the
+                        # store didn't supply a count for this tool (closed/missing).
+                        eligible_fb = readiness_counts.get(tool_name, fb)
+                        if eligible_fb >= min_samples_required:
+                            detail_parts.append("auto-tune ready")
+                        else:
+                            detail_parts.append(
+                                f"need {min_samples_required - eligible_fb} more for auto-tune"
+                            )
                 lines.append(f"  {tool_name}: {', '.join(detail_parts)}")
 
         if stats["rating_distribution"]:

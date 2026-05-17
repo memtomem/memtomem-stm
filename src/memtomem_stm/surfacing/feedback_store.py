@@ -418,3 +418,24 @@ class FeedbackStore:
                 "SELECT COUNT(*) FROM surfacing_feedback WHERE rating = 'not_relevant'"
             ).fetchone()[0]
         return not_relevant / total if total > 0 else 0.0
+
+    def get_per_tool_feedback_counts(self) -> dict[str, int]:
+        """Return total feedback rows per tool, ignoring any time window.
+
+        Mirrors what ``AutoTuner.maybe_adjust`` actually sees — the tuner
+        decides readiness from the full feedback history, not from any
+        ``since`` window an operator passes to ``stm_surfacing_stats``.
+        Used by the server formatter to compute "auto-tune ready" /
+        "need N more" labels that don't contradict the tuner just because
+        the stats query is windowed.
+
+        Returns ``{}`` when the store is closed.
+        """
+        if self._db is None:
+            return {}
+        rows = self._db.execute(
+            "SELECT e.tool, COUNT(*) FROM surfacing_feedback f "
+            "JOIN surfacing_events e ON f.surfacing_id = e.id "
+            "GROUP BY e.tool"
+        ).fetchall()
+        return {tool: count for tool, count in rows}
