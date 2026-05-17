@@ -133,6 +133,40 @@ class SurfacingEngine:
         """
         return self._config.injection_mode
 
+    def get_min_score_snapshot(self) -> dict:
+        """Return the current min_score state for observability.
+
+        Read by ``server.py::stm_surfacing_stats`` to render which tools
+        have been auto-tuned away from the default and which are still
+        accumulating samples. ``adjusted`` only contains tools whose
+        ``AutoTuner.maybe_adjust`` has fired this process; an empty dict
+        with ``enabled=True`` means auto-tuning is on but no tool has
+        moved off the default yet (either insufficient samples or ratio
+        inside the [0.2, 0.6] no-op band).
+
+        ``overrides`` maps tool name → pinned ``min_score`` from
+        ``context_tools.<tool>.min_score``. These tools bypass the
+        auto-tuner entirely (see ``_do_surface`` — tool_cfg override
+        takes precedence over ``maybe_adjust``), so the formatter must
+        suppress readiness labels for them or it implies the tuner
+        could change a threshold the operator has explicitly pinned.
+        """
+        adjusted: dict[str, float] = (
+            self._auto_tuner.adjustments if self._auto_tuner is not None else {}
+        )
+        overrides: dict[str, float] = {
+            tool: tcfg.min_score
+            for tool, tcfg in self._config.context_tools.items()
+            if tcfg.min_score is not None
+        }
+        return {
+            "default": self._config.min_score,
+            "auto_tune_enabled": self._config.auto_tune_enabled and self._auto_tuner is not None,
+            "auto_tune_min_samples": self._config.auto_tune_min_samples,
+            "adjusted": adjusted,
+            "overrides": overrides,
+        }
+
     async def surface(
         self,
         server: str,

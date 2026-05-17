@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
 from memtomem_stm.surfacing.feedback_store import FeedbackStore
@@ -90,11 +91,15 @@ class TestFeedbackStore:
             "tool": "tool_a",
             "events": 2,
             "avg_memory_count": 2.5,
+            "feedback_count": 2,
+            "not_relevant_count": 1,
         }
         assert stats["per_tool_breakdown"][1] == {
             "tool": "tool_b",
             "events": 1,
             "avg_memory_count": 1.0,
+            "feedback_count": 1,
+            "not_relevant_count": 0,
         }
         assert stats["rating_distribution"] == {
             "helpful": 1,
@@ -172,6 +177,28 @@ class TestFeedbackStore:
         assert stats["rating_distribution"] == {"helpful": 1}
         assert all(r["tool"] == "tool_a" for r in stats["recent"])
 
+    def test_get_per_tool_feedback_counts_is_unfiltered(self, feedback_store: FeedbackStore):
+        """Powers the auto-tune readiness gate in ``stm_surfacing_stats`` —
+        must always return the full history, not honor any time window."""
+        feedback_store.record_surfacing("s_old", "sv", "t1", "q", ["m1"], [0.9])
+        feedback_store._db.execute(  # type: ignore[union-attr]
+            "UPDATE surfacing_events SET created_at = ? WHERE id = ?",
+            (time.time() - 7200, "s_old"),
+        )
+        feedback_store._db.commit()  # type: ignore[union-attr]
+        feedback_store.record_feedback("s_old", "helpful")
+        feedback_store.record_feedback("s_old", "not_relevant")
+
+        feedback_store.record_surfacing("s_new", "sv", "t2", "q", ["m2"], [0.9])
+        feedback_store.record_feedback("s_new", "helpful")
+
+        counts = feedback_store.get_per_tool_feedback_counts()
+        # Both tools present despite t1's feedback being well before "now".
+        assert counts == {"t1": 2, "t2": 1}
+
+    def test_get_per_tool_feedback_counts_empty(self, feedback_store: FeedbackStore):
+        assert feedback_store.get_per_tool_feedback_counts() == {}
+
     def test_not_relevant_ratio_computed(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
         for i in range(20):
@@ -180,6 +207,107 @@ class TestFeedbackStore:
         ratio = feedback_store.get_tool_not_relevant_ratio("t", min_samples=20)
         assert ratio is not None
         assert abs(ratio - 0.6) < 0.01
+
+    def test_per_tool_breakdown_includes_feedback_counts(self, feedback_store: FeedbackStore):
+        """Per-tool breakdown exposes feedback_count + not_relevant_count."""
+        feedback_store.record_surfacing("s_a1", "sv", "tool_a", "q", ["m1"], [0.9])
+        feedback_store.record_surfacing("s_a2", "sv", "tool_a", "q", ["m2"], [0.9])
+        feedback_store.record_surfacing("s_b", "sv", "tool_b", "q", ["m3"], [0.9])
+        feedback_store.record_feedback("s_a1", "helpful")
+        feedback_store.record_feedback("s_a2", "not_relevant")
+        feedback_store.record_feedback("s_a2", "not_relevant")
+        # tool_b has no feedback yet.
+
+        stats = feedback_store.get_stats()
+        by_tool = {row["tool"]: row for row in stats["per_tool_breakdown"]}
+        assert by_tool["tool_a"]["feedback_count"] == 3
+        assert by_tool["tool_a"]["not_relevant_count"] == 2
+        assert by_tool["tool_b"]["feedback_count"] == 0
+        assert by_tool["tool_b"]["not_relevant_count"] == 0
+
+    def test_per_tool_feedback_honors_since_filter(self, feedback_store: FeedbackStore):
+        """since= filters feedback rows via their parent event's created_at."""
+        feedback_store.record_surfacing("s_old", "sv", "t", "q", ["m1"], [0.9])
+        feedback_store._db.execute(  # type: ignore[union-attr]
+            "UPDATE surfacing_events SET created_at = ? WHERE id = ?",
+            (time.time() - 3600, "s_old"),
+        )
+        feedback_store._db.commit()  # type: ignore[union-attr]
+        feedback_store.record_feedback("s_old", "not_relevant")
+
+        feedback_store.record_surfacing("s_new", "sv", "t", "q", ["m2"], [0.9])
+        feedback_store.record_feedback("s_new", "helpful")
+
+        stats = feedback_store.get_stats(since=time.time() - 60)
+        row = stats["per_tool_breakdown"][0]
+        assert row["feedback_count"] == 1
+        assert row["not_relevant_count"] == 0
+
+
+class TestFeedbackStoreCoexistence:
+    """Regression: surfacing tables coexist with compression tables on the same DB.
+
+    Real ``~/.memtomem/stm_feedback.db`` files in the wild may have been
+    initialized by ``CompressionFeedbackStore`` alone (compression_feedback +
+    progressive_reads) before surfacing was ever enabled. When surfacing
+    starts up against such a DB, ``FeedbackStore.initialize()`` must add its
+    own tables without disturbing existing rows or schema.
+    """
+
+    def test_initialize_against_compression_only_db(self, tmp_path: Path):
+        db_path = tmp_path / "shared.db"
+
+        # Simulate the production state: compression store created first,
+        # with a row already written.
+        cstore = CompressionFeedbackStore(db_path)
+        cstore.initialize()
+        cstore.record(
+            server="server-x",
+            tool="tool-x",
+            kind="missing_field",
+            missing="x.y",
+            trace_id="trace-1",
+        )
+        cstore.close()
+
+        # FeedbackStore opens the same file later. Surfacing tables should
+        # appear; compression rows must remain.
+        fstore = FeedbackStore(db_path)
+        fstore.initialize()
+        try:
+            tables = {
+                r[0]
+                for r in fstore._db.execute(  # type: ignore[union-attr]
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert {"surfacing_events", "surfacing_feedback", "seen_memories"} <= tables
+            assert "compression_feedback" in tables
+
+            preserved = fstore._db.execute(  # type: ignore[union-attr]
+                "SELECT server, tool FROM compression_feedback"
+            ).fetchall()
+            assert preserved == [("server-x", "tool-x")]
+        finally:
+            fstore.close()
+
+    def test_initialize_is_idempotent(self, tmp_path: Path):
+        """Re-opening must be a no-op — no data loss, no schema errors."""
+        db_path = tmp_path / "shared.db"
+        fstore = FeedbackStore(db_path)
+        fstore.initialize()
+        fstore.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.9])
+        fstore.record_feedback("s1", "helpful")
+        fstore.close()
+
+        fstore2 = FeedbackStore(db_path)
+        fstore2.initialize()  # second initialize on existing schema
+        try:
+            stats = fstore2.get_stats()
+            assert stats["events_total"] == 1
+            assert stats["rating_distribution"] == {"helpful": 1}
+        finally:
+            fstore2.close()
 
 
 # ---------------------------------------------------------------------------

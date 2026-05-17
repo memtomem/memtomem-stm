@@ -649,13 +649,117 @@ async def stm_surfacing_stats(
             last_iso = datetime.fromtimestamp(dr["last"]).isoformat(timespec="seconds")
             lines.append(f"Date range:      {first_iso} — {last_iso}")
 
+        # Min score block — show the default, whether auto-tune is on, and any
+        # per-tool adjustments AutoTuner has made this process. Surfaced before
+        # the per-tool breakdown so the reader can interpret the breakdown's
+        # "feedback N (negative R%)" against the auto-tune readiness threshold.
+        # When ``tool=`` is set we restrict the per-tool sublists to that tool
+        # only — otherwise the lists would contradict the trailing
+        # "(filtered by tool: ...)" marker by leaking unrelated thresholds.
+        min_samples_required = 0
+        adjusted_scores: dict[str, float] = {}
+        overrides: dict[str, float] = {}
+        auto_tune_active = False
+        # Readiness must be computed against the same unfiltered sample set
+        # AutoTuner sees — a ``since=`` window would otherwise under-report
+        # eligibility for a tool with enough historical samples but only a
+        # handful of recent events. Falls back to the row's filtered fb only
+        # when the unfiltered counts aren't available (e.g. tracker missing).
+        # ``readiness_total_fb`` mirrors the global pool AutoTuner consults
+        # via the documented cold-start fallback: a tool with too few of
+        # its own samples still becomes eligible once total feedback across
+        # all tools reaches ``min_samples`` (feedback.py::maybe_adjust).
+        readiness_counts: dict[str, int] = {}
+        if app.feedback_tracker is not None:
+            try:
+                readiness_counts = app.feedback_tracker.store.get_per_tool_feedback_counts()
+            except Exception:
+                readiness_counts = {}
+        readiness_total_fb = sum(readiness_counts.values())
+        if app.surfacing_engine is not None:
+            snap = app.surfacing_engine.get_min_score_snapshot()
+            adjusted_scores = snap["adjusted"]
+            overrides = snap.get("overrides", {})
+            min_samples_required = snap["auto_tune_min_samples"]
+            auto_tune_active = snap["auto_tune_enabled"]
+            auto_state = "on" if auto_tune_active else "off"
+            lines.append(
+                f"\nMin score:       {snap['default']:.3f} "
+                f"(auto-tune {auto_state}, min {min_samples_required} samples)"
+            )
+            visible_adjusted = (
+                {t: s for t, s in adjusted_scores.items() if t == tool}
+                if tool is not None
+                else adjusted_scores
+            )
+            visible_overrides = (
+                {t: s for t, s in overrides.items() if t == tool} if tool is not None else overrides
+            )
+            if visible_adjusted:
+                lines.append("  Per-tool adjustments:")
+                for t, s in sorted(visible_adjusted.items()):
+                    lines.append(f"    {t}: {s:.3f}")
+            if visible_overrides:
+                lines.append("  Per-tool pinned (bypass auto-tune):")
+                for t, s in sorted(visible_overrides.items()):
+                    lines.append(f"    {t}: {s:.3f}")
+
         if stats["per_tool_breakdown"]:
             lines.append("\nBy tool:")
             for row in stats["per_tool_breakdown"]:
-                lines.append(
-                    f"  {row['tool']}: {row['events']} events, "
-                    f"avg {row['avg_memory_count']} memories"
-                )
+                fb = row.get("feedback_count", 0)
+                neg = row.get("not_relevant_count", 0)
+                # Readiness annotations only render when auto-tune is actually
+                # active and the tool isn't pinned via context_tools.<tool>.min_score.
+                # A pinned override bypasses the tuner entirely (engine.py:458-460),
+                # so any "ready" / "need N more" label would imply the tuner could
+                # change a threshold the operator has explicitly fixed.
+                detail_parts = [
+                    f"{row['events']} events",
+                    f"avg {row['avg_memory_count']} memories",
+                ]
+                if fb > 0:
+                    ratio_pct = round(neg / fb * 100, 1)
+                    detail_parts.append(f"feedback {fb} (negative {ratio_pct}%)")
+                else:
+                    detail_parts.append("feedback 0")
+                tool_name = row["tool"]
+                if tool_name in overrides:
+                    detail_parts.append(f"pinned {overrides[tool_name]:.3f}")
+                elif auto_tune_active and min_samples_required > 0:
+                    # Check ``adjusted_scores`` first: AutoTuner has a documented
+                    # cold-start fallback (feedback.py::maybe_adjust) that tunes a
+                    # tool from the global feedback pool even when the tool's own
+                    # feedback count is below ``min_samples``. So an "auto-tuned"
+                    # row can have fb < min_samples — gating on fb first would
+                    # contradict both the per-tool adjustment block and the
+                    # effective threshold the engine actually used.
+                    if tool_name in adjusted_scores:
+                        detail_parts.append("auto-tuned")
+                    else:
+                        # AutoTuner is eligible when either the tool's own
+                        # feedback or the global pool has hit ``min_samples``
+                        # (cold-start fallback). Reporting only the per-tool
+                        # gate would label a tool "need N more" even when the
+                        # very next surfacing would tune it from the global
+                        # pool with ratio outside the [0.2, 0.6] no-op band.
+                        # Falls back to the windowed fb when the store didn't
+                        # supply a count for this tool (closed/missing).
+                        eligible_fb = readiness_counts.get(tool_name, fb)
+                        if (
+                            eligible_fb >= min_samples_required
+                            or readiness_total_fb >= min_samples_required
+                        ):
+                            detail_parts.append("auto-tune ready")
+                        else:
+                            # Cold-start gap is the smaller of the two — once
+                            # the global pool reaches min_samples, any tool
+                            # becomes eligible regardless of its own count.
+                            detail_parts.append(
+                                f"need {min_samples_required - readiness_total_fb} "
+                                "more for auto-tune"
+                            )
+                lines.append(f"  {tool_name}: {', '.join(detail_parts)}")
 
         if stats["rating_distribution"]:
             lines.append("\nRating distribution:")

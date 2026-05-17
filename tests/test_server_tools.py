@@ -285,8 +285,20 @@ class TestSurfacingStats:
             "distinct_tools": 2,
             "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
             "per_tool_breakdown": [
-                {"tool": "t", "events": 7, "avg_memory_count": 3.0},
-                {"tool": "u", "events": 3, "avg_memory_count": 2.0},
+                {
+                    "tool": "t",
+                    "events": 7,
+                    "avg_memory_count": 3.0,
+                    "feedback_count": 5,
+                    "not_relevant_count": 2,
+                },
+                {
+                    "tool": "u",
+                    "events": 3,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 0,
+                    "not_relevant_count": 0,
+                },
             ],
             "rating_distribution": {"helpful": 3, "not_relevant": 2},
             "total_feedback": 5,
@@ -314,6 +326,394 @@ class TestSurfacingStats:
         assert "Recent:" in result
         assert "hello world" in result
         assert "(filtered by tool: t)" in result
+
+    async def test_min_score_block_when_engine_present(self):
+        """With a surfacing engine, output includes the min_score snapshot
+        and per-tool auto-tune readiness annotations."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 2,
+            "distinct_tools": 2,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "ready_tool",
+                    "events": 25,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 25,
+                    "not_relevant_count": 5,
+                },
+                {
+                    "tool": "tuned_tool",
+                    "events": 30,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 30,
+                    "not_relevant_count": 22,
+                },
+                {
+                    "tool": "cold_tool",
+                    "events": 3,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 4,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 25, "not_relevant": 28},
+            "total_feedback": 59,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "ready_tool": 25,
+            "tuned_tool": 30,
+            "cold_tool": 4,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {"tuned_tool": 0.038},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        assert "Min score:       0.030 (auto-tune on, min 20 samples)" in result
+        assert "Per-tool adjustments:" in result
+        assert "tuned_tool: 0.038" in result
+        # Auto-tune readiness annotations:
+        assert "tuned_tool: 30 events" in result and "auto-tuned" in result
+        assert "ready_tool: 25 events" in result and "auto-tune ready" in result
+        # cold_tool has only 4 of its own samples, but the global pool here
+        # has 59 (25 + 30 + 4) — past the 20-sample threshold — so the
+        # tuner's cold-start fallback would fire on the next surfacing.
+        # Readiness label reflects that, not the per-tool count alone.
+        cold_row = next(
+            line
+            for line in result.splitlines()
+            if "cold_tool:" in line and "events" in line
+        )
+        assert "auto-tune ready" in cold_row
+        assert "need" not in cold_row
+        # Negative ratio rendered where feedback exists.
+        assert "negative 73.3%" in result  # tuned: 22/30
+        assert "negative 20.0%" in result  # ready: 5/25
+
+    async def test_need_more_uses_global_gap_when_pool_also_below_threshold(self):
+        """When *both* the tool's own and the global pool are below
+        ``min_samples``, the "need N more" message must reflect the
+        cold-start gap — the global shortfall — since that's the smaller
+        of the two gates and is what the tuner is actually waiting on."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "lonely_tool",
+                    "events": 3,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 2,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 1, "not_relevant": 1},
+            "total_feedback": 2,
+            "recent": [],
+        }
+        # Per-tool 2 + one other tool 5 → global 7, both well below 20.
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "lonely_tool": 2,
+            "other_tool": 5,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        row = next(
+            line
+            for line in result.splitlines()
+            if "lonely_tool:" in line and "events" in line
+        )
+        # Gap reported against global pool (20 - 7 = 13), not per-tool (20 - 2 = 18).
+        assert "need 13 more for auto-tune" in row
+
+    async def test_cold_start_tuned_tool_reported_as_tuned(self):
+        """AutoTuner's cold-start fallback (feedback.py::maybe_adjust) can
+        tune a tool from the global feedback pool even when the tool's own
+        feedback count is below ``min_samples``. Such a tool appears in
+        ``adjusted`` despite low per-tool feedback — the formatter must
+        report it as ``auto-tuned``, not ``need N more for auto-tune``."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "cold_but_tuned",
+                    "events": 4,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 3,  # below the 20-sample threshold
+                    "not_relevant_count": 0,
+                },
+            ],
+            "rating_distribution": {"helpful": 3},
+            "total_feedback": 3,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {"cold_but_tuned": 3}
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            # AutoTuner has already adjusted this tool from the global pool.
+            "adjusted": {"cold_but_tuned": 0.026},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        row = next(
+            line
+            for line in result.splitlines()
+            if "cold_but_tuned:" in line and "events" in line
+        )
+        assert "auto-tuned" in row
+        assert "need" not in row
+        assert "auto-tune ready" not in row
+
+    async def test_readiness_labels_suppressed_for_overridden_tools(self):
+        """Tools pinned via context_tools.<tool>.min_score bypass the tuner
+        entirely (engine.py:458-460). Stats output must show the pinned value
+        and suppress readiness labels for them, while still reporting
+        readiness for un-overridden siblings."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 2,
+            "distinct_tools": 2,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "pinned_tool",
+                    "events": 50,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 40,
+                    "not_relevant_count": 30,
+                },
+                {
+                    "tool": "tunable_tool",
+                    "events": 25,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 25,
+                    "not_relevant_count": 5,
+                },
+            ],
+            "rating_distribution": {"helpful": 30, "not_relevant": 35},
+            "total_feedback": 65,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "pinned_tool": 40,
+            "tunable_tool": 25,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {"pinned_tool": 0.045},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        # Pinned override listed in the Min score block:
+        assert "Per-tool pinned (bypass auto-tune):" in result
+        assert "pinned_tool: 0.045" in result
+        # Filter to "By tool:" breakdown rows (they include "events"), not the
+        # Min-score-block sublist row that also mentions pinned_tool.
+        pinned_row = next(
+            line
+            for line in result.splitlines()
+            if "pinned_tool:" in line and "events" in line
+        )
+        assert "pinned 0.045" in pinned_row
+        assert "auto-tuned" not in pinned_row
+        assert "auto-tune ready" not in pinned_row
+        assert "for auto-tune" not in pinned_row
+        # The un-overridden sibling still gets its readiness label:
+        tunable_row = next(
+            line
+            for line in result.splitlines()
+            if "tunable_tool:" in line and "events" in line
+        )
+        assert "auto-tune ready" in tunable_row
+
+    async def test_readiness_labels_suppressed_when_auto_tune_off(self):
+        """With auto_tune_enabled=False, the per-tool readiness labels must
+        NOT render — otherwise output contradicts its own "auto-tune off"
+        header for configs that have disabled tuning."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "ready_tool",
+                    "events": 25,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 25,
+                    "not_relevant_count": 5,
+                },
+                {
+                    "tool": "cold_tool",
+                    "events": 3,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 4,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 20, "not_relevant": 9},
+            "total_feedback": 29,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "ready_tool": 25,
+            "cold_tool": 4,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        assert "Min score:       0.030 (auto-tune off, min 20 samples)" in result
+        # Negative ratio still rendered — orthogonal to auto-tune state.
+        assert "negative 20.0%" in result
+        # No readiness labels of any flavor:
+        assert "auto-tuned" not in result
+        assert "auto-tune ready" not in result
+        assert "for auto-tune" not in result
+
+    async def test_readiness_uses_unfiltered_count_under_since_window(self):
+        """``since=`` filters the stats rows but AutoTuner sees the full
+        history; readiness must reflect unfiltered counts or it will
+        under-report eligibility for tools with sparse recent activity."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "historic_tool",
+                    "events": 2,
+                    "avg_memory_count": 1.0,
+                    # Only 3 feedback rows fell in the since window — the row
+                    # count would otherwise drive a "need 17 more" label.
+                    "feedback_count": 3,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 2, "not_relevant": 1},
+            "total_feedback": 3,
+            "recent": [],
+        }
+        # The full history has 50 samples — well past the 20-sample threshold —
+        # but not yet adjusted (ratio in [0.2, 0.6] no-op band).
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {"historic_tool": 50}
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(since="2026-04-01T00:00:00", ctx=ctx)
+
+        row = next(
+            line
+            for line in result.splitlines()
+            if "historic_tool:" in line and "events" in line
+        )
+        assert "auto-tune ready" in row
+        # Windowed feedback count is still reported for the operator's audit,
+        # but the readiness gate honors the unfiltered total.
+        assert "feedback 3" in row
+        assert "need" not in row
+
+    async def test_min_score_lists_honor_tool_filter(self):
+        """When ``tool=`` is set, the per-tool adjustment / pinned sublists
+        must restrict to that tool — otherwise they contradict the trailing
+        ``(filtered by tool: ...)`` marker by leaking unrelated thresholds."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "alpha",
+                    "events": 10,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 10,
+                    "not_relevant_count": 0,
+                },
+            ],
+            "rating_distribution": {"helpful": 10},
+            "total_feedback": 10,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {
+            "alpha": 10,
+            "beta": 30,
+            "gamma": 30,
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {"beta": 0.038},
+            "overrides": {"gamma": 0.045},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(tool="alpha", ctx=ctx)
+
+        # Neither beta (adjusted) nor gamma (pinned) belong in an alpha-filtered
+        # report — the sublists must drop them entirely.
+        assert "beta:" not in result
+        assert "gamma:" not in result
+        # Without any alpha-specific adjustment/override, the sublists collapse.
+        assert "Per-tool adjustments:" not in result
+        assert "Per-tool pinned" not in result
+        # Filter marker still present.
+        assert "(filtered by tool: alpha)" in result
 
     async def test_invalid_since(self):
         """Malformed ISO timestamp is rejected cleanly, not raised."""
@@ -783,9 +1183,9 @@ class TestAdvertiseOrder:
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
             _move_stm_tools_to_end(server)  # must not raise
-        assert any(
-            "FastMCP internal API changed" in rec.message for rec in caplog.records
-        ), [r.message for r in caplog.records]
+        assert any("FastMCP internal API changed" in rec.message for rec in caplog.records), [
+            r.message for r in caplog.records
+        ]
 
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
@@ -854,6 +1254,5 @@ class TestMainExceptionBarrier:
 
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert not error_records, (
-            f"clean exit should not emit ERROR logs; got: "
-            f"{[r.getMessage() for r in error_records]}"
+            f"clean exit should not emit ERROR logs; got: {[r.getMessage() for r in error_records]}"
         )

@@ -143,3 +143,13 @@ class AutoTuner:
     def get_effective_min_score(self, tool: str) -> float:
         """Return the auto-tuned min_score for a tool, or the default."""
         return self._adjustments.get(tool, self._config.min_score)
+
+    @property
+    def adjustments(self) -> dict[str, float]:
+        """Per-tool min_score adjustments applied this process.
+
+        Returned as a snapshot copy so callers (e.g. the engine's
+        ``get_min_score_snapshot`` and ``stm_surfacing_stats``) cannot
+        mutate the tuner's internal state.
+        """
+        return dict(self._adjustments)

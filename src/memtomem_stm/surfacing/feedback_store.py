@@ -263,6 +263,28 @@ class FeedbackStore:
             bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
             bucket["events"] += 1
             bucket["sum_memory_count"] += n
+
+        # Per-tool feedback counts (total + not_relevant) within the same
+        # event filter. Powers the AutoTuner readiness signal: with these
+        # the formatter can render "feedback N (negative R%)" and decide
+        # whether the tool has hit auto_tune_min_samples.
+        per_tool_feedback_filter = " AND ".join(f"e.{f}" for f in event_filters)
+        per_tool_feedback_where = (
+            (" WHERE " + per_tool_feedback_filter) if per_tool_feedback_filter else ""
+        )
+        feedback_rows = self._db.execute(
+            "SELECT e.tool, f.rating, COUNT(*) FROM surfacing_feedback f "
+            "JOIN surfacing_events e ON f.surfacing_id = e.id"
+            f"{per_tool_feedback_where} GROUP BY e.tool, f.rating",
+            event_params,
+        ).fetchall()
+        per_tool_feedback: dict[str, dict[str, int]] = {}
+        for tool_name, rating, count in feedback_rows:
+            bucket_fb = per_tool_feedback.setdefault(tool_name, {"total": 0, "not_relevant": 0})
+            bucket_fb["total"] += count
+            if rating == "not_relevant":
+                bucket_fb["not_relevant"] += count
+
         per_tool_breakdown: list[dict] = [
             {
                 "tool": t,
@@ -270,6 +292,8 @@ class FeedbackStore:
                 "avg_memory_count": round(b["sum_memory_count"] / b["events"], 2)
                 if b["events"]
                 else 0.0,
+                "feedback_count": per_tool_feedback.get(t, {}).get("total", 0),
+                "not_relevant_count": per_tool_feedback.get(t, {}).get("not_relevant", 0),
             }
             for t, b in sorted(per_tool.items(), key=lambda kv: kv[1]["events"], reverse=True)
         ]
@@ -394,3 +418,24 @@ class FeedbackStore:
                 "SELECT COUNT(*) FROM surfacing_feedback WHERE rating = 'not_relevant'"
             ).fetchone()[0]
         return not_relevant / total if total > 0 else 0.0
+
+    def get_per_tool_feedback_counts(self) -> dict[str, int]:
+        """Return total feedback rows per tool, ignoring any time window.
+
+        Mirrors what ``AutoTuner.maybe_adjust`` actually sees — the tuner
+        decides readiness from the full feedback history, not from any
+        ``since`` window an operator passes to ``stm_surfacing_stats``.
+        Used by the server formatter to compute "auto-tune ready" /
+        "need N more" labels that don't contradict the tuner just because
+        the stats query is windowed.
+
+        Returns ``{}`` when the store is closed.
+        """
+        if self._db is None:
+            return {}
+        rows = self._db.execute(
+            "SELECT e.tool, COUNT(*) FROM surfacing_feedback f "
+            "JOIN surfacing_events e ON f.surfacing_id = e.id "
+            "GROUP BY e.tool"
+        ).fetchall()
+        return {tool: count for tool, count in rows}
