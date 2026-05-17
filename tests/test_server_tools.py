@@ -384,6 +384,70 @@ class TestSurfacingStats:
         assert "negative 73.3%" in result  # tuned: 22/30
         assert "negative 20.0%" in result  # ready: 5/25
 
+    async def test_readiness_labels_suppressed_for_overridden_tools(self):
+        """Tools pinned via context_tools.<tool>.min_score bypass the tuner
+        entirely (engine.py:458-460). Stats output must show the pinned value
+        and suppress readiness labels for them, while still reporting
+        readiness for un-overridden siblings."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 2,
+            "distinct_tools": 2,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "pinned_tool",
+                    "events": 50,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 40,
+                    "not_relevant_count": 30,
+                },
+                {
+                    "tool": "tunable_tool",
+                    "events": 25,
+                    "avg_memory_count": 2.0,
+                    "feedback_count": 25,
+                    "not_relevant_count": 5,
+                },
+            ],
+            "rating_distribution": {"helpful": 30, "not_relevant": 35},
+            "total_feedback": 65,
+            "recent": [],
+        }
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {"pinned_tool": 0.045},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        # Pinned override listed in the Min score block:
+        assert "Per-tool pinned (bypass auto-tune):" in result
+        assert "pinned_tool: 0.045" in result
+        # Filter to "By tool:" breakdown rows (they include "events"), not the
+        # Min-score-block sublist row that also mentions pinned_tool.
+        pinned_row = next(
+            line
+            for line in result.splitlines()
+            if "pinned_tool:" in line and "events" in line
+        )
+        assert "pinned 0.045" in pinned_row
+        assert "auto-tuned" not in pinned_row
+        assert "auto-tune ready" not in pinned_row
+        assert "for auto-tune" not in pinned_row
+        # The un-overridden sibling still gets its readiness label:
+        tunable_row = next(
+            line
+            for line in result.splitlines()
+            if "tunable_tool:" in line and "events" in line
+        )
+        assert "auto-tune ready" in tunable_row
+
     async def test_readiness_labels_suppressed_when_auto_tune_off(self):
         """With auto_tune_enabled=False, the per-tool readiness labels must
         NOT render — otherwise output contradicts its own "auto-tune off"

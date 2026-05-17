@@ -655,10 +655,12 @@ async def stm_surfacing_stats(
         # "feedback N (negative R%)" against the auto-tune readiness threshold.
         min_samples_required = 0
         adjusted_scores: dict[str, float] = {}
+        overrides: dict[str, float] = {}
         auto_tune_active = False
         if app.surfacing_engine is not None:
             snap = app.surfacing_engine.get_min_score_snapshot()
             adjusted_scores = snap["adjusted"]
+            overrides = snap.get("overrides", {})
             min_samples_required = snap["auto_tune_min_samples"]
             auto_tune_active = snap["auto_tune_enabled"]
             auto_state = "on" if auto_tune_active else "off"
@@ -670,6 +672,10 @@ async def stm_surfacing_stats(
                 lines.append("  Per-tool adjustments:")
                 for t, s in sorted(adjusted_scores.items()):
                     lines.append(f"    {t}: {s:.3f}")
+            if overrides:
+                lines.append("  Per-tool pinned (bypass auto-tune):")
+                for t, s in sorted(overrides.items()):
+                    lines.append(f"    {t}: {s:.3f}")
 
         if stats["per_tool_breakdown"]:
             lines.append("\nBy tool:")
@@ -677,9 +683,10 @@ async def stm_surfacing_stats(
                 fb = row.get("feedback_count", 0)
                 neg = row.get("not_relevant_count", 0)
                 # Readiness annotations only render when auto-tune is actually
-                # active; otherwise they'd contradict the "auto-tune off" header
-                # (operators with auto_tune_enabled=False would see "ready" /
-                # "need N more" labels for a tuner that will never fire).
+                # active and the tool isn't pinned via context_tools.<tool>.min_score.
+                # A pinned override bypasses the tuner entirely (engine.py:458-460),
+                # so any "ready" / "need N more" label would imply the tuner could
+                # change a threshold the operator has explicitly fixed.
                 detail_parts = [
                     f"{row['events']} events",
                     f"avg {row['avg_memory_count']} memories",
@@ -689,15 +696,18 @@ async def stm_surfacing_stats(
                     detail_parts.append(f"feedback {fb} (negative {ratio_pct}%)")
                 else:
                     detail_parts.append("feedback 0")
-                if auto_tune_active and min_samples_required > 0:
+                tool_name = row["tool"]
+                if tool_name in overrides:
+                    detail_parts.append(f"pinned {overrides[tool_name]:.3f}")
+                elif auto_tune_active and min_samples_required > 0:
                     if fb >= min_samples_required:
-                        if row["tool"] in adjusted_scores:
+                        if tool_name in adjusted_scores:
                             detail_parts.append("auto-tuned")
                         else:
                             detail_parts.append("auto-tune ready")
                     else:
                         detail_parts.append(f"need {min_samples_required - fb} more for auto-tune")
-                lines.append(f"  {row['tool']}: {', '.join(detail_parts)}")
+                lines.append(f"  {tool_name}: {', '.join(detail_parts)}")
 
         if stats["rating_distribution"]:
             lines.append("\nRating distribution:")
