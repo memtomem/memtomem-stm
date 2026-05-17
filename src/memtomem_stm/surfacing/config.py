@@ -38,7 +38,7 @@ class SurfacingConfig(BaseModel):
     ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``."""
     ltm_mcp_command: str = "memtomem-server"
     ltm_mcp_args: list[str] = []
-    min_score: float = Field(default=0.02, ge=0.0, le=1.0)
+    min_score: float = Field(default=0.03, ge=0.0, le=1.0)
     max_results: int = Field(default=3, gt=0)
     min_query_tokens: int = Field(default=3, gt=0)
     cooldown_seconds: float = Field(default=5.0, ge=0.0)

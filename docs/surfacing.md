@@ -69,7 +69,7 @@ The injection mode is configurable: `prepend` (default), `append`, or `section`.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Global on/off switch |
-| `min_score` | `0.02` | Minimum search score to include a result |
+| `min_score` | `0.03` | Minimum search score to include a result |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing for small responses |
