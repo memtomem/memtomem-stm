@@ -235,6 +235,17 @@ class McpClientSearchAdapter:
         # cancellation must propagate), so we mark the session here and let
         # the next caller heal the connection lazily before issuing an RPC.
         self._needs_reconnect = False
+        # Lazy MCP client start: the LTM subprocess used to be spawned
+        # eagerly from app_lifespan, but its initialize+version_negotiate
+        # round trip blocked the proxy's own MCP startup long enough for
+        # hosts (e.g. codex with a 60s startup_timeout) to time out and
+        # respawn the proxy — creating two parallel LTM children. Defer
+        # the start to the first RPC. The lock serializes concurrent
+        # first-callers; the flag prevents retrying a permanently failing
+        # start on every subsequent RPC (matches the prior single-shot
+        # lifespan behavior).
+        self._start_attempted = False
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Connect to the memtomem MCP server."""
@@ -311,15 +322,50 @@ class McpClientSearchAdapter:
         logger.info("MCP adapter reconnected successfully")
 
     async def _heal_if_needed(self) -> bool:
-        """Reconnect lazily if a prior RPC was cancelled mid-message (#290).
+        """Ready the session for the next RPC.
 
-        Returns ``True`` when the session is ready to issue a new RPC,
-        ``False`` when no session was ever started or the reconnect failed.
-        Callers treat ``False`` the same as a missing session: return empty
-        results and let the next surfacing cycle retry.
+        Three transitions:
+
+        * No session yet → lazy-start the LTM client. First concurrent
+          caller wins; failure is sticky for this adapter's lifetime to
+          avoid respawning the LTM subprocess on every cycle (matches
+          the prior single-shot ``app_lifespan`` behavior).
+        * Session marked for reconnect (#290) → tear down and rebuild
+          before the RPC.
+        * Healthy session → fast path, no I/O.
+
+        Returns ``True`` when the session is ready, ``False`` when
+        callers should treat the adapter as unavailable.
         """
         if self._session is None:
-            return False
+            async with self._start_lock:
+                # Re-check under lock: another coroutine may have raced
+                # us through start() while we were waiting on the lock.
+                if self._session is not None:
+                    return True
+                if self._start_attempted:
+                    return False
+                self._start_attempted = True
+                try:
+                    await self.start()
+                except asyncio.CancelledError:
+                    # Outer wait_for / timeout cancelled us mid-init
+                    # (SurfacingEngine wraps adapter calls in
+                    # ``asyncio.wait_for``). ``start()``'s BaseException
+                    # handler already cleared ``_session`` and unwound
+                    # the AsyncExitStack — without resetting
+                    # ``_start_attempted`` here, every subsequent cycle
+                    # would short-circuit on the sticky flag and
+                    # surfacing would stay permanently off in exactly
+                    # the slow-startup environments this patch targets.
+                    # Propagate per the cooperative cancellation
+                    # contract (#290).
+                    self._start_attempted = False
+                    raise
+                except Exception as exc:
+                    logger.warning("Lazy MCP adapter start failed — surfacing disabled: %s", exc)
+                    return False
+                return True
         if not self._needs_reconnect:
             return True
         try:

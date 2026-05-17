@@ -127,14 +127,19 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             # MCP client adapter. The adapter spawns (or connects to) a
             # memtomem MCP server using
             # config.surfacing.ltm_mcp_command / ltm_mcp_args.
+            # The adapter's MCP connection is deferred to the first
+            # surfacing RPC (see ``McpClientSearchAdapter._heal_if_needed``);
+            # eagerly awaiting ``start()`` here used to block the proxy's
+            # own MCP initialize handshake long enough for hosts (e.g.
+            # codex with a 60s startup_timeout) to time out and respawn
+            # the proxy, leaving two parallel LTM children.
             if config.surfacing.enabled:
                 try:
                     from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
 
                     mcp_adapter = McpClientSearchAdapter(config.surfacing)
-                    await mcp_adapter.start()
                     logger.info(
-                        "Surfacing engine connected via MCP client to %s",
+                        "Surfacing engine MCP client configured for lazy start: %s",
                         config.surfacing.ltm_mcp_command,
                     )
                 except Exception:

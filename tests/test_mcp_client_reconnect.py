@@ -515,3 +515,158 @@ class TestOuterCancellationLazyReconnect:
             await asyncio.wait_for(adapter.scratch_list(), timeout=0.05)
 
         assert adapter._needs_reconnect is True
+
+
+# ── Lazy start paths ─────────────────────────────────────────────────────
+
+
+class TestLazyStart:
+    """Adapter.start() is deferred from ``app_lifespan`` to the first RPC.
+
+    The host's proxy startup used to hang on ``mcp_adapter.start()`` waiting
+    for the LTM subprocess's MCP handshake, which exceeded codex's 60s
+    startup_timeout and caused codex to respawn the proxy — creating two
+    parallel LTM children. The fix moves start() into ``_heal_if_needed``
+    so the proxy's own initialize() returns immediately. These tests pin
+    the new contract: lazy bootstrap, sticky failure, lock-serialized
+    concurrent first-callers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_search_triggers_start_and_returns_results(self):
+        """No prior ``start()`` — search() must bootstrap the session itself
+        and deliver real results, not the silent ``no_session`` of the old
+        eager-start contract."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        compact_output = "[1] 0.9 | [default] src/a.py\nfrom lazy start.\n"
+        good_result = _result_with_text(compact_output)
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=good_result)
+
+        async def fake_start():
+            adapter._session = mock_session
+
+        adapter.start = AsyncMock(side_effect=fake_start)  # type: ignore[method-assign]
+
+        results, hints, outcome = await adapter.search("q")
+
+        adapter.start.assert_awaited_once()
+        assert outcome == "ok"
+        assert len(results) == 1
+        assert "lazy start" in results[0].chunk.content.lower()
+        assert adapter._start_attempted is True
+
+    @pytest.mark.asyncio
+    async def test_failed_start_is_sticky_within_lifecycle(self):
+        """A start() that raises must flip ``_start_attempted`` and stop
+        retrying. Otherwise every surfacing cycle would respawn the LTM
+        subprocess — the exact thundering-herd the lifespan-shot avoided."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        adapter.start = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ConnectionError("LTM unreachable"),
+        )
+
+        first = await adapter.search("q1")
+        second = await adapter.search("q2")
+
+        assert first == ([], [], "no_session")
+        assert second == ([], [], "no_session")
+        # Only the first call attempted start; the second short-circuits
+        # on the sticky flag instead of spawning a fresh LTM subprocess.
+        adapter.start.assert_awaited_once()
+        assert adapter._start_attempted is True
+        assert adapter._session is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_callers_serialize_start(self):
+        """Surfacing fires from multiple coroutines per request. Without the
+        lock, two coroutines hitting ``_session is None`` simultaneously
+        would each spawn a separate LTM subprocess — the same dual-process
+        regression we just fixed at the lifespan level."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=_result_with_text(""))
+
+        start_call_count = 0
+
+        async def fake_start():
+            nonlocal start_call_count
+            start_call_count += 1
+            # Yield once so a concurrent caller has a real chance to race
+            # the assignment — without the lock this is where the bug would
+            # show up as start_call_count == 2.
+            await asyncio.sleep(0)
+            adapter._session = mock_session
+
+        adapter.start = AsyncMock(side_effect=fake_start)  # type: ignore[method-assign]
+
+        results = await asyncio.gather(
+            adapter.search("q1"),
+            adapter.search("q2"),
+            adapter.search("q3"),
+        )
+
+        assert start_call_count == 1
+        adapter.start.assert_awaited_once()
+        # All three callers see the same healthy session.
+        for r in results:
+            assert r[2] in {"ok", "empty_content", "empty_results"}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_resets_flag_and_propagates(self):
+        """If ``start()`` is cancelled mid-init (outer wait_for timeout),
+        the sticky flag must reset so a later cycle can retry — otherwise
+        a single timeout permanently disables surfacing in exactly the
+        slow-startup environments lazy-start was meant to help.
+        Cancellation must propagate (cooperative cancellation, #290)."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        async def slow_start():
+            # Simulate a long-running LTM handshake that an outer
+            # wait_for will cancel before it completes.
+            await asyncio.sleep(10)
+
+        adapter.start = AsyncMock(side_effect=slow_start)  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        # Flag reset → next caller can retry.
+        assert adapter._start_attempted is False
+        # No session ever materialized.
+        assert adapter._session is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_allows_retry_on_next_call(self):
+        """End-to-end: cancellation on attempt 1 must not block attempt 2.
+        Pairs with the unit test above — proves the reset actually
+        un-sticks the path rather than just clearing a flag in isolation."""
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=_result_with_text(""))
+
+        attempt = 0
+
+        async def start_impl():
+            nonlocal attempt
+            attempt += 1
+            if attempt == 1:
+                # First attempt: hang until outer wait_for cancels us.
+                await asyncio.sleep(10)
+            # Second attempt: succeed instantly.
+            adapter._session = mock_session
+
+        adapter.start = AsyncMock(side_effect=start_impl)  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q1"), timeout=0.05)
+
+        # Second call must reach start() again (not short-circuit on the
+        # sticky flag) and succeed.
+        results, _, outcome = await adapter.search("q2")
+        assert attempt == 2
+        assert outcome in {"ok", "empty_content", "empty_results"}
+        assert adapter._session is mock_session
