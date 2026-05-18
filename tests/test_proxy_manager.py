@@ -145,6 +145,9 @@ class TestToolConfigResolution:
 
 
 # ── Auto-index startup warning tests ────────────────────────────────────
+# See also: ``tests/test_docs_sync.py::test_bundled_server_proxy_manager_omits_index_engine``
+# and ``::test_configuration_md_stage4_inert_note_pinned`` — paired docs/code
+# drift guards for the bundled ``mms`` server's engine-less construction (#299).
 
 
 class TestAutoIndexStartupWarning:
