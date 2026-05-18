@@ -457,15 +457,13 @@ See [Configuration → General](configuration.md#general) for details.
 
 ## Trimming the advertised MCP tool surface
 
-STM advertises four model-facing MCP tools by default. Eight additional
-tools are operator-facing (observability / admin) and accessible through
-this very CLI; the default four are model-facing (progressive-delivery
-unlocks and feedback channels). On clients that eager-load MCP tool
-schemas into the model context at session start, the eight observability
-tools would pay schema tokens for calls the model rarely makes.
+STM advertises four model-facing MCP tools by default (progressive-delivery
+unlocks and feedback channels). Eight additional tools are operator-facing
+(observability / admin). On clients that eager-load MCP tool schemas into
+the model context at session start, the eight observability tools would
+pay schema tokens for calls the model rarely makes.
 
-Set the following to advertise them over MCP (they stay callable via
-`mms`):
+Set the following and restart STM to advertise them over MCP:
 
 ```bash
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true

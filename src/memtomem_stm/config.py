@@ -64,10 +64,9 @@ class STMConfig(BaseSettings):
     ``stm_proxy_health``, ``stm_proxy_cache_clear``, ``stm_surfacing_stats``,
     ``stm_index_stats``, ``stm_compression_stats``,
     ``stm_progressive_stats``, ``stm_tuning_recommendations``) are
-    advertised to MCP clients. When ``False``, these are hidden from
-    ``tools/list`` but remain callable via the ``mms`` CLI — useful for
-    eager-loading clients (e.g. OpenAI Codex CLI) where every advertised
-    tool pays schema tokens upfront. Set
+    advertised to MCP clients. When ``False``, these are not registered
+    with the MCP server — useful for eager-loading clients (e.g. OpenAI
+    Codex CLI) where every advertised tool pays schema tokens upfront. Set
     ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`` to opt these admin
     tools back into MCP advertisement. Claude Code defers tool schemas via
     its own mechanism so this flag has no effect there. Read via env var

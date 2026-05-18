@@ -39,9 +39,9 @@ When unset or `false`, hides STM's eight observability / admin tools
 `stm_surfacing_stats`, `stm_index_stats`, `stm_compression_stats`,
 `stm_progressive_stats`, `stm_tuning_recommendations`) from the MCP
 `tools/list` surface so eager-loading clients (e.g. OpenAI Codex CLI)
-don't pay schema tokens for tools the model rarely calls. The hidden
-tools remain fully callable via the [`mms`](cli.md) CLI; only the MCP
-advertisement is suppressed.  The four model-facing tools
+don't pay schema tokens for tools the model rarely calls. Hidden admin
+tools are not registered with the MCP server while the flag is unset or
+`false`.  The four model-facing tools
 (`stm_proxy_read_more`, `stm_proxy_select_chunks`,
 `stm_surfacing_feedback`, `stm_compression_feedback`) stay advertised
 regardless.  Set this flag to `true` to advertise the admin tools over
