@@ -361,6 +361,82 @@ def test_surfacing_md_documents_phase_1_observability_sample() -> None:
         )
 
 
+def test_surfacing_md_ltm_connection_distinguishes_from_generic_upstream() -> None:
+    """``docs/surfacing.md``'s ``## LTM Connection`` section must not claim
+    that LTM responses flow through the proxy pipeline.
+
+    LTM is reached via the dedicated ``McpClientSearchAdapter``
+    (``src/memtomem_stm/surfacing/mcp_client.py``) wired into
+    ``SurfacingEngine``, not via ``ProxyConfig.upstream_servers``. LTM
+    responses feed *into* the surfacing engine to compose context for
+    upstream calls; they do not get compressed, cached, or surfaced as
+    if they were upstream tool output. The previous wording — "the same
+    compression / cache / surfacing pipeline applies" — implied the
+    opposite and misled operators tuning compression for LTM-shaped
+    responses (#298).
+
+    Pinning the prose against the ``McpClientSearchAdapter`` import in
+    ``server.py`` keeps the docs claim anchored to source: if LTM ever
+    migrates onto the generic upstream path, the import goes away and
+    this test fails loudly so the docs can be revisited.
+    """
+    server_src = _read("src/memtomem_stm/server.py")
+    # Anchor: server.py still imports the special-purpose LTM adapter.
+    # If this disappears, LTM may now travel the generic-upstream path
+    # and the docs claim that it doesn't would need re-evaluation.
+    assert "McpClientSearchAdapter" in server_src, (
+        "src/memtomem_stm/server.py no longer imports "
+        "`McpClientSearchAdapter` — LTM may have moved onto the generic "
+        "upstream proxy path. Update docs/surfacing.md's `## LTM "
+        "Connection` section alongside the wiring change (#298)."
+    )
+
+    surfacing_md = _read("docs/surfacing.md")
+    section_match = re.search(
+        r"##\s+LTM Connection[^\n]*\n(.*?)(?=\n##\s|\Z)",
+        surfacing_md,
+        re.DOTALL,
+    )
+    if not section_match:
+        pytest.fail(
+            "docs/surfacing.md lost its `## LTM Connection` H2 section — "
+            "either restructure the test or restore the section heading."
+        )
+    section_body = section_match.group(1)
+
+    # The pre-#298 phrasing must not return: it claimed LTM responses
+    # flow through compression / cache / surfacing as if LTM were a
+    # generic upstream, which contradicts the McpClientSearchAdapter
+    # wiring above.
+    deprecated = "same compression / cache / surfacing pipeline applies"
+    if deprecated in section_body:
+        pytest.fail(
+            f"docs/surfacing.md `## LTM Connection` reintroduced the "
+            f"deprecated phrase {deprecated!r}. LTM responses bypass the "
+            "proxy pipeline (they feed *into* surfacing, not through it). "
+            "Restore the #298 wording or, if LTM is now a generic "
+            "upstream, also drop the `McpClientSearchAdapter` import "
+            "check in this test."
+        )
+
+    # The replacement wording must keep the operator-facing claims:
+    # (a) LTM bypasses the compression/cache pipeline, (b) it feeds the
+    # surfacing engine, (c) crash isolation still holds. Use a lowercased
+    # scope so casing tweaks don't false-fail.
+    lowered = section_body.lower()
+    required = ("bypass", "surfacing engine", "crash")
+    missing = [kw for kw in required if kw not in lowered]
+    if missing:
+        pytest.fail(
+            f"docs/surfacing.md `## LTM Connection` is missing keyword(s) "
+            f"that distinguish LTM from a generic proxied upstream: "
+            f"{missing!r}. The section must explain (a) LTM bypasses the "
+            "compression/cache pipeline, (b) responses feed the surfacing "
+            "engine, (c) memtomem crash isolation. See #298 for the "
+            "rationale and suggested wording."
+        )
+
+
 def test_cli_md_describes_surfacing_observability_columns() -> None:
     """docs/cli.md's ``stm_surfacing_stats`` row in the observability
     tools table must mention the Phase 1 axes (skip / outcome / cache)
