@@ -8,6 +8,7 @@ in local testing and only surfaces through user confusion.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -168,6 +169,130 @@ def test_configuration_full_example_documents_upstream_timeouts() -> None:
             "at the init, per-call, and overall-deadline layers. Keep "
             "them visible next to `max_retries` / `reconnect_delay_seconds` "
             "so operators discover them when scanning the example."
+        )
+
+
+_PROXY_MANAGER_EXPECTED_KWARGS = frozenset(
+    {
+        "surfacing_engine",
+        "cache",
+        "env_overrides",
+        "progressive_reads_tracker",
+    }
+)
+
+
+def test_bundled_server_proxy_manager_omits_index_engine() -> None:
+    """The bundled ``mms`` server's ``ProxyManager(...)`` construction in
+    ``app_lifespan`` must not pass ``index_engine=``.
+
+    ``docs/configuration.md`` (Stage 4 NOTE block, ~lines 73-87) tells
+    operators that ``AUTO_INDEX__*`` / ``EXTRACTION__*`` are inert in the
+    bundled server because no index engine is wired. That claim is grounded
+    in ``src/memtomem_stm/server.py``'s single ``ProxyManager(...)`` call,
+    which today passes only ``config.proxy`` and ``tracker`` positionally
+    plus a fixed set of unrelated kwargs (#288/#299, PR #339). If a future
+    PR wires an ``index_engine=`` here without also dropping the inert
+    NOTE, the docs silently revalidate against stale prose — operators
+    keep seeing the no-op warning in the docs while the server now writes
+    to LTM.
+
+    Paired with ``test_configuration_md_stage4_inert_note_pinned`` (the
+    inverse direction).
+    """
+    server_src = _read("src/memtomem_stm/server.py")
+    tree = ast.parse(server_src)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ProxyManager"
+    ]
+    if len(calls) != 1:
+        pytest.fail(
+            f"Could not locate a unique `ProxyManager(...)` construction in "
+            f"src/memtomem_stm/server.py (found {len(calls)}). The wiring was "
+            "refactored; update this test alongside the refactor before "
+            "assuming Stage 4 is now wired."
+        )
+    call = calls[0]
+
+    kwarg_names = {kw.arg for kw in call.keywords if kw.arg is not None}
+    if "index_engine" in kwarg_names:
+        pytest.fail(
+            "server.py wires `index_engine=` into ProxyManager — Stage 4 is "
+            "no longer inert in the bundled `mms` server. Update "
+            "`docs/configuration.md` to drop the inert NOTE (lines ~73-87) "
+            "and close #299."
+        )
+    if len(call.args) != 2:
+        pytest.fail(
+            f"`ProxyManager(...)` construction in server.py has "
+            f"{len(call.args)} positional args (expected 2: `config.proxy`, "
+            "`tracker`). A 3rd positional would smuggle `index_engine` past "
+            "the keyword check — `ProxyManager.__init__`'s 3rd parameter is "
+            "`index_engine`. Either update this test alongside the new "
+            "signature, or close #299 and drop the inert NOTE in "
+            "`docs/configuration.md`."
+        )
+    extras = kwarg_names - _PROXY_MANAGER_EXPECTED_KWARGS
+    if extras:
+        pytest.fail(
+            f"`ProxyManager(...)` construction in server.py has unexpected "
+            f"kwarg(s): {sorted(extras)!r}. If you added a new unrelated "
+            "kwarg, append it to `_PROXY_MANAGER_EXPECTED_KWARGS` in this "
+            "test. If you wired `index_engine=` (renamed?), also drop the "
+            "inert NOTE in `docs/configuration.md` (lines ~73-87) and close "
+            "#299."
+        )
+
+
+def test_configuration_md_stage4_inert_note_pinned() -> None:
+    """``docs/configuration.md``'s Stage 4 NOTE block must keep the inert-
+    state warning that pairs with ``server.py``'s engine-less ``ProxyManager``
+    construction.
+
+    PR #339 (resolving the operator-visible half of #288) added a comment
+    block immediately above the ``AUTO_INDEX__*`` exports explaining that
+    those env vars currently have no runtime effect because the bundled
+    server constructs ``ProxyManager`` without an ``index_engine``. If
+    that NOTE goes away while the server still has no engine wired
+    (``test_bundled_server_proxy_manager_omits_index_engine``), operators
+    flipping ``AUTO_INDEX__ENABLED=true`` get zero behaviour and zero
+    explanation again — the failure mode #288 originally reported.
+    """
+    config_md = _read("docs/configuration.md")
+    # Locate the contiguous ``^#`` comment paragraph immediately
+    # preceding the ``AUTO_INDEX__ENABLED`` export. Paragraph scope (not
+    # a tight line window) so prose tweaks inside the same block don't
+    # false-fail; anchoring to the actual export keeps the check tied
+    # to the operator-facing surface.
+    block_match = re.search(
+        r"((?:^#[^\n]*\n)+)export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=",
+        config_md,
+        re.MULTILINE,
+    )
+    if not block_match:
+        pytest.fail(
+            "docs/configuration.md no longer has a `#`-comment paragraph "
+            "directly above `export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=` — "
+            "either the export was renamed/removed, or the NOTE was "
+            "moved into prose. Update this test alongside the docs "
+            "restructure or restore the inert NOTE (see #299)."
+        )
+    note = block_match.group(1).lower()
+
+    required = ("inert", "index_engine", "#288")
+    missing = [kw for kw in required if kw.lower() not in note]
+    if missing:
+        pytest.fail(
+            f"docs/configuration.md Stage 4 NOTE is missing keyword(s): "
+            f"{missing!r}. If `mms` now wires `index_engine`, also delete "
+            "`test_bundled_server_proxy_manager_omits_index_engine` and "
+            "close #299. Otherwise restore the inert NOTE — operators "
+            "flipping `AUTO_INDEX__ENABLED=true` need to know the env var "
+            "is currently a no-op in the bundled server (PR #339, #288)."
         )
 
 
