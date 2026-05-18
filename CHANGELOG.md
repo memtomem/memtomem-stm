@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed
+
+- **STM observability/admin MCP tools are now opt-in by default** (#228 phase 2) — `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` now defaults to `false`, so the MCP surface advertises only the four model-facing STM tools (`stm_proxy_read_more`, `stm_proxy_select_chunks`, `stm_surfacing_feedback`, `stm_compression_feedback`) plus proxied upstream tools unless the operator explicitly sets `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`. The eight observability/admin tools remain callable through `mms` and can still be re-enabled over MCP with the env var. This preserves the phase-1 ordering fix while reducing picker noise and schema load for clients that eager-load every advertised tool.
+
 ### Fixed
 
 - **`ProxyConfig.default_compression` is now read** (#292) — the field was previously declared but never consulted by `_resolve_tool_config`, so an operator who set `default_compression: selective` in `stm_proxy.json` saw no effect on any upstream — every server fell back to `UpstreamServerConfig.compression`'s own AUTO default. Resolution now uses `UpstreamServerConfig.model_fields_set` to distinguish "operator omitted compression" (→ honour the global default) from "operator explicitly typed `compression: auto`" (→ honour their explicit choice). The `model_fields_set` approach is load-bearing because `compression` has no None sentinel; a plain default-equality check would silently override a user's explicit `compression: auto` when the global is something else. Behavior change: configs that already set `default_compression` but had no per-server `compression:` keys now flip those servers to the global default. Configs that did not set `default_compression` keep the unchanged AUTO behavior. Four regression tests in `test_default_compression_fallback.py` pin all four corners (default+omit / default+explicit-auto / global+omit / global+explicit).

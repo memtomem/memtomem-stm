@@ -1062,7 +1062,7 @@ class TestLifespan:
 
 # ── advertise_observability_tools flag ──────────────────────────────────
 #
-# The flag hides 7 observability tools from the MCP ``tools/list`` surface
+# The flag hides 8 observability tools from the MCP ``tools/list`` surface
 # while keeping them importable from Python. Registration happens at
 # module import, so the end-to-end assertion uses a subprocess to get a
 # fresh interpreter under the intended env var.
@@ -1094,7 +1094,7 @@ class TestShouldAdvertiseObsTools:
 
     def test_default_when_unset(self, monkeypatch):
         monkeypatch.delenv(_FLAG_ENV, raising=False)
-        assert _should_advertise_obs_tools() is True
+        assert _should_advertise_obs_tools() is False
 
     def test_false_variants_disable(self, monkeypatch):
         for value in ("false", "FALSE", "False", "0", "no", "NO", "  false  "):
@@ -1104,7 +1104,7 @@ class TestShouldAdvertiseObsTools:
     def test_other_values_passthrough(self, monkeypatch):
         for value in ("true", "yes", "1", "", "anything-else"):
             monkeypatch.setenv(_FLAG_ENV, value)
-            assert _should_advertise_obs_tools() is True, f"{value!r} should keep default-on"
+            assert _should_advertise_obs_tools() is True, f"{value!r} should opt in"
 
 
 class TestAdvertiseObservabilityFlagEndToEnd:
@@ -1140,8 +1140,13 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_default_advertises_all_twelve(self):
+    def test_default_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override=None))
+        assert names == _MODEL_FACING_TOOLS
+        assert _OBSERVABILITY_TOOLS.isdisjoint(names)
+
+    def test_flag_true_advertises_all_twelve(self):
+        names = set(self._list_registered(env_override="true"))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
         assert len(names) == 12
 
@@ -1214,7 +1219,7 @@ class TestAdvertiseOrder:
 
     def test_reorder_skips_missing_stm_tools(self):
         """When ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`` hides
-        the 7 observability tools, ``_tool_manager._tools`` only holds the
+        the 8 observability tools, ``_tool_manager._tools`` only holds the
         4 model-facing STM tools. The reorder helper must not KeyError on
         the absent names — ``.pop(name, None)`` is the contract."""
         from memtomem_stm.server import _move_stm_tools_to_end
