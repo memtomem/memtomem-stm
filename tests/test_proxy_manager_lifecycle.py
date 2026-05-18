@@ -112,6 +112,27 @@ class TestStart:
         mock_close.assert_awaited_once()
         assert mgr._stack is not first_stack
 
+    async def test_double_start_closes_existing_connection_stacks(self):
+        """Calling start() twice closes per-connection stacks before clearing them."""
+        mgr = _make_manager(servers={})
+        with patch.object(ProxyConfig, "load_from_file", return_value=None):
+            await mgr.start()
+
+        mock_stack = AsyncMock()
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv",
+            config=UpstreamServerConfig(prefix="test"),
+            session=AsyncMock(),
+            tools=[],
+            stack=mock_stack,
+        )
+
+        with patch.object(ProxyConfig, "load_from_file", return_value=None):
+            await mgr.start()
+
+        mock_stack.aclose.assert_awaited_once()
+        assert mgr._connections == {}
+
 
 # ── stop() ────────────────────────────────────────────────────────────────
 
@@ -214,6 +235,41 @@ class TestConnectTimeout:
             await mgr.start()
 
         assert "Failed to connect to upstream server 'slow'" in caplog.text
+
+
+class TestConnectServerCleanup:
+    async def test_connect_server_closes_partial_stack_when_list_tools_fails(self):
+        """Failed initial connection must not leave transport/session cleanup
+        deferred until ProxyManager.stop().
+        """
+        cfg = UpstreamServerConfig(prefix="bad")
+        mgr = _make_manager(servers={"bad": cfg})
+
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(side_effect=RuntimeError("catalog failed"))
+
+        mock_transport = AsyncMock()
+        mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        mock_transport.__aexit__ = AsyncMock(return_value=False)
+
+        import pytest as _pt
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            with _pt.raises(RuntimeError, match="catalog failed"):
+                await mgr._connect_server("bad", cfg, set())
+
+        assert "bad" not in mgr._connections
+        mock_session.__aexit__.assert_awaited_once()
+        mock_transport.__aexit__.assert_awaited_once()
 
 
 # ── tool name overflow skip (#261) ───────────────────────────────────────

@@ -189,6 +189,15 @@ class ProxyManager:
         """Connect to all upstream servers, discover their tools."""
         # Guard against double start — close previous stack to avoid leaking connections
         if self._stack is not None:
+            for conn in self._connections.values():
+                if conn.stack is not None:
+                    try:
+                        await conn.stack.aclose()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close connection stack in double-start guard",
+                            exc_info=True,
+                        )
             try:
                 await self._stack.aclose()
             except Exception:
@@ -288,13 +297,25 @@ class ProxyManager:
             logger.warning("Skipping server '%s': transport=%s requires url", name, cfg.transport)
             return
 
-        transport_ctx = self._open_transport(cfg)
-        streams = await self._stack.enter_async_context(transport_ctx)
-        read, write = streams[0], streams[1]
-        session = await self._stack.enter_async_context(ClientSession(read, write))
-        await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
+        conn_stack = AsyncExitStack()
+        try:
+            transport_ctx = self._open_transport(cfg)
+            streams = await conn_stack.enter_async_context(transport_ctx)
+            read, write = streams[0], streams[1]
+            session = await conn_stack.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
+            result = await session.list_tools()
+        except BaseException:
+            # Roll back any contexts we entered before the connection becomes
+            # visible to stop()/reconnect cleanup.
+            try:
+                await conn_stack.aclose()
+            except Exception:
+                logger.debug(
+                    "Error during initial connection cleanup for '%s'", name, exc_info=True
+                )
+            raise
 
-        result = await session.list_tools()
         valid_tools = []
         for t in result.tools:
             prefixed = f"{cfg.prefix}__{t.name}"
@@ -326,7 +347,7 @@ class ProxyManager:
             valid_tools.append(t)
 
         self._connections[name] = UpstreamConnection(
-            name=name, config=cfg, session=session, tools=valid_tools
+            name=name, config=cfg, session=session, tools=valid_tools, stack=conn_stack
         )
         logger.info("Connected to '%s' (%s tools)", name, len(valid_tools))
 
