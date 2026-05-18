@@ -190,7 +190,7 @@ export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=memtomem-server
 export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--config","/etc/memtomem.json"]'
 ```
 
-This makes memtomem just another MCP upstream as far as STM is concerned — the same compression / cache / surfacing pipeline applies, and a memtomem crash never takes down STM's other upstream connections.
+This makes memtomem reachable over the same MCP protocol boundary STM uses for other upstreams. Unlike a generic proxied upstream, LTM responses bypass the compression / cache pipeline — they are consumed by STM's surfacing engine (via `McpClientSearchAdapter`, see `src/memtomem_stm/surfacing/mcp_client.py`) to compose context for upstream calls, rather than being passed through to the caller. A memtomem crash never takes down STM's other upstream connections.
 
 > **Note**: prior versions supported an in-process mode that imported memtomem directly. That path was removed so STM has a single LTM retrieval path and so core internals can evolve without breaking STM.
 
