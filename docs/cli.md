@@ -457,25 +457,23 @@ See [Configuration → General](configuration.md#general) for details.
 
 ## Trimming the advertised MCP tool surface
 
-STM advertises eleven MCP tools by default. Seven are operator-facing
-(observability / admin) and accessible through this very CLI; the
-remaining four are model-facing (progressive-delivery unlocks and
-feedback channels). On clients that eager-load MCP tool schemas
-into the model context at session start, the seven observability
-tools pay schema tokens for calls the model rarely makes.
+STM advertises four model-facing MCP tools by default (progressive-delivery
+unlocks and feedback channels). Eight additional tools are operator-facing
+(observability / admin). On clients that eager-load MCP tool schemas into
+the model context at session start, the eight observability tools would
+pay schema tokens for calls the model rarely makes.
 
-Set the following to hide them from MCP (they stay callable via
-`mms`):
+Set the following and restart STM to advertise them over MCP:
 
 ```bash
-export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false
+export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true
 ```
 
 - **Claude Code**: no effect needed — Claude Code lazy-loads MCP
   tool schemas via `ToolSearch`, so advertised count is
   near-free.
-- **OpenAI Codex CLI** and other eager-loading clients: set this
-  to `false`, or use the downstream per-server filter if your
+- **OpenAI Codex CLI** and other eager-loading clients: leave this
+  unset/`false`, or use the downstream per-server filter if your
   client supports one. For Codex:
 
   ```toml
@@ -483,7 +481,7 @@ export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false
   [mcp_servers.memtomem-stm]
   disabled_tools = [
     "stm_proxy_stats", "stm_proxy_health", "stm_proxy_cache_clear",
-    "stm_surfacing_stats", "stm_compression_stats",
+    "stm_surfacing_stats", "stm_index_stats", "stm_compression_stats",
     "stm_progressive_stats", "stm_tuning_recommendations",
   ]
   ```

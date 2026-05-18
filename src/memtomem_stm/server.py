@@ -311,7 +311,7 @@ def _should_advertise_obs_tools() -> bool:
     module import, before ``app_lifespan`` loads the JSON config file.
     """
     return os.environ.get(
-        "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "true"
+        "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false"
     ).strip().lower() not in ("false", "0", "no")
 
 
