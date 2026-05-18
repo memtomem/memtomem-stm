@@ -252,6 +252,10 @@ class McpClientSearchAdapter:
         stack = AsyncExitStack()
         self._stack = stack
         try:
+            # #297: LTM transport is stdio-only by design (single-user local
+            # install). When a deployment needs SSE / streamable HTTP, mirror
+            # ``ProxyManager._open_transport`` and branch on a SurfacingConfig
+            # transport field.
             params = StdioServerParameters(
                 command=self._config.ltm_mcp_command,
                 args=self._config.ltm_mcp_args,
