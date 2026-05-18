@@ -17,8 +17,10 @@ the Windows crash:
 Plain ``if True:`` / ``if some_var:`` / ``try: ... except OSError:`` do **not**
 exempt — the import still runs at load time and still crashes on Windows.
 
-Function- and class-body imports don't run at module load and are out of scope
-for this guard (they would fail at call time on Windows, a separate bug class).
+Function-body imports don't run at module load and are out of scope for this
+guard (they would fail at call time on Windows — a separate bug class). Class
+bodies, by contrast, **do** execute during module import (Python constructs
+the class namespace at definition time), so they're walked too.
 
 ``stm`` has zero POSIX-only imports today (verified during the #302 Windows
 triage); this is preventive insurance against regressions during ongoing
@@ -108,10 +110,12 @@ def _find_unguarded_posix_imports(
 ) -> list[tuple[int, str]]:
     """Return ``(lineno, top_level_module_name)`` for offending imports.
 
-    Recurses into ``If`` / ``Try`` (those run at module load time), flipping
-    ``exempt=True`` for the protected sub-tree only when the construct matches
-    a recognized POSIX-only guard or ``ImportError``-catching wrapper. Does
-    not recurse into function/class bodies — those don't execute at load time.
+    Recurses into ``If`` / ``Try`` / ``ClassDef`` — all of which execute at
+    module load time — flipping ``exempt=True`` for the protected sub-tree
+    only when the construct matches a recognized POSIX-only guard or
+    ``ImportError``-catching wrapper. Does not recurse into function bodies:
+    those don't execute until called, so an import there is a separate
+    (call-time) bug class outside this guard's scope.
     """
     offenses: list[tuple[int, str]] = []
     for node in body:
@@ -139,6 +143,13 @@ def _find_unguarded_posix_imports(
                 offenses.extend(_find_unguarded_posix_imports(handler.body, exempt=exempt))
             offenses.extend(_find_unguarded_posix_imports(node.orelse, exempt=exempt))
             offenses.extend(_find_unguarded_posix_imports(node.finalbody, exempt=exempt))
+        elif isinstance(node, ast.ClassDef):
+            # Class bodies execute at module load — the class namespace is
+            # built by running the suite at definition time. A bare
+            # ``class C: import fcntl`` raises ``ModuleNotFoundError`` on
+            # Windows at import. Recurse with the same ``exempt`` (no class
+            # construct itself confers exemption).
+            offenses.extend(_find_unguarded_posix_imports(node.body, exempt=exempt))
     return offenses
 
 
@@ -213,5 +224,20 @@ def test_guard_rejects_try_with_non_import_handler() -> None:
 
 def test_guard_skips_function_body_imports() -> None:
     """Function-body imports don't run at module load; out of scope for this guard."""
-    body = "def f():\n    import fcntl\n    return fcntl\n"
+    for body in (
+        "def f():\n    import fcntl\n    return fcntl\n",
+        "async def f():\n    import fcntl\n    return fcntl\n",
+    ):
+        assert "fcntl" not in _names(body), body
+
+
+def test_guard_flags_class_body_imports() -> None:
+    """Class bodies execute at module load, so imports there must be flagged."""
+    body = "class C:\n    import fcntl\n"
+    assert "fcntl" in _names(body)
+
+
+def test_guard_skips_class_method_body_imports() -> None:
+    """Methods are function bodies — import there is call-time, not load-time."""
+    body = "class C:\n    def m(self):\n        import fcntl\n        return fcntl\n"
     assert "fcntl" not in _names(body)
