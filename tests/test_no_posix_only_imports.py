@@ -1,0 +1,329 @@
+"""POSIX-only stdlib imports must not run at module load in ``src/``.
+
+Python evaluates ``import`` statements eagerly. A bare ``import fcntl`` at the
+top of a module raises ``ModuleNotFoundError`` on Windows the moment the
+module is loaded — even when no call site uses it.
+
+This guard walks every ``.py`` under ``src/`` and rejects POSIX-only stdlib
+imports that execute at module-load time. An import is exempt only when nested
+inside one of three recognized patterns whose runtime behavior actually
+prevents the Windows crash:
+
+* a platform guard: ``if sys.platform != "win32":``, ``if os.name != "nt":``,
+  or ``if os.name == "posix":``
+* an ``except ImportError`` wrapper (also ``ModuleNotFoundError``, broader
+  catchall families, or bare ``except:``)
+* a ``with contextlib.suppress(ImportError):`` (or bare ``suppress`` imported
+  from ``contextlib``) context manager
+
+Plain ``if True:`` / ``if some_var:`` / ``try: ... except OSError:`` /
+``with contextlib.suppress(OSError):`` do **not** exempt — the import still
+runs at load time and still crashes on Windows. ``for`` / ``while`` / ``match``
+at module scope are recursed into but confer no exemption.
+
+Function-body imports don't run at module load and are out of scope for this
+guard (they would fail at call time on Windows — a separate bug class). Class
+bodies, by contrast, **do** execute during module import (Python constructs
+the class namespace at definition time), so they're walked too.
+
+``stm`` has zero POSIX-only imports today (verified during the #302 Windows
+triage); this is preventive insurance against regressions during ongoing
+Windows-correctness work. Mirrors memtomem #657.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+
+# Stdlib modules that exist only on POSIX builds of CPython. A module-load
+# import of any of these crashes on Windows. ``pty`` and ``tty`` are included
+# because both transitively import ``termios``; CPython docs mark each as
+# "Availability: Unix" in its own right.
+POSIX_ONLY_STDLIB_MODULES = frozenset(
+    {
+        "fcntl",
+        "grp",
+        "nis",
+        "ossaudiodev",
+        "posix",
+        "pty",
+        "pwd",
+        "resource",
+        "spwd",
+        "syslog",
+        "termios",
+        "tty",
+    }
+)
+
+# Exception types whose presence in an ``except`` clause genuinely protects
+# against POSIX-only import failure.
+IMPORT_ERROR_CATCHERS = frozenset(
+    {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+)
+
+
+def _is_posix_platform_guard(test: ast.expr) -> bool:
+    """Recognize the canonical ``if`` tests that confine code to POSIX.
+
+    Only the three documented forms exempt nested imports. Anything else
+    (``if True``, ``if some_var``, ``if sys.platform == "darwin"``) leaves
+    the import running at module-load time on Windows runners.
+    """
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+        return False
+    left, op, right = test.left, test.ops[0], test.comparators[0]
+    if not isinstance(right, ast.Constant) or not isinstance(right.value, str):
+        return False
+
+    def _is_attr(node: ast.expr, owner: str, attr: str) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == attr
+            and isinstance(node.value, ast.Name)
+            and node.value.id == owner
+        )
+
+    if _is_attr(left, "sys", "platform") and isinstance(op, ast.NotEq) and right.value == "win32":
+        return True
+    if _is_attr(left, "os", "name") and isinstance(op, ast.NotEq) and right.value == "nt":
+        return True
+    if _is_attr(left, "os", "name") and isinstance(op, ast.Eq) and right.value == "posix":
+        return True
+    return False
+
+
+def _try_catches_import_error(handlers: list[ast.ExceptHandler]) -> bool:
+    """True if any handler catches ``ImportError`` (or a superclass / bare except)."""
+    for handler in handlers:
+        if handler.type is None:
+            return True  # bare ``except:``
+        types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+        for node in types:
+            if isinstance(node, ast.Name) and node.id in IMPORT_ERROR_CATCHERS:
+                return True
+    return False
+
+
+def _with_suppresses_import_error(items: list[ast.withitem]) -> bool:
+    """True if any context manager is ``contextlib.suppress(ImportError, ...)``.
+
+    Recognizes both ``contextlib.suppress(...)`` and bare ``suppress(...)`` (as
+    when imported via ``from contextlib import suppress``). Other suppress-like
+    helpers (``contextlib2.suppress``, ``ExitStack().enter_context(...)``) are
+    not recognized — the canonical form covers the practical case.
+    """
+    for item in items:
+        call = item.context_expr
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        is_contextlib_suppress = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "suppress"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "contextlib"
+        )
+        is_bare_suppress = isinstance(func, ast.Name) and func.id == "suppress"
+        if not (is_contextlib_suppress or is_bare_suppress):
+            continue
+        for arg in call.args:
+            if isinstance(arg, ast.Name) and arg.id in IMPORT_ERROR_CATCHERS:
+                return True
+    return False
+
+
+def _find_unguarded_posix_imports(
+    body: list[ast.stmt], *, exempt: bool = False
+) -> list[tuple[int, str]]:
+    """Return ``(lineno, top_level_module_name)`` for offending imports.
+
+    Recurses into every statement type that executes at module load — ``If``,
+    ``Try`` / ``TryStar``, ``With``, ``For``, ``While``, ``Match``, and
+    ``ClassDef`` — flipping ``exempt=True`` for the protected sub-tree only
+    when the construct matches a recognized POSIX-only guard, an
+    ``ImportError``-catching ``except``, or a ``contextlib.suppress``-style
+    ``with``. Does not recurse into function bodies (``FunctionDef`` /
+    ``AsyncFunctionDef``): those don't execute until called, so an import
+    there is a separate (call-time) bug class outside this guard's scope.
+    ``async with`` / ``async for`` are only legal inside ``async def`` and
+    therefore unreachable at module load.
+    """
+    offenses: list[tuple[int, str]] = []
+    for node in body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in POSIX_ONLY_STDLIB_MODULES and not exempt:
+                    offenses.append((node.lineno, top))
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            if top in POSIX_ONLY_STDLIB_MODULES and not exempt:
+                offenses.append((node.lineno, top))
+        elif isinstance(node, ast.If):
+            body_exempt = exempt or _is_posix_platform_guard(node.test)
+            offenses.extend(_find_unguarded_posix_imports(node.body, exempt=body_exempt))
+            # ``orelse`` (the False branch) inherits only the outer ``exempt``.
+            # We don't recognize the inverse ``if sys.platform == "win32":``
+            # form because no src/ file uses it today; if one ever does, the
+            # canonical fix is to flip the condition rather than expand here.
+            offenses.extend(_find_unguarded_posix_imports(node.orelse, exempt=exempt))
+        elif isinstance(node, (ast.Try, ast.TryStar)):
+            body_exempt = exempt or _try_catches_import_error(node.handlers)
+            offenses.extend(_find_unguarded_posix_imports(node.body, exempt=body_exempt))
+            for handler in node.handlers:
+                offenses.extend(_find_unguarded_posix_imports(handler.body, exempt=exempt))
+            offenses.extend(_find_unguarded_posix_imports(node.orelse, exempt=exempt))
+            offenses.extend(_find_unguarded_posix_imports(node.finalbody, exempt=exempt))
+        elif isinstance(node, ast.ClassDef):
+            # Class bodies execute at module load — the class namespace is
+            # built by running the suite at definition time. A bare
+            # ``class C: import fcntl`` raises ``ModuleNotFoundError`` on
+            # Windows at import. Recurse with the same ``exempt`` (no class
+            # construct itself confers exemption).
+            offenses.extend(_find_unguarded_posix_imports(node.body, exempt=exempt))
+        elif isinstance(node, ast.With):
+            body_exempt = exempt or _with_suppresses_import_error(node.items)
+            offenses.extend(_find_unguarded_posix_imports(node.body, exempt=body_exempt))
+        elif isinstance(node, (ast.For, ast.While)):
+            # Loop bodies execute at module load if the iterable / test ever
+            # evaluates true. No syntactic form confers exemption — recurse
+            # with the inherited ``exempt`` only.
+            offenses.extend(_find_unguarded_posix_imports(node.body, exempt=exempt))
+            offenses.extend(_find_unguarded_posix_imports(node.orelse, exempt=exempt))
+        elif isinstance(node, ast.Match):
+            # ``match`` case bodies execute at module load. We don't try to
+            # recognize platform-dispatch patterns like ``match sys.platform:
+            # case "linux": ...`` — the canonical fix is an ``if`` guard.
+            for case in node.cases:
+                offenses.extend(_find_unguarded_posix_imports(case.body, exempt=exempt))
+    return offenses
+
+
+def test_no_posix_only_load_time_imports_in_src() -> None:
+    paths = sorted(SRC_ROOT.rglob("*.py"))
+    assert paths, f"no python sources discovered under {SRC_ROOT}"
+
+    offenses: list[str] = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for lineno, name in _find_unguarded_posix_imports(tree.body):
+            offenses.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: import {name}")
+
+    assert not offenses, (
+        "POSIX-only stdlib module(s) imported at module load (will crash on "
+        "Windows). Wrap in `if sys.platform != 'win32':` or "
+        "`try/except ImportError`:\n  " + "\n  ".join(offenses)
+    )
+
+
+# --- walker self-tests -------------------------------------------------------
+# Pin the contract: any change that loosens these is a guard regression.
+
+
+def _names(src: str) -> set[str]:
+    return {name for _, name in _find_unguarded_posix_imports(ast.parse(src).body)}
+
+
+def test_guard_flags_bare_top_level_posix_import() -> None:
+    assert "fcntl" in _names("import fcntl\n")
+
+
+def test_guard_flags_pty_and_tty() -> None:
+    assert "pty" in _names("import pty\n")
+    assert "tty" in _names("import tty\n")
+
+
+def test_guard_exempts_recognized_platform_guards() -> None:
+    for guard in (
+        "if sys.platform != 'win32':\n    import fcntl\n",
+        "if os.name != 'nt':\n    import fcntl\n",
+        "if os.name == 'posix':\n    import fcntl\n",
+    ):
+        assert "fcntl" not in _names(guard), guard
+
+
+def test_guard_rejects_unrecognized_if_block() -> None:
+    """``if True:`` and arbitrary tests still execute on Windows at load time."""
+    for body in (
+        "if True:\n    import fcntl\n",
+        "if some_var:\n    import fcntl\n",
+        "if sys.platform == 'darwin':\n    import fcntl\n",
+    ):
+        assert "fcntl" in _names(body), body
+
+
+def test_guard_exempts_try_except_import_error() -> None:
+    for body in (
+        "try:\n    import fcntl\nexcept ImportError:\n    fcntl = None\n",
+        "try:\n    import fcntl\nexcept ModuleNotFoundError:\n    fcntl = None\n",
+        "try:\n    import fcntl\nexcept (ImportError, OSError):\n    fcntl = None\n",
+        "try:\n    import fcntl\nexcept:\n    fcntl = None\n",
+    ):
+        assert "fcntl" not in _names(body), body
+
+
+def test_guard_rejects_try_with_non_import_handler() -> None:
+    """``try`` whose handlers don't catch ImportError still lets the crash through."""
+    body = "try:\n    import fcntl\nexcept OSError:\n    fcntl = None\n"
+    assert "fcntl" in _names(body)
+
+
+def test_guard_skips_function_body_imports() -> None:
+    """Function-body imports don't run at module load; out of scope for this guard."""
+    for body in (
+        "def f():\n    import fcntl\n    return fcntl\n",
+        "async def f():\n    import fcntl\n    return fcntl\n",
+    ):
+        assert "fcntl" not in _names(body), body
+
+
+def test_guard_flags_class_body_imports() -> None:
+    """Class bodies execute at module load, so imports there must be flagged."""
+    body = "class C:\n    import fcntl\n"
+    assert "fcntl" in _names(body)
+
+
+def test_guard_skips_class_method_body_imports() -> None:
+    """Methods are function bodies — import there is call-time, not load-time."""
+    body = "class C:\n    def m(self):\n        import fcntl\n        return fcntl\n"
+    assert "fcntl" not in _names(body)
+
+
+def test_guard_flags_with_block_import() -> None:
+    """A plain ``with`` block still runs its body at module load."""
+    body = "with open('foo'):\n    import fcntl\n"
+    assert "fcntl" in _names(body)
+
+
+def test_guard_exempts_contextlib_suppress_import_error() -> None:
+    for body in (
+        "with contextlib.suppress(ImportError):\n    import fcntl\n",
+        "with suppress(ImportError):\n    import fcntl\n",
+        "with contextlib.suppress(ImportError, OSError):\n    import fcntl\n",
+        "with contextlib.suppress(ModuleNotFoundError):\n    import fcntl\n",
+    ):
+        assert "fcntl" not in _names(body), body
+
+
+def test_guard_rejects_suppress_without_import_error() -> None:
+    """``suppress(OSError)`` does not catch the ImportError."""
+    body = "with contextlib.suppress(OSError):\n    import fcntl\n"
+    assert "fcntl" in _names(body)
+
+
+def test_guard_flags_for_and_while_loop_imports() -> None:
+    for body in (
+        "for _ in [1]:\n    import fcntl\n",
+        "while False:\n    import fcntl\n",
+    ):
+        assert "fcntl" in _names(body), body
+
+
+def test_guard_flags_match_case_imports() -> None:
+    body = "match x:\n    case _:\n        import fcntl\n"
+    assert "fcntl" in _names(body)
