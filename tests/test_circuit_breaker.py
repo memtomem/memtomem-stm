@@ -58,7 +58,7 @@ class TestCircuitBreakerHalfOpen:
 
         # Simulate time passing beyond reset_timeout
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 11.0
+            mock_time.monotonic.return_value = cb.opened_at + 11.0
             # Should transition to half-open and allow one probe
             assert not cb.is_open
             assert cb._state == "half-open"
@@ -68,7 +68,7 @@ class TestCircuitBreakerHalfOpen:
         cb.record_failure()
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 11.0
+            mock_time.monotonic.return_value = cb.opened_at + 11.0
             assert not cb.is_open  # half-open
 
         cb.record_success()
@@ -80,7 +80,7 @@ class TestCircuitBreakerHalfOpen:
         cb.record_failure()
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 11.0
+            mock_time.monotonic.return_value = cb.opened_at + 11.0
             assert not cb.is_open  # half-open
 
         cb.record_failure()
@@ -90,7 +90,7 @@ class TestCircuitBreakerHalfOpen:
     def test_half_open_failure_resets_timeout(self):
         cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
         cb.record_failure()
-        first_opened_at = cb._opened_at
+        first_opened_at = cb.opened_at
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
             mock_time.monotonic.return_value = first_opened_at + 11.0
@@ -98,7 +98,7 @@ class TestCircuitBreakerHalfOpen:
 
         cb.record_failure()
         # opened_at should be refreshed
-        assert cb._opened_at > first_opened_at or cb._opened_at == first_opened_at
+        assert cb.opened_at > first_opened_at or cb.opened_at == first_opened_at
         # If time.monotonic was called normally, opened_at >= first_opened_at
 
     def test_repeated_open_close_cycles(self):
@@ -111,7 +111,7 @@ class TestCircuitBreakerHalfOpen:
 
         # Half-open → success → closed
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 6.0
+            mock_time.monotonic.return_value = cb.opened_at + 6.0
             assert not cb.is_open
         cb.record_success()
         assert not cb.is_open
@@ -128,7 +128,7 @@ class TestCircuitBreakerHalfOpen:
         cb.record_failure()
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 11.0
+            mock_time.monotonic.return_value = cb.opened_at + 11.0
             # First call: transitions to half-open, returns False
             assert not cb.is_open
             assert cb._state == "half-open"
@@ -157,7 +157,7 @@ class TestCircuitBreakerProperties:
         cb.record_failure()
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 11.0
+            mock_time.monotonic.return_value = cb.opened_at + 11.0
             assert not cb.is_open  # triggers half-open
             # assertion inside the patch block — fix for timing concern
             assert cb.time_until_reset is None
@@ -167,16 +167,46 @@ class TestCircuitBreakerProperties:
         cb.record_failure()
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb._opened_at + 10.0
+            mock_time.monotonic.return_value = cb.opened_at + 10.0
             result = cb.time_until_reset
-            # ``time_until_reset`` computes ``reset_timeout - (now - opened_at)``.
-            # ``opened_at`` is a real ``time.monotonic()`` value (often ~1e5-1e9
-            # seconds on CI runners), so ``(opened_at + 10.0) - opened_at`` loses
-            # a few low bits and the result is ``~1e-14`` rather than bit-exact
-            # ``0.0``. The contract here is "not positive, effectively zero" —
-            # pick a tolerance several orders of magnitude below any observable
-            # reset window.
+            # The contract here is "not positive, effectively zero" — pick a
+            # tolerance several orders of magnitude below any observable reset
+            # window. See ``CircuitBreaker.opened_at`` docstring for the
+            # float-precision rationale (paragraph migrated there per #277).
             assert result is not None and abs(result) < 1e-9
+
+    def test_opened_at_lifecycle_preserves_most_recent_open(self):
+        """``opened_at`` is None initially, captures the open transition,
+        and survives the recover→close path so diagnostics retain the
+        historical "last trip" timestamp (#277).
+
+        ``record_success`` flips state to ``closed`` and zeroes
+        ``failure_count`` but intentionally does not clear
+        ``_opened_at`` — this regression pins that contract so a
+        future "reset on close" change does not silently erase the
+        diagnostic without updating the property docstring.
+        """
+        cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
+        assert cb.opened_at is None  # never opened
+
+        cb.record_failure()
+        assert cb.is_open
+        opened_when_tripped = cb.opened_at
+        assert opened_when_tripped is not None  # captured at open
+        # Still equals that value while currently open.
+        assert cb.opened_at == opened_when_tripped
+
+        with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
+            mock_time.monotonic.return_value = opened_when_tripped + 11.0
+            assert not cb.is_open  # auto-transitions to half-open
+            assert cb.state == "half-open"
+            # Half-open does not refresh opened_at.
+            assert cb.opened_at == opened_when_tripped
+
+        cb.record_success()
+        assert cb.state == "closed"
+        # Recovery does not clear opened_at — the "last trip" survives.
+        assert cb.opened_at == opened_when_tripped
 
     def test_backward_compat_failure_alias(self):
         cb = CircuitBreaker(max_failures=2)
