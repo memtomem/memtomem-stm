@@ -252,6 +252,9 @@ class McpClientSearchAdapter:
         stack = AsyncExitStack()
         self._stack = stack
         try:
+            # #297: LTM transport is currently stdio-only. Adding SSE /
+            # streamable HTTP means giving SurfacingConfig a transport field
+            # and branching here, mirroring ``ProxyManager._open_transport``.
             params = StdioServerParameters(
                 command=self._config.ltm_mcp_command,
                 args=self._config.ltm_mcp_args,
