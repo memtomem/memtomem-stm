@@ -14,6 +14,8 @@ from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
 
+_NEGATIVE_FEEDBACK_RATINGS = ("not_relevant", "already_known")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS surfacing_events (
     id          TEXT    PRIMARY KEY,
@@ -317,7 +319,7 @@ class FeedbackStore:
             bucket["events"] += 1
             bucket["sum_memory_count"] += n
 
-        # Per-tool feedback counts (total + not_relevant) within the same
+        # Per-tool feedback counts (total + negative) within the same
         # event filter. Powers the AutoTuner readiness signal: with these
         # the formatter can render "feedback N (negative R%)" and decide
         # whether the tool has hit auto_tune_min_samples.
@@ -333,10 +335,15 @@ class FeedbackStore:
         ).fetchall()
         per_tool_feedback: dict[str, dict[str, int]] = {}
         for tool_name, rating, count in feedback_rows:
-            bucket_fb = per_tool_feedback.setdefault(tool_name, {"total": 0, "not_relevant": 0})
+            bucket_fb = per_tool_feedback.setdefault(
+                tool_name,
+                {"total": 0, "not_relevant": 0, "negative": 0},
+            )
             bucket_fb["total"] += count
             if rating == "not_relevant":
                 bucket_fb["not_relevant"] += count
+            if rating in _NEGATIVE_FEEDBACK_RATINGS:
+                bucket_fb["negative"] += count
 
         per_tool_breakdown: list[dict] = [
             {
@@ -347,6 +354,7 @@ class FeedbackStore:
                 else 0.0,
                 "feedback_count": per_tool_feedback.get(t, {}).get("total", 0),
                 "not_relevant_count": per_tool_feedback.get(t, {}).get("not_relevant", 0),
+                "negative_count": per_tool_feedback.get(t, {}).get("negative", 0),
             }
             for t, b in sorted(per_tool.items(), key=lambda kv: kv[1]["events"], reverse=True)
         ]
@@ -440,14 +448,16 @@ class FeedbackStore:
             self._db.commit()
             return cursor.rowcount
 
-    def get_tool_not_relevant_ratio(self, tool: str | None, min_samples: int = 20) -> float | None:
-        """Return ratio of not_relevant feedback. None if insufficient samples.
-
-        If tool is None, returns the global ratio across all tools (used
-        as a cold-start fallback when a specific tool has too few samples).
-        """
+    def _get_tool_rating_ratio(
+        self,
+        tool: str | None,
+        ratings: tuple[str, ...],
+        min_samples: int,
+    ) -> float | None:
         if self._db is None:
             return None
+
+        placeholders = ", ".join("?" for _ in ratings)
         if tool is not None:
             total = self._db.execute(
                 "SELECT COUNT(*) FROM surfacing_feedback f "
@@ -457,20 +467,38 @@ class FeedbackStore:
             ).fetchone()[0]
             if total < min_samples:
                 return None
-            not_relevant = self._db.execute(
+            matching = self._db.execute(
                 "SELECT COUNT(*) FROM surfacing_feedback f "
                 "JOIN surfacing_events e ON f.surfacing_id = e.id "
-                "WHERE e.tool = ? AND f.rating = 'not_relevant'",
-                (tool,),
+                f"WHERE e.tool = ? AND f.rating IN ({placeholders})",
+                (tool, *ratings),
             ).fetchone()[0]
         else:
             total = self._db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()[0]
             if total < min_samples:
                 return None
-            not_relevant = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_feedback WHERE rating = 'not_relevant'"
+            matching = self._db.execute(
+                f"SELECT COUNT(*) FROM surfacing_feedback WHERE rating IN ({placeholders})",
+                ratings,
             ).fetchone()[0]
-        return not_relevant / total if total > 0 else 0.0
+        return matching / total if total > 0 else 0.0
+
+    def get_tool_negative_ratio(self, tool: str | None, min_samples: int = 20) -> float | None:
+        """Return ratio of negative feedback. None if insufficient samples.
+
+        Negative feedback is ``not_relevant`` or ``already_known``. If tool is
+        None, returns the global ratio across all tools (used as a cold-start
+        fallback when a specific tool has too few samples).
+        """
+        return self._get_tool_rating_ratio(tool, _NEGATIVE_FEEDBACK_RATINGS, min_samples)
+
+    def get_tool_not_relevant_ratio(self, tool: str | None, min_samples: int = 20) -> float | None:
+        """Return ratio of not_relevant feedback. None if insufficient samples.
+
+        If tool is None, returns the global ratio across all tools (used
+        as a cold-start fallback when a specific tool has too few samples).
+        """
+        return self._get_tool_rating_ratio(tool, ("not_relevant",), min_samples)
 
     # ── AutoTuner persistence ──────────────────────────────────────────
 

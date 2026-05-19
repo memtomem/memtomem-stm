@@ -82,7 +82,7 @@ class FeedbackTracker:
 
 
 class AutoTuner:
-    """Auto-adjust min_score based on feedback ratios.
+    """Auto-adjust min_score based on negative feedback ratios.
 
     Integrated into SurfacingEngine — when `auto_tune_enabled=True` and
     FeedbackTracker is available, the engine calls maybe_adjust(tool)
@@ -97,7 +97,7 @@ class AutoTuner:
         self._adjustments: dict[str, float] = dict(store.load_adjustments())
 
     def maybe_adjust(self, tool: str) -> float | None:
-        """Check feedback ratio and adjust min_score for a tool.
+        """Check negative feedback ratio and adjust min_score for a tool.
 
         When the tool has insufficient samples, falls back to the global
         ratio across all tools (cold-start mitigation).
@@ -107,13 +107,13 @@ class AutoTuner:
         if not self._config.auto_tune_enabled:
             return None
 
-        ratio = self._store.get_tool_not_relevant_ratio(
+        ratio = self._store.get_tool_negative_ratio(
             tool,
             min_samples=self._config.auto_tune_min_samples,
         )
         if ratio is None:
             # Cold start: use global ratio as fallback
-            ratio = self._store.get_tool_not_relevant_ratio(
+            ratio = self._store.get_tool_negative_ratio(
                 None,  # None = all tools
                 min_samples=self._config.auto_tune_min_samples,
             )
@@ -124,13 +124,13 @@ class AutoTuner:
         increment = self._config.auto_tune_score_increment
 
         if ratio > 0.6:
-            # Too many not_relevant → raise threshold
+            # Too much negative feedback -> raise threshold.
             new_score = min(current + increment, 0.05)
             if new_score != current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
                 logger.info(
-                    "AutoTune: %s min_score %.2f → %.2f (not_relevant ratio: %.0f%%)",
+                    "AutoTune: %s min_score %.2f → %.2f (negative ratio: %.0f%%)",
                     tool,
                     current,
                     new_score,
@@ -138,13 +138,13 @@ class AutoTuner:
                 )
                 return new_score
         elif ratio < 0.2:
-            # Mostly helpful → lower threshold (surface more)
+            # Mostly helpful feedback -> lower threshold (surface more).
             new_score = max(current - increment, 0.005)
             if new_score != current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
                 logger.info(
-                    "AutoTune: %s min_score %.2f → %.2f (not_relevant ratio: %.0f%%)",
+                    "AutoTune: %s min_score %.2f → %.2f (negative ratio: %.0f%%)",
                     tool,
                     current,
                     new_score,
