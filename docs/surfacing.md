@@ -227,7 +227,7 @@ sequenceDiagram
         Core-->>FB: ok (capped at max_boost=1.5)
     end
     FB->>AT: maybe_adjust(tool)
-    AT->>AT: compute not_relevant ratio
+    AT->>AT: compute negative ratio
     alt ≥ 20 samples for tool
         AT->>AT: per-tool ratio
     else cold start
@@ -247,13 +247,13 @@ stm_surfacing_feedback(surfacing_id="ghi789", rating="already_known")
 
 Valid ratings: `helpful`, `not_relevant`, `already_known`.
 
-When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback. In plain terms: **`not_relevant` ratings push `min_score` up** (surfacing becomes more selective), while a run of **`helpful`/`already_known` ratings pushes it down** (surfacing becomes more inclusive) because they keep the `not_relevant` ratio low. Concretely:
+When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback. In plain terms: **`not_relevant` and `already_known` ratings push `min_score` up** (surfacing becomes more selective), while a run of **`helpful` ratings pushes it down** (surfacing becomes more inclusive) because they keep the negative-feedback ratio low. Concretely:
 
 | Feedback ratio | Action |
 |----------------|--------|
-| > 60% `not_relevant` | Raise `min_score` by +0.002 (surface fewer, more relevant) |
-| < 20% `not_relevant` | Lower `min_score` by -0.002 (surface more) |
-| 20–60% `not_relevant` | Hold current `min_score` |
+| > 60% negative (`not_relevant` + `already_known`) | Raise `min_score` by +0.002 (surface fewer, more relevant) |
+| < 20% negative | Lower `min_score` by -0.002 (surface more) |
+| 20–60% negative | Hold current `min_score` |
 
 Adjustment step is `auto_tune_score_increment` (default `0.002`) and the tuned score is clamped to `[0.005, 0.05]`.
 
@@ -262,7 +262,7 @@ flowchart LR
     Sample["new feedback"] --> N{"≥ 20 samples<br/>for this tool?"}
     N -->|no| Cold["use global ratio<br/>(cold-start fallback)"]
     N -->|yes| Local["use per-tool ratio"]
-    Cold --> R{"not_relevant<br/>ratio?"}
+    Cold --> R{"negative<br/>ratio?"}
     Local --> R
     R -->|"> 60%"| Up["min_score += 0.002<br/>(surface less)"]
     R -->|"< 20%"| Down["min_score -= 0.002<br/>(surface more)"]

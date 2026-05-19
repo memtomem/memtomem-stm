@@ -774,7 +774,7 @@ async def stm_surfacing_stats(
             lines.append("\nBy tool:")
             for row in stats["per_tool_breakdown"]:
                 fb = row.get("feedback_count", 0)
-                neg = row.get("not_relevant_count", 0)
+                neg = row.get("negative_count", row.get("not_relevant_count", 0))
                 # Readiness annotations only render when auto-tune is actually
                 # active and the tool isn't pinned via context_tools.<tool>.min_score.
                 # A pinned override bypasses the tuner entirely (engine.py:458-460),
