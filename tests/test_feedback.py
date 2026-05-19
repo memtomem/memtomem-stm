@@ -151,6 +151,7 @@ class TestFeedbackStore:
             "avg_memory_count": 2.5,
             "feedback_count": 2,
             "not_relevant_count": 1,
+            "negative_count": 1,
         }
         assert stats["per_tool_breakdown"][1] == {
             "tool": "tool_b",
@@ -158,6 +159,7 @@ class TestFeedbackStore:
             "avg_memory_count": 1.0,
             "feedback_count": 1,
             "not_relevant_count": 0,
+            "negative_count": 1,
         }
         assert stats["rating_distribution"] == {
             "helpful": 1,
@@ -266,8 +268,17 @@ class TestFeedbackStore:
         assert ratio is not None
         assert abs(ratio - 0.6) < 0.01
 
+    def test_negative_ratio_counts_already_known(self, feedback_store: FeedbackStore):
+        feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
+        for i in range(20):
+            feedback_store.record_feedback("s1", "already_known" if i < 12 else "helpful")
+
+        ratio = feedback_store.get_tool_negative_ratio("t", min_samples=20)
+        assert ratio is not None
+        assert abs(ratio - 0.6) < 0.01
+
     def test_per_tool_breakdown_includes_feedback_counts(self, feedback_store: FeedbackStore):
-        """Per-tool breakdown exposes feedback_count + not_relevant_count."""
+        """Per-tool breakdown exposes total, not_relevant, and negative counts."""
         feedback_store.record_surfacing("s_a1", "sv", "tool_a", "q", ["m1"], [0.9])
         feedback_store.record_surfacing("s_a2", "sv", "tool_a", "q", ["m2"], [0.9])
         feedback_store.record_surfacing("s_b", "sv", "tool_b", "q", ["m3"], [0.9])
@@ -280,8 +291,10 @@ class TestFeedbackStore:
         by_tool = {row["tool"]: row for row in stats["per_tool_breakdown"]}
         assert by_tool["tool_a"]["feedback_count"] == 3
         assert by_tool["tool_a"]["not_relevant_count"] == 2
+        assert by_tool["tool_a"]["negative_count"] == 2
         assert by_tool["tool_b"]["feedback_count"] == 0
         assert by_tool["tool_b"]["not_relevant_count"] == 0
+        assert by_tool["tool_b"]["negative_count"] == 0
 
     def test_per_tool_feedback_honors_since_filter(self, feedback_store: FeedbackStore):
         """since= filters feedback rows via their parent event's created_at."""
@@ -300,6 +313,7 @@ class TestFeedbackStore:
         row = stats["per_tool_breakdown"][0]
         assert row["feedback_count"] == 1
         assert row["not_relevant_count"] == 0
+        assert row["negative_count"] == 0
 
 
 class TestFeedbackStoreCoexistence:
@@ -433,15 +447,31 @@ class TestAutoTuner:
         )
         return AutoTuner(cfg, feedback_store)
 
-    def _seed_feedback(self, store: FeedbackStore, tool: str, not_relevant: int, helpful: int):
+    def _seed_feedback(
+        self,
+        store: FeedbackStore,
+        tool: str,
+        not_relevant: int,
+        helpful: int,
+        already_known: int = 0,
+    ):
         store.record_surfacing("s1", "sv", tool, "q", ["m1"], [0.5])
         for _ in range(not_relevant):
             store.record_feedback("s1", "not_relevant")
+        for _ in range(already_known):
+            store.record_feedback("s1", "already_known")
         for _ in range(helpful):
             store.record_feedback("s1", "helpful")
 
     def test_high_not_relevant_raises_threshold(self, feedback_store: FeedbackStore):
         self._seed_feedback(feedback_store, "t", not_relevant=5, helpful=1)
+        tuner = self._make_tuner(feedback_store)
+        result = tuner.maybe_adjust("t")
+        assert result is not None
+        assert result > 0.02
+
+    def test_already_known_raises_threshold(self, feedback_store: FeedbackStore):
+        self._seed_feedback(feedback_store, "t", not_relevant=0, helpful=0, already_known=5)
         tuner = self._make_tuner(feedback_store)
         result = tuner.maybe_adjust("t")
         assert result is not None
