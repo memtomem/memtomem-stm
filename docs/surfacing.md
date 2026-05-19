@@ -47,9 +47,11 @@ flowchart TD
 
 ## What the Agent Sees
 
-When memories are found, they're wrapped in `<surfaced-memories>` XML tags and injected before the response:
+When memories are found, they're wrapped in `<surfaced-memories>` XML tags and injected after the response (default `append`):
 
 ```
+(original tool response here)
+
 <surfaced-memories>
 ## Relevant Memories
 
@@ -58,11 +60,9 @@ When memories are found, they're wrapped in `<surfaced-memories>` XML tags and i
 
 _Surfacing ID: abc123def456 — call `stm_surfacing_feedback` to rate_
 </surfaced-memories>
-
-(original tool response here)
 ```
 
-The injection mode is configurable: `prepend` (default), `append`, or `section`.
+The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
 
 ## Surfacing Controls
 
@@ -77,7 +77,7 @@ The injection mode is configurable: `prepend` (default), `append`, or `section`.
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response) |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
 | `max_surfacings_per_minute` | `15` | Global rate limit |
-| `injection_mode` | `prepend` | Where to inject: `prepend`, `append`, `section` |
+| `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_surfacing_stats`. |
 | `section_header` | `## Relevant Memories` | Header text for injected section |
 | `default_namespace` | `null` | Restrict search to a specific namespace |
 | `exclude_tools` | `[]` | fnmatch patterns to never surface (e.g. `["*debug*"]`) |

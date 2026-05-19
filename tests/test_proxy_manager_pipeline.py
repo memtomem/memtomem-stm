@@ -479,13 +479,19 @@ class TestApplySurfacing:
 # ── _apply_surfacing_on_progressive (F6) ────────────────────────────────
 
 
-def _mock_engine_with_mode(mode: str, *, surface_return: str = "surfaced"):
-    """Return an AsyncMock engine whose ``injection_mode`` property matches *mode*."""
+def _mock_engine_with_mode(mode: str, *, surface_return: str = "surfaced", observability=None):
+    """Return an AsyncMock engine whose ``injection_mode`` property matches *mode*.
+
+    ``observability`` is exposed as a plain attribute so the manager's
+    ``engine.observability`` access returns the supplied instance (or ``None``)
+    rather than an auto-generated ``AsyncMock``.
+    """
     eng = AsyncMock()
     eng.surface.return_value = surface_return
     # ``injection_mode`` is a sync property on the real engine; set it on the
     # mock as a plain attribute so attribute access does not return a coroutine.
     type(eng).injection_mode = property(lambda _self, _m=mode: _m)
+    eng.observability = observability
     return eng
 
 
@@ -541,6 +547,35 @@ class TestApplySurfacingOnProgressive:
         mgr._surfacing_engine.surface.assert_not_awaited()
         warnings = [r for r in caplog.records if "injection_mode='prepend'" in r.message]
         assert len(warnings) == 1, "prepend-on-progressive WARNING must fire exactly once"
+
+    async def test_prepend_mode_records_skip_in_observability(self, tmp_path):
+        """#348: every progressive call skipped because of prepend must
+        increment the ``progressive_mode_conflict`` skip counter so
+        ``stm_surfacing_stats`` reflects the bypass — the one-shot WARNING
+        is not a sufficient operator signal after a process restart."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        obs = SurfacingObservability()
+        mgr._surfacing_engine = _mock_engine_with_mode("prepend", observability=obs)
+
+        await mgr._apply_surfacing_on_progressive("srv", "tool_a", {}, "c1")
+        await mgr._apply_surfacing_on_progressive("srv", "tool_a", {}, "c2")
+        await mgr._apply_surfacing_on_progressive("srv", "tool_b", {}, "c3")
+
+        snap = obs.snapshot()
+        assert snap["skip_reasons"]["tool_a"]["progressive_mode_conflict"] == 2
+        assert snap["skip_reasons"]["tool_b"]["progressive_mode_conflict"] == 1
+        assert snap["skip_reasons"]["__total__"]["progressive_mode_conflict"] == 3
+
+    async def test_prepend_mode_skip_works_without_observability(self, tmp_path):
+        """Engine constructed without observability (``observability is None``)
+        must not raise when the prepend-skip path tries to record."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        mgr._surfacing_engine = _mock_engine_with_mode("prepend", observability=None)
+
+        text, ok, err = await mgr._apply_surfacing_on_progressive("srv", "t", {}, "chunk")
+        assert (text, ok, err) == ("chunk", None, None)
 
     async def test_engine_failure_captured_as_error(self, tmp_path, caplog):
         """``append`` mode + engine raises → ``ok=False``, ``error`` populated,

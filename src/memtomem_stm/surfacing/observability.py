@@ -50,6 +50,13 @@ SkipReason = Literal[
     "ltm_unavailable",
     "ltm_call_failed",
     "ltm_parse_empty",
+    # #348: progressive-delivery path skips surfacing when the engine's
+    # injection mode would shift character offsets and break the
+    # ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant ``stm_proxy_read_more``
+    # relies on. Today only ``injection_mode='prepend'`` triggers this; the
+    # label is mode-agnostic so a future per-mode constraint can reuse it
+    # without a new enum value.
+    "progressive_mode_conflict",
 ]
 
 Outcome = Literal[
