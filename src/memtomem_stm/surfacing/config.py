@@ -43,7 +43,15 @@ class SurfacingConfig(BaseModel):
     min_query_tokens: int = Field(default=3, gt=0)
     cooldown_seconds: float = Field(default=5.0, ge=0.0)
     timeout_seconds: float = Field(default=3.0, gt=0.0)
-    injection_mode: Literal["prepend", "append", "section"] = "prepend"
+    # #348: default flipped from ``"prepend"`` to ``"append"`` so the
+    # progressive-delivery path actually surfaces memories. ``"prepend"``
+    # would shift character offsets and break the
+    # ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant ``stm_proxy_read_more``
+    # depends on, so the progressive path short-circuits in that mode
+    # (see ``ProxyManager._apply_surfacing_on_progressive``). ``"prepend"``
+    # remains valid for non-progressive responses where the agent should
+    # see memories first.
+    injection_mode: Literal["prepend", "append", "section"] = "append"
     section_header: str = "## Relevant Memories"
     default_namespace: str | None = None
     exclude_tools: list[str] = []

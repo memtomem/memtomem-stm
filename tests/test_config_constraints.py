@@ -175,6 +175,12 @@ class TestSurfacingNumericConstraints:
         for mode in ("prepend", "append", "section"):
             SurfacingConfig(injection_mode=mode)  # type: ignore[arg-type]
 
+    def test_surfacing_injection_mode_default_is_append(self) -> None:
+        """#348: default is ``append`` so the progressive-delivery path
+        surfaces by default. ``prepend`` short-circuits in progressive mode
+        because it would shift ``stm_proxy_read_more`` character offsets."""
+        assert SurfacingConfig().injection_mode == "append"
+
     def test_surfacing_result_format_literal(self) -> None:
         with pytest.raises(ValidationError):
             SurfacingConfig(result_format="json")  # type: ignore[arg-type]
