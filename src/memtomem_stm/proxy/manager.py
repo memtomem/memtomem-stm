@@ -799,6 +799,11 @@ class ProxyManager:
                     "injection_mode to 'append' or 'section' to enable it."
                 )
                 self._warned_prepend_on_progressive = True
+            # #348: counter so ``stm_surfacing_stats`` reflects the skip
+            # instead of operators relying on the one-shot WARNING above.
+            obs = self._surfacing_engine.observability
+            if obs is not None:
+                obs.record_skip(tool, "progressive_mode_conflict")
             return text, None, None
         try:
             surfaced = await self._surfacing_engine.surface(
