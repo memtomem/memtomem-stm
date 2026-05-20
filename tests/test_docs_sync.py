@@ -298,12 +298,14 @@ def test_configuration_md_stage4_inert_note_pinned() -> None:
 
 def test_surfacing_md_documents_phase_1_observability_sample() -> None:
     """docs/surfacing.md's ``stm_surfacing_stats`` example must include
-    the Phase 1 ``Skip reasons`` / ``Outcomes`` / ``Cache`` sections.
+    the Phase 1 ``Healthy skips`` / ``Fault skips`` / ``Outcomes`` /
+    ``Cache`` sections.
 
     The header strings ship in ``server.py::_format_observability_sections``
-    (v0.1.19 / PR #256). If a future operator regenerates the sample
-    output and only captures the legacy event-counts block, readers
-    of `docs/surfacing.md` lose the only operator-facing surface that
+    (v0.1.19 / PR #256; the skip-reason healthy/fault split is #362,
+    v0.1.24). If a future operator regenerates the sample output and
+    only captures the legacy event-counts block, readers of
+    `docs/surfacing.md` lose the only operator-facing surface that
     explains *why* surfacing skipped, and the RFC's "no more
     DEBUG-log only skips" promise becomes invisible. Scope the
     assertion to the fenced code block immediately after the
@@ -315,7 +317,12 @@ def test_surfacing_md_documents_phase_1_observability_sample() -> None:
     # Pin the exact header literals server.py emits — if they ever
     # rename, the test fails loudly here rather than silently passing
     # against stale docs.
-    required_headers = ("Skip reasons", "Outcomes", "Cache (since process start)")
+    required_headers = (
+        "Healthy skips",
+        "Fault skips",
+        "Outcomes",
+        "Cache (since process start)",
+    )
     missing_in_source = [h for h in required_headers if h not in server_src]
     if missing_in_source:
         pytest.fail(

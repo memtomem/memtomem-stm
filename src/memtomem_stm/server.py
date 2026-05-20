@@ -19,7 +19,11 @@ from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
-from memtomem_stm.surfacing.observability import SurfacingObservability
+from memtomem_stm.surfacing.observability import (
+    FAULT_SKIP_REASONS,
+    HEALTHY_SKIP_REASONS,
+    SurfacingObservability,
+)
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 
@@ -891,13 +895,42 @@ def _ordered_tool_keys(per_tool: dict) -> list[str]:
     return keys
 
 
-def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
-    """Render the Skip reasons / Outcomes / Cache sections for stm_surfacing_stats.
+def _split_skip_reasons_by_category(
+    skip_reasons: dict[str, dict[str, int]],
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    """Partition per-tool skip-reason counts by healthy / fault category.
 
-    Returns a list of lines starting with a blank separator. When
-    ``tool_filter`` is set, per-tool dicts are restricted to that tool plus
-    the ``__total__`` aggregate so the operator can compare a single tool's
-    counters against the total without re-running the call.
+    Returns ``(healthy_view, fault_view)``. Tools with no reasons in a
+    given category are omitted from that view so empty per-tool sublists
+    don't render. Unclassified reasons are silently dropped on the
+    assumption that ``test_skip_reason_categorization_is_exhaustive``
+    catches missing classifications at CI time — a new ``SkipReason``
+    enum value without a category would otherwise vanish from the
+    rendered output instead of failing loudly. See observability.py
+    for the categorization rationale (#362).
+    """
+    healthy_view: dict[str, dict[str, int]] = {}
+    fault_view: dict[str, dict[str, int]] = {}
+    for tool_name, reasons in skip_reasons.items():
+        h = {r: c for r, c in reasons.items() if r in HEALTHY_SKIP_REASONS}
+        f = {r: c for r, c in reasons.items() if r in FAULT_SKIP_REASONS}
+        if h:
+            healthy_view[tool_name] = h
+        if f:
+            fault_view[tool_name] = f
+    return healthy_view, fault_view
+
+
+def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
+    """Render the skip-reason / outcome / cache sections for stm_surfacing_stats.
+
+    Skip reasons are split into two subsections — healthy (gate / threshold
+    / no-results) and fault (LTM / circuit) — so 1000 ``gate_cooldown`` and
+    1000 ``ltm_unavailable`` don't render identically (#362). Returns a list
+    of lines starting with a blank separator. When ``tool_filter`` is set,
+    per-tool dicts are restricted to that tool plus the ``__total__``
+    aggregate so the operator can compare a single tool's counters against
+    the total without re-running the call.
     """
     skip_reasons: dict[str, dict[str, int]] = snapshot["skip_reasons"]
     outcomes: dict[str, dict[str, int]] = snapshot["outcomes"]
@@ -911,12 +944,20 @@ def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -
 
     lines: list[str] = []
 
-    if skip_reasons:
-        lines.append("\nSkip reasons (since process start):")
-        for tool_name in _ordered_tool_keys(skip_reasons):
-            reasons = skip_reasons[tool_name]
-            if not reasons:
-                continue
+    healthy_skips, fault_skips = _split_skip_reasons_by_category(skip_reasons)
+
+    if healthy_skips:
+        lines.append("\nHealthy skips — gate / threshold / no-results (since process start):")
+        for tool_name in _ordered_tool_keys(healthy_skips):
+            reasons = healthy_skips[tool_name]
+            lines.append(f"  {tool_name}:")
+            for reason, count in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"    {reason}: {count}")
+
+    if fault_skips:
+        lines.append("\nFault skips — LTM / circuit (since process start):")
+        for tool_name in _ordered_tool_keys(fault_skips):
+            reasons = fault_skips[tool_name]
             lines.append(f"  {tool_name}:")
             for reason, count in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
                 lines.append(f"    {reason}: {count}")

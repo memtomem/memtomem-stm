@@ -59,6 +59,47 @@ SkipReason = Literal[
     "progressive_mode_conflict",
 ]
 
+# Operator-facing categorization for ``stm_surfacing_stats`` (#362, #351 part 2).
+# Healthy skips are expected gate/threshold/no-results outcomes that mean
+# surfacing intentionally declined to fire; fault skips are degraded LTM /
+# circuit-breaker states that indicate something is wrong. Without the split,
+# 1000 ``gate_cooldown`` and 1000 ``ltm_unavailable`` render identically and
+# operators can't tell at a glance whether the bypass count is healthy backoff
+# or LTM trouble.
+#
+# Every ``SkipReason`` member must appear in exactly one set —
+# ``test_skip_reason_categorization_is_exhaustive`` pins this so a new enum
+# value added without classification fails CI rather than silently dropping
+# out of the rendered output. ``ltm_parse_empty`` is classified fault because
+# #295 introduced it specifically to distinguish "core returned no text
+# content" from the healthy ``no_results_*`` family — it's the degraded shape,
+# not a normal empty result.
+HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        "disabled",
+        "response_too_short",
+        "no_query",
+        "gate_excluded_tool",
+        "gate_write_tool",
+        "gate_tool_disabled",
+        "gate_rate_limit",
+        "gate_cooldown",
+        "no_results_score",
+        "no_results_dedup",
+        "no_results_invalidated",
+        "no_results_empty_cache",
+        "progressive_mode_conflict",
+    }
+)
+FAULT_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        "circuit_open",
+        "ltm_unavailable",
+        "ltm_call_failed",
+        "ltm_parse_empty",
+    }
+)
+
 Outcome = Literal[
     "surfaced_cache_hit",
     "surfaced_cache_miss",
