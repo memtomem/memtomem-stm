@@ -3941,6 +3941,86 @@ class TestHealth:
         assert "ltm server: UNREACHABLE" in proc.stdout
         assert "timeout (1s)" in proc.stdout
 
+    def test_health_ltm_probe_shares_timeout_across_phases(
+        self, config, monkeypatch, tmp_path
+    ):
+        """A server that handshakes + lists tools fast but stalls on
+        ``mem_do(action="version")`` must not extend total probe time past
+        ``--timeout``. The probe shares one end-to-end budget across
+        initialize + list_tools + the optional version call; the version
+        call's stall is absorbed and ``connected`` stays true because
+        ``mem_search`` connectivity was already proven."""
+        import subprocess
+        import textwrap
+        import time
+
+        stall_version_server = tmp_path / "_stall_version_server.py"
+        stall_version_server.write_text(
+            textwrap.dedent(
+                """\
+                import asyncio
+                from mcp.server.fastmcp import FastMCP
+
+                mcp = FastMCP("stall-version")
+
+                @mcp.tool()
+                async def mem_search(query: str) -> str:
+                    return ""
+
+                @mcp.tool()
+                async def mem_do(action: str, params: dict | None = None) -> str:
+                    if action == "version":
+                        await asyncio.sleep(60)
+                    return "{}"
+
+                if __name__ == "__main__":
+                    mcp.run()
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(stall_version_server)]),
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "30")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        start = time.perf_counter()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--json",
+                "--timeout",
+                "1",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        elapsed = time.perf_counter() - start
+
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        data = json.loads(proc.stdout)
+        ltm = data["surfacing"]["ltm_server"]
+        # ``mem_search`` connectivity is proven before the version probe
+        # runs, so the version stall must not flip the verdict.
+        assert ltm["connected"] is True, ltm
+        # Version probe was budget-starved → silently dropped, not reported.
+        assert ltm["version"] is None, ltm
+        # Pre-fix this would have run ~30s (surfacing.timeout_seconds was the
+        # version probe's bound). Post-fix the shared budget caps it near
+        # the 1s ``--timeout``; ~5s gives plenty of room for subprocess
+        # spawn + Python startup on slow CI without being a no-op check.
+        assert elapsed < 5.0, f"shared-budget probe took {elapsed:.2f}s"
+
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
         at the wrong path gets a clear hint instead of a silent no-op

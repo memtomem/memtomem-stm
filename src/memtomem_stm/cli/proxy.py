@@ -2206,6 +2206,13 @@ async def _probe_ltm_mcp_command(
 ) -> dict[str, Any]:
     """Probe the configured LTM stdio MCP server without starting the proxy.
 
+    *timeout* is an **end-to-end** budget shared across initialize +
+    list_tools + the optional ``mem_do(action="version")`` probe — each
+    ``wait_for`` gets ``deadline - now`` so a stall in any phase can't push
+    the probe past the ``mms health --timeout`` ceiling. If the budget is
+    already exhausted when the version probe would run, it's skipped (the
+    version string is best-effort UX, not a correctness signal).
+
     Verifies that ``mem_search`` (the only tool the surfacing adapter strictly
     requires — see ``surfacing/mcp_client.py:423``) is advertised by the
     server before declaring ``connected``. A process that handshakes as MCP
@@ -2223,11 +2230,21 @@ async def _probe_ltm_mcp_command(
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
+    deadline = asyncio.get_running_loop().time() + timeout
+
+    def remaining() -> float:
+        # ``asyncio.wait_for`` treats <=0 as "fire immediately"; clamp to a
+        # tiny positive so we always raise ``TimeoutError`` rather than
+        # returning a bogus result on a zero-budget call.
+        return max(1e-3, deadline - asyncio.get_running_loop().time())
+
     params = StdioServerParameters(command=command, args=args)
     async with stdio_client(params, errlog=errlog) as streams:
         async with ClientSession(streams[0], streams[1]) as session:
-            await asyncio.wait_for(session.initialize(), timeout=timeout)
-            tools_result = await asyncio.wait_for(session.list_tools(), timeout=timeout)
+            await asyncio.wait_for(session.initialize(), timeout=remaining())
+            tools_result = await asyncio.wait_for(
+                session.list_tools(), timeout=remaining()
+            )
             tool_names = {t.name for t in tools_result.tools}
             if "mem_search" not in tool_names:
                 return {
@@ -2240,17 +2257,24 @@ async def _probe_ltm_mcp_command(
                     ),
                 }
             version: str | None = None
-            if "mem_do" in tool_names:
+            # ``mem_search`` connectivity is already proven — don't burn what
+            # remains of the budget on the optional version probe if it'd
+            # push us past the deadline. The threshold is small enough to
+            # let a typical sub-second ``mem_do`` round-trip through but
+            # large enough to avoid spawning a ``wait_for`` we know will
+            # immediately raise.
+            budget_left = deadline - asyncio.get_running_loop().time()
+            if "mem_do" in tool_names and budget_left > 0.05:
                 try:
                     result = await asyncio.wait_for(
                         session.call_tool("mem_do", {"action": "version"}),
-                        timeout=timeout,
+                        timeout=remaining(),
                     )
                     version = _version_from_tool_result(result)
                 except Exception:
                     logger.debug(
-                        "LTM mem_do(version) probe failed; treating as "
-                        "unsupported on this server.",
+                        "LTM mem_do(version) probe failed or timed out within "
+                        "the shared budget; treating as unsupported.",
                         exc_info=True,
                     )
             return {"connected": True, "version": version, "error": None}
