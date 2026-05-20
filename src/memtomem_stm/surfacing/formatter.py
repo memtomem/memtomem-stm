@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.feedback import VALID_RATINGS
 
 
 class SurfacingFormatter:
@@ -32,7 +33,31 @@ class SurfacingFormatter:
         if not results and not scratch_items:
             return response_text
 
-        lines = [self._config.section_header, ""]
+        # #350: surfacing_id + rating spec live above the bullet list so they
+        # survive ``effective_max_injection_chars`` truncation. The previous
+        # trailing ``_Surfacing ID: ...`` line was cut on the largest, most
+        # expensive surfacings — exactly the cases where feedback matters
+        # most. The rating values come from ``feedback.VALID_RATINGS`` (single
+        # source of truth) so the agent-visible enumeration cannot drift from
+        # the server-side validator.
+        lines: list[str] = [self._config.section_header]
+        if surfacing_id:
+            # The rendered callable must be copy-pasteable as a single valid
+            # call: ``rating="helpful" | "not_relevant" | "already_known"``
+            # parses as ``BinOp(BitOr)`` and the validator rejects the
+            # resulting non-string, so we keep one literal value in the
+            # argument and list the alternatives in prose outside the call.
+            # The example uses ``VALID_RATINGS[0]`` ("helpful") to pin the
+            # canonical-order contract.
+            options_list = " | ".join(f'"{r}"' for r in VALID_RATINGS)
+            example_rating = VALID_RATINGS[0]
+            lines.append(f"_surfacing_id: {surfacing_id}_")
+            lines.append(
+                f"> Rate (one of {options_list}): "
+                f"`stm_surfacing_feedback(surfacing_id={surfacing_id!r}, "
+                f"rating={example_rating!r})`"
+            )
+        lines.append("")
 
         for r in results:
             chunk = r.chunk
@@ -67,11 +92,6 @@ class SurfacingFormatter:
                 key = item.get("key", "")
                 value = str(item.get("value", ""))[:200].replace("\n", " ")
                 lines.append(f"- `{key}`: {value}")
-
-        if surfacing_id:
-            lines.append(
-                f"\n_Surfacing ID: {surfacing_id} — call `stm_surfacing_feedback` to rate_"
-            )
 
         memory_block = "\n".join(lines)
 

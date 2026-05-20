@@ -54,11 +54,11 @@ When memories are found, they're wrapped in `<surfaced-memories>` XML tags and i
 
 <surfaced-memories>
 ## Relevant Memories
+_surfacing_id: abc123def456_
+> Rate (one of "helpful" | "not_relevant" | "already_known"): `stm_surfacing_feedback(surfacing_id="abc123def456", rating="helpful")`
 
 - **auth_notes.md** [code-notes] (score=0.85): OAuth2 implementation uses PKCE flow...
 - **api_design.md** (score=0.72): Rate limiting is handled by middleware in...
-
-_Surfacing ID: abc123def456 — call `stm_surfacing_feedback` to rate_
 </surfaced-memories>
 ```
 

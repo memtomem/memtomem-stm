@@ -551,16 +551,16 @@ class TestCachedSurfacingFeedback:
 
             # Miss → populates cache
             out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-            assert "Surfacing ID:" in out1
+            assert "surfacing_id" in out1
 
             # Cache hit → new surfacing_id recorded
             out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-            assert "Surfacing ID:" in out2
+            assert "surfacing_id" in out2
 
             # Extract the surfacing_id from the second (cached) output
             import re
 
-            match = re.search(r"Surfacing ID: (\w+)", out2)
+            match = re.search(r"surfacing_id[:=]\s*\"?([a-f0-9]{16})", out2)
             assert match, "surfacing_id not found in cached output"
             cached_sid = match.group(1)
 
@@ -592,7 +592,7 @@ class TestCachedSurfacingFeedback:
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
 
         assert "mem content" in out
-        assert "Surfacing ID:" not in out
+        assert "surfacing_id" not in out
         assert "Failed to record surfacing event" in caplog.text
 
         # Cache hit path — same behavior
@@ -600,7 +600,7 @@ class TestCachedSurfacingFeedback:
         out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
 
         assert "mem content" in out2
-        assert "Surfacing ID:" not in out2
+        assert "surfacing_id" not in out2
         assert "Failed to record cached surfacing event" in caplog.text
 
     async def test_empty_scratch_list_omits_section(self):
@@ -914,7 +914,7 @@ class TestCacheInvalidationOnNegativeFeedback:
 
             import re
 
-            match = re.search(r"Surfacing ID: (\w+)", out1)
+            match = re.search(r"surfacing_id[:=]\s*\"?([a-f0-9]{16})", out1)
             assert match, "surfacing_id not found in first output"
             first_sid = match.group(1)
 
@@ -951,7 +951,7 @@ class TestCacheInvalidationOnNegativeFeedback:
             out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
             import re
 
-            match = re.search(r"Surfacing ID: (\w+)", out1)
+            match = re.search(r"surfacing_id[:=]\s*\"?([a-f0-9]{16})", out1)
             assert match
             first_sid = match.group(1)
 
