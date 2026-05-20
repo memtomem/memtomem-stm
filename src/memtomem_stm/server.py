@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -28,6 +29,15 @@ from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 
 logger = logging.getLogger(__name__)
+
+_HASHED_QUERY_PREVIEW_RE = re.compile(r"sha256:[0-9a-f]{16}")
+"""Exact shape of the opaque ID `FeedbackStore.get_stats` passes through
+verbatim for rows persisted under ``persist_query_text=False`` (#352
+part 3). Used by ``stm_surfacing_stats`` to decide whether to emit the
+hash-legend line. A raw query starting with ``sha256:`` (e.g. a
+user-typed checksum search) would be 80-char-clipped by the store but
+still carry the literal prefix; matching the full 23-char digest shape
+keeps the legend from misfiring on those rows."""
 
 
 @dataclass
@@ -857,6 +867,27 @@ async def stm_surfacing_stats(
 
         if stats["recent"]:
             lines.append("\nRecent:")
+            # #352 part 3: when ``persist_query_text=False`` was active for
+            # any of the recent rows, ``query_preview`` carries an opaque
+            # ``sha256:<16-hex>`` ID instead of the raw query text.
+            # Surface a one-line legend so operators reading the output
+            # don't mistake the digest for a malformed query. Data-driven
+            # so the legend also appears for rows persisted before the
+            # operator flipped the flag back to ``True``. The match is
+            # ``fullmatch`` against the exact 23-char shape — a raw query
+            # that starts with ``sha256:`` (e.g. a user-typed checksum
+            # search) would be 80-char-clipped by the store but still
+            # carry the literal prefix; prefix-only matching here would
+            # misfire the legend on that row.
+            if any(
+                isinstance(row.get("query_preview"), str)
+                and _HASHED_QUERY_PREVIEW_RE.fullmatch(row["query_preview"])
+                for row in stats["recent"]
+            ):
+                lines.append(
+                    "  (queries shown as sha256:<digest> for rows written "
+                    "under persist_query_text=false; #352 part 3)"
+                )
             for row in stats["recent"]:
                 ts_iso = datetime.fromtimestamp(row["ts"]).isoformat(timespec="seconds")
                 n_mem = len(row["memory_ids"])

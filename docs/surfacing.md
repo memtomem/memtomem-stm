@@ -85,6 +85,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
 | `query_retention_days` | `30` | Days to keep the raw extracted query text in `surfacing_events.query` before the opportunistic cleanup nulls it out; `0` to disable (column keeps whatever `record_surfacing` wrote, indefinitely). The event row itself is never deleted by this knob — only the column is cleared, so aggregate counts in `stm_surfacing_stats` are unaffected. |
+| `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text — this knob only governs what gets persisted to disk. `stm_surfacing_stats` renders the hash verbatim and prints a one-line legend so the substitution is visible. |
 | `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |

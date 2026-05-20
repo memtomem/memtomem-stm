@@ -94,6 +94,18 @@ class SurfacingConfig(BaseModel):
     so aggregate counts in ``stm_surfacing_stats`` are unaffected. Part 3
     of #352 (``persist_query_text=False`` opt-in hashing) is the
     write-side counterpart to this read-side retention sweep."""
+    persist_query_text: bool = True
+    """#352 part 3 — when ``True`` (default, backward-compatible),
+    ``FeedbackStore`` stores the verbatim extracted query in
+    ``surfacing_events.query``. When ``False``, the engine substitutes
+    ``"sha256:" + sha256(query)[:16]`` before handing the value to the
+    store, so the persisted column never contains user-derived text.
+    The hashed value still survives ``stm_surfacing_stats`` rendering
+    (``query_preview`` returns it verbatim) and the server formatter
+    emits a one-line legend explaining the substitution. Part 2's
+    ``query_retention_days`` is the read-side counterpart that ages
+    out raw text on a TTL for operators who keep the default and want
+    bounded retention rather than full opt-out."""
     consumer_model: str = ""
     result_format: Literal["compact", "structured"] = "compact"
     """Parser format for mem_search output. ``compact`` is the legacy

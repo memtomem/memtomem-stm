@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 _NEGATIVE_FEEDBACK_RATINGS = ("not_relevant", "already_known")
 
+_HASHED_QUERY_RE = re.compile(r"sha256:[0-9a-f]{16}")
+"""Exact shape of the opaque ID written under
+``SurfacingConfig.persist_query_text=False`` (#352 part 3): the literal
+prefix ``sha256:`` followed by 16 lowercase hex chars (23 chars total).
+Prefix-only matching would misclassify legitimate raw queries that
+happen to start with ``sha256:`` — e.g. a user-typed checksum search —
+and bypass the 80-char preview clip, leaking unbounded user-derived
+text. ``re.fullmatch`` against this pattern is the gate."""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS surfacing_events (
     id          TEXT    PRIMARY KEY,
@@ -437,15 +446,25 @@ class FeedbackStore:
                     scores = json.loads(scores_json)
                 except (json.JSONDecodeError, TypeError):
                     scores = []
-                # #352 part 2: ``query`` is now nullable. ``cleanup_expired_queries``
-                # clears the column on rows older than ``query_retention_days``
-                # while preserving the row itself for stats aggregates, so a
-                # SELECT can legitimately yield ``None`` here. ``len(None)``
-                # would crash ``stm_surfacing_stats`` once retention has actually
-                # swept anything — render a stable placeholder instead so
-                # operators see "this row exists but its query text expired".
+                # #352 part 2: ``query`` is now nullable.
+                # ``cleanup_expired_queries`` clears the column on rows
+                # older than ``query_retention_days`` while preserving
+                # the row itself for stats aggregates, so a SELECT can
+                # legitimately yield ``None`` here. ``len(None)`` would
+                # crash ``stm_surfacing_stats`` once retention has
+                # actually swept anything — render a stable placeholder.
+                # #352 part 3: only the exact ``sha256:<16-hex>`` shape
+                # written by the engine under ``persist_query_text=False``
+                # bypasses the 80-char clip. Prefix-only matching would
+                # misclassify legitimate raw queries that happen to
+                # start with ``sha256:`` (e.g. a user-typed checksum
+                # search) and leak unbounded text under the default
+                # config. Raw text — including any ``sha256:``-prefixed
+                # user query — keeps the legacy 80-char clip.
                 if query is None:
                     preview = "<expired>"
+                elif _HASHED_QUERY_RE.fullmatch(query):
+                    preview = query
                 else:
                     preview = query if len(query) <= 80 else query[:77] + "..."
                 recent.append(
