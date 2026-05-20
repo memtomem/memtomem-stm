@@ -818,13 +818,27 @@ async def stm_surfacing_stats(
                         ):
                             detail_parts.append("auto-tune ready")
                         else:
-                            # Cold-start gap is the smaller of the two — once
-                            # the global pool reaches min_samples, any tool
-                            # becomes eligible regardless of its own count.
-                            detail_parts.append(
-                                f"need {min_samples_required - readiness_total_fb} "
-                                "more for auto-tune"
-                            )
+                            # Both per-tool and global-pool gaps surface so
+                            # operators don't read the binding figure as their
+                            # own tool's shortfall (#361). The global gap is
+                            # always ≤ the per-tool gap (eligible_fb is a
+                            # subset of readiness_total_fb), so the global
+                            # number is the one the tuner is actually waiting
+                            # on; the per-tool number tells operators what
+                            # their tool itself would need without the
+                            # cold-start fallback. When a single tool owns
+                            # all the feedback the two gaps coincide, so the
+                            # legacy single-number label is preserved to
+                            # avoid redundant text.
+                            global_gap = min_samples_required - readiness_total_fb
+                            per_tool_gap = min_samples_required - eligible_fb
+                            if per_tool_gap > global_gap:
+                                detail_parts.append(
+                                    f"need {global_gap} more (global pool) "
+                                    f"or {per_tool_gap} more for this tool"
+                                )
+                            else:
+                                detail_parts.append(f"need {global_gap} more for auto-tune")
                 lines.append(f"  {tool_name}: {', '.join(detail_parts)}")
 
         if stats["rating_distribution"]:
