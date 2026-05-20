@@ -3814,7 +3814,16 @@ class TestHealth:
         assert "ltm server: UNREACHABLE" in result.output
         assert "__missing_ltm__ not on PATH" in result.output
 
-    def test_health_reports_connectable_ltm_server(self, runner, config, monkeypatch):
+    def test_health_reports_connectable_ltm_server(self, config, monkeypatch):
+        """Probe a live MCP child via real subprocess.
+
+        Cannot use ``CliRunner`` here: Click's runner replaces ``sys.stderr``
+        with a buffer that has no ``fileno()``, and the MCP stdio client
+        forwards that stderr to ``asyncio.create_subprocess_exec`` which needs
+        a real file descriptor. Mirrors ``TestAddValidate``'s success-path
+        test, which hit the same constraint."""
+        import subprocess
+
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
         monkeypatch.setenv(
             "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
@@ -3822,11 +3831,22 @@ class TestHealth:
         )
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
 
-        result = runner.invoke(cli, ["health", *_cfg_args(config)])
-
-        assert result.exit_code == 0
-        assert "ltm server: connectable" in result.output
-        assert "version 0.3.0-fake" in result.output
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "ltm server: connectable" in proc.stdout
+        assert "version 0.3.0-fake" in proc.stdout
 
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
