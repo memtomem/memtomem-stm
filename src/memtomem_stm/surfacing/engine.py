@@ -592,7 +592,8 @@ class SurfacingEngine:
                 del self._surfaced_ids[k]
 
         self._gate.record_surfacing(query)
-        logger.info(
+        logger.info("Surfacing %d memories for %s/%s", len(relevant), server, tool)
+        logger.debug(
             "Surfacing %d memories for %s/%s (query=%s)", len(relevant), server, tool, query[:50]
         )
 

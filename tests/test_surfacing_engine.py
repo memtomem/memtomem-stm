@@ -1859,3 +1859,43 @@ class TestSurfacingLtmOutcomeDispatch:
             await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         warnings = [r for r in caplog.records if "is not reachable" in r.message]
         assert warnings == []
+
+
+class TestSurfacingQueryPrivacyAtInfo:
+    """Issue #352 part 1 — the surfacing hot path must not emit user-derived
+    query text at INFO. The extracted query routinely contains internal file
+    paths, partial commit messages, or ticket first-sentences; operators who
+    need it for tracing can flip the engine logger to DEBUG."""
+
+    async def test_happy_path_info_log_omits_query_preview(self, caplog):
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
+        )
+        with caplog.at_level("INFO", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # `VALID_ARGS["_context_query"]` is 'Flask web framework architecture',
+        # well under 50 chars so it would fully fit in any historical
+        # `query[:50]` slice. Assert no INFO record leaks it.
+        query = VALID_ARGS["_context_query"]
+        info_records = [r for r in caplog.records if r.levelname == "INFO"]
+        assert info_records, "expected at least one INFO record for the surfacing path"
+        assert not any(query in r.getMessage() for r in info_records)
+
+    async def test_query_preview_still_available_at_debug(self, caplog):
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
+        )
+        with caplog.at_level("DEBUG", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        query = VALID_ARGS["_context_query"]
+        debug_with_query = [
+            r
+            for r in caplog.records
+            if r.levelname == "DEBUG" and query in r.getMessage() and "Surfacing" in r.getMessage()
+        ]
+        assert debug_with_query, (
+            "operators flipping the surfacing logger to DEBUG must still see the "
+            "query preview for tracing — only the default INFO level is sanitized"
+        )
