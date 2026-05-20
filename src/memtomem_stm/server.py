@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
@@ -647,8 +648,9 @@ def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:
 @mcp.tool()
 async def stm_surfacing_feedback(
     surfacing_id: str,
-    rating: str,
+    rating: str | None = None,
     memory_id: str | None = None,
+    ratings: list[dict] | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
     """Provide feedback on proactively surfaced memories.
@@ -657,20 +659,84 @@ async def stm_surfacing_feedback(
 
     Args:
         surfacing_id: The surfacing ID shown in the memory section.
-        rating: One of 'helpful', 'not_relevant', 'already_known'.
-        memory_id: Optional specific memory chunk ID to rate.
+        rating: One of 'helpful', 'not_relevant', 'already_known' (legacy
+            single-rating path).
+        memory_id: Optional specific memory chunk ID for the legacy path.
+        ratings: Batched per-memory ratings — a list of objects shaped
+            ``{"memory_id": str, "rating": str}`` (additional keys are
+            ignored). Mutually exclusive with the legacy ``rating`` /
+            ``memory_id`` fields. The engine fan-outs internally to the
+            same record / invalidation / boost routines as the
+            single-call path; a ``helpful`` boost across multiple
+            entries collapses to one ``increment_access`` call per
+            surfacing event.
     """
+    legacy_set = rating is not None or memory_id is not None
+    batched_set = ratings is not None
+    if legacy_set and batched_set:
+        return (
+            "Error: cannot mix legacy (`rating`/`memory_id`) and batched (`ratings`) "
+            "feedback fields in one call — pick one shape."
+        )
+    if not legacy_set and not batched_set:
+        return "Error: either `rating` or `ratings` is required."
+
     app = _get_ctx(ctx)
     with traced(
         "stm_surfacing_feedback",
-        metadata={"surfacing_id": surfacing_id, "rating": rating, "memory_id": memory_id},
+        metadata={
+            "surfacing_id": surfacing_id,
+            "rating": rating,
+            "memory_id": memory_id,
+            "ratings_count": len(ratings) if ratings is not None else None,
+        },
     ):
         # Route through SurfacingEngine to trigger access boost for helpful feedback
         if app.surfacing_engine is not None:
+            if ratings is not None:
+                return await app.surfacing_engine.handle_feedback_batch(surfacing_id, ratings)
             return await app.surfacing_engine.handle_feedback(surfacing_id, rating, memory_id)
         if app.feedback_tracker is None:
             return "Feedback tracking is not enabled."
+        if ratings is not None:
+            return _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
         return app.feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+
+
+def _record_batched_via_tracker(
+    tracker: Any,
+    surfacing_id: str,
+    ratings: list[dict],
+) -> str:
+    """Fallback fan-out when the engine is unavailable but the tracker is.
+
+    Mirrors :meth:`SurfacingEngine.handle_feedback_batch` minus the cache
+    invalidation and access-boost side effects (the engine owns those).
+    Used by the proxy-disabled / engine-absent path so the batched MCP
+    surface still records rows for operators running in tracker-only mode.
+    """
+    if not ratings:
+        return "Error: `ratings` must contain at least one entry."
+    recorded = 0
+    errors: list[str] = []
+    for i, entry in enumerate(ratings):
+        if not isinstance(entry, dict):
+            return f"Error: ratings[{i}] must be an object."
+        mid = entry.get("memory_id")
+        rat = entry.get("rating")
+        if not isinstance(mid, str) or not mid:
+            return f"Error: ratings[{i}] missing string `memory_id`."
+        if not isinstance(rat, str):
+            return f"Error: ratings[{i}] missing string `rating`."
+        result = tracker.record_feedback(surfacing_id, rat, mid)
+        if isinstance(result, str) and result.startswith("Error"):
+            errors.append(f"ratings[{i}]: {result}")
+        else:
+            recorded += 1
+    summary = f"Feedback recorded: {recorded}/{len(ratings)} entries"
+    if errors:
+        summary += " — " + "; ".join(errors)
+    return summary
 
 
 # ---------------------------------------------------------------------------
