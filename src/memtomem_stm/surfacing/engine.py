@@ -112,6 +112,12 @@ class SurfacingEngine:
         # Opportunistic cleanup: run cleanup_expired at most once per hour
         self._cleanup_interval = 3600.0
         self._last_cleanup: float = time.monotonic()
+        # #349: one-shot WARNING when the LTM adapter reports
+        # ``no_session`` / ``transport_error`` for the first time. The
+        # ``ltm_unavailable`` skip counter is the durable signal, but
+        # operators easily miss a counter — symmetric to the #348
+        # prepend-on-progressive WARNING-once pattern.
+        self._warned_ltm_unavailable: bool = False
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -509,6 +515,16 @@ class SurfacingEngine:
         # tuning min_score keep seeing the same signal for the genuine
         # empty-namespace case.
         if outcome in ("no_session", "transport_error"):
+            if not self._warned_ltm_unavailable:
+                logger.warning(
+                    "Surfacing skipped: LTM MCP command %r is not reachable "
+                    "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
+                    "in stm_surfacing_stats. Run `mms health` to diagnose or "
+                    "set `surfacing.enabled=false` to silence.",
+                    self._config.ltm_mcp_command,
+                    outcome,
+                )
+                self._warned_ltm_unavailable = True
             self._observability.record_skip(tool, "ltm_unavailable")
             return response_text
         if outcome == "call_error":

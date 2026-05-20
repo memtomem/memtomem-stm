@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import pytest
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -1806,3 +1807,55 @@ class TestSurfacingLtmOutcomeDispatch:
         # Two LTM attempts, two ``ltm_unavailable`` skips, no cache hits.
         assert snap["skip_reasons"]["read_file"] == {"ltm_unavailable": 2}
         assert snap["cache"].get("hit", 0) == 0
+
+    @pytest.mark.parametrize("outcome", ["no_session", "transport_error"])
+    async def test_first_ltm_unavailable_logs_warning_once(self, outcome, caplog):
+        """#349: the operator-visible signal for "LTM unreachable" was
+        previously only a counter in ``stm_surfacing_stats`` that operators
+        had to know to read. The first ``no_session`` / ``transport_error``
+        outcome now logs a single WARNING naming the configured
+        ``ltm_mcp_command`` so the operator can grep their logs and so
+        ``mms health`` becomes a discoverable next step. Subsequent skips
+        increment the counter only — the WARNING must not repeat per call,
+        matching the prepend-on-progressive WARNING-once pattern (#348).
+
+        Parametrized across both outcomes that map to ``ltm_unavailable``:
+        a single-outcome test would silently pass if the engine condition
+        were narrowed to ``if outcome == "no_session"`` only — the
+        ``transport_error`` branch would lose its warning with no
+        regression signal."""
+        engine, obs = self._engine(outcome=outcome)
+        args = {"_context_query": "ltm unreachable warning probe"}
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", args, LONG_RESPONSE)
+            await engine.surface("s", "read_file", args, LONG_RESPONSE)
+            await engine.surface("s", "another_tool", args, LONG_RESPONSE)
+
+        warnings = [
+            r
+            for r in caplog.records
+            if "is not reachable" in r.message and r.levelname == "WARNING"
+        ]
+        assert len(warnings) == 1, (
+            f"ltm-unavailable WARNING must fire exactly once across N skips, got {len(warnings)}"
+        )
+        # The WARNING must name the configured command so operators can map
+        # the log line back to the misconfigured path.
+        assert "memtomem-server" in warnings[0].message
+        # All three calls still record the skip — the WARNING is in addition
+        # to, not in place of, the counter signal.
+        snap = obs.snapshot()
+        assert snap["skip_reasons"]["read_file"]["ltm_unavailable"] == 2
+        assert snap["skip_reasons"]["another_tool"]["ltm_unavailable"] == 1
+
+    async def test_call_error_outcome_does_not_log_unavailable_warning(self, caplog):
+        """The WARNING is scoped to the no-session / transport-error bucket
+        (LTM not reachable). A mid-call ``call_error`` means the session
+        opened fine and the operator's diagnostic path is different — that
+        skip stays counter-only."""
+        engine, _ = self._engine(outcome="call_error")
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        warnings = [r for r in caplog.records if "is not reachable" in r.message]
+        assert warnings == []
