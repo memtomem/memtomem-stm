@@ -294,16 +294,22 @@ By rating:
 
 Helpfulness: 73.7%
 
-Skip reasons (since process start):
+Healthy skips — gate / threshold / no-results (since process start):
   __total__:
     response_too_short: 142
-    gate_cooldown: 18
     gate_write_tool: 89
+    gate_cooldown: 18
   read_file:
     response_too_short: 142
     gate_cooldown: 18
   write_file:
     gate_write_tool: 89
+
+Fault skips — LTM / circuit (since process start):
+  __total__:
+    ltm_unavailable: 2
+  read_file:
+    ltm_unavailable: 2
 
 Outcomes (since process start):
   __total__:
@@ -317,12 +323,17 @@ Cache (since process start): hits 9, misses 14, hit ratio 39.1%
 ```
 
 The first block (totals + ratings + helpfulness) is read from
-`stm_feedback.db` and persists across restarts. The lower three
-sections — `Skip reasons`, `Outcomes`, `Cache` — are in-memory
-counters from `SurfacingObservability` and reset whenever the
-proxy process restarts. They are suppressed entirely when the
-proxy has not yet attempted any surfacing call, so the legacy
-output stays byte-for-byte for zero-traffic deployments.
+`stm_feedback.db` and persists across restarts. The lower
+sections — `Healthy skips`, `Fault skips`, `Outcomes`, `Cache` —
+are in-memory counters from `SurfacingObservability` and reset
+whenever the proxy process restarts. They are suppressed
+entirely when the proxy has not yet attempted any surfacing
+call, so the legacy output stays byte-for-byte for zero-traffic
+deployments. Skip reasons are partitioned by category so 1000
+`gate_cooldown` and 1000 `ltm_unavailable` don't render
+identically — healthy skips (gate / threshold / no-results) are
+expected backoffs while fault skips (LTM / circuit) indicate
+something is wrong with the upstream.
 
 Each `surface()` call records exactly one skip reason **or** one
 outcome (no double-counting). Cache hit/miss is incremented on
