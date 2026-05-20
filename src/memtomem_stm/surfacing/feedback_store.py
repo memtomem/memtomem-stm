@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS surfacing_events (
     id          TEXT    PRIMARY KEY,
     server      TEXT    NOT NULL,
     tool        TEXT    NOT NULL,
-    query       TEXT    NOT NULL,
+    query       TEXT,
     memory_ids  TEXT    NOT NULL,
     scores      TEXT    NOT NULL,
     created_at  REAL    NOT NULL
@@ -56,6 +56,54 @@ CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 _REQUIRED_TABLES = tuple(
     re.findall(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", _SCHEMA)
 )
+
+
+def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
+    """Migrate the legacy NOT NULL constraint off ``surfacing_events.query``.
+
+    Pre-#352 schemas declared ``query TEXT NOT NULL`` because the column
+    was assumed to be load-bearing for stats. The #352-part-2 retention
+    workflow needs to clear the column on rows older than the retention
+    window while keeping the row itself for aggregate counts — UPDATE-to-
+    NULL is rejected by the legacy NOT NULL, so the constraint has to
+    come off on existing DBs too. SQLite ``ALTER TABLE`` cannot relax a
+    column-level constraint in place; the standard recipe is to recreate
+    the table without it and copy rows over.
+
+    No-op when ``surfacing_events.query`` is already nullable (fresh DBs
+    created from the current ``_SCHEMA`` definition).
+    """
+    row = db.execute(
+        "SELECT \"notnull\" FROM pragma_table_info('surfacing_events') WHERE name = 'query'"
+    ).fetchone()
+    if row is None or row[0] == 0:
+        # column missing (fresh CREATE just ran with the relaxed schema, or
+        # the table genuinely doesn't have a `query` column on some future
+        # variant) — nothing to migrate.
+        return
+    db.executescript(
+        """
+        BEGIN IMMEDIATE;
+        CREATE TABLE surfacing_events__migrate_352 (
+            id          TEXT    PRIMARY KEY,
+            server      TEXT    NOT NULL,
+            tool        TEXT    NOT NULL,
+            query       TEXT,
+            memory_ids  TEXT    NOT NULL,
+            scores      TEXT    NOT NULL,
+            created_at  REAL    NOT NULL
+        );
+        INSERT INTO surfacing_events__migrate_352
+            (id, server, tool, query, memory_ids, scores, created_at)
+        SELECT id, server, tool, query, memory_ids, scores, created_at
+        FROM surfacing_events;
+        DROP TABLE surfacing_events;
+        ALTER TABLE surfacing_events__migrate_352 RENAME TO surfacing_events;
+        CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
+        COMMIT;
+        """
+    )
+    logger.info("Migrated surfacing_events: relaxed NOT NULL on query column (#352 part 2)")
 
 
 def inspect_feedback_db(db_path: Path) -> dict[str, object]:
@@ -114,6 +162,7 @@ class FeedbackStore:
         try:
             tune_connection(db)
             db.executescript(_SCHEMA)
+            _relax_surfacing_events_query_notnull(db)
         except Exception:
             db.close()
             raise
@@ -388,7 +437,17 @@ class FeedbackStore:
                     scores = json.loads(scores_json)
                 except (json.JSONDecodeError, TypeError):
                     scores = []
-                preview = query if len(query) <= 80 else query[:77] + "..."
+                # #352 part 2: ``query`` is now nullable. ``cleanup_expired_queries``
+                # clears the column on rows older than ``query_retention_days``
+                # while preserving the row itself for stats aggregates, so a
+                # SELECT can legitimately yield ``None`` here. ``len(None)``
+                # would crash ``stm_surfacing_stats`` once retention has actually
+                # swept anything — render a stable placeholder instead so
+                # operators see "this row exists but its query text expired".
+                if query is None:
+                    preview = "<expired>"
+                else:
+                    preview = query if len(query) <= 80 else query[:77] + "..."
                 recent.append(
                     {
                         "ts": ts,
@@ -445,6 +504,25 @@ class FeedbackStore:
         cutoff = time.time() - ttl_seconds
         with self._lock:
             cursor = self._db.execute("DELETE FROM seen_memories WHERE last_seen_at < ?", (cutoff,))
+            self._db.commit()
+            return cursor.rowcount
+
+    def cleanup_expired_queries(self, retention_seconds: float) -> int:
+        """Null out ``surfacing_events.query`` on rows older than the
+        retention window. The row itself is preserved so aggregate counts
+        in ``stm_surfacing_stats`` stay accurate; only the user-derived
+        query text is cleared. Returns the number of rows actually
+        updated (``query IS NOT NULL`` before the sweep). Issue #352
+        part 2."""
+        if self._db is None or retention_seconds <= 0:
+            return 0
+        cutoff = time.time() - retention_seconds
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE surfacing_events SET query = NULL "
+                "WHERE created_at < ? AND query IS NOT NULL",
+                (cutoff,),
+            )
             self._db.commit()
             return cursor.rowcount
 

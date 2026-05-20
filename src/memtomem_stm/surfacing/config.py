@@ -85,6 +85,15 @@ class SurfacingConfig(BaseModel):
     """Max chars rendered per result preview in the injected memory block."""
     dedup_ttl_seconds: float = Field(default=604800.0, ge=0.0)
     """7 days default; 0 disables cross-session dedup."""
+    query_retention_days: int = Field(default=30, ge=0)
+    """#352 part 2 — days to keep the raw extracted query string in
+    ``surfacing_events.query`` before the opportunistic cleanup nulls it.
+    ``0`` disables retention-driven null-out (the column keeps whatever
+    ``record_surfacing`` wrote, indefinitely). The event row itself is
+    never deleted by this knob — only the ``query`` column is cleared,
+    so aggregate counts in ``stm_surfacing_stats`` are unaffected. Part 3
+    of #352 (``persist_query_text=False`` opt-in hashing) is the
+    write-side counterpart to this read-side retention sweep."""
     consumer_model: str = ""
     result_format: Literal["compact", "structured"] = "compact"
     """Parser format for mem_search output. ``compact`` is the legacy

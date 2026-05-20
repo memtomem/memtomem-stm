@@ -84,6 +84,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `write_tool_patterns` | `*write*`, `*create*`, `*delete*`, `*push*`, `*send*`, `*remove*` | Auto-skip write/mutation operations |
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
+| `query_retention_days` | `30` | Days to keep the raw extracted query text in `surfacing_events.query` before the opportunistic cleanup nulls it out; `0` to disable (column keeps whatever `record_surfacing` wrote, indefinitely). The event row itself is never deleted by this knob — only the column is cleared, so aggregate counts in `stm_surfacing_stats` are unaffected. |
 | `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
@@ -207,6 +208,12 @@ Surfacing tracks which memory IDs have already been shown so the same content do
 The in-memory set is **seeded from `seen_memories`** on startup so dedup survives restarts within the TTL, and every new surfacing writes to both layers via `FeedbackStore.mark_surfaced(ids)`.
 
 > **Why did an old memory re-surface?** Two common causes: (1) the 10k FIFO cap evicted the ID during a long session, so the in-memory layer no longer remembers it; (2) `dedup_ttl_seconds` elapsed, so the persistent row was ignored. Lower the TTL or raise it as needed — setting `dedup_ttl_seconds=0` disables cross-session dedup entirely.
+
+### Query text lifecycle in `stm_feedback.db`
+
+Every successful surfacing call writes one `surfacing_events` row containing the verbatim extracted query — typically file paths, the first sentence of a description argument, or an explicit `_context_query` from the agent. The text is kept so `stm_surfacing_stats` can render the most recent queries when an operator investigates skip-reason imbalances, and so per-tool query previews remain available for triage.
+
+To keep the per-user DB from accumulating raw query text indefinitely, the opportunistic cleanup loop (one pass per hour from `SurfacingEngine.surface()`) clears the `query` column on rows older than `query_retention_days` (default `30`). The row itself is preserved so `SELECT COUNT(*)` aggregates in `stm_surfacing_stats` stay accurate; only the user-derived text is dropped. Set `query_retention_days=0` to disable the sweep entirely, or lower it for tighter retention. The DB path is `~/.memtomem/stm_feedback.db` by default; you can also delete the file manually to clear all history.
 
 ## Feedback & Auto-Tuning
 

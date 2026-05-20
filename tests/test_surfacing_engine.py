@@ -57,6 +57,10 @@ def _make_config(**overrides) -> SurfacingConfig:
         "include_session_context": False,
         "fire_webhook": False,
         "cache_ttl_seconds": 60.0,
+        # #352 part 2: default off in tests so the cleanup loop's new
+        # retention branch only fires when a test opts in. Production
+        # default is 30 days (set in SurfacingConfig).
+        "query_retention_days": 0,
     }
     defaults.update(overrides)
     return SurfacingConfig(**defaults)
@@ -1101,6 +1105,7 @@ class TestMaybeCleanupExpired:
         tracker.store.get_seen_ids = MagicMock(return_value=set())
         tracker.store.mark_surfaced = MagicMock()
         tracker.store.cleanup_expired = MagicMock(return_value=0)
+        tracker.store.cleanup_expired_queries = MagicMock(return_value=0)
         tracker.store.record_surfacing_event = MagicMock()
         return tracker
 
@@ -1197,6 +1202,74 @@ class TestMaybeCleanupExpired:
         # Should not crash — cleanup error is swallowed
         assert "mem" in output
         tracker.store.cleanup_expired.assert_called_once()
+
+    # ── #352 part 2: query retention branch ────────────────────────────
+
+    async def test_query_retention_runs_when_enabled(self):
+        """``query_retention_days > 0`` triggers ``cleanup_expired_queries``
+        with the configured window in seconds."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600, query_retention_days=30),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store.cleanup_expired_queries.assert_called_once_with(30 * 86400.0)
+
+    async def test_query_retention_skipped_when_zero(self):
+        """``query_retention_days=0`` disables the retention branch even
+        when dedup cleanup is on — operators who want indefinite query
+        retention keep the column populated."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600, query_retention_days=0),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store.cleanup_expired_queries.assert_not_called()
+
+    async def test_retention_runs_even_when_dedup_disabled(self):
+        """Retention is independent of dedup — ``dedup_ttl_seconds=0`` must
+        not suppress query-column nulling. The old guard short-circuited
+        on ``dedup_ttl_seconds <= 0`` and would have skipped retention
+        entirely; this test pins the independent-sub-tasks contract."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, query_retention_days=7),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store.cleanup_expired.assert_not_called()
+        tracker.store.cleanup_expired_queries.assert_called_once_with(7 * 86400.0)
+
+    async def test_retention_exception_is_swallowed(self):
+        """A misbehaving ``cleanup_expired_queries`` must not break
+        surface() — symmetric to the dedup-cleanup exception path."""
+        tracker = self._make_tracker()
+        tracker.store.cleanup_expired_queries = MagicMock(side_effect=RuntimeError("locked"))
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, query_retention_days=7),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "mem" in out
+        tracker.store.cleanup_expired_queries.assert_called_once()
 
 
 class TestSurfacingEngineStop:
