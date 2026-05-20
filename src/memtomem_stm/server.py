@@ -659,8 +659,11 @@ async def stm_surfacing_feedback(
 
     Args:
         surfacing_id: The surfacing ID shown in the memory section.
-        rating: One of 'helpful', 'not_relevant', 'already_known' (legacy
-            single-rating path).
+        rating: One of 'helpful', 'partially_helpful', 'not_relevant',
+            'already_known' (legacy single-rating path).
+            ``partially_helpful`` is neutral — useful context but not
+            directly used; it counts toward the auto-tune denominator
+            but contributes to neither the raise nor the lower band.
         memory_id: Optional specific memory chunk ID for the legacy path.
         ratings: Batched per-memory ratings — a list of objects shaped
             ``{"memory_id": str, "rating": str}`` (additional keys are

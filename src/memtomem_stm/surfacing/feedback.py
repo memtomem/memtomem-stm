@@ -10,10 +10,19 @@ from memtomem_stm.surfacing.feedback_store import FeedbackStore, inspect_feedbac
 
 logger = logging.getLogger(__name__)
 
-# Canonical UX order: positive → negative → "I already had this". The
-# formatter renders these in the same order in the agent-facing rating
-# spec, so the validator and the agent-visible hint cannot drift (#350).
-VALID_RATINGS: tuple[str, ...] = ("helpful", "not_relevant", "already_known")
+# Canonical UX order: strong positive → weak positive → negative →
+# "I already had this". The formatter renders these in the same order
+# in the agent-facing rating spec, so the validator and the agent-visible
+# hint cannot drift (#350). ``partially_helpful`` (#353 part 2) sits
+# between ``helpful`` and the two negatives so the hint reads as a
+# strength gradient — agents pick the closest band rather than
+# defaulting to ``helpful`` when the memory only gave context.
+VALID_RATINGS: tuple[str, ...] = (
+    "helpful",
+    "partially_helpful",
+    "not_relevant",
+    "already_known",
+)
 
 
 class FeedbackTracker:
@@ -100,34 +109,46 @@ class AutoTuner:
         self._adjustments: dict[str, float] = dict(store.load_adjustments())
 
     def maybe_adjust(self, tool: str) -> float | None:
-        """Check negative feedback ratio and adjust min_score for a tool.
+        """Check feedback ratios and adjust min_score for a tool.
 
-        When the tool has insufficient samples, falls back to the global
-        ratio across all tools (cold-start mitigation).
+        Two independent band checks (#353 part 2):
+        - ``negative_ratio > 0.6`` (``not_relevant`` + ``already_known``)
+          → raise threshold so noisy memories stop surfacing.
+        - ``helpful_ratio > 0.8`` (strict ``helpful``, **not**
+          ``partially_helpful``) → lower threshold to surface more.
 
-        Returns new min_score if adjusted, None otherwise.
+        Pre-#353 the lower branch checked ``negative_ratio < 0.2`` — that
+        was equivalent in a three-value world but inverted under
+        ``partially_helpful``, where a tool whose feedback was "useful
+        context but not directly used" would drive ``min_score`` down
+        the same way as repeated ``helpful``. Splitting the branches lets
+        ``partially_helpful`` count strictly toward the denominator
+        (neutral) without contributing to either direction.
+
+        Each tool falls back to the global ratio when its own sample
+        count is below ``auto_tune_min_samples`` (cold-start mitigation).
+        Returns the new min_score if adjusted, ``None`` otherwise.
         """
         if not self._config.auto_tune_enabled:
             return None
 
-        ratio = self._store.get_tool_negative_ratio(
-            tool,
-            min_samples=self._config.auto_tune_min_samples,
-        )
-        if ratio is None:
-            # Cold start: use global ratio as fallback
-            ratio = self._store.get_tool_negative_ratio(
-                None,  # None = all tools
-                min_samples=self._config.auto_tune_min_samples,
-            )
-            if ratio is None:
-                return None
+        min_samples = self._config.auto_tune_min_samples
+        neg_ratio = self._store.get_tool_negative_ratio(tool, min_samples=min_samples)
+        if neg_ratio is None:
+            neg_ratio = self._store.get_tool_negative_ratio(None, min_samples=min_samples)
+        helpful_ratio = self._store.get_tool_helpful_ratio(tool, min_samples=min_samples)
+        if helpful_ratio is None:
+            helpful_ratio = self._store.get_tool_helpful_ratio(None, min_samples=min_samples)
+
+        if neg_ratio is None and helpful_ratio is None:
+            return None
 
         current = self._adjustments.get(tool, self._config.min_score)
         increment = self._config.auto_tune_score_increment
 
-        if ratio > 0.6:
-            # Too much negative feedback -> raise threshold.
+        # Raise wins over lower when both fire — defensive: negative
+        # feedback is the stronger signal to suppress.
+        if neg_ratio is not None and neg_ratio > 0.6:
             new_score = min(current + increment, 0.05)
             if new_score != current:
                 self._adjustments[tool] = new_score
@@ -137,21 +158,20 @@ class AutoTuner:
                     tool,
                     current,
                     new_score,
-                    ratio * 100,
+                    neg_ratio * 100,
                 )
                 return new_score
-        elif ratio < 0.2:
-            # Mostly helpful feedback -> lower threshold (surface more).
+        elif helpful_ratio is not None and helpful_ratio > 0.8:
             new_score = max(current - increment, 0.005)
             if new_score != current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
                 logger.info(
-                    "AutoTune: %s min_score %.2f → %.2f (negative ratio: %.0f%%)",
+                    "AutoTune: %s min_score %.2f → %.2f (helpful ratio: %.0f%%)",
                     tool,
                     current,
                     new_score,
-                    ratio * 100,
+                    helpful_ratio * 100,
                 )
                 return new_score
 
