@@ -15,7 +15,7 @@ import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import click
 
@@ -2202,23 +2202,57 @@ async def _probe_ltm_mcp_command(
     command: str,
     args: list[str],
     timeout: float,
+    errlog: TextIO,
 ) -> dict[str, Any]:
-    """Probe the configured LTM stdio MCP server without starting the proxy."""
+    """Probe the configured LTM stdio MCP server without starting the proxy.
+
+    Verifies that ``mem_search`` (the only tool the surfacing adapter strictly
+    requires — see ``surfacing/mcp_client.py:423``) is advertised by the
+    server before declaring ``connected``. A process that handshakes as MCP
+    but doesn't expose ``mem_search`` would later silently fail every
+    surfacing call; flagging it here is the diagnostic operators want from
+    ``mms health``. The ``mem_do(action="version")`` probe stays best-effort
+    and only runs when ``mem_do`` is advertised — older servers that don't
+    recognize ``action=version`` should not poison the result.
+
+    Child stderr is routed to *errlog* so server banner / log lines don't
+    bleed into the ``mms health`` text/JSON output (caller passes an
+    fd-backed sink — ``stdio_client`` forwards this to
+    ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
+    """
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
-    async with stdio_client(StdioServerParameters(command=command, args=args)) as streams:
+    params = StdioServerParameters(command=command, args=args)
+    async with stdio_client(params, errlog=errlog) as streams:
         async with ClientSession(streams[0], streams[1]) as session:
             await asyncio.wait_for(session.initialize(), timeout=timeout)
+            tools_result = await asyncio.wait_for(session.list_tools(), timeout=timeout)
+            tool_names = {t.name for t in tools_result.tools}
+            if "mem_search" not in tool_names:
+                return {
+                    "connected": False,
+                    "version": None,
+                    "error": (
+                        "server initialized but does not expose 'mem_search' "
+                        "(surfacing adapter calls this tool — config likely "
+                        "points at a non-memtomem MCP server)"
+                    ),
+                }
             version: str | None = None
-            try:
-                result = await asyncio.wait_for(
-                    session.call_tool("mem_do", {"action": "version"}),
-                    timeout=timeout,
-                )
-                version = _version_from_tool_result(result)
-            except Exception:
-                logger.debug("LTM version probe failed", exc_info=True)
+            if "mem_do" in tool_names:
+                try:
+                    result = await asyncio.wait_for(
+                        session.call_tool("mem_do", {"action": "version"}),
+                        timeout=timeout,
+                    )
+                    version = _version_from_tool_result(result)
+                except Exception:
+                    logger.debug(
+                        "LTM mem_do(version) probe failed; treating as "
+                        "unsupported on this server.",
+                        exc_info=True,
+                    )
             return {"connected": True, "version": version, "error": None}
 
 
@@ -2249,7 +2283,13 @@ def _ltm_mcp_status(surfacing: Any) -> dict[str, Any]:
 
     timeout = max(0.1, float(getattr(surfacing, "timeout_seconds", 3.0) or 3.0))
     try:
-        probe = asyncio.run(_probe_ltm_mcp_command(command, args, timeout))
+        # ``stdio_client`` forwards *errlog* directly to
+        # ``asyncio.create_subprocess_exec(stderr=...)``, which requires a real
+        # file descriptor — ``io.StringIO`` lacks ``fileno`` and would crash
+        # here. ``os.devnull`` gives us a fd-backed sink so server banners
+        # and MCP-SDK stderr can't bleed into ``mms health`` output.
+        with open(os.devnull, "w") as errnull, _silenced_mcp_sdk_logs():
+            probe = asyncio.run(_probe_ltm_mcp_command(command, args, timeout, errnull))
     except asyncio.TimeoutError:
         status["connected"] = False
         status["error"] = f"{display}: timeout ({timeout:g}s)"

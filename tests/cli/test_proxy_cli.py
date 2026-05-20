@@ -3848,6 +3848,60 @@ class TestHealth:
         assert "ltm server: connectable" in proc.stdout
         assert "version 0.3.0-fake" in proc.stdout
 
+    def test_health_flags_ltm_server_missing_mem_search(self, config, monkeypatch, tmp_path):
+        """An MCP server that initializes but doesn't expose ``mem_search``
+        cannot serve any surfacing call — flag it as UNREACHABLE instead of
+        falsely advertising ``connectable``.
+
+        Uses real subprocess for the same stderr-fileno reason as the
+        connectable test."""
+        import subprocess
+        import textwrap
+
+        bare_server = tmp_path / "_bare_mcp_server.py"
+        bare_server.write_text(
+            textwrap.dedent(
+                """\
+                from mcp.server.fastmcp import FastMCP
+
+                mcp = FastMCP("bare-no-mem-search")
+
+                @mcp.tool()
+                async def unrelated_tool() -> str:
+                    return "ok"
+
+                if __name__ == "__main__":
+                    mcp.run()
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(bare_server)]),
+        )
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "ltm server: UNREACHABLE" in proc.stdout
+        assert "mem_search" in proc.stdout
+        assert "ltm server: connectable" not in proc.stdout
+
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
         at the wrong path gets a clear hint instead of a silent no-op
