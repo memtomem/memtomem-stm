@@ -2256,7 +2256,14 @@ async def _probe_ltm_mcp_command(
             return {"connected": True, "version": version, "error": None}
 
 
-def _ltm_mcp_status(surfacing: Any) -> dict[str, Any]:
+def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
+    """Probe the configured LTM MCP server for ``mms health``.
+
+    *timeout* is the per-server bound from ``mms health --timeout``; the LTM
+    probe must honor it so a stalled LTM command can't push the health
+    diagnostic past the user-requested ceiling. ``surfacing.timeout_seconds``
+    (the runtime-call timeout) is not used here — it's a different SLA.
+    """
     command = str(getattr(surfacing, "ltm_mcp_command", "") or "")
     args = [str(arg) for arg in (getattr(surfacing, "ltm_mcp_args", []) or [])]
     display = _format_command_for_display(command, args) if command else "(empty command)"
@@ -2281,7 +2288,7 @@ def _ltm_mcp_status(surfacing: Any) -> dict[str, Any]:
         status["error"] = f"{command} not on PATH"
         return status
 
-    timeout = max(0.1, float(getattr(surfacing, "timeout_seconds", 3.0) or 3.0))
+    probe_timeout = max(0.1, float(timeout))
     try:
         # ``stdio_client`` forwards *errlog* directly to
         # ``asyncio.create_subprocess_exec(stderr=...)``, which requires a real
@@ -2289,33 +2296,50 @@ def _ltm_mcp_status(surfacing: Any) -> dict[str, Any]:
         # here. ``os.devnull`` gives us a fd-backed sink so server banners
         # and MCP-SDK stderr can't bleed into ``mms health`` output.
         with open(os.devnull, "w") as errnull, _silenced_mcp_sdk_logs():
-            probe = asyncio.run(_probe_ltm_mcp_command(command, args, timeout, errnull))
-    except asyncio.TimeoutError:
-        status["connected"] = False
-        status["error"] = f"{display}: timeout ({timeout:g}s)"
+            probe = asyncio.run(_probe_ltm_mcp_command(command, args, probe_timeout, errnull))
     except Exception as exc:
+        # ``asyncio.wait_for`` inside the probe raises ``TimeoutError``, but
+        # anyio's ``TaskGroup`` (wrapped by ``stdio_client``) re-raises it
+        # as an ``ExceptionGroup`` leaf — a bare ``except TimeoutError``
+        # would miss the wrapped case. Walk to the root cause and dispatch
+        # on the leaf type instead so ``--timeout N`` always renders as
+        # ``timeout (Ns)`` rather than a ``TimeoutError`` type name.
+        root = _root_cause_exc(exc)
         status["connected"] = False
-        status["error"] = f"{display}: {_root_cause_message(exc)}"
+        if isinstance(root, TimeoutError):
+            status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
+        else:
+            status["error"] = f"{display}: {str(root) or type(root).__name__}"
     else:
         status.update(probe)
     return status
 
 
-def _root_cause_message(exc: BaseException) -> str:
+def _root_cause_exc(exc: BaseException) -> BaseException:
     """Walk into ``BaseExceptionGroup`` (anyio TaskGroup wraps probe failures
     as ``unhandled errors in a TaskGroup (N sub-exception)``) to surface the
-    first non-group leaf so users see the real cause instead of the wrapper.
+    first non-group leaf so callers can dispatch on the real cause's type
+    or message instead of the wrapper.
     """
     seen: set[int] = set()
     cur: BaseException = exc
     while isinstance(cur, BaseExceptionGroup) and cur.exceptions and id(cur) not in seen:
         seen.add(id(cur))
         cur = cur.exceptions[0]
+    return cur
+
+
+def _root_cause_message(exc: BaseException) -> str:
+    cur = _root_cause_exc(exc)
     return str(cur) or type(cur).__name__
 
 
-def _surfacing_bootstrap_status() -> dict[str, Any]:
-    """Return surfacing bootstrap readiness without starting the proxy."""
+def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
+    """Return surfacing bootstrap readiness without starting the proxy.
+
+    *timeout* is the ``mms health --timeout`` value, forwarded into the LTM
+    probe so the documented per-server bound covers it too.
+    """
     try:
         from memtomem_stm.config import STMConfig
         from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
@@ -2326,7 +2350,7 @@ def _surfacing_bootstrap_status() -> dict[str, Any]:
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
-            "ltm_server": _ltm_mcp_status(surfacing),
+            "ltm_server": _ltm_mcp_status(surfacing, timeout),
         }
     except Exception as exc:
         logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
@@ -2480,7 +2504,7 @@ def health(
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    surfacing_status = _surfacing_bootstrap_status()
+    surfacing_status = _surfacing_bootstrap_status(float(timeout))
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
     # ensure_ascii=False) so scripts piping the three commands through the

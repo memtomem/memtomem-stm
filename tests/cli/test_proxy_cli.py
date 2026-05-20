@@ -3788,7 +3788,7 @@ class TestHealth:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda: {
+            lambda _timeout: {
                 "enabled": None,
                 "feedback_enabled": None,
                 "feedback_db": None,
@@ -3901,6 +3901,45 @@ class TestHealth:
         assert "ltm server: UNREACHABLE" in proc.stdout
         assert "mem_search" in proc.stdout
         assert "ltm server: connectable" not in proc.stdout
+
+    def test_health_ltm_probe_honors_cli_timeout(self, config, monkeypatch, tmp_path):
+        """``mms health --timeout N`` must bound the LTM probe at N seconds,
+        not at ``surfacing.timeout_seconds``. A stalled LTM command with a
+        large surfacing timeout would otherwise pin ``mms health`` past the
+        documented per-server bound."""
+        import subprocess
+
+        stall_server = tmp_path / "_stall_server.py"
+        stall_server.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(stall_server)]),
+        )
+        # Surfacing's runtime timeout is set high so the CLI flag is the only
+        # thing that can bound the probe — pins the regression.
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "30")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--timeout",
+                "1",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "ltm server: UNREACHABLE" in proc.stdout
+        assert "timeout (1s)" in proc.stdout
 
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
