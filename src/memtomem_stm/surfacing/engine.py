@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
@@ -18,6 +19,14 @@ from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+_QUERY_HASH_PREFIX = "sha256:"
+"""Marker prefixed to the truncated sha256 digest written to
+``surfacing_events.query`` when ``SurfacingConfig.persist_query_text`` is
+``False`` (#352 part 3). Lets the stats formatter recognize the
+hashed-form row without re-reading config and lets ad-hoc DB inspection
+tell user-derived text apart from a stable opaque ID. The full stored
+value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
 
 
 class SurfacingEngine:
@@ -127,6 +136,25 @@ class SurfacingEngine:
         engine was constructed with — the internal no-op stand-in used
         for unconditional recording is not exposed here."""
         return self._observability_public
+
+    def _persistable_query(self, query: str) -> str:
+        """Return the form of ``query`` that gets written to
+        ``surfacing_events.query`` (#352 part 3).
+
+        When ``persist_query_text=True`` (default, backward-compatible)
+        this is just ``query``. When ``False``, the engine substitutes a
+        truncated sha256 digest with a ``sha256:`` prefix so the persisted
+        value is a stable opaque ID rather than user-derived text. The
+        in-memory ``RelevanceGate.record_surfacing(query)`` cooldown
+        signal (and the in-flight ``query`` argument used for similarity
+        comparison, dedup, formatter rendering, etc.) intentionally keeps
+        the raw text — this knob only governs **what gets persisted to
+        disk**, nothing about the in-process surface call.
+        """
+        if self._config.persist_query_text:
+            return query
+        digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+        return f"{_QUERY_HASH_PREFIX}{digest}"
 
     @property
     def injection_mode(self) -> str:
@@ -402,7 +430,7 @@ class SurfacingEngine:
                     surfacing_id=surfacing_id,
                     server=server,
                     tool=tool,
-                    query=query,
+                    query=self._persistable_query(query),
                     memory_ids=[str(r.chunk.id) for r in cached],
                     scores=[r.score for r in cached],
                 )
@@ -617,7 +645,7 @@ class SurfacingEngine:
                     surfacing_id=surfacing_id,
                     server=server,
                     tool=tool,
-                    query=query,
+                    query=self._persistable_query(query),
                     memory_ids=new_ids,
                     scores=[r.score for r in relevant],
                 )
