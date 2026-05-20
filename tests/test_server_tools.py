@@ -332,6 +332,112 @@ class TestSurfacingFeedback:
         assert result == "Recorded."
         mock_tracker.record_feedback.assert_called_once_with("s1", "not_relevant", "m1")
 
+    async def test_batched_via_engine(self):
+        """Batched ratings dispatch to engine.handle_feedback_batch."""
+        mock_engine = AsyncMock()
+        mock_engine.handle_feedback_batch.return_value = "Feedback recorded: 3/3 entries"
+
+        ctx = _make_ctx(surfacing_engine=mock_engine)
+        ratings = [
+            {"memory_id": "m1", "rating": "helpful"},
+            {"memory_id": "m2", "rating": "not_relevant"},
+            {"memory_id": "m3", "rating": "already_known"},
+        ]
+        result = await stm_surfacing_feedback(surfacing_id="s1", ratings=ratings, ctx=ctx)
+        assert result == "Feedback recorded: 3/3 entries"
+        mock_engine.handle_feedback_batch.assert_awaited_once_with("s1", ratings)
+        # Legacy single-rating path must not also fire.
+        mock_engine.handle_feedback.assert_not_awaited()
+
+    async def test_mixing_legacy_and_batched_fields_errors(self):
+        """Caller must pick one shape — never both."""
+        mock_engine = AsyncMock()
+        ctx = _make_ctx(surfacing_engine=mock_engine)
+        result = await stm_surfacing_feedback(
+            surfacing_id="s1",
+            rating="helpful",
+            ratings=[{"memory_id": "m1", "rating": "helpful"}],
+            ctx=ctx,
+        )
+        assert result.startswith("Error:")
+        assert "cannot mix" in result
+        # Neither dispatch fires when the request is rejected up-front.
+        mock_engine.handle_feedback.assert_not_awaited()
+        mock_engine.handle_feedback_batch.assert_not_awaited()
+
+    async def test_mixing_legacy_memory_id_and_batched_fields_errors(self):
+        """`memory_id` without `rating` still counts as the legacy shape."""
+        mock_engine = AsyncMock()
+        ctx = _make_ctx(surfacing_engine=mock_engine)
+        result = await stm_surfacing_feedback(
+            surfacing_id="s1",
+            memory_id="m1",
+            ratings=[{"memory_id": "m1", "rating": "helpful"}],
+            ctx=ctx,
+        )
+        assert result.startswith("Error:")
+        assert "cannot mix" in result
+
+    async def test_no_rating_and_no_ratings_errors(self):
+        """At least one of `rating` / `ratings` must be supplied."""
+        ctx = _make_ctx(surfacing_engine=AsyncMock())
+        result = await stm_surfacing_feedback(surfacing_id="s1", ctx=ctx)
+        assert result.startswith("Error:")
+        assert "required" in result
+
+    async def test_batched_fallback_to_tracker(self):
+        """Engine-absent path fans out via the tracker without boost/invalidation."""
+        mock_tracker = MagicMock()
+        mock_tracker.record_feedback.side_effect = [
+            "Feedback recorded: helpful",
+            "Feedback recorded: not_relevant",
+        ]
+
+        ctx = _make_ctx(surfacing_engine=None, feedback_tracker=mock_tracker)
+        result = await stm_surfacing_feedback(
+            surfacing_id="s1",
+            ratings=[
+                {"memory_id": "m1", "rating": "helpful"},
+                {"memory_id": "m2", "rating": "not_relevant"},
+            ],
+            ctx=ctx,
+        )
+        assert "2/2 entries" in result
+        assert mock_tracker.record_feedback.call_count == 2
+
+    async def test_batched_fallback_shape_error_short_circuits(self):
+        """Malformed entry rejects the whole call without partial writes."""
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(surfacing_engine=None, feedback_tracker=mock_tracker)
+        result = await stm_surfacing_feedback(
+            surfacing_id="s1",
+            ratings=[{"memory_id": "m1"}],  # missing rating
+            ctx=ctx,
+        )
+        assert result.startswith("Error:")
+        mock_tracker.record_feedback.assert_not_called()
+
+    async def test_batched_fallback_malformed_after_valid_persists_nothing(self):
+        """Reviewer pin: a malformed entry *after* a valid one must not
+        leave the valid entry's row committed. The engine path does
+        fail-fast via its own two-pass parse; an earlier inline-validate
+        loop in the tracker-only fallback let a partial prefix persist
+        when validation failed mid-batch.
+        """
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(surfacing_engine=None, feedback_tracker=mock_tracker)
+        result = await stm_surfacing_feedback(
+            surfacing_id="s1",
+            ratings=[
+                {"memory_id": "m1", "rating": "helpful"},  # valid
+                {"memory_id": "m2"},  # missing rating — must reject the whole batch
+            ],
+            ctx=ctx,
+        )
+        assert result.startswith("Error:")
+        # CRITICAL: the valid first entry must NOT have been recorded.
+        mock_tracker.record_feedback.assert_not_called()
+
 
 # ── stm_surfacing_stats ──────────────────────────────────────────────────
 

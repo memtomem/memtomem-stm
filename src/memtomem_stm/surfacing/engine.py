@@ -343,6 +343,86 @@ class SurfacingEngine:
 
         return result
 
+    async def handle_feedback_batch(
+        self,
+        surfacing_id: str,
+        ratings: list[dict],
+    ) -> str:
+        """Record feedback for multiple memories from one surfacing event.
+
+        Each entry is ``{"memory_id": str, "rating": str}``; unknown keys
+        (e.g. a future ``note``) are ignored. Fans out to the same
+        record / invalidation / boost routines as :meth:`handle_feedback`
+        so the single-call and batched paths share side-effect semantics.
+        ``helpful`` boosts collapse to one ``increment_access`` call
+        covering every helpful memory id, keeping the per-event guard
+        enforceable when single and batched calls interleave for the
+        same surfacing event.
+        """
+        if self._feedback_tracker is None:
+            return "Feedback tracking is not enabled."
+        if not ratings:
+            return "Error: `ratings` must contain at least one entry."
+
+        parsed: list[tuple[str, str]] = []
+        for i, entry in enumerate(ratings):
+            if not isinstance(entry, dict):
+                return f"Error: ratings[{i}] must be an object."
+            mid = entry.get("memory_id")
+            rat = entry.get("rating")
+            if not isinstance(mid, str) or not mid:
+                return f"Error: ratings[{i}] missing string `memory_id`."
+            if not isinstance(rat, str):
+                return f"Error: ratings[{i}] missing string `rating`."
+            parsed.append((mid, rat))
+
+        recorded = 0
+        errors: list[str] = []
+        helpful_ids: list[str] = []
+        seen_helpful: set[str] = set()
+        for i, (mid, rat) in enumerate(parsed):
+            result = self._feedback_tracker.record_feedback(surfacing_id, rat, mid)
+            if isinstance(result, str) and result.startswith("Error"):
+                errors.append(f"ratings[{i}]: {result}")
+                continue
+            recorded += 1
+            if rat in ("not_relevant", "already_known"):
+                self._invalidate_cache_for_feedback(surfacing_id, mid)
+            elif rat == "helpful" and mid not in seen_helpful:
+                seen_helpful.add(mid)
+                helpful_ids.append(mid)
+
+        if helpful_ids and surfacing_id not in self._boosted_event_ids:
+            # Claim the guard before the await so a concurrent helpful
+            # rating for the same surfacing_id short-circuits — same shape
+            # as the single-rating path.
+            self._boosted_event_ids[surfacing_id] = None
+            try:
+                with traced(
+                    "surfacing_feedback_boost",
+                    metadata={
+                        "surfacing_id": surfacing_id,
+                        "chunk_count": len(helpful_ids),
+                    },
+                ):
+                    await self._mcp_adapter.increment_access(helpful_ids)
+                if len(self._boosted_event_ids) > self._boosted_event_ids_max:
+                    excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
+                    for k in list(self._boosted_event_ids)[:excess]:
+                        del self._boosted_event_ids[k]
+            except Exception:
+                self._boosted_event_ids.pop(surfacing_id, None)
+                logger.debug(
+                    "Failed to boost access_count for surfacing %s",
+                    surfacing_id,
+                    exc_info=True,
+                )
+
+        summary = f"Feedback recorded: {recorded}/{len(parsed)} entries"
+        if errors:
+            summary += " — " + "; ".join(errors)
+        return summary
+
     def _invalidate_cache_for_feedback(self, surfacing_id: str, memory_id: str | None) -> None:
         """Populate ``_invalidated_ids`` from a surfacing event.
 

@@ -796,6 +796,188 @@ class TestFeedbackBoost:
         adapter.increment_access.assert_not_called()
 
 
+class TestHandleFeedbackBatch:
+    """Batched per-memory ratings (#353 part 1).
+
+    ``handle_feedback_batch`` fans out to the same record / invalidate /
+    boost routines as the single-call path. Boosts across the helpful
+    subset collapse into one ``increment_access`` RPC.
+    """
+
+    def _make_tracker(
+        self,
+        server: str = "gh",
+        tool: str = "read_file",
+        memory_ids: list[str] | None = None,
+    ):
+        tracker = MagicMock()
+        # Per-call success is the default; specific tests can override.
+        tracker.record_feedback = MagicMock(
+            side_effect=lambda _sid, rat, _mid: f"Feedback recorded: {rat}"
+        )
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.get_memory_ids_for_surfacing = MagicMock(return_value=list(memory_ids or []))
+        tracker.store.get_surfacing_event = MagicMock(
+            return_value={
+                "server": server,
+                "tool": tool,
+                "memory_ids": list(memory_ids or []),
+            }
+        )
+        return tracker
+
+    async def test_mixed_ratings_record_each_and_collapse_boost(self):
+        """3 entries with mixed ratings → 3 record_feedback calls, 1 boost RPC."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B", "mid-C"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback_batch(
+            "sid-batch",
+            [
+                {"memory_id": "mid-A", "rating": "helpful"},
+                {"memory_id": "mid-B", "rating": "not_relevant"},
+                {"memory_id": "mid-C", "rating": "already_known"},
+            ],
+        )
+
+        assert "3/3 entries" in result
+        assert tracker.record_feedback.call_count == 3
+        adapter.increment_access.assert_awaited_once_with(["mid-A"])
+        # Both negatives invalidated.
+        assert ("gh", "read_file", "mid-B") in engine._invalidated_ids
+        assert ("gh", "read_file", "mid-C") in engine._invalidated_ids
+        # The helpful entry did NOT land in the invalidation set.
+        assert ("gh", "read_file", "mid-A") not in engine._invalidated_ids
+
+    async def test_multiple_helpful_collapse_to_single_boost_with_set(self):
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback_batch(
+            "sid-batch",
+            [
+                {"memory_id": "mid-A", "rating": "helpful"},
+                {"memory_id": "mid-B", "rating": "helpful"},
+                {"memory_id": "mid-A", "rating": "helpful"},  # duplicate id
+            ],
+        )
+
+        adapter.increment_access.assert_awaited_once_with(["mid-A", "mid-B"])
+
+    async def test_per_event_boost_guard_blocks_batched_after_single(self):
+        """A single-call ``helpful`` first claims the guard; a subsequent
+        batched call with helpful entries for the same surfacing_id must
+        not double-boost."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await engine.handle_feedback("sid-shared", "helpful", memory_id="mid-A")
+        await engine.handle_feedback_batch(
+            "sid-shared",
+            [{"memory_id": "mid-B", "rating": "helpful"}],
+        )
+
+        assert adapter.increment_access.await_count == 1
+
+    async def test_empty_ratings_returns_error(self):
+        adapter = _make_mcp_adapter([])
+        tracker = self._make_tracker(memory_ids=["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback_batch("sid-x", [])
+        assert result.startswith("Error:")
+        tracker.record_feedback.assert_not_called()
+
+    async def test_malformed_entry_short_circuits_no_partial_writes(self):
+        """A bad entry shape rejects the whole call before any record happens."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(memory_ids=["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback_batch(
+            "sid-x",
+            [
+                {"memory_id": "mid-A", "rating": "helpful"},
+                {"memory_id": "mid-B"},  # missing rating — fail-fast
+            ],
+        )
+        assert result.startswith("Error:")
+        tracker.record_feedback.assert_not_called()
+        adapter.increment_access.assert_not_called()
+
+    async def test_invalid_rating_value_persists_others(self):
+        """A rejected rating value (per VALID_RATINGS) fails its own entry but
+        does not block the surrounding helpful/negative side effects."""
+        adapter = _make_mcp_adapter([])
+        adapter.increment_access = AsyncMock()
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B"])
+
+        def fake_record(_sid, rat, _mid):
+            if rat == "bogus":
+                return "Error: rating must be one of ['helpful', 'not_relevant', 'already_known']"
+            return f"Feedback recorded: {rat}"
+
+        tracker.record_feedback.side_effect = fake_record
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback_batch(
+            "sid-x",
+            [
+                {"memory_id": "mid-A", "rating": "helpful"},
+                {"memory_id": "mid-B", "rating": "bogus"},
+            ],
+        )
+
+        assert "1/2 entries" in result
+        assert "ratings[1]" in result
+        adapter.increment_access.assert_awaited_once_with(["mid-A"])
+
+    async def test_no_tracker_returns_disabled_message(self):
+        adapter = _make_mcp_adapter([])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=None,
+        )
+
+        result = await engine.handle_feedback_batch(
+            "sid-x", [{"memory_id": "mid-A", "rating": "helpful"}]
+        )
+        assert "not enabled" in result
+
+
 class TestCacheInvalidationOnNegativeFeedback:
     """Negative feedback (``not_relevant`` / ``already_known``) must populate
     ``_invalidated_ids`` so subsequent cache hits for the same
