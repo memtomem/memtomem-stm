@@ -682,21 +682,41 @@ class SurfacingEngine:
         self._background_tasks.clear()
 
     def _maybe_cleanup_expired(self) -> None:
-        """Run cleanup_expired() at most once per cleanup interval.
+        """Run periodic store maintenance at most once per cleanup interval.
 
         Called opportunistically from surface() — no separate timer thread
-        needed. The cleanup itself is synchronous (SQLite DELETE) and fast
-        enough to run inline.
+        needed. Each sub-task is synchronous (SQLite DELETE / UPDATE) and
+        fast enough to run inline. Sub-tasks are independent: an operator
+        can disable cross-session dedup (``dedup_ttl_seconds=0``) while
+        keeping query retention on, and vice versa. The interval check
+        is shared so the loop fires once and visits both.
         """
-        if self._feedback_tracker is None or self._config.dedup_ttl_seconds <= 0:
+        if self._feedback_tracker is None:
+            return
+        dedup_ttl = self._config.dedup_ttl_seconds
+        retention_days = self._config.query_retention_days
+        if dedup_ttl <= 0 and retention_days <= 0:
             return
         now = time.monotonic()
         if now - self._last_cleanup < self._cleanup_interval:
             return
         self._last_cleanup = now
-        try:
-            deleted = self._feedback_tracker.store.cleanup_expired(self._config.dedup_ttl_seconds)
-            if deleted:
-                logger.info("Cleaned up %d expired seen_memories entries", deleted)
-        except Exception:
-            logger.warning("Failed to clean up expired seen_memories", exc_info=True)
+        store = self._feedback_tracker.store
+        if dedup_ttl > 0:
+            try:
+                deleted = store.cleanup_expired(dedup_ttl)
+                if deleted:
+                    logger.info("Cleaned up %d expired seen_memories entries", deleted)
+            except Exception:
+                logger.warning("Failed to clean up expired seen_memories", exc_info=True)
+        if retention_days > 0:
+            try:
+                nulled = store.cleanup_expired_queries(retention_days * 86400.0)
+                if nulled:
+                    logger.info(
+                        "Nulled query column on %d surfacing_events rows older than %d days (#352)",
+                        nulled,
+                        retention_days,
+                    )
+            except Exception:
+                logger.warning("Failed to clean up expired surfacing queries", exc_info=True)
