@@ -10,7 +10,10 @@ from memtomem_stm.surfacing.feedback_store import FeedbackStore, inspect_feedbac
 
 logger = logging.getLogger(__name__)
 
-_VALID_RATINGS = {"helpful", "not_relevant", "already_known"}
+# Canonical UX order: positive → negative → "I already had this". The
+# formatter renders these in the same order in the agent-facing rating
+# spec, so the validator and the agent-visible hint cannot drift (#350).
+VALID_RATINGS: tuple[str, ...] = ("helpful", "not_relevant", "already_known")
 
 
 class FeedbackTracker:
@@ -63,8 +66,8 @@ class FeedbackTracker:
         rating: str,
         memory_id: str | None = None,
     ) -> str:
-        if rating not in _VALID_RATINGS:
-            return f"Error: rating must be one of {sorted(_VALID_RATINGS)}"
+        if rating not in VALID_RATINGS:
+            return f"Error: rating must be one of {list(VALID_RATINGS)}"
 
         ok = self._store.record_feedback(surfacing_id, rating, memory_id)
         if not ok:

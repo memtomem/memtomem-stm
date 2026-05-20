@@ -278,7 +278,11 @@ async def test_s05_skeleton_preserves_turn_speakers(tmp_path, bench_qa_report):
         store.close()
 
 
-_SURFACING_ID_RE = re.compile(r"Surfacing ID:\s*([a-f0-9]{16})")
+# Matches the formatter's ID line (``_surfacing_id: <id>_``) as well as
+# the rating-spec callable (``stm_surfacing_feedback(surfacing_id="<id>",``)
+# rendered just below it. Either form proves the id reached the agent
+# (#350 moved the id above the bullet list).
+_SURFACING_ID_RE = re.compile(r"surfacing_id[:=]\s*\"?([a-f0-9]{16})")
 
 
 @pytest.mark.bench_qa

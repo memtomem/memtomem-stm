@@ -81,6 +81,72 @@ class TestFormatterInjection:
         assert "xyz789" in output
         assert "stm_surfacing_feedback" in output
 
+    def test_rating_spec_enumerates_all_valid_ratings(self):
+        """#350 part 3: the agent-facing rating spec must enumerate every
+        value the server-side validator accepts. The previous italic hint
+        only said "call ``stm_surfacing_feedback`` to rate" — agents (Claude
+        / GPT) routinely guessed ``"good"`` / ``"useful"`` and the resulting
+        feedback was rejected by ``FeedbackTracker.record_feedback``, so the
+        AutoTuner never saw the signal. The values come from
+        ``feedback.VALID_RATINGS`` (the same source the validator reads) so
+        the two cannot drift."""
+        from memtomem_stm.surfacing.feedback import VALID_RATINGS
+
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [FakeResult(FakeChunk(), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="abc123")
+
+        for rating in VALID_RATINGS:
+            assert f'"{rating}"' in output, (
+                f"rating spec must enumerate {rating!r} so the agent does not "
+                f"guess an invalid value; got: {output!r}"
+            )
+        # The spec is formatted as a callable so the LLM treats it as a tool
+        # invocation pattern, not prose — ``stm_surfacing_feedback(...)``.
+        assert "stm_surfacing_feedback(surfacing_id=" in output
+
+    def test_surfacing_id_survives_truncation(self):
+        """#350 part 4: the surfacing_id used to be appended at the end of
+        ``lines`` and could be cut off when the memory block exceeded
+        ``effective_max_injection_chars`` — the agent saw memories but had
+        no way to rate them, silently breaking the feedback loop on the
+        largest, most expensive surfacings. The ID now lives directly after
+        the section header so it survives any truncation that leaves the
+        header intact."""
+        # ~50 chars caps below the bullet list but above the header + ID
+        # line; the regression would put the surfacing_id below the cut.
+        config = SurfacingConfig(max_injection_chars=200)
+        fmt = SurfacingFormatter(config)
+        results = [FakeResult(FakeChunk(content="x" * 5000), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="trunc-survivor-id")
+        assert "truncated" in output, "precondition: the block must actually be truncated"
+        assert "trunc-survivor-id" in output, (
+            "surfacing_id must survive truncation so the feedback loop "
+            "remains usable on large surfacings"
+        )
+
+    def test_no_trailing_surfacing_id_line(self):
+        """Regression guard: the old trailing ``_Surfacing ID: ... — call
+        ... to rate_`` line is gone. Parsers that scraped the bottom line
+        need to know the location moved (CHANGELOG flags this as a behavior
+        change)."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [FakeResult(FakeChunk(), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="abc123")
+        assert "to rate_" not in output
+        assert "Surfacing ID:" not in output  # old capitalized form gone
+
+    def test_no_rating_spec_when_surfacing_id_absent(self):
+        """The rating spec is gated on ``surfacing_id`` — callers that
+        intentionally suppress the ID (e.g. callers without feedback
+        tracking enabled) should not see a hint pointing at a tool that
+        cannot accept their None ID."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [FakeResult(FakeChunk(), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id=None)
+        assert "stm_surfacing_feedback" not in output
+        assert "surfacing_id" not in output
+
     def test_scratch_items_included(self):
         fmt = SurfacingFormatter(SurfacingConfig())
         results = [FakeResult(FakeChunk(), 0.5)]
@@ -193,8 +259,7 @@ class TestPreviewMaxCharsKnob:
         # so when window_before+chunk would exceed the cap, window_before is
         # trimmed or dropped rather than the chunk.
         assert "m" in preview_line, (
-            f"matched chunk content (the hit) must be preserved, "
-            f"got: {preview_line!r}"
+            f"matched chunk content (the hit) must be preserved, got: {preview_line!r}"
         )
 
     def test_default_cap_with_context_windows_keeps_chunk_and_trims_windows(self):
