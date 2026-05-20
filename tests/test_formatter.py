@@ -105,6 +105,50 @@ class TestFormatterInjection:
         # invocation pattern, not prose — ``stm_surfacing_feedback(...)``.
         assert "stm_surfacing_feedback(surfacing_id=" in output
 
+    def test_rendered_callable_is_a_single_valid_call(self):
+        """Reviewer pin: when the agent copies the rendered ``Rate:`` call
+        verbatim, the resulting MCP call must be parseable and accepted by
+        ``FeedbackTracker.record_feedback``. A pipe-alternation inside
+        ``rating=`` (``rating="helpful" | "not_relevant" | ...``) parses as
+        ``BinOp(BitOr)`` of strings, which is not a string the validator
+        recognises — copied as-is it would drop the very signal this PR
+        is meant to preserve. So the callable example must carry a single
+        valid rating literal, and the alternatives belong outside the
+        argument."""
+        import ast
+        import re
+
+        from memtomem_stm.surfacing.feedback import VALID_RATINGS
+
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [FakeResult(FakeChunk(), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="abc123")
+
+        # Pull the callable out of its backticked code span.
+        m = re.search(r"`(stm_surfacing_feedback\([^`]+\))`", output)
+        assert m, f"could not find backticked Rate callable in output: {output!r}"
+        call_src = m.group(1)
+
+        # 1) Must parse as a single Python call expression. Pipe-alternation
+        #    in the rating= argument would parse as a ``BinOp(BitOr)``
+        #    rather than a single literal — this check catches that.
+        expr = ast.parse(call_src, mode="eval")
+        assert isinstance(expr.body, ast.Call), f"not a Call: {ast.dump(expr.body)}"
+
+        # 2) The rating= kwarg must resolve to exactly one valid string
+        #    literal — what the validator actually accepts.
+        rating_kw = next((k for k in expr.body.keywords if k.arg == "rating"), None)
+        assert rating_kw is not None, f"no rating= keyword in {call_src!r}"
+        assert isinstance(rating_kw.value, ast.Constant), (
+            f"rating= must be a single literal string for the call to be "
+            f"copy-pasteable; got {ast.dump(rating_kw.value)} — likely a "
+            f"BinOp(BitOr) from a pipe-alternation regression"
+        )
+        assert rating_kw.value.value in VALID_RATINGS, (
+            f"rating= literal {rating_kw.value.value!r} must be a valid "
+            f"value the server-side validator accepts"
+        )
+
     def test_surfacing_id_survives_truncation(self):
         """#350 part 4: the surfacing_id used to be appended at the end of
         ``lines`` and could be cut off when the memory block exceeded

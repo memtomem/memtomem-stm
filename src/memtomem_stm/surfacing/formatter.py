@@ -42,11 +42,20 @@ class SurfacingFormatter:
         # the server-side validator.
         lines: list[str] = [self._config.section_header]
         if surfacing_id:
-            rating_options = " | ".join(f'"{r}"' for r in VALID_RATINGS)
+            # The rendered callable must be copy-pasteable as a single valid
+            # call: ``rating="helpful" | "not_relevant" | "already_known"``
+            # parses as ``BinOp(BitOr)`` and the validator rejects the
+            # resulting non-string, so we keep one literal value in the
+            # argument and list the alternatives in prose outside the call.
+            # The example uses ``VALID_RATINGS[0]`` ("helpful") to pin the
+            # canonical-order contract.
+            options_list = " | ".join(f'"{r}"' for r in VALID_RATINGS)
+            example_rating = VALID_RATINGS[0]
             lines.append(f"_surfacing_id: {surfacing_id}_")
             lines.append(
-                f"> Rate: `stm_surfacing_feedback(surfacing_id={surfacing_id!r}, "
-                f"rating={rating_options})`"
+                f"> Rate (one of {options_list}): "
+                f"`stm_surfacing_feedback(surfacing_id={surfacing_id!r}, "
+                f"rating={example_rating!r})`"
             )
         lines.append("")
 
