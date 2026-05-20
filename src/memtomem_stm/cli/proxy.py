@@ -8,13 +8,14 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import click
 
@@ -2173,21 +2174,194 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
             }
 
 
-def _root_cause_message(exc: BaseException) -> str:
+def _format_command_for_display(command: str, args: list[str]) -> str:
+    return shlex.join([command, *args]) if args else command
+
+
+def _text_parts_from_tool_result(result: Any) -> list[str]:
+    return [
+        str(getattr(content, "text", "") or "")
+        for content in getattr(result, "content", [])
+        if getattr(content, "type", None) == "text"
+    ]
+
+
+def _version_from_tool_result(result: Any) -> str | None:
+    text_parts = _text_parts_from_tool_result(result)
+    if not text_parts:
+        return None
+    try:
+        data = json.loads(text_parts[0])
+    except json.JSONDecodeError:
+        return None
+    version = data.get("version")
+    return str(version) if version else None
+
+
+async def _probe_ltm_mcp_command(
+    command: str,
+    args: list[str],
+    timeout: float,
+    errlog: TextIO,
+) -> dict[str, Any]:
+    """Probe the configured LTM stdio MCP server without starting the proxy.
+
+    *timeout* is an **end-to-end** budget shared across initialize +
+    list_tools + the optional ``mem_do(action="version")`` probe — each
+    ``wait_for`` gets ``deadline - now`` so a stall in any phase can't push
+    the probe past the ``mms health --timeout`` ceiling. If the budget is
+    already exhausted when the version probe would run, it's skipped (the
+    version string is best-effort UX, not a correctness signal).
+
+    Verifies that ``mem_search`` (the only tool the surfacing adapter strictly
+    requires — see ``surfacing/mcp_client.py:423``) is advertised by the
+    server before declaring ``connected``. A process that handshakes as MCP
+    but doesn't expose ``mem_search`` would later silently fail every
+    surfacing call; flagging it here is the diagnostic operators want from
+    ``mms health``. The ``mem_do(action="version")`` probe stays best-effort
+    and only runs when ``mem_do`` is advertised — older servers that don't
+    recognize ``action=version`` should not poison the result.
+
+    Child stderr is routed to *errlog* so server banner / log lines don't
+    bleed into the ``mms health`` text/JSON output (caller passes an
+    fd-backed sink — ``stdio_client`` forwards this to
+    ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
+    """
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    deadline = asyncio.get_running_loop().time() + timeout
+
+    def remaining() -> float:
+        # ``asyncio.wait_for`` treats <=0 as "fire immediately"; clamp to a
+        # tiny positive so we always raise ``TimeoutError`` rather than
+        # returning a bogus result on a zero-budget call.
+        return max(1e-3, deadline - asyncio.get_running_loop().time())
+
+    params = StdioServerParameters(command=command, args=args)
+    async with stdio_client(params, errlog=errlog) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await asyncio.wait_for(session.initialize(), timeout=remaining())
+            tools_result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
+            tool_names = {t.name for t in tools_result.tools}
+            if "mem_search" not in tool_names:
+                return {
+                    "connected": False,
+                    "version": None,
+                    "error": (
+                        "server initialized but does not expose 'mem_search' "
+                        "(surfacing adapter calls this tool — config likely "
+                        "points at a non-memtomem MCP server)"
+                    ),
+                }
+            version: str | None = None
+            # ``mem_search`` connectivity is already proven — don't burn what
+            # remains of the budget on the optional version probe if it'd
+            # push us past the deadline. The threshold is small enough to
+            # let a typical sub-second ``mem_do`` round-trip through but
+            # large enough to avoid spawning a ``wait_for`` we know will
+            # immediately raise.
+            budget_left = deadline - asyncio.get_running_loop().time()
+            if "mem_do" in tool_names and budget_left > 0.05:
+                try:
+                    result = await asyncio.wait_for(
+                        session.call_tool("mem_do", {"action": "version"}),
+                        timeout=remaining(),
+                    )
+                    version = _version_from_tool_result(result)
+                except Exception:
+                    logger.debug(
+                        "LTM mem_do(version) probe failed or timed out within "
+                        "the shared budget; treating as unsupported.",
+                        exc_info=True,
+                    )
+            return {"connected": True, "version": version, "error": None}
+
+
+def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
+    """Probe the configured LTM MCP server for ``mms health``.
+
+    *timeout* is the per-server bound from ``mms health --timeout``; the LTM
+    probe must honor it so a stalled LTM command can't push the health
+    diagnostic past the user-requested ceiling. ``surfacing.timeout_seconds``
+    (the runtime-call timeout) is not used here — it's a different SLA.
+    """
+    command = str(getattr(surfacing, "ltm_mcp_command", "") or "")
+    args = [str(arg) for arg in (getattr(surfacing, "ltm_mcp_args", []) or [])]
+    display = _format_command_for_display(command, args) if command else "(empty command)"
+    status: dict[str, Any] = {
+        "command": command,
+        "args": args,
+        "display": display,
+        "connected": None,
+        "version": None,
+        "error": None,
+    }
+
+    if not getattr(surfacing, "enabled", False):
+        status["skipped"] = "surfacing_disabled"
+        return status
+    if not command:
+        status["connected"] = False
+        status["error"] = "ltm_mcp_command is empty"
+        return status
+    if shutil.which(command) is None:
+        status["connected"] = False
+        status["error"] = f"{command} not on PATH"
+        return status
+
+    probe_timeout = max(0.1, float(timeout))
+    try:
+        # ``stdio_client`` forwards *errlog* directly to
+        # ``asyncio.create_subprocess_exec(stderr=...)``, which requires a real
+        # file descriptor — ``io.StringIO`` lacks ``fileno`` and would crash
+        # here. ``os.devnull`` gives us a fd-backed sink so server banners
+        # and MCP-SDK stderr can't bleed into ``mms health`` output.
+        with open(os.devnull, "w") as errnull, _silenced_mcp_sdk_logs():
+            probe = asyncio.run(_probe_ltm_mcp_command(command, args, probe_timeout, errnull))
+    except Exception as exc:
+        # ``asyncio.wait_for`` inside the probe raises ``TimeoutError``, but
+        # anyio's ``TaskGroup`` (wrapped by ``stdio_client``) re-raises it
+        # as an ``ExceptionGroup`` leaf — a bare ``except TimeoutError``
+        # would miss the wrapped case. Walk to the root cause and dispatch
+        # on the leaf type instead so ``--timeout N`` always renders as
+        # ``timeout (Ns)`` rather than a ``TimeoutError`` type name.
+        root = _root_cause_exc(exc)
+        status["connected"] = False
+        if isinstance(root, TimeoutError):
+            status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
+        else:
+            status["error"] = f"{display}: {str(root) or type(root).__name__}"
+    else:
+        status.update(probe)
+    return status
+
+
+def _root_cause_exc(exc: BaseException) -> BaseException:
     """Walk into ``BaseExceptionGroup`` (anyio TaskGroup wraps probe failures
     as ``unhandled errors in a TaskGroup (N sub-exception)``) to surface the
-    first non-group leaf so users see the real cause instead of the wrapper.
+    first non-group leaf so callers can dispatch on the real cause's type
+    or message instead of the wrapper.
     """
     seen: set[int] = set()
     cur: BaseException = exc
     while isinstance(cur, BaseExceptionGroup) and cur.exceptions and id(cur) not in seen:
         seen.add(id(cur))
         cur = cur.exceptions[0]
+    return cur
+
+
+def _root_cause_message(exc: BaseException) -> str:
+    cur = _root_cause_exc(exc)
     return str(cur) or type(cur).__name__
 
 
-def _surfacing_bootstrap_status() -> dict[str, Any]:
-    """Return surfacing feedback DB readiness without starting the proxy."""
+def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
+    """Return surfacing bootstrap readiness without starting the proxy.
+
+    *timeout* is the ``mms health --timeout`` value, forwarded into the LTM
+    probe so the documented per-server bound covers it too.
+    """
     try:
         from memtomem_stm.config import STMConfig
         from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
@@ -2198,6 +2372,7 @@ def _surfacing_bootstrap_status() -> dict[str, Any]:
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
+            "ltm_server": _ltm_mcp_status(surfacing, timeout),
         }
     except Exception as exc:
         logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
@@ -2205,6 +2380,7 @@ def _surfacing_bootstrap_status() -> dict[str, Any]:
             "enabled": None,
             "feedback_enabled": None,
             "feedback_db": None,
+            "ltm_server": None,
             "error": str(exc) or type(exc).__name__,
         }
 
@@ -2236,6 +2412,18 @@ def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
             f"  feedback tables: {_warn('missing')} ({missing}) — "
             "surfacing has not initialized this DB"
         )
+    ltm_server = status.get("ltm_server")
+    if isinstance(ltm_server, dict):
+        if ltm_server.get("skipped") == "surfacing_disabled":
+            lines.append("  ltm server: skipped (surfacing disabled)")
+        elif ltm_server.get("connected"):
+            detail = str(ltm_server.get("display") or ltm_server.get("command") or "")
+            if ltm_server.get("version"):
+                detail = f"{detail}, version {ltm_server['version']}"
+            lines.append(f"  ltm server: {_ok('connectable')} ({detail})")
+        else:
+            err = ltm_server.get("error") or "unknown error"
+            lines.append(f"  ltm server: {_bad('UNREACHABLE')} — {err}")
     return lines
 
 
@@ -2338,7 +2526,7 @@ def health(
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    surfacing_status = _surfacing_bootstrap_status()
+    surfacing_status = _surfacing_bootstrap_status(float(timeout))
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
     # ensure_ascii=False) so scripts piping the three commands through the

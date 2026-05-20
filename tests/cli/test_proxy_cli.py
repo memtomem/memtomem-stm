@@ -3726,6 +3726,7 @@ class TestHealth:
     @pytest.fixture(autouse=True)
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
 
     def test_health_no_servers(self, runner, config):
         """Empty config → friendly message, no crash."""
@@ -3746,6 +3747,7 @@ class TestHealth:
         assert data["surfacing"]["feedback_enabled"] is True
         assert data["surfacing"]["feedback_db"]["exists"] is False
         assert data["surfacing"]["feedback_db"]["initialized"] is False
+        assert data["surfacing"]["ltm_server"]["connected"] is False
 
     def test_health_flags_existing_uninitialized_surfacing_db(
         self, runner, config, tmp_path, monkeypatch
@@ -3786,7 +3788,7 @@ class TestHealth:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda: {
+            lambda _timeout: {
                 "enabled": None,
                 "feedback_enabled": None,
                 "feedback_db": None,
@@ -3802,6 +3804,237 @@ class TestHealth:
         as_json = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert as_json.exit_code == 0
         assert json.loads(as_json.output)["surfacing"]["error"] == "bad config"
+
+    def test_health_reports_unreachable_ltm_server(self, runner, config):
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+
+        assert result.exit_code == 0
+        assert "ltm server: UNREACHABLE" in result.output
+        assert "__missing_ltm__ not on PATH" in result.output
+
+    def test_health_reports_connectable_ltm_server(self, config, monkeypatch):
+        """Probe a live MCP child via real subprocess.
+
+        Cannot use ``CliRunner`` here: Click's runner replaces ``sys.stderr``
+        with a buffer that has no ``fileno()``, and the MCP stdio client
+        forwards that stderr to ``asyncio.create_subprocess_exec`` which needs
+        a real file descriptor. Mirrors ``TestAddValidate``'s success-path
+        test, which hit the same constraint."""
+        import subprocess
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(_FAKE_SERVER)]),
+        )
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "ltm server: connectable" in proc.stdout
+        assert "version 0.3.0-fake" in proc.stdout
+
+    def test_health_flags_ltm_server_missing_mem_search(self, config, monkeypatch, tmp_path):
+        """An MCP server that initializes but doesn't expose ``mem_search``
+        cannot serve any surfacing call — flag it as UNREACHABLE instead of
+        falsely advertising ``connectable``.
+
+        Uses real subprocess for the same stderr-fileno reason as the
+        connectable test."""
+        import subprocess
+        import textwrap
+
+        bare_server = tmp_path / "_bare_mcp_server.py"
+        bare_server.write_text(
+            textwrap.dedent(
+                """\
+                from mcp.server.fastmcp import FastMCP
+
+                mcp = FastMCP("bare-no-mem-search")
+
+                @mcp.tool()
+                async def unrelated_tool() -> str:
+                    return "ok"
+
+                if __name__ == "__main__":
+                    mcp.run()
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(bare_server)]),
+        )
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "ltm server: UNREACHABLE" in proc.stdout
+        assert "mem_search" in proc.stdout
+        assert "ltm server: connectable" not in proc.stdout
+
+    def test_health_ltm_probe_honors_cli_timeout(self, config, monkeypatch, tmp_path):
+        """``mms health --timeout N`` must bound the LTM probe at N seconds,
+        not at ``surfacing.timeout_seconds``. A stalled LTM command with a
+        large surfacing timeout would otherwise pin ``mms health`` past the
+        documented per-server bound."""
+        import subprocess
+
+        stall_server = tmp_path / "_stall_server.py"
+        stall_server.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(stall_server)]),
+        )
+        # Surfacing's runtime timeout is set high so the CLI flag is the only
+        # thing that can bound the probe — pins the regression.
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "30")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "health",
+                "--timeout",
+                "1",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "ltm server: UNREACHABLE" in proc.stdout
+        assert "timeout (1s)" in proc.stdout
+
+    def test_health_ltm_probe_shares_timeout_across_phases(
+        self, config, monkeypatch, tmp_path
+    ):
+        """A server that handshakes + lists tools fast but stalls on
+        ``mem_do(action="version")`` must not extend total probe time past
+        ``--timeout``. The probe shares one end-to-end budget across
+        initialize + list_tools + the optional version call; the version
+        call's stall is absorbed and ``connected`` stays true because
+        ``mem_search`` connectivity was already proven."""
+        import subprocess
+        import textwrap
+        import time
+
+        stall_version_server = tmp_path / "_stall_version_server.py"
+        stall_version_server.write_text(
+            textwrap.dedent(
+                """\
+                import asyncio
+                from mcp.server.fastmcp import FastMCP
+
+                mcp = FastMCP("stall-version")
+
+                @mcp.tool()
+                async def mem_search(query: str) -> str:
+                    return ""
+
+                @mcp.tool()
+                async def mem_do(action: str, params: dict | None = None) -> str:
+                    if action == "version":
+                        await asyncio.sleep(60)
+                    return "{}"
+
+                if __name__ == "__main__":
+                    mcp.run()
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(stall_version_server)]),
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "30")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        # ``--timeout 3`` (not 1) gives initialize + list_tools headroom on
+        # slow CI runners where Python child startup + FastMCP boot can eat
+        # several hundred ms; we still want the version stall to be bounded
+        # at ~3s, not 30s.
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from memtomem_stm.cli.proxy import cli; cli()",
+                    "health",
+                    "--json",
+                    "--timeout",
+                    "3",
+                    "--config",
+                    str(config),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Pre-fix this is the canonical regression mode: the version
+            # probe gets the full ``TIMEOUT_SECONDS=30`` budget on top of
+            # initialize/list_tools, so the outer 20s watchdog trips before
+            # ``mms health`` returns.
+            raise AssertionError(
+                f"LTM probe didn't honor shared budget — outer subprocess "
+                f"timed out at {exc.timeout}s (expected ~3s wall time)"
+            ) from exc
+        elapsed = time.perf_counter() - start
+
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        data = json.loads(proc.stdout)
+        ltm = data["surfacing"]["ltm_server"]
+        # ``mem_search`` connectivity is proven before the version probe
+        # runs, so the version stall must not flip the verdict.
+        assert ltm["connected"] is True, ltm
+        # Version probe was budget-starved → silently dropped, not reported.
+        assert ltm["version"] is None, ltm
+        # Pre-fix the version probe alone would burn ~30s; post-fix the
+        # shared budget caps it near the 3s ``--timeout``. 10s upper bound
+        # gives plenty of slack for slow CI without being a no-op check —
+        # pre-fix elapsed would actually trip the outer 20s
+        # ``subprocess.run`` first (caught above).
+        assert elapsed < 10.0, f"shared-budget probe took {elapsed:.2f}s"
 
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
