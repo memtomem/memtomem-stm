@@ -3726,6 +3726,7 @@ class TestHealth:
     @pytest.fixture(autouse=True)
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
 
     def test_health_no_servers(self, runner, config):
         """Empty config → friendly message, no crash."""
@@ -3746,6 +3747,7 @@ class TestHealth:
         assert data["surfacing"]["feedback_enabled"] is True
         assert data["surfacing"]["feedback_db"]["exists"] is False
         assert data["surfacing"]["feedback_db"]["initialized"] is False
+        assert data["surfacing"]["ltm_server"]["connected"] is False
 
     def test_health_flags_existing_uninitialized_surfacing_db(
         self, runner, config, tmp_path, monkeypatch
@@ -3802,6 +3804,29 @@ class TestHealth:
         as_json = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert as_json.exit_code == 0
         assert json.loads(as_json.output)["surfacing"]["error"] == "bad config"
+
+    def test_health_reports_unreachable_ltm_server(self, runner, config):
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+
+        assert result.exit_code == 0
+        assert "ltm server: UNREACHABLE" in result.output
+        assert "__missing_ltm__ not on PATH" in result.output
+
+    def test_health_reports_connectable_ltm_server(self, runner, config, monkeypatch):
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+            json.dumps([str(_FAKE_SERVER)]),
+        )
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+
+        assert result.exit_code == 0
+        assert "ltm server: connectable" in result.output
+        assert "version 0.3.0-fake" in result.output
 
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing

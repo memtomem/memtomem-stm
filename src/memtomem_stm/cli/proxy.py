@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -2173,6 +2174,93 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
             }
 
 
+def _format_command_for_display(command: str, args: list[str]) -> str:
+    return shlex.join([command, *args]) if args else command
+
+
+def _text_parts_from_tool_result(result: Any) -> list[str]:
+    return [
+        str(getattr(content, "text", "") or "")
+        for content in getattr(result, "content", [])
+        if getattr(content, "type", None) == "text"
+    ]
+
+
+def _version_from_tool_result(result: Any) -> str | None:
+    text_parts = _text_parts_from_tool_result(result)
+    if not text_parts:
+        return None
+    try:
+        data = json.loads(text_parts[0])
+    except json.JSONDecodeError:
+        return None
+    version = data.get("version")
+    return str(version) if version else None
+
+
+async def _probe_ltm_mcp_command(
+    command: str,
+    args: list[str],
+    timeout: float,
+) -> dict[str, Any]:
+    """Probe the configured LTM stdio MCP server without starting the proxy."""
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    async with stdio_client(StdioServerParameters(command=command, args=args)) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await asyncio.wait_for(session.initialize(), timeout=timeout)
+            version: str | None = None
+            try:
+                result = await asyncio.wait_for(
+                    session.call_tool("mem_do", {"action": "version"}),
+                    timeout=timeout,
+                )
+                version = _version_from_tool_result(result)
+            except Exception:
+                logger.debug("LTM version probe failed", exc_info=True)
+            return {"connected": True, "version": version, "error": None}
+
+
+def _ltm_mcp_status(surfacing: Any) -> dict[str, Any]:
+    command = str(getattr(surfacing, "ltm_mcp_command", "") or "")
+    args = [str(arg) for arg in (getattr(surfacing, "ltm_mcp_args", []) or [])]
+    display = _format_command_for_display(command, args) if command else "(empty command)"
+    status: dict[str, Any] = {
+        "command": command,
+        "args": args,
+        "display": display,
+        "connected": None,
+        "version": None,
+        "error": None,
+    }
+
+    if not getattr(surfacing, "enabled", False):
+        status["skipped"] = "surfacing_disabled"
+        return status
+    if not command:
+        status["connected"] = False
+        status["error"] = "ltm_mcp_command is empty"
+        return status
+    if shutil.which(command) is None:
+        status["connected"] = False
+        status["error"] = f"{command} not on PATH"
+        return status
+
+    timeout = max(0.1, float(getattr(surfacing, "timeout_seconds", 3.0) or 3.0))
+    try:
+        probe = asyncio.run(_probe_ltm_mcp_command(command, args, timeout))
+    except asyncio.TimeoutError:
+        status["connected"] = False
+        status["error"] = f"{display}: timeout ({timeout:g}s)"
+    except Exception as exc:
+        status["connected"] = False
+        status["error"] = f"{display}: {_root_cause_message(exc)}"
+    else:
+        status.update(probe)
+    return status
+
+
 def _root_cause_message(exc: BaseException) -> str:
     """Walk into ``BaseExceptionGroup`` (anyio TaskGroup wraps probe failures
     as ``unhandled errors in a TaskGroup (N sub-exception)``) to surface the
@@ -2187,7 +2275,7 @@ def _root_cause_message(exc: BaseException) -> str:
 
 
 def _surfacing_bootstrap_status() -> dict[str, Any]:
-    """Return surfacing feedback DB readiness without starting the proxy."""
+    """Return surfacing bootstrap readiness without starting the proxy."""
     try:
         from memtomem_stm.config import STMConfig
         from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
@@ -2198,6 +2286,7 @@ def _surfacing_bootstrap_status() -> dict[str, Any]:
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
+            "ltm_server": _ltm_mcp_status(surfacing),
         }
     except Exception as exc:
         logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
@@ -2205,6 +2294,7 @@ def _surfacing_bootstrap_status() -> dict[str, Any]:
             "enabled": None,
             "feedback_enabled": None,
             "feedback_db": None,
+            "ltm_server": None,
             "error": str(exc) or type(exc).__name__,
         }
 
@@ -2236,6 +2326,18 @@ def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
             f"  feedback tables: {_warn('missing')} ({missing}) — "
             "surfacing has not initialized this DB"
         )
+    ltm_server = status.get("ltm_server")
+    if isinstance(ltm_server, dict):
+        if ltm_server.get("skipped") == "surfacing_disabled":
+            lines.append("  ltm server: skipped (surfacing disabled)")
+        elif ltm_server.get("connected"):
+            detail = str(ltm_server.get("display") or ltm_server.get("command") or "")
+            if ltm_server.get("version"):
+                detail = f"{detail}, version {ltm_server['version']}"
+            lines.append(f"  ltm server: {_ok('connectable')} ({detail})")
+        else:
+            err = ltm_server.get("error") or "unknown error"
+            lines.append(f"  ltm server: {_bad('UNREACHABLE')} — {err}")
     return lines
 
 
