@@ -417,6 +417,27 @@ class TestSurfacingFeedback:
         assert result.startswith("Error:")
         mock_tracker.record_feedback.assert_not_called()
 
+    async def test_batched_fallback_malformed_after_valid_persists_nothing(self):
+        """Reviewer pin: a malformed entry *after* a valid one must not
+        leave the valid entry's row committed. The engine path does
+        fail-fast via its own two-pass parse; an earlier inline-validate
+        loop in the tracker-only fallback let a partial prefix persist
+        when validation failed mid-batch.
+        """
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(surfacing_engine=None, feedback_tracker=mock_tracker)
+        result = await stm_surfacing_feedback(
+            surfacing_id="s1",
+            ratings=[
+                {"memory_id": "m1", "rating": "helpful"},  # valid
+                {"memory_id": "m2"},  # missing rating — must reject the whole batch
+            ],
+            ctx=ctx,
+        )
+        assert result.startswith("Error:")
+        # CRITICAL: the valid first entry must NOT have been recorded.
+        mock_tracker.record_feedback.assert_not_called()
+
 
 # ── stm_surfacing_stats ──────────────────────────────────────────────────
 

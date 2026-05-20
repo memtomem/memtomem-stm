@@ -717,8 +717,14 @@ def _record_batched_via_tracker(
     """
     if not ratings:
         return "Error: `ratings` must contain at least one entry."
-    recorded = 0
-    errors: list[str] = []
+
+    # Two-pass to match SurfacingEngine.handle_feedback_batch fail-fast
+    # semantics: parse + shape-validate every entry up-front so a bad
+    # entry mid-batch does not leave earlier ``record_feedback`` rows
+    # committed. The engine path does this via its own ``parsed`` list;
+    # an earlier inline-validate-then-record loop here silently diverged
+    # and let a malformed batch persist its prefix.
+    parsed: list[tuple[str, str]] = []
     for i, entry in enumerate(ratings):
         if not isinstance(entry, dict):
             return f"Error: ratings[{i}] must be an object."
@@ -728,12 +734,17 @@ def _record_batched_via_tracker(
             return f"Error: ratings[{i}] missing string `memory_id`."
         if not isinstance(rat, str):
             return f"Error: ratings[{i}] missing string `rating`."
+        parsed.append((mid, rat))
+
+    recorded = 0
+    errors: list[str] = []
+    for i, (mid, rat) in enumerate(parsed):
         result = tracker.record_feedback(surfacing_id, rat, mid)
         if isinstance(result, str) and result.startswith("Error"):
             errors.append(f"ratings[{i}]: {result}")
         else:
             recorded += 1
-    summary = f"Feedback recorded: {recorded}/{len(ratings)} entries"
+    summary = f"Feedback recorded: {recorded}/{len(parsed)} entries"
     if errors:
         summary += " — " + "; ".join(errors)
     return summary
