@@ -2242,9 +2242,7 @@ async def _probe_ltm_mcp_command(
     async with stdio_client(params, errlog=errlog) as streams:
         async with ClientSession(streams[0], streams[1]) as session:
             await asyncio.wait_for(session.initialize(), timeout=remaining())
-            tools_result = await asyncio.wait_for(
-                session.list_tools(), timeout=remaining()
-            )
+            tools_result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
             tool_names = {t.name for t in tools_result.tools}
             if "mem_search" not in tool_names:
                 return {
