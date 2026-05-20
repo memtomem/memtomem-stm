@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import pytest
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -1807,7 +1808,8 @@ class TestSurfacingLtmOutcomeDispatch:
         assert snap["skip_reasons"]["read_file"] == {"ltm_unavailable": 2}
         assert snap["cache"].get("hit", 0) == 0
 
-    async def test_first_ltm_unavailable_logs_warning_once(self, caplog):
+    @pytest.mark.parametrize("outcome", ["no_session", "transport_error"])
+    async def test_first_ltm_unavailable_logs_warning_once(self, outcome, caplog):
         """#349: the operator-visible signal for "LTM unreachable" was
         previously only a counter in ``stm_surfacing_stats`` that operators
         had to know to read. The first ``no_session`` / ``transport_error``
@@ -1815,8 +1817,14 @@ class TestSurfacingLtmOutcomeDispatch:
         ``ltm_mcp_command`` so the operator can grep their logs and so
         ``mms health`` becomes a discoverable next step. Subsequent skips
         increment the counter only — the WARNING must not repeat per call,
-        matching the prepend-on-progressive WARNING-once pattern (#348)."""
-        engine, obs = self._engine(outcome="no_session")
+        matching the prepend-on-progressive WARNING-once pattern (#348).
+
+        Parametrized across both outcomes that map to ``ltm_unavailable``:
+        a single-outcome test would silently pass if the engine condition
+        were narrowed to ``if outcome == "no_session"`` only — the
+        ``transport_error`` branch would lose its warning with no
+        regression signal."""
+        engine, obs = self._engine(outcome=outcome)
         args = {"_context_query": "ltm unreachable warning probe"}
 
         with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
