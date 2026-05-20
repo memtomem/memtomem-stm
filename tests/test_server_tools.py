@@ -456,9 +456,7 @@ class TestSurfacingStats:
         # tuner's cold-start fallback would fire on the next surfacing.
         # Readiness label reflects that, not the per-tool count alone.
         cold_row = next(
-            line
-            for line in result.splitlines()
-            if "cold_tool:" in line and "events" in line
+            line for line in result.splitlines() if "cold_tool:" in line and "events" in line
         )
         assert "auto-tune ready" in cold_row
         assert "need" not in cold_row
@@ -468,9 +466,12 @@ class TestSurfacingStats:
 
     async def test_need_more_uses_global_gap_when_pool_also_below_threshold(self):
         """When *both* the tool's own and the global pool are below
-        ``min_samples``, the "need N more" message must reflect the
-        cold-start gap — the global shortfall — since that's the smaller
-        of the two gates and is what the tuner is actually waiting on."""
+        ``min_samples``, the "need N more" message surfaces both numbers
+        side-by-side (#361). The global gap is the one the tuner is
+        actually waiting on (cold-start fallback), but the per-tool gap
+        is what the row's own feedback would need without the fallback;
+        operators previously read the single global figure as their own
+        tool's shortfall, so both are now rendered when they diverge."""
         mock_tracker = MagicMock()
         mock_tracker.get_stats.return_value = {
             "events_total": 1,
@@ -507,12 +508,62 @@ class TestSurfacingStats:
         result = await stm_surfacing_stats(ctx=ctx)
 
         row = next(
-            line
-            for line in result.splitlines()
-            if "lonely_tool:" in line and "events" in line
+            line for line in result.splitlines() if "lonely_tool:" in line and "events" in line
         )
-        # Gap reported against global pool (20 - 7 = 13), not per-tool (20 - 2 = 18).
-        assert "need 13 more for auto-tune" in row
+        # Both gaps render side-by-side: global pool (20 - 7 = 13) is the
+        # binding gate, but the per-tool figure (20 - 2 = 18) also surfaces
+        # so the global number isn't misread as the tool's own shortfall.
+        assert "need 13 more (global pool) or 18 more for this tool" in row
+        # The legacy single-number form must NOT appear when the gaps diverge
+        # (it would still parse as a substring of the dual form if we didn't
+        # explicitly check the trailing context).
+        assert "need 13 more for auto-tune" not in row
+
+    async def test_need_more_renders_single_number_when_one_tool_owns_pool(self):
+        """When a single tool owns the entire feedback pool the per-tool
+        and global gaps coincide, so the legacy single-number label is
+        preserved to avoid redundant `N more (global pool) or N more for
+        this tool` output. Pins the equal-gap branch of the #361 split."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [
+                {
+                    "tool": "solo_tool",
+                    "events": 4,
+                    "avg_memory_count": 1.0,
+                    "feedback_count": 5,
+                    "not_relevant_count": 1,
+                },
+            ],
+            "rating_distribution": {"helpful": 4, "not_relevant": 1},
+            "total_feedback": 5,
+            "recent": [],
+        }
+        # Single tool owns the whole pool: per-tool 5 == global 5, both
+        # below the 20-sample threshold.
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {"solo_tool": 5}
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": True,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        row = next(
+            line for line in result.splitlines() if "solo_tool:" in line and "events" in line
+        )
+        assert "need 15 more for auto-tune" in row
+        # No dual-figure rendering when the gaps coincide.
+        assert "(global pool)" not in row
+        assert "for this tool" not in row
 
     async def test_cold_start_tuned_tool_reported_as_tuned(self):
         """AutoTuner's cold-start fallback (feedback.py::maybe_adjust) can
@@ -553,9 +604,7 @@ class TestSurfacingStats:
         result = await stm_surfacing_stats(ctx=ctx)
 
         row = next(
-            line
-            for line in result.splitlines()
-            if "cold_but_tuned:" in line and "events" in line
+            line for line in result.splitlines() if "cold_but_tuned:" in line and "events" in line
         )
         assert "auto-tuned" in row
         assert "need" not in row
@@ -613,9 +662,7 @@ class TestSurfacingStats:
         # Filter to "By tool:" breakdown rows (they include "events"), not the
         # Min-score-block sublist row that also mentions pinned_tool.
         pinned_row = next(
-            line
-            for line in result.splitlines()
-            if "pinned_tool:" in line and "events" in line
+            line for line in result.splitlines() if "pinned_tool:" in line and "events" in line
         )
         assert "pinned 0.045" in pinned_row
         assert "auto-tuned" not in pinned_row
@@ -623,9 +670,7 @@ class TestSurfacingStats:
         assert "for auto-tune" not in pinned_row
         # The un-overridden sibling still gets its readiness label:
         tunable_row = next(
-            line
-            for line in result.splitlines()
-            if "tunable_tool:" in line and "events" in line
+            line for line in result.splitlines() if "tunable_tool:" in line and "events" in line
         )
         assert "auto-tune ready" in tunable_row
 
@@ -722,9 +767,7 @@ class TestSurfacingStats:
         result = await stm_surfacing_stats(since="2026-04-01T00:00:00", ctx=ctx)
 
         row = next(
-            line
-            for line in result.splitlines()
-            if "historic_tool:" in line and "events" in line
+            line for line in result.splitlines() if "historic_tool:" in line and "events" in line
         )
         assert "auto-tune ready" in row
         # Windowed feedback count is still reported for the operator's audit,
