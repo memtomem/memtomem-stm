@@ -3988,23 +3988,37 @@ class TestHealth:
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "30")
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
 
+        # ``--timeout 3`` (not 1) gives initialize + list_tools headroom on
+        # slow CI runners where Python child startup + FastMCP boot can eat
+        # several hundred ms; we still want the version stall to be bounded
+        # at ~3s, not 30s.
         start = time.perf_counter()
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from memtomem_stm.cli.proxy import cli; cli()",
-                "health",
-                "--json",
-                "--timeout",
-                "1",
-                "--config",
-                str(config),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from memtomem_stm.cli.proxy import cli; cli()",
+                    "health",
+                    "--json",
+                    "--timeout",
+                    "3",
+                    "--config",
+                    str(config),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Pre-fix this is the canonical regression mode: the version
+            # probe gets the full ``TIMEOUT_SECONDS=30`` budget on top of
+            # initialize/list_tools, so the outer 20s watchdog trips before
+            # ``mms health`` returns.
+            raise AssertionError(
+                f"LTM probe didn't honor shared budget — outer subprocess "
+                f"timed out at {exc.timeout}s (expected ~3s wall time)"
+            ) from exc
         elapsed = time.perf_counter() - start
 
         assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
@@ -4015,11 +4029,12 @@ class TestHealth:
         assert ltm["connected"] is True, ltm
         # Version probe was budget-starved → silently dropped, not reported.
         assert ltm["version"] is None, ltm
-        # Pre-fix this would have run ~30s (surfacing.timeout_seconds was the
-        # version probe's bound). Post-fix the shared budget caps it near
-        # the 1s ``--timeout``; ~5s gives plenty of room for subprocess
-        # spawn + Python startup on slow CI without being a no-op check.
-        assert elapsed < 5.0, f"shared-budget probe took {elapsed:.2f}s"
+        # Pre-fix the version probe alone would burn ~30s; post-fix the
+        # shared budget caps it near the 3s ``--timeout``. 10s upper bound
+        # gives plenty of slack for slow CI without being a no-op check —
+        # pre-fix elapsed would actually trip the outer 20s
+        # ``subprocess.run`` first (caught above).
+        assert elapsed < 10.0, f"shared-budget probe took {elapsed:.2f}s"
 
     def test_health_missing_config(self, runner, config):
         """Missing file → distinguish from empty-config so a user pointing
