@@ -597,6 +597,17 @@ class FeedbackStore:
         """
         return self._get_tool_rating_ratio(tool, ("not_relevant",), min_samples)
 
+    def get_tool_helpful_ratio(self, tool: str | None, min_samples: int = 20) -> float | None:
+        """Return ratio of ``helpful`` feedback. None if insufficient samples.
+
+        Strictly counts the explicit positive signal — ``partially_helpful``
+        is intentionally excluded so a tool whose feedback is mostly
+        "useful context but not directly used" does not pull
+        ``min_score`` down. Mirrors :meth:`get_tool_negative_ratio` for
+        symmetric AutoTuner band checks after #353 part 2.
+        """
+        return self._get_tool_rating_ratio(tool, ("helpful",), min_samples)
+
     # ── AutoTuner persistence ──────────────────────────────────────────
 
     def load_adjustments(self) -> dict[str, float]:

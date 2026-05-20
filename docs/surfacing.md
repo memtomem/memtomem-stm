@@ -55,7 +55,7 @@ When memories are found, they're wrapped in `<surfaced-memories>` XML tags and i
 <surfaced-memories>
 ## Relevant Memories
 _surfacing_id: abc123def456_
-> Rate (one of "helpful" | "not_relevant" | "already_known"): `stm_surfacing_feedback(surfacing_id="abc123def456", rating="helpful")`
+> Rate (one of "helpful" | "partially_helpful" | "not_relevant" | "already_known"): `stm_surfacing_feedback(surfacing_id="abc123def456", rating="helpful")`
 
 - **auth_notes.md** [code-notes] (score=0.85): OAuth2 implementation uses PKCE flow...
 - **api_design.md** (score=0.72): Rate limiting is handled by middleware in...
@@ -94,7 +94,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `cache_ttl_seconds` | `60.0` | Internal surfacing result cache TTL |
 | `circuit_max_failures` | `3` | Consecutive failures before circuit breaker opens |
 | `circuit_reset_seconds` | `60.0` | Seconds before half-open probe after circuit opens |
-| `auto_tune_enabled` | `true` | Auto-adjust `min_score` from feedback: >60% `not_relevant` raises it (stricter), <20% lowers it (more inclusive) |
+| `auto_tune_enabled` | `true` | Auto-adjust `min_score` from feedback: >60% negative (`not_relevant` + `already_known`) raises it (stricter), >80% strictly `helpful` lowers it (more inclusive); `partially_helpful` is neutral |
 | `auto_tune_min_samples` | `20` | Minimum feedback entries before adjusting per-tool score |
 | `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
 | `feedback_enabled` | `true` | Enable the feedback recording and `stm_surfacing_feedback` tool |
@@ -249,19 +249,33 @@ Rate surfaced memories to improve future relevance:
 
 ```
 stm_surfacing_feedback(surfacing_id="abc123", rating="helpful")
-stm_surfacing_feedback(surfacing_id="def456", rating="not_relevant")
-stm_surfacing_feedback(surfacing_id="ghi789", rating="already_known")
+stm_surfacing_feedback(surfacing_id="def456", rating="partially_helpful")
+stm_surfacing_feedback(surfacing_id="ghi789", rating="not_relevant")
+stm_surfacing_feedback(surfacing_id="jkl012", rating="already_known")
 ```
 
-Valid ratings: `helpful`, `not_relevant`, `already_known`.
+For an event with multiple memories that deserve different ratings, send them in one call via the batched form — the engine fans out internally and collapses `helpful` boosts to a single `mem_do(increment_access)`:
 
-When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback. In plain terms: **`not_relevant` and `already_known` ratings push `min_score` up** (surfacing becomes more selective), while a run of **`helpful` ratings pushes it down** (surfacing becomes more inclusive) because they keep the negative-feedback ratio low. Concretely:
+```
+stm_surfacing_feedback(
+  surfacing_id="abc123",
+  ratings=[
+    {"memory_id": "m1", "rating": "helpful"},
+    {"memory_id": "m2", "rating": "partially_helpful"},
+    {"memory_id": "m3", "rating": "not_relevant"},
+  ],
+)
+```
+
+Valid ratings: `helpful`, `partially_helpful`, `not_relevant`, `already_known`. `partially_helpful` is neutral — useful context but not directly used; it counts toward the denominator of the auto-tune ratios but contributes to neither the raise nor the lower band.
+
+When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on feedback. Two independent band checks (#353 part 2): a high **negative** ratio raises `min_score` (surfacing becomes more selective); a high **helpful** ratio lowers it (surfacing becomes more inclusive). `partially_helpful` lands in the denominator only, so a tool whose feedback is mostly "useful context" stays put rather than getting pulled in either direction.
 
 | Feedback ratio | Action |
 |----------------|--------|
 | > 60% negative (`not_relevant` + `already_known`) | Raise `min_score` by +0.002 (surface fewer, more relevant) |
-| < 20% negative | Lower `min_score` by -0.002 (surface more) |
-| 20–60% negative | Hold current `min_score` |
+| > 80% strictly `helpful` | Lower `min_score` by -0.002 (surface more) |
+| otherwise | Hold current `min_score` |
 
 Adjustment step is `auto_tune_score_increment` (default `0.002`) and the tuned score is clamped to `[0.005, 0.05]`.
 
@@ -270,11 +284,11 @@ flowchart LR
     Sample["new feedback"] --> N{"≥ 20 samples<br/>for this tool?"}
     N -->|no| Cold["use global ratio<br/>(cold-start fallback)"]
     N -->|yes| Local["use per-tool ratio"]
-    Cold --> R{"negative<br/>ratio?"}
+    Cold --> R{"band?"}
     Local --> R
-    R -->|"> 60%"| Up["min_score += 0.002<br/>(surface less)"]
-    R -->|"< 20%"| Down["min_score -= 0.002<br/>(surface more)"]
-    R -->|"20-60%"| Hold["no change"]
+    R -->|"negative > 60%"| Up["min_score += 0.002<br/>(surface less)"]
+    R -->|"helpful > 80%"| Down["min_score -= 0.002<br/>(surface more)"]
+    R -->|"otherwise"| Hold["no change<br/>(incl. partially_helpful)"]
     Up --> Cap["clamp to<br/>[0.005, 0.05]"]
     Down --> Cap
     Cap --> Tool[("per-tool<br/>min_score")]

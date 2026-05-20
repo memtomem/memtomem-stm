@@ -454,6 +454,7 @@ class TestAutoTuner:
         not_relevant: int,
         helpful: int,
         already_known: int = 0,
+        partially_helpful: int = 0,
     ):
         store.record_surfacing("s1", "sv", tool, "q", ["m1"], [0.5])
         for _ in range(not_relevant):
@@ -462,6 +463,8 @@ class TestAutoTuner:
             store.record_feedback("s1", "already_known")
         for _ in range(helpful):
             store.record_feedback("s1", "helpful")
+        for _ in range(partially_helpful):
+            store.record_feedback("s1", "partially_helpful")
 
     def test_high_not_relevant_raises_threshold(self, feedback_store: FeedbackStore):
         self._seed_feedback(feedback_store, "t", not_relevant=5, helpful=1)
@@ -545,3 +548,56 @@ class TestAutoTuner:
         feedback_store.save_adjustment("tool_b", 0.015)
         feedback_store.save_adjustment("tool_a", 0.030)  # upsert overwrites
         assert feedback_store.load_adjustments() == {"tool_a": 0.030, "tool_b": 0.015}
+
+    # ── #353 part 2: partially_helpful is neutral ───────────────────────
+
+    def test_partially_helpful_does_not_lower_threshold(self, feedback_store: FeedbackStore):
+        """A tool whose feedback is mostly ``partially_helpful`` must NOT
+        trigger the lower-threshold branch — that signal means "useful
+        context but not directly used," not "surface more aggressively."
+        Pre-#353 the old ``negative_ratio < 0.2`` branch fired on this
+        shape because ``partially_helpful`` diluted the negative ratio
+        to ~0; the split helpful/negative branches make it a true no-op.
+        """
+        self._seed_feedback(feedback_store, "t", not_relevant=0, helpful=0, partially_helpful=10)
+        tuner = self._make_tuner(feedback_store)
+        assert tuner.maybe_adjust("t") is None
+
+    def test_partially_helpful_does_not_count_as_helpful(self, feedback_store: FeedbackStore):
+        """Mixed helpful + partially_helpful at the boundary: 7 helpful +
+        3 partially_helpful gives a helpful ratio of 0.7, below the 0.8
+        lower-threshold gate, so the tuner stays put. If
+        ``partially_helpful`` were aliased into ``helpful`` the ratio
+        would be 1.0 and the threshold would drop.
+        """
+        self._seed_feedback(feedback_store, "t", not_relevant=0, helpful=7, partially_helpful=3)
+        tuner = self._make_tuner(feedback_store)
+        assert tuner.maybe_adjust("t") is None
+
+    def test_partially_helpful_counts_in_denominator_dilutes_negative(
+        self, feedback_store: FeedbackStore
+    ):
+        """5 not_relevant + 5 partially_helpful = total 10, negative ratio
+        0.5 — below the 0.6 raise gate. Without ``partially_helpful`` in
+        the denominator (numerator only) the ratio would be 1.0 and fire.
+        """
+        self._seed_feedback(feedback_store, "t", not_relevant=5, helpful=0, partially_helpful=5)
+        tuner = self._make_tuner(feedback_store)
+        assert tuner.maybe_adjust("t") is None
+
+    def test_partially_helpful_records_as_valid_rating(self, tmp_path: Path):
+        """VALID_RATINGS extension end-to-end — tracker accepts the value
+        and the row lands in the store with the expected rating string.
+        """
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        tracker = FeedbackTracker(SurfacingConfig(), db_path=tmp_path / "fb.db")
+        try:
+            tracker.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
+            result = tracker.record_feedback("s1", "partially_helpful")
+            assert "recorded" in result.lower()
+            assert "partially_helpful" in result
+            summary = tracker.store.get_tool_feedback_summary(tool="t")
+            assert summary["by_rating"].get("partially_helpful") == 1
+        finally:
+            tracker.close()
