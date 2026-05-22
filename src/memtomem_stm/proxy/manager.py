@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.cache import ProxyCache
+    from memtomem_stm.proxy.pending_store import PendingStore
     from memtomem_stm.proxy.protocols import FileIndexer
     from memtomem_stm.proxy.relevance import RelevanceScorer
     from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -929,11 +930,13 @@ class ProxyManager:
         if self._progressive_store is None or (
             sel_cfg is not None and sel_cfg != self._progressive_store_cfg
         ):
+            store: PendingStore
             if sel_cfg is not None and sel_cfg.pending_store == "sqlite":
                 from memtomem_stm.proxy.pending_store import SQLitePendingStore
 
-                store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
-                store.initialize()
+                sqlite_store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+                sqlite_store.initialize()
+                store = sqlite_store
             else:
                 from memtomem_stm.proxy.pending_store import InMemoryPendingStore
 
