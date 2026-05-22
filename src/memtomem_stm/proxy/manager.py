@@ -506,6 +506,11 @@ class ProxyManager:
         from memtomem_stm.proxy.relevance import create_scorer
 
         sc = config.relevance_scorer
+        # ``embedding_base_url`` is typed ``str | None`` but the
+        # ``_apply_provider_default_url`` model validator substitutes the
+        # provider default (Ollama / OpenAI) whenever the field is omitted,
+        # so by this point it is always populated.
+        assert sc.embedding_base_url is not None
         return create_scorer(
             scorer_type=sc.scorer,
             provider=sc.embedding_provider,
