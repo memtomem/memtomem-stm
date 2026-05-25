@@ -6,6 +6,12 @@ call is a sub-second round trip instead of a ~6s cold start. Requests are
 token-authenticated and dispatched over the newline-JSON
 :mod:`~memtomem_stm.daemon.protocol`.
 
+Single-instance is enforced by the lifetime ownership lock
+(:mod:`~memtomem_stm.daemon.locking`): ``serve`` acquires it (with a brief
+retry) **before** building the engine and holds it until teardown, so a
+redundant/late daemon exits without warming an LTM. This replaces the older
+``ping``-based guard, closing its TOCTOU window and recycled-PID weakness.
+
 Engine wiring is the **dedup-only** variant of ``server.py``'s app_lifespan: a
 ``FeedbackTracker`` is attached so cross-session dedup (``seen_memories``)
 survives restarts, but ``record_feedback_events=False`` means no query text is
@@ -32,7 +38,7 @@ from typing import Any
 
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig
-from memtomem_stm.daemon import client, discovery
+from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_PING,
@@ -64,6 +70,12 @@ async def _quiet(coro: Any, what: str) -> None:
 class DaemonServer:
     """A single-process loopback surfacing daemon."""
 
+    # Lifetime-lock acquire: retry briefly so a losing/late child becomes a warm
+    # standby that grabs the lock the instant an incumbent releases (closes the
+    # crash-during-build dead window) without ever building an engine to lose it.
+    _LOCK_ACQUIRE_RETRY_SECONDS = 1.5
+    _LOCK_ACQUIRE_POLL_SECONDS = 0.05
+
     def __init__(self, config: STMConfig) -> None:
         self._config = config
         self._host = config.daemon.host
@@ -84,18 +96,42 @@ class DaemonServer:
     async def serve(self) -> int:
         """Run until shutdown (signal, idle timeout, or ``shutdown`` op).
 
-        Refuses to start a second daemon if a live one already answers ``ping``.
+        Holds the lifetime ownership lock for the whole run: a second daemon
+        that can't acquire it (within a brief retry window) exits *before*
+        warming an LTM, so "lock held" is the authoritative single-owner signal.
         Returns a process exit code.
         """
-        existing = await client.ping(self._config, timeout=2.0)
-        if existing is not None:
-            logger.warning(
-                "daemon already running (pid=%s port=%s) — not starting another",
-                existing.get("pid"),
-                existing.get("port"),
-            )
+        try:
+            fd = locking.open_lock_fd(locking.lock_path(self._config.data_dir))
+        except OSError:
+            logger.warning("daemon could not open the lock file — exiting", exc_info=True)
             return 0
+        try:
+            if not await self._acquire_lifetime_lock(fd):
+                return 0
+            return await self._serve_owned()
+        finally:
+            locking.release_lock(fd)
 
+    async def _acquire_lifetime_lock(self, fd: int) -> bool:
+        """Take the lifetime lock, retrying briefly so a losing/late child becomes
+        a warm standby that grabs it the instant an incumbent releases. Retry the
+        lock acquisition ONLY — the (expensive) engine build happens once, after.
+        Async sleep (never ``time.sleep``) so it doesn't block the event loop."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._LOCK_ACQUIRE_RETRY_SECONDS
+        while not locking.try_lock(fd):
+            if loop.time() >= deadline:
+                # Best-effort pid for a friendly log; gate nothing on it.
+                raw = discovery.read_handshake(discovery.handshake_path(self._config.data_dir))
+                pid = raw.get("pid") if isinstance(raw, dict) else None
+                logger.warning("another daemon already owns the lock (pid=%s) — exiting", pid)
+                return False
+            await asyncio.sleep(self._LOCK_ACQUIRE_POLL_SECONDS)
+        return True
+
+    async def _serve_owned(self) -> int:
+        """The serve body, run with the lifetime lock held."""
         self._build_engine()
         self._last_request = time.monotonic()
         server = await asyncio.start_server(

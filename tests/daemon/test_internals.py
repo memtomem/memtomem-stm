@@ -111,6 +111,7 @@ def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest
         ("use_daemon", True),
         ("fallback", "cold"),
         ("daemon_timeout_seconds", 9.9),
+        ("auto_spawn", False),
     ]:
         c = STMConfig()
         setattr(c.hook, field, value)
@@ -121,10 +122,14 @@ def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest
     assert discovery.config_fingerprint(c) != fp
 
 
-def test_start_holds_spawn_lock_through_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # Two concurrent `mms daemon start` must not both spawn. The lock has to be
-    # held across _wait_ready(), not just across the spawn call — otherwise a
-    # second start acquires it before our child publishes its handshake.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock re-entrancy semantics")
+def test_start_does_not_hold_lock_through_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Inverted invariant (vs the pre-lifetime-lock design): single-owner
+    # protection now lives in the daemon, so `mms daemon start` must NOT hold the
+    # lock while polling readiness — the spawned child needs to acquire it. A
+    # fresh acquire during _wait_ready() therefore SUCCEEDS.
     from unittest.mock import AsyncMock
 
     from click.testing import CliRunner
@@ -134,12 +139,12 @@ def test_start_holds_spawn_lock_through_readiness(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
     monkeypatch.setattr("memtomem_stm.daemon.client.ping", AsyncMock(return_value=None))
-    monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._spawn_detached", lambda: None)
+    # request_spawn reports "spawned" without launching a real detached daemon.
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda config: True)
 
     observed: dict[str, bool] = {}
 
     def fake_wait_ready(config, *, timeout):
-        # start_cmd must still hold the lock here → a fresh acquire fails.
         with single_owner_lock(lock_path(config.data_dir)) as got:
             observed["acquired_during_wait"] = got
         return None
@@ -148,7 +153,69 @@ def test_start_holds_spawn_lock_through_readiness(tmp_path: Path, monkeypatch: p
 
     result = CliRunner().invoke(cli, ["daemon", "start"])
     assert result.exit_code == 0
-    assert observed["acquired_during_wait"] is False  # lock held across readiness
+    assert observed["acquired_during_wait"] is True  # lock NOT held across readiness
+
+
+# ── spawn (request_spawn) ─────────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock re-entrancy semantics")
+def test_request_spawn_skips_when_lock_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from memtomem_stm.daemon import spawn
+    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+
+    cfg = STMConfig()
+    cfg.data_dir = tmp_path
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
+    with single_owner_lock(lock_path(cfg.data_dir)) as held:
+        assert held is True
+        assert spawn.request_spawn(cfg) is False  # a live owner → defer
+    assert calls == []  # no duplicate spawn launched
+
+
+def test_request_spawn_spawns_when_lock_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from memtomem_stm.daemon import spawn
+    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+
+    cfg = STMConfig()
+    cfg.data_dir = tmp_path
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
+    assert spawn.request_spawn(cfg) is True
+    assert calls == [1]  # spawned exactly once
+    # The probe released the lock → the child can still acquire it.
+    with single_owner_lock(lock_path(cfg.data_dir)) as got:
+        assert got is True
+
+
+def test_request_spawn_swallows_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from memtomem_stm.daemon import locking, spawn
+
+    cfg = STMConfig()
+    cfg.data_dir = tmp_path
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
+
+    def _boom(_path):
+        raise OSError("cannot open lock file")
+
+    monkeypatch.setattr(locking, "single_owner_lock", _boom)
+    assert spawn.request_spawn(cfg) is False  # never raises into the hot path
+    assert calls == []
+
+
+# ── config (hook auto_spawn) ──────────────────────────────────────────────────
+
+
+def test_hook_auto_spawn_default_true(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__AUTO_SPAWN", raising=False)
+    assert STMConfig().hook.auto_spawn is True
+
+
+def test_hook_auto_spawn_env_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__AUTO_SPAWN", "0")
+    assert STMConfig().hook.auto_spawn is False
 
 
 async def test_request_respects_single_wall_clock_budget(monkeypatch: pytest.MonkeyPatch):

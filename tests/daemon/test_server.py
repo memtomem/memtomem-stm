@@ -9,10 +9,13 @@ RPC. That keeps the suite deterministic even on a dev box with a live LTM.
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
+
+import pytest
 
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
@@ -253,12 +256,181 @@ async def test_idle_shutdown_stops_daemon(tmp_path: Path) -> None:
 async def test_hook_run_hook_skips_when_daemon_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Daemon enabled but none running, default fallback=skip → {} (no cold path).
+    # Daemon enabled but none running, default fallback=skip → {} (no cold path),
+    # AND auto-spawn (default on) kicks off a background spawn for the next call.
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
     monkeypatch.delenv("MEMTOMEM_STM_HOOK__FALLBACK", raising=False)
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__AUTO_SPAWN", raising=False)
+
+    from memtomem_stm.daemon import spawn
+
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "request_spawn", lambda cfg: bool(calls.append(1)) or True)
 
     from memtomem_stm.cli.hook_cmd import _run_hook
 
     out = await _run_hook(_READ_PAYLOAD)
     assert out == {}
+    assert calls == [1]  # fire-and-forget spawn requested
+
+
+async def test_hook_run_hook_no_autospawn_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AUTO_SPAWN=0 → degrade to {} without requesting a spawn.
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__AUTO_SPAWN", "0")
+
+    from memtomem_stm.daemon import spawn
+
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "request_spawn", lambda cfg: calls.append(1))
+
+    from memtomem_stm.cli.hook_cmd import _run_hook
+
+    out = await _run_hook(_READ_PAYLOAD)
+    assert out == {}
+    assert calls == []
+
+
+async def test_hook_run_hook_autospawn_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A spawn failure must never break the hook — it still degrades to {}.
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+
+    from memtomem_stm.daemon import spawn
+
+    def _boom(cfg):
+        raise RuntimeError("spawn blew up")
+
+    monkeypatch.setattr(spawn, "request_spawn", _boom)
+
+    from memtomem_stm.cli.hook_cmd import _run_hook
+
+    out = await _run_hook(_READ_PAYLOAD)
+    assert out == {}
+
+
+async def test_hook_run_hook_autospawn_with_fallback_cold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fallback=cold → request a spawn (for next call) AND still run the cold
+    # in-process path for THIS call. The two are independent.
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__FALLBACK", "cold")
+
+    import memtomem_stm.cli.hook_cmd as hook_cmd
+    from memtomem_stm.daemon import spawn
+
+    spawned: list[int] = []
+    monkeypatch.setattr(spawn, "request_spawn", lambda cfg: spawned.append(1))
+
+    cold: list[dict] = []
+
+    async def _fake_cold(payload):
+        cold.append(payload)
+        return {"cold": True}
+
+    monkeypatch.setattr(hook_cmd, "run_surfacing_hook", _fake_cold)
+
+    out = await hook_cmd._run_hook(_READ_PAYLOAD)
+    assert spawned == [1]  # spawn kicked off for next call
+    assert cold == [_READ_PAYLOAD]  # cold path ran this call
+    assert out == {"cold": True}
+
+
+async def test_hook_run_hook_no_autospawn_when_daemon_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A live daemon answers surface → no spawn requested (we only spawn on None).
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(tmp_path / "fb.db"))
+    monkeypatch.setenv("MEMTOMEM_STM_DAEMON__IDLE_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+
+    from memtomem_stm.daemon import spawn
+
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "request_spawn", lambda cfg: calls.append(1))
+
+    from memtomem_stm.cli.hook_cmd import _run_hook
+
+    cfg = STMConfig()
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        out = await _run_hook(_READ_PAYLOAD)
+        assert "<surfaced-memories>" in out["hookSpecificOutput"]["additionalContext"]
+        assert calls == []  # live daemon → no duplicate spawn
+    finally:
+        await _stop(cfg, task)
+
+
+# ── lifetime ownership lock ───────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="same-process flock contention")
+async def test_second_daemon_returns_without_building_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # While daemon 1 owns the lifetime lock, a second daemon must exit 0 WITHOUT
+    # building an engine (the load-bearing ordering: no orphaned warm LTM).
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        monkeypatch.setattr(DaemonServer, "_LOCK_ACQUIRE_RETRY_SECONDS", 0.2)
+        d2 = DaemonServer(cfg)
+        built: list[int] = []
+        d2._build_engine = lambda: built.append(1)  # type: ignore[method-assign]
+        rc = await d2.serve()
+        assert rc == 0
+        assert built == []  # loser never warms an engine
+        assert d2._handshake_written is False
+    finally:
+        await _stop(cfg, task)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="same-process flock contention")
+async def test_daemon_holds_lock_for_lifetime(tmp_path: Path) -> None:
+    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        with single_owner_lock(lock_path(cfg.data_dir)) as got:
+            assert got is False  # held by the serving daemon
+    finally:
+        await _stop(cfg, task)
+    # Released on teardown → acquirable again.
+    with single_owner_lock(lock_path(cfg.data_dir)) as got:
+        assert got is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="same-process flock contention")
+async def test_lifetime_lock_retry_acquires_after_incumbent_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A late/losing daemon retries the acquire and becomes the owner the instant
+    # the incumbent releases — no dead window, and it builds exactly once after.
+    from memtomem_stm.daemon import locking
+
+    cfg = _config(tmp_path)
+    monkeypatch.setattr(DaemonServer, "_LOCK_ACQUIRE_RETRY_SECONDS", 3.0)
+
+    fd = locking.open_lock_fd(locking.lock_path(cfg.data_dir))
+    assert locking.try_lock(fd) is True  # hold it like a (mock) incumbent
+
+    server = DaemonServer(cfg)
+    server._build_engine = lambda: setattr(server, "_engine", _engine_with_result())  # type: ignore[method-assign]
+    task = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.2)  # daemon is now retrying the acquire
+    assert not handshake_path(cfg.data_dir).exists()  # hasn't built/published yet
+    locking.release_lock(fd)  # incumbent leaves
+    try:
+        await _await_handshake(cfg)  # proves it acquired → built → published
+    finally:
+        await _stop(cfg, task)

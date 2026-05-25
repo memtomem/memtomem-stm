@@ -11,7 +11,8 @@ Submodules:
 
 - :mod:`~memtomem_stm.daemon.protocol` — newline-delimited JSON framing + token.
 - :mod:`~memtomem_stm.daemon.discovery` — the ``stm-daemon.json`` handshake file.
-- :mod:`~memtomem_stm.daemon.locking` — cross-platform single-owner spawn lock.
+- :mod:`~memtomem_stm.daemon.locking` — cross-platform single-owner lifetime lock.
+- :mod:`~memtomem_stm.daemon.spawn` — lock-probed, fire-and-forget detached spawn.
 - :mod:`~memtomem_stm.daemon.server` — the asyncio server loop + warm engine.
 """
 

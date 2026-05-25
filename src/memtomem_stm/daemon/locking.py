@@ -1,18 +1,27 @@
-"""Cross-platform single-owner advisory lock.
+"""Cross-platform single-owner advisory lock — the daemon's lifetime ownership.
 
-Used to keep two concurrent ``mms hook`` auto-spawns (or two ``mms daemon
-start`` invocations) from racing to launch a second daemon. **This lock is the
-ownership primitive** — the port bind is *not*: the daemon binds an
-OS-assigned ephemeral port (``port 0``), so two daemons would simply get two
-different ports and both succeed, and the handshake file is last-writer-wins
-(the second overwrites the first, orphaning it). The guard against a second
-daemon is therefore: hold this lock across the start decision and re-check a
-``ping`` under it before spawning. A caller that fails to acquire assumes
-another process is mid-spawn and just polls the handshake file.
+**This lock is the ownership primitive** — the port bind is *not*: the daemon
+binds an OS-assigned ephemeral port (``port 0``), so two daemons would simply
+get two different ports and both succeed, and the handshake file is
+last-writer-wins (the second overwrites the first, orphaning it). Instead, the
+running daemon **holds this lock for its entire lifetime** (acquired before it
+warms its engine), so "lock held" is the authoritative "a daemon is alive"
+signal. A would-be spawner (``mms hook`` auto-spawn, ``mms daemon start``) only
+*probes* the lock: if it's held, a daemon already owns it, so don't launch a
+duplicate; if it's free, spawn — and the spawned child re-acquires the lock as
+the single owner, so a rare concurrent double-spawn just has the loser exit
+before warming an LTM.
+
+Two access shapes:
+- :func:`single_owner_lock` — a context manager for the *probe* (acquire,
+  yield, release). Used by ``request_spawn`` and ``mms daemon start``.
+- :func:`open_lock_fd` / :func:`try_lock` / :func:`release_lock` — the daemon
+  holds an fd across its whole asyncio run, retrying ``try_lock`` with
+  ``await asyncio.sleep`` and releasing on teardown.
 
 POSIX uses ``fcntl.flock``; Windows uses ``msvcrt.locking``. Both are advisory
-and auto-released if the holding process dies, so a crashed spawner never
-wedges the lock.
+and auto-released if the holding process dies, so a crashed daemon never wedges
+the lock (the next probe finds it free and self-heals).
 """
 
 from __future__ import annotations
@@ -29,8 +38,32 @@ LOCK_FILENAME = "stm-daemon.lock"
 
 
 def lock_path(data_dir: Path) -> Path:
-    """Absolute path to the spawn lock file under ``data_dir``."""
+    """Absolute path to the daemon's lifetime ownership lock under ``data_dir``."""
     return (data_dir / LOCK_FILENAME).expanduser()
+
+
+def open_lock_fd(path: Path) -> int:
+    """Open (creating) the lock file and return its fd. Caller owns the fd and
+    must :func:`release_lock` it. Raises ``OSError`` only if the file can't be
+    opened at all (which a caller may treat as "don't run / don't spawn")."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def try_lock(fd: int) -> bool:
+    """Non-blocking exclusive lock attempt on ``fd``. ``True`` iff acquired."""
+    return _try_lock(fd)
+
+
+def release_lock(fd: int) -> None:
+    """Best-effort unlock + close of a lock fd. Safe to call even if ``fd`` was
+    never locked (a never-acquired retry that timed out) — the unlock is
+    swallowed and the fd is always closed."""
+    _unlock(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        logger.debug("failed to close lock fd", exc_info=True)
 
 
 @contextmanager

@@ -70,6 +70,13 @@ class HookConfig(BaseModel):
     ~6s cold start, so the default never pays it. ``cold`` falls back to the
     in-process surfacing path (still bounded by ``_hook_budget_seconds()``),
     preserving pre-daemon behavior for callers who prefer it."""
+    auto_spawn: bool = True
+    """When ``True`` (and ``use_daemon``), ``mms hook`` fire-and-forget spawns
+    the daemon if none is running, so the *next* call is warm — no manual
+    ``mms daemon start`` needed. Lock-guarded against duplicate warm daemons.
+    Disable with ``MEMTOMEM_STM_HOOK__AUTO_SPAWN=0``. Client-only knob (like
+    ``use_daemon``/``fallback``) — excluded from the daemon config fingerprint,
+    so a daemon started with it off still matches an auto-spawning hook."""
     record_feedback_events: bool = False
     """Passed to the daemon's ``SurfacingEngine``. Default ``False`` keeps
     cross-session dedup (``seen_memories``, memory IDs only) while persisting
