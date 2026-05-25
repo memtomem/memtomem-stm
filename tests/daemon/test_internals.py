@@ -104,11 +104,13 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
 def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())
-    # Client-only hook fields must NOT move the fingerprint — a daemon started
-    # without USE_DAEMON must still match a hook that sets it (else the hook
-    # rejects the live daemon and returns {} forever under fallback=skip).
+    # Client-only hook fields must NOT move the fingerprint — the daemon's
+    # behavior is independent of them, so a live daemon must still match a hook
+    # that has opted out (else the hook rejects it and returns {} forever under
+    # fallback=skip). use_daemon defaults True now, so toggle it OFF to prove
+    # it's actually excluded.
     for field, value in [
-        ("use_daemon", True),
+        ("use_daemon", False),
         ("fallback", "cold"),
         ("daemon_timeout_seconds", 9.9),
         ("auto_spawn", False),
@@ -319,7 +321,17 @@ def test_request_spawn_swallows_oserror(tmp_path: Path, monkeypatch: pytest.Monk
     assert calls == []
 
 
-# ── config (hook auto_spawn) ──────────────────────────────────────────────────
+# ── config (hook use_daemon / auto_spawn) ─────────────────────────────────────
+
+
+def test_hook_use_daemon_default_true(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)
+    assert STMConfig().hook.use_daemon is True
+
+
+def test_hook_use_daemon_env_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    assert STMConfig().hook.use_daemon is False
 
 
 def test_hook_auto_spawn_default_true(monkeypatch: pytest.MonkeyPatch):

@@ -203,7 +203,10 @@ def status_cmd(as_json: bool) -> None:
     from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive, read_handshake
 
     config = _load_config()
-    use_daemon = config.hook.use_daemon
+    # The hook only reaches the daemon for eligible surfacing calls, so global
+    # surfacing-off means it never will — regardless of the use_daemon knob.
+    surfacing_on = config.surfacing.enabled
+    use_daemon = config.hook.use_daemon and surfacing_on
     hs = asyncio.run(client.ping(config, timeout=2.0))
     if hs is not None:
         uptime = max(0.0, time.time() - float(hs.get("created_at", time.time())))
@@ -249,7 +252,12 @@ def status_cmd(as_json: bool) -> None:
         )
     else:
         click.echo("stopped")
-    hint = "yes" if use_daemon else "no (set MEMTOMEM_STM_HOOK__USE_DAEMON=1)"
+    if use_daemon:
+        hint = "yes"
+    elif not surfacing_on:
+        hint = "no (surfacing disabled)"
+    else:
+        hint = "no (opted out via MEMTOMEM_STM_HOOK__USE_DAEMON=0)"
     click.echo(f"hook will use daemon: {hint}")
 
 

@@ -37,15 +37,18 @@ Register in Claude Code ``settings.json``::
       {"matcher": "Read|Grep|Glob|Bash",
        "hooks": [{"type": "command", "command": "mms hook"}]}]}}
 
-Performance — cold path vs daemon: the in-process path spawns a fresh LTM MCP
-child per call, and that cold start (embedding + reranker model load) measured
-~6s here, exceeding the default ``surfacing.timeout_seconds`` of 3.0 — so
-surfacing usually times out and returns ``{}``. The real fix is the local
-daemon: set ``MEMTOMEM_STM_HOOK__USE_DAEMON=1`` (and run ``mms daemon start``,
-or let the hook reach an already-running daemon) so each call is a sub-second
-round trip to a warm LTM connection. When the daemon is unreachable the hook
+Performance — daemon by default: surfacing routes through the local daemon
+(``HookConfig.use_daemon`` defaults ``True``), a warm LTM connection that turns
+each call into a sub-second round trip. The daemon is auto-spawned on first use
+(``auto_spawn``), so the first call typically returns ``{}`` while it warms up
+and later calls hit the warm process. The legacy in-process path spawns a fresh
+LTM MCP child per call, whose cold start (embedding + reranker model load)
+measured ~6s here — exceeding the default ``surfacing.timeout_seconds`` of 3.0,
+so it usually times out to ``{}``. Opt out with
+``MEMTOMEM_STM_HOOK__USE_DAEMON=0``; when the daemon is unreachable the hook
 degrades per ``HookConfig.fallback`` — ``skip`` (default) returns ``{}``,
-``cold`` runs the in-process path. To exercise the cold path directly, raise
+``cold`` runs the in-process path. To exercise the cold path directly, set
+``MEMTOMEM_STM_HOOK__USE_DAEMON=0``, raise
 ``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` (e.g. 8) and lower
 ``MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS``, accepting the per-call latency.
 """
@@ -271,17 +274,34 @@ def _read_payload(stream: TextIO) -> dict[str, Any] | None:
 def _daemon_enabled() -> bool:
     """Whether the hook should route through the local daemon.
 
-    Read directly from the environment (mirroring ``HookConfig.use_daemon``'s
-    ``MEMTOMEM_STM_HOOK__USE_DAEMON`` binding) so the default daemon-off path
-    pays no extra config load and behaves byte-for-byte as it did before the
-    daemon landed. ``_surface_tools()`` already reads its env knob this way.
+    Daemon mode is the default (``HookConfig.use_daemon=True``); unset → on. We
+    read ``MEMTOMEM_STM_HOOK__USE_DAEMON`` directly here (mirroring the field's
+    env binding) so the explicit opt-out path pays no extra config load —
+    ``_surface_tools()`` reads its env knob the same way. The falsy-token set
+    matches Pydantic's bool parsing so this and ``mms daemon status`` (which
+    reads the parsed field) agree on every value Pydantic accepts. We strip and
+    lower-case first, so a padded token like ``" off "`` still disables (Pydantic
+    doesn't strip and would reject it); any other value Pydantic rejects (empty,
+    garbage) returns enabled here, while a config load like ``mms daemon status``
+    would raise.
     """
-    return os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    val = os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "f", "no", "n", "off")
+
+
+def _hook_eligible(payload: dict[str, Any]) -> bool:
+    """Cheap pre-gate mirroring the head of :func:`_run_surfacing_hook_inner` —
+    a PostToolUse call for a surface-allowlisted tool. ``_run_hook`` uses it to
+    reject ineligible payloads (non-PostToolUse, or a missing/non-allowlisted
+    tool) before routing to — or auto-spawning — the daemon, so an off-target
+    hook call never warms a pointless daemon. The inner re-checks, so this is an
+    optimization, never the authority."""
+    if (payload.get("hook_event_name") or "PostToolUse") != "PostToolUse":
+        return False
+    tool_name = payload.get("tool_name")
+    return isinstance(tool_name, str) and tool_name in _surface_tools()
 
 
 async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
@@ -301,6 +321,12 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
         from memtomem_stm.daemon import client
 
         config = STMConfig()
+        # Reject ineligible payloads (surfacing globally off, non-PostToolUse, or
+        # a non-allowlisted tool) before routing to / spawning the daemon — an
+        # off-target hook call must not warm a pointless daemon. The cold path
+        # (run_surfacing_hook) re-checks, so this gate is an optimization.
+        if not config.surfacing.enabled or not _hook_eligible(payload):
+            return {}
         try:
             out = await client.surface(config, payload, timeout=config.hook.daemon_timeout_seconds)
         except Exception:
@@ -331,8 +357,9 @@ def hook_command() -> None:
 
     Reads the hook JSON payload on stdin and, for read-like built-in tools,
     prints a hook response whose ``additionalContext`` carries relevant LTM
-    memories. With ``MEMTOMEM_STM_HOOK__USE_DAEMON=1`` the surfacing runs in the
-    warm ``mms daemon`` (no per-call cold start); otherwise it runs in-process.
+    memories. By default the surfacing runs in the warm ``mms daemon`` (no
+    per-call cold start), auto-spawned on first use; set
+    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to run the legacy cold in-process path.
     Always exits 0; on any problem the tool output passes through unchanged
     (prints ``{}``).
     """
