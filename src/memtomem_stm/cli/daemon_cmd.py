@@ -106,7 +106,12 @@ def start_cmd() -> None:
     *different-config* daemon stays alive and won't release — that we report.
     """
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import config_fingerprint, handshake_path, read_handshake
+    from memtomem_stm.daemon.discovery import (
+        config_fingerprint,
+        handshake_path,
+        is_pid_alive,
+        read_handshake,
+    )
     from memtomem_stm.daemon.spawn import request_spawn
 
     config = _load_config()
@@ -118,6 +123,7 @@ def start_cmd() -> None:
         return
 
     deadline = time.time() + 10.0
+    spawned = False
     while time.time() < deadline:
         hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
@@ -127,21 +133,29 @@ def start_cmd() -> None:
             # We launched a child (lock was free). Give it a moment to acquire
             # the lock + publish, then loop back to ping it. We don't hold the
             # lock, so the child can take ownership.
+            spawned = True
             time.sleep(0.3)
             continue
-        # Lock held by another daemon. A *different-config* one stays alive and
-        # won't release the lock — report instead of waiting it out. (A matching
-        # daemon mid-startup, or any daemon mid-shutdown, falls through to wait:
-        # the next iteration re-attempts the spawn once the lock is free.)
-        raw = read_handshake(handshake_path(config.data_dir))
-        if raw is not None and raw.get("config_fingerprint") != config_fingerprint(config):
-            click.echo(
-                _warn(
-                    f"a daemon with a different config is running (pid={raw.get('pid')}) — "
-                    "run `mms daemon restart` to replace it"
+        # Lock held by another daemon. Only a *live* different-config daemon that
+        # we did not just spawn is a real conflict worth reporting: a stale
+        # handshake (dead pid) left by a crash, or the matching child we just
+        # spawned that hasn't published its handshake yet, must NOT be
+        # misreported. Everything else falls through to wait — the next
+        # iteration re-attempts the spawn once the lock frees.
+        if not spawned:
+            raw = read_handshake(handshake_path(config.data_dir))
+            if (
+                raw is not None
+                and raw.get("config_fingerprint") != config_fingerprint(config)
+                and is_pid_alive(int(raw.get("pid", -1)))
+            ):
+                click.echo(
+                    _warn(
+                        f"a daemon with a different config is running (pid={raw.get('pid')}) — "
+                        "run `mms daemon restart` to replace it"
+                    )
                 )
-            )
-            return
+                return
         time.sleep(0.2)
     click.echo(
         _warn(

@@ -159,6 +159,111 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
     assert "daemon started" in result.output
 
 
+def test_start_does_not_misreport_stale_handshake_after_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A crashed different-config daemon left a stale handshake. `start` spawns a
+    # matching child; while it's mid-startup (holds the lock, hasn't published)
+    # the stale handshake must NOT be misreported as a live config conflict.
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    discovery.write_handshake(
+        discovery.handshake_path(tmp_path),
+        pid=2**31 - 1,  # not a live process
+        host="127.0.0.1",
+        port=1,
+        token="t",
+        config_fingerprint="stale-different-fp",
+        created_at=0.0,
+    )
+
+    state = {"spawns": 0, "pings": 0}
+
+    def fake_request_spawn(config):
+        state["spawns"] += 1
+        return state["spawns"] == 1  # lock free → spawn; then "held" by our child
+
+    async def fake_ping(config, *, timeout=2.0):
+        state["pings"] += 1
+        return {"pid": 99, "port": 4567} if state["pings"] >= 4 else None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 0
+    assert "different config" not in result.output  # stale handshake not misreported
+    assert "daemon started" in result.output
+
+
+def test_start_ignores_stale_handshake_with_dead_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Lock held by a matching daemon mid-startup we did NOT spawn, with a stale
+    # different-config handshake (dead pid) on disk. The dead pid means "not a
+    # live conflict" → wait it out rather than misreport.
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    discovery.write_handshake(
+        discovery.handshake_path(tmp_path),
+        pid=2**31 - 1,
+        host="127.0.0.1",
+        port=1,
+        token="t",
+        config_fingerprint="stale-different-fp",
+        created_at=0.0,
+    )
+
+    state = {"pings": 0}
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda config: False)
+
+    async def fake_ping(config, *, timeout=2.0):
+        state["pings"] += 1
+        return {"pid": 7, "port": 4567} if state["pings"] >= 3 else None
+
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 0
+    assert "different config" not in result.output
+    assert "daemon started" in result.output
+
+
+def test_start_reports_live_different_config_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A genuinely live different-config daemon (alive pid) holds the lock → it
+    # won't release, so report it clearly instead of waiting out the deadline.
+    from unittest.mock import AsyncMock
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    discovery.write_handshake(
+        discovery.handshake_path(tmp_path),
+        pid=os.getpid(),  # alive
+        host="127.0.0.1",
+        port=1,
+        token="t",
+        config_fingerprint="a-different-fp",
+        created_at=0.0,
+    )
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda config: False)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", AsyncMock(return_value=None))
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 0
+    assert "a daemon with a different config is running" in result.output
+
+
 # ── spawn (request_spawn) ─────────────────────────────────────────────────────
 
 
