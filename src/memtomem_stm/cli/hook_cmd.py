@@ -37,15 +37,17 @@ Register in Claude Code ``settings.json``::
       {"matcher": "Read|Grep|Glob|Bash",
        "hooks": [{"type": "command", "command": "mms hook"}]}]}}
 
-Performance caveat — near-no-op with stock defaults: a fresh ``mms hook``
-process spawns a fresh LTM MCP child per call, and that cold start (embedding
-+ reranker model load) measured ~6s here, which exceeds the default
-``surfacing.timeout_seconds`` of 3.0 — so surfacing usually times out and
-returns ``{}``. The default ``surfacing.min_response_chars`` of 5000 also
-gates out small tool outputs. To make surfacing actually fire before the
-daemon lands, raise ``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` (e.g. 8) and
-lower ``MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS``, accepting the per-call
-latency. A persistent local daemon (warm LTM connection) is the real fix.
+Performance — cold path vs daemon: the in-process path spawns a fresh LTM MCP
+child per call, and that cold start (embedding + reranker model load) measured
+~6s here, exceeding the default ``surfacing.timeout_seconds`` of 3.0 — so
+surfacing usually times out and returns ``{}``. The real fix is the local
+daemon: set ``MEMTOMEM_STM_HOOK__USE_DAEMON=1`` (and run ``mms daemon start``,
+or let the hook reach an already-running daemon) so each call is a sub-second
+round trip to a warm LTM connection. When the daemon is unreachable the hook
+degrades per ``HookConfig.fallback`` — ``skip`` (default) returns ``{}``,
+``cold`` runs the in-process path. To exercise the cold path directly, raise
+``MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS`` (e.g. 8) and lower
+``MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS``, accepting the per-call latency.
 """
 
 from __future__ import annotations
@@ -266,21 +268,67 @@ def _read_payload(stream: TextIO) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _daemon_enabled() -> bool:
+    """Whether the hook should route through the local daemon.
+
+    Read directly from the environment (mirroring ``HookConfig.use_daemon``'s
+    ``MEMTOMEM_STM_HOOK__USE_DAEMON`` binding) so the default daemon-off path
+    pays no extra config load and behaves byte-for-byte as it did before the
+    daemon landed. ``_surface_tools()`` already reads its env knob this way.
+    """
+    return os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the hook output, preferring the warm daemon when enabled.
+
+    Degradation ladder (every rung still yields a hook-output dict, never
+    raises): daemon disabled → cold in-process path (unchanged). Daemon enabled
+    → one bounded round trip; on unavailable/stale/slow either ``{}`` (default
+    ``fallback=skip`` — the daemon exists precisely to avoid the ~6s cold start)
+    or the cold path (``fallback=cold``). The whole call runs inside
+    ``_hook_budget_seconds()`` in :func:`hook_command`.
+    """
+    if _daemon_enabled():
+        from memtomem_stm.config import STMConfig
+        from memtomem_stm.daemon import client
+
+        config = STMConfig()
+        try:
+            out = await client.surface(config, payload, timeout=config.hook.daemon_timeout_seconds)
+        except Exception:
+            logger.debug("daemon surface request failed", exc_info=True)
+            out = None
+        if out is not None:
+            return out
+        if config.hook.fallback != "cold":
+            return {}
+        # fallback=cold → fall through to the in-process surfacing path.
+    return await run_surfacing_hook(payload)
+
+
 @click.command(name="hook")
 def hook_command() -> None:
     """Surface STM memories for a host's built-in tool call (PostToolUse hook).
 
     Reads the hook JSON payload on stdin and, for read-like built-in tools,
     prints a hook response whose ``additionalContext`` carries relevant LTM
-    memories. Always exits 0; on any problem the tool output passes through
-    unchanged (prints ``{}``).
+    memories. With ``MEMTOMEM_STM_HOOK__USE_DAEMON=1`` the surfacing runs in the
+    warm ``mms daemon`` (no per-call cold start); otherwise it runs in-process.
+    Always exits 0; on any problem the tool output passes through unchanged
+    (prints ``{}``).
     """
     payload = _read_payload(sys.stdin)
     output: dict[str, Any] = {}
     if payload is not None:
         try:
             output = asyncio.run(
-                asyncio.wait_for(run_surfacing_hook(payload), timeout=_hook_budget_seconds())
+                asyncio.wait_for(_run_hook(payload), timeout=_hook_budget_seconds())
             )
         except Exception:
             logger.warning("hook surfacing failed — passing tool output through", exc_info=True)

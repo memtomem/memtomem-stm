@@ -50,12 +50,24 @@ class SurfacingEngine:
         feedback_tracker: Any | None = None,
         token_tracker: Any | None = None,
         observability: SurfacingObservability | None = None,
+        record_feedback_events: bool = True,
     ) -> None:
         self._config = config
         self._mcp_adapter = mcp_adapter
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
         self._token_tracker = token_tracker
+        # Decouple cross-session dedup from feedback-event recording. When a
+        # tracker is attached, it normally does two independent jobs: (1) seed
+        # ``_surfaced_ids`` + ``mark_surfaced`` for dedup (``seen_memories`` —
+        # memory IDs only, privacy-clean), and (2) mint a ``surfacing_id`` +
+        # ``record_surfacing`` the extracted query into ``surfacing_events`` +
+        # advertise a ``stm_surfacing_feedback`` rating prompt. The hook daemon
+        # path wants (1) but not (2): it has no in-band channel for the model to
+        # return a rating (the prompt would be unresolvable), and the query for
+        # ``Bash`` may carry secrets we refuse to persist. Set this ``False`` to
+        # keep dedup while skipping all feedback-event recording/prompting.
+        self._record_feedback_events = record_feedback_events
         # Public ``observability`` property still returns the original
         # ``SurfacingObservability | None`` so consumers (server.py) can
         # short-circuit on absence; ``_observability`` is the internal
@@ -504,9 +516,10 @@ class SurfacingEngine:
         self._observability.record_outcome(tool, "surfaced_cache_hit")
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
         # See ``_do_surface_miss``: only advertise a feedback ID we actually
-        # recorded, so a no-tracker path doesn't prompt for an unresolvable ID.
+        # recorded, so neither a no-tracker path nor the dedup-only daemon path
+        # (``record_feedback_events=False``) prompts for an unresolvable ID.
         surfacing_id: str | None = None
-        if self._feedback_tracker is not None:
+        if self._feedback_tracker is not None and self._record_feedback_events:
             surfacing_id = uuid.uuid4().hex[:16]
             try:
                 self._feedback_tracker.record_surfacing(
@@ -721,12 +734,14 @@ class SurfacingEngine:
                 scratch_items = None
 
         # Generate surfacing ID and record event. Only mint an ID when a
-        # tracker is attached to record it — otherwise the formatter would
-        # advertise a ``stm_surfacing_feedback(...)`` prompt for an event the
-        # server can't resolve. Both the ``mms hook`` path and the
-        # feedback-disabled server path run with no tracker.
+        # tracker is attached *and* feedback-event recording is on — otherwise
+        # the formatter would advertise a ``stm_surfacing_feedback(...)`` prompt
+        # for an event no in-band channel can resolve. Three cases skip it: the
+        # no-tracker ``mms hook`` / feedback-disabled server paths, and the hook
+        # daemon's dedup-only wiring (``record_feedback_events=False``) which
+        # keeps a tracker for ``seen_memories`` dedup but persists no query.
         surfacing_id: str | None = None
-        if self._feedback_tracker is not None:
+        if self._feedback_tracker is not None and self._record_feedback_events:
             surfacing_id = uuid.uuid4().hex[:16]
             try:
                 self._feedback_tracker.record_surfacing(

@@ -304,3 +304,62 @@ class TestCrossSessionDedup:
 
         output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "memory" in output
+
+
+# ── record_feedback_events flag (hook daemon dedup-only wiring) ───────────
+
+
+class TestRecordFeedbackEventsFlag:
+    """The hook daemon wires a FeedbackTracker for cross-session dedup but sets
+    ``record_feedback_events=False`` so it persists *no* query text and emits no
+    unresolvable ``stm_surfacing_feedback`` rating prompt. Dedup
+    (``seen_memories``, memory IDs only) must keep working; the feedback-event
+    side (``surfacing_events``, ``surfacing_id``) must be fully suppressed."""
+
+    @staticmethod
+    def _event_count(tracker) -> int:
+        row = tracker.store._db.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()
+        return row[0]
+
+    async def test_dedup_only_skips_event_and_prompt(self, tmp_path):
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "feedback.db")
+        chunk = FakeChunk(content="surfaced now")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+            record_feedback_events=False,
+        )
+
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        # Memory still surfaced ...
+        assert "surfaced now" in output
+        # ... and dedup still persisted (seen_memories holds the ID).
+        assert chunk.id in tracker.store.get_seen_ids(ttl_seconds=3600)
+        # But no feedback event was recorded and no rating prompt leaked.
+        assert self._event_count(tracker) == 0
+        assert "stm_surfacing_feedback" not in output
+        assert "surfacing_id" not in output
+
+        tracker.close()
+
+    async def test_default_records_event(self, tmp_path):
+        """Default (record_feedback_events=True) preserves the proxy-path behavior:
+        a surfacing event is recorded so feedback/stats keep working."""
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "feedback.db")
+        chunk = FakeChunk(content="surfaced now")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert self._event_count(tracker) == 1
+        assert chunk.id in tracker.store.get_seen_ids(ttl_seconds=3600)
+
+        tracker.close()
