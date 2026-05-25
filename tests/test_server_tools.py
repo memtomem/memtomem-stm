@@ -385,6 +385,27 @@ class TestSurfacingFeedback:
         assert result.startswith("Error:")
         assert "required" in result
 
+    async def test_legacy_memory_id_only_rejected_before_engine_dispatch(self):
+        """`memory_id` without `rating` is the legacy shape but lacks the
+        mandatory rating — reject up-front so `None` never reaches the
+        engine's `rating: str` parameter."""
+        mock_engine = AsyncMock()
+        ctx = _make_ctx(surfacing_engine=mock_engine)
+        result = await stm_surfacing_feedback(surfacing_id="s1", memory_id="m1", ctx=ctx)
+        assert result.startswith("Error:")
+        assert "rating" in result and "required" in result
+        mock_engine.handle_feedback.assert_not_awaited()
+
+    async def test_legacy_memory_id_only_rejected_before_tracker_dispatch(self):
+        """Same guard on the engine-absent path — never reaches the tracker's
+        `rating: str` parameter."""
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(surfacing_engine=None, feedback_tracker=mock_tracker)
+        result = await stm_surfacing_feedback(surfacing_id="s1", memory_id="m1", ctx=ctx)
+        assert result.startswith("Error:")
+        assert "rating" in result and "required" in result
+        mock_tracker.record_feedback.assert_not_called()
+
     async def test_batched_fallback_to_tracker(self):
         """Engine-absent path fans out via the tracker without boost/invalidation."""
         mock_tracker = MagicMock()
