@@ -10,10 +10,11 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.utils.numeric import safe_float
@@ -404,6 +405,10 @@ class McpClientSearchAdapter:
         """
         if not await self._heal_if_needed():
             return [], [], "no_session"
+        # ``_heal_if_needed`` guarantees a live session on True; the asserts
+        # make that invariant visible to mypy (``self._session`` is typed
+        # ``ClientSession | None``).
+        assert self._session is not None
 
         args: dict[str, Any] = {"query": query}
         if top_k is not None:
@@ -425,7 +430,8 @@ class McpClientSearchAdapter:
             logger.warning("MCP transport error, attempting reconnect: %s", exc)
             try:
                 await self._reconnect()
-                result = await self._session.call_tool("mem_search", args)  # type: ignore[union-attr]
+                assert self._session is not None
+                result = await self._session.call_tool("mem_search", args)
             except Exception as retry_exc:
                 # Upstream LTM is unreachable; surfacing will return empty.
                 logger.warning("MCP mem_search failed after reconnect: %s", retry_exc)
@@ -444,7 +450,13 @@ class McpClientSearchAdapter:
         # Parse text response into results
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
-        text_parts = [c.text or "" for c in (result.content or []) if c.type == "text"]
+        # ``c.text or ""`` further tolerates ``TextContent.text=None`` from
+        # spec-noncompliant servers (mirrors manager.py:1042). The ``cast``
+        # narrows the call_tool union (TextContent | Image | Audio | …) to
+        # the branch the ``c.type == "text"`` filter already selects.
+        text_parts = [
+            cast(TextContent, c).text or "" for c in (result.content or []) if c.type == "text"
+        ]
         if not text_parts:
             return [], [], "empty_content"
 
@@ -467,6 +479,7 @@ class McpClientSearchAdapter:
             return
         if not await self._heal_if_needed():
             return
+        assert self._session is not None  # ``_heal_if_needed`` guarantees live session
 
         call_args: dict[str, Any] = {
             "action": "increment_access",
@@ -481,7 +494,8 @@ class McpClientSearchAdapter:
             logger.warning("MCP transport error in increment_access, reconnecting: %s", exc)
             try:
                 await self._reconnect()
-                await self._session.call_tool("mem_do", call_args)  # type: ignore[union-attr]
+                assert self._session is not None
+                await self._session.call_tool("mem_do", call_args)
             except Exception as retry_exc:
                 logger.debug("MCP mem_do(increment_access) failed after reconnect: %s", retry_exc)
         except asyncio.CancelledError:
@@ -507,6 +521,7 @@ class McpClientSearchAdapter:
         """
         if not await self._heal_if_needed():
             return []
+        assert self._session is not None  # ``_heal_if_needed`` guarantees live session
 
         call_args: dict[str, Any] = {"action": "scratch_get", "params": {}}
         if trace_id is not None:
@@ -518,10 +533,8 @@ class McpClientSearchAdapter:
             logger.warning("MCP transport error in scratch_list, reconnecting: %s", exc)
             try:
                 await self._reconnect()
-                result = await self._session.call_tool(  # type: ignore[union-attr]
-                    "mem_do",
-                    call_args,
-                )
+                assert self._session is not None
+                result = await self._session.call_tool("mem_do", call_args)
             except Exception:
                 return []
         except asyncio.CancelledError:
@@ -535,7 +548,11 @@ class McpClientSearchAdapter:
 
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
-        text_parts = [c.text or "" for c in (result.content or []) if c.type == "text"]
+        # ``c.text or ""`` further tolerates ``TextContent.text=None`` from
+        # spec-noncompliant servers; see ``search()`` for the full rationale.
+        text_parts = [
+            cast(TextContent, c).text or "" for c in (result.content or []) if c.type == "text"
+        ]
         if not text_parts:
             return []
 
