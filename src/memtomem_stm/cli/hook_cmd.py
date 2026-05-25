@@ -7,12 +7,16 @@ proactive memory surfacing over the built-in tool's output, and — when
 relevant LTM memories are found — returns them through ``additionalContext``
 so the host appends them next to the tool result the model reads.
 
-Why surfacing-only (no ``updatedToolOutput``): appending context is the
-side-effect-free hook play. Compression-style *replacement* of a built-in
-tool's output is a separate, riskier stage (it must match each tool's output
-shape, and compressing ``Read`` breaks a later ``Edit``'s verbatim
-``old_string`` match) and is intentionally out of scope here. See the Stage B
-section of the project plan / ``project_stm_builtin_tool_hooks`` memory.
+Two stages, two hook fields. *Surfacing* appends ``additionalContext`` (the
+side-effect-free play). *Compression* (P1a) *replaces* a built-in tool's output
+via ``updatedToolOutput`` and is **Bash-only and opt-in**
+(``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``): for the built-in Bash tool the
+value must be a structured object mirroring the tool result, so we clone the
+original ``tool_response`` and shrink only its ``stdout`` channel (preserving
+``stderr`` / exit / ``interrupted`` / ``isImage`` verbatim). Compression stays
+Bash-only because replacing ``Read`` would break a later ``Edit`` whose
+``old_string`` must match the file verbatim. The two halves merge into one
+``hookSpecificOutput`` (:func:`_orchestrate` / :func:`_build_hook_output`).
 
 Tool scope: we only surface for **read-like** built-in tools
 (:data:`_DEFAULT_SURFACE_TOOLS` — Read/Grep/Glob/Bash, overridable via
@@ -60,9 +64,12 @@ import json
 import logging
 import os
 import sys
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 import click
+
+if TYPE_CHECKING:
+    from memtomem_stm.config import HookCompressionConfig, STMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,20 @@ _SURFACED_CLOSE = "</surfaced-memories>"
 # ``write_tool_patterns`` can't be relied on here because ``fnmatch`` is
 # case-normalizing (identity on POSIX), so ``*write*`` never matches ``Write``.
 _DEFAULT_SURFACE_TOOLS = frozenset({"Read", "Grep", "Glob", "Bash"})
+
+# Unique marker prepended to compressed ``stdout`` so a re-fired hook recognizes
+# its own output and no-ops (idempotency). Matched *exactly* — never via
+# ``TruncateCompressor``'s generic markers (``(truncated`` / ``(original:`` /
+# ``… omitted``), which appear in real logs and would falsely skip compression.
+_COMPRESS_SENTINEL = "⟦stm-compressed⟧"
+
+# Hard cap on the ``tool_response`` text forwarded to surfacing, independent of
+# the compression budget. Keeps a multi-MB built-in result from overflowing the
+# daemon's ``MAX_MESSAGE_BYTES`` (4 MiB) frame even when compression is disabled
+# or no-ops. Comfortably below 4 MiB after JSON escaping; surfacing only needs
+# enough text to clear its ``min_response_chars`` gate (the query comes from
+# ``tool_input``), so capping costs nothing for relevance.
+_SAFE_DAEMON_BUDGET = 256 * 1024
 
 
 def _surface_tools() -> frozenset[str]:
@@ -139,6 +160,103 @@ def _tool_response_to_text(tool_response: Any) -> str:
         except (TypeError, ValueError):
             return str(tool_response)
     return str(tool_response)
+
+
+def _bash_stdout(tool_response: Any) -> tuple[str, dict[str, Any]] | None:
+    """Extract the compressible ``stdout`` channel of a Bash tool result.
+
+    Returns ``(stdout_text, original_dict)`` only when ``tool_response`` is a
+    dict carrying a string ``stdout`` — so the caller can clone the dict and
+    replace just that field, preserving ``stderr`` / exit / ``interrupted`` /
+    ``isImage`` verbatim. ``None`` for any other shape.
+
+    We deliberately do **not** handle a plain-string ``tool_response``: for the
+    built-in Bash tool ``updatedToolOutput`` must be a structured object
+    mirroring the tool result, so a bare string would be ignored by the host
+    (silently leaving the original output visible). An unknown shape is left
+    untouched rather than replaced with something the host rejects. Unlike
+    :func:`_tool_response_to_text` this never folds ``stderr`` into the
+    compressible channel — replacement must not lose or merge the error stream.
+    """
+    if isinstance(tool_response, dict):
+        stdout = tool_response.get("stdout")
+        if isinstance(stdout, str):
+            return stdout, tool_response
+    return None
+
+
+def _already_compressed(text: str) -> bool:
+    """Whether ``text`` already carries our compression sentinel (idempotency)."""
+    return _COMPRESS_SENTINEL in text
+
+
+def maybe_compress_builtin(
+    payload: dict[str, Any], cfg: "HookCompressionConfig"
+) -> dict[str, Any] | None:
+    """Compress a Bash tool's ``stdout`` for the PostToolUse ``updatedToolOutput``.
+
+    Returns the value to place in ``updatedToolOutput`` — a dict mirroring the
+    original Bash ``tool_response`` with only ``stdout`` shrunk (every other
+    field preserved verbatim) — or ``None`` to leave the tool output untouched.
+    Only structured Bash results are handled (see :func:`_bash_stdout`).
+    **Never raises.**
+
+    Gate: ``cfg.enabled`` + PostToolUse + ``tool_name == "Bash"`` + ``stdout``
+    longer than ``cfg.max_chars`` + not already compressed. The strategy is fixed
+    to :class:`TruncateCompressor` (self-contained — no chunk-store callback,
+    unlike SELECTIVE/HYBRID/PROGRESSIVE, whose retrieval tools live in the
+    separate ``mms`` server process). ``cfg.max_chars`` budgets the *whole*
+    replacement stdout: the sentinel prefix is reserved out of the compressor's
+    budget so the result stays at/near the configured size.
+    """
+    try:
+        if not cfg.enabled:
+            return None
+        if (payload.get("hook_event_name") or "PostToolUse") != "PostToolUse":
+            return None
+        if payload.get("tool_name") != "Bash":
+            return None
+        extracted = _bash_stdout(payload.get("tool_response"))
+        if extracted is None:
+            return None
+        stdout, original = extracted
+        if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
+            return None
+
+        # Lazy import: keep ``mms hook --help`` and the no-op path off the
+        # compression module's import cost.
+        from memtomem_stm.proxy.compression import TruncateCompressor
+
+        # Reserve the sentinel prefix out of the budget so sentinel + body stays
+        # at/near ``max_chars`` (TruncateCompressor's own suffix may still add a
+        # small, bounded overage — the budget is a target, not a hard cap).
+        prefix = f"{_COMPRESS_SENTINEL}\n"
+        body_budget = max(1, cfg.max_chars - len(prefix))
+        compressed = TruncateCompressor().compress(stdout, max_chars=body_budget)
+        clone = dict(original)
+        clone["stdout"] = prefix + compressed
+        return clone
+    except Exception:
+        logger.debug(
+            "builtin output compression failed — leaving tool output unchanged", exc_info=True
+        )
+        return None
+
+
+def _bounded_surfacing_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return ``payload`` with its ``tool_response`` text capped to
+    :data:`_SAFE_DAEMON_BUDGET`.
+
+    Independent of compression: a multi-MB built-in result must never overflow
+    the daemon's 4 MiB frame, even when compression is disabled or no-ops.
+    Pass-through (same object) when the response is already small, so the common
+    case is untouched. The cap keeps the head of the flattened text (stdout, then
+    stderr), which is all surfacing needs to clear its size gate.
+    """
+    text = _tool_response_to_text(payload.get("tool_response"))
+    if len(text) <= _SAFE_DAEMON_BUDGET:
+        return payload
+    return {**payload, "tool_response": text[:_SAFE_DAEMON_BUDGET]}
 
 
 def _extract_surfaced_block(original: str, injected: str, injection_mode: str) -> str | None:
@@ -247,6 +365,34 @@ def _build_output(response_text: str, injected: str, injection_mode: str) -> dic
     }
 
 
+def _extract_surfaced_context(surf_out: dict[str, Any]) -> str | None:
+    """Pull the surfaced ``additionalContext`` string out of a surfacing
+    hook-output dict (as produced by :func:`_build_output`), or ``None`` when
+    surfacing produced nothing."""
+    hso = surf_out.get("hookSpecificOutput")
+    if isinstance(hso, dict):
+        ctx = hso.get("additionalContext")
+        if isinstance(ctx, str) and ctx:
+            return ctx
+    return None
+
+
+def _build_hook_output(
+    updated_tool_output: Any | None, additional_context: str | None
+) -> dict[str, Any]:
+    """Merge optional compression + surfacing results into a single PostToolUse
+    ``hookSpecificOutput`` so neither stage overwrites the other. Returns ``{}``
+    when both are absent (the tool output passes through untouched)."""
+    inner: dict[str, Any] = {"hookEventName": "PostToolUse"}
+    if updated_tool_output is not None:
+        inner["updatedToolOutput"] = updated_tool_output
+    if additional_context:
+        inner["additionalContext"] = additional_context
+    if len(inner) == 1:  # only hookEventName — nothing to say
+        return {}
+    return {"hookSpecificOutput": inner}
+
+
 async def _quiet_async(coro: Any, what: str) -> None:
     """Await a cleanup coroutine, swallowing (and debug-logging) any error."""
     try:
@@ -304,8 +450,10 @@ def _hook_eligible(payload: dict[str, Any]) -> bool:
     return isinstance(tool_name, str) and tool_name in _surface_tools()
 
 
-async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the hook output, preferring the warm daemon when enabled.
+async def _run_hook(
+    payload: dict[str, Any], *, config: "STMConfig | None" = None
+) -> dict[str, Any]:
+    """Resolve the *surfacing* hook output, preferring the warm daemon when enabled.
 
     Degradation ladder (every rung still yields a hook-output dict, never
     raises): daemon disabled → cold in-process path (unchanged). Daemon enabled
@@ -314,13 +462,15 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
     call either return ``{}`` (default ``fallback=skip`` — the daemon exists
     precisely to avoid the ~6s cold start) or take the cold path
     (``fallback=cold``). The whole call runs inside ``_hook_budget_seconds()``
-    in :func:`hook_command`.
+    in :func:`hook_command`. ``config`` is reused from :func:`_orchestrate` when
+    given (saving a redundant ``STMConfig()`` load); ``None`` loads on demand.
     """
     if _daemon_enabled():
         from memtomem_stm.config import STMConfig
         from memtomem_stm.daemon import client
 
-        config = STMConfig()
+        if config is None:
+            config = STMConfig()
         # Reject ineligible payloads (surfacing globally off, non-PostToolUse, or
         # a non-allowlisted tool) before routing to / spawning the daemon — an
         # off-target hook call must not warm a pointless daemon. The cold path
@@ -351,16 +501,42 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
     return await run_surfacing_hook(payload)
 
 
+async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the full hook output: in-process Bash *compression* merged with
+    LTM *surfacing*, as one ``hookSpecificOutput``.
+
+    Ordering matters. Compression runs **first and in-process** so a multi-MB
+    Bash result is shrunk before it could be sent whole to the daemon's 4 MiB
+    frame, and it is **independent of the surfacing gate** — it still runs when
+    surfacing is disabled or Bash is not in the *surface* allowlist. Surfacing
+    then runs on a frame-bounded copy of the payload, wrapped so that a
+    surfacing failure degrades to "no memories" while still returning the
+    compression half (``maybe_compress_builtin`` is itself non-raising). The CLI
+    wrapper backstops the whole call.
+    """
+    from memtomem_stm.config import STMConfig
+
+    config = STMConfig()
+    updated = maybe_compress_builtin(payload, config.hook.compression)
+    surf_out: dict[str, Any] = {}
+    try:
+        surf_out = await _run_hook(_bounded_surfacing_payload(payload), config=config)
+    except Exception:
+        logger.debug("surfacing failed — keeping the compression half", exc_info=True)
+    return _build_hook_output(updated, _extract_surfaced_context(surf_out))
+
+
 @click.command(name="hook")
 def hook_command() -> None:
-    """Surface STM memories for a host's built-in tool call (PostToolUse hook).
+    """Compress and/or surface for a host's built-in tool call (PostToolUse hook).
 
-    Reads the hook JSON payload on stdin and, for read-like built-in tools,
-    prints a hook response whose ``additionalContext`` carries relevant LTM
-    memories. By default the surfacing runs in the warm ``mms daemon`` (no
-    per-call cold start), auto-spawned on first use; set
-    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to run the legacy cold in-process path.
-    Always exits 0; on any problem the tool output passes through unchanged
+    Reads the hook JSON payload on stdin and prints a hook response that may
+    carry ``updatedToolOutput`` (compressed Bash output — opt-in via
+    ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and/or ``additionalContext``
+    (relevant LTM memories, for read-like tools). Surfacing runs in the warm
+    ``mms daemon`` by default (no per-call cold start), auto-spawned on first
+    use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
+    path. Always exits 0; on any problem the tool output passes through unchanged
     (prints ``{}``).
     """
     payload = _read_payload(sys.stdin)
@@ -368,9 +544,9 @@ def hook_command() -> None:
     if payload is not None:
         try:
             output = asyncio.run(
-                asyncio.wait_for(_run_hook(payload), timeout=_hook_budget_seconds())
+                asyncio.wait_for(_orchestrate(payload), timeout=_hook_budget_seconds())
             )
         except Exception:
-            logger.warning("hook surfacing failed — passing tool output through", exc_info=True)
+            logger.warning("hook processing failed — passing tool output through", exc_info=True)
             output = {}
     click.echo(json.dumps(output, ensure_ascii=False))

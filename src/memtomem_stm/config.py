@@ -47,6 +47,35 @@ class LangfuseConfig(BaseModel):
         return self
 
 
+class HookCompressionConfig(BaseModel):
+    """``mms hook`` built-in tool *output compression* settings (P1a — Bash).
+
+    A gate **independent of surfacing**: compressing a built-in tool's output
+    (via the PostToolUse ``updatedToolOutput`` field) replaces what the model
+    reads, whereas surfacing only *appends* ``additionalContext``. Env keys are
+    ``MEMTOMEM_STM_HOOK__COMPRESSION__<field>``.
+
+    Scope is **Bash only** for now — compressing ``Read`` would break a later
+    ``Edit`` whose ``old_string`` must match the file verbatim. The allowlist is
+    intentionally hardcoded (not a Pydantic list field): pydantic-settings parses
+    complex env values as JSON, so a comma-separated ``…__TOOLS=Bash,Grep`` would
+    raise rather than split. The compression strategy is likewise fixed to
+    ``TruncateCompressor`` (self-contained, no chunk-store callback)."""
+
+    enabled: bool = False
+    """Opt-in (default ``False``), mirroring ``proxy.enabled``. Because
+    compression *replaces* model-visible output it ships dormant; enable with
+    ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`` after the empirical hook test
+    confirms the host honors ``updatedToolOutput`` for Bash."""
+    max_chars: int = Field(default=16000, gt=0)
+    """Target character budget for the replacement ``stdout`` channel, and the
+    threshold below which output is left untouched (only stdout longer than this
+    is compressed). The sentinel prefix is reserved out of this budget; the
+    compressor's own truncation suffix may still add a small, bounded overage, so
+    treat it as a target rather than a hard ceiling. Matches the proxy's
+    ``default_max_result_chars`` default."""
+
+
 class HookConfig(BaseModel):
     """Built-in tool hook (``mms hook``) settings — Stage 2 daemon integration.
 
@@ -86,6 +115,9 @@ class HookConfig(BaseModel):
     the pure-hook path has no in-band channel for the model to return a rating,
     and a ``Bash`` query may carry secrets. See
     ``SurfacingEngine(record_feedback_events=...)``."""
+    compression: HookCompressionConfig = Field(default_factory=HookCompressionConfig)
+    """Built-in tool *output compression* (P1a — Bash). Independent of surfacing:
+    see :class:`HookCompressionConfig`. Env: ``MEMTOMEM_STM_HOOK__COMPRESSION__*``."""
 
 
 class DaemonConfig(BaseModel):
