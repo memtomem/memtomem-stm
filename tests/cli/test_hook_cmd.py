@@ -14,6 +14,7 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +25,9 @@ import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.hook_cmd import (
+    _daemon_enabled,
     _extract_surfaced_block,
+    _run_hook,
     _tool_response_to_text,
     run_surfacing_hook,
 )
@@ -219,3 +222,62 @@ def test_cli_surfacing_disabled_is_noop(monkeypatch: pytest.MonkeyPatch):
     result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
     assert result.exit_code == 0
     assert json.loads(result.output) == {}
+
+
+# ── Daemon routing + degradation ladder ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("1", True), ("true", True), ("YES", True), ("on", True), ("0", False), ("", False)],
+)
+def test_daemon_enabled_env_parsing(monkeypatch: pytest.MonkeyPatch, value: str, expected: bool):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", value)
+    assert _daemon_enabled() is expected
+
+
+def test_daemon_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)
+    sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel))
+    # client.surface must never be consulted when the daemon is disabled.
+    boom = AsyncMock(side_effect=AssertionError("daemon must not be used when disabled"))
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", boom)
+    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    assert out == sentinel
+    boom.assert_not_called()
+
+
+def test_daemon_used_when_enabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    daemon_out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "warm"}}
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", AsyncMock(return_value=daemon_out))
+    # Cold path must not run when the daemon answers.
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.run_surfacing_hook",
+        AsyncMock(side_effect=AssertionError("cold path must not run on a daemon hit")),
+    )
+    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    assert out == daemon_out
+
+
+def test_daemon_unavailable_skip_returns_empty(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__FALLBACK", raising=False)  # default = skip
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.run_surfacing_hook",
+        AsyncMock(side_effect=AssertionError("skip must not fall back to the cold path")),
+    )
+    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    assert out == {}
+
+
+def test_daemon_unavailable_cold_fallback(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__FALLBACK", "cold")
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", AsyncMock(return_value=None))
+    sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel))
+    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    assert out == sentinel

@@ -47,6 +47,53 @@ class LangfuseConfig(BaseModel):
         return self
 
 
+class HookConfig(BaseModel):
+    """Built-in tool hook (``mms hook``) settings — Stage 2 daemon integration.
+
+    Env keys are ``MEMTOMEM_STM_HOOK__<field>`` (note the double underscore for
+    nesting). The pre-existing ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` (single
+    underscore) is a separate direct-read knob in ``cli/hook_cmd.py`` and is
+    unaffected by this model."""
+
+    use_daemon: bool = False
+    """When ``True``, ``mms hook`` routes surfacing through the local daemon
+    (warm LTM connection) instead of spawning a cold LTM subprocess per call.
+    Opt-in this release — default ``False`` keeps ``mms hook`` behaving exactly
+    as before (cold in-process path)."""
+    daemon_timeout_seconds: float = Field(default=2.5, gt=0.0)
+    """Per-request wall-clock budget for the hook→daemon round trip. Small and
+    independent of the cold-path ``_hook_budget_seconds()`` backstop — a warm
+    LTM search is sub-second, so this only needs to cover connect + RTT."""
+    fallback: Literal["skip", "cold"] = "skip"
+    """What ``mms hook`` does when the daemon is unreachable. ``skip`` (default)
+    degrades to ``{}`` immediately — the daemon exists precisely to avoid the
+    ~6s cold start, so the default never pays it. ``cold`` falls back to the
+    in-process surfacing path (still bounded by ``_hook_budget_seconds()``),
+    preserving pre-daemon behavior for callers who prefer it."""
+    record_feedback_events: bool = False
+    """Passed to the daemon's ``SurfacingEngine``. Default ``False`` keeps
+    cross-session dedup (``seen_memories``, memory IDs only) while persisting
+    *no* query text and emitting no ``stm_surfacing_feedback`` rating prompt:
+    the pure-hook path has no in-band channel for the model to return a rating,
+    and a ``Bash`` query may carry secrets. See
+    ``SurfacingEngine(record_feedback_events=...)``."""
+
+
+class DaemonConfig(BaseModel):
+    """Local surfacing daemon (``mms daemon``) settings — Stage 2.
+
+    Env keys are ``MEMTOMEM_STM_DAEMON__<field>``."""
+
+    host: str = "127.0.0.1"
+    """Loopback bind address. The daemon is local-only and authenticated by a
+    per-start random token, not by network ACLs — never bind a non-loopback
+    address."""
+    idle_timeout_seconds: float = Field(default=900.0, ge=0.0)
+    """Shut the daemon (and its warm LTM child) down after this many seconds
+    with no requests, so an abandoned coding session doesn't leak a
+    multi-GB process forever. ``0`` disables idle shutdown (pin the process)."""
+
+
 class STMConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="MEMTOMEM_STM_",
@@ -57,6 +104,8 @@ class STMConfig(BaseSettings):
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
+    hook: HookConfig = Field(default_factory=HookConfig)
+    daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     data_dir: Path = Path("~/.memtomem")
 
     advertise_observability_tools: bool = False

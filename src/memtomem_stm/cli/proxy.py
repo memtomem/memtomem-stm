@@ -19,6 +19,7 @@ from typing import Any, TextIO
 
 import click
 
+from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
 from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
 from memtomem_stm.cli.mms_import import import_command as _mms_import_command
@@ -2597,3 +2598,7 @@ cli.add_command(_mms_host_group)
 # `mms hook` — bridge a host's built-in tool calls (Claude Code PostToolUse)
 # into STM surfacing; lives in src/memtomem_stm/cli/hook_cmd.py.
 cli.add_command(_hook_command)
+
+# `mms daemon ...` — manage the local surfacing daemon (Stage 2 warm LTM
+# connection for `mms hook`); lives in src/memtomem_stm/cli/daemon_cmd.py.
+cli.add_command(_daemon_group)

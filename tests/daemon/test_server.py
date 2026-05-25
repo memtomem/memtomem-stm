@@ -1,0 +1,264 @@
+"""End-to-end transport + lifecycle tests for the surfacing daemon.
+
+These never contact a real LTM server: the surface-hit path injects a
+``SurfacingEngine`` over a mock adapter, and the real-wiring path exercises a
+non-allowlisted tool so ``run_surfacing_hook`` returns ``{}`` before any LTM
+RPC. That keeps the suite deterministic even on a dev box with a live LTM.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+from memtomem_stm.config import STMConfig
+from memtomem_stm.daemon import client
+from memtomem_stm.daemon.discovery import handshake_path, read_handshake
+from memtomem_stm.daemon.protocol import (
+    MAX_MESSAGE_BYTES,
+    OP_SURFACE,
+    build_request,
+    encode_line,
+)
+from memtomem_stm.daemon.server import DaemonServer
+from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.engine import SurfacingEngine
+
+
+@dataclass
+class _Meta:
+    source_file: Path = Path("/notes/test.md")
+    namespace: str = "default"
+
+
+@dataclass
+class _Chunk:
+    id: str = ""
+    content: str = "remembered detail about jwt"
+    metadata: _Meta | None = None
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = str(uuid4())
+        if self.metadata is None:
+            self.metadata = _Meta()
+
+
+@dataclass
+class _Result:
+    chunk: _Chunk
+    score: float
+
+
+_LONG = "JWT authentication handler. " * 50
+_READ_PAYLOAD = {
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Read",
+    "tool_input": {"file_path": "/src/auth/jwt_handler.py"},
+    "tool_response": {"content": _LONG},
+}
+
+
+def _config(tmp_path: Path) -> STMConfig:
+    cfg = STMConfig()
+    cfg.data_dir = tmp_path
+    cfg.daemon.idle_timeout_seconds = 0.0
+    s = cfg.surfacing
+    s.feedback_db_path = tmp_path / "feedback.db"
+    s.enabled = True
+    s.min_response_chars = 10
+    s.timeout_seconds = 5.0
+    s.min_score = 0.02
+    s.cooldown_seconds = 0.0
+    s.max_surfacings_per_minute = 1000
+    s.auto_tune_enabled = False
+    s.include_session_context = False
+    s.fire_webhook = False
+    return cfg
+
+
+def _engine_with_result() -> SurfacingEngine:
+    adapter = AsyncMock()
+    adapter.search = AsyncMock(return_value=([_Result(_Chunk(), 0.5)], [], "ok"))
+    config = SurfacingConfig(
+        enabled=True,
+        min_response_chars=10,
+        timeout_seconds=5.0,
+        min_score=0.02,
+        cooldown_seconds=0.0,
+        max_surfacings_per_minute=1000,
+        auto_tune_enabled=False,
+        include_session_context=False,
+        fire_webhook=False,
+    )
+    return SurfacingEngine(config, mcp_adapter=adapter)
+
+
+async def _await_handshake(cfg: STMConfig, timeout: float = 3.0) -> None:
+    hp = handshake_path(cfg.data_dir)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if hp.exists():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("daemon did not publish a handshake in time")
+
+
+async def _start(cfg: STMConfig, engine: SurfacingEngine | None = None):
+    server = DaemonServer(cfg)
+    if engine is not None:
+        # Bypass the real LTM/SQLite wiring; inject a ready engine instead.
+        server._build_engine = lambda: setattr(server, "_engine", engine)  # type: ignore[method-assign]
+    task = asyncio.create_task(server.serve())
+    await _await_handshake(cfg)
+    return server, task
+
+
+async def _stop(cfg: STMConfig, task: asyncio.Task) -> None:
+    await client.shutdown(cfg)
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_ping_reports_ready_and_cold_ltm(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        hs = await client.ping(cfg, timeout=2.0)
+        assert hs is not None
+        assert hs["ltm"] == "cold"  # injected engine: adapter never started
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_surface_round_trip_injects_memories(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        out = await client.surface(cfg, _READ_PAYLOAD, timeout=3.0)
+        assert out is not None
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "<surfaced-memories>" in ctx
+        # Stage-1 invariant survives the daemon path: no unresolvable prompt.
+        assert "surfacing_id" not in ctx
+        assert "stm_surfacing_feedback" not in ctx
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_noop_surface_for_non_allowlisted_tool_real_wiring(tmp_path: Path) -> None:
+    # Real _build_engine (FeedbackTracker + lazy LTM adapter). A Write tool is
+    # not allowlisted, so run_surfacing_hook returns {} without touching LTM.
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg)
+    try:
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/x"},
+            "tool_response": {"content": _LONG},
+        }
+        out = await client.surface(cfg, payload, timeout=3.0)
+        assert out == {}
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_bad_token_is_rejected(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        hs = read_handshake(handshake_path(cfg.data_dir))
+        assert hs is not None
+        reader, writer = await asyncio.open_connection(
+            hs["host"], hs["port"], limit=MAX_MESSAGE_BYTES
+        )
+        writer.write(encode_line(build_request("wrong-token", OP_SURFACE, _READ_PAYLOAD)))
+        await writer.drain()
+        # Server closes the connection without responding to an unauthenticated peer.
+        data = await asyncio.wait_for(reader.read(), timeout=3.0)
+        assert data == b""
+        writer.close()
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_surface_returns_none_when_daemon_absent(tmp_path: Path) -> None:
+    # No daemon → client.surface returns None so the hook degrades to {}.
+    cfg = _config(tmp_path)
+    out = await client.surface(cfg, _READ_PAYLOAD, timeout=0.5)
+    assert out is None
+
+
+async def test_hook_run_hook_routes_to_live_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End-to-end: ``_run_hook`` (daemon enabled, env-driven config) reaches a
+    # live daemon and returns its surfaced output — the full hook→client→
+    # daemon→engine→back path, no LTM (engine injected).
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(tmp_path / "fb.db"))
+    monkeypatch.setenv("MEMTOMEM_STM_DAEMON__IDLE_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+
+    from memtomem_stm.cli.hook_cmd import _run_hook
+
+    cfg = STMConfig()  # reads the env above → data_dir == tmp_path
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        out = await _run_hook(_READ_PAYLOAD)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "<surfaced-memories>" in ctx
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_build_engine_dedup_only_wiring(tmp_path: Path) -> None:
+    # Default (record_feedback_events=False) → dedup-only: result cache off so
+    # _surfaced_ids/seen_memories dedup is authoritative (F1), AutoTuner off so
+    # shared feedback rows can't nudge ranking (F3), query text never persisted.
+    cfg = _config(tmp_path)
+    assert cfg.hook.record_feedback_events is False
+    server = DaemonServer(cfg)
+    server._build_engine()
+    try:
+        ec = server._engine._config
+        assert ec.cache_ttl_seconds == 0.0
+        assert ec.auto_tune_enabled is False
+        assert ec.persist_query_text is False
+        assert server._engine._auto_tuner is None
+        assert server._engine._record_feedback_events is False
+        assert server._tracker is not None  # tracker still wired for dedup
+    finally:
+        if server._tracker is not None:
+            server._tracker.close()
+        await server._adapter.stop()
+
+
+async def test_idle_shutdown_stops_daemon(tmp_path: Path) -> None:
+    # With a tiny idle timeout and no requests, the daemon shuts itself down
+    # and removes its handshake — no leaked warm process after a quiet session.
+    cfg = _config(tmp_path)
+    cfg.daemon.idle_timeout_seconds = 0.2
+    server = DaemonServer(cfg)
+    server._build_engine = lambda: setattr(server, "_engine", _engine_with_result())  # type: ignore[method-assign]
+    task = asyncio.create_task(server.serve())
+    await _await_handshake(cfg)
+    await asyncio.wait_for(task, timeout=5.0)  # self-terminates on idle
+    assert not handshake_path(cfg.data_dir).exists()
+
+
+async def test_hook_run_hook_skips_when_daemon_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Daemon enabled but none running, default fallback=skip → {} (no cold path).
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__FALLBACK", raising=False)
+
+    from memtomem_stm.cli.hook_cmd import _run_hook
+
+    out = await _run_hook(_READ_PAYLOAD)
+    assert out == {}
