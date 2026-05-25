@@ -55,7 +55,7 @@ async def test_read_message_malformed_and_non_object():
 
 
 def test_handshake_round_trip_and_mode(tmp_path: Path):
-    path = discovery.handshake_path(tmp_path)
+    path = discovery.handshake_path(tmp_path, "fp")
     discovery.write_handshake(
         path,
         pid=4321,
@@ -77,6 +77,19 @@ def test_read_handshake_missing_and_malformed(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
     assert discovery.read_handshake(bad) is None
+
+
+def test_handshake_and_lock_paths_keyed_by_fingerprint(tmp_path: Path):
+    # Distinct fingerprints → distinct files (so different-config daemons can
+    # coexist); same fingerprint → stable path; the two files share the
+    # ``stm-daemon`` prefix and differ only by extension.
+    from memtomem_stm.daemon.locking import lock_path
+
+    assert discovery.handshake_path(tmp_path, "aaaa").name == "stm-daemon-aaaa.json"
+    assert lock_path(tmp_path, "aaaa").name == "stm-daemon-aaaa.lock"
+    assert discovery.handshake_path(tmp_path, "aaaa") != discovery.handshake_path(tmp_path, "bbbb")
+    assert lock_path(tmp_path, "aaaa") != lock_path(tmp_path, "bbbb")
+    assert discovery.handshake_path(tmp_path, "aaaa") == discovery.handshake_path(tmp_path, "aaaa")
 
 
 def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
@@ -140,9 +153,10 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
     state = {"spawns": 0, "lock_free_seen": []}
 
     def fake_request_spawn(config):
-        # The real request_spawn probes the lock; if start_cmd held it this would
-        # see it taken. Assert it's free → start holds nothing across the loop.
-        with single_owner_lock(lock_path(config.data_dir)) as got:
+        # The real request_spawn probes the (per-config) lock; if start_cmd held
+        # it this would see it taken. Assert it's free → start holds nothing.
+        lp = lock_path(config.data_dir, discovery.config_fingerprint(config))
+        with single_owner_lock(lp) as got:
             state["lock_free_seen"].append(got)
         state["spawns"] += 1
         return state["spawns"] >= 3  # declined twice (lock "held"), then spawns
@@ -161,102 +175,21 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
     assert "daemon started" in result.output
 
 
-def test_start_does_not_misreport_stale_handshake_after_spawn(
+def test_start_coexists_with_different_config_daemon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    # A crashed different-config daemon left a stale handshake. `start` spawns a
-    # matching child; while it's mid-startup (holds the lock, hasn't published)
-    # the stale handshake must NOT be misreported as a live config conflict.
+    # config-drift coexistence: a daemon under a *different* config is alive (it
+    # owns its own keyed handshake + lock). `start` under our config must just
+    # spawn our daemon and report success — never treat the other as a conflict.
     from click.testing import CliRunner
 
     from memtomem_stm.cli.proxy import cli
 
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    # A different-config daemon's live handshake, at ITS keyed path. Our config
+    # never reads this file, so it must not influence `start` at all.
     discovery.write_handshake(
-        discovery.handshake_path(tmp_path),
-        pid=2**31 - 1,  # not a live process
-        host="127.0.0.1",
-        port=1,
-        token="t",
-        config_fingerprint="stale-different-fp",
-        created_at=0.0,
-    )
-
-    state = {"spawns": 0, "pings": 0}
-
-    def fake_request_spawn(config):
-        state["spawns"] += 1
-        return state["spawns"] == 1  # lock free → spawn; then "held" by our child
-
-    async def fake_ping(config, *, timeout=2.0):
-        state["pings"] += 1
-        return {"pid": 99, "port": 4567} if state["pings"] >= 4 else None
-
-    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
-    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
-
-    result = CliRunner().invoke(cli, ["daemon", "start"])
-    assert result.exit_code == 0
-    assert "different config" not in result.output  # stale handshake not misreported
-    assert "daemon started" in result.output
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="is_pid_alive() always returns True on Windows (no signal-0) → the "
-    "dead-pid guard is a documented no-op there; the spawned-flag guard is "
-    "what protects the common case cross-platform.",
-)
-def test_start_ignores_stale_handshake_with_dead_pid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    # Lock held by a matching daemon mid-startup we did NOT spawn, with a stale
-    # different-config handshake (dead pid) on disk. The dead pid means "not a
-    # live conflict" → wait it out rather than misreport.
-    from click.testing import CliRunner
-
-    from memtomem_stm.cli.proxy import cli
-
-    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
-    discovery.write_handshake(
-        discovery.handshake_path(tmp_path),
-        pid=2**31 - 1,
-        host="127.0.0.1",
-        port=1,
-        token="t",
-        config_fingerprint="stale-different-fp",
-        created_at=0.0,
-    )
-
-    state = {"pings": 0}
-    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda config: False)
-
-    async def fake_ping(config, *, timeout=2.0):
-        state["pings"] += 1
-        return {"pid": 7, "port": 4567} if state["pings"] >= 3 else None
-
-    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
-
-    result = CliRunner().invoke(cli, ["daemon", "start"])
-    assert result.exit_code == 0
-    assert "different config" not in result.output
-    assert "daemon started" in result.output
-
-
-def test_start_reports_live_different_config_daemon(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    # A genuinely live different-config daemon (alive pid) holds the lock → it
-    # won't release, so report it clearly instead of waiting out the deadline.
-    from unittest.mock import AsyncMock
-
-    from click.testing import CliRunner
-
-    from memtomem_stm.cli.proxy import cli
-
-    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
-    discovery.write_handshake(
-        discovery.handshake_path(tmp_path),
+        discovery.handshake_path(tmp_path, "a-different-fp"),
         pid=os.getpid(),  # alive
         host="127.0.0.1",
         port=1,
@@ -264,12 +197,25 @@ def test_start_reports_live_different_config_daemon(
         config_fingerprint="a-different-fp",
         created_at=0.0,
     )
-    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda config: False)
-    monkeypatch.setattr("memtomem_stm.daemon.client.ping", AsyncMock(return_value=None))
+
+    state = {"spawns": 0}
+
+    def fake_request_spawn(config):
+        state["spawns"] += 1
+        return True  # our config's lock is free → spawn proceeds
+
+    async def fake_ping(config, *, timeout=2.0):
+        # Our config has no daemon until we've spawned one.
+        return {"pid": 99, "port": 4567} if state["spawns"] >= 1 else None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
 
     result = CliRunner().invoke(cli, ["daemon", "start"])
     assert result.exit_code == 0
-    assert "a daemon with a different config is running" in result.output
+    assert state["spawns"] >= 1  # spawned our own daemon despite the other one
+    assert "different config" not in result.output  # no obsolete conflict report
+    assert "daemon started" in result.output
 
 
 # ── spawn (request_spawn) ─────────────────────────────────────────────────────
@@ -284,9 +230,9 @@ def test_request_spawn_skips_when_lock_held(tmp_path: Path, monkeypatch: pytest.
     cfg.data_dir = tmp_path
     calls: list[int] = []
     monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
-    with single_owner_lock(lock_path(cfg.data_dir)) as held:
+    with single_owner_lock(lock_path(cfg.data_dir, discovery.config_fingerprint(cfg))) as held:
         assert held is True
-        assert spawn.request_spawn(cfg) is False  # a live owner → defer
+        assert spawn.request_spawn(cfg) is False  # a live same-config owner → defer
     assert calls == []  # no duplicate spawn launched
 
 
@@ -301,8 +247,30 @@ def test_request_spawn_spawns_when_lock_free(tmp_path: Path, monkeypatch: pytest
     assert spawn.request_spawn(cfg) is True
     assert calls == [1]  # spawned exactly once
     # The probe released the lock → the child can still acquire it.
-    with single_owner_lock(lock_path(cfg.data_dir)) as got:
+    with single_owner_lock(lock_path(cfg.data_dir, discovery.config_fingerprint(cfg))) as got:
         assert got is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock re-entrancy semantics")
+def test_request_spawn_unblocked_by_different_config_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # config-drift coexistence: a daemon under a *different* config holds ITS
+    # (differently-keyed) lock. Our spawn keys to our own fingerprint, finds it
+    # free, and spawns anyway — the other daemon never blocks us.
+    from memtomem_stm.daemon import spawn
+    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+
+    cfg = STMConfig()
+    cfg.data_dir = tmp_path
+    other_fp = "different00000fp"
+    assert other_fp != discovery.config_fingerprint(cfg)
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "_spawn_detached", lambda: calls.append(1))
+    with single_owner_lock(lock_path(cfg.data_dir, other_fp)) as held:
+        assert held is True  # the other config's lock is taken
+        assert spawn.request_spawn(cfg) is True  # ours is free → spawn proceeds
+    assert calls == [1]
 
 
 def test_request_spawn_swallows_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -365,7 +333,7 @@ async def test_request_respects_single_wall_clock_budget(monkeypatch: pytest.Mon
 
 
 def test_remove_handshake_if_owner(tmp_path: Path):
-    path = discovery.handshake_path(tmp_path)
+    path = discovery.handshake_path(tmp_path, "fp")
     discovery.write_handshake(
         path, pid=10, host="127.0.0.1", port=1, token="t", config_fingerprint="fp", created_at=0.0
     )

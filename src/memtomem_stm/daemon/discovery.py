@@ -1,23 +1,32 @@
-"""Daemon discovery — the ``stm-daemon.json`` handshake file.
+"""Daemon discovery — the per-config ``stm-daemon-<fingerprint>.json`` handshake.
 
-The daemon publishes its loopback endpoint + auth token to a single file under
+The daemon publishes its loopback endpoint + auth token to a file under
 ``data_dir`` (default ``~/.memtomem``). ``mms hook`` and ``mms daemon
 status/stop`` read it to find a running daemon; the daemon writes it
 **atomically at ``0o600`` only after a successful port bind**, so the file
-never advertises an endpoint that isn't accepting yet. The write is
-last-writer-wins, not a mutual-exclusion primitive (two daemons binding
-distinct ephemeral ports would overwrite each other here) — preventing a second
-daemon is the spawn lock's job (see :mod:`~memtomem_stm.daemon.locking`).
+never advertises an endpoint that isn't accepting yet.
+
+The filename is **keyed by the config fingerprint** (``stm-daemon-<fp>.json``),
+so daemons started under different configs (different LTM command, feedback DB,
+…) own *distinct* handshake files and coexist instead of clobbering one shared
+file — config-drift coexistence. A reader only ever opens the file for *its
+own* config's fingerprint, so it never even sees a mismatched daemon's
+handshake; the in-file ``config_fingerprint`` then double-checks the content
+matches the path (defense against a corrupted/hand-edited file). Within a
+single fingerprint the write is still last-writer-wins, not a mutual-exclusion
+primitive — preventing a second *same-config* daemon is the (likewise
+fingerprint-keyed) lock's job (see :mod:`~memtomem_stm.daemon.locking`).
 Liveness is proven by a successful ``ping`` over the socket — not by the
 recorded ``pid`` — so a recycled PID can't be mistaken for the daemon.
+
+A config change leaves the old fingerprint's handshake behind as an orphan; it
+is harmless (no reader keys to it anymore) and the old daemon removes its own on
+graceful teardown / idle timeout.
 
 File shape::
 
     {"v": 1, "pid": 1234, "host": "127.0.0.1", "port": 53412,
      "token": "<hex>", "created_at": 1716600000.0, "config_fingerprint": "<sha>"}
-
-``config_fingerprint`` lets a reader detect a daemon started under stale config
-(different LTM command, feedback DB, etc.) and treat it as stale.
 """
 
 from __future__ import annotations
@@ -37,12 +46,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 HANDSHAKE_VERSION = 1
-HANDSHAKE_FILENAME = "stm-daemon.json"
+# Filenames are ``stm-daemon-<fingerprint>.{json,lock}`` (the lock half lives in
+# ``locking.py`` with the same prefix). The fingerprint is a 16-hex digest, so
+# it is always a filesystem-safe filename component.
+HANDSHAKE_PREFIX = "stm-daemon"
 
 
-def handshake_path(data_dir: Path) -> Path:
-    """Absolute path to the handshake file under ``data_dir``."""
-    return (data_dir / HANDSHAKE_FILENAME).expanduser()
+def handshake_path(data_dir: Path, fingerprint: str) -> Path:
+    """Per-config handshake file ``stm-daemon-<fingerprint>.json`` under ``data_dir``.
+
+    Keyed by the config fingerprint so daemons under different configs publish to
+    distinct files and coexist (see the module docstring). Callers pass
+    :func:`config_fingerprint` of their own effective config.
+    """
+    return (data_dir / f"{HANDSHAKE_PREFIX}-{fingerprint}.json").expanduser()
 
 
 def config_fingerprint(config: STMConfig) -> str:

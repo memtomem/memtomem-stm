@@ -80,6 +80,11 @@ class DaemonServer:
         self._config = config
         self._host = config.daemon.host
         self._idle_timeout = config.daemon.idle_timeout_seconds
+        # Freeze the config fingerprint at construction and reuse it for the lock
+        # path, handshake path, and handshake content — one value, so the lock we
+        # hold, the file we publish, and the fingerprint we advertise can never
+        # disagree (and a mid-run env change can't repoint us at a different file).
+        self._fingerprint = discovery.config_fingerprint(config)
         self._token = secrets.token_hex(32)
         self._port = 0
         self._started_at = time.time()
@@ -102,7 +107,7 @@ class DaemonServer:
         Returns a process exit code.
         """
         try:
-            fd = locking.open_lock_fd(locking.lock_path(self._config.data_dir))
+            fd = locking.open_lock_fd(locking.lock_path(self._config.data_dir, self._fingerprint))
         except OSError:
             logger.warning("daemon could not open the lock file — exiting", exc_info=True)
             return 0
@@ -123,7 +128,9 @@ class DaemonServer:
         while not locking.try_lock(fd):
             if loop.time() >= deadline:
                 # Best-effort pid for a friendly log; gate nothing on it.
-                raw = discovery.read_handshake(discovery.handshake_path(self._config.data_dir))
+                raw = discovery.read_handshake(
+                    discovery.handshake_path(self._config.data_dir, self._fingerprint)
+                )
                 pid = raw.get("pid") if isinstance(raw, dict) else None
                 logger.warning("another daemon already owns the lock (pid=%s) — exiting", pid)
                 return False
@@ -140,12 +147,12 @@ class DaemonServer:
         self._port = server.sockets[0].getsockname()[1]
         self._install_signals()
         discovery.write_handshake(
-            discovery.handshake_path(self._config.data_dir),
+            discovery.handshake_path(self._config.data_dir, self._fingerprint),
             pid=os.getpid(),
             host=self._host,
             port=self._port,
             token=self._token,
-            config_fingerprint=discovery.config_fingerprint(self._config),
+            config_fingerprint=self._fingerprint,
             created_at=self._started_at,
         )
         self._handshake_written = True
@@ -234,7 +241,7 @@ class DaemonServer:
             await _quiet(self._adapter.stop(), "LTM adapter stop")
         if self._handshake_written:
             discovery.remove_handshake_if_owner(
-                discovery.handshake_path(self._config.data_dir),
+                discovery.handshake_path(self._config.data_dir, self._fingerprint),
                 pid=os.getpid(),
                 token=self._token,
             )

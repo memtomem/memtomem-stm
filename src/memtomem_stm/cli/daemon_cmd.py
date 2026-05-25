@@ -96,22 +96,19 @@ def run_cmd(detached: bool, foreground: bool) -> None:
 
 @daemon_group.command(name="start")
 def start_cmd() -> None:
-    """Spawn the daemon detached if it isn't already running.
+    """Spawn the daemon detached if one isn't already running for this config.
 
-    The daemon self-guards via its lifetime lock, so ``start`` never holds the
-    lock — it reconciles toward a running daemon. The lock may currently be held
-    by a daemon that is *shutting down* (e.g. right after ``mms daemon stop``):
-    it won't answer ping and will soon release the lock, so we keep retrying the
-    spawn until the lock frees rather than polling ping once and giving up. A
-    *different-config* daemon stays alive and won't release — that we report.
+    Reconciles toward a running daemon *for the current config*. The daemon
+    self-guards via its (per-config) lifetime lock, so ``start`` never holds the
+    lock. The lock may briefly be held by a *same-config* daemon that is
+    *shutting down* (e.g. right after ``mms daemon stop``): it won't answer ping
+    and will soon release the lock, so we keep retrying the spawn until it frees
+    rather than polling ping once and giving up. A daemon started under a
+    *different* config owns a different lock + handshake (config-drift
+    coexistence), so it never blocks this spawn and is left untouched — there is
+    no cross-config conflict to report.
     """
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import (
-        config_fingerprint,
-        handshake_path,
-        is_pid_alive,
-        read_handshake,
-    )
     from memtomem_stm.daemon.spawn import request_spawn
 
     config = _load_config()
@@ -123,40 +120,18 @@ def start_cmd() -> None:
         return
 
     deadline = time.time() + 10.0
-    spawned = False
     while time.time() < deadline:
         hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
             click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
             return
-        if request_spawn(config):
-            # We launched a child (lock was free). Give it a moment to acquire
-            # the lock + publish, then loop back to ping it. We don't hold the
-            # lock, so the child can take ownership.
-            spawned = True
-            time.sleep(0.3)
-            continue
-        # Lock held by another daemon. Only a *live* different-config daemon that
-        # we did not just spawn is a real conflict worth reporting: a stale
-        # handshake (dead pid) left by a crash, or the matching child we just
-        # spawned that hasn't published its handshake yet, must NOT be
-        # misreported. Everything else falls through to wait — the next
-        # iteration re-attempts the spawn once the lock frees.
-        if not spawned:
-            raw = read_handshake(handshake_path(config.data_dir))
-            if (
-                raw is not None
-                and raw.get("config_fingerprint") != config_fingerprint(config)
-                and is_pid_alive(int(raw.get("pid", -1)))
-            ):
-                click.echo(
-                    _warn(
-                        f"a daemon with a different config is running (pid={raw.get('pid')}) — "
-                        "run `mms daemon restart` to replace it"
-                    )
-                )
-                return
-        time.sleep(0.2)
+        # request_spawn launches a detached child iff our config's lock is free;
+        # it returns False only when a same-config daemon already holds it
+        # (mid-startup → ping succeeds soon, or mid-shutdown → the lock frees and
+        # the next attempt wins). Either way we just keep retrying. We never hold
+        # the lock, so the spawned child can take ownership.
+        request_spawn(config)
+        time.sleep(0.3)
     click.echo(
         _warn(
             "daemon did not become ready in time — "
@@ -169,14 +144,22 @@ def start_cmd() -> None:
 def stop_cmd() -> None:
     """Ask a running daemon to shut down gracefully."""
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive, read_handshake
+    from memtomem_stm.daemon.discovery import (
+        config_fingerprint,
+        handshake_path,
+        is_pid_alive,
+        read_handshake,
+    )
 
     config = _load_config()
     if asyncio.run(client.shutdown(config)):
         click.echo(_ok("daemon stopped"))
         return
-    # Graceful path declined (no daemon, or its config fingerprint drifted).
-    raw = read_handshake(handshake_path(config.data_dir))
+    # Graceful path declined → no daemon for *this config*. Only ever act on our
+    # own config's handshake; a different-config daemon owns a different file and
+    # is none of our business here.
+    hs_path = handshake_path(config.data_dir, config_fingerprint(config))
+    raw = read_handshake(hs_path)
     if raw is None:
         click.echo("no running daemon")
         return
@@ -189,7 +172,7 @@ def stop_cmd() -> None:
         except OSError:
             pass
     try:
-        handshake_path(config.data_dir).unlink(missing_ok=True)
+        hs_path.unlink(missing_ok=True)
     except OSError:
         pass
     click.echo(_warn("no responsive daemon; cleaned stale handshake"))
@@ -200,7 +183,12 @@ def stop_cmd() -> None:
 def status_cmd(as_json: bool) -> None:
     """Report whether a daemon is running, with pid/port/uptime/LTM warmth."""
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive, read_handshake
+    from memtomem_stm.daemon.discovery import (
+        config_fingerprint,
+        handshake_path,
+        is_pid_alive,
+        read_handshake,
+    )
 
     config = _load_config()
     # The hook only reaches the daemon for eligible surfacing calls, so global
@@ -220,7 +208,7 @@ def status_cmd(as_json: bool) -> None:
             "hook_will_use_daemon": use_daemon,
         }
     else:
-        raw = read_handshake(handshake_path(config.data_dir))
+        raw = read_handshake(handshake_path(config.data_dir, config_fingerprint(config)))
         if raw is not None:
             info = {
                 "state": "stale",
@@ -264,7 +252,10 @@ def status_cmd(as_json: bool) -> None:
 @daemon_group.command(name="restart")
 @click.pass_context
 def restart_cmd(ctx: click.Context) -> None:
-    """Stop any running daemon, then start a fresh one once the lock is free."""
+    """Stop this config's running daemon, then start a fresh one once its lock is
+    free. Daemons under other configs are left running (config-drift coexistence).
+    """
+    from memtomem_stm.daemon.discovery import config_fingerprint
     from memtomem_stm.daemon.locking import lock_path, single_owner_lock
 
     config = _load_config()
@@ -273,9 +264,10 @@ def restart_cmd(ctx: click.Context) -> None:
     # fixed sleep could race: _teardown() awaits the warm LTM child's stop and
     # has no hard timeout. Bounded so a wedged teardown reports clearly instead
     # of letting start_cmd produce a misleading readiness timeout.
+    fp = config_fingerprint(config)
     deadline = time.time() + 5.0
     while time.time() < deadline:
-        with single_owner_lock(lock_path(config.data_dir)) as acquired:
+        with single_owner_lock(lock_path(config.data_dir, fp)) as acquired:
             free = acquired
         if free:
             ctx.invoke(start_cmd)

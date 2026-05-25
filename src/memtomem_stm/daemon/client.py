@@ -71,18 +71,22 @@ async def _request(
 
 
 def _live_handshake_candidate(config: STMConfig) -> dict[str, Any] | None:
-    """Read the handshake and reject it if version or config fingerprint drift.
+    """Read *this config's* handshake and reject it on version/fingerprint drift.
 
-    A fingerprint/version mismatch means the running daemon was started under
-    different wiring (LTM command, feedback DB, …) and would serve stale
-    behavior — treated as "not the daemon we want".
+    The handshake path is keyed by ``config``'s fingerprint, so we only ever read
+    the file a daemon under *our* config published — a different-config daemon's
+    handshake lives at a different path and is invisible here. The in-file
+    ``config_fingerprint`` check is then a belt-and-suspenders guard against a
+    corrupted/hand-edited file whose content doesn't match its keyed name; a
+    version mismatch likewise means "not the daemon we want".
     """
-    hs = read_handshake(handshake_path(config.data_dir))
+    fp = config_fingerprint(config)
+    hs = read_handshake(handshake_path(config.data_dir, fp))
     if hs is None:
         return None
     if hs.get("v") != HANDSHAKE_VERSION:
         return None
-    if hs.get("config_fingerprint") != config_fingerprint(config):
+    if hs.get("config_fingerprint") != fp:
         return None
     return hs
 
