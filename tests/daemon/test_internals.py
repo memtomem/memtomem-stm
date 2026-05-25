@@ -101,6 +101,56 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
+def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
+    fp = discovery.config_fingerprint(STMConfig())
+    # Client-only hook fields must NOT move the fingerprint — a daemon started
+    # without USE_DAEMON must still match a hook that sets it (else the hook
+    # rejects the live daemon and returns {} forever under fallback=skip).
+    for field, value in [
+        ("use_daemon", True),
+        ("fallback", "cold"),
+        ("daemon_timeout_seconds", 9.9),
+    ]:
+        c = STMConfig()
+        setattr(c.hook, field, value)
+        assert discovery.config_fingerprint(c) == fp, field
+    # record_feedback_events DOES drive daemon engine wiring → must move it.
+    c = STMConfig()
+    c.hook.record_feedback_events = True
+    assert discovery.config_fingerprint(c) != fp
+
+
+def test_start_holds_spawn_lock_through_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Two concurrent `mms daemon start` must not both spawn. The lock has to be
+    # held across _wait_ready(), not just across the spawn call — otherwise a
+    # second start acquires it before our child publishes its handshake.
+    from unittest.mock import AsyncMock
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", AsyncMock(return_value=None))
+    monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._spawn_detached", lambda: None)
+
+    observed: dict[str, bool] = {}
+
+    def fake_wait_ready(config, *, timeout):
+        # start_cmd must still hold the lock here → a fresh acquire fails.
+        with single_owner_lock(lock_path(config.data_dir)) as got:
+            observed["acquired_during_wait"] = got
+        return None
+
+    monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._wait_ready", fake_wait_ready)
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 0
+    assert observed["acquired_during_wait"] is False  # lock held across readiness
+
+
 async def test_request_respects_single_wall_clock_budget(monkeypatch: pytest.MonkeyPatch):
     # connect that hangs past the budget → the whole _request is bounded by the
     # single asyncio.timeout, returning None well within ~budget (not ~2x).

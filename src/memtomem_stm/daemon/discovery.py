@@ -49,20 +49,27 @@ def config_fingerprint(config: STMConfig) -> str:
     """Stable digest of the config that determines daemon/engine behavior.
 
     A running daemon froze its config at start; if a caller's effective config
-    differs, the daemon would serve stale behavior, so the caller must treat it
-    as stale. We therefore fingerprint the *whole* daemon-relevant surface
-    rather than a hand-picked subset: the full ``surfacing`` model (min_score,
+    differs *in a way that changes daemon behavior*, the daemon would serve
+    stale behavior and the caller must treat it as stale. So we fingerprint the
+    daemon-behavior-relevant surface: the full ``surfacing`` model (min_score,
     max_results, min_response_chars, default_namespace, result_format,
-    include_session_context, persist_query_text, the LTM command, …), the full
-    ``hook`` model (record_feedback_events, …), the bind host, and the flat
-    ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` env that ``cli.hook_cmd`` reads directly
-    (so it isn't in any model). ``mode="json"`` makes ``Path``/enum values
-    serializable. Over-inclusion only costs an extra restart on a config
-    change, which is the safe direction.
+    include_session_context, persist_query_text, the LTM command, …), the bind
+    host, the flat ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` env that ``cli.hook_cmd``
+    reads directly (so it isn't in any model), and exactly the one ``hook``
+    field the daemon engine wiring consumes: ``record_feedback_events``.
+
+    Deliberately **excluded**: the client-only ``hook`` fields ``use_daemon``,
+    ``fallback`` and ``daemon_timeout_seconds``. They govern how the *hook*
+    talks to the daemon, never what the daemon does — and a daemon is commonly
+    started without ``MEMTOMEM_STM_HOOK__USE_DAEMON=1`` (e.g. ``mms daemon
+    start`` in a plain shell) while the hook runs with it set. Including them
+    would make that live daemon look stale and the hook would reject it (then,
+    under the default ``fallback=skip``, return ``{}`` forever). ``mode="json"``
+    makes ``Path``/enum values serializable.
     """
     material = {
         "surfacing": config.surfacing.model_dump(mode="json"),
-        "hook": config.hook.model_dump(mode="json"),
+        "record_feedback_events": config.hook.record_feedback_events,
         "host": config.daemon.host,
         "surface_tools_env": os.environ.get("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", ""),
     }

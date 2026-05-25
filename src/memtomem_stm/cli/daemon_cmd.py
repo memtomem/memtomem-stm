@@ -149,7 +149,12 @@ def start_cmd() -> None:
             click.echo(_ok("daemon already running"))
             return
         _spawn_detached()
-    hs = _wait_ready(config, timeout=8.0)
+        # Hold the lock through readiness. Releasing it here would let a
+        # concurrent `start` acquire it, see ping return None (our child hasn't
+        # published its handshake yet), and spawn a *second* daemon — which,
+        # with ephemeral ports + last-writer-wins handshake, orphans an extra
+        # warm LTM process.
+        hs = _wait_ready(config, timeout=8.0)
     if hs is not None:
         click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
     else:
