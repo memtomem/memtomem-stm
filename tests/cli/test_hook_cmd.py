@@ -25,13 +25,20 @@ import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.hook_cmd import (
+    _COMPRESS_SENTINEL,
+    _SAFE_DAEMON_BUDGET,
+    _bounded_surfacing_payload,
+    _build_hook_output,
     _daemon_enabled,
     _extract_surfaced_block,
+    _orchestrate,
     _run_hook,
     _tool_response_to_text,
+    maybe_compress_builtin,
     run_surfacing_hook,
 )
 from memtomem_stm.cli.proxy import cli
+from memtomem_stm.config import HookCompressionConfig
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 
@@ -275,7 +282,9 @@ def test_daemon_enabled_default_when_unset(monkeypatch: pytest.MonkeyPatch):
 def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
-    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel))
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel)
+    )
     # client.surface must never be consulted when the daemon is opted out.
     boom = AsyncMock(side_effect=AssertionError("daemon must not be used when disabled"))
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", boom)
@@ -286,7 +295,9 @@ def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPat
 
 def test_daemon_used_when_enabled(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
-    daemon_out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "warm"}}
+    daemon_out = {
+        "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "warm"}
+    }
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", AsyncMock(return_value=daemon_out))
     # Cold path must not run when the daemon answers.
     monkeypatch.setattr(
@@ -303,7 +314,9 @@ def test_daemon_not_used_for_ineligible_tool(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)  # prove default-on
     spawns: list[int] = []
     monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: spawns.append(1))
-    surface = AsyncMock(side_effect=AssertionError("daemon must not be consulted for an ineligible tool"))
+    surface = AsyncMock(
+        side_effect=AssertionError("daemon must not be consulted for an ineligible tool")
+    )
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", surface)
     out = asyncio.run(_run_hook({**_READ_PAYLOAD, "tool_name": "Write"}))
     assert out == {}
@@ -328,6 +341,189 @@ def test_daemon_unavailable_cold_fallback(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__FALLBACK", "cold")
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", AsyncMock(return_value=None))
     sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
-    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel))
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel)
+    )
     out = asyncio.run(_run_hook(_READ_PAYLOAD))
     assert out == sentinel
+
+
+# ── Bash output compression (P1a — updatedToolOutput) ─────────────────────────
+
+_BIG_STDOUT = "log line %d\n" % 0 + "".join(f"log line {i}\n" for i in range(1, 4000))  # ~50KB
+_CFG = HookCompressionConfig(enabled=True, max_chars=2000)
+
+
+def _bash_payload(tool_response, *, tool="Bash", event="PostToolUse"):
+    return {
+        "hook_event_name": event,
+        "tool_name": tool,
+        "tool_input": {"command": "seq 1 4000"},
+        "tool_response": tool_response,
+    }
+
+
+def test_compress_dict_preserves_metadata_and_shrinks_stdout():
+    resp = {"stdout": _BIG_STDOUT, "stderr": "a warning", "interrupted": False, "isImage": False}
+    out = maybe_compress_builtin(_bash_payload(resp), _CFG)
+    assert isinstance(out, dict)
+    # Only stdout is replaced; it is shrunk and carries the sentinel.
+    assert out["stdout"].startswith(_COMPRESS_SENTINEL)
+    assert len(out["stdout"]) < len(_BIG_STDOUT)
+    # Every other channel survives verbatim (Codex: must not lose stderr/metadata).
+    assert out["stderr"] == "a warning"
+    assert out["interrupted"] is False
+    assert out["isImage"] is False
+    # Original payload is not mutated in place.
+    assert resp["stdout"] == _BIG_STDOUT
+
+
+def test_compress_plain_string_response():
+    out = maybe_compress_builtin(_bash_payload(_BIG_STDOUT), _CFG)
+    assert isinstance(out, str)
+    assert out.startswith(_COMPRESS_SENTINEL)
+    assert len(out) < len(_BIG_STDOUT)
+
+
+def test_compress_noop_when_small():
+    assert maybe_compress_builtin(_bash_payload({"stdout": "tiny"}), _CFG) is None
+
+
+def test_compress_noop_when_disabled():
+    cfg = HookCompressionConfig(enabled=False, max_chars=2000)
+    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), cfg) is None
+
+
+def test_compress_noop_for_non_bash_tool():
+    # Read output must never be replaced (a later Edit needs it verbatim).
+    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}, tool="Read"), _CFG) is None
+
+
+def test_compress_noop_for_non_posttooluse():
+    assert (
+        maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}, event="PreToolUse"), _CFG)
+        is None
+    )
+
+
+def test_compress_is_idempotent_on_sentinel():
+    out = maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG)
+    # Feeding the already-compressed stdout back must not re-compress.
+    assert maybe_compress_builtin(_bash_payload({"stdout": out["stdout"]}), _CFG) is None
+
+
+def test_compress_no_false_positive_on_truncate_marker():
+    # A real log that happens to contain TruncateCompressor's generic marker text
+    # must STILL be compressed — only the unique sentinel suppresses (Codex Major).
+    poisoned = (
+        _BIG_STDOUT + "\n... (truncated, original: 5 chars)\n... (12 similar lines omitted)\n"
+    )
+    out = maybe_compress_builtin(_bash_payload({"stdout": poisoned}), _CFG)
+    assert out is not None and out["stdout"].startswith(_COMPRESS_SENTINEL)
+
+
+def test_compress_never_raises(monkeypatch: pytest.MonkeyPatch):
+    class _Boom:
+        def compress(self, *a, **k):
+            raise RuntimeError("compressor exploded")
+
+    monkeypatch.setattr("memtomem_stm.proxy.compression.TruncateCompressor", _Boom)
+    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG) is None
+
+
+# ── bounded surfacing payload + merge builder ────────────────────────────────
+
+
+def test_bounded_surfacing_payload_passthrough_when_small():
+    payload = _bash_payload({"stdout": "small"})
+    assert _bounded_surfacing_payload(payload) is payload  # same object, no copy
+
+
+def test_bounded_surfacing_payload_caps_huge_output():
+    huge = "x" * (_SAFE_DAEMON_BUDGET + 5000)
+    payload = _bash_payload({"stdout": huge, "stderr": "y" * 100})
+    bounded = _bounded_surfacing_payload(payload)
+    assert bounded is not payload
+    assert len(bounded["tool_response"]) == _SAFE_DAEMON_BUDGET
+
+
+def test_build_hook_output_merges_both_halves():
+    out = _build_hook_output({"stdout": "c"}, "<surfaced-memories>m</surfaced-memories>")
+    hso = out["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PostToolUse"
+    assert hso["updatedToolOutput"] == {"stdout": "c"}
+    assert hso["additionalContext"] == "<surfaced-memories>m</surfaced-memories>"
+
+
+def test_build_hook_output_each_half_alone():
+    assert _build_hook_output({"stdout": "c"}, None)["hookSpecificOutput"].keys() == {
+        "hookEventName",
+        "updatedToolOutput",
+    }
+    assert _build_hook_output(None, "ctx")["hookSpecificOutput"].keys() == {
+        "hookEventName",
+        "additionalContext",
+    }
+    assert _build_hook_output(None, None) == {}
+
+
+# ── _orchestrate: compression + surfacing merge, independent gates ───────────
+
+
+def test_orchestrate_merges_compression_and_surfacing(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")  # cold path → run_surfacing_hook
+    surfaced = {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "<surfaced-memories>m</surfaced-memories>",
+        }
+    }
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=surfaced)
+    )
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
+    hso = out["hookSpecificOutput"]
+    assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
+    assert hso["additionalContext"] == "<surfaced-memories>m</surfaced-memories>"
+
+
+def test_orchestrate_compression_runs_when_surfacing_yields_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Independent gate: surfacing produced {} (disabled / no hits) yet the Bash
+    # output is still compressed.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
+    hso = out["hookSpecificOutput"]
+    assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
+    assert "additionalContext" not in hso
+
+
+def test_cli_compresses_bash_output_end_to_end(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
+    result = CliRunner().invoke(
+        cli, ["hook"], input=json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+    )
+    assert result.exit_code == 0
+    hso = json.loads(result.output)["hookSpecificOutput"]
+    assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
+
+
+def test_cli_compression_default_off_is_passthrough(monkeypatch: pytest.MonkeyPatch):
+    # Opt-in: with the flag unset, a large Bash output is NOT replaced.
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", raising=False)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
+    result = CliRunner().invoke(
+        cli, ["hook"], input=json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+    )
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
