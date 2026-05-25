@@ -381,6 +381,26 @@ def test_compress_dict_preserves_metadata_and_shrinks_stdout():
     assert resp["stdout"] == _BIG_STDOUT
 
 
+def test_compress_reserves_sentinel_from_budget(monkeypatch: pytest.MonkeyPatch):
+    # Directly prove the sentinel prefix is reserved out of the compressor's
+    # budget (Codex nit): capture the max_chars handed to TruncateCompressor and
+    # assert it is cfg.max_chars minus the prefix length — a regression back to
+    # passing the full budget would fail here even though the repetitive fixture
+    # compresses well under max_chars.
+    seen: dict[str, int] = {}
+
+    class _Spy:
+        def compress(self, text: str, *, max_chars: int) -> str:
+            seen["budget"] = max_chars
+            return "BODY"
+
+    monkeypatch.setattr("memtomem_stm.proxy.compression.TruncateCompressor", _Spy)
+    out = maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG)
+    prefix_len = len(_COMPRESS_SENTINEL) + 1  # sentinel + "\n"
+    assert seen["budget"] == _CFG.max_chars - prefix_len
+    assert out["stdout"] == f"{_COMPRESS_SENTINEL}\nBODY"
+
+
 def test_compress_noop_for_plain_string_response():
     # For the built-in Bash tool, updatedToolOutput must be a structured object;
     # a bare string would be ignored by the host, so an unstructured response is
