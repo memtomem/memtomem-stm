@@ -370,6 +370,9 @@ def test_compress_dict_preserves_metadata_and_shrinks_stdout():
     # Only stdout is replaced; it is shrunk and carries the sentinel.
     assert out["stdout"].startswith(_COMPRESS_SENTINEL)
     assert len(out["stdout"]) < len(_BIG_STDOUT)
+    # Budget is a target: sentinel reserved out of it, small compressor-suffix
+    # overage tolerated — but the result must stay close to max_chars, not blow it.
+    assert len(out["stdout"]) <= _CFG.max_chars + 200
     # Every other channel survives verbatim (Codex: must not lose stderr/metadata).
     assert out["stderr"] == "a warning"
     assert out["interrupted"] is False
@@ -378,11 +381,11 @@ def test_compress_dict_preserves_metadata_and_shrinks_stdout():
     assert resp["stdout"] == _BIG_STDOUT
 
 
-def test_compress_plain_string_response():
-    out = maybe_compress_builtin(_bash_payload(_BIG_STDOUT), _CFG)
-    assert isinstance(out, str)
-    assert out.startswith(_COMPRESS_SENTINEL)
-    assert len(out) < len(_BIG_STDOUT)
+def test_compress_noop_for_plain_string_response():
+    # For the built-in Bash tool, updatedToolOutput must be a structured object;
+    # a bare string would be ignored by the host, so an unstructured response is
+    # left untouched rather than replaced (Codex Major).
+    assert maybe_compress_builtin(_bash_payload(_BIG_STDOUT), _CFG) is None
 
 
 def test_compress_noop_when_small():
@@ -498,6 +501,22 @@ def test_orchestrate_compression_runs_when_surfacing_yields_nothing(
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
+    hso = out["hookSpecificOutput"]
+    assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
+    assert "additionalContext" not in hso
+
+
+def test_orchestrate_keeps_compression_when_surfacing_raises(monkeypatch: pytest.MonkeyPatch):
+    # A surfacing failure must NOT discard the already-computed compression half
+    # (Codex Major — the never-raises/independence contract).
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.run_surfacing_hook",
+        AsyncMock(side_effect=RuntimeError("surfacing exploded")),
+    )
     out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
     hso = out["hookSpecificOutput"]
     assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)

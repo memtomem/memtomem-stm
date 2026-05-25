@@ -68,9 +68,12 @@ class HookCompressionConfig(BaseModel):
     ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`` after the empirical hook test
     confirms the host honors ``updatedToolOutput`` for Bash."""
     max_chars: int = Field(default=16000, gt=0)
-    """Character budget for the compressed ``stdout`` channel, and the threshold
-    below which output is left untouched (only stdout longer than this is
-    compressed). Matches the proxy's ``default_max_result_chars`` default."""
+    """Target character budget for the replacement ``stdout`` channel, and the
+    threshold below which output is left untouched (only stdout longer than this
+    is compressed). The sentinel prefix is reserved out of this budget; the
+    compressor's own truncation suffix may still add a small, bounded overage, so
+    treat it as a target rather than a hard ceiling. Matches the proxy's
+    ``default_max_result_chars`` default."""
 
 
 class HookConfig(BaseModel):

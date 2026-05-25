@@ -162,25 +162,27 @@ def _tool_response_to_text(tool_response: Any) -> str:
     return str(tool_response)
 
 
-def _bash_stdout(tool_response: Any) -> tuple[str | None, dict[str, Any] | None]:
+def _bash_stdout(tool_response: Any) -> tuple[str, dict[str, Any]] | None:
     """Extract the compressible ``stdout`` channel of a Bash tool result.
 
-    Returns ``(stdout_text, original_dict)`` when ``tool_response`` is a dict
-    carrying a string ``stdout`` (so the caller can clone the dict and replace
-    only that field, preserving ``stderr`` / exit / ``interrupted`` / ``isImage``
-    verbatim), or ``(text, None)`` when ``tool_response`` is itself a plain
-    string (replace wholesale). ``(None, None)`` when there is nothing
-    string-like to compress. Unlike :func:`_tool_response_to_text` this never
-    folds ``stderr`` into the compressible channel — replacement must not lose
-    the error stream or merge it into stdout.
+    Returns ``(stdout_text, original_dict)`` only when ``tool_response`` is a
+    dict carrying a string ``stdout`` — so the caller can clone the dict and
+    replace just that field, preserving ``stderr`` / exit / ``interrupted`` /
+    ``isImage`` verbatim. ``None`` for any other shape.
+
+    We deliberately do **not** handle a plain-string ``tool_response``: for the
+    built-in Bash tool ``updatedToolOutput`` must be a structured object
+    mirroring the tool result, so a bare string would be ignored by the host
+    (silently leaving the original output visible). An unknown shape is left
+    untouched rather than replaced with something the host rejects. Unlike
+    :func:`_tool_response_to_text` this never folds ``stderr`` into the
+    compressible channel — replacement must not lose or merge the error stream.
     """
-    if isinstance(tool_response, str):
-        return tool_response, None
     if isinstance(tool_response, dict):
         stdout = tool_response.get("stdout")
         if isinstance(stdout, str):
             return stdout, tool_response
-    return None, None
+    return None
 
 
 def _already_compressed(text: str) -> bool:
@@ -188,19 +190,24 @@ def _already_compressed(text: str) -> bool:
     return _COMPRESS_SENTINEL in text
 
 
-def maybe_compress_builtin(payload: dict[str, Any], cfg: "HookCompressionConfig") -> Any | None:
+def maybe_compress_builtin(
+    payload: dict[str, Any], cfg: "HookCompressionConfig"
+) -> dict[str, Any] | None:
     """Compress a Bash tool's ``stdout`` for the PostToolUse ``updatedToolOutput``.
 
     Returns the value to place in ``updatedToolOutput`` — a dict mirroring the
     original Bash ``tool_response`` with only ``stdout`` shrunk (every other
-    field preserved verbatim), or a plain string when the original response was a
-    string — or ``None`` to leave the tool output untouched. **Never raises.**
+    field preserved verbatim) — or ``None`` to leave the tool output untouched.
+    Only structured Bash results are handled (see :func:`_bash_stdout`).
+    **Never raises.**
 
     Gate: ``cfg.enabled`` + PostToolUse + ``tool_name == "Bash"`` + ``stdout``
     longer than ``cfg.max_chars`` + not already compressed. The strategy is fixed
     to :class:`TruncateCompressor` (self-contained — no chunk-store callback,
     unlike SELECTIVE/HYBRID/PROGRESSIVE, whose retrieval tools live in the
-    separate ``mms`` server process).
+    separate ``mms`` server process). ``cfg.max_chars`` budgets the *whole*
+    replacement stdout: the sentinel prefix is reserved out of the compressor's
+    budget so the result stays at/near the configured size.
     """
     try:
         if not cfg.enabled:
@@ -209,20 +216,25 @@ def maybe_compress_builtin(payload: dict[str, Any], cfg: "HookCompressionConfig"
             return None
         if payload.get("tool_name") != "Bash":
             return None
-        stdout, original = _bash_stdout(payload.get("tool_response"))
-        if stdout is None or len(stdout) <= cfg.max_chars or _already_compressed(stdout):
+        extracted = _bash_stdout(payload.get("tool_response"))
+        if extracted is None:
+            return None
+        stdout, original = extracted
+        if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
             return None
 
         # Lazy import: keep ``mms hook --help`` and the no-op path off the
         # compression module's import cost.
         from memtomem_stm.proxy.compression import TruncateCompressor
 
-        compressed = TruncateCompressor().compress(stdout, max_chars=cfg.max_chars)
-        compressed = f"{_COMPRESS_SENTINEL}\n{compressed}"
-        if original is None:
-            return compressed
+        # Reserve the sentinel prefix out of the budget so sentinel + body stays
+        # at/near ``max_chars`` (TruncateCompressor's own suffix may still add a
+        # small, bounded overage — the budget is a target, not a hard cap).
+        prefix = f"{_COMPRESS_SENTINEL}\n"
+        body_budget = max(1, cfg.max_chars - len(prefix))
+        compressed = TruncateCompressor().compress(stdout, max_chars=body_budget)
         clone = dict(original)
-        clone["stdout"] = compressed
+        clone["stdout"] = prefix + compressed
         return clone
     except Exception:
         logger.debug(
@@ -497,14 +509,20 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     Bash result is shrunk before it could be sent whole to the daemon's 4 MiB
     frame, and it is **independent of the surfacing gate** — it still runs when
     surfacing is disabled or Bash is not in the *surface* allowlist. Surfacing
-    then runs on a frame-bounded copy of the payload. Never raises (the CLI
-    wrapper also backstops); each half degrades to "absent" on any failure.
+    then runs on a frame-bounded copy of the payload, wrapped so that a
+    surfacing failure degrades to "no memories" while still returning the
+    compression half (``maybe_compress_builtin`` is itself non-raising). The CLI
+    wrapper backstops the whole call.
     """
     from memtomem_stm.config import STMConfig
 
     config = STMConfig()
     updated = maybe_compress_builtin(payload, config.hook.compression)
-    surf_out = await _run_hook(_bounded_surfacing_payload(payload), config=config)
+    surf_out: dict[str, Any] = {}
+    try:
+        surf_out = await _run_hook(_bounded_surfacing_payload(payload), config=config)
+    except Exception:
+        logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     return _build_hook_output(updated, _extract_surfaced_context(surf_out))
 
 
