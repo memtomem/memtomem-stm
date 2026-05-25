@@ -60,12 +60,12 @@ def config_fingerprint(config: STMConfig) -> str:
 
     Deliberately **excluded**: the client-only ``hook`` fields ``use_daemon``,
     ``fallback`` and ``daemon_timeout_seconds``. They govern how the *hook*
-    talks to the daemon, never what the daemon does — and a daemon is commonly
-    started without ``MEMTOMEM_STM_HOOK__USE_DAEMON=1`` (e.g. ``mms daemon
-    start`` in a plain shell) while the hook runs with it set. Including them
-    would make that live daemon look stale and the hook would reject it (then,
-    under the default ``fallback=skip``, return ``{}`` forever). ``mode="json"``
-    makes ``Path``/enum values serializable.
+    talks to the daemon, never what the daemon does — the daemon's behavior is
+    independent of them (``mms daemon start`` warms the same daemon whether or
+    not the hook has opted out via ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``).
+    Including them would make a live daemon look stale and the hook would reject
+    it (then, under the default ``fallback=skip``, return ``{}`` forever).
+    ``mode="json"`` makes ``Path``/enum values serializable.
     """
     material = {
         "surfacing": config.surfacing.model_dump(mode="json"),

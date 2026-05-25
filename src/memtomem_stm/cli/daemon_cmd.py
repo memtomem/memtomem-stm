@@ -249,7 +249,7 @@ def status_cmd(as_json: bool) -> None:
         )
     else:
         click.echo("stopped")
-    hint = "yes" if use_daemon else "no (set MEMTOMEM_STM_HOOK__USE_DAEMON=1)"
+    hint = "yes" if use_daemon else "no (opted out via MEMTOMEM_STM_HOOK__USE_DAEMON=0)"
     click.echo(f"hook will use daemon: {hint}")
 
 

@@ -55,11 +55,13 @@ class HookConfig(BaseModel):
     underscore) is a separate direct-read knob in ``cli/hook_cmd.py`` and is
     unaffected by this model."""
 
-    use_daemon: bool = False
-    """When ``True``, ``mms hook`` routes surfacing through the local daemon
-    (warm LTM connection) instead of spawning a cold LTM subprocess per call.
-    Opt-in this release — default ``False`` keeps ``mms hook`` behaving exactly
-    as before (cold in-process path)."""
+    use_daemon: bool = True
+    """When ``True`` (the default), ``mms hook`` routes surfacing through the
+    local daemon (warm LTM connection) instead of spawning a cold LTM subprocess
+    per call. The daemon is auto-spawned on first use (see ``auto_spawn``), so no
+    manual ``mms daemon start`` is needed. Set
+    ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to opt out to the legacy cold in-process
+    path."""
     daemon_timeout_seconds: float = Field(default=2.5, gt=0.0)
     """Per-request wall-clock budget for the hook→daemon round trip. Small and
     independent of the cold-path ``_hook_budget_seconds()`` backstop — a warm

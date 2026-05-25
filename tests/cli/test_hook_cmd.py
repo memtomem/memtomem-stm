@@ -36,6 +36,18 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Daemon mode is on by default now (``HookConfig.use_daemon=True``), so any
+    ``mms hook`` / ``_run_hook`` call here would otherwise read the real
+    ``~/.memtomem`` handshake and fire-and-forget ``Popen`` a detached daemon.
+    Isolate state to a tmp dir and neutralize the spawn so these CLI tests never
+    touch the dev box's daemon or leak a subprocess. (Spawn behavior itself is
+    covered in tests/daemon/test_server.py.)"""
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: None)
+
+
 # ── Fakes (mirror tests/test_surfacing_engine.py shapes) ─────────────────────
 
 
@@ -216,8 +228,9 @@ def test_cli_degrades_to_empty_object(stdin: str):
 
 
 def test_cli_surfacing_disabled_is_noop(monkeypatch: pytest.MonkeyPatch):
-    # A valid PostToolUse payload, but surfacing off → returns {} without ever
+    # Cold path (daemon opted out) + surfacing off → returns {} without ever
     # constructing the LTM adapter (so no subprocess spawn in CI).
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
     result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
     assert result.exit_code == 0
@@ -229,18 +242,38 @@ def test_cli_surfacing_disabled_is_noop(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.parametrize(
     "value,expected",
-    [("1", True), ("true", True), ("YES", True), ("on", True), ("0", False), ("", False)],
+    [
+        ("1", True),
+        ("true", True),
+        ("YES", True),
+        ("on", True),
+        ("0", False),
+        ("false", False),
+        ("f", False),
+        ("no", False),
+        ("n", False),
+        ("off", False),
+    ],
 )
 def test_daemon_enabled_env_parsing(monkeypatch: pytest.MonkeyPatch, value: str, expected: bool):
+    # Falsy-token set matches Pydantic's bool parsing, so the hot path and
+    # `mms daemon status` (the parsed field) never disagree on a value Pydantic
+    # accepts.
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", value)
     assert _daemon_enabled() is expected
 
 
-def test_daemon_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPatch):
+def test_daemon_enabled_default_when_unset(monkeypatch: pytest.MonkeyPatch):
+    # Daemon mode is the default now — unset → enabled.
     monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)
+    assert _daemon_enabled() is True
+
+
+def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel))
-    # client.surface must never be consulted when the daemon is disabled.
+    # client.surface must never be consulted when the daemon is opted out.
     boom = AsyncMock(side_effect=AssertionError("daemon must not be used when disabled"))
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", boom)
     out = asyncio.run(_run_hook(_READ_PAYLOAD))
