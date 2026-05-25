@@ -279,9 +279,11 @@ def _daemon_enabled() -> bool:
     env binding) so the explicit opt-out path pays no extra config load —
     ``_surface_tools()`` reads its env knob the same way. The falsy-token set
     matches Pydantic's bool parsing so this and ``mms daemon status`` (which
-    reads the parsed field) never disagree on a value Pydantic accepts; values
-    Pydantic rejects outright (empty/garbage) fall to the default-on side here
-    while a config load would raise.
+    reads the parsed field) agree on every value Pydantic accepts. We strip and
+    lower-case first, so a padded token like ``" off "`` still disables (Pydantic
+    doesn't strip and would reject it); any other value Pydantic rejects (empty,
+    garbage) returns enabled here, while a config load like ``mms daemon status``
+    would raise.
     """
     val = os.environ.get("MEMTOMEM_STM_HOOK__USE_DAEMON")
     if val is None:
@@ -306,6 +308,10 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
         from memtomem_stm.daemon import client
 
         config = STMConfig()
+        if not config.surfacing.enabled:
+            # Surfacing globally off → nothing to route or warm a daemon for;
+            # mirror the cold path's no-op instead of spawning a pointless daemon.
+            return {}
         try:
             out = await client.surface(config, payload, timeout=config.hook.daemon_timeout_seconds)
         except Exception:

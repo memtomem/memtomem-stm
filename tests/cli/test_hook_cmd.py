@@ -228,13 +228,15 @@ def test_cli_degrades_to_empty_object(stdin: str):
 
 
 def test_cli_surfacing_disabled_is_noop(monkeypatch: pytest.MonkeyPatch):
-    # Cold path (daemon opted out) + surfacing off → returns {} without ever
-    # constructing the LTM adapter (so no subprocess spawn in CI).
-    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    # Default daemon-on path + surfacing globally off → {} immediately, and the
+    # hook must NOT spawn a daemon (nothing to surface) or build an LTM adapter.
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    spawns: list[int] = []
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: spawns.append(1))
     result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
     assert result.exit_code == 0
     assert json.loads(result.output) == {}
+    assert spawns == []  # surfacing disabled → no daemon spawn
 
 
 # ── Daemon routing + degradation ladder ──────────────────────────────────────
