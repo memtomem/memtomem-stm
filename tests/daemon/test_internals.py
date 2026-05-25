@@ -199,6 +199,12 @@ def test_start_does_not_misreport_stale_handshake_after_spawn(
     assert "daemon started" in result.output
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="is_pid_alive() always returns True on Windows (no signal-0) → the "
+    "dead-pid guard is a documented no-op there; the spawned-flag guard is "
+    "what protects the common case cross-platform.",
+)
 def test_start_ignores_stale_handshake_with_dead_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
