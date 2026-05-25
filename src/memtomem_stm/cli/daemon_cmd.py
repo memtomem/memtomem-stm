@@ -69,19 +69,6 @@ def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     )
 
 
-def _wait_ready(config: STMConfig, *, timeout: float) -> dict[str, Any] | None:
-    """Poll ``ping`` until the daemon answers or ``timeout`` elapses."""
-    from memtomem_stm.daemon import client
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        hs = asyncio.run(client.ping(config, timeout=1.0))
-        if hs is not None:
-            return hs
-        time.sleep(0.2)
-    return None
-
-
 @click.group(name="daemon")
 def daemon_group() -> None:
     """Manage the local surfacing daemon (warm LTM connection for ``mms hook``)."""
@@ -111,11 +98,12 @@ def run_cmd(detached: bool, foreground: bool) -> None:
 def start_cmd() -> None:
     """Spawn the daemon detached if it isn't already running.
 
-    The daemon now self-guards via its lifetime lock, so ``start`` no longer
-    holds the lock through readiness — it just classifies the current state:
-    a matching daemon already running, a spawn we launched, a *different-config*
-    daemon holding the lock (which it can't replace — points at ``restart``), or
-    a matching daemon mid-startup (waits for it).
+    The daemon self-guards via its lifetime lock, so ``start`` never holds the
+    lock — it reconciles toward a running daemon. The lock may currently be held
+    by a daemon that is *shutting down* (e.g. right after ``mms daemon stop``):
+    it won't answer ping and will soon release the lock, so we keep retrying the
+    spawn until the lock frees rather than polling ping once and giving up. A
+    *different-config* daemon stays alive and won't release — that we report.
     """
     from memtomem_stm.daemon import client
     from memtomem_stm.daemon.discovery import config_fingerprint, handshake_path, read_handshake
@@ -129,43 +117,38 @@ def start_cmd() -> None:
         )
         return
 
-    if request_spawn(config):
-        # Lock was free → we launched a child. Poll for readiness (UX only; the
-        # child owns the lock now, we don't hold it).
-        hs = _wait_ready(config, timeout=8.0)
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
             click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
-        else:
+            return
+        if request_spawn(config):
+            # We launched a child (lock was free). Give it a moment to acquire
+            # the lock + publish, then loop back to ping it. We don't hold the
+            # lock, so the child can take ownership.
+            time.sleep(0.3)
+            continue
+        # Lock held by another daemon. A *different-config* one stays alive and
+        # won't release the lock — report instead of waiting it out. (A matching
+        # daemon mid-startup, or any daemon mid-shutdown, falls through to wait:
+        # the next iteration re-attempts the spawn once the lock is free.)
+        raw = read_handshake(handshake_path(config.data_dir))
+        if raw is not None and raw.get("config_fingerprint") != config_fingerprint(config):
             click.echo(
                 _warn(
-                    "daemon spawn requested but it did not become ready in time — "
-                    "check the daemon log under data_dir (stm-daemon.log)"
+                    f"a daemon with a different config is running (pid={raw.get('pid')}) — "
+                    "run `mms daemon restart` to replace it"
                 )
             )
-        return
-
-    # Lock held but no *matching* daemon answered ping. Distinguish a
-    # different-config daemon (can't be used by this config; needs an explicit
-    # restart) from a matching one still coming up.
-    raw = read_handshake(handshake_path(config.data_dir))
-    if raw is not None and raw.get("config_fingerprint") != config_fingerprint(config):
-        click.echo(
-            _warn(
-                f"a daemon with a different config is running (pid={raw.get('pid')}) — "
-                "run `mms daemon restart` to replace it"
-            )
+            return
+        time.sleep(0.2)
+    click.echo(
+        _warn(
+            "daemon did not become ready in time — "
+            "check the daemon log under data_dir (stm-daemon.log)"
         )
-        return
-    hs = _wait_ready(config, timeout=8.0)
-    if hs is not None:
-        click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
-    else:
-        click.echo(
-            _warn(
-                "another daemon owns the lock but did not become ready in time — "
-                "check the daemon log under data_dir (stm-daemon.log)"
-            )
-        )
+    )
 
 
 @daemon_group.command(name="stop")

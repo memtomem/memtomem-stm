@@ -123,37 +123,40 @@ def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock re-entrancy semantics")
-def test_start_does_not_hold_lock_through_readiness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    # Inverted invariant (vs the pre-lifetime-lock design): single-owner
-    # protection now lives in the daemon, so `mms daemon start` must NOT hold the
-    # lock while polling readiness — the spawned child needs to acquire it. A
-    # fresh acquire during _wait_ready() therefore SUCCEEDS.
-    from unittest.mock import AsyncMock
-
+def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A daemon shutting down still holds the lifetime lock, so request_spawn
+    # declines — but it WILL release the lock and never become ready. `start`
+    # must keep retrying the spawn (not poll ping once and give up), and must
+    # never hold the lock itself (so the spawned child can take ownership).
     from click.testing import CliRunner
 
     from memtomem_stm.cli.proxy import cli
     from memtomem_stm.daemon.locking import lock_path, single_owner_lock
 
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr("memtomem_stm.daemon.client.ping", AsyncMock(return_value=None))
-    # request_spawn reports "spawned" without launching a real detached daemon.
-    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda config: True)
 
-    observed: dict[str, bool] = {}
+    state = {"spawns": 0, "lock_free_seen": []}
 
-    def fake_wait_ready(config, *, timeout):
+    def fake_request_spawn(config):
+        # The real request_spawn probes the lock; if start_cmd held it this would
+        # see it taken. Assert it's free → start holds nothing across the loop.
         with single_owner_lock(lock_path(config.data_dir)) as got:
-            observed["acquired_during_wait"] = got
-        return None
+            state["lock_free_seen"].append(got)
+        state["spawns"] += 1
+        return state["spawns"] >= 3  # declined twice (lock "held"), then spawns
 
-    monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._wait_ready", fake_wait_ready)
+    async def fake_ping(config, *, timeout=2.0):
+        # Answers only once the (faked) shutdown finished and we spawned.
+        return {"pid": 123, "port": 4567} if state["spawns"] >= 3 else None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
 
     result = CliRunner().invoke(cli, ["daemon", "start"])
     assert result.exit_code == 0
-    assert observed["acquired_during_wait"] is True  # lock NOT held across readiness
+    assert state["spawns"] >= 3  # retried past the initial declines
+    assert all(state["lock_free_seen"])  # start never held the lock
+    assert "daemon started" in result.output
 
 
 # ── spawn (request_spawn) ─────────────────────────────────────────────────────
