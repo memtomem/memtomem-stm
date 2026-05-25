@@ -19,6 +19,7 @@ from typing import Any, TextIO
 
 import click
 
+from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
 from memtomem_stm.cli.mms_import import import_command as _mms_import_command
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
@@ -2592,3 +2593,7 @@ cli.add_command(_mms_import_command)
 
 # `mms host ...` — RFC §7.3, lives in src/memtomem_stm/cli/mms_host.py.
 cli.add_command(_mms_host_group)
+
+# `mms hook` — bridge a host's built-in tool calls (Claude Code PostToolUse)
+# into STM surfacing; lives in src/memtomem_stm/cli/hook_cmd.py.
+cli.add_command(_hook_command)

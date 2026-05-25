@@ -116,6 +116,17 @@ class TestSurfacingBasic:
         output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert output == LONG_RESPONSE
 
+    async def test_no_feedback_prompt_without_tracker(self):
+        # With no feedback tracker (mms-hook path / feedback-disabled server),
+        # the engine must not advertise a surfacing_id / stm_surfacing_feedback
+        # prompt — the event was never recorded, so the ID is unresolvable.
+        results = [FakeSearchResult(chunk=FakeChunk(content="Flask chosen"), score=0.5)]
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=_make_mcp_adapter(results))
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "Flask chosen" in output
+        assert "stm_surfacing_feedback" not in output
+        assert "surfacing_id" not in output
+
     async def test_disabled_returns_original(self):
         engine = SurfacingEngine(
             config=_make_config(enabled=False),
