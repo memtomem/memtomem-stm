@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING, Any
@@ -70,38 +69,6 @@ def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     )
 
 
-def _spawn_detached() -> None:
-    """Launch ``mms daemon run --detached`` as a background process."""
-    cmd = [sys.executable, "-m", "memtomem_stm", "daemon", "run", "--detached"]
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
-        kwargs["creationflags"] = flags
-    else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen(cmd, **kwargs)
-
-
-def _wait_ready(config: STMConfig, *, timeout: float) -> dict[str, Any] | None:
-    """Poll ``ping`` until the daemon answers or ``timeout`` elapses."""
-    from memtomem_stm.daemon import client
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        hs = asyncio.run(client.ping(config, timeout=1.0))
-        if hs is not None:
-            return hs
-        time.sleep(0.2)
-    return None
-
-
 @click.group(name="daemon")
 def daemon_group() -> None:
     """Manage the local surfacing daemon (warm LTM connection for ``mms hook``)."""
@@ -129,9 +96,23 @@ def run_cmd(detached: bool, foreground: bool) -> None:
 
 @daemon_group.command(name="start")
 def start_cmd() -> None:
-    """Spawn the daemon detached if it isn't already running."""
+    """Spawn the daemon detached if it isn't already running.
+
+    The daemon self-guards via its lifetime lock, so ``start`` never holds the
+    lock — it reconciles toward a running daemon. The lock may currently be held
+    by a daemon that is *shutting down* (e.g. right after ``mms daemon stop``):
+    it won't answer ping and will soon release the lock, so we keep retrying the
+    spawn until the lock frees rather than polling ping once and giving up. A
+    *different-config* daemon stays alive and won't release — that we report.
+    """
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+    from memtomem_stm.daemon.discovery import (
+        config_fingerprint,
+        handshake_path,
+        is_pid_alive,
+        read_handshake,
+    )
+    from memtomem_stm.daemon.spawn import request_spawn
 
     config = _load_config()
     existing = asyncio.run(client.ping(config, timeout=2.0))
@@ -140,30 +121,48 @@ def start_cmd() -> None:
             _ok(f"daemon already running (pid={existing.get('pid')} port={existing.get('port')})")
         )
         return
-    with single_owner_lock(lock_path(config.data_dir)) as acquired:
-        if not acquired:
-            click.echo(_warn("another `mms daemon start` is in progress"))
+
+    deadline = time.time() + 10.0
+    spawned = False
+    while time.time() < deadline:
+        hs = asyncio.run(client.ping(config, timeout=1.0))
+        if hs is not None:
+            click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
             return
-        # Re-check under the lock to avoid a double-spawn race.
-        if asyncio.run(client.ping(config, timeout=1.0)) is not None:
-            click.echo(_ok("daemon already running"))
-            return
-        _spawn_detached()
-        # Hold the lock through readiness. Releasing it here would let a
-        # concurrent `start` acquire it, see ping return None (our child hasn't
-        # published its handshake yet), and spawn a *second* daemon — which,
-        # with ephemeral ports + last-writer-wins handshake, orphans an extra
-        # warm LTM process.
-        hs = _wait_ready(config, timeout=8.0)
-    if hs is not None:
-        click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
-    else:
-        click.echo(
-            _warn(
-                "daemon spawn requested but it did not become ready in time — "
-                "check the daemon log under data_dir (stm-daemon.log)"
-            )
+        if request_spawn(config):
+            # We launched a child (lock was free). Give it a moment to acquire
+            # the lock + publish, then loop back to ping it. We don't hold the
+            # lock, so the child can take ownership.
+            spawned = True
+            time.sleep(0.3)
+            continue
+        # Lock held by another daemon. Only a *live* different-config daemon that
+        # we did not just spawn is a real conflict worth reporting: a stale
+        # handshake (dead pid) left by a crash, or the matching child we just
+        # spawned that hasn't published its handshake yet, must NOT be
+        # misreported. Everything else falls through to wait — the next
+        # iteration re-attempts the spawn once the lock frees.
+        if not spawned:
+            raw = read_handshake(handshake_path(config.data_dir))
+            if (
+                raw is not None
+                and raw.get("config_fingerprint") != config_fingerprint(config)
+                and is_pid_alive(int(raw.get("pid", -1)))
+            ):
+                click.echo(
+                    _warn(
+                        f"a daemon with a different config is running (pid={raw.get('pid')}) — "
+                        "run `mms daemon restart` to replace it"
+                    )
+                )
+                return
+        time.sleep(0.2)
+    click.echo(
+        _warn(
+            "daemon did not become ready in time — "
+            "check the daemon log under data_dir (stm-daemon.log)"
         )
+    )
 
 
 @daemon_group.command(name="stop")
@@ -257,7 +256,21 @@ def status_cmd(as_json: bool) -> None:
 @daemon_group.command(name="restart")
 @click.pass_context
 def restart_cmd(ctx: click.Context) -> None:
-    """Stop any running daemon, then start a fresh one."""
+    """Stop any running daemon, then start a fresh one once the lock is free."""
+    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+
+    config = _load_config()
     ctx.invoke(stop_cmd)
-    time.sleep(0.3)
-    ctx.invoke(start_cmd)
+    # Wait for the old daemon to release its lifetime lock before starting. A
+    # fixed sleep could race: _teardown() awaits the warm LTM child's stop and
+    # has no hard timeout. Bounded so a wedged teardown reports clearly instead
+    # of letting start_cmd produce a misleading readiness timeout.
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        with single_owner_lock(lock_path(config.data_dir)) as acquired:
+            free = acquired
+        if free:
+            ctx.invoke(start_cmd)
+            return
+        time.sleep(0.2)
+    click.echo(_warn("previous daemon still shutting down — try `mms daemon start` again shortly"))

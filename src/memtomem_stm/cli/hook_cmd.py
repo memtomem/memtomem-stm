@@ -289,10 +289,12 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
 
     Degradation ladder (every rung still yields a hook-output dict, never
     raises): daemon disabled → cold in-process path (unchanged). Daemon enabled
-    → one bounded round trip; on unavailable/stale/slow either ``{}`` (default
-    ``fallback=skip`` — the daemon exists precisely to avoid the ~6s cold start)
-    or the cold path (``fallback=cold``). The whole call runs inside
-    ``_hook_budget_seconds()`` in :func:`hook_command`.
+    → one bounded round trip; on unavailable/stale/slow we (optionally)
+    fire-and-forget spawn the daemon so the *next* call is warm, then for *this*
+    call either return ``{}`` (default ``fallback=skip`` — the daemon exists
+    precisely to avoid the ~6s cold start) or take the cold path
+    (``fallback=cold``). The whole call runs inside ``_hook_budget_seconds()``
+    in :func:`hook_command`.
     """
     if _daemon_enabled():
         from memtomem_stm.config import STMConfig
@@ -306,6 +308,17 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
             out = None
         if out is not None:
             return out
+        # Daemon unreachable. Kick off a lock-guarded background spawn so the
+        # next call is warm (this call still degrades below). request_spawn is a
+        # quick flock probe + detached Popen — fire-and-forget, never blocking
+        # the hook budget, never raising into the hot path.
+        if config.hook.auto_spawn:
+            try:
+                from memtomem_stm.daemon.spawn import request_spawn
+
+                request_spawn(config)
+            except Exception:
+                logger.debug("daemon auto-spawn failed", exc_info=True)
         if config.hook.fallback != "cold":
             return {}
         # fallback=cold → fall through to the in-process surfacing path.
