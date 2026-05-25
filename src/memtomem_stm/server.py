@@ -698,11 +698,19 @@ async def stm_surfacing_feedback(
         if app.surfacing_engine is not None:
             if ratings is not None:
                 return await app.surfacing_engine.handle_feedback_batch(surfacing_id, ratings)
+            # Legacy single-memory path requires a rating — the param is
+            # optional only to admit the batched ``ratings`` shape. Reject a
+            # ``memory_id``-only call so ``None`` never reaches the callee's
+            # ``rating: str`` (this also narrows ``rating`` for the type check).
+            if rating is None:
+                return "Error: `rating` is required for single-memory feedback."
             return await app.surfacing_engine.handle_feedback(surfacing_id, rating, memory_id)
         if app.feedback_tracker is None:
             return "Feedback tracking is not enabled."
         if ratings is not None:
             return _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
+        if rating is None:
+            return "Error: `rating` is required for single-memory feedback."
         return app.feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
 
 
