@@ -291,6 +291,19 @@ def _daemon_enabled() -> bool:
     return val.strip().lower() not in ("0", "false", "f", "no", "n", "off")
 
 
+def _hook_eligible(payload: dict[str, Any]) -> bool:
+    """Cheap pre-gate mirroring the head of :func:`_run_surfacing_hook_inner` —
+    a PostToolUse call for a surface-allowlisted tool. ``_run_hook`` uses it to
+    reject ineligible payloads (non-PostToolUse, or a missing/non-allowlisted
+    tool) before routing to — or auto-spawning — the daemon, so an off-target
+    hook call never warms a pointless daemon. The inner re-checks, so this is an
+    optimization, never the authority."""
+    if (payload.get("hook_event_name") or "PostToolUse") != "PostToolUse":
+        return False
+    tool_name = payload.get("tool_name")
+    return isinstance(tool_name, str) and tool_name in _surface_tools()
+
+
 async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the hook output, preferring the warm daemon when enabled.
 
@@ -308,9 +321,11 @@ async def _run_hook(payload: dict[str, Any]) -> dict[str, Any]:
         from memtomem_stm.daemon import client
 
         config = STMConfig()
-        if not config.surfacing.enabled:
-            # Surfacing globally off → nothing to route or warm a daemon for;
-            # mirror the cold path's no-op instead of spawning a pointless daemon.
+        # Reject ineligible payloads (surfacing globally off, non-PostToolUse, or
+        # a non-allowlisted tool) before routing to / spawning the daemon — an
+        # off-target hook call must not warm a pointless daemon. The cold path
+        # (run_surfacing_hook) re-checks, so this gate is an optimization.
+        if not config.surfacing.enabled or not _hook_eligible(payload):
             return {}
         try:
             out = await client.surface(config, payload, timeout=config.hook.daemon_timeout_seconds)

@@ -230,6 +230,7 @@ def test_cli_degrades_to_empty_object(stdin: str):
 def test_cli_surfacing_disabled_is_noop(monkeypatch: pytest.MonkeyPatch):
     # Default daemon-on path + surfacing globally off → {} immediately, and the
     # hook must NOT spawn a daemon (nothing to surface) or build an LTM adapter.
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)  # prove default-on
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
     spawns: list[int] = []
     monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: spawns.append(1))
@@ -294,6 +295,20 @@ def test_daemon_used_when_enabled(monkeypatch: pytest.MonkeyPatch):
     )
     out = asyncio.run(_run_hook(_READ_PAYLOAD))
     assert out == daemon_out
+
+
+def test_daemon_not_used_for_ineligible_tool(monkeypatch: pytest.MonkeyPatch):
+    # Default daemon-on, but a non-allowlisted tool (Write) → {} without
+    # consulting or spawning the daemon: an off-target call must not warm one.
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__USE_DAEMON", raising=False)  # prove default-on
+    spawns: list[int] = []
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: spawns.append(1))
+    surface = AsyncMock(side_effect=AssertionError("daemon must not be consulted for an ineligible tool"))
+    monkeypatch.setattr("memtomem_stm.daemon.client.surface", surface)
+    out = asyncio.run(_run_hook({**_READ_PAYLOAD, "tool_name": "Write"}))
+    assert out == {}
+    assert spawns == []
+    surface.assert_not_called()
 
 
 def test_daemon_unavailable_skip_returns_empty(monkeypatch: pytest.MonkeyPatch):
