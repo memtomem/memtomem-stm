@@ -19,7 +19,7 @@ import pytest
 
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
-from memtomem_stm.daemon.discovery import handshake_path, read_handshake
+from memtomem_stm.daemon.discovery import config_fingerprint, handshake_path, read_handshake
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_SURFACE,
@@ -83,6 +83,18 @@ def _config(tmp_path: Path) -> STMConfig:
     return cfg
 
 
+def _hs_path(cfg: STMConfig) -> Path:
+    """This config's keyed handshake path — what the running daemon publishes."""
+    return handshake_path(cfg.data_dir, config_fingerprint(cfg))
+
+
+def _lock_path(cfg: STMConfig) -> Path:
+    """This config's keyed lifetime-lock path."""
+    from memtomem_stm.daemon.locking import lock_path
+
+    return lock_path(cfg.data_dir, config_fingerprint(cfg))
+
+
 def _engine_with_result() -> SurfacingEngine:
     adapter = AsyncMock()
     adapter.search = AsyncMock(return_value=([_Result(_Chunk(), 0.5)], [], "ok"))
@@ -101,7 +113,7 @@ def _engine_with_result() -> SurfacingEngine:
 
 
 async def _await_handshake(cfg: STMConfig, timeout: float = 3.0) -> None:
-    hp = handshake_path(cfg.data_dir)
+    hp = _hs_path(cfg)
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         if hp.exists():
@@ -173,7 +185,7 @@ async def test_bad_token_is_rejected(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     _, task = await _start(cfg, engine=_engine_with_result())
     try:
-        hs = read_handshake(handshake_path(cfg.data_dir))
+        hs = read_handshake(_hs_path(cfg))
         assert hs is not None
         reader, writer = await asyncio.open_connection(
             hs["host"], hs["port"], limit=MAX_MESSAGE_BYTES
@@ -250,7 +262,7 @@ async def test_idle_shutdown_stops_daemon(tmp_path: Path) -> None:
     task = asyncio.create_task(server.serve())
     await _await_handshake(cfg)
     await asyncio.wait_for(task, timeout=5.0)  # self-terminates on idle
-    assert not handshake_path(cfg.data_dir).exists()
+    assert not _hs_path(cfg).exists()
 
 
 async def test_hook_run_hook_skips_when_daemon_absent(
@@ -396,17 +408,17 @@ async def test_second_daemon_returns_without_building_engine(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="same-process flock contention")
 async def test_daemon_holds_lock_for_lifetime(tmp_path: Path) -> None:
-    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+    from memtomem_stm.daemon.locking import single_owner_lock
 
     cfg = _config(tmp_path)
     _, task = await _start(cfg, engine=_engine_with_result())
     try:
-        with single_owner_lock(lock_path(cfg.data_dir)) as got:
+        with single_owner_lock(_lock_path(cfg)) as got:
             assert got is False  # held by the serving daemon
     finally:
         await _stop(cfg, task)
     # Released on teardown → acquirable again.
-    with single_owner_lock(lock_path(cfg.data_dir)) as got:
+    with single_owner_lock(_lock_path(cfg)) as got:
         assert got is True
 
 
@@ -421,14 +433,14 @@ async def test_lifetime_lock_retry_acquires_after_incumbent_releases(
     cfg = _config(tmp_path)
     monkeypatch.setattr(DaemonServer, "_LOCK_ACQUIRE_RETRY_SECONDS", 3.0)
 
-    fd = locking.open_lock_fd(locking.lock_path(cfg.data_dir))
+    fd = locking.open_lock_fd(_lock_path(cfg))
     assert locking.try_lock(fd) is True  # hold it like a (mock) incumbent
 
     server = DaemonServer(cfg)
     server._build_engine = lambda: setattr(server, "_engine", _engine_with_result())  # type: ignore[method-assign]
     task = asyncio.create_task(server.serve())
     await asyncio.sleep(0.2)  # daemon is now retrying the acquire
-    assert not handshake_path(cfg.data_dir).exists()  # hasn't built/published yet
+    assert not _hs_path(cfg).exists()  # hasn't built/published yet
     locking.release_lock(fd)  # incumbent leaves
     try:
         await _await_handshake(cfg)  # proves it acquired → built → published

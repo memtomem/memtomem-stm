@@ -12,6 +12,13 @@ duplicate; if it's free, spawn — and the spawned child re-acquires the lock as
 the single owner, so a rare concurrent double-spawn just has the loser exit
 before warming an LTM.
 
+The lock file is **keyed by the config fingerprint** (``stm-daemon-<fp>.lock``),
+mirroring the handshake file, so a daemon under one config holds a *different*
+lock than a daemon under another: they coexist, and a config-A daemon never
+blocks a config-B hook from spawning the daemon it actually needs (config-drift
+coexistence). "Single owner" is therefore per-config — exactly one daemon *per
+distinct config*.
+
 Two access shapes:
 - :func:`single_owner_lock` — a context manager for the *probe* (acquire,
   yield, release). Used by ``request_spawn`` and ``mms daemon start``.
@@ -34,12 +41,20 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LOCK_FILENAME = "stm-daemon.lock"
+# Shares the handshake's ``stm-daemon`` prefix; differs only by extension. The
+# fingerprint is a 16-hex digest, always a filesystem-safe filename component.
+LOCK_PREFIX = "stm-daemon"
 
 
-def lock_path(data_dir: Path) -> Path:
-    """Absolute path to the daemon's lifetime ownership lock under ``data_dir``."""
-    return (data_dir / LOCK_FILENAME).expanduser()
+def lock_path(data_dir: Path, fingerprint: str) -> Path:
+    """Per-config lifetime ownership lock ``stm-daemon-<fingerprint>.lock``.
+
+    Keyed by the config fingerprint so daemons under different configs hold
+    different locks and coexist (see the module docstring). Callers pass
+    :func:`~memtomem_stm.daemon.discovery.config_fingerprint` of their own
+    effective config — the same value used to derive the handshake path.
+    """
+    return (data_dir / f"{LOCK_PREFIX}-{fingerprint}.lock").expanduser()
 
 
 def open_lock_fd(path: Path) -> int:
