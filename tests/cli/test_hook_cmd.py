@@ -143,6 +143,9 @@ async def test_run_hook_surfaces_into_additional_context():
     assert ctx.startswith("<surfaced-memories>")
     # additionalContext carries only the memories, not a copy of tool output.
     assert "JWT authentication handler." not in ctx
+    # No feedback store on this path → no unresolvable feedback prompt.
+    assert "stm_surfacing_feedback" not in ctx
+    assert "surfacing_id" not in ctx
 
 
 async def test_run_hook_empty_results_is_noop():

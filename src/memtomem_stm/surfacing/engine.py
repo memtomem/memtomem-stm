@@ -503,8 +503,11 @@ class SurfacingEngine:
             return response_text
         self._observability.record_outcome(tool, "surfaced_cache_hit")
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
-        surfacing_id: str | None = uuid.uuid4().hex[:16]
+        # See ``_do_surface_miss``: only advertise a feedback ID we actually
+        # recorded, so a no-tracker path doesn't prompt for an unresolvable ID.
+        surfacing_id: str | None = None
         if self._feedback_tracker is not None:
+            surfacing_id = uuid.uuid4().hex[:16]
             try:
                 self._feedback_tracker.record_surfacing(
                     surfacing_id=surfacing_id,
@@ -717,9 +720,14 @@ class SurfacingEngine:
                 logger.debug("Failed to fetch session scratch items", exc_info=True)
                 scratch_items = None
 
-        # Generate surfacing ID and record event
-        surfacing_id: str | None = uuid.uuid4().hex[:16]
+        # Generate surfacing ID and record event. Only mint an ID when a
+        # tracker is attached to record it — otherwise the formatter would
+        # advertise a ``stm_surfacing_feedback(...)`` prompt for an event the
+        # server can't resolve. Both the ``mms hook`` path and the
+        # feedback-disabled server path run with no tracker.
+        surfacing_id: str | None = None
         if self._feedback_tracker is not None:
+            surfacing_id = uuid.uuid4().hex[:16]
             try:
                 self._feedback_tracker.record_surfacing(
                     surfacing_id=surfacing_id,
