@@ -12,6 +12,10 @@ _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 _HEX_RE = re.compile(r"^[0-9a-f]{24,}$", re.I)
 _SEMANTIC_KEYS = {"query", "search", "path", "file", "url", "topic", "name", "title", "description"}
 _PATH_KEYS = {"path", "file", "filepath", "file_path", "filename"}
+# Grep/Glob carry their search target in ``pattern`` (or ``glob``); tokenizing
+# it turns one opaque regex/glob token into searchable words so the query can
+# clear ``min_query_tokens`` and surfacing actually fires for those tools.
+_PATTERN_KEYS = {"pattern", "glob"}
 
 
 class ContextExtractor:
@@ -44,20 +48,30 @@ class ContextExtractor:
             if isinstance(cq, str) and cq.strip():
                 return cq.strip()
 
-        # 3. Heuristic extraction — prioritize argument values over tool name
+        # 3. Heuristic extraction — prioritize argument values over tool name.
+        # Iterate in sorted key order so two identical calls whose arguments
+        # were built in a different order produce the same query string (the
+        # surfacing cache is keyed on that string, and a stable query keeps the
+        # cooldown/dedup heuristics consistent).
         parts: list[str] = []
 
-        for key, value in arguments.items():
+        for key, value in sorted(arguments.items()):
             if key.startswith("_"):
                 continue
             if isinstance(value, str) and len(value) > 2 and not self._is_identifier(value):
-                # Tokenize pure file paths into meaningful words
-                # Only tokenize if value looks like a path (no spaces)
+                # Tokenize file paths and Grep/Glob patterns into meaningful
+                # words; otherwise keep the first sentence of free text.
                 if key in _PATH_KEYS and ("/" in value or "\\" in value) and " " not in value:
                     parts.append(self._tokenize_path(value))
+                elif key in _PATTERN_KEYS:
+                    parts.append(self._tokenize_pattern(value))
                 else:
                     parts.append(self._first_sentence(value, max_chars=200))
-            elif key in _SEMANTIC_KEYS:
+            elif key in _SEMANTIC_KEYS and not self._is_identifier(str(value)):
+                # A semantic key whose value is an opaque id (uuid/hex/bool) is
+                # filtered here too — pre-fix only the free-text branch applied
+                # the identifier filter, so a semantic-keyed id leaked into the
+                # query (inconsistent and a poor search term).
                 parts.append(str(value))
 
         # Fall back to tool name only if no semantic args found
@@ -100,6 +114,21 @@ class ContextExtractor:
         # Strip leading slashes and split by / . _ -
         parts = re.split(r"[/._\-]+", path.strip("/"))
         # Filter out empty, very short, or purely numeric parts
+        tokens = [p for p in parts if len(p) > 1 and not p.isdigit()]
+        return " ".join(tokens)
+
+    @staticmethod
+    def _tokenize_pattern(pattern: str) -> str:
+        """Convert a Grep/Glob pattern into space-separated searchable words.
+
+        Splits on regex/glob metacharacters and separators so a pattern like
+        ``auth.*token`` or ``**/*.jwt_handler.py`` yields real terms
+        (``auth token`` / ``jwt handler py``) instead of one opaque token that
+        trips ``min_query_tokens`` and suppresses surfacing. Drops empty,
+        single-char, and purely numeric fragments; Unicode word characters
+        (e.g. Hangul) are preserved.
+        """
+        parts = re.split(r"[\W_]+", pattern)
         tokens = [p for p in parts if len(p) > 1 and not p.isdigit()]
         return " ".join(tokens)
 
