@@ -197,10 +197,10 @@ class TestSecretGuard:
     _SECRETS = [
         "git clone repo then sk-ABCDEFGHIJKLMNOPQRSTUVWX",
         "fetch url with api_key=abc12345",
-        "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36",
         "psql password=hunter2secret",
         "aws AKIAIOSFODNN7EXAMPLE",
-        "gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+        "gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
         "-----BEGIN RSA PRIVATE KEY-----",
     ]
     _CLEAN = [
