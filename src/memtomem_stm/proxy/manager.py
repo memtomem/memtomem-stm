@@ -31,6 +31,7 @@ from memtomem_stm.proxy.compression import (
     SelectiveCompressor,
     TruncateCompressor,
     auto_select_strategy,
+    count_markdown_headings,
     get_compressor,
 )
 from memtomem_stm.proxy.config import (
@@ -722,7 +723,7 @@ class ProxyManager:
             )
             return (
                 TruncateCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars
+                    text, max_chars=max_chars, context_query=context_query
                 ),
                 "no_config",
             )
@@ -1661,7 +1662,12 @@ class ProxyManager:
                         # truncate loses little structural information.
                         _MIN_HEADINGS_FOR_HYBRID = 3
                         if not progressive_fallback:
-                            heading_count = cleaned.count("\n#")
+                            # Canonical heading count (shared with
+                            # auto_select_strategy) — the old ``count("\n#")``
+                            # missed a heading at offset 0 and over-counted any
+                            # ``#`` not followed by whitespace, so the ladder and
+                            # AUTO could disagree on whether content is "markdown".
+                            heading_count = count_markdown_headings(cleaned)
                             if heading_count >= _MIN_HEADINGS_FOR_HYBRID:
                                 try:
                                     compressed = await self._apply_hybrid(
@@ -1695,19 +1701,43 @@ class ProxyManager:
                         # and lacks structure for hybrid.
                         if not progressive_fallback and not hybrid_fallback:
                             compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
-                                cleaned, max_chars=effective_max_chars
+                                cleaned,
+                                max_chars=effective_max_chars,
+                                context_query=context_query,
                             )
                             metrics_strategy = f"{original_strategy}→truncate_fallback"
-                            logger.warning(
-                                "Ratio guard truncate fallback for %s/%s: %s "
-                                "(ratio %.3f→%.3f, budget=%d)",
-                                server,
-                                tool,
-                                metrics_strategy,
-                                compressed_ratio,
-                                (len(compressed) / cleaned_len if cleaned_len else 0),
-                                effective_max_chars,
-                            )
+                            # Re-check the ratio symmetrically with the hybrid
+                            # tier (which gates on the floor): truncate is the
+                            # terminal tier, so we only record the outcome — but
+                            # an operator still needs to see when even the
+                            # "guaranteed floor" tier landed below it (e.g.
+                            # tail-anomaly content that fills far less than the
+                            # budget). Pre-fix this path logged unconditionally
+                            # without comparing against the floor.
+                            truncate_ratio = len(compressed) / cleaned_len if cleaned_len else 0
+                            if truncate_ratio >= dynamic:
+                                logger.info(
+                                    "Ratio guard truncate fallback for %s/%s: %s "
+                                    "(ratio %.3f→%.3f, budget=%d)",
+                                    server,
+                                    tool,
+                                    metrics_strategy,
+                                    compressed_ratio,
+                                    truncate_ratio,
+                                    effective_max_chars,
+                                )
+                            else:
+                                logger.warning(
+                                    "Ratio guard truncate fallback for %s/%s still below floor: %s "
+                                    "(ratio %.3f→%.3f < %.3f, budget=%d)",
+                                    server,
+                                    tool,
+                                    metrics_strategy,
+                                    compressed_ratio,
+                                    truncate_ratio,
+                                    dynamic,
+                                    effective_max_chars,
+                                )
 
             # Record metrics BEFORE surfacing (surfacing adds content, not compresses)
             compressed_chars_for_metrics = len(compressed)
