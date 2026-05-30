@@ -45,6 +45,17 @@ class TestRelevanceGateExclusions:
         assert gate.should_surface("s", "list_repos", "query about listing repos")
         assert gate.should_surface("s", "get_issue", "query about getting issues")
 
+    def test_write_pattern_matches_server_prefixed_full_name(self):
+        # write_tool_patterns now matches the ``server__tool`` full name too
+        # (symmetric with exclude_tools), so a server-qualified write pattern
+        # gates that server's tool. Pre-fix it only matched the bare tool name,
+        # so ``github__sync_*`` never fired.
+        gate = _gate(write_tool_patterns=["github__sync_*"])
+        assert not gate.should_surface("github", "sync_state", "query text here")
+        # The same tool name on another server is not gated by the qualified
+        # pattern (and bare ``sync_state`` is not a default write verb).
+        assert gate.should_surface("gitlab", "sync_state", "query text here")
+
 
 class TestRelevanceGatePerTool:
     def test_per_tool_disabled(self):
