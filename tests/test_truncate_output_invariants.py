@@ -123,6 +123,19 @@ def test_json_key_truncate_records_omitted_keys() -> None:
     assert "omitted" in parsed["_truncated"]
 
 
+@pytest.mark.parametrize("budget", [1, 2, 5])
+def test_json_path_stays_valid_json_at_pathological_budget(budget: int) -> None:
+    """Contract floor: valid JSON cannot be shorter than ``{}`` (2 chars), so a
+    sub-2-char budget keeps JSON validity over the length cap (it returns
+    ``{}``). This documents/pins the one edge where len > max_chars is allowed —
+    a budget never produced by config or the manager retention ladder. Above the
+    2-char floor the length cap holds (budget=5 → still ``<= 5``)."""
+    text = _config_json(8)
+    out = TruncateCompressor().compress(text, max_chars=budget)
+    json.loads(out)  # always parseable
+    assert len(out) <= max(2, budget)
+
+
 def test_tail_anomaly_is_preserved_under_tight_budget() -> None:
     """Invariant C: the repetitive-content path keeps the tail anomaly (the
     whole reason the path exists). Pre-fix the START-anchored slice cut it off."""

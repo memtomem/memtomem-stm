@@ -224,7 +224,13 @@ class TruncateCompressor:
         # max_chars and appended a note — producing INVALID JSON and STILL
         # overshooting the budget. Instead drop whole trailing keys (recording
         # the count in a valid ``_truncated`` member) until the object fits, so
-        # the result always parses and never exceeds max_chars.
+        # the result always parses and stays within budget.
+        #
+        # Contract floor: valid JSON cannot be shorter than ``{}`` (2 chars).
+        # For any ``max_chars >= 2`` the result is ``<= max_chars``; at a
+        # pathological sub-2-char budget (never produced by config or the
+        # manager retention ladder, which raises tiny budgets) JSON validity
+        # takes precedence and we still return ``{}``.
         def _assemble(kept: list[str], omitted: int) -> str:
             members = list(kept)
             if omitted:
