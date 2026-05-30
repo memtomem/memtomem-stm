@@ -45,10 +45,17 @@ class TestTruncateCompressor:
         assert c.compress("short", max_chars=100) == "short"
 
     def test_truncates_at_sentence_boundary(self):
-        text = "First sentence. Second sentence. Third sentence."
-        result = TruncateCompressor().compress(text, max_chars=20)
+        # Budget comfortably holds the first sentence plus the truncation note.
+        # (Pre-fix, max_chars=20 only "passed" because compress() overshot to
+        # ~52 chars — the very overshoot the output-length invariant now forbids;
+        # see test_truncate_output_invariants.py. A 48-char source has no budget
+        # that fits sentence + full note under that invariant, so use a longer
+        # source where the sentence-boundary contract is actually expressible.)
+        text = "First sentence. " + "Filler sentence here. " * 20
+        result = TruncateCompressor().compress(text, max_chars=80)
         assert "First sentence." in result
         assert "truncated" in result
+        assert len(result) <= 80
 
     def test_truncation_metadata_includes_summary(self):
         text = "# Heading\n\nSome text.\n\n```code```\n\n- item1\n- item2"

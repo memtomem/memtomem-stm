@@ -151,10 +151,18 @@ class TruncateCompressor:
         if result:
             return result
 
-        # Fallback: position-based truncation
-        break_at = self._find_break(text, max_chars)
+        # Fallback: position-based truncation. Reserve the suffix out of the
+        # budget so break_at + suffix never exceeds max_chars — the suffix used
+        # to be appended *after* a budget-filling break point, overshooting it.
+        # When the budget is too small to hold the informative note, fall back
+        # to a 1-char marker so the body (the useful part) still gets the room.
         summary = _content_summary(text)
-        return text[:break_at] + f"\n... (truncated, original: {len(text)} chars){summary}"
+        suffix = f"\n... (truncated, original: {len(text)} chars){summary}"
+        if len(suffix) >= max_chars:
+            suffix = "…"
+        break_at = self._find_break(text, max(1, max_chars - len(suffix)))
+        result = text[:break_at] + suffix
+        return result if len(result) <= max_chars else result[:max_chars]
 
     _SUMMARY_RE = re.compile(
         r"summary|conclusion|결론|요약|security|root\s*cause|remediation"
@@ -212,10 +220,25 @@ class TruncateCompressor:
                 inner = part.strip()[1:-1].strip()
                 parts.append(inner)
 
-        result = "{\n" + ",\n".join(parts) + "\n}"
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (truncated)"
-        return result
+        # Assemble as valid JSON. The old path sliced the assembled string to
+        # max_chars and appended a note — producing INVALID JSON and STILL
+        # overshooting the budget. Instead drop whole trailing keys (recording
+        # the count in a valid ``_truncated`` member) until the object fits, so
+        # the result always parses and never exceeds max_chars.
+        def _assemble(kept: list[str], omitted: int) -> str:
+            members = list(kept)
+            if omitted:
+                members.append(f'"_truncated": "{omitted} of {len(parts)} keys omitted"')
+            return "{\n" + ",\n".join(members) + "\n}"
+
+        result = _assemble(parts, 0)
+        if len(result) <= max_chars:
+            return result
+        for keep in range(len(parts) - 1, -1, -1):
+            candidate = _assemble(parts[:keep], len(parts) - keep)
+            if len(candidate) <= max_chars:
+                return candidate
+        return "{}"
 
     def _truncate_json_value(self, value: object, budget: int) -> object:
         """Truncate a JSON value to fit within character budget."""
@@ -295,10 +318,18 @@ class TruncateCompressor:
         head_text = "\n".join(head_lines)
         omitted = max(0, len(lines) - sample_count - len(tail_lines))
 
-        result = f"{head_text}\n... ({omitted} similar lines omitted)\n{tail_text}"
-        if len(result) > max_chars:
-            result = result[:max_chars]
-        return result
+        # The tail anomaly is the payload this path exists to surface, so it is
+        # reserved first. The old code sliced from the START on overflow, which
+        # cut the anomaly off entirely — destroying what it set out to preserve.
+        # When even the tail overflows the budget, keep its most-recent end
+        # (where anomalies surface) together with the marker.
+        marker = f"\n... ({omitted} similar lines omitted)\n"
+        head_budget = max_chars - len(marker) - len(tail_text)
+        if head_budget < 0:
+            body = marker + tail_text
+            return body[-max_chars:] if len(body) > max_chars else body
+        head_kept = head_text if len(head_text) <= head_budget else head_text[:head_budget]
+        return head_kept + marker + tail_text
 
     def _section_aware_truncate(
         self,
@@ -426,13 +457,12 @@ class TruncateCompressor:
         for i, section_text in enumerate(enriched):
             parts.append(section_text)
 
-        result = "\n\n".join(parts)
+        body = "\n\n".join(parts)
         footer = f"\n(original: {len(text)} chars)"
-        result += footer
-
-        if len(result) > max_chars:
-            result = result[:max_chars]
-        return result
+        # Reserve the footer (and a sentinel when cutting) so neither is sliced
+        # off; the old ``result[:max_chars]`` dropped the footer and tail
+        # sections with no truncation marker when the minimums overflowed.
+        return self._fit_with_footer(body, footer, max_chars)
 
     def _enrich_by_relevance(
         self,
@@ -575,11 +605,9 @@ class TruncateCompressor:
                 parts.append(f"\n... ({len(remaining)} more blocks)\n")
                 parts.extend(sig_parts)
 
-        result = "\n\n".join(parts)
-        result += f"\n(original: {len(text)} chars)"
-        if len(result) > max_chars:
-            result = result[:max_chars]
-        return result
+        body = "\n\n".join(parts)
+        footer = f"\n(original: {len(text)} chars)"
+        return self._fit_with_footer(body, footer, max_chars)
 
     @staticmethod
     def _find_break(text: str, max_chars: int) -> int:
@@ -594,6 +622,36 @@ class TruncateCompressor:
             if i < len(text) and text[i] in " \n\t":
                 return i
         return max_chars
+
+    @staticmethod
+    def _fit_with_footer(
+        body: str, footer: str, max_chars: int, *, sentinel: str = "\n... (truncated)"
+    ) -> str:
+        """Assemble ``body + footer`` within ``max_chars`` without slicing the footer.
+
+        Fixes the family of defects where ``(body + footer)[:max_chars]`` both
+        overshot the budget (the footer was appended after the body already
+        filled it) and silently dropped the footer / tail content with no
+        marker. The footer — and, when a cut is needed, a truncation
+        ``sentinel`` — are reserved out of the budget, and the body is cut at a
+        line boundary when one is reasonably close.
+
+        The result is always ``<= max_chars`` for any
+        ``max_chars >= len(sentinel) + len(footer)``; for a pathologically tiny
+        budget that cannot hold even the footer, it degrades to a hard slice.
+        """
+        full = body + footer
+        if len(full) <= max_chars:
+            return full
+        reserve = len(sentinel) + len(footer)
+        keep = max_chars - reserve
+        if keep <= 0:
+            return full[:max_chars]
+        cut = body[:keep]
+        nl = cut.rfind("\n")
+        if nl >= keep // 2:
+            cut = cut[:nl]
+        return cut + sentinel + footer
 
 
 @dataclass
