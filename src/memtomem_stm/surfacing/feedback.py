@@ -107,6 +107,40 @@ class AutoTuner:
         # Resume tunings persisted from a previous process — without this
         # every restart silently throws away the AutoTuner's view.
         self._adjustments: dict[str, float] = dict(store.load_adjustments())
+        logger.info(
+            "AutoTuner bounds: floor=%.4f, ceiling=%.4f, increment=%.4f, "
+            "base min_score=%.4f",
+            config.auto_tune_score_floor,
+            config.auto_tune_score_ceiling,
+            config.auto_tune_score_increment,
+            config.min_score,
+        )
+        self._purge_pinned_adjustments()
+
+    def _purge_pinned_adjustments(self) -> None:
+        """Suppress persisted adjustments for operator-pinned tools.
+
+        When a per-tool ``min_score`` override is set the engine always uses
+        the pin (it skips ``maybe_adjust`` for that tool), so a previously
+        learned adjustment is inert. Drop it from the in-memory map so
+        ``get_min_score_snapshot`` and the surfacing stats don't report a
+        stale value. The persisted row is left intact, so removing the pin
+        later restores the learned threshold.
+        """
+        pinned = {
+            tool
+            for tool, tool_cfg in self._config.context_tools.items()
+            if tool_cfg.min_score is not None
+        }
+        purged = [tool for tool in self._adjustments if tool in pinned]
+        for tool in purged:
+            del self._adjustments[tool]
+        if purged:
+            logger.info(
+                "AutoTuner: suppressed %d persisted adjustment(s) for pinned tools: %s",
+                len(purged),
+                sorted(purged),
+            )
 
     def maybe_adjust(self, tool: str) -> float | None:
         """Check feedback ratios and adjust min_score for a tool.
@@ -149,7 +183,7 @@ class AutoTuner:
         # Raise wins over lower when both fire — defensive: negative
         # feedback is the stronger signal to suppress.
         if neg_ratio is not None and neg_ratio > 0.6:
-            new_score = min(current + increment, 0.05)
+            new_score = min(current + increment, self._config.auto_tune_score_ceiling)
             if new_score != current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
@@ -162,7 +196,7 @@ class AutoTuner:
                 )
                 return new_score
         elif helpful_ratio is not None and helpful_ratio > 0.8:
-            new_score = max(current - increment, 0.005)
+            new_score = max(current - increment, self._config.auto_tune_score_floor)
             if new_score != current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
