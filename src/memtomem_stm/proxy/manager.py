@@ -539,6 +539,16 @@ class ProxyManager:
                 store.initialize()
         if store is not None:
             kwargs["store"] = store
+        # Inject the manager's relevance scorer so SELECTIVE/HYBRID rank their
+        # TOC with the operator's configured scorer (e.g. embedding) instead of
+        # SelectiveCompressor's built-in BM25 default. With the default bm25
+        # scorer this is a no-op (passing a BM25Scorer == the class default).
+        # The scorer is read via the self-refreshing property, so a compressor
+        # built after a scorer change picks up the new scorer; a scorer-only
+        # hot-reload that does not also change the selective config keeps the
+        # cached compressor (and its scorer) until the next rebuild — an
+        # accepted edge case, tracked as a follow-up.
+        kwargs["scorer"] = self._relevance_scorer
         return SelectiveCompressor(**kwargs)
 
     def _resolve_tool_config(
