@@ -67,9 +67,12 @@ class RelevanceGate:
                 self._observability.record_skip(tool, "gate_excluded_tool")
                 return False
 
-        # Write-tool heuristic
+        # Write-tool heuristic. Match against both the bare tool name and the
+        # ``server__tool`` full name — symmetric with ``exclude_tools`` above —
+        # so a write pattern can target a specific server's tool (e.g.
+        # ``github__create_*``) instead of only matching unqualified tool names.
         for pattern in self._config.write_tool_patterns:
-            if fnmatch(tool, pattern):
+            if fnmatch(full_name, pattern) or fnmatch(tool, pattern):
                 self._observability.record_skip(tool, "gate_write_tool")
                 return False
 
