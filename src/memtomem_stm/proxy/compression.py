@@ -1240,7 +1240,12 @@ class SchemaPruningCompressor:
             omitted = n - min(2, n) - 1
             return head + [f"... ({omitted} items omitted)"] + tail
         if isinstance(data, str) and len(data) > max_str:
-            return data[:max_str] + "..."
+            # Never let the "..." ellipsis make the value LONGER than the
+            # original (e.g. a 2-char string at max_str=1). This keeps a very
+            # small max_str (used by the final tier to shrink values before
+            # dropping keys) from ever inflating short strings.
+            truncated = data[:max_str] + "..."
+            return truncated if len(truncated) < len(data) else data
         return data
 
     def _fit_minimal(self, data: object, max_chars: int) -> str:
@@ -1250,10 +1255,11 @@ class SchemaPruningCompressor:
         keeps every key and never drops whole items (the all-keys schema
         invariant). Degrades gracefully, validity and budget always held:
 
-        1. Keep EVERY top-level key, progressively collapsing the deepest nested
-           levels to compact shape stubs (``{N keys}`` / ``[N items]``) until the
-           object fits — so the agent still sees the full top-level schema, and
-           nested detail survives in proportion to the budget.
+        1. Keep EVERY top-level key, escalating value compression until it fits:
+           first collapse the deepest nested levels to shape stubs (``{N keys}``
+           / ``[N items]``), then shrink scalar strings — so the agent still sees
+           the full top-level schema, with nested/string detail surviving in
+           proportion to the budget.
         2. Only when the top-level keys *themselves* cannot fit (a wide object /
            array, where the key names alone exceed the budget) drop whole
            trailing keys/items into a valid marker.
@@ -1261,42 +1267,67 @@ class SchemaPruningCompressor:
            validity wins over the length cap (a budget the manager retention
            ladder never produces). Keys/items are dropped by position; at this
            tier all detail is uniform, so there is no relevance preference left.
+
+        Scalar roots have no keys to preserve, so they bypass the container
+        tiers and shrink the value directly (a string keeps a prefix; any other
+        scalar floors to ``null``).
         """
-        # Tier 1: all keys, shrinking nested depth (None == full depth, the old
-        # minimal tier). Deepest collapse keeps top-level keys with stub values.
-        for max_depth in (None, 3, 2, 1):
-            pruned = self._prune(data, max_str=10, max_array=2, max_depth=max_depth)
-            result = json.dumps(pruned, ensure_ascii=False, indent=2)
-            if len(result) <= max_chars:
-                return result
+        if isinstance(data, (dict, list)) and data:
+            # Tier 1: keep EVERY key/item, escalating value compression until it
+            # fits — collapse the deepest nesting to shape stubs, then shrink
+            # scalar strings (10 -> 4 -> 0 chars). Dropping a key is a last resort
+            # (Tier 2); a smaller stub value is always preferred. (max_str,
+            # max_depth); ``max_depth=None`` == full depth == byte-identical to
+            # the pre-final-tier behavior.
+            for max_str, max_depth in ((10, None), (10, 3), (10, 2), (10, 1), (4, 1), (0, 1)):
+                pruned = self._prune(data, max_str=max_str, max_array=2, max_depth=max_depth)
+                result = json.dumps(pruned, ensure_ascii=False, indent=2)
+                if len(result) <= max_chars:
+                    return result
 
-        # Tier 2: even the all-keys forms overflow — drop trailing keys/items.
-        if isinstance(data, dict) and data:
-            # Depth-1 form (stub values) so as many keys as possible survive.
-            items = list(self._prune(data, max_str=10, max_array=2, max_depth=1).items())
-            total = len(items)
-            # Collision-safe marker key: never clobber a real top-level "_pruned"
-            # field (that would lose its value AND skew the omitted count).
-            marker = "_pruned"
-            existing = {k for k, _ in items}
-            while marker in existing:
-                marker += "_"
-            for keep in range(total - 1, -1, -1):
-                kept = dict(items[:keep])
-                kept[marker] = f"{total - keep} of {total} keys omitted"
-                candidate = json.dumps(kept, ensure_ascii=False, indent=2)
-                if len(candidate) <= max_chars:
-                    return candidate
-            return "{}"
+            # Tier 2: even the most compact all-keys form overflows — the
+            # top-level keys themselves don't fit, so drop whole trailing ones.
+            if isinstance(data, dict):
+                # Most compact value form (stubbed nesting + minimal strings) so
+                # as many keys as possible survive before any are dropped.
+                items = list(self._prune(data, max_str=0, max_array=2, max_depth=1).items())
+                total = len(items)
+                # Collision-safe marker key: never clobber (or repurpose as the
+                # marker) a real top-level "_pruned" field, which would skew the
+                # omitted count and replace the user's key.
+                marker = "_pruned"
+                existing = {k for k, _ in items}
+                while marker in existing:
+                    marker += "_"
 
-        if isinstance(data, list) and data:
-            # Count against the ORIGINAL length: _prune already samples a long
-            # list, so counting the sampled form understates omissions by orders
-            # of magnitude. Show head elements (depth-1 stubs) + an exact marker.
+                def _candidate(keep: int) -> str:
+                    kept = dict(items[:keep])
+                    kept[marker] = f"{total - keep} of {total} keys omitted"
+                    return json.dumps(kept, ensure_ascii=False, indent=2)
+
+                # ``len(_candidate(keep))`` is monotonic in ``keep`` (each extra
+                # key adds far more than the marker's digit change), so
+                # binary-search the largest prefix that fits instead of dumping
+                # every prefix — O(log n) serializations, not O(n) (a wide object
+                # used to stall here).
+                lo, hi, best = 0, total - 1, None
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    candidate = _candidate(mid)
+                    if len(candidate) <= max_chars:
+                        best, lo = candidate, mid + 1
+                    else:
+                        hi = mid - 1
+                return best if best is not None else "{}"
+
+            # list: count against the ORIGINAL length — _prune already samples a
+            # long list, so counting the sampled form understates omissions by
+            # orders of magnitude. Show head elements (most compact) + an exact
+            # marker.
             total = len(data)
             for keep in range(min(2, total), -1, -1):
                 shown: list[object] = [
-                    self._prune(data[i], max_str=10, max_array=2, max_depth=1) for i in range(keep)
+                    self._prune(data[i], max_str=0, max_array=2, max_depth=1) for i in range(keep)
                 ]
                 shown.append(f"... ({total - keep} of {total} items omitted)")
                 candidate = json.dumps(shown, ensure_ascii=False, indent=2)
@@ -1304,22 +1335,24 @@ class SchemaPruningCompressor:
                     return candidate
             return "[]"
 
-        # Scalar root or empty container: always emit a VALID token that fits.
-        # An empty object/array keeps its type ("{}"/"[]"); a string shrinks to a
-        # shorter valid JSON string (down to ``""``); any other scalar has no
-        # shorter same-type form, so emit a valid ``null`` rather than a
-        # mid-token slice — validity wins over the length cap (as for {}/[]/"").
-        pruned = self._prune(data, max_str=10, max_array=2)
+        # Scalar root or empty container: emit the shortest VALID token that
+        # fits. An empty object/array keeps its type; a string keeps a prefix
+        # (down to ``""``); any other scalar floors to a valid ``null`` rather
+        # than a mid-token slice — validity wins over the cap (as for {}/[]/"").
+        if isinstance(data, dict):
+            return "{}"
+        if isinstance(data, list):
+            return "[]"
+        pruned = self._prune(data, max_str=10)
         if isinstance(pruned, str):
+            result = json.dumps(pruned, ensure_ascii=False)
+            if len(result) <= max_chars:
+                return result
             for k in range(len(pruned), -1, -1):
                 candidate = json.dumps(pruned[:k], ensure_ascii=False)
                 if len(candidate) <= max_chars:
                     return candidate
             return '""'
-        if isinstance(pruned, dict):
-            return "{}"
-        if isinstance(pruned, list):
-            return "[]"
         return "null"
 
 
