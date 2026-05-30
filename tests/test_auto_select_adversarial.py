@@ -140,9 +140,26 @@ class TestJsonDictArrayBoundary:
 
     def test_dict_multiple_arrays_all_under_20(self):
         data = {"a": [{"k": i} for i in range(19)], "b": [{"k": i} for i in range(15)]}
-        # No array ≥ 20 → skip SCHEMA_PRUNING
-        # nested count = 2 (both lists) → < 3 → TRUNCATE
+        # No single array ≥ 20 and nested count = 2 (< 3), but the combined item
+        # count is 34 (≥ 20) → SCHEMA_PRUNING preserves the shared row schema
+        # across both arrays instead of TRUNCATE dropping a whole array.
+        assert auto_select_strategy(json.dumps(data), max_chars=10) == S.SCHEMA_PRUNING
+
+    def test_dict_two_small_arrays_sum_at_20(self):
+        # Combined length exactly at the 20-item boundary → SCHEMA_PRUNING.
+        data = {"a": [{"k": i} for i in range(11)], "b": [{"k": i} for i in range(9)]}
+        assert auto_select_strategy(json.dumps(data), max_chars=10) == S.SCHEMA_PRUNING
+
+    def test_dict_two_small_arrays_sum_19(self):
+        # Combined length 19 (< 20) and nested count 2 (< 3) → still TRUNCATE.
+        data = {"a": [{"k": i} for i in range(10)], "b": [{"k": i} for i in range(9)]}
         assert auto_select_strategy(json.dumps(data), max_chars=10) == S.TRUNCATE
+
+    def test_dict_scalar_arrays_sum_at_20(self):
+        # Summed-array routing is length-only (mirrors the top-level scalar-array
+        # cutoff in test_array_of_scalars_at_20); scalar arrays count too.
+        data = {"a": list(range(12)), "b": list(range(8))}
+        assert auto_select_strategy(json.dumps(data), max_chars=10) == S.SCHEMA_PRUNING
 
 
 # ── B5: JSON dict nested count (3 threshold) ──────────────────────────

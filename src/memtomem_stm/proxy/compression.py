@@ -1618,6 +1618,13 @@ def auto_select_strategy(text: str, *, max_chars: int = 0) -> CompressionStrateg
                 nested = sum(1 for v in data.values() if isinstance(v, (dict, list)))
                 if nested >= 3:
                     return CompressionStrategy.EXTRACT_FIELDS
+                # Several smaller arrays whose combined length is large (no single
+                # array ≥ 20, nested < 3) → schema_pruning preserves the shared row
+                # schema across every array, vs truncate dropping whole arrays once
+                # the byte budget runs out. Mirrors the top-level list ≥ 20 cutoff.
+                list_values = [v for v in data.values() if isinstance(v, list)]
+                if list_values and sum(len(v) for v in list_values) >= 20:
+                    return CompressionStrategy.SCHEMA_PRUNING
             return CompressionStrategy.TRUNCATE
         except (json.JSONDecodeError, ValueError):
             pass
