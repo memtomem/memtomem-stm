@@ -687,7 +687,12 @@ class ProxyManager:
                 if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                     self._selective_compressor = self._create_selective(sel_cfg)
                     self._selective_compressor_cfg = sel_cfg
-            return self._selective_compressor.compress(text, max_chars=max_chars), None
+            return (
+                self._selective_compressor.compress(
+                    text, max_chars=max_chars, context_query=context_query
+                ),
+                None,
+            )
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
