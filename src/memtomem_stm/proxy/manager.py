@@ -28,7 +28,9 @@ from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
     HybridCompressor,
     LLMCompressor,
+    SchemaPruningCompressor,
     SelectiveCompressor,
+    SkeletonCompressor,
     TruncateCompressor,
     auto_select_strategy,
     count_markdown_headings,
@@ -746,6 +748,27 @@ class ProxyManager:
         if compression == CompressionStrategy.TRUNCATE:
             return (
                 TruncateCompressor(scorer=self._relevance_scorer).compress(
+                    text, max_chars=max_chars, context_query=context_query
+                ),
+                None,
+            )
+
+        # SCHEMA_PRUNING / SKELETON are query-aware (the manager's relevance
+        # scorer is injected and context_query forwarded), so they get explicit
+        # branches rather than the query-blind generic dispatch below. The
+        # remaining strategies routed through get_compressor (NONE, PROGRESSIVE,
+        # EXTRACT_FIELDS) take neither a scorer nor a context_query.
+        if compression == CompressionStrategy.SCHEMA_PRUNING:
+            return (
+                SchemaPruningCompressor(scorer=self._relevance_scorer).compress(
+                    text, max_chars=max_chars, context_query=context_query
+                ),
+                None,
+            )
+
+        if compression == CompressionStrategy.SKELETON:
+            return (
+                SkeletonCompressor(scorer=self._relevance_scorer).compress(
                     text, max_chars=max_chars, context_query=context_query
                 ),
                 None,
