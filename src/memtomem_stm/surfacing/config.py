@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from memtomem_stm.proxy.config import MODEL_CONTEXT_WINDOWS
 
@@ -72,6 +72,13 @@ class SurfacingConfig(BaseModel):
     auto_tune_enabled: bool = True
     auto_tune_min_samples: int = Field(default=20, gt=0)
     auto_tune_score_increment: float = Field(default=0.002, gt=0.0)
+    auto_tune_score_ceiling: float = Field(default=0.05, gt=0.0, le=1.0)
+    """Upper bound auto-tuning may raise a tool's min_score to. Left at its
+    default it widens to ``max(0.05, min_score)`` so a stricter min_score
+    never breaks construction; set it explicitly to cap below the default."""
+    auto_tune_score_floor: float = Field(default=0.005, ge=0.0, le=1.0)
+    """Lower bound auto-tuning may lower a tool's min_score to. Left at its
+    default it widens to ``min(0.005, min_score)``."""
     min_response_chars: int = Field(default=5000, ge=0)
     include_session_context: bool = True
     fire_webhook: bool = True
@@ -112,6 +119,47 @@ class SurfacingConfig(BaseModel):
     core format (``[rank] score | source``). ``structured`` selects the
     machine-parseable JSON format (``{"results": [...]}``) with automatic
     version negotiation — falls back to compact if core is too old."""
+
+    @model_validator(mode="after")
+    def _validate_auto_tune_bounds(self) -> SurfacingConfig:
+        """Keep floor <= min_score <= ceiling and the increment no larger
+        than the band it moves within.
+
+        The default ceiling/floor (0.05 / 0.005) bracket the default
+        min_score (0.03). When an operator raises or lowers min_score
+        without touching the bounds, the unset bound widens to include it so
+        a previously-valid config never fails. Explicitly setting a bound on
+        the wrong side of min_score is a real misconfiguration and is
+        rejected.
+
+        The increment guard rejects only a step bigger than the whole
+        [floor, ceiling] band — such a step would jump from one clamp to the
+        other in a single adjustment. Sub-band increments (the 0.002 default
+        crosses the band in ~22 steps) are accepted as-is; calibrating the
+        step further is a wait-for-signal concern, not a constructor
+        constraint.
+        """
+        set_fields = self.model_fields_set
+        if "auto_tune_score_ceiling" not in set_fields:
+            self.auto_tune_score_ceiling = max(self.auto_tune_score_ceiling, self.min_score)
+        if "auto_tune_score_floor" not in set_fields:
+            self.auto_tune_score_floor = min(self.auto_tune_score_floor, self.min_score)
+
+        if not (self.auto_tune_score_floor <= self.min_score <= self.auto_tune_score_ceiling):
+            raise ValueError(
+                "auto-tune bounds must satisfy floor <= min_score <= ceiling; got "
+                f"floor={self.auto_tune_score_floor}, min_score={self.min_score}, "
+                f"ceiling={self.auto_tune_score_ceiling}"
+            )
+        band = self.auto_tune_score_ceiling - self.auto_tune_score_floor
+        if band > 0 and self.auto_tune_score_increment > band:
+            raise ValueError(
+                f"auto_tune_score_increment={self.auto_tune_score_increment} exceeds the "
+                f"auto-tune band [{self.auto_tune_score_floor}, "
+                f"{self.auto_tune_score_ceiling}] (width {band}); a single step would "
+                "jump the entire range. Reduce the increment or widen the band."
+            )
+        return self
 
     def _context_tokens(self) -> int | None:
         if not self.consumer_model:
