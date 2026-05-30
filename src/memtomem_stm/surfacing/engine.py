@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from memtomem_stm.observability.tracing import traced
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
@@ -162,9 +163,25 @@ class SurfacingEngine:
         comparison, dedup, formatter rendering, etc.) intentionally keeps
         the raw text — this knob only governs **what gets persisted to
         disk**, nothing about the in-process surface call.
+
+        Secret guard: regardless of ``persist_query_text``, a query whose
+        text matches a known secret pattern (API key, bearer token, JWT,
+        ``password=``/``api_key=`` assignment, private-key header) is
+        hashed before persistence, so an inline credential in a Bash
+        ``command`` argument or a tokenized URL never reaches disk verbatim
+        on the proxy path (the hook/daemon cold paths already disable
+        persistence). Only the persisted value is affected — the in-flight
+        ``query`` keeps its raw text as described above.
         """
-        if self._config.persist_query_text:
-            return query
+        if not self._config.persist_query_text:
+            return self._hashed_query(query)
+        if contains_sensitive_content(query):
+            return self._hashed_query(query)
+        return query
+
+    @staticmethod
+    def _hashed_query(query: str) -> str:
+        """Return the stable ``sha256:`` + 16-hex-char digest form of *query*."""
         digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 

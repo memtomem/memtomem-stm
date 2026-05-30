@@ -184,6 +184,90 @@ class TestEngineHashesPersistedQuery:
         assert a == b
 
 
+class TestSecretGuard:
+    """A secret-bearing query is hashed even when ``persist_query_text=True``.
+
+    Closes the proxy-path gap (#352 covered the opt-in knob, not secrets):
+    a Bash ``command`` argument or a tokenized URL carrying an inline
+    credential must never reach ``surfacing_events.query`` verbatim. The
+    literals below are each verified to match ``proxy.privacy``'s default
+    patterns; the clean queries are verified not to.
+    """
+
+    _SECRETS = [
+        "git clone repo then sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+        "fetch url with api_key=abc12345",
+        "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36",
+        "psql password=hunter2secret",
+        "aws AKIAIOSFODNN7EXAMPLE",
+        "gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "-----BEGIN RSA PRIVATE KEY-----",
+    ]
+    _CLEAN = [
+        "find the authentication bug in login",
+        "refactor the token parser module",
+        "reset the user password screen please",
+    ]
+
+    @pytest.mark.parametrize("secret", _SECRETS)
+    async def test_secret_query_hashed_when_persist_true(self, secret):
+        # Default config → persist_query_text=True; the secret guard must
+        # still hash it before it reaches record_surfacing.
+        tracker = _make_tracker()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
+            feedback_tracker=tracker,
+        )
+        await engine.surface("s", "Bash", {"_context_query": secret}, LONG_RESPONSE)
+
+        tracker.record_surfacing.assert_called_once()
+        persisted = tracker.record_surfacing.call_args.kwargs["query"]
+        assert persisted.startswith(_QUERY_HASH_PREFIX)
+        assert secret not in persisted
+        expected = _QUERY_HASH_PREFIX + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
+        assert persisted == expected
+
+    @pytest.mark.parametrize("clean", _CLEAN)
+    async def test_clean_query_literal_when_persist_true(self, clean):
+        # A non-secret query is unaffected by the guard — persisted raw so
+        # feedback ratings keyed on (tool, query) keep correlating.
+        tracker = _make_tracker()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(FakeChunk(), 0.9)]),
+            feedback_tracker=tracker,
+        )
+        await engine.surface("s", "read_file", {"_context_query": clean}, LONG_RESPONSE)
+
+        tracker.record_surfacing.assert_called_once()
+        assert tracker.record_surfacing.call_args.kwargs["query"] == clean
+
+    async def test_secret_guard_unit_level(self):
+        # Direct unit assertion on the chokepoint, independent of surface().
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=_make_tracker(),
+        )
+        out = engine._persistable_query("sk-ABCDEFGHIJKLMNOPQRSTUVWX")
+        assert out.startswith(_QUERY_HASH_PREFIX)
+        assert engine._persistable_query("ordinary search text") == "ordinary search text"
+
+
+class TestPersistSitesRouteThroughGuard:
+    """Both persistence sites must funnel through ``_persistable_query`` so
+    the guard cannot be bypassed by one path. The cache-hit
+    (``_render_cached``) and miss (``_do_surface_miss``) call sites are
+    shape-identical, so pin them by source inspection."""
+
+    def test_both_persist_sites_wrap_query(self):
+        import inspect
+
+        s = inspect.getsource(SurfacingEngine)
+        assert s.count("query=self._persistable_query(query)") >= 2
+
+
 # ── 2. Store stats query_preview ──────────────────────────────────────
 
 
