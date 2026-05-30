@@ -108,8 +108,7 @@ class AutoTuner:
         # every restart silently throws away the AutoTuner's view.
         self._adjustments: dict[str, float] = dict(store.load_adjustments())
         logger.info(
-            "AutoTuner bounds: floor=%.4f, ceiling=%.4f, increment=%.4f, "
-            "base min_score=%.4f",
+            "AutoTuner bounds: floor=%.4f, ceiling=%.4f, increment=%.4f, base min_score=%.4f",
             config.auto_tune_score_floor,
             config.auto_tune_score_ceiling,
             config.auto_tune_score_increment,
