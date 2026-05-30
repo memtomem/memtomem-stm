@@ -35,7 +35,25 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
-from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+
+class _RecordingScorer:
+    """A RelevanceScorer stub that records calls and scores by token overlap.
+
+    Used to prove a compressor actually *consults* the injected scorer (not just
+    stores it), without any network dependency.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
+        self.calls.append((query, len(sections)))
+        terms = query.lower().split()
+        return [
+            float(sum(t in f"{title} {body}".lower() for t in terms)) for title, body in sections
+        ]
+
 
 # A dict-of-arrays payload (the dominant SCHEMA_PRUNING routing trigger): three
 # top-level keys, each an array of records, only one of which matches the query.
@@ -125,6 +143,25 @@ class TestSchemaPruningQueryAware:
         base = c.compress(list_payload, max_chars=300)
         assert c.compress(list_payload, max_chars=300, context_query="anything here") == base
 
+    def test_single_key_dict_is_byte_identical(self) -> None:
+        # A single-key object has nothing to weight (len < 2) — the query path is
+        # skipped and the output matches the no-query path exactly.
+        payload = json.dumps(
+            {"orders": [{"oid": i, "total": 12.5, "desc": "order text " * 6} for i in range(25)]}
+        )
+        c = SchemaPruningCompressor()
+        base = c.compress(payload, max_chars=400)
+        assert c.compress(payload, max_chars=400, context_query="orders total") == base
+
+    def test_tight_budget_delegates_to_uniform_path(self) -> None:
+        # When the budget is too tight for the weighted tiers, _compress_weighted
+        # returns None and the query path falls through to the uniform minimal
+        # tier instead of carrying a divergent copy of the overflow handling —
+        # so the output is identical to the no-query path.
+        c = SchemaPruningCompressor()
+        base = c.compress(_PRUNE_PAYLOAD, max_chars=100)
+        assert c.compress(_PRUNE_PAYLOAD, max_chars=100, context_query="orders total") == base
+
 
 class TestSkeletonQueryAware:
     def test_no_query_is_byte_identical(self) -> None:
@@ -182,16 +219,24 @@ class TestStructuralScorerInjection:
     def test_schema_pruning_defaults_to_bm25(self) -> None:
         assert isinstance(SchemaPruningCompressor()._scorer, BM25Scorer)
 
-    def test_schema_pruning_accepts_injected_scorer(self) -> None:
-        scorer = EmbeddingScorer.__new__(EmbeddingScorer)  # no network, identity only
-        assert SchemaPruningCompressor(scorer=scorer)._scorer is scorer
-
     def test_skeleton_defaults_to_bm25(self) -> None:
         assert isinstance(SkeletonCompressor()._scorer, BM25Scorer)
 
-    def test_skeleton_accepts_injected_scorer(self) -> None:
-        scorer = BM25Scorer()
-        assert SkeletonCompressor(scorer=scorer)._scorer is scorer
+    def test_schema_pruning_consults_injected_scorer(self) -> None:
+        # Inject a recording scorer and confirm it is both stored AND used when a
+        # query drives compression (not merely held as an attribute).
+        scorer = _RecordingScorer()
+        c = SchemaPruningCompressor(scorer=scorer)
+        assert c._scorer is scorer
+        c.compress(_PRUNE_PAYLOAD, max_chars=900, context_query="orders total")
+        assert scorer.calls, "injected scorer was never consulted"
+
+    def test_skeleton_consults_injected_scorer(self) -> None:
+        scorer = _RecordingScorer()
+        c = SkeletonCompressor(scorer=scorer)
+        assert c._scorer is scorer
+        c.compress(_skeleton_doc(), max_chars=400, context_query="invoice payment billing")
+        assert scorer.calls, "injected scorer was never consulted"
 
 
 @pytest.mark.asyncio

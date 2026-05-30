@@ -344,8 +344,17 @@ class BenchHarness:
             budget = self._apply_retention(len(cleaned), budget)
 
             t0 = _time.monotonic()
-            # Pass context_query to TruncateCompressor for query-aware allocation
-            if context_query and isinstance(comp, TruncateCompressor):
+            # Forward context_query to the query-aware compressors (truncate,
+            # schema-pruning, skeleton, and selective/hybrid). The rest take no
+            # context_query, so guard on the types that accept it.
+            query_aware = (
+                TruncateCompressor,
+                SchemaPruningCompressor,
+                SkeletonCompressor,
+                SelectiveCompressor,
+                HybridCompressor,
+            )
+            if context_query and isinstance(comp, query_aware):
                 compressed = comp.compress(cleaned, max_chars=budget, context_query=context_query)
             else:
                 compressed = comp.compress(cleaned, max_chars=budget)

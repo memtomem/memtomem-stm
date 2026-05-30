@@ -1122,13 +1122,17 @@ class SchemaPruningCompressor:
         # keys most relevant to the query — relevant subtrees keep longer
         # strings and more array items, irrelevant ones are pruned harder.
         # Every key is still emitted (the schema invariant) and key order is
-        # untouched. With no query, no BM25 signal, or a non-object root the
-        # uniform path below runs and the output is byte-for-byte identical to
-        # the pre-query behavior.
+        # untouched. With no query, no BM25 signal, a single-key dict, or a
+        # non-object root the uniform path below runs and the output is
+        # byte-for-byte identical to the pre-query behavior. When the budget is
+        # too tight even for the weighted tiers, _compress_weighted returns None
+        # and we likewise fall through to the uniform minimal/final tier.
         if context_query and context_query.strip() and isinstance(data, dict) and len(data) >= 2:
             relevant = self._relevant_keys(data, context_query)
             if relevant is not None:
-                return self._compress_weighted(data, max_chars, relevant)
+                weighted = self._compress_weighted(data, max_chars, relevant)
+                if weighted is not None:
+                    return weighted
 
         # Iteratively reduce detail until output fits budget
         for max_str in (self._max_string, 40, 20):
@@ -1156,7 +1160,7 @@ class SchemaPruningCompressor:
             return None
         return {k for (k, _), s in zip(sections, scores) if s > 0}
 
-    def _compress_weighted(self, data: dict, max_chars: int, relevant: set[str]) -> str:
+    def _compress_weighted(self, data: dict, max_chars: int, relevant: set[str]) -> str | None:
         """Prune relevant keys gently and irrelevant keys hard, tightening to fit.
 
         The first tier keeps full default detail everywhere — identical to the
@@ -1165,6 +1169,12 @@ class SchemaPruningCompressor:
         tiers cap irrelevant subtrees first (relevant keys stay at full detail),
         and finally trim relevant keys too. Every key survives and key order is
         preserved.
+
+        Returns ``None`` when even the tightest tier overflows ``max_chars`` — at
+        that point all detail is already minimal and there is no relevance
+        preference left to keep, so the caller falls through to the uniform
+        minimal/final tier rather than this method carrying its own overflow
+        handling (which would duplicate the uniform path's truncation).
         """
         # (relevant_max_str, irrelevant_max_str, irrelevant_max_array)
         tiers = (
@@ -1187,12 +1197,7 @@ class SchemaPruningCompressor:
             if len(result) <= max_chars:
                 return result
 
-        # Final: minimal detail everywhere (mirrors the uniform final tier).
-        pruned = {k: self._prune(v, max_str=10, max_array=2) for k, v in data.items()}
-        result = json.dumps(pruned, ensure_ascii=False, indent=2)
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (pruned)"
-        return result
+        return None
 
     def _prune(self, data: object, max_str: int = 80, max_array: int | None = None) -> object:
         ma = max_array if max_array is not None else self._max_array
