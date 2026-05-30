@@ -1087,8 +1087,15 @@ class SchemaPruningCompressor:
 
     Strategy: recursively walk JSON tree, preserving the full key structure.
     Arrays are sampled (first 2 + last 1 + count), strings are capped.
-    This ensures every configuration field, every nested key, and every
-    data relationship is represented in the output.
+    At a normal budget this represents every configuration field, every nested
+    key, and every data relationship in the output.
+
+    When the budget physically cannot hold the full schema, the final tier
+    (``_fit_minimal``) degrades gracefully and always emits valid JSON within
+    budget: the deepest nesting collapses to shape stubs (``{N keys}`` /
+    ``[N items]``) first, and only if the top-level keys themselves overflow are
+    whole trailing keys/items dropped into a marker. So "all keys / every nested
+    key" is the normal-budget guarantee, not an unconditional one.
 
     Example — nested config with a long array (all keys preserved, array sampled)::
 
@@ -1141,12 +1148,10 @@ class SchemaPruningCompressor:
             if len(result) <= max_chars:
                 return result
 
-        # Final: minimal detail
-        pruned = self._prune(data, max_str=10, max_array=2)
-        result = json.dumps(pruned, ensure_ascii=False, indent=2)
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (pruned)"
-        return result
+        # Final tier: emit VALID JSON within the budget. The old
+        # ``result[:max_chars] + "... (pruned)"`` hard slice cut JSON mid-token
+        # (invalid output) and overshot the budget by the suffix length.
+        return self._fit_minimal(data, max_chars)
 
     def _relevant_keys(self, data: dict, context_query: str) -> set[str] | None:
         """Top-level keys whose subtree scores against the query.
@@ -1203,22 +1208,152 @@ class SchemaPruningCompressor:
 
         return None
 
-    def _prune(self, data: object, max_str: int = 80, max_array: int | None = None) -> object:
+    def _prune(
+        self,
+        data: object,
+        max_str: int = 80,
+        max_array: int | None = None,
+        max_depth: int | None = None,
+        _depth: int = 0,
+    ) -> object:
         ma = max_array if max_array is not None else self._max_array
+        # Depth cap (final-tier only): collapse a nested container to a compact
+        # shape stub so every shallower key still survives. ``max_depth=None``
+        # (the default for all earlier tiers) keeps full depth — byte-identical
+        # to the pre-depth behavior.
+        if max_depth is not None and _depth >= max_depth:
+            if isinstance(data, dict):
+                return f"{{{len(data)} keys}}"
+            if isinstance(data, list):
+                return f"[{len(data)} items]"
         if isinstance(data, dict):
-            return {k: self._prune(v, max_str, ma) for k, v in data.items()}
+            return {k: self._prune(v, max_str, ma, max_depth, _depth + 1) for k, v in data.items()}
         if isinstance(data, list):
             n = len(data)
             if n <= ma:
-                return [self._prune(item, max_str, ma) for item in data]
+                return [self._prune(item, max_str, ma, max_depth, _depth + 1) for item in data]
             # First 2 + last 1 + count (preserves head and tail anomalies)
-            head = [self._prune(data[i], max_str, ma) for i in range(min(2, n))]
-            tail = [self._prune(data[-1], max_str, ma)]
+            head = [
+                self._prune(data[i], max_str, ma, max_depth, _depth + 1) for i in range(min(2, n))
+            ]
+            tail = [self._prune(data[-1], max_str, ma, max_depth, _depth + 1)]
             omitted = n - min(2, n) - 1
             return head + [f"... ({omitted} items omitted)"] + tail
         if isinstance(data, str) and len(data) > max_str:
-            return data[:max_str] + "..."
+            # Never let the "..." ellipsis make the value LONGER than the
+            # original (e.g. a 2-char string at max_str=1). This keeps a very
+            # small max_str (used by the final tier to shrink values before
+            # dropping keys) from ever inflating short strings.
+            truncated = data[:max_str] + "..."
+            return truncated if len(truncated) < len(data) else data
         return data
+
+    def _fit_minimal(self, data: object, max_chars: int) -> str:
+        """Fit ``data`` into ``max_chars`` as VALID JSON at the final tier.
+
+        Reached when even minimal per-value pruning overflows because ``_prune``
+        keeps every key and never drops whole items (the all-keys schema
+        invariant). Degrades gracefully, validity and budget always held:
+
+        1. Keep EVERY top-level key, escalating value compression until it fits:
+           first collapse the deepest nested levels to shape stubs (``{N keys}``
+           / ``[N items]``), then shrink scalar strings — so the agent still sees
+           the full top-level schema, with nested/string detail surviving in
+           proportion to the budget.
+        2. Only when the top-level keys *themselves* cannot fit (a wide object /
+           array, where the key names alone exceed the budget) drop whole
+           trailing keys/items into a valid marker.
+        3. Floor: ``{}`` / ``[]`` / ``""`` / ``null`` — at a sub-token budget
+           validity wins over the length cap (a budget the manager retention
+           ladder never produces). Keys/items are dropped by position; at this
+           tier all detail is uniform, so there is no relevance preference left.
+
+        Scalar roots have no keys to preserve, so they bypass the container
+        tiers and shrink the value directly (a string keeps a prefix; any other
+        scalar floors to ``null``).
+        """
+        if isinstance(data, (dict, list)) and data:
+            # Tier 1: keep EVERY key/item, escalating value compression until it
+            # fits — collapse the deepest nesting to shape stubs, then shrink
+            # scalar strings (10 -> 4 -> 0 chars). Dropping a key is a last resort
+            # (Tier 2); a smaller stub value is always preferred. (max_str,
+            # max_depth); ``max_depth=None`` == full depth == byte-identical to
+            # the pre-final-tier behavior.
+            for max_str, max_depth in ((10, None), (10, 3), (10, 2), (10, 1), (4, 1), (0, 1)):
+                pruned = self._prune(data, max_str=max_str, max_array=2, max_depth=max_depth)
+                result = json.dumps(pruned, ensure_ascii=False, indent=2)
+                if len(result) <= max_chars:
+                    return result
+
+            # Tier 2: even the most compact all-keys form overflows — the
+            # top-level keys themselves don't fit, so drop whole trailing ones.
+            if isinstance(data, dict):
+                # Most compact value form (stubbed nesting + minimal strings) so
+                # as many keys as possible survive before any are dropped.
+                items = list(self._prune(data, max_str=0, max_array=2, max_depth=1).items())
+                total = len(items)
+                # Collision-safe marker key: never clobber (or repurpose as the
+                # marker) a real top-level "_pruned" field, which would skew the
+                # omitted count and replace the user's key.
+                marker = "_pruned"
+                existing = {k for k, _ in items}
+                while marker in existing:
+                    marker += "_"
+
+                def _candidate(keep: int) -> str:
+                    kept = dict(items[:keep])
+                    kept[marker] = f"{total - keep} of {total} keys omitted"
+                    return json.dumps(kept, ensure_ascii=False, indent=2)
+
+                # ``len(_candidate(keep))`` is monotonic in ``keep`` (each extra
+                # key adds far more than the marker's digit change), so
+                # binary-search the largest prefix that fits instead of dumping
+                # every prefix — O(log n) serializations, not O(n) (a wide object
+                # used to stall here).
+                lo, hi, best = 0, total - 1, None
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    candidate = _candidate(mid)
+                    if len(candidate) <= max_chars:
+                        best, lo = candidate, mid + 1
+                    else:
+                        hi = mid - 1
+                return best if best is not None else "{}"
+
+            # list: count against the ORIGINAL length — _prune already samples a
+            # long list, so counting the sampled form understates omissions by
+            # orders of magnitude. Show head elements (most compact) + an exact
+            # marker.
+            total = len(data)
+            for keep in range(min(2, total), -1, -1):
+                shown: list[object] = [
+                    self._prune(data[i], max_str=0, max_array=2, max_depth=1) for i in range(keep)
+                ]
+                shown.append(f"... ({total - keep} of {total} items omitted)")
+                candidate = json.dumps(shown, ensure_ascii=False, indent=2)
+                if len(candidate) <= max_chars:
+                    return candidate
+            return "[]"
+
+        # Scalar root or empty container: emit the shortest VALID token that
+        # fits. An empty object/array keeps its type; a string keeps a prefix
+        # (down to ``""``); any other scalar floors to a valid ``null`` rather
+        # than a mid-token slice — validity wins over the cap (as for {}/[]/"").
+        if isinstance(data, dict):
+            return "{}"
+        if isinstance(data, list):
+            return "[]"
+        pruned = self._prune(data, max_str=10)
+        if isinstance(pruned, str):
+            result = json.dumps(pruned, ensure_ascii=False)
+            if len(result) <= max_chars:
+                return result
+            for k in range(len(pruned), -1, -1):
+                candidate = json.dumps(pruned[:k], ensure_ascii=False)
+                if len(candidate) <= max_chars:
+                    return candidate
+            return '""'
+        return "null"
 
 
 class SkeletonCompressor:
