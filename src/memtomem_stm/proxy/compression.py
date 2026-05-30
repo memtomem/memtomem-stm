@@ -635,11 +635,13 @@ class SelectiveCompressor:
         json_depth: int = 1,
         min_section_chars: int = 50,
         store: object | None = None,
+        scorer: RelevanceScorer | None = None,
     ) -> None:
         self._max_pending = max_pending
         self._ttl = pending_ttl_seconds
         self._json_depth = json_depth
         self._min_section_chars = min_section_chars
+        self._scorer = scorer or BM25Scorer()
         if store is not None:
             self._store = store
         else:
@@ -647,7 +649,7 @@ class SelectiveCompressor:
 
             self._store = InMemoryPendingStore()
 
-    def compress(self, text: str, *, max_chars: int) -> str:
+    def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text
 
@@ -656,19 +658,25 @@ class SelectiveCompressor:
         if len(chunks) <= 1:
             chunks = self._decompose_single_chunk(chunks, fmt)
             if len(chunks) <= 1:
-                return TruncateCompressor().compress(text, max_chars=max_chars)
+                return TruncateCompressor().compress(
+                    text, max_chars=max_chars, context_query=context_query
+                )
 
-        return self._store_and_build_toc(text, fmt, chunks)
+        return self._store_and_build_toc(text, fmt, chunks, context_query)
 
-    def compress_full_toc(self, text: str, *, max_chars: int) -> str | None:
+    def compress_full_toc(
+        self, text: str, *, max_chars: int, context_query: str | None = None
+    ) -> str | None:
         fmt, chunks = self._detect_and_parse(text)
         if len(chunks) <= 1:
             chunks = self._decompose_single_chunk(chunks, fmt)
             if len(chunks) <= 1:
                 return None
-        return self._store_and_build_toc(text, fmt, chunks)
+        return self._store_and_build_toc(text, fmt, chunks, context_query)
 
-    def _store_and_build_toc(self, text: str, fmt: str, chunks: dict[str, str]) -> str:
+    def _store_and_build_toc(
+        self, text: str, fmt: str, chunks: dict[str, str], context_query: str | None = None
+    ) -> str:
         selection_key = uuid.uuid4().hex[:16]
 
         self._store.put(
@@ -697,6 +705,22 @@ class SelectiveCompressor:
                     "inline": is_inline,
                 }
             )
+
+        # Query-aware ordering: when a context query is supplied, surface the
+        # most relevant sections first so the agent sees them at the top of the
+        # TOC. Selection by key is unaffected — ``chunks`` still holds every
+        # section. With no query (or no signal) the original insertion order is
+        # preserved, which callers and tests rely on. Stable sort keeps ties in
+        # insertion order.
+        if context_query and context_query.strip():
+            # ``entries`` is built from ``chunks.items()`` in order, so the
+            # i-th entry and the i-th chunk are the same section — score the
+            # (key, content) pairs directly and reorder entries by that index.
+            chunk_items = list(chunks.items())
+            scores = self._scorer.score_sections(context_query, chunk_items)
+            if any(s > 0 for s in scores):
+                order = sorted(range(len(entries)), key=lambda i: -scores[i])
+                entries = [entries[i] for i in order]
 
         toc = {
             "type": "toc",
@@ -1421,7 +1445,9 @@ class HybridCompressor:
             )
 
         if self._tail_mode == TailMode.TOC:
-            tail_compressed = self._selective.compress(tail_text, max_chars=toc_budget)
+            tail_compressed = self._selective.compress(
+                tail_text, max_chars=toc_budget, context_query=context_query
+            )
         else:
             tail_compressed = TruncateCompressor().compress(
                 tail_text, max_chars=toc_budget, context_query=context_query
