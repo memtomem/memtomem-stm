@@ -55,6 +55,19 @@ def _content_summary(text: str) -> str:
     return f" [{', '.join(counts)}]" if counts else ""
 
 
+def count_markdown_headings(text: str) -> int:
+    """Count ATX markdown headings with the canonical regex.
+
+    Shared by ``auto_select_strategy`` (HYBRID routing) and the proxy's
+    retention-ladder hybrid-fallback gate so the two agree on what a "heading"
+    is. Requires ``#``..``######`` followed by whitespace and matches a heading
+    at offset 0 — unlike a bare ``text.count("\\n#")``, which both misses an
+    offset-0 heading and over-counts a ``#`` that is not a heading (e.g. a shell
+    comment line, or ``#`` inside prose without a following space).
+    """
+    return len(_HEADINGS_RE.findall(text))
+
+
 class Compressor(Protocol):
     def compress(self, text: str, *, max_chars: int) -> str: ...
 
@@ -1584,7 +1597,7 @@ def auto_select_strategy(text: str, *, max_chars: int = 0) -> CompressionStrateg
             pass
 
     # Markdown detection
-    heading_count = len(re.findall(r"(?:^|\n)#{1,6}\s", stripped))
+    heading_count = count_markdown_headings(stripped)
 
     if heading_count >= 4:
         # Skeleton for API-docs with HTTP method endpoints
