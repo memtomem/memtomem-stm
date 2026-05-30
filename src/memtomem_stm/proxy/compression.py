@@ -1098,17 +1098,41 @@ class SchemaPruningCompressor:
                  "servers": ["s1", "s2", "... (2 items omitted)", "s5"]}
     """
 
-    def __init__(self, max_string: int = 80, max_array_items: int = 3) -> None:
+    def __init__(
+        self,
+        max_string: int = 80,
+        max_array_items: int = 3,
+        scorer: RelevanceScorer | None = None,
+    ) -> None:
         self._max_string = max_string
         self._max_array = max_array_items
+        self._scorer = scorer or BM25Scorer()
 
-    def compress(self, text: str, *, max_chars: int) -> str:
+    def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            return TruncateCompressor().compress(text, max_chars=max_chars)
+            return TruncateCompressor(scorer=self._scorer).compress(
+                text, max_chars=max_chars, context_query=context_query
+            )
+
+        # Query-aware: for a top-level object, spend the value budget on the
+        # keys most relevant to the query — relevant subtrees keep longer
+        # strings and more array items, irrelevant ones are pruned harder.
+        # Every key is still emitted (the schema invariant) and key order is
+        # untouched. With no query, no BM25 signal, a single-key dict, or a
+        # non-object root the uniform path below runs and the output is
+        # byte-for-byte identical to the pre-query behavior. When the budget is
+        # too tight even for the weighted tiers, _compress_weighted returns None
+        # and we likewise fall through to the uniform minimal/final tier.
+        if context_query and context_query.strip() and isinstance(data, dict) and len(data) >= 2:
+            relevant = self._relevant_keys(data, context_query)
+            if relevant is not None:
+                weighted = self._compress_weighted(data, max_chars, relevant)
+                if weighted is not None:
+                    return weighted
 
         # Iteratively reduce detail until output fits budget
         for max_str in (self._max_string, 40, 20):
@@ -1123,6 +1147,61 @@ class SchemaPruningCompressor:
         if len(result) > max_chars:
             result = result[:max_chars] + "\n... (pruned)"
         return result
+
+    def _relevant_keys(self, data: dict, context_query: str) -> set[str] | None:
+        """Top-level keys whose subtree scores against the query.
+
+        Returns ``None`` when no key scores (no BM25 signal), which tells the
+        caller to fall back to the uniform path for byte-identical output.
+        """
+        sections = [(k, json.dumps(v, ensure_ascii=False)) for k, v in data.items()]
+        scores = self._scorer.score_sections(context_query, sections)
+        if not any(s > 0 for s in scores):
+            return None
+        return {k for (k, _), s in zip(sections, scores) if s > 0}
+
+    def _compress_weighted(self, data: dict, max_chars: int, relevant: set[str]) -> str | None:
+        """Prune relevant keys gently and irrelevant keys hard, tightening to fit.
+
+        The first tier keeps full default detail everywhere — identical to the
+        uniform path — so when the whole object fits there is no needless
+        pruning of irrelevant keys. Only under real budget pressure do later
+        tiers cap irrelevant subtrees first (relevant keys stay at full detail),
+        and finally trim relevant keys too. Every key survives and key order is
+        preserved.
+
+        Returns ``None`` when even the tightest tier overflows ``max_chars`` — at
+        that point all detail is already minimal and there is no relevance
+        preference left to keep, so the caller falls through to the uniform
+        minimal/final tier rather than this method carrying its own overflow
+        handling (which would duplicate the uniform path's truncation).
+        """
+        # (relevant_max_str, irrelevant_max_str, irrelevant_max_array)
+        # irrelevant_max_array stays >= 2: _prune samples "first 2 + last 1", so
+        # max_array=1 on a 2-item array duplicates the tail and emits a bogus
+        # "(-1 items omitted)" marker (oversized, not pruned). The value lever
+        # for irrelevant keys is max_string, not the array cap.
+        tiers = (
+            (self._max_string, self._max_string, self._max_array),
+            (self._max_string, 40, 2),
+            (self._max_string, 20, 2),
+            (40, 12, 2),
+            (20, 10, 2),
+        )
+        for rel_str, irr_str, irr_arr in tiers:
+            pruned = {
+                k: self._prune(
+                    v,
+                    max_str=(rel_str if k in relevant else irr_str),
+                    max_array=(self._max_array if k in relevant else irr_arr),
+                )
+                for k, v in data.items()
+            }
+            result = json.dumps(pruned, ensure_ascii=False, indent=2)
+            if len(result) <= max_chars:
+                return result
+
+        return None
 
     def _prune(self, data: object, max_str: int = 80, max_array: int | None = None) -> object:
         ma = max_array if max_array is not None else self._max_array
@@ -1161,42 +1240,57 @@ class SkeletonCompressor:
 
     _HEADING_RE = re.compile(r"^(#{1,6}\s.+)$", re.MULTILINE)
 
-    def compress(self, text: str, *, max_chars: int) -> str:
-        """Keep all headings + first content line per section."""
+    def __init__(self, scorer: RelevanceScorer | None = None) -> None:
+        self._scorer = scorer or BM25Scorer()
+
+    def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
+        """Keep all headings + first content line per section.
+
+        When a context query is supplied, the per-section content budget is
+        weighted toward the sections most relevant to the query so they retain
+        more body lines; every heading still survives and section order is
+        preserved. With no query (or no BM25 signal) the budget is split evenly
+        and the output is byte-for-byte identical to the pre-query behavior.
+        """
         if not text or len(text) <= max_chars:
             return text
 
         headings = list(self._HEADING_RE.finditer(text))
         if len(headings) < 2:
-            return TruncateCompressor().compress(text, max_chars=max_chars)
+            return TruncateCompressor(scorer=self._scorer).compress(
+                text, max_chars=max_chars, context_query=context_query
+            )
 
-        # Build sections: heading + first few meaningful content lines
-        parts: list[str] = []
-        total_body_trimmed = 0
-        budget_per_section = max(60, (max_chars - 80) // len(headings))
-
+        # Slice each section once into (heading_line, body_lines).
+        sections: list[tuple[str, list[str]]] = []
         for i, m in enumerate(headings):
             sec_start = m.start()
             sec_end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
-            section = text[sec_start:sec_end].rstrip()
-            lines = section.split("\n")
+            lines = text[sec_start:sec_end].rstrip().split("\n")
+            body_lines = [ln for ln in lines[1:] if ln.strip()]
+            sections.append((lines[0], body_lines))
 
+        budgets = self._section_budgets(sections, max_chars, context_query)
+
+        # Build sections: heading + first content lines up to the budget.
+        parts: list[str] = []
+        total_body_trimmed = 0
+        for (heading, body_lines), budget in zip(sections, budgets):
             # Always keep the heading
-            kept = [lines[0]]
-            kept_chars = len(lines[0])
+            kept = [heading]
+            kept_chars = len(heading)
 
             # Measure total body content (non-empty, non-heading lines)
-            body_lines = [ln for ln in lines[1:] if ln.strip()]
             section_body_chars = sum(len(ln) for ln in body_lines)
 
             # Add content lines until per-section budget
             for line in body_lines:
-                if kept_chars + len(line) + 1 > budget_per_section:
+                if kept_chars + len(line) + 1 > budget:
                     break
                 kept.append(line)
                 kept_chars += len(line) + 1
 
-            kept_body_chars = kept_chars - len(lines[0])
+            kept_body_chars = kept_chars - len(heading)
             total_body_trimmed += max(0, section_body_chars - kept_body_chars)
 
             parts.append("\n".join(kept))
@@ -1211,6 +1305,43 @@ class SkeletonCompressor:
         if len(result) > max_chars:
             result = result[:max_chars]
         return result
+
+    def _section_budgets(
+        self,
+        sections: list[tuple[str, list[str]]],
+        max_chars: int,
+        context_query: str | None,
+    ) -> list[int]:
+        """Per-section content budget: even split unless a query reweights it.
+
+        Without a query (or with no BM25 signal) every section gets the same
+        ``max(60, (max_chars - 80) // n)`` budget as before — byte-identical.
+        With a query, every section keeps the 60-char floor and the remaining
+        budget is handed out in proportion to BM25 relevance, so the most
+        relevant sections retain more body lines. The weighted total never
+        exceeds the even-split total, so query-awareness adds no overshoot.
+        """
+        n = len(sections)
+        content_budget = max_chars - 80
+        base = max(60, content_budget // n)
+        if not (context_query and context_query.strip()):
+            return [base] * n
+
+        scored = [(heading, "\n".join(body)) for heading, body in sections]
+        # Clamp to non-negative: BM25 scores are always >= 0 (no-op, preserves
+        # byte-identity), but an EmbeddingScorer returns cosine similarities that
+        # can be negative. Raw negatives would skew the proportional split into
+        # negative/huge per-section budgets, overfilling early sections so the
+        # final hard slice drops trailing headings — breaking the skeleton's
+        # every-heading-survives invariant.
+        scores = [max(0.0, s) for s in self._scorer.score_sections(context_query, scored)]
+        total = sum(scores)
+        if total <= 0:
+            return [base] * n
+
+        floor = 60
+        remainder = max(0, content_budget - floor * n)
+        return [floor + int(remainder * s / total) for s in scores]
 
 
 class LLMCompressor:
