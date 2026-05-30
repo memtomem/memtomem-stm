@@ -1177,12 +1177,16 @@ class SchemaPruningCompressor:
         handling (which would duplicate the uniform path's truncation).
         """
         # (relevant_max_str, irrelevant_max_str, irrelevant_max_array)
+        # irrelevant_max_array stays >= 2: _prune samples "first 2 + last 1", so
+        # max_array=1 on a 2-item array duplicates the tail and emits a bogus
+        # "(-1 items omitted)" marker (oversized, not pruned). The value lever
+        # for irrelevant keys is max_string, not the array cap.
         tiers = (
             (self._max_string, self._max_string, self._max_array),
             (self._max_string, 40, 2),
-            (self._max_string, 20, 1),
-            (40, 12, 1),
-            (20, 10, 1),
+            (self._max_string, 20, 2),
+            (40, 12, 2),
+            (20, 10, 2),
         )
         for rel_str, irr_str, irr_arr in tiers:
             pruned = {
@@ -1324,7 +1328,13 @@ class SkeletonCompressor:
             return [base] * n
 
         scored = [(heading, "\n".join(body)) for heading, body in sections]
-        scores = self._scorer.score_sections(context_query, scored)
+        # Clamp to non-negative: BM25 scores are always >= 0 (no-op, preserves
+        # byte-identity), but an EmbeddingScorer returns cosine similarities that
+        # can be negative. Raw negatives would skew the proportional split into
+        # negative/huge per-section budgets, overfilling early sections so the
+        # final hard slice drops trailing headings — breaking the skeleton's
+        # every-heading-survives invariant.
+        scores = [max(0.0, s) for s in self._scorer.score_sections(context_query, scored)]
         total = sum(scores)
         if total <= 0:
             return [base] * n

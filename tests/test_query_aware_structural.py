@@ -162,6 +162,31 @@ class TestSchemaPruningQueryAware:
         base = c.compress(_PRUNE_PAYLOAD, max_chars=100)
         assert c.compress(_PRUNE_PAYLOAD, max_chars=100, context_query="orders total") == base
 
+    def test_irrelevant_small_array_not_corrupted(self) -> None:
+        # Regression: the weighted tiers used to pass max_array=1 to _prune, which
+        # samples "first 2 + last 1" — on a 2-item irrelevant array that
+        # duplicated the tail and emitted a bogus "(-1 items omitted)" marker
+        # (oversized, not pruned). The array cap must stay >= 2.
+        class _OnlyOrders:
+            def score_sections(self, q, sections):
+                return [1.0 if k == "orders" else 0.0 for k, _ in sections]
+
+        payload = json.dumps(
+            {
+                "orders": [{"oid": i, "desc": "order text " * 8} for i in range(40)],
+                "flags": ["alpha", "beta"],  # irrelevant 2-item array
+            }
+        )
+        c = SchemaPruningCompressor(scorer=_OnlyOrders())
+        for budget in range(300, 1600, 50):
+            out = c.compress(payload, max_chars=budget, context_query="orders")
+            assert "items omitted" not in out or "(-1" not in out
+            assert "-1 items omitted" not in out
+            if out.strip().startswith("{") and not out.endswith("(pruned)"):
+                flags = json.loads(out).get("flags")
+                if isinstance(flags, list):
+                    assert flags == ["alpha", "beta"], f"budget={budget}: {flags}"
+
 
 class TestSkeletonQueryAware:
     def test_no_query_is_byte_identical(self) -> None:
@@ -213,6 +238,22 @@ class TestSkeletonQueryAware:
         assert _block(bill_q, "## Billing").count("invoice") > _block(auth_q, "## Billing").count(
             "invoice"
         )
+
+    def test_negative_scores_do_not_drop_headings(self) -> None:
+        # Regression: an EmbeddingScorer returns cosine similarities that can be
+        # negative. Raw negatives used to skew the proportional budget so one
+        # section overfilled and the final hard slice dropped trailing headings.
+        # Scores are clamped to >= 0, so every heading must still survive.
+        class _NegScorer:
+            def score_sections(self, q, sections):
+                return [0.9, -0.8, 0.7, -0.7][: len(sections)]
+
+        doc = _skeleton_doc()
+        out = SkeletonCompressor(scorer=_NegScorer()).compress(
+            doc, max_chars=400, context_query="q"
+        )
+        assert all(h in out for h in ["## Auth", "## Billing", "## Logging", "## Metrics"])
+        assert len(out) <= 400
 
 
 class TestStructuralScorerInjection:
