@@ -466,6 +466,18 @@ class SurfacingEngine:
             for k in list(self._invalidated_ids)[:excess]:
                 del self._invalidated_ids[k]
 
+    def _claim_surfaced_ids(self, ids: list[str]) -> None:
+        """Record memory IDs as surfaced this session, FIFO-pruning to
+        ``_surfaced_ids_max``. Shared by the miss path and the cache-hit path so
+        a memory injected either way is deduped against later misses (evicting
+        the oldest half once the cap is exceeded)."""
+        for mid in ids:
+            self._surfaced_ids[mid] = None
+        if len(self._surfaced_ids) > self._surfaced_ids_max:
+            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
+            for k in list(self._surfaced_ids)[:excess]:
+                del self._surfaced_ids[k]
+
     def _render_cached(
         self,
         cached: list[Any],
@@ -515,6 +527,16 @@ class SurfacingEngine:
             return response_text
         self._observability.record_outcome(tool, "surfaced_cache_hit")
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
+        # Reclaim the injected IDs into the session-dedup set, symmetric with
+        # the miss path, so a memory re-shown from cache is deduped against
+        # later misses (e.g. one FIFO-evicted from _surfaced_ids but still in a
+        # cache entry). We deliberately do NOT *filter* the cached list against
+        # _surfaced_ids: the miss already claimed these IDs, so filtering would
+        # empty a normal repeated-query cache hit and break the
+        # concurrent-identical-query contract. Cooldown refresh
+        # (record_surfacing) and cross-session mark_surfaced stay miss-only by
+        # design.
+        self._claim_surfaced_ids([str(r.chunk.id) for r in cached])
         # See ``_do_surface_miss``: only advertise a feedback ID we actually
         # recorded, so neither a no-tracker path nor the dedup-only daemon path
         # (``record_feedback_events=False``) prompts for an unresolvable ID.
@@ -706,14 +728,7 @@ class SurfacingEngine:
         # coroutines build ``relevant`` including the same memory and
         # violate the documented session-dedup invariant.
         new_ids = [str(r.chunk.id) for r in relevant]
-        for mid in new_ids:
-            self._surfaced_ids[mid] = None
-        # Prune if exceeded cap — evict oldest (first-inserted) entries.
-        if len(self._surfaced_ids) > self._surfaced_ids_max:
-            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
-            keys = list(self._surfaced_ids)[:excess]
-            for k in keys:
-                del self._surfaced_ids[k]
+        self._claim_surfaced_ids(new_ids)
 
         self._gate.record_surfacing(query)
         logger.info("Surfacing %d memories for %s/%s", len(relevant), server, tool)
