@@ -293,9 +293,7 @@ def test_take_keeps_full_container_when_it_fits() -> None:
 def test_dict_fit_reserves_space_for_omission_marker() -> None:
     """Nested dict fitting must prefer an omitted-count marker over silently
     returning a longer key prefix with no marker."""
-    payload = json.dumps(
-        {"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"}
-    )
+    payload = json.dumps({"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"})
     out = FieldExtractCompressor().compress(payload, max_chars=80)
     parsed = json.loads(out)
     outer = parsed["outer"]
@@ -458,3 +456,111 @@ def test_wide_config_dict_routes_to_extract_fields() -> None:
         auto_select_strategy(_wide_config_dict(40), max_chars=500)
         == CompressionStrategy.EXTRACT_FIELDS
     )
+
+
+# ── E3. Monotonicity: a larger budget never shows less content (the 4B fix) ───
+
+
+def _preserved_leaves(obj: object) -> int:
+    """Count preserved original scalar leaves, EXCLUDING omitted-count markers
+    (the dict ``_truncated`` member and the in-array ``... items omitted`` string)."""
+    if isinstance(obj, dict):
+        return sum(
+            _preserved_leaves(v)
+            for k, v in obj.items()
+            if not str(k).startswith("_truncated") and not (isinstance(v, str) and "omitted" in v)
+        )
+    if isinstance(obj, list):
+        return sum(_preserved_leaves(e) for e in obj if not (isinstance(e, str) and "omitted" in e))
+    return 1
+
+
+_LIST_MONO_FIXTURES: dict[str, object] = {
+    # The canonical regression: a bulky nested field on the FIRST element. The
+    # old `_take`-based enrichment flipped element 0 into a longer-but-emptier
+    # marker as the budget grew (content 4 @ 62 -> 2 @ 63).
+    "bulky_first": [{"a": 1, "b": {"c": "deep", "d": [10, 20]}}, {"a": 2}, {"a": 3}],
+    "wide_records": [{"id": i, "v": "x" * (i % 7)} for i in range(40)],
+    "nested_lists": [[1, 2, 3], [4, 5], [6]],
+    "strings": ["x" * 30, "y" * 20, "z" * 10, "short"],
+    "mixed": [{"x": "hello world", "y": [1, 2, 3]}, {"x": "hi"}, {"z": 9}],
+    "big_dicts": _big_list_of_dicts(8, 6),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LIST_MONO_FIXTURES))
+def test_list_root_content_is_monotone_in_budget(name: str) -> None:
+    """For a list root, a LARGER budget must never preserve FEWER original leaves
+    in the final tier.
+
+    ``_take``'s content is non-monotone in its budget (a larger child budget can
+    flip a value into a longer-but-emptier ``_truncated`` marker), so any search
+    that maximizes the per-child budget regresses. ``_fit_monotone`` keeps the
+    prefix shape but makes every degree of freedom monotone. Budgets are swept
+    CONTIGUOUSLY so a one-char cliff cannot hide between sampled points; output
+    is asserted valid + within budget at every step too.
+
+    Exercises ``_fit_extracted`` (the final tier this PR rewrites) directly, the
+    same surface the design probe swept. The ``_compress_json`` *router* in front
+    of it has a SEPARATE, pre-existing non-monotonicity — it prefers a fixed
+    5-item ``indent=2`` ``_preview_list`` whenever that pretty form fits, which
+    carries less content than the budget-filling compact final tier — and is
+    out of scope here.
+    """
+    fixture = _LIST_MONO_FIXTURES[name]
+    data = json.loads(fixture) if isinstance(fixture, str) else fixture
+    compressor = FieldExtractCompressor()
+    prev: int | None = None
+    for budget in range(2, len(json.dumps(data)) + 5):
+        out = compressor._fit_extracted(data, budget)
+        parsed = json.loads(out)  # always valid JSON
+        assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
+        leaves = _preserved_leaves(parsed)
+        if prev is not None:
+            assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+def test_small_list_keeps_markerless_prefix_below_marker_width() -> None:
+    """Below the omission-marker's width, a SMALL list keeps a markerless leading
+    prefix instead of collapsing to ``[]``. The marker tier is unreachable for such
+    a value (its full form is cheaper than the marker), so dropping the marker
+    stays monotone. ``_fit_extracted([1, 2, 3], 8)`` regressed to ``[]`` mid-review.
+    """
+    c = FieldExtractCompressor()
+    assert c._fit_extracted([1, 2, 3], 8) == "[1, 2]"
+    assert c._fit_extracted([1, 2, 3], 5) == "[1]"
+    assert json.loads(c._fit_extracted([1, 2, 3], 2)) == []  # the true floor
+
+
+def test_huge_boundary_item_does_not_scan_quadratically() -> None:
+    """A huge leading item under a tight budget must bound the boundary cap by the
+    budget, not the item's full size — otherwise the scan is quadratic and hangs.
+    The fixed path is sub-millisecond; the generous bound only catches a regression
+    back to O(item_size**2)."""
+    import time
+
+    c = FieldExtractCompressor()
+    start = time.perf_counter()
+    out = c._fit_extracted(["x" * 100_000, "y"], 100)
+    elapsed = time.perf_counter() - start
+    assert len(out) <= 100
+    json.loads(out)  # valid JSON
+    assert elapsed < 1.0, f"boundary scan took {elapsed:.2f}s (quadratic regression?)"
+
+
+def test_list_string_element_budgeted_by_serialized_length() -> None:
+    """A list string element that needs JSON escaping must be budgeted by its
+    SERIALIZED length, not raw char count. Otherwise _fit_monotone returns an
+    over-budget candidate, the frame rejects it, and fitting content (a truncated
+    string, then the cheap tail item) is wrongly dropped to a marker. (`['"'*20,
+    'ok']` at max_chars=45 emitted only the omission marker mid-review.)"""
+    c = FieldExtractCompressor()
+    out45 = c._fit_extracted(['"' * 20, "ok"], 45)
+    parsed45 = json.loads(out45)
+    assert len(out45) <= 45
+    # A truncated escaped-string element survives instead of marker-only output.
+    assert isinstance(parsed45[0], str) and parsed45[0].startswith('"')
+    out50 = c._fit_extracted(['"' * 20, "ok"], 50)
+    assert len(out50) <= 50
+    assert "ok" in json.loads(out50)  # the cheap tail survives once there is room
