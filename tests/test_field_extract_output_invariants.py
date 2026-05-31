@@ -482,16 +482,17 @@ def test_wide_config_dict_routes_to_extract_fields() -> None:
 
 def _preserved_leaves(obj: object, original: object) -> int:
     """Count preserved ORIGINAL scalar leaves — the true monotonicity metric, scored
-    by PROVENANCE against ``original`` (not by string pattern, which can't tell a
-    real ``"[2 items]"`` value from a generated ``{N items}`` stub).
+    purely by PROVENANCE against ``original`` (NO string-pattern filters, which can't
+    tell a real ``"[2 items]"`` / ``"... omitted"`` value or a real ``_truncated_x``
+    key from a generated marker or stub).
 
     An output scalar counts 1 iff it derives from an original scalar — an exact
     original value, or a ``"…"``-truncated prefix of one. Generated placeholders
-    therefore count 0: omitted-count markers, the empty-string / shape stubs from
-    ``_stub_value`` (none of which appear in ``original``), and empty containers.
-    Mirrors the intent of ``FieldExtractCompressor._is_contentless``."""
+    therefore count 0 automatically (they are absent from ``original``): omitted-count
+    markers, the empty-string / shape stubs from ``_stub_value``, and empty
+    containers. No key/value is skipped by name, so a real key like ``_truncated_x``
+    or a real value containing ``omitted`` is still scored on its own provenance."""
     strings: set[str] = set()
-    others: set = set()
 
     def collect(o: object) -> None:
         if isinstance(o, dict):
@@ -502,8 +503,6 @@ def _preserved_leaves(obj: object, original: object) -> int:
                 collect(e)
         elif isinstance(o, str):
             strings.add(o)
-        else:
-            others.add(o)
 
     collect(original)
 
@@ -514,17 +513,12 @@ def _preserved_leaves(obj: object, original: object) -> int:
 
     def count(o: object) -> int:
         if isinstance(o, dict):
-            return sum(
-                count(v)
-                for k, v in o.items()
-                if not str(k).startswith("_truncated")
-                and not (isinstance(v, str) and "omitted" in v)
-            )
+            return sum(count(v) for v in o.values())
         if isinstance(o, list):
-            return sum(count(e) for e in o if not (isinstance(e, str) and "omitted" in e))
+            return sum(count(e) for e in o)
         if isinstance(o, str):
             return 1 if derives(o) else 0
-        return 1  # numbers / bools / None are emitted verbatim or stubbed away
+        return 1  # numbers / bools / None are emitted verbatim, never fabricated
 
     return count(obj)
 
@@ -861,5 +855,33 @@ def test_dict_empty_nested_value_is_monotone_against_its_stub() -> None:
     prev = -1
     for budget in range(2, len(json.dumps(data)) + 5):
         leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)), data)
+        assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # A real list value containing the word "omitted" must not be mistaken for a
+        # generated omitted-count marker by the boundary guard.
+        {"a": ["a real omitted note", "tail"], "b": "x" * 40, "c": [1, 2, 3]},
+        # A real string value that reads like the in-array marker.
+        {"a": {"label": "... (2 of 2 items omitted)", "note": "hello"}, "b": "x" * 40},
+        # A real key whose name starts with the collision-safe marker prefix.
+        {"outer": {"_truncated_real": "keep me", "z": "tail"}, "id": "abc", "pad": "y" * 40},
+        # A real top-level _truncated* key.
+        {"_truncated_x": "keep", "data": [{"v": i} for i in range(15)], "id": "z"},
+    ],
+)
+def test_dict_provenance_not_pattern_for_markers(data: object) -> None:
+    """Marker/placeholder detection is by PROVENANCE, not string pattern: a real
+    value containing ``omitted`` or a real ``_truncated*`` key is genuine content,
+    so the boundary guard must not drop it and the budget must stay monotone."""
+    c = FieldExtractCompressor()
+    prev = -1
+    for budget in range(2, len(json.dumps(data)) + 5):
+        out = c._fit_extracted(data, budget)
+        assert len(out) <= max(2, budget), f"@{budget}: over budget"
+        leaves = _preserved_leaves(json.loads(out), data)
         assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
         prev = leaves

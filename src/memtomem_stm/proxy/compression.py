@@ -1212,28 +1212,48 @@ class FieldExtractCompressor:
         return value  # int / float / bool / None
 
     @staticmethod
-    def _is_contentless(obj: object) -> bool:
-        """True if ``obj`` — a ``_fit_monotone`` rendering — preserves NO original
-        scalar: an empty container, the empty-string scalar stub ``""``, or a
-        container holding only omitted-count markers and other contentless values.
+    def _scalar_pool(obj: object) -> list:
+        """Every scalar leaf of ``obj``, flattened depth-first."""
+        pool: list = []
+        stack = [obj]
+        while stack:
+            o = stack.pop()
+            if isinstance(o, dict):
+                stack.extend(o.values())
+            elif isinstance(o, list):
+                stack.extend(o)
+            else:
+                pool.append(o)
+        return pool
 
-        Provenance-correct by construction: ``_fit_monotone`` only ever emits
-        original values, truncated original strings, ``""`` for an oversized scalar,
-        and omitted-count markers — it NEVER fabricates a ``{N keys}`` / ``[N items]``
-        shape stub (those come only from ``_stub_value``). So a string that merely
-        looks like ``"[2 items]"`` here is a genuine original value and is correctly
-        treated as content — no pattern-matching, no false positives."""
-        if isinstance(obj, dict):
-            return all(
-                str(k).startswith("_truncated") or FieldExtractCompressor._is_contentless(v)
-                for k, v in obj.items()
-            )
-        if isinstance(obj, list):
-            return all(
-                (isinstance(e, str) and "omitted" in e) or FieldExtractCompressor._is_contentless(e)
-                for e in obj
-            )
-        return obj == ""
+    @staticmethod
+    def _fill_preserves_source(filled: object, source: object) -> bool:
+        """True if ``filled`` (a ``_fit_monotone`` rendering of ``source``) preserves
+        at least one ORIGINAL scalar of ``source`` — judged by PROVENANCE, never by
+        string pattern. A scalar of ``filled`` is preserved when it equals a source
+        scalar or is a ``"…"``-truncated prefix of one; generated markers, stubs and
+        empty fills are absent from the source pool and so add nothing. A source with
+        no scalars at all (empty-nested) is vacuously preserved — the truthful empty
+        fill is fine.
+
+        Pattern-based detection (a ``_truncated`` key prefix, an ``"omitted"``
+        substring) would misclassify real keys/values that happen to look like the
+        generated markers; comparing against the source avoids that entirely."""
+        src = FieldExtractCompressor._scalar_pool(source)
+        if not src:
+            return True
+        src_set = set(src)
+        src_strs = [s for s in src if isinstance(s, str)]
+        for f in FieldExtractCompressor._scalar_pool(filled):
+            if f in src_set:
+                return True
+            if (
+                isinstance(f, str)
+                and f.endswith("...")
+                and any(o.startswith(f[:-3]) for o in src_strs)
+            ):
+                return True
+        return False
 
     def _enrich_dict_monotone(self, data: dict, max_chars: int) -> str:
         """Fill a dict root's budget MONOTONICALLY while keeping EVERY top-level
@@ -1309,15 +1329,16 @@ class FieldExtractCompressor:
         # monotone in it; the assembled frame is re-checked against the budget.
         room = max_chars - len(dump(base)) + len(dump(stub[bkey]))
         filled = self._fit_monotone(bval, room) if room >= 2 else None
-        # Take the boundary fill unless it is a content-free rendering ({} / [] / a
-        # marker-only container) of a source that DID have content — then the
-        # cheaper, equally-informative ``{N keys}`` stub is kept instead of spending
-        # budget on an empty-looking shell. (Both score zero preserved leaves, so
-        # this is a quality choice, not needed for monotonicity.) When the source
-        # itself is contentless, the truthful empty-nested fill is fine.
+        # Take the boundary fill unless it preserves NONE of the source's original
+        # scalars (a content-free shell — {} / [] / a marker-only container) while
+        # the source DID have scalars; then the cheaper, equally-informative
+        # ``{N keys}`` stub is kept instead of spending budget on an empty-looking
+        # shell. Both preserve zero original scalars, so this is a quality choice,
+        # not needed for monotonicity. Provenance, not pattern: a real value that
+        # looks like a marker still counts as preserved.
         if (
             filled is not None
-            and not (self._is_contentless(filled) and not self._is_contentless(bval))
+            and self._fill_preserves_source(filled, bval)
             and len(dump(frame(n_full, b_idx, filled))) <= max_chars
         ):
             return dump(frame(n_full, b_idx, filled))
