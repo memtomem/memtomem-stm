@@ -1402,25 +1402,194 @@ class FieldExtractCompressor:
                     return candidate
             return '""'
 
-        # List or string root: ``_take`` is strict (<= budget) for containers, so
-        # a single call at the hard budget fills it — no search, no cliff.
-        candidate = dump(self._take(data, max_chars))
-        if len(candidate) <= max_chars:
-            return candidate
-
-        # Even the most compact ``_take`` form overflows. Floor to the smallest
-        # valid JSON within budget.
-        if isinstance(data, dict):
-            return "{}"
         if isinstance(data, list):
-            return "[]"
+            # ``_take`` content is NON-monotone in its budget: a larger child
+            # budget can flip a value into a longer-but-emptier omitted marker
+            # (e.g. ``_take({"a": 1, "b": {...}}, 37)`` -> ``{"_truncated": ...}``),
+            # so a search that maximizes the budget handed to ``_take`` can show
+            # LESS content at a LARGER ``max_chars``. ``_fit_monotone`` is the
+            # monotone analog (breadth-preserving, shared-cap depth fill), leaving
+            # ``_take`` — which the dict-enrich search at the top relies on —
+            # untouched.
+            return dump(self._fit_monotone(data, max(2, max_chars)))
+
         if isinstance(data, str):
+            # ``_take`` string truncation is already monotone in the budget.
+            candidate = dump(self._take(data, max_chars))
+            if len(candidate) <= max_chars:
+                return candidate
             for k in range(len(data), -1, -1):
                 candidate = json.dumps(data[:k], ensure_ascii=False)
                 if len(candidate) <= max_chars:
                     return candidate
             return '""'
-        return '""'
+
+        # Defensive: any other container type.
+        candidate = dump(self._take(data, max_chars))
+        if len(candidate) <= max_chars:
+            return candidate
+        return "{}" if isinstance(data, dict) else '""'
+
+    def _fit_monotone(self, value: object, budget: int) -> object:
+        """Monotone analog of ``_take``: the preserved-leaf content of the result
+        is NON-DECREASING in ``budget``, so a larger budget never shows less.
+        Returns a compact-JSON-serializable object whose ``json.dumps`` length is
+        ``<= budget`` (callers pass ``max(2, max_chars)``).
+
+        ``_take`` hands each child the largest budget that fits and assumes more
+        budget means more content — false, because ``_take`` itself flips a value
+        into a longer-but-emptier omitted marker as its own budget grows (e.g.
+        ``_take({"a": 1, "b": {...}}, 37)`` -> ``{"_truncated": "..."}``). A search
+        that maximizes the per-child budget inherits that regression, so a LARGER
+        ``max_chars`` can show LESS content.
+
+        The fix keeps ``_take``'s prefix shape — leading items in FULL detail, a
+        single truncated boundary item, then an omitted-count marker — but makes
+        every degree of freedom monotone:
+
+        - **Full prefix**: keep item ``k`` in FULL only while ``[full 0..k] + marker``
+          fits. A full item is full at every larger budget, so the prefix length
+          only grows; growing it replaces the old (partial) boundary with a FULL
+          element, which never has less content.
+        - **Boundary**: the first item that does not fit full is filled by RECURSING
+          (``_fit_monotone``), whose content is monotone in its own budget — unlike
+          ``_take``, it never collapses to an emptier marker as the budget grows.
+        - **Marker**: counts the items AFTER the boundary; a dropped tail is
+          content-free, so the prefix/boundary/marker split is monotone overall.
+
+        The boundary's budget is derived by EXACT frame arithmetic (one recursion,
+        no per-cap scan), so a deeply nested or huge boundary item costs O(depth),
+        not O(budget**depth).
+        """
+
+        def dump(obj: object) -> str:
+            return json.dumps(obj, ensure_ascii=False)
+
+        if isinstance(value, str):
+            if len(dump(value)) <= budget:  # dump() counts the quotes AND escaping
+                return value
+            # Truncate to the largest prefix whose DUMPED length (escaping makes it
+            # non-linear in the prefix length) plus the "..." marker fits. Dumped
+            # length is monotone in the prefix length, so binary-search it; budgeting
+            # by raw len() would under-count escaped chars and overflow the budget.
+            lo, hi, best = 0, len(value), ""
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand = value[:mid] + "..."
+                if len(dump(cand)) <= budget:
+                    best, lo = cand, mid + 1
+                else:
+                    hi = mid - 1
+            return best
+        if not isinstance(value, (dict, list)):
+            literal = dump(value)
+            return value if len(literal) <= budget else ""
+        if len(dump(value)) <= budget:
+            return value  # whole value fits in full
+
+        # Narrow ``value`` for both the type checker and key/index handling, and
+        # pick a collision-safe marker key checked against ALL original keys (a
+        # real "_truncated" may sit in the dropped tail) — mirroring ``_take``.
+        marker_key = "_truncated"
+        if isinstance(value, dict):
+            is_dict = True
+            items: list = list(value.items())
+            existing = set(value)
+            while marker_key in existing:
+                marker_key += "_"
+        else:
+            is_dict = False
+            items = list(enumerate(value))
+        n = len(items)
+
+        _MISSING = object()  # "no boundary item" sentinel (``None`` is a valid value)
+
+        def frame(full_count: int, boundary: object, omitted: int) -> object:
+            """Leading ``full_count`` items in FULL + an optional truncated boundary
+            at index ``full_count`` + an omitted-count marker."""
+            if is_dict:
+                out: dict = {items[i][0]: items[i][1] for i in range(full_count)}
+                if boundary is not _MISSING:
+                    out[items[full_count][0]] = boundary
+                if omitted > 0:
+                    out[marker_key] = f"{omitted} of {n} keys omitted"
+                return out
+            lst: list = [items[i][1] for i in range(full_count)]
+            if boundary is not _MISSING:
+                lst.append(boundary)
+            if omitted > 0:
+                lst.append(f"... ({omitted} of {n} items omitted)")
+            return lst
+
+        def starved(child: object, source: object) -> bool:
+            # An empty container/string standing in for a non-empty source carries
+            # no content; a scalar legitimately stubbed to "" is not starved.
+            if child == "" and not isinstance(source, (dict, list, str)):
+                return False
+            return child in ({}, [], "") and source not in (None, {}, [], "", 0, False)
+
+        # Full prefix: keep item ``k`` in FULL while ``[full 0..k] + marker`` fits.
+        # Adding a full item strictly grows the frame (a marker's digit width
+        # shrinks by at most a couple of chars), so the first overflow ends it.
+        full_k = 0
+        for k in range(1, n + 1):
+            if len(dump(frame(k, _MISSING, n - k))) <= budget:
+                full_k = k
+            else:
+                break
+        if full_k >= n:
+            return value  # defensive — the whole value already fit above
+
+        # Boundary: fill the leftover with a truncated form of item ``full_k`` via
+        # the monotone recursion, keeping a marker for the items AFTER it. Fit it in
+        # ONE recursion (``_fit_monotone`` guarantees its dump <= its budget) rather
+        # than scanning every cap — a scan re-serializes a large nested boundary
+        # once per cap (O(budget * boundary_size)) and binary search is unsafe
+        # because the candidate's length is not monotone in the cap. The room is
+        # ``budget`` minus the marker-bearing frame minus the EXACT framing an
+        # inserted item adds (a ", " separator, plus a "<key>: " for a dict), so the
+        # assembled frame lands at or under ``budget`` by construction and the room
+        # — hence the boundary's content — is monotone in ``budget``.
+        boundary_item = items[full_k][1]
+        omitted_after = n - full_k - 1
+        base = frame(full_k, _MISSING, omitted_after)
+        base_empty = full_k == 0 and omitted_after == 0  # leading "["/"{" with no element
+        if is_dict:
+            framing = len(dump(items[full_k][0])) + (2 if base_empty else 4)
+        else:
+            framing = 0 if base_empty else 2
+        room = budget - len(dump(base)) - framing
+        cand = self._fit_monotone(boundary_item, room) if room >= 0 else _MISSING
+        if (
+            cand is not _MISSING
+            and not starved(cand, boundary_item)
+            and len(dump(frame(full_k, cand, omitted_after))) <= budget
+        ):
+            return frame(full_k, cand, omitted_after)
+
+        # No room for a content-bearing boundary: keep the full prefix + a marker
+        # for every remaining item.
+        if full_k > 0:
+            return frame(full_k, _MISSING, n - full_k)
+        # full_k == 0: emit the marker alone if it fits. Below the marker's width,
+        # keep a MARKERLESS prefix when the whole value is cheaper than the marker
+        # — then the value's FULL form (never a marker tier) is what appears as the
+        # budget grows, so dropping the marker keeps the result monotone. For a
+        # large value (marker cheaper than full) a markerless prefix would regress
+        # against the marker-only tier just above it, so floor to an empty container.
+        marker_only = frame(0, _MISSING, n)
+        if len(dump(marker_only)) <= budget:
+            return marker_only
+        if len(dump(value)) <= len(dump(marker_only)):
+            markerless_k = 0
+            for k in range(1, n + 1):
+                if len(dump(frame(k, _MISSING, 0))) <= budget:
+                    markerless_k = k
+                else:
+                    break
+            if markerless_k > 0:
+                return frame(markerless_k, _MISSING, 0)
+        return {} if is_dict else []
 
     def _compress_text(self, text: str, max_chars: int) -> str:
         lines = text.split("\n")
