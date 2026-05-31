@@ -1212,13 +1212,24 @@ class FieldExtractCompressor:
         return value  # int / float / bool / None
 
     @staticmethod
+    def _is_shape_stub(s: str) -> bool:
+        """True for a placeholder emitted by ``_stub_value`` for a dropped value —
+        ``{N keys}`` / ``[N items]`` / ``""`` — none of which preserves any
+        ORIGINAL scalar content."""
+        return s == "" or (
+            (s.startswith("{") and s.endswith(" keys}"))
+            or (s.startswith("[") and s.endswith(" items]"))
+        )
+
+    @staticmethod
     def _content_leaves(obj: object) -> int:
         """Count preserved ORIGINAL scalar leaves — the metric the monotonicity
-        contract is stated in. Omitted-count markers carry no original content and
-        are excluded: a ``_truncated`` dict member and an ``... omitted`` in-array
-        string. A shape stub (``{N keys}`` / ``[N items]`` / ``""``) is a plain
-        scalar here and counts as one, so trading it for an emptier or marker-only
-        container is correctly seen as a loss."""
+        contract is stated in. PLACEHOLDERS carry no original content and count 0:
+        omitted-count markers (a ``_truncated`` dict member, an ``... omitted``
+        in-array string), shape stubs (``{N keys}`` / ``[N items]`` / ``""``), and
+        empty containers. So showing the COMPLETE value of a key (even an
+        empty-nested one) is never scored below its stub — the stub stands for zero
+        preserved scalars, exactly what an empty-nested full value also preserves."""
         if isinstance(obj, dict):
             return sum(
                 FieldExtractCompressor._content_leaves(v)
@@ -1232,6 +1243,8 @@ class FieldExtractCompressor:
                 for e in obj
                 if not (isinstance(e, str) and "omitted" in e)
             )
+        if isinstance(obj, str) and FieldExtractCompressor._is_shape_stub(obj):
+            return 0
         return 1
 
     def _enrich_dict_monotone(self, data: dict, max_chars: int) -> str:
@@ -1308,9 +1321,16 @@ class FieldExtractCompressor:
         # monotone in it; the assembled frame is re-checked against the budget.
         room = max_chars - len(dump(base)) + len(dump(stub[bkey]))
         filled = self._fit_monotone(bval, room) if room >= 2 else None
+        # Take the boundary fill only when it carries REAL content, OR the source
+        # itself has none (then the truthful empty-nested value is fine). A
+        # content-free fill of a NON-empty source ({} / [] / a marker-only
+        # container) is dropped in favor of the cheaper, equally-informative
+        # ``{N keys}`` stub — keeping it would just spend budget without adding a
+        # leaf. (The stub counts 0 too, so this is a quality choice, not needed for
+        # monotonicity: a full prefix value is never scored below its stub.)
         if (
             filled is not None
-            and self._content_leaves(filled) >= self._content_leaves(stub[bkey])
+            and (self._content_leaves(filled) > 0 or self._content_leaves(bval) == 0)
             and len(dump(frame(n_full, b_idx, filled))) <= max_chars
         ):
             return dump(frame(n_full, b_idx, filled))

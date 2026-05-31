@@ -481,8 +481,20 @@ def test_wide_config_dict_routes_to_extract_fields() -> None:
 
 
 def _preserved_leaves(obj: object) -> int:
-    """Count preserved original scalar leaves, EXCLUDING omitted-count markers
-    (the dict ``_truncated`` member and the in-array ``... items omitted`` string)."""
+    """Count preserved ORIGINAL scalar leaves — the true monotonicity metric.
+    PLACEHOLDERS count 0 (they preserve no original content): omitted-count markers
+    (the dict ``_truncated`` member, the in-array ``... omitted`` string), shape
+    stubs (``{N keys}`` / ``[N items]`` / ``""``), and empty containers. Counting a
+    stub as a leaf would falsely score the COMPLETE value of an empty-nested key
+    below its stub. Mirrors ``FieldExtractCompressor._content_leaves``."""
+
+    def _is_stub(s: str) -> bool:
+        return (
+            s == ""
+            or (s.startswith("{") and s.endswith(" keys}"))
+            or (s.startswith("[") and s.endswith(" items]"))
+        )
+
     if isinstance(obj, dict):
         return sum(
             _preserved_leaves(v)
@@ -491,6 +503,8 @@ def _preserved_leaves(obj: object) -> int:
         )
     if isinstance(obj, list):
         return sum(_preserved_leaves(e) for e in obj if not (isinstance(e, str) and "omitted" in e))
+    if isinstance(obj, str) and _is_stub(obj):
+        return 0
     return 1
 
 
@@ -742,6 +756,9 @@ _DICT_MONO_FIXTURES: dict[str, object] = {
     },
     "flat_scalars": {f"k{i}": f"value-{i}" for i in range(25)},
     "deep": {"l1": {"l2": {"l3": {"l4": [1, 2, 3], "id": "x"}, "k": "v"}, "m": 5}, "n": 9},
+    # Empty-nested values (0 original scalars): a full ``{"x": []}`` must not score
+    # below its ``{1 keys}`` stub — the metric counts both as 0 preserved content.
+    "empty_nested": {"a": {"x": []}, "b": "tail", "c": [[], {}], "d": 5},
 }
 
 
@@ -809,3 +826,19 @@ def test_dict_small_container_full_fits_after_larger_prefix_overflows() -> None:
     assert len(out) <= 48
     assert parsed["a"] == [0, 1, 2, 3]
     assert parsed["b"] == [0]  # the small container survives FULL, not "[1 items]"
+
+
+def test_dict_empty_nested_value_is_monotone_against_its_stub() -> None:
+    """A key whose whole value is empty-nested (``{"x": []}`` — zero original
+    scalars) must not score below its ``{1 keys}`` stub as the budget grows. The
+    stub preserves no original scalar (counts 0); so does the full empty-nested
+    value, so promoting it to full is monotone. Pre-metric-fix this regressed from
+    2 -> 1 'leaves' at the budget where the full value first fit, because the stub
+    string was wrongly counted as a preserved leaf."""
+    c = FieldExtractCompressor()
+    data = {"a": {"x": []}, "b": "tail"}
+    prev = -1
+    for budget in range(2, len(json.dumps(data)) + 5):
+        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)))
+        assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
+        prev = leaves
