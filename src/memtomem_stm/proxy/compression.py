@@ -1211,6 +1211,103 @@ class FieldExtractCompressor:
             return ""
         return value  # int / float / bool / None
 
+    @staticmethod
+    def _content_leaves(obj: object) -> int:
+        """Count preserved ORIGINAL scalar leaves — the metric the monotonicity
+        contract is stated in. Omitted-count markers carry no original content and
+        are excluded: a ``_truncated`` dict member and an ``... omitted`` in-array
+        string. A shape stub (``{N keys}`` / ``[N items]`` / ``""``) is a plain
+        scalar here and counts as one, so trading it for an emptier or marker-only
+        container is correctly seen as a loss."""
+        if isinstance(obj, dict):
+            return sum(
+                FieldExtractCompressor._content_leaves(v)
+                for k, v in obj.items()
+                if not str(k).startswith("_truncated")
+                and not (isinstance(v, str) and "omitted" in v)
+            )
+        if isinstance(obj, list):
+            return sum(
+                FieldExtractCompressor._content_leaves(e)
+                for e in obj
+                if not (isinstance(e, str) and "omitted" in e)
+            )
+        return 1
+
+    def _enrich_dict_monotone(self, data: dict, max_chars: int) -> str:
+        """Fill a dict root's budget MONOTONICALLY while keeping EVERY top-level
+        key (the all-stub skeleton, which the caller verified fits).
+
+        Mirrors ``_fit_monotone``'s discipline — a growing FULL prefix plus ONE
+        partial boundary — but the tail is STUBS, not a marker, so no top-level
+        key vanishes (FieldExtract's "preserve key structure" contract). Each key's
+        value is filled by ``_fit_monotone`` (sibling-preserving + monotone). Keys
+        are prioritized oversized-scalar-LAST so a huge value cannot crowd out
+        short, high-value siblings; otherwise document order. Only ONE key is ever
+        partial, so a growing budget never displaces another key — the source of
+        the old per-key greedy's non-monotonicity. Output keeps the ORIGINAL key
+        order; only the fill *priority* is reordered.
+        """
+
+        def dump(obj: object) -> str:
+            return json.dumps(obj, ensure_ascii=False)
+
+        items = list(data.items())
+        stub = {k: self._stub_value(v) for k, v in items}
+
+        def rank(i: int) -> tuple:
+            v = items[i][1]
+            if isinstance(v, (dict, list)):
+                return (1, 0, i)  # collections: after short scalars, document order
+            size = len(dump(v))
+            if size > 80:
+                return (2, size, i)  # oversized scalars LAST (a huge blob is low value)
+            return (0, size, i)  # short scalars FIRST, smallest first (ids/names/flags win)
+
+        order = sorted(range(len(items)), key=rank)
+
+        def frame(n_full: int, b_idx: int | None, b_val: object) -> dict:
+            full = {order[i] for i in range(n_full)}
+            out: dict = {}
+            for i, (k, v) in enumerate(items):  # ORIGINAL key order
+                if i in full:
+                    out[k] = v
+                elif b_idx is not None and i == b_idx:
+                    out[k] = b_val
+                else:
+                    out[k] = stub[k]
+            return out
+
+        # Largest FULL-value prefix (in priority order) that fits; the rest stay
+        # stubs. ``frame`` length is non-decreasing in ``n_full`` (a full value is
+        # never shorter than its stub), so the first overflow ends the prefix.
+        n_full = 0
+        for n in range(1, len(items) + 1):
+            if len(dump(frame(n, None, None))) <= max_chars:
+                n_full = n
+            else:
+                break
+        if n_full >= len(items):
+            return dump(frame(n_full, None, None))  # every value full
+
+        base = frame(n_full, None, None)
+        b_idx = order[n_full]
+        bkey = items[b_idx][0]
+        bval = items[b_idx][1]
+        # The boundary REPLACES bkey's stub already counted in ``base`` (the key and
+        # ``": "`` stay), so the room for the filled value is the leftover plus the
+        # stub it displaces. ``_fit_monotone`` keeps its dump within that room and is
+        # monotone in it; the assembled frame is re-checked against the budget.
+        room = max_chars - len(dump(base)) + len(dump(stub[bkey]))
+        filled = self._fit_monotone(bval, room) if room >= 2 else None
+        if (
+            filled is not None
+            and self._content_leaves(filled) >= self._content_leaves(stub[bkey])
+            and len(dump(frame(n_full, b_idx, filled))) <= max_chars
+        ):
+            return dump(frame(n_full, b_idx, filled))
+        return dump(base)
+
     def _fit_extracted(self, data: object, max_chars: int) -> str:
         """Re-derive a VALID, within-budget form from the ORIGINAL data, filling
         the budget with as much leading full-detail content as fits.
@@ -1222,11 +1319,11 @@ class FieldExtractCompressor:
 
         Top-level dict: first lay down a *skeleton* — every key with a minimal
         stub value — so no top-level key vanishes while the budget allows it
-        (FieldExtract's "preserve key structure" contract). Then restore short
-        scalar values first before enriching keys with as much full-detail
-        content (via ``_take``) as the remaining budget allows — values like
-        names/ids/roles survive in full rather than every value being shrunk to
-        a stub.
+        (FieldExtract's "preserve key structure" contract). When the skeleton
+        fits, ``_enrich_dict_monotone`` fills the budget MONOTONICALLY: a growing
+        FULL-value prefix (oversized scalars ranked last so short, high-value
+        siblings survive) plus ONE partial boundary value, every other key kept
+        as its stub.
         Only when the stubs themselves overflow are trailing keys dropped into a
         valid collision-safe marker. A list root fills the budget MONOTONICALLY
         via ``_fit_monotone``; string / scalar roots truncate directly. Floors to
@@ -1240,34 +1337,7 @@ class FieldExtractCompressor:
             items = list(data.items())
             skeleton = {k: self._stub_value(v) for k, v in items}
             if len(dump(skeleton)) <= max_chars:
-                # Enrich keys to fill the budget, but enrich SCALARS before
-                # collections: cheap, high-value scalar fields (ids, names, flags)
-                # must survive a tight budget even when large nested sections
-                # precede them in document order. The output dict keeps the original
-                # key order — only the enrichment *priority* is reordered.
-                out = dict(skeleton)
-                scalars = [(k, v) for k, v in items if not isinstance(v, (dict, list))]
-                collections = [(k, v) for k, v in items if isinstance(v, (dict, list))]
-                for k, v in sorted(scalars, key=lambda item: len(dump(item[1]))):
-                    trial = dict(out)
-                    trial[k] = v
-                    if len(dump(trial)) <= max_chars:
-                        out[k] = v
-
-                for k, v in scalars + collections:
-                    if out[k] == v:
-                        continue
-                    lo, hi, best_v = 0, len(dump(v)), out[k]
-                    while lo <= hi:
-                        mid = (lo + hi) // 2
-                        trial = dict(out)
-                        trial[k] = self._take(v, mid)
-                        if len(dump(trial)) <= max_chars:
-                            best_v, lo = trial[k], mid + 1
-                        else:
-                            hi = mid - 1
-                    out[k] = best_v
-                return dump(out)
+                return self._enrich_dict_monotone(data, max_chars)
 
             # Even the all-stub skeleton overflows — keep the leading keys that
             # fit + a valid marker. ``len`` is monotonic in ``keep``. The marker
@@ -1396,7 +1466,17 @@ class FieldExtractCompressor:
         marker_key = "_truncated"
         if isinstance(value, dict):
             is_dict = True
-            items: list = list(value.items())
+            # Rank oversized SCALAR values LAST: a huge id/number/string would
+            # otherwise become the boundary (or full prefix) and crowd its often
+            # short, high-value siblings into the marker. Pushing it to the tail
+            # keeps the cheap siblings in the FULL prefix; the oversized scalar then
+            # degrades cheaply as the boundary or marker. Stable, so non-oversized
+            # keys keep document order. (A container value is never "oversized" here
+            # — it can absorb the boundary budget meaningfully via recursion.)
+            items: list = sorted(
+                value.items(),
+                key=lambda kv: not isinstance(kv[1], (dict, list)) and len(dump(kv[1])) > 80,
+            )
             existing = set(value)
             while marker_key in existing:
                 marker_key += "_"

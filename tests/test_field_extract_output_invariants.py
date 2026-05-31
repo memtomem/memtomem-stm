@@ -291,18 +291,37 @@ def test_take_keeps_full_container_when_it_fits() -> None:
 
 
 def test_dict_fit_reserves_space_for_omission_marker() -> None:
-    """Nested dict fitting must prefer an omitted-count marker over silently
-    returning a longer key prefix with no marker."""
+    """A partially-shown nested dict keeps retained keys + an omitted-count marker
+    (never a silent prefix). The budget must leave room to retain >= 1 key: when
+    NONE fit, the monotone fill instead collapses the whole nested dict to the
+    compact ``{N keys}`` stub (a smaller, still-explicit omission indicator that —
+    unlike a marker-only dict — never regresses against the stub as the budget
+    grows; see test_dict_fully_omitted_nested_collapses_to_stub)."""
     payload = json.dumps({"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"})
-    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    out = FieldExtractCompressor().compress(payload, max_chars=120)
     parsed = json.loads(out)
     outer = parsed["outer"]
     marker = outer.get("_truncated", "")
     retained = len([k for k in outer if k != "_truncated"])
     omitted = int(marker.split(" of ")[0])
+    assert len(out) <= 120
+    assert parsed["id"] == "abc"
+    assert retained >= 1  # at this budget at least the leading key survives
+    assert omitted + retained == 1000
+
+
+def test_dict_fully_omitted_nested_collapses_to_stub() -> None:
+    """When a nested dict is too big to retain even ONE key, it collapses to the
+    compact ``{N keys}`` stub rather than a marker-only ``{"_truncated": ...}``
+    dict. The stub is smaller AND carries a content leaf, so the fill never
+    regresses from the stub to a larger-but-emptier marker as the budget grows
+    (the monotonicity contract). The sibling ``id`` still survives."""
+    payload = json.dumps({"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"})
+    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    parsed = json.loads(out)
     assert len(out) <= 80
     assert parsed["id"] == "abc"
-    assert omitted + retained == 1000
+    assert parsed["outer"] == "{1000 keys}"  # compact omission indicator, not a marker dict
 
 
 def test_dict_fit_allows_exact_marker_fit() -> None:
@@ -684,3 +703,94 @@ def test_router_emits_whole_value_pretty_when_it_fits() -> None:
     lst = [1, 2, 3]
     out2 = c._compress_json(lst, 100)
     assert "\n" in out2 and json.loads(out2) == lst
+
+
+# ── E5. Monotonicity: the DICT final tier (the dict analog of the 4B list fix) ─
+#
+# The old dict enrich filled the budget with a per-key greedy ``_take`` search.
+# That was non-monotone two ways: (1) ``_take``'s own content flips to a
+# longer-but-emptier marker as its budget grows (the 4B root cause), and (2) the
+# per-key greedy let a growing budget hand an EARLIER key more budget, displacing
+# a LATER key. ``_enrich_dict_monotone`` replaces it with ``_fit_monotone``'s
+# discipline — a growing full-value prefix plus ONE partial boundary, every other
+# key kept as its stub — so only one key is ever partial and a larger budget never
+# shows fewer leaves on a dict root.
+
+
+_DICT_MONO_FIXTURES: dict[str, object] = {
+    # cfg (a nested dict) used to enrich to a marker-only form that displaced the
+    # trailing ``tags`` content as the budget grew.
+    "displacing_coll": {
+        "name": "app",
+        "cfg": {f"o{i}": i for i in range(15)},
+        "tags": list(range(20)),
+    },
+    # An early bulky collection used to steal budget from a later collection.
+    "early_big_late": {
+        "A": [{"p": i, "q": f"v{i}"} for i in range(15)],
+        "B": {"x": 1, "y": 2, "z": 3},
+    },
+    # A huge leading scalar must not crowd out short later identifiers.
+    "oversized_first": {"blob": "x" * 300, "id": "abc", "name": "Alice", "cfg": {"a": 1, "b": 2}},
+    # Wide config: every value a nested dict; fill must stay tight AND monotone.
+    "wide_config": _wide_config_dict(20),
+    "nested_lists": {
+        "a": 1,
+        "b": 2,
+        "items": [{"x": i, "y": f"v{i}"} for i in range(20)],
+        "tail": "end",
+    },
+    "flat_scalars": {f"k{i}": f"value-{i}" for i in range(25)},
+    "deep": {"l1": {"l2": {"l3": {"l4": [1, 2, 3], "id": "x"}, "k": "v"}, "m": 5}, "n": 9},
+}
+
+
+@pytest.mark.parametrize("name", sorted(_DICT_MONO_FIXTURES))
+def test_dict_root_content_is_monotone_in_budget(name: str) -> None:
+    """For a dict root, a LARGER budget must never preserve FEWER original leaves
+    in the final tier. Budgets are swept CONTIGUOUSLY so a one-char cliff cannot
+    hide between sampled points; output is asserted valid + within budget too."""
+    fixture = _DICT_MONO_FIXTURES[name]
+    data = json.loads(fixture) if isinstance(fixture, str) else fixture
+    c = FieldExtractCompressor()
+    prev: int | None = None
+    for budget in range(2, len(json.dumps(data)) + 5):
+        out = c._fit_extracted(data, budget)
+        parsed = json.loads(out)  # always valid JSON
+        assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
+        leaves = _preserved_leaves(parsed)
+        if prev is not None:
+            assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+def test_dict_single_partial_boundary_no_cross_key_displacement() -> None:
+    """The canonical pre-fix cross-key regression: as the budget grows one char,
+    an early collection used to grab more budget and an emptier-marker form
+    displaced a later key (content dropped). With a single partial boundary the
+    leaf count is non-decreasing across that exact boundary."""
+    c = FieldExtractCompressor()
+    data = {
+        "A": [{"p": i, "q": f"v{i}", "r": [i, i + 1]} for i in range(15)],
+        "B": {"x": 1, "y": 2, "z": 3, "w": 4},
+    }
+    prev = -1
+    for budget in range(2, 200):
+        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)))
+        assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+def test_dict_oversized_scalar_ranked_last_preserves_short_siblings() -> None:
+    """A huge scalar value is ranked LAST, so short, high-value siblings land in
+    the full prefix instead of being crowded into the boundary/marker. Mirrors the
+    contract behind test_later_short_scalars_* but through the new enrich path."""
+    c = FieldExtractCompressor()
+    data = {"blob": "x" * 500, "id": "abc", "name": "Alice", "flag": True}
+    out = c._fit_extracted(data, 120)
+    parsed = json.loads(out)
+    assert len(out) <= 120
+    assert parsed["id"] == "abc"
+    assert parsed["name"] == "Alice"
+    assert parsed["flag"] is True
+    assert parsed["blob"] != "x" * 500  # the huge value is the one that degrades
