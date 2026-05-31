@@ -500,12 +500,11 @@ def test_list_root_content_is_monotone_in_budget(name: str) -> None:
     CONTIGUOUSLY so a one-char cliff cannot hide between sampled points; output
     is asserted valid + within budget at every step too.
 
-    Exercises ``_fit_extracted`` (the final tier this PR rewrites) directly, the
-    same surface the design probe swept. The ``_compress_json`` *router* in front
-    of it has a SEPARATE, pre-existing non-monotonicity — it prefers a fixed
-    5-item ``indent=2`` ``_preview_list`` whenever that pretty form fits, which
-    carries less content than the budget-filling compact final tier — and is
-    out of scope here.
+    Exercises ``_fit_extracted`` (the final tier the 4B fix rewrites) directly,
+    the same surface the design probe swept. The ``_compress_json`` *router* in
+    front of it had a SEPARATE non-monotonicity — it preferred a fixed 5-item
+    ``indent=2`` head preview over the budget-filling compact final tier — now
+    fixed and covered by the E4 router tests below.
     """
     fixture = _LIST_MONO_FIXTURES[name]
     data = json.loads(fixture) if isinstance(fixture, str) else fixture
@@ -564,3 +563,124 @@ def test_list_string_element_budgeted_by_serialized_length() -> None:
     out50 = c._fit_extracted(['"' * 20, "ok"], 50)
     assert len(out50) <= 50
     assert "ok" in json.loads(out50)  # the cheap tail survives once there is room
+
+
+# ── E4. Router monotonicity: the _compress_json head-preview cliff is gone ─────
+#
+# These exercise ``_compress_json`` DIRECTLY (like E3 hits ``_fit_extracted``):
+# the public ``compress`` short-circuits and returns the input verbatim once it
+# fits the budget, which masks the router at the very budgets where the cliff
+# lived. The router now emits the WHOLE value as ``indent=2`` pretty JSON when it
+# fits (lossless, max content) and otherwise hands every overflow to the
+# budget-filling final tier — instead of preferring a fixed 5-item pretty head
+# preview that carried fewer leaves than the compact tier did at a smaller budget.
+
+
+_ROUTER_LIST_FIXTURES: dict[str, object] = {
+    # Each hit the old router cliff: at the budget where the fixed 5-item
+    # ``indent=2`` head preview just fit, the router returned it (few leaves) even
+    # though the compact final tier carried MORE leaves one char below.
+    "ints_50": list(range(50)),  # leaves 9 @ 60 -> 5 @ 61 pre-fix
+    "small_dicts_100": [{"id": i, "name": f"item{i}"} for i in range(100)],  # 15 @ 246 -> 10 @ 247
+    "short_strings": [f"val-{i}" for i in range(40)],
+    "nested_lists": [[i, i + 1, i + 2] for i in range(20)],
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ROUTER_LIST_FIXTURES))
+def test_list_root_monotone_through_router(name: str) -> None:
+    """For a LIST root, a larger budget never preserves fewer leaves through the
+    full router. Pre-fix the fixed ``indent=2`` head preview undercut the compact
+    final tier; routing every overflow through ``_fit_extracted`` (itself monotone
+    for lists, the 4B fix) removes the cliff. Budgets swept CONTIGUOUSLY."""
+    data = _ROUTER_LIST_FIXTURES[name]
+    c = FieldExtractCompressor()
+    prev: int | None = None
+    for budget in range(2, len(json.dumps(data, indent=2)) + 5):
+        out = c._compress_json(data, budget)
+        parsed = json.loads(out)  # always valid JSON
+        assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
+        leaves = _preserved_leaves(parsed)
+        if prev is not None:
+            assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+_FLAT_DICT_FIXTURES: dict[str, object] = {
+    # Scalar-only dicts: the dict final tier (skeleton + scalar enrich) is itself
+    # monotone, so end-to-end monotonicity holds once the router preview cliff is
+    # gone. Dicts with NESTED collections also lose the router cliff, but their
+    # final tier still inherits ``_take``'s non-monotonicity (the dict analog of
+    # the list 4B fix, tracked as a follow-up) — so they are asserted only via the
+    # weaker pretty-is-lossless invariant below, not full monotonicity.
+    "string_values_30": {f"k{i}": f"value-{i}" for i in range(30)},
+    "mixed_scalars": {f"f{i}": (i if i % 2 else f"s{i}") for i in range(25)},
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FLAT_DICT_FIXTURES))
+def test_flat_dict_monotone_through_router(name: str) -> None:
+    """A scalar-only DICT root is monotone end-to-end once the router no longer
+    prefers the lossy ``indent=2`` preview (its final tier carries no nested
+    collection that ``_take`` could flip into an emptier marker)."""
+    data = _FLAT_DICT_FIXTURES[name]
+    c = FieldExtractCompressor()
+    prev: int | None = None
+    for budget in range(2, len(json.dumps(data, indent=2)) + 5):
+        out = c._compress_json(data, budget)
+        parsed = json.loads(out)
+        assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
+        leaves = _preserved_leaves(parsed)
+        if prev is not None:
+            assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        list(range(50)),
+        [{"id": i, "name": f"item{i}"} for i in range(30)],
+        {"a": 1, "b": 2, "items": [{"x": i, "y": f"v{i}"} for i in range(20)], "tail": "end"},
+        {f"k{i}": "x" * 50 for i in range(10)},
+    ],
+)
+def test_router_pretty_output_is_always_lossless(data: object) -> None:
+    """The router emits ``indent=2`` pretty JSON ONLY for the WHOLE value (the
+    lossless tier); every overflow is the compact final tier. So whenever the
+    output is pretty (contains a newline) it must round-trip to the original data
+    EXACTLY — never a lossy head preview. Holds for list AND dict roots,
+    independent of the dict final tier's separate residual non-monotonicity."""
+    c = FieldExtractCompressor()
+    for budget in range(2, len(json.dumps(data, indent=2)) + 5):
+        out = c._compress_json(data, budget)
+        if "\n" in out:  # pretty (indent=2) => must be the full, lossless value
+            assert json.loads(out) == data, f"@{budget}: pretty output is lossy"
+
+
+def test_router_no_longer_prefers_lossy_preview() -> None:
+    """Pin the canonical pre-fix regressions: a larger budget returned the bulky
+    5-item ``indent=2`` preview (fewer leaves) than the compact tier carried one
+    char below. After the fix the leaf count is non-decreasing across the
+    boundary, for both a list-of-ints and a list-of-dicts root."""
+    c = FieldExtractCompressor()
+    ints: list[object] = list(range(50))
+    assert _preserved_leaves(json.loads(c._compress_json(ints, 61))) >= _preserved_leaves(
+        json.loads(c._compress_json(ints, 60))
+    )
+    dicts: list[object] = [{"id": i, "name": f"item{i}"} for i in range(100)]
+    assert _preserved_leaves(json.loads(c._compress_json(dicts, 247))) >= _preserved_leaves(
+        json.loads(c._compress_json(dicts, 246))
+    )
+
+
+def test_router_emits_whole_value_pretty_when_it_fits() -> None:
+    """A value that fits in full is emitted losslessly as ``indent=2`` pretty JSON
+    for containers — the readable tier the router still keeps."""
+    c = FieldExtractCompressor()
+    d = {"name": "svc", "port": 8080, "tags": ["a", "b"]}
+    out = c._compress_json(d, 500)
+    assert "\n" in out and json.loads(out) == d  # pretty + lossless
+    lst = [1, 2, 3]
+    out2 = c._compress_json(lst, 100)
+    assert "\n" in out2 and json.loads(out2) == lst

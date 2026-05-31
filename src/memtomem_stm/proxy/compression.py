@@ -1052,125 +1052,28 @@ class FieldExtractCompressor:
         return self._compress_text(text, max_chars)
 
     def _compress_json(self, data: object, max_chars: int) -> str:
-        if isinstance(data, dict):
-            preview: object = self._extract_dict(data, max_chars)
-        elif isinstance(data, list):
-            preview = self._preview_list(data)
-        else:
-            preview = data
+        # If the WHOLE value fits, emit it losslessly — pretty (indent=2) for
+        # containers, compact for scalars. ``json.dumps(data)`` always round-trips
+        # ``data`` exactly, so this tier carries the maximum possible content and
+        # can never regress as the budget grows.
         indent = 2 if isinstance(data, (dict, list)) else None
-        result = json.dumps(preview, ensure_ascii=False, indent=indent)
+        result = json.dumps(data, ensure_ascii=False, indent=indent)
         if len(result) <= max_chars:
             return result
-        # Final tier: emit VALID JSON within budget. The old
-        # ``result[:max_chars] + "\n... (truncated)"`` overshot the budget by the
-        # suffix length AND cut the JSON mid-token (invalid output); a top-level
-        # array additionally appended a non-JSON text marker. ``_fit_extracted``
-        # re-derives a valid, within-budget form from the original data.
+
+        # The value overflows: hand off to the budget-filling final tier. It emits
+        # VALID JSON within budget and — for a list root — fills it MONOTONICALLY
+        # (a larger budget never shows less; see ``_fit_monotone``).
+        #
+        # The old router instead returned a FIXED 5-item ``indent=2`` head preview
+        # whenever that pretty form fit. That preview was content-NON-monotone
+        # against this tier: at a budget where the bulky pretty preview just fits it
+        # carries fewer leaves than the compact final tier carries at a SMALLER
+        # budget, so a larger ``max_chars`` could show LESS content. Preferring this
+        # tier for every overflow removes that cliff. (The dict final tier still
+        # inherits ``_take``'s own non-monotonicity — tracked separately, the dict
+        # analog of the list fix.)
         return self._fit_extracted(data, max_chars)
-
-    def _preview_list(self, data: list) -> list[object]:
-        """Head preview of a top-level array as VALID JSON: the first items, then
-        an in-array omitted-count marker (an extra string element). The pre-fix
-        code appended ``"\\n... (N items total ...)"`` as text *after*
-        ``json.dumps``, which left the whole output unparseable for any array
-        over the 5-item preview."""
-        n = len(data)
-        preview_n = min(5, n)
-        preview: list[object] = [
-            self._preview_dict(item) if isinstance(item, dict) else item
-            for item in data[:preview_n]
-        ]
-        if n > preview_n:
-            preview.append(f"... ({n - preview_n} of {n} items omitted)")
-        return preview
-
-    def _extract_dict(self, data: dict, budget: int) -> dict:
-        """Budget-aware recursive dict extraction — preserves all keys with depth.
-
-        Scalar/small values are placed first so they survive truncation.
-        Large arrays/dicts are placed after, allowing them to be cut if needed.
-        """
-        # Separate scalar (small) values from large collections
-        scalar_keys: list[str] = []
-        collection_keys: list[str] = []
-        for key, value in data.items():
-            if isinstance(value, (list, dict)):
-                collection_keys.append(key)
-            else:
-                scalar_keys.append(key)
-
-        # Process scalars first (survive truncation), then collections
-        summary: dict = {}
-        for key in scalar_keys + collection_keys:
-            value = data[key]
-            if isinstance(value, str) and len(value) > 80:
-                if "```" in value:
-                    limit = min(len(value), 500)
-                    fence_end = value.rfind("```", 0, limit)
-                    summary[key] = (
-                        value[: fence_end + 3] if fence_end > 80 else value[:limit] + "..."
-                    )
-                else:
-                    summary[key] = value[:80] + "..."
-            elif isinstance(value, list):
-                preview_n = min(5, len(value))
-                items: list[object] = []
-                for item in value[:preview_n]:
-                    if isinstance(item, str) and len(item) > 80:
-                        items.append(item[:80] + "...")
-                    elif isinstance(item, dict):
-                        items.append(self._preview_dict(item))
-                    elif isinstance(item, list):
-                        items.append(f"[{len(item)} items]")
-                    else:
-                        items.append(item)
-                remaining = len(value) - preview_n
-                if remaining > 0:
-                    items.append(f"... ({remaining} more)")
-                summary[key] = items
-            elif isinstance(value, dict):
-                # Recurse one level — preserve all keys of nested dicts
-                summary[key] = self._preview_dict(value)
-            else:
-                summary[key] = value
-        return summary
-
-    @staticmethod
-    def _preview_dict(d: dict, max_keys: int = 6, max_value_len: int = 80) -> dict:
-        """Show first N key-value pairs with truncated values, hint at rest."""
-        preview: dict = {}
-        keys = list(d.keys())
-        for k in keys[:max_keys]:
-            v = d[k]
-            if isinstance(v, str) and len(v) > max_value_len:
-                preview[k] = v[:max_value_len] + "..."
-            elif isinstance(v, dict):
-                # One more level of preview for nested dicts
-                inner: dict = {}
-                inner_keys = list(v.keys())
-                for ik in inner_keys[:4]:
-                    iv = v[ik]
-                    if isinstance(iv, str) and len(iv) > 40:
-                        inner[ik] = iv[:40] + "..."
-                    elif isinstance(iv, (dict, list)):
-                        inner[ik] = f"({type(iv).__name__}, {len(iv)})"
-                    else:
-                        inner[ik] = iv
-                if len(inner_keys) > 4:
-                    inner[f"...{len(inner_keys) - 4} more"] = "..."
-                preview[k] = inner
-            elif isinstance(v, list):
-                if len(v) <= 3:
-                    preview[k] = v
-                else:
-                    preview[k] = v[:3] + [f"... ({len(v) - 3} more)"]
-            else:
-                preview[k] = v
-        remaining = len(keys) - max_keys
-        if remaining > 0:
-            preview[f"...{remaining} more"] = "..."
-        return preview
 
     def _take(self, value: object, budget: int) -> object:
         """Greedy prefix-fill: keep the leading, full-detail content of ``value``
@@ -1325,8 +1228,9 @@ class FieldExtractCompressor:
         names/ids/roles survive in full rather than every value being shrunk to
         a stub.
         Only when the stubs themselves overflow are trailing keys dropped into a
-        valid collision-safe marker. List / scalar roots binary-search ``_take``
-        directly. Floors to ``{}`` / ``[]`` / ``""`` / ``null``.
+        valid collision-safe marker. A list root fills the budget MONOTONICALLY
+        via ``_fit_monotone``; string / scalar roots truncate directly. Floors to
+        ``{}`` / ``[]`` / ``""`` / ``null``.
         """
 
         def dump(obj: object) -> str:
@@ -1337,11 +1241,10 @@ class FieldExtractCompressor:
             skeleton = {k: self._stub_value(v) for k, v in items}
             if len(dump(skeleton)) <= max_chars:
                 # Enrich keys to fill the budget, but enrich SCALARS before
-                # collections (mirrors _extract_dict's scalar-first ordering):
-                # cheap, high-value scalar fields (ids, names, flags) must
-                # survive a tight budget even when large nested sections precede
-                # them in document order. The output dict keeps the original key
-                # order — only the enrichment *priority* is reordered.
+                # collections: cheap, high-value scalar fields (ids, names, flags)
+                # must survive a tight budget even when large nested sections
+                # precede them in document order. The output dict keeps the original
+                # key order — only the enrichment *priority* is reordered.
                 out = dict(skeleton)
                 scalars = [(k, v) for k, v in items if not isinstance(v, (dict, list))]
                 collections = [(k, v) for k, v in items if isinstance(v, (dict, list))]
