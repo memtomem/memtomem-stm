@@ -830,6 +830,110 @@ class TestFeedbackBoost:
         adapter.increment_access.assert_not_called()
 
 
+class TestFeedbackDemotion:
+    async def test_repeated_negative_feedback_filters_future_surfacing(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        tracker = FeedbackTracker(
+            config=_make_config(),
+            db_path=tmp_path / "fb.db",
+        )
+        try:
+            for i in range(3):
+                sid = f"sid-neg-{i}"
+                tracker.record_surfacing(sid, "gh", "read_file", "q", ["demoted"], [0.9])
+                tracker.record_feedback(sid, "not_relevant", "demoted")
+
+            results = [
+                FakeSearchResult(
+                    chunk=FakeChunk(id="demoted", content="memory that should be hidden"),
+                    score=0.9,
+                ),
+                FakeSearchResult(
+                    chunk=FakeChunk(id="fresh", content="memory that should remain"),
+                    score=0.8,
+                ),
+            ]
+            engine = SurfacingEngine(
+                config=_make_config(feedback_demotion_negative_threshold=3),
+                mcp_adapter=_make_mcp_adapter(results),
+                feedback_tracker=tracker,
+            )
+
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+            assert "memory that should be hidden" not in output
+            assert "memory that should remain" in output
+        finally:
+            tracker.close()
+
+    async def test_feedback_demotion_can_be_disabled(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        tracker = FeedbackTracker(
+            config=_make_config(),
+            db_path=tmp_path / "fb.db",
+        )
+        try:
+            for i in range(3):
+                sid = f"sid-neg-{i}"
+                tracker.record_surfacing(sid, "gh", "read_file", "q", ["demoted"], [0.9])
+                tracker.record_feedback(sid, "already_known", "demoted")
+
+            results = [
+                FakeSearchResult(
+                    chunk=FakeChunk(id="demoted", content="memory that should still show"),
+                    score=0.9,
+                )
+            ]
+            engine = SurfacingEngine(
+                config=_make_config(feedback_demotion_enabled=False),
+                mcp_adapter=_make_mcp_adapter(results),
+                feedback_tracker=tracker,
+            )
+
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+            assert "memory that should still show" in output
+        finally:
+            tracker.close()
+
+    async def test_feedback_demotion_skipped_for_dedup_only_engine(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        tracker = FeedbackTracker(
+            config=_make_config(),
+            db_path=tmp_path / "fb.db",
+        )
+        try:
+            for i in range(3):
+                sid = f"sid-neg-{i}"
+                tracker.record_surfacing(sid, "gh", "read_file", "q", ["demoted"], [0.9])
+                tracker.record_feedback(sid, "not_relevant", "demoted")
+
+            results = [
+                FakeSearchResult(
+                    chunk=FakeChunk(
+                        id="demoted",
+                        content="memory that should show in dedup-only mode",
+                    ),
+                    score=0.9,
+                )
+            ]
+            engine = SurfacingEngine(
+                config=_make_config(feedback_demotion_negative_threshold=3),
+                mcp_adapter=_make_mcp_adapter(results),
+                feedback_tracker=tracker,
+                record_feedback_events=False,
+            )
+
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+            assert "memory that should show in dedup-only mode" in output
+        finally:
+            tracker.close()
+
+
 class TestHandleFeedbackBatch:
     """Batched per-memory ratings (#353 part 1).
 

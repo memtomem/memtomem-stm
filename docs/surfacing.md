@@ -105,6 +105,8 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `auto_tune_min_samples` | `20` | Minimum feedback entries before adjusting per-tool score |
 | `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
 | `feedback_enabled` | `true` | Enable the feedback recording and `stm_surfacing_feedback` tool |
+| `feedback_demotion_enabled` | `true` | Locally filter memories that accumulated repeated negative feedback (`not_relevant` or `already_known`) before cache/injection |
+| `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
 | `fire_webhook` | `true` | Fire surfacing event webhooks |
 
 ## Per-tool Templates
@@ -218,6 +220,7 @@ Surfacing tracks which memory IDs have already been shown so the same content do
 | In-memory `_surfaced_ids` | Insertion-ordered `dict` on the `SurfacingEngine` | Skip IDs already surfaced in this process | Bulk prune to ~5,000 entries when size exceeds **10,000** (FIFO — oldest insertions go first) |
 | In-memory `_boosted_event_ids` | Insertion-ordered `dict` on the `SurfacingEngine` | Ensure each surfacing event's `access_count` boost fires exactly once, even across repeated `helpful` ratings | Bulk prune to ~5,000 when size exceeds **10,000** (same FIFO as `_surfaced_ids`) |
 | Persistent `seen_memories` | SQLite row in `stm_feedback.db` | Skip IDs surfaced in a prior session within `dedup_ttl_seconds` | TTL-based (default 7 days; `0` disables) |
+| Persistent negative feedback | SQLite rows in `surfacing_feedback` | Locally demote IDs with at least `feedback_demotion_negative_threshold` distinct negative surfacing events | Kept with feedback history; set `feedback_demotion_enabled=false` to disable filtering |
 
 The in-memory set is **seeded from `seen_memories`** on startup so dedup survives restarts within the TTL, and every new surfacing writes to both layers via `FeedbackStore.mark_surfaced(ids)`.
 

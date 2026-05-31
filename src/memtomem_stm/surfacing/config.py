@@ -71,6 +71,13 @@ class SurfacingConfig(BaseModel):
     ]
     context_tools: dict[str, ToolSurfacingConfig] = {}
     feedback_enabled: bool = True
+    feedback_demotion_enabled: bool = True
+    """When enabled, memories with repeated negative feedback are locally
+    filtered from future STM surfacing results. This is an STM-side shadow
+    demotion; the LTM rank itself is not mutated."""
+    feedback_demotion_negative_threshold: int = Field(default=3, gt=0)
+    """Distinct negative surfacing events required before a memory is locally
+    demoted. Negative feedback is ``not_relevant`` or ``already_known``."""
     max_surfacings_per_minute: int = Field(default=15, gt=0)
     cache_ttl_seconds: float = Field(default=60.0, ge=0.0)
     circuit_max_failures: int = Field(default=3, ge=0)

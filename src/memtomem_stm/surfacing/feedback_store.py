@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS auto_tune_adjustments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_memory_rating ON surfacing_feedback(memory_id, rating);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 """
@@ -245,6 +246,55 @@ class FeedbackStore:
             return json.loads(row[0])
         except (json.JSONDecodeError, TypeError):
             return []
+
+    def get_negative_feedback_counts(self, memory_ids: list[str]) -> dict[str, int]:
+        """Return durable negative-feedback event counts for memory IDs.
+
+        Counts distinct ``surfacing_id`` values, not raw feedback rows, so
+        repeated submissions for the same surfacing event cannot trigger
+        demotion by themselves. Explicit per-memory feedback is counted
+        directly from ``surfacing_feedback.memory_id``. Legacy blanket
+        negatives (``memory_id IS NULL``) are expanded from the parent
+        event's ``memory_ids`` JSON without relying on SQLite JSON1.
+        """
+        if self._db is None or not memory_ids:
+            return {}
+
+        target_ids = list(dict.fromkeys(str(mid) for mid in memory_ids))
+        event_ids_by_memory = {mid: set() for mid in target_ids}
+        target_set = set(target_ids)
+
+        placeholders = ", ".join("?" for _ in target_ids)
+        rating_placeholders = ", ".join("?" for _ in _NEGATIVE_FEEDBACK_RATINGS)
+        explicit_rows = self._db.execute(
+            "SELECT DISTINCT memory_id, surfacing_id FROM surfacing_feedback "
+            f"WHERE memory_id IN ({placeholders}) "
+            f"AND rating IN ({rating_placeholders})",
+            (*target_ids, *_NEGATIVE_FEEDBACK_RATINGS),
+        ).fetchall()
+        for memory_id, surfacing_id in explicit_rows:
+            event_ids_by_memory[str(memory_id)].add(str(surfacing_id))
+
+        blanket_rows = self._db.execute(
+            "SELECT DISTINCT f.surfacing_id, e.memory_ids FROM surfacing_feedback f "
+            "JOIN surfacing_events e ON f.surfacing_id = e.id "
+            "WHERE f.memory_id IS NULL "
+            f"AND f.rating IN ({rating_placeholders})",
+            _NEGATIVE_FEEDBACK_RATINGS,
+        ).fetchall()
+        for surfacing_id, event_memory_ids_json in blanket_rows:
+            try:
+                event_memory_ids = json.loads(event_memory_ids_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(event_memory_ids, list):
+                continue
+            for memory_id in event_memory_ids:
+                mid = str(memory_id)
+                if mid in target_set:
+                    event_ids_by_memory[mid].add(str(surfacing_id))
+
+        return {mid: len(event_ids) for mid, event_ids in event_ids_by_memory.items()}
 
     def get_surfacing_event(self, surfacing_id: str) -> dict | None:
         """Return ``{server, tool, memory_ids}`` for a surfacing event.

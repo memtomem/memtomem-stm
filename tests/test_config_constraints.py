@@ -190,6 +190,8 @@ class TestSurfacingNumericConstraints:
             SurfacingConfig(max_injection_chars=0)
         with pytest.raises(ValidationError):
             SurfacingConfig(min_query_tokens=0)
+        with pytest.raises(ValidationError):
+            SurfacingConfig(feedback_demotion_negative_threshold=0)
 
     def test_surfacing_context_window_nonnegative(self) -> None:
         with pytest.raises(ValidationError):
