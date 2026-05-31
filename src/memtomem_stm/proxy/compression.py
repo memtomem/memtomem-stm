@@ -1681,16 +1681,19 @@ class SkeletonCompressor:
 
         budgets = self._section_budgets(sections, max_chars, context_query)
 
-        # Build sections: heading + first content lines up to the budget.
-        parts: list[str] = []
+        # Build sections: heading + first content lines up to the per-section
+        # budget. Keep the per-section line lists (not pre-joined) so the
+        # degraded path can shed body and whole heading lines independently.
+        kept_sections: list[list[str]] = []
         total_body_trimmed = 0
+        total_body_chars = 0
         for (heading, body_lines), budget in zip(sections, budgets):
-            # Always keep the heading
-            kept = [heading]
+            kept = [heading]  # always keep the heading
             kept_chars = len(heading)
 
             # Measure total body content (non-empty, non-heading lines)
             section_body_chars = sum(len(ln) for ln in body_lines)
+            total_body_chars += section_body_chars
 
             # Add content lines until per-section budget
             for line in body_lines:
@@ -1699,21 +1702,20 @@ class SkeletonCompressor:
                 kept.append(line)
                 kept_chars += len(line) + 1
 
-            kept_body_chars = kept_chars - len(heading)
-            total_body_trimmed += max(0, section_body_chars - kept_body_chars)
+            total_body_trimmed += max(0, section_body_chars - (kept_chars - len(heading)))
+            kept_sections.append(kept)
 
-            parts.append("\n".join(kept))
+        result = "\n\n".join("\n".join(kept) for kept in kept_sections)
+        result += self._footer(len(text), total_body_trimmed, len(headings))
+        if len(result) <= max_chars:
+            return result
 
-        result = "\n\n".join(parts)
-        result += (
-            f"\n(skeleton — {len(text)} chars original"
-            f", {total_body_trimmed} body_trimmed_chars"
-            f", {len(headings)} sections)"
+        # The assembled skeleton overshoots the budget. Degrade gracefully
+        # rather than ``result[:max_chars]`` (which dropped trailing headings,
+        # cut a heading mid-line, and sliced the footer marker).
+        return self._fit_skeleton(
+            sections, budgets, len(text), len(headings), total_body_chars, max_chars
         )
-
-        if len(result) > max_chars:
-            result = result[:max_chars]
-        return result
 
     def _section_budgets(
         self,
@@ -1751,6 +1753,118 @@ class SkeletonCompressor:
         floor = 60
         remainder = max(0, content_budget - floor * n)
         return [floor + int(remainder * s / total) for s in scores]
+
+    @staticmethod
+    def _footer(text_len: int, body_trimmed: int, num_headings: int) -> str:
+        """The trailing skeleton-metadata line, kept verbatim in every tier."""
+        return (
+            f"\n(skeleton — {text_len} chars original"
+            f", {body_trimmed} body_trimmed_chars"
+            f", {num_headings} sections)"
+        )
+
+    @staticmethod
+    def _omitted_marker(omitted: int, total: int) -> str:
+        """Marker line recording whole sections dropped under budget pressure."""
+        return f"\n... ({omitted} of {total} sections omitted)"
+
+    @staticmethod
+    def _heading_prefix(headings: list[str], sep: str, max_chars: int, reserve: int) -> int:
+        """Count of leading WHOLE heading lines that fit in ``max_chars`` once
+        ``reserve`` bytes are set aside for a trailing marker/footer."""
+        used = 0
+        kept = 0
+        for i, heading in enumerate(headings):
+            add = len(heading) + (len(sep) if i > 0 else 0)
+            if used + add + reserve > max_chars:
+                break
+            used += add
+            kept += 1
+        return kept
+
+    def _fit_skeleton(
+        self,
+        sections: list[tuple[str, list[str]]],
+        budgets: list[int],
+        text_len: int,
+        num_headings: int,
+        total_body_chars: int,
+        max_chars: int,
+    ) -> str:
+        """Assemble the skeleton within ``max_chars`` preserving WHOLE headings.
+
+        Replaces the old ``result[:max_chars]`` slice, which dropped trailing
+        headings, cut a heading mid-line, and truncated the footer — violating
+        the class's "every heading survives" contract. Degradation order:
+
+        * **Tier 2** — every heading fits beside the footer: keep all headings
+          and refill body lines (relevance-weighted via ``budgets``) up to the
+          budget. No heading is dropped or cut.
+        * **Tier 3** — even the bare heading lines overflow: keep the longest
+          prefix of WHOLE heading lines and record the rest in a
+          ``... (N of M sections omitted)`` marker — the "all-headings
+          invariant yields to budget" analog of SchemaPruning/FieldExtract.
+        * **Floor** — a budget too small for even one heading + marker + footer
+          (below anything the retention ladder produces): a last-resort hard
+          slice, mirroring ``TruncateCompressor._fit_with_footer``.
+
+        The footer/marker are never sliced; the result is always
+        ``<= max(0, max_chars)``. Reserves use their widest possible width
+        (footer with all body trimmed, marker with max-digit counts), so the
+        actual — never wider — fits by construction.
+        """
+        headings = [heading for heading, _ in sections]
+        sep = "\n\n"
+        footer_reserve = len(self._footer(text_len, total_body_chars, num_headings))
+        marker_reserve = len(self._omitted_marker(num_headings, num_headings))
+
+        all_headings_len = sum(len(h) for h in headings) + len(sep) * (num_headings - 1)
+
+        # Tier 2: all headings fit — keep them, refill bodies up to the budget.
+        if all_headings_len + footer_reserve <= max_chars:
+            kept_lines: list[list[str]] = [[h] for h in headings]
+            kept_chars = [len(h) for h in headings]
+            running = all_headings_len
+            body_trimmed = total_body_chars
+            for idx, (_heading, body_lines) in enumerate(sections):
+                budget = budgets[idx]
+                for line in body_lines:
+                    # Honor both the per-section relevance budget and the global
+                    # budget (gated on the widest footer) so no heading is lost.
+                    if kept_chars[idx] + len(line) + 1 > budget:
+                        break
+                    if running + len(line) + 1 + footer_reserve > max_chars:
+                        break
+                    kept_lines[idx].append(line)
+                    kept_chars[idx] += len(line) + 1
+                    running += len(line) + 1
+                    body_trimmed -= len(line)
+            body = sep.join("\n".join(lines) for lines in kept_lines)
+            return body + self._footer(text_len, body_trimmed, num_headings)
+
+        # Tier 3: keep the longest whole-heading prefix beside marker + footer.
+        kept = self._heading_prefix(headings, sep, max_chars, marker_reserve + footer_reserve)
+        if kept >= 1:
+            body = sep.join(headings[:kept])
+            marker = self._omitted_marker(num_headings - kept, num_headings)
+            return body + marker + self._footer(text_len, total_body_chars, num_headings)
+
+        # Floor A: the footer no longer fits, but the omission marker still does
+        # — keep the marker so the truncation stays visible (and the kept-heading
+        # count stays monotonic as the budget shrinks).
+        kept = self._heading_prefix(headings, sep, max_chars, marker_reserve)
+        if kept >= 1:
+            return sep.join(headings[:kept]) + self._omitted_marker(
+                num_headings - kept, num_headings
+            )
+
+        # Floor B: not even the marker fits. Keep the longest WHOLE-heading
+        # prefix that fits the raw budget (still no mid-cut); hard-slice only
+        # when not even one heading fits — below anything the ladder produces.
+        kept = self._heading_prefix(headings, sep, max_chars, 0)
+        if kept >= 1:
+            return sep.join(headings[:kept])
+        return (headings[0] if headings else "")[: max(0, max_chars)]
 
 
 class LLMCompressor:
