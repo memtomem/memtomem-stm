@@ -1845,6 +1845,58 @@ class TestPerToolMinScoreOverride:
             "per-tool min_score=0.0 must be respected (is-not-None, not truthy)"
         )
 
+    async def test_per_tool_override_drives_bucket_floor(self):
+        """Bucket labels must use the same per-tool floor that filtered results."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        config = _make_config(
+            auto_tune_enabled=False,
+            min_score=0.03,
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.6)},
+        )
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(content="near override floor"), score=0.70)]
+            ),
+        )
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "[weak]: near override floor" in out
+        assert "[strong]: near override floor" not in out
+
+    async def test_auto_tuned_min_score_drives_bucket_floor(self, tmp_path: Path):
+        """Bucket labels must use the adjusted AutoTuner floor, not the global default."""
+        config = _make_config(
+            auto_tune_enabled=True,
+            auto_tune_min_samples=3,
+            auto_tune_score_ceiling=0.6,
+            auto_tune_score_increment=0.57,
+            min_score=0.03,
+        )
+        tracker = self._make_tracker(tmp_path, config)
+        try:
+            tracker.store.record_surfacing("seed-auto", "gh", "read_file", "q", ["m1"], [0.5])
+            for _ in range(5):
+                tracker.store.record_feedback("seed-auto", "not_relevant")
+
+            engine = SurfacingEngine(
+                config=config,
+                mcp_adapter=_make_mcp_adapter(
+                    [FakeSearchResult(chunk=FakeChunk(content="near tuned floor"), score=0.70)]
+                ),
+                feedback_tracker=tracker,
+            )
+
+            out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.6
+            assert "[weak]: near tuned floor" in out
+            assert "[strong]: near tuned floor" not in out
+        finally:
+            tracker.close()
+
 
 class TestSurfacingEngineObservability:
     """Engine-level skip/outcome counter wiring.

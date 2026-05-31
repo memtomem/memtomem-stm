@@ -14,6 +14,21 @@ class SurfacingFormatter:
     def __init__(self, config: SurfacingConfig) -> None:
         self._config = config
 
+    def _relevance_bucket(self, score: float, score_floor: float | None = None) -> str:
+        floor = self._config.min_score if score_floor is None else score_floor
+        if floor >= 1.0:
+            return "strong"
+
+        band = 1.0 - floor
+        related_start = floor + band / 3
+        strong_start = floor + 2 * band / 3
+
+        if score < related_start:
+            return "weak"
+        if score < strong_start:
+            return "related"
+        return "strong"
+
     @staticmethod
     def _format_source(source_file: Any) -> str:
         parts = getattr(source_file, "parts", None)
@@ -38,6 +53,7 @@ class SurfacingFormatter:
         query: str,
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
+        score_floor: float | None = None,
     ) -> str:
         """Inject surfaced memories into ``response_text``.
 
@@ -100,7 +116,8 @@ class SurfacingFormatter:
                     snippet = ctx.window_after[0].content[:budget].replace("\n", " ")
                     preview = preview + " | " + snippet + "..."
 
-            lines.append(f"- **{source}**{ns_badge} (score={r.score:.2f}): {preview}")
+            bucket = self._relevance_bucket(float(r.score), score_floor)
+            lines.append(f"- **{source}**{ns_badge} [{bucket}]: {preview}")
 
         if scratch_items:
             lines.append("")
