@@ -29,6 +29,23 @@ class SurfacingFormatter:
             return "related"
         return "strong"
 
+    @staticmethod
+    def _format_source(source_file: Any) -> str:
+        parts = getattr(source_file, "parts", None)
+        if not parts:
+            return str(source_file)
+
+        anchor = getattr(source_file, "anchor", "")
+        path_parts = [part for part in parts if part and part != anchor]
+        if not path_parts:
+            return str(source_file)
+        return "/".join(path_parts[-2:])
+
+    def _format_namespace_badge(self, namespace: str | None) -> str:
+        if not namespace or namespace == self._config.default_namespace:
+            return ""
+        return f" [{namespace}]"
+
     def inject(
         self,
         response_text: str,
@@ -77,8 +94,8 @@ class SurfacingFormatter:
         for r in results:
             chunk = r.chunk
             meta = chunk.metadata
-            ns_badge = f" [{meta.namespace}]" if meta.namespace != "default" else ""
-            source = str(meta.source_file.name) if meta.source_file else ""
+            ns_badge = self._format_namespace_badge(meta.namespace)
+            source = self._format_source(meta.source_file) if meta.source_file else ""
 
             ctx = getattr(r, "context", None)
             preview_cap = self._config.preview_max_chars

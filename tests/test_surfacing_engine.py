@@ -726,6 +726,29 @@ class TestFeedbackBoost:
         # so a future call can retry the boost.
         assert "sid-5" not in engine._boosted_event_ids
 
+    async def test_boost_timeout_does_not_break_feedback(self):
+        """A stalled LTM boost must not stall feedback recording indefinitely."""
+        adapter = _make_mcp_adapter([])
+
+        async def stalled_increment(_ids):
+            await asyncio.sleep(60)
+
+        adapter.increment_access = AsyncMock(side_effect=stalled_increment)
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.01),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback("sid-timeout", "helpful", memory_id="mid-A")
+
+        assert "Feedback recorded" in result
+        adapter.increment_access.assert_awaited_once_with(["mid-A"])
+        # Timeout is treated like any other failed best-effort boost: release
+        # the guard so a later feedback call can retry.
+        assert "sid-timeout" not in engine._boosted_event_ids
+
     async def test_no_boost_when_event_has_no_memories(self):
         """When the surfacing event has no memories, skip the call entirely."""
         adapter = _make_mcp_adapter([])
@@ -887,6 +910,32 @@ class TestHandleFeedbackBatch:
         )
 
         adapter.increment_access.assert_awaited_once_with(["mid-A", "mid-B"])
+
+    async def test_batched_boost_timeout_does_not_break_feedback(self):
+        adapter = _make_mcp_adapter([])
+
+        async def stalled_increment(_ids):
+            await asyncio.sleep(60)
+
+        adapter.increment_access = AsyncMock(side_effect=stalled_increment)
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B"])
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.01),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback_batch(
+            "sid-batch-timeout",
+            [
+                {"memory_id": "mid-A", "rating": "helpful"},
+                {"memory_id": "mid-B", "rating": "helpful"},
+            ],
+        )
+
+        assert "2/2 entries" in result
+        adapter.increment_access.assert_awaited_once_with(["mid-A", "mid-B"])
+        assert "sid-batch-timeout" not in engine._boosted_event_ids
 
     async def test_per_event_boost_guard_blocks_batched_after_single(self):
         """A single-call ``helpful`` first claims the guard; a subsequent

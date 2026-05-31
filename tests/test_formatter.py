@@ -90,9 +90,9 @@ class TestFormatterInjection:
             FakeResult(FakeChunk(content="top band"), 0.95),
         ]
         output = fmt.inject("response", results, "query")
-        assert "- **test.md** [weak]: near floor" in output
-        assert "- **test.md** [related]: middle band" in output
-        assert "- **test.md** [strong]: top band" in output
+        assert "- **notes/test.md** [default] [weak]: near floor" in output
+        assert "- **notes/test.md** [default] [related]: middle band" in output
+        assert "- **notes/test.md** [default] [strong]: top band" in output
         assert "score=" not in output
         assert "0.04" not in output
         assert "0.50" not in output
@@ -106,9 +106,61 @@ class TestFormatterInjection:
             FakeResult(FakeChunk(content="custom strong"), 0.90),
         ]
         output = fmt.inject("response", results, "query")
-        assert "- **test.md** [weak]: custom weak" in output
-        assert "- **test.md** [related]: custom related" in output
-        assert "- **test.md** [strong]: custom strong" in output
+        assert "- **notes/test.md** [default] [weak]: custom weak" in output
+        assert "- **notes/test.md** [default] [related]: custom related" in output
+        assert "- **notes/test.md** [default] [strong]: custom strong" in output
+
+    def test_source_renders_parent_and_basename(self):
+        fmt = SurfacingFormatter(SurfacingConfig())
+        chunk = FakeChunk(content="ambiguous auth note")
+        chunk.metadata = FakeChunkMeta(
+            source_file=Path("/notes/2026-q1/auth.md"),
+            namespace="default",
+        )
+        results = [FakeResult(chunk, 0.42)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "**2026-q1/auth.md**" in output
+        assert "**auth.md**" not in output
+        assert "notes/2026-q1/auth.md" not in output
+
+    def test_top_level_source_renders_basename_only(self):
+        fmt = SurfacingFormatter(SurfacingConfig())
+        chunk = FakeChunk(content="top level auth note")
+        chunk.metadata = FakeChunkMeta(source_file=Path("/auth.md"), namespace="default")
+        results = [FakeResult(chunk, 0.42)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "**auth.md**" in output
+        assert "**/auth.md**" not in output
+
+    def test_default_namespace_none_renders_default_badge(self):
+        fmt = SurfacingFormatter(SurfacingConfig(default_namespace=None))
+        results = [FakeResult(FakeChunk(), 0.5)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "[default]" in output
+
+    def test_configured_default_namespace_suppresses_matching_badge(self):
+        fmt = SurfacingFormatter(SurfacingConfig(default_namespace="work"))
+        chunk = FakeChunk(content="work namespace note")
+        chunk.metadata = FakeChunkMeta(source_file=Path("/notes/work.md"), namespace="work")
+        results = [FakeResult(chunk, 0.5)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "[work]" not in output
+
+    def test_configured_default_namespace_keeps_other_badges(self):
+        fmt = SurfacingFormatter(SurfacingConfig(default_namespace="work"))
+        results = [FakeResult(FakeChunk(), 0.5)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "[default]" in output
 
     def test_surfacing_id_included(self):
         fmt = SurfacingFormatter(SurfacingConfig())
