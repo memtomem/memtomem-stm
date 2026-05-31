@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -66,6 +67,63 @@ def count_markdown_headings(text: str) -> int:
     comment line, or ``#`` inside prose without a following space).
     """
     return len(_HEADINGS_RE.findall(text))
+
+
+def _sanitize_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (``NaN`` / ``Infinity`` /
+    ``-Infinity``) with ``None`` so the result serializes to valid JSON.
+
+    ``json.dumps`` emits the bareword tokens ``NaN`` / ``Infinity`` /
+    ``-Infinity`` for non-finite floats, which RFC 8259 JSON forbids and strict
+    parsers (browser ``JSON.parse``, Go ``encoding/json``,
+    ``json.loads(parse_constant=...)``) reject. Upstream tool responses that dump
+    numpy/pandas/ML metrics routinely carry these tokens. We sanitize ONCE at
+    parse time (see ``_mm_json_loads``) so every compression tier that re-dumps
+    the parsed payload — including the budget-search probe loops that measure
+    ``len(json.dumps(candidate))`` — sees only finite values and never re-emits
+    an invalid token.
+
+    Returns the input object UNCHANGED (same identity) when it contains no
+    non-finite float, so the common case allocates nothing. ``bool`` is an
+    ``int`` subclass (not ``float``) and is left untouched.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        replaced: dict | None = None
+        for key, value in obj.items():
+            sanitized = _sanitize_nonfinite(value)
+            if sanitized is not value:
+                if replaced is None:
+                    replaced = dict(obj)
+                replaced[key] = sanitized
+        return replaced if replaced is not None else obj
+    if isinstance(obj, (list, tuple)):
+        replaced_seq: list | None = None
+        for index, value in enumerate(obj):
+            sanitized = _sanitize_nonfinite(value)
+            if sanitized is not value:
+                if replaced_seq is None:
+                    replaced_seq = list(obj)
+                replaced_seq[index] = sanitized
+        if replaced_seq is not None:
+            return replaced_seq
+        # A tuple with no non-finite float still round-trips through json as an
+        # array; return it unchanged to preserve the no-copy fast path.
+        return obj
+    return obj
+
+
+def _mm_json_loads(s: str, **kwargs: object) -> object:
+    """``json.loads`` that scrubs non-finite floats from the parsed result.
+
+    Python's ``json.loads`` accepts the ``NaN`` / ``Infinity`` / ``-Infinity``
+    extension tokens and turns them into ``float('nan')`` / ``float('inf')``,
+    which would later re-serialize as those same invalid tokens. Sanitizing here
+    — the single ingest point for every JSON-handling compression tier — keeps
+    all downstream output valid JSON without per-serialization overhead.
+    """
+    return _sanitize_nonfinite(json.loads(s, **kwargs))
 
 
 class Compressor(Protocol):
@@ -132,7 +190,7 @@ class TruncateCompressor:
         stripped = text.strip()
         if stripped and stripped[0] == "{":
             try:
-                data = json.loads(stripped)
+                data = _mm_json_loads(stripped)
                 if (
                     isinstance(data, dict)
                     and len(data) >= 2
@@ -832,7 +890,7 @@ class SelectiveCompressor:
 
     def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
         try:
-            data = json.loads(text)
+            data = _mm_json_loads(text)
             if isinstance(data, dict):
                 return "json", self._parse_json_dict(data, text)
             if isinstance(data, list):
@@ -903,7 +961,7 @@ class SelectiveCompressor:
             return chunks
         key, value = next(iter(chunks.items()))
         try:
-            parsed = json.loads(value)
+            parsed = _mm_json_loads(value)
         except (json.JSONDecodeError, ValueError):
             return chunks
         if isinstance(parsed, dict) and len(parsed) > 1:
@@ -952,7 +1010,7 @@ class FieldExtractCompressor:
         if not text or len(text) <= max_chars:
             return text
         try:
-            data = json.loads(text)
+            data = _mm_json_loads(text)
             return self._compress_json(data, max_chars)
         except (json.JSONDecodeError, ValueError):
             pass
@@ -1393,7 +1451,7 @@ class SchemaPruningCompressor:
         if not text or len(text) <= max_chars:
             return text
         try:
-            data = json.loads(text)
+            data = _mm_json_loads(text)
         except (json.JSONDecodeError, ValueError):
             return TruncateCompressor(scorer=self._scorer).compress(
                 text, max_chars=max_chars, context_query=context_query
@@ -2285,7 +2343,7 @@ def auto_select_strategy(text: str, *, max_chars: int = 0) -> CompressionStrateg
     # JSON detection
     if stripped[0] in "{[":
         try:
-            data = json.loads(stripped)
+            data = _mm_json_loads(stripped)
             if isinstance(data, list) and len(data) >= 20:
                 return CompressionStrategy.SCHEMA_PRUNING
             if isinstance(data, dict):
