@@ -751,8 +751,16 @@ class SelectiveCompressor:
                 return None
         return self._store_and_build_toc(text, fmt, chunks, context_query)
 
+    # Largest per-entry preview length (the historical default).
+    _MAX_PREVIEW = 80
+
     def _store_and_build_toc(
-        self, text: str, fmt: str, chunks: dict[str, str], context_query: str | None = None
+        self,
+        text: str,
+        fmt: str,
+        chunks: dict[str, str],
+        context_query: str | None = None,
+        max_chars: int | None = None,
     ) -> str:
         selection_key = uuid.uuid4().hex[:16]
 
@@ -767,48 +775,75 @@ class SelectiveCompressor:
         )
         self._evict()
 
-        entries = []
-        for key, content in chunks.items():
-            size = len(content)
-            is_inline = size < self._min_section_chars
-            preview = content if is_inline else content[:80].replace("\n", " ")
-            content_type = self._infer_type(key, content, fmt)
-            entries.append(
-                {
-                    "key": key,
-                    "type": content_type,
-                    "size": size,
-                    "preview": preview,
-                    "inline": is_inline,
-                }
-            )
-
         # Query-aware ordering: when a context query is supplied, surface the
         # most relevant sections first so the agent sees them at the top of the
         # TOC. Selection by key is unaffected — ``chunks`` still holds every
         # section. With no query (or no signal) the original insertion order is
         # preserved, which callers and tests rely on. Stable sort keeps ties in
-        # insertion order.
+        # insertion order. Order is decided ONCE here so the preview-budget
+        # search below rebuilds the same entries in the same order.
+        items = list(chunks.items())
         if context_query and context_query.strip():
-            # ``entries`` is built from ``chunks.items()`` in order, so the
-            # i-th entry and the i-th chunk are the same section — score the
-            # (key, content) pairs directly and reorder entries by that index.
-            chunk_items = list(chunks.items())
-            scores = self._scorer.score_sections(context_query, chunk_items)
+            scores = self._scorer.score_sections(context_query, items)
             if any(s > 0 for s in scores):
-                order = sorted(range(len(entries)), key=lambda i: -scores[i])
-                entries = [entries[i] for i in order]
+                order = sorted(range(len(items)), key=lambda i: -scores[i])
+                items = [items[i] for i in order]
 
-        toc = {
-            "type": "toc",
-            "selection_key": selection_key,
-            "format": fmt,
-            "total_chars": len(text),
-            "ttl_seconds_remaining": int(self._ttl),
-            "entries": entries,
-            "hint": f"Call stm_proxy_select_chunks(key='{selection_key}', sections=[...]) to retrieve.",
-        }
-        return json.dumps(toc, ensure_ascii=False)
+        def build(preview_cap: int) -> str:
+            entries = []
+            for key, content in items:
+                size = len(content)
+                is_inline = size < self._min_section_chars
+                # Inline short sections show their content in full; only the
+                # longer-section preview is capped. ``preview_cap`` bounds that
+                # preview so a many-section TOC can honor the char budget without
+                # dropping entries — every section stays addressable by key,
+                # which the two-phase select() protocol depends on.
+                preview = content if is_inline else content[:preview_cap].replace("\n", " ")
+                entries.append(
+                    {
+                        "key": key,
+                        "type": self._infer_type(key, content, fmt),
+                        "size": size,
+                        "preview": preview,
+                        "inline": is_inline,
+                    }
+                )
+            toc = {
+                "type": "toc",
+                "selection_key": selection_key,
+                "format": fmt,
+                "total_chars": len(text),
+                "ttl_seconds_remaining": int(self._ttl),
+                "entries": entries,
+                "hint": (
+                    f"Call stm_proxy_select_chunks(key='{selection_key}', "
+                    "sections=[...]) to retrieve."
+                ),
+            }
+            return json.dumps(toc, ensure_ascii=False)
+
+        full = build(self._MAX_PREVIEW)
+        if max_chars is None or len(full) <= max_chars:
+            return full
+
+        # Over budget: shrink the uniform preview cap to fill as much of the
+        # budget as possible while keeping EVERY entry. ``len(build(cap))`` is
+        # non-decreasing in ``cap``, so a binary search finds the largest cap
+        # that fits; ``build(0)`` (empty previews) is the floor. The entry COUNT
+        # and the envelope are never reduced — at extreme section counts even the
+        # zero-preview TOC may exceed the budget, which is accepted by design
+        # (the manager exempts SELECTIVE from the ratio guard because the agent
+        # retrieves full content via stm_proxy_select_chunks).
+        lo, hi, best = 0, self._MAX_PREVIEW, build(0)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = build(mid)
+            if len(candidate) <= max_chars:
+                best, lo = candidate, mid + 1
+            else:
+                hi = mid - 1
+        return best
 
     def select(self, key: str, sections: list[str]) -> str:
         self._store.evict_expired(self._ttl)

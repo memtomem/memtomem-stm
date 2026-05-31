@@ -21,18 +21,27 @@ import json
 from memtomem_stm.proxy.compression import SelectiveCompressor
 
 
-def _doc(n_sections: int) -> str:
+def _doc(n_sections: int, body: int = 4) -> str:
     return "\n\n".join(
-        f"## Section number {i} heading\n\n" + ("lorem ipsum dolor sit amet " * 4)
+        f"## Section number {i} heading\n\n" + ("lorem ipsum dolor sit amet " * body)
         for i in range(n_sections)
     )
 
 
 def test_many_section_toc_honors_budget() -> None:
-    """A 50-section doc must produce a within-budget, valid-JSON TOC that still
-    lists every section — the standalone-path overflow the fix targets."""
+    """A 50-section doc honors the budget by shrinking previews while still
+    listing every section — the standalone-path overflow the fix targets.
+
+    The budgets below sit inside the window where shrinking actually applies:
+    above the structural floor (~5.3k — the zero-preview, 50-entry key/type/size
+    scaffold, never dropped because the two-phase index needs every key) and
+    below the raw doc length (~7k — at/above which ``compress`` passes the raw
+    text through and never builds a TOC). The sub-floor regime (even empty
+    previews overflow) is the documented trade-off pinned by
+    ``test_tight_budget_keeps_entries_over_strict_fit``.
+    """
     doc = _doc(50)
-    for budget in (4000, 1000, 600, 300, 150):
+    for budget in (6900, 6500, 6000, 5500):
         out = SelectiveCompressor().compress(doc, max_chars=budget)
         parsed = json.loads(out)  # valid JSON
         assert len(out) <= budget, f"@{budget}: produced {len(out)} (+{len(out) - budget})"
@@ -62,11 +71,16 @@ def test_select_resolves_section_omitted_from_preview() -> None:
 
 def test_preview_unchanged_when_full_toc_fits() -> None:
     """When the full 80-char-preview TOC already fits the budget, previews are
-    NOT shrunk — backward-compatible output for the common small-doc case."""
-    doc = _doc(3)
-    generous = SelectiveCompressor().compress(doc, max_chars=100_000)
-    parsed = json.loads(generous)
-    # A non-inline section keeps the full 80-char preview.
+    NOT shrunk — backward-compatible output for the common case.
+
+    The doc must exceed the budget (else ``compress`` passes the raw text
+    through untouched) while the full-preview TOC fits under it, so the sections
+    carry long bodies: doc ~3.3k, full TOC ~0.8k, budget 2k sits between.
+    """
+    doc = _doc(3, body=40)
+    out = SelectiveCompressor().compress(doc, max_chars=2000)
+    parsed = json.loads(out)
+    # A non-inline section keeps the full 80-char preview (no shrink applied).
     long_entries = [e for e in parsed["entries"] if not e["inline"]]
     assert long_entries, "fixture should have at least one long section"
     assert any(len(e["preview"]) == 80 for e in long_entries)
