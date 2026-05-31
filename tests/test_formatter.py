@@ -36,6 +36,12 @@ class FakeResult:
     score: float
 
 
+def _preview_line_after_bucket(output: str, bucket: str = "related") -> str:
+    marker = f"[{bucket}]: "
+    idx = output.index(marker) + len(marker)
+    return output[idx:].split("\n", 1)[0]
+
+
 class TestFormatterInjection:
     def test_prepend_mode(self):
         fmt = SurfacingFormatter(SurfacingConfig(injection_mode="prepend"))
@@ -72,7 +78,98 @@ class TestFormatterInjection:
         output = fmt.inject("response", results, "query")
         assert "deploy.md" in output
         assert "[work]" in output
-        assert "0.42" in output
+        assert "[related]" in output
+        assert "score=" not in output
+        assert "0.42" not in output
+
+    def test_relevance_bucket_labels_replace_raw_scores(self):
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [
+            FakeResult(FakeChunk(content="near floor"), 0.04),
+            FakeResult(FakeChunk(content="middle band"), 0.50),
+            FakeResult(FakeChunk(content="top band"), 0.95),
+        ]
+        output = fmt.inject("response", results, "query")
+        assert "- **notes/test.md** [default] [weak]: near floor" in output
+        assert "- **notes/test.md** [default] [related]: middle band" in output
+        assert "- **notes/test.md** [default] [strong]: top band" in output
+        assert "score=" not in output
+        assert "0.04" not in output
+        assert "0.50" not in output
+        assert "0.95" not in output
+
+    def test_relevance_bucket_boundaries_follow_min_score(self):
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.4))
+        results = [
+            FakeResult(FakeChunk(content="custom weak"), 0.55),
+            FakeResult(FakeChunk(content="custom related"), 0.70),
+            FakeResult(FakeChunk(content="custom strong"), 0.90),
+        ]
+        output = fmt.inject("response", results, "query")
+        assert "- **notes/test.md** [default] [weak]: custom weak" in output
+        assert "- **notes/test.md** [default] [related]: custom related" in output
+        assert "- **notes/test.md** [default] [strong]: custom strong" in output
+
+    def test_relevance_bucket_uses_active_score_floor_when_provided(self):
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.03))
+        results = [FakeResult(FakeChunk(content="near active floor"), 0.70)]
+
+        output = fmt.inject("response", results, "query", score_floor=0.6)
+
+        assert "- **notes/test.md** [default] [weak]: near active floor" in output
+        assert "[strong]" not in output
+
+    def test_source_renders_parent_and_basename(self):
+        fmt = SurfacingFormatter(SurfacingConfig())
+        chunk = FakeChunk(content="ambiguous auth note")
+        chunk.metadata = FakeChunkMeta(
+            source_file=Path("/notes/2026-q1/auth.md"),
+            namespace="default",
+        )
+        results = [FakeResult(chunk, 0.42)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "**2026-q1/auth.md**" in output
+        assert "**auth.md**" not in output
+        assert "notes/2026-q1/auth.md" not in output
+
+    def test_top_level_source_renders_basename_only(self):
+        fmt = SurfacingFormatter(SurfacingConfig())
+        chunk = FakeChunk(content="top level auth note")
+        chunk.metadata = FakeChunkMeta(source_file=Path("/auth.md"), namespace="default")
+        results = [FakeResult(chunk, 0.42)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "**auth.md**" in output
+        assert "**/auth.md**" not in output
+
+    def test_default_namespace_none_renders_default_badge(self):
+        fmt = SurfacingFormatter(SurfacingConfig(default_namespace=None))
+        results = [FakeResult(FakeChunk(), 0.5)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "[default]" in output
+
+    def test_configured_default_namespace_suppresses_matching_badge(self):
+        fmt = SurfacingFormatter(SurfacingConfig(default_namespace="work"))
+        chunk = FakeChunk(content="work namespace note")
+        chunk.metadata = FakeChunkMeta(source_file=Path("/notes/work.md"), namespace="work")
+        results = [FakeResult(chunk, 0.5)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "[work]" not in output
+
+    def test_configured_default_namespace_keeps_other_badges(self):
+        fmt = SurfacingFormatter(SurfacingConfig(default_namespace="work"))
+        results = [FakeResult(FakeChunk(), 0.5)]
+
+        output = fmt.inject("response", results, "query")
+
+        assert "[default]" in output
 
     def test_surfacing_id_included(self):
         fmt = SurfacingFormatter(SurfacingConfig())
@@ -231,10 +328,8 @@ class TestPreviewMaxCharsKnob:
         long_content = "a" * 800
         results = [FakeResult(FakeChunk(content=long_content), 0.5)]
         output = fmt.inject("response", results, "query")
-        # The preview is the slice that follows the "score=X.XX): " marker
-        marker = "score=0.50): "
-        idx = output.index(marker) + len(marker)
-        preview_line = output[idx:].split("\n", 1)[0]
+        # The preview is the slice that follows the relevance bucket marker.
+        preview_line = _preview_line_after_bucket(output)
         assert len(preview_line) <= 300
         assert "a" * 250 in preview_line  # well within the cap
 
@@ -242,9 +337,7 @@ class TestPreviewMaxCharsKnob:
         fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=50))
         results = [FakeResult(FakeChunk(content="b" * 800), 0.5)]
         output = fmt.inject("response", results, "query")
-        marker = "score=0.50): "
-        idx = output.index(marker) + len(marker)
-        preview_line = output[idx:].split("\n", 1)[0]
+        preview_line = _preview_line_after_bucket(output)
         assert len(preview_line) <= 50
         # Tighter check: exactly 50 'b's then nothing more on that line
         assert preview_line.startswith("b" * 50)
@@ -254,9 +347,7 @@ class TestPreviewMaxCharsKnob:
         fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=600, max_injection_chars=10000))
         results = [FakeResult(FakeChunk(content="c" * 800), 0.5)]
         output = fmt.inject("response", results, "query")
-        marker = "score=0.50): "
-        idx = output.index(marker) + len(marker)
-        preview_line = output[idx:].split("\n", 1)[0]
+        preview_line = _preview_line_after_bucket(output)
         assert len(preview_line) >= 600
         assert "c" * 600 in preview_line
 
@@ -292,9 +383,7 @@ class TestPreviewMaxCharsKnob:
         )
         fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=50))
         output = fmt.inject("response", [result], "query")
-        marker = "score=0.50): "
-        idx = output.index(marker) + len(marker)
-        preview_line = output[idx:].split("\n", 1)[0]
+        preview_line = _preview_line_after_bucket(output)
         assert len(preview_line) <= 50, (
             f"preview_max_chars=50 must bound the assembled preview, "
             f"got len={len(preview_line)}: {preview_line!r}"
@@ -336,9 +425,7 @@ class TestPreviewMaxCharsKnob:
         )
         fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=300))
         output = fmt.inject("response", [result], "query")
-        marker = "score=0.50): "
-        idx = output.index(marker) + len(marker)
-        preview_line = output[idx:].split("\n", 1)[0]
+        preview_line = _preview_line_after_bucket(output)
         assert len(preview_line) <= 300
         assert "m" * 80 in preview_line  # full chunk fits
         assert "b" in preview_line  # window_before included
@@ -373,9 +460,7 @@ class TestPreviewMaxCharsKnob:
         )
         fmt = SurfacingFormatter(SurfacingConfig(preview_max_chars=20))
         output = fmt.inject("response", [result], "query")
-        marker = "score=0.50): "
-        idx = output.index(marker) + len(marker)
-        preview_line = output[idx:].split("\n", 1)[0]
+        preview_line = _preview_line_after_bucket(output)
         assert preview_line == "m" * 20, (
             f"tiny cap must yield chunk-only preview, got: {preview_line!r}"
         )

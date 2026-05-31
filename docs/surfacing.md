@@ -57,10 +57,12 @@ When memories are found, they're wrapped in `<surfaced-memories>` XML tags and i
 _surfacing_id: abc123def456_
 > Rate (one of "helpful" | "partially_helpful" | "not_relevant" | "already_known"): `stm_surfacing_feedback(surfacing_id="abc123def456", rating="helpful")`
 
-- **auth_notes.md** [code-notes] (score=0.85): OAuth2 implementation uses PKCE flow...
-- **api_design.md** (score=0.72): Rate limiting is handled by middleware in...
+- **notes/auth_notes.md** [code-notes] [strong]: OAuth2 implementation uses PKCE flow...
+- **design/api_design.md** [default] [related]: Rate limiting is handled by middleware in...
 </surfaced-memories>
 ```
+
+Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. Exact raw-score distributions remain available through `stm_surfacing_stats`.
 
 The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
 
@@ -91,6 +93,11 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
+| `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
+| `ltm_mcp_command` | `memtomem-server` | Command used when `ltm_mcp_transport=stdio` |
+| `ltm_mcp_args` | `[]` | Args passed to the stdio LTM command |
+| `ltm_mcp_url` | `""` | Required endpoint when `ltm_mcp_transport` is `sse` or `streamable_http` |
+| `ltm_mcp_headers` | `null` | Optional static headers for network LTM transports |
 | `cache_ttl_seconds` | `60.0` | Internal surfacing result cache TTL |
 | `circuit_max_failures` | `3` | Consecutive failures before circuit breaker opens |
 | `circuit_reset_seconds` | `60.0` | Seconds before half-open probe after circuit opens |
@@ -186,10 +193,16 @@ STM connects to the LTM exclusively over the MCP protocol. The surfacing engine 
 
 ```bash
 # Default — spawns `memtomem-server` as a child process
+export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=stdio
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=memtomem-server
 
 # Pass extra arguments if needed (e.g. point at a custom config)
 export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--config","/etc/memtomem.json"]'
+
+# Or connect to a long-running network MCP service
+export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=sse
+export MEMTOMEM_STM_SURFACING__LTM_MCP_URL=https://ltm.example/sse
+export MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS='{"Authorization":"Bearer ..."}'
 ```
 
 This makes memtomem reachable over the same MCP protocol boundary STM uses for other upstreams. Unlike a generic proxied upstream, LTM responses bypass the compression / cache pipeline — they are consumed by STM's surfacing engine (via `McpClientSearchAdapter`, see `src/memtomem_stm/surfacing/mcp_client.py`) to compose context for upstream calls, rather than being passed through to the caller. A memtomem crash never takes down STM's other upstream connections.

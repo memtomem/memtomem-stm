@@ -116,8 +116,14 @@ export MEMTOMEM_STM_SURFACING__DEDUP_TTL_SECONDS=604800    # 7 days; 0 to disabl
 export MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH=~/.memtomem/stm_feedback.db
 
 # LTM connection (defaults shown)
+export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=stdio
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=memtomem-server
 export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--config","/etc/memtomem.json"]'
+
+# Network LTM service instead of stdio
+export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=streamable_http
+export MEMTOMEM_STM_SURFACING__LTM_MCP_URL=https://ltm.example/mcp
+export MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS='{"Authorization":"Bearer ..."}'
 ```
 
 See [Surfacing → Surfacing Controls](surfacing.md#surfacing-controls) for the complete table of fields and defaults.
