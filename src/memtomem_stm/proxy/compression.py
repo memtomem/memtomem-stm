@@ -739,7 +739,7 @@ class SelectiveCompressor:
                     text, max_chars=max_chars, context_query=context_query
                 )
 
-        return self._store_and_build_toc(text, fmt, chunks, context_query)
+        return self._store_and_build_toc(text, fmt, chunks, context_query, max_chars=max_chars)
 
     def compress_full_toc(
         self, text: str, *, max_chars: int, context_query: str | None = None
