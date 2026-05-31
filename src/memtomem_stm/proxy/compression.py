@@ -1795,75 +1795,83 @@ class SkeletonCompressor:
 
         Replaces the old ``result[:max_chars]`` slice, which dropped trailing
         headings, cut a heading mid-line, and truncated the footer — violating
-        the class's "every heading survives" contract. Degradation order:
+        the class's "every heading survives" contract. The footer is metadata,
+        secondary to heading preservation, so it is best-effort (appended only
+        when it still fits); the omission marker — the only piece carrying the
+        heading-drop accounting — is reserved with a constant width so the
+        kept-heading count is monotonic in the budget (a shrinking budget never
+        frees reserved bytes for *more* headings).
 
-        * **Tier 2** — every heading fits beside the footer: keep all headings
-          and refill body lines (relevance-weighted via ``budgets``) up to the
-          budget. No heading is dropped or cut.
-        * **Tier 3** — even the bare heading lines overflow: keep the longest
-          prefix of WHOLE heading lines and record the rest in a
-          ``... (N of M sections omitted)`` marker — the "all-headings
-          invariant yields to budget" analog of SchemaPruning/FieldExtract.
-        * **Floor** — a budget too small for even one heading + marker + footer
-          (below anything the retention ladder produces): a last-resort hard
-          slice, mirroring ``TruncateCompressor._fit_with_footer``.
+        * **All headings fit** (``all_headings_len <= max_chars``): keep every
+          heading (the primary contract), refill body lines up to the budget,
+          and append the footer only if it still fits.
+        * **Partial** (the bare heading lines overflow): keep the longest prefix
+          of WHOLE heading lines — reserving room for the ``... (N of M sections
+          omitted)`` marker but NOT the footer — then append the marker, and the
+          footer too if it additionally fits.
+        * **Floor** — a budget below one heading + marker: the whole first
+          heading when it fits, else a last-resort hard slice (mirroring
+          ``TruncateCompressor._fit_with_footer``). Below a single heading's
+          width is a budget the retention ladder never produces.
 
-        The footer/marker are never sliced; the result is always
-        ``<= max(0, max_chars)``. Reserves use their widest possible width
-        (footer with all body trimmed, marker with max-digit counts), so the
-        actual — never wider — fits by construction.
+        Reserves use their widest possible width (footer with all body trimmed,
+        marker with max-digit counts), so the actual — never wider — fits and
+        ``len(output) <= max(0, max_chars)`` holds by construction.
         """
         headings = [heading for heading, _ in sections]
         sep = "\n\n"
         footer_reserve = len(self._footer(text_len, total_body_chars, num_headings))
         marker_reserve = len(self._omitted_marker(num_headings, num_headings))
-
         all_headings_len = sum(len(h) for h in headings) + len(sep) * (num_headings - 1)
 
-        # Tier 2: all headings fit — keep them, refill bodies up to the budget.
-        if all_headings_len + footer_reserve <= max_chars:
+        # All headings fit: keep every one (heading preservation outranks the
+        # metadata footer). Refill bodies up to the budget; the footer is
+        # best-effort. Reserve footer room while filling only if it can fit at
+        # all — otherwise fill to the raw budget and drop the footer.
+        if all_headings_len <= max_chars:
+            reserve = footer_reserve if all_headings_len + footer_reserve <= max_chars else 0
             kept_lines: list[list[str]] = [[h] for h in headings]
             kept_chars = [len(h) for h in headings]
             running = all_headings_len
-            body_trimmed = total_body_chars
             for idx, (_heading, body_lines) in enumerate(sections):
                 budget = budgets[idx]
                 for line in body_lines:
-                    # Honor both the per-section relevance budget and the global
-                    # budget (gated on the widest footer) so no heading is lost.
+                    # Honor both the per-section budget and the global budget.
                     if kept_chars[idx] + len(line) + 1 > budget:
                         break
-                    if running + len(line) + 1 + footer_reserve > max_chars:
+                    if running + len(line) + 1 + reserve > max_chars:
                         break
                     kept_lines[idx].append(line)
                     kept_chars[idx] += len(line) + 1
                     running += len(line) + 1
-                    body_trimmed -= len(line)
+            # Same per-section accounting as the fits-case build above
+            # (``kept_chars[idx] - len(heading)`` counts each kept body line's
+            # joining newline), so body_trimmed_chars is identical across paths.
+            body_trimmed = sum(
+                max(0, sum(len(ln) for ln in body_lines) - (kept_chars[idx] - len(headings[idx])))
+                for idx, (_heading, body_lines) in enumerate(sections)
+            )
             body = sep.join("\n".join(lines) for lines in kept_lines)
-            return body + self._footer(text_len, body_trimmed, num_headings)
+            footer = self._footer(text_len, body_trimmed, num_headings)
+            return body + footer if running + len(footer) <= max_chars else body
 
-        # Tier 3: keep the longest whole-heading prefix beside marker + footer.
-        kept = self._heading_prefix(headings, sep, max_chars, marker_reserve + footer_reserve)
-        if kept >= 1:
-            body = sep.join(headings[:kept])
-            marker = self._omitted_marker(num_headings - kept, num_headings)
-            return body + marker + self._footer(text_len, total_body_chars, num_headings)
-
-        # Floor A: the footer no longer fits, but the omission marker still does
-        # — keep the marker so the truncation stays visible (and the kept-heading
-        # count stays monotonic as the budget shrinks).
+        # Partial: keep the longest whole-heading prefix, reserving room ONLY for
+        # the omission marker (a constant, budget-independent reserve, so the
+        # kept-heading count never rises as the budget falls). Append the marker,
+        # then the footer too if it additionally fits.
         kept = self._heading_prefix(headings, sep, max_chars, marker_reserve)
         if kept >= 1:
-            return sep.join(headings[:kept]) + self._omitted_marker(
+            out = sep.join(headings[:kept]) + self._omitted_marker(
                 num_headings - kept, num_headings
             )
+            footer = self._footer(text_len, total_body_chars, num_headings)
+            if len(out) + len(footer) <= max_chars:
+                out += footer
+            return out
 
-        # Floor B: not even the marker fits. Keep the longest WHOLE-heading
-        # prefix that fits the raw budget (still no mid-cut); hard-slice only
-        # when not even one heading fits — below anything the ladder produces.
-        kept = self._heading_prefix(headings, sep, max_chars, 0)
-        if kept >= 1:
-            return sep.join(headings[:kept])
+        # Floor: not even one heading + marker fits. ``headings[0][:max_chars]``
+        # is the whole first heading when it fits, and a hard slice only below a
+        # single heading's width — a budget the retention ladder never produces.
         return (headings[0] if headings else "")[: max(0, max_chars)]
 
 

@@ -10,22 +10,25 @@ last heading mid-line, and (c) sliced away the ``(skeleton — …)`` footer —
 violations of the documented invariant. An 80-section doc at a routine 2000-char
 budget already lost the footer and mid-cut a heading.
 
-This file is the regression net. The final tier now degrades gracefully:
+This file is the regression net. The final tier now degrades gracefully, with
+heading preservation ranked above the metadata footer:
 
-1. **Tier 2** — every heading fits beside the footer: keep all headings and
-   refill body lines (relevance-weighted) up to the budget.
-2. **Tier 3** — the bare heading lines overflow: keep the longest WHOLE-heading
-   prefix and record the rest in a ``... (N of M sections omitted)`` marker.
-3. **Floor** — a budget too small for even one heading + marker + footer: keep
-   the longest whole-heading prefix (still no mid-cut). A hard slice happens
-   only below the width of a single heading — a budget the retention ladder
-   never produces.
+1. **All headings fit** (``all_headings_len <= max_chars``): keep every heading,
+   refill body lines up to the budget, and append the footer only if it fits.
+2. **Partial** (the bare heading lines overflow): keep the longest WHOLE-heading
+   prefix, reserving room for a ``... (N of M sections omitted)`` marker (never
+   for the footer, so the kept-heading count stays monotonic in the budget);
+   append the footer too if it additionally fits.
+3. **Floor** — a budget below one heading + marker: the whole first heading when
+   it fits, else a hard slice only below a single heading's width — a budget the
+   retention ladder never produces.
 
 Invariants asserted for every fixture × budget: ``len(out) <= max(0, budget)``;
-no heading line is ever cut mid-way (above the single-heading floor); the footer
-survives whenever it fits; and every dropped section is accounted for in the
-marker. Byte-identity with the pre-query path is preserved in the degraded
-tiers, mirroring ``tests/test_query_aware_structural.py``.
+no heading line is ever cut mid-way (above the single-heading floor); the
+kept-heading count is monotonic non-increasing as the budget shrinks; the footer
+survives whenever it fits and its counts are accurate; and every dropped section
+is accounted for in the marker. Byte-identity with the pre-query path is
+preserved in the degraded path, mirroring ``tests/test_query_aware_structural.py``.
 """
 
 from __future__ import annotations
@@ -41,6 +44,55 @@ _HEADING_RE = re.compile(r"^#{1,6}\s.+$", re.MULTILINE)
 
 def _headings(text: str) -> list[str]:
     return _HEADING_RE.findall(text)
+
+
+def _is_heading(line: str) -> bool:
+    return bool(_HEADING_RE.match(line))
+
+
+def _doc_body_chars(doc: str) -> int:
+    """Total body chars = non-empty, non-heading lines (the compressor's
+    ``body_lines`` definition), computed INDEPENDENTLY of the compressor so a
+    refill-accounting regression cannot hide behind shared logic."""
+    return sum(len(ln) for ln in doc.split("\n") if ln.strip() and not _is_heading(ln))
+
+
+def _out_body_chars(out: str) -> int:
+    """Body chars in a compressor output: non-empty lines that are neither a
+    heading nor the footer / omission marker."""
+    total = 0
+    for ln in out.split("\n"):
+        s = ln.strip()
+        if not s or _is_heading(ln) or s.startswith("(skeleton —") or s.startswith("... ("):
+            continue
+        total += len(ln)
+    return total
+
+
+def _build_body_trimmed(doc: str, out: str) -> int:
+    """Replicate the compressor's documented body_trimmed metric independently:
+    per kept section, ``max(0, original_body_chars − kept_body_chars)`` where
+    kept_body_chars counts each kept body line's length PLUS its joining newline
+    (the compressor's established convention). Catches a refill-accounting
+    regression without reusing the compressor's own computation."""
+    orig: dict[str, int] = {}
+    cur: str | None = None
+    for ln in doc.split("\n"):
+        if _is_heading(ln):
+            cur = ln
+            orig[cur] = 0
+        elif ln.strip() and cur is not None:
+            orig[cur] += len(ln)
+    kept: dict[str, int] = {}
+    cur = None
+    for ln in out.split("\n"):
+        s = ln.strip()
+        if _is_heading(ln):
+            cur = ln
+            kept[cur] = 0
+        elif s and cur is not None and not s.startswith(("(skeleton —", "... (")):
+            kept[cur] += len(ln) + 1
+    return sum(max(0, orig[h] - kept.get(h, 0)) for h in orig)
 
 
 # ── Fixtures, one per tier ───────────────────────────────────────────────────
@@ -119,17 +171,27 @@ def test_no_heading_is_cut_mid_line(name: str, budget: int) -> None:
         assert h in original, f"{name}@{budget}: mid-cut heading {h!r}"
 
 
-# Only the large fixtures actually overflow these budgets; the tiny ones
-# (headings_only, one_giant_heading) pass through unchanged with no footer.
-_COMPRESSED_FIXTURES = ["few_rich_sections", "many_short_headings"]
+# (fixture, budget) pairs where the budget comfortably exceeds all headings +
+# the footer, so the (best-effort) footer is genuinely present. few_rich_sections
+# has 4 short headings → footer fits at every budget here; many_short_headings
+# (80 headings, ~2068 bytes of bare headings) only leaves footer room well above
+# that. In the partial regime the footer is intentionally dropped to keep
+# headings (see test_marker_survives_when_footer_does_not).
+_FOOTER_PRESENT_CASES = [
+    ("few_rich_sections", 4000),
+    ("few_rich_sections", 2000),
+    ("few_rich_sections", 800),
+    ("few_rich_sections", 500),
+    ("many_short_headings", 4000),
+    ("many_short_headings", 3000),
+]
 
 
-@pytest.mark.parametrize("name", _COMPRESSED_FIXTURES)
-@pytest.mark.parametrize("budget", [4000, 2000, 800, 500])
+@pytest.mark.parametrize("name,budget", _FOOTER_PRESENT_CASES)
 def test_footer_present_when_budget_is_roomy(name: str, budget: int) -> None:
-    """Invariant C: the ``(skeleton — …)`` footer survives at every non-floor
-    budget where the payload is actually compressed. Pre-fix the slice dropped
-    it whenever the body overflowed."""
+    """Invariant C: the ``(skeleton — …)`` footer survives when the budget
+    comfortably fits all headings plus the footer. Pre-fix the slice dropped it
+    whenever the body overflowed."""
     out = SkeletonCompressor().compress(_FIXTURES[name], max_chars=budget)
     assert out != _FIXTURES[name]  # genuinely compressed, not passthrough
     assert "sections)" in out and "body_trimmed_chars" in out
@@ -149,20 +211,35 @@ def test_all_headings_survive_when_they_fit(budget: int) -> None:
         assert h in out, f"heading dropped at budget {budget}: {h!r}"
 
 
-@pytest.mark.parametrize("budget", [1500, 1000, 700, 500, 300])
-def test_dropped_sections_are_accounted_for_in_the_marker(budget: int) -> None:
-    """Tier 3: kept headings + the marker's omitted-count reconcile to the total
-    (no off-by-one), and the marker's total equals the footer's section count."""
-    doc = _many_short_headings(80)
+@pytest.mark.parametrize(
+    "doc,total,budget",
+    [
+        (_many_short_headings(80), 80, 1500),
+        (_many_short_headings(80), 80, 1000),
+        (_many_short_headings(80), 80, 700),
+        (_many_short_headings(80), 80, 500),
+        (_many_short_headings(80), 80, 300),
+        (_headings_only(40), 40, 400),
+        (_headings_only(40), 40, 200),
+        (_headings_only(40), 40, 120),
+    ],
+)
+def test_dropped_sections_are_accounted_for_in_the_marker(
+    doc: str, total: int, budget: int
+) -> None:
+    """Partial tier: kept headings + the marker's omitted-count reconcile to the
+    total (no off-by-one), across multiple fixtures. When the (best-effort)
+    footer is also present, its section count must equal the same total."""
     out = SkeletonCompressor().compress(doc, max_chars=budget)
     m = re.search(r"\.\.\. \((\d+) of (\d+) sections omitted\)", out)
     assert m, f"expected an omission marker at budget {budget}"
-    omitted, total = int(m.group(1)), int(m.group(2))
+    omitted, marker_total = int(m.group(1)), int(m.group(2))
     kept = len(_headings(out))
-    assert kept + omitted == total == 80
+    assert kept + omitted == marker_total == total
     assert omitted > 0 and kept > 0
     footer = re.search(r"(\d+) sections\)", out)
-    assert footer and int(footer.group(1)) == total
+    if footer:  # footer is best-effort in the partial regime
+        assert int(footer.group(1)) == total
 
 
 def test_headings_are_an_order_preserving_prefix_in_tier3() -> None:
@@ -171,6 +248,28 @@ def test_headings_are_an_order_preserving_prefix_in_tier3() -> None:
     out = SkeletonCompressor().compress(doc, max_chars=600)
     kept = _headings(out)
     assert kept == _headings(doc)[: len(kept)]
+
+
+@pytest.mark.parametrize(
+    "doc", [_many_short_headings(80), _few_rich_sections(), _headings_only(40)]
+)
+def test_kept_heading_count_is_monotonic_in_budget(doc: str) -> None:
+    """A SMALLER budget must never surface MORE headings. The pre-review code
+    reserved different amounts across tier boundaries (marker+footer in Tier 3,
+    marker-only in Floor A, nothing in Floor B), so dropping a reserve at a
+    lower budget freed space for EXTRA headings — a smaller budget literally
+    showed more sections. Sweep every budget descending and assert the kept
+    count is non-increasing (and never over budget)."""
+    prev_kept = None
+    for budget in range(2200, 9, -1):
+        out = SkeletonCompressor().compress(doc, max_chars=budget)
+        assert len(out) <= budget, f"over budget at {budget}: {len(out)} chars"
+        kept = len(_headings(out))
+        if prev_kept is not None:
+            assert kept <= prev_kept, (
+                f"non-monotonic: budget {budget} kept {kept} > budget {budget + 1} kept {prev_kept}"
+            )
+        prev_kept = kept
 
 
 # ── C. Byte-identity with the pre-query path (load-bearing) ──────────────────
@@ -213,6 +312,34 @@ def test_passthrough_when_input_fits() -> None:
     assert SkeletonCompressor().compress(doc, max_chars=10_000) == doc
 
 
+@pytest.mark.parametrize(
+    "doc,budget,n",
+    [
+        (_few_rich_sections(), 3000, 4),  # fits-case build path
+        (_many_short_headings(80), 3000, 80),  # CASE-A degraded path (overflow)
+    ],
+)
+def test_footer_format_is_byte_exact_and_count_is_accurate(doc: str, budget: int, n: int) -> None:
+    """Pin the footer's literal byte format (so a format regression fails) AND
+    independently verify body_trimmed_chars (so a refill-accounting regression
+    cannot pass silently) — for BOTH the fits-case build and the degraded
+    all-headings path, which must agree on the metric."""
+    out = SkeletonCompressor().compress(doc, max_chars=budget)
+    assert "sections omitted" not in out  # every heading kept → no marker
+    assert len(_headings(out)) == n  # all headings present
+    m = re.search(r"(\d+) chars original, (\d+) body_trimmed_chars, (\d+) sections\)$", out)
+    assert m, "footer missing or malformed"
+    orig, trimmed, sections = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    # literal byte format: reconstructing it from the parsed numbers must match
+    assert out.endswith(
+        f"\n(skeleton — {orig} chars original, {trimmed} body_trimmed_chars, {sections} sections)"
+    )
+    assert orig == len(doc)
+    assert sections == n
+    assert trimmed == _build_body_trimmed(doc, out)
+    assert trimmed > 0
+
+
 # ── D. Tier 3 packs whole headings without wasteful gaps ─────────────────────
 
 
@@ -252,6 +379,19 @@ def test_floor_keeps_whole_headings_without_mid_cut() -> None:
 def test_one_giant_heading_degrades_within_budget() -> None:
     out = SkeletonCompressor().compress(_one_giant_heading(), max_chars=50)
     assert len(out) <= 50  # no crash, budget held
+
+
+@pytest.mark.parametrize("budget", [150, 100, 50])
+def test_hard_slice_below_single_heading_width(budget: int) -> None:
+    """When the budget is below the first heading's width, the documented last
+    resort is a hard slice of that heading — pin its exact shape (a prefix of
+    the first heading) so the floor contract is not silently changed. The first
+    heading of _one_giant_heading is ~203 chars, so all these budgets hit it."""
+    doc = _one_giant_heading()
+    first = _headings(doc)[0]
+    assert budget < len(first)  # guard: these budgets are genuinely sub-heading
+    out = SkeletonCompressor().compress(doc, max_chars=budget)
+    assert out == first[:budget]
 
 
 def test_marker_survives_when_footer_does_not() -> None:
