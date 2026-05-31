@@ -187,14 +187,21 @@ def test_scalar_string_is_valid_and_within_budget(budget: int) -> None:
 
 
 @pytest.mark.parametrize("literal", ["true", "false", "null", "12345", "-98765", "3.14159"])
-@pytest.mark.parametrize("budget", [2, 3, 4])
-def test_non_string_scalar_root_is_not_corrupted(literal: str, budget: int) -> None:
-    """A bare scalar root that can't be shortened is emitted verbatim, never
-    silently rewritten to a different value. (The first cut floored every
-    overflowing scalar to "null", turning ``true``/``42`` into ``null`` even
-    within budget — a value corruption.)"""
-    out = FieldExtractCompressor().compress(literal, max_chars=budget)
-    assert json.loads(out) == json.loads(literal), f"{literal}@{budget} -> {out!r} (corrupted)"
+def test_non_string_scalar_root_verbatim_when_it_fits(literal: str) -> None:
+    """A bare scalar root that fits the budget is emitted VERBATIM, never
+    rewritten to a different value. (The first cut floored every overflowing
+    scalar to "null", turning ``true``/``42`` into ``null`` — value corruption.)"""
+    out = FieldExtractCompressor().compress(literal, max_chars=len(literal))
+    assert json.loads(out) == json.loads(literal), f"{literal} -> {out!r} (corrupted)"
+
+
+def test_huge_scalar_root_stays_within_budget() -> None:
+    """A scalar literal longer than the budget (e.g. a 1000-digit number) is
+    bounded — max_chars is a hard token budget — by degrading to a truncated
+    string, never emitted verbatim over budget."""
+    out = FieldExtractCompressor().compress("1" * 1000, max_chars=100)
+    json.loads(out)
+    assert len(out) <= 100
 
 
 # ── G. Adversarial-review regressions ─────────────────────────────────────────

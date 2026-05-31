@@ -1186,10 +1186,16 @@ class FieldExtractCompressor:
             items = list(data.items())
             skeleton = {k: self._stub_value(v) for k, v in items}
             if len(dump(skeleton)) <= max_chars:
-                # Enrich each key in order; leading keys grab budget first, all
-                # keys stay at least as their stub.
+                # Enrich keys to fill the budget, but enrich SCALARS before
+                # collections (mirrors _extract_dict's scalar-first ordering):
+                # cheap, high-value scalar fields (ids, names, flags) must
+                # survive a tight budget even when large nested sections precede
+                # them in document order. The output dict keeps the original key
+                # order — only the enrichment *priority* is reordered.
                 out = dict(skeleton)
-                for k, v in items:
+                scalars = [(k, v) for k, v in items if not isinstance(v, (dict, list))]
+                collections = [(k, v) for k, v in items if isinstance(v, (dict, list))]
+                for k, v in scalars + collections:
                     lo, hi, best_v = 0, len(dump(v)), out[k]
                     while lo <= hi:
                         mid = (lo + hi) // 2
@@ -1241,12 +1247,22 @@ class FieldExtractCompressor:
                 if len(candidate) <= max_chars:
                     return candidate
             return '""'
-        # Non-string scalar root (number / bool / null): no shorter valid-JSON
-        # token preserves the value, so emit it verbatim rather than corrupt it
-        # to a within-budget literal (the old ``else "null"`` turned ``true`` /
-        # ``42`` into ``null``). The result is irreducible: it can exceed a
-        # sub-token budget the manager retention ladder never actually produces.
-        return json.dumps(data, ensure_ascii=False)
+        # Non-string scalar root (number / bool / null). Emit it verbatim when
+        # it fits — the old ``else "null"`` corrupted ``true`` / ``42`` to
+        # ``null`` even within budget. When the literal itself exceeds the budget
+        # (e.g. a 1000-digit number), no shorter literal PRESERVES the value, so
+        # degrade to a truncated STRING of the literal: valid JSON, WITHIN budget
+        # (max_chars is a hard token budget downstream relies on), and visibly
+        # truncated — never a silently-wrong number. (Sub-literal budgets like
+        # this are never produced by the manager retention ladder.)
+        literal = json.dumps(data, ensure_ascii=False)
+        if len(literal) <= max_chars:
+            return literal
+        for k in range(len(literal), -1, -1):
+            candidate = json.dumps(literal[:k], ensure_ascii=False)
+            if len(candidate) <= max_chars:
+                return candidate
+        return '""'
 
     def _compress_text(self, text: str, max_chars: int) -> str:
         lines = text.split("\n")
