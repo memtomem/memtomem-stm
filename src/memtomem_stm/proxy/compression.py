@@ -960,24 +960,37 @@ class FieldExtractCompressor:
 
     def _compress_json(self, data: object, max_chars: int) -> str:
         if isinstance(data, dict):
-            summary = self._extract_dict(data, max_chars)
-            result = json.dumps(summary, ensure_ascii=False, indent=2)
+            preview: object = self._extract_dict(data, max_chars)
         elif isinstance(data, list):
-            preview_n = min(5, len(data))
-            preview: list[object] = []
-            for item in data[:preview_n]:
-                if isinstance(item, dict):
-                    preview.append(self._preview_dict(item))
-                else:
-                    preview.append(item)
-            result = json.dumps(preview, ensure_ascii=False, indent=2)
-            if len(data) > preview_n:
-                result += f"\n... ({len(data)} items total, showing first {preview_n})"
+            preview = self._preview_list(data)
         else:
-            result = json.dumps(data, ensure_ascii=False)
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (truncated)"
-        return result
+            preview = data
+        indent = 2 if isinstance(data, (dict, list)) else None
+        result = json.dumps(preview, ensure_ascii=False, indent=indent)
+        if len(result) <= max_chars:
+            return result
+        # Final tier: emit VALID JSON within budget. The old
+        # ``result[:max_chars] + "\n... (truncated)"`` overshot the budget by the
+        # suffix length AND cut the JSON mid-token (invalid output); a top-level
+        # array additionally appended a non-JSON text marker. ``_fit_extracted``
+        # re-derives a valid, within-budget form from the original data.
+        return self._fit_extracted(data, max_chars)
+
+    def _preview_list(self, data: list) -> list[object]:
+        """Head preview of a top-level array as VALID JSON: the first items, then
+        an in-array omitted-count marker (an extra string element). The pre-fix
+        code appended ``"\\n... (N items total ...)"`` as text *after*
+        ``json.dumps``, which left the whole output unparseable for any array
+        over the 5-item preview."""
+        n = len(data)
+        preview_n = min(5, n)
+        preview: list[object] = [
+            self._preview_dict(item) if isinstance(item, dict) else item
+            for item in data[:preview_n]
+        ]
+        if n > preview_n:
+            preview.append(f"... ({n - preview_n} of {n} items omitted)")
+        return preview
 
     def _extract_dict(self, data: dict, budget: int) -> dict:
         """Budget-aware recursive dict extraction — preserves all keys with depth.
@@ -1066,10 +1079,179 @@ class FieldExtractCompressor:
             preview[f"...{remaining} more"] = "..."
         return preview
 
+    def _take(self, value: object, budget: int) -> object:
+        """Greedy prefix-fill: keep the leading, full-detail content of ``value``
+        whose serialized cost fits ``budget`` (COMPACT) chars, dropping the tail
+        into a valid omitted-count marker (an extra ``_truncated`` dict member or
+        an in-array string element, counted against the ORIGINAL length).
+
+        STRICT budget for containers: ``len(json.dumps(_take(value, b))) <= b``
+        always — every child (including the first) is gated, and a child is
+        accepted only if it still fits, so a caller can hand ``_take`` the hard
+        ``max_chars`` directly and trust the result. Leading full-length scalars
+        (names, ids, roles) survive untouched — only a boundary string is ever
+        truncated. A non-string scalar is returned whole (the parent's budget
+        check then drops it if it overflows).
+        """
+        if isinstance(value, str):
+            if len(value) + 2 <= budget:  # +2 for the surrounding quotes
+                return value
+            keep = budget - 5  # quotes (2) + "..." (3)
+            return value[:keep] + "..." if keep > 0 else ""
+        if not isinstance(value, (dict, list)):
+            return value  # int / float / bool / None: atomic; parent guards size
+
+        # Collision-safe marker key, checked against ALL original keys (a real
+        # "_truncated" key can be in the *dropped* tail, invisible to ``out``).
+        marker_key = "_truncated"
+        if isinstance(value, dict):
+            is_dict = True
+            items: list = list(value.items())
+            existing = set(value)
+            while marker_key in existing:
+                marker_key += "_"
+        else:
+            is_dict = False
+            items = list(enumerate(value))
+        n = len(items)
+
+        out_dict: dict = {}
+        out_list: list = []
+        used = 2  # "{}" / "[]"
+        for i, (k, v) in enumerate(items):
+            overhead = (len(json.dumps(k, ensure_ascii=False)) + 4) if is_dict else 2
+            child = self._take(v, max(0, budget - used - overhead))
+            cost = overhead + len(json.dumps(child, ensure_ascii=False))
+            # Stop when the child won't fit, or when the budget starved it down
+            # to an empty container while the source was non-empty (an empty
+            # stub adds noise, not signal — mark the tail instead).
+            starved = child in ({}, [], "") and v not in (None, {}, [], "", 0, False)
+            if used + cost > budget or starved:
+                if is_dict:
+                    mtext = f"{n - i} of {n} keys omitted"
+                    if (
+                        used + len(json.dumps({marker_key: mtext}, ensure_ascii=False)) - 1
+                        <= budget
+                    ):
+                        out_dict[marker_key] = mtext
+                else:
+                    mark = f"... ({n - i} of {n} items omitted)"
+                    if used + len(json.dumps(mark, ensure_ascii=False)) + 1 <= budget:
+                        out_list.append(mark)
+                break
+            if is_dict:
+                out_dict[k] = child
+            else:
+                out_list.append(child)
+            used += cost
+        return out_dict if is_dict else out_list
+
+    @staticmethod
+    def _stub_value(value: object) -> object:
+        """Smallest placeholder that keeps a key visible: a shape stub for a
+        container, an empty string for a string, the value itself for a small
+        scalar."""
+        if isinstance(value, dict):
+            return f"{{{len(value)} keys}}" if value else {}
+        if isinstance(value, list):
+            return f"[{len(value)} items]" if value else []
+        if isinstance(value, str):
+            return ""
+        return value  # int / float / bool / None
+
+    def _fit_extracted(self, data: object, max_chars: int) -> str:
+        """Re-derive a VALID, within-budget form from the ORIGINAL data, filling
+        the budget with as much leading full-detail content as fits.
+
+        Output is COMPACT JSON (no indent) so ``_take``'s compact cost
+        accounting matches the measured length exactly — the exact match makes
+        length monotonic in the soft budget, so the search fills ``max_chars``
+        instead of landing on a collapse cliff.
+
+        Top-level dict: first lay down a *skeleton* — every key with a minimal
+        stub value — so no top-level key vanishes while the budget allows it
+        (FieldExtract's "preserve key structure" contract). Then enrich keys in
+        document order, each grabbing as much full-detail content (via ``_take``)
+        as the remaining budget allows — leading values (names/ids/roles, what
+        QA reads) survive in full rather than every value being shrunk to a stub.
+        Only when the stubs themselves overflow are trailing keys dropped into a
+        valid collision-safe marker. List / scalar roots binary-search ``_take``
+        directly. Floors to ``{}`` / ``[]`` / ``""`` / ``null``.
+        """
+
+        def dump(obj: object) -> str:
+            return json.dumps(obj, ensure_ascii=False)
+
+        if isinstance(data, dict) and data:
+            items = list(data.items())
+            skeleton = {k: self._stub_value(v) for k, v in items}
+            if len(dump(skeleton)) <= max_chars:
+                # Enrich each key in order; leading keys grab budget first, all
+                # keys stay at least as their stub.
+                out = dict(skeleton)
+                for k, v in items:
+                    lo, hi, best_v = 0, len(dump(v)), out[k]
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        trial = dict(out)
+                        trial[k] = self._take(v, mid)
+                        if len(dump(trial)) <= max_chars:
+                            best_v, lo = trial[k], mid + 1
+                        else:
+                            hi = mid - 1
+                    out[k] = best_v
+                return dump(out)
+
+            # Even the all-stub skeleton overflows — keep the leading keys that
+            # fit + a valid marker. ``len`` is monotonic in ``keep``. The marker
+            # key is checked against ALL original keys, not just the kept prefix:
+            # a real "_truncated" key can sit in the *dropped* tail (invisible to
+            # ``kept``), and reusing its name would clobber/shadow it.
+            existing = set(data)
+            marker = "_truncated"
+            while marker in existing:
+                marker += "_"
+            lo, hi, best = 0, len(items) - 1, None
+            while lo <= hi:
+                keep = (lo + hi) // 2
+                kept = {k: skeleton[k] for k, _ in items[:keep]}
+                kept[marker] = f"{len(items) - keep} of {len(items)} keys omitted"
+                candidate = dump(kept)
+                if len(candidate) <= max_chars:
+                    best, lo = candidate, keep + 1
+                else:
+                    hi = keep - 1
+            return best if best is not None else "{}"
+
+        # List or scalar root: ``_take`` is strict (<= budget) for containers, so
+        # a single call at the hard budget fills it — no search, no cliff.
+        candidate = dump(self._take(data, max_chars))
+        if len(candidate) <= max_chars:
+            return candidate
+
+        # Even the most compact ``_take`` form overflows. Floor to the smallest
+        # valid JSON within budget.
+        if isinstance(data, dict):
+            return "{}"
+        if isinstance(data, list):
+            return "[]"
+        if isinstance(data, str):
+            for k in range(len(data), -1, -1):
+                candidate = json.dumps(data[:k], ensure_ascii=False)
+                if len(candidate) <= max_chars:
+                    return candidate
+            return '""'
+        # Non-string scalar root (number / bool / null): no shorter valid-JSON
+        # token preserves the value, so emit it verbatim rather than corrupt it
+        # to a within-budget literal (the old ``else "null"`` turned ``true`` /
+        # ``42`` into ``null``). The result is irreducible: it can exceed a
+        # sub-token budget the manager retention ladder never actually produces.
+        return json.dumps(data, ensure_ascii=False)
+
     def _compress_text(self, text: str, max_chars: int) -> str:
         lines = text.split("\n")
         if len(lines) <= 10:
-            return text[:max_chars] + "\n... (truncated)" if len(text) > max_chars else text
+            return self._fit_text(text, max_chars)
         head_count = max(3, len(lines) // 10)
         tail_count = max(3, len(lines) // 10)
         head = "\n".join(lines[:head_count])
@@ -1077,9 +1259,20 @@ class FieldExtractCompressor:
         omitted = len(lines) - head_count - tail_count
         summary = _content_summary(text)
         result = f"{head}\n... ({omitted} lines omitted){summary} ...\n{tail}"
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (truncated)"
-        return result
+        return self._fit_text(result, max_chars)
+
+    @staticmethod
+    def _fit_text(text: str, max_chars: int) -> str:
+        """Within-budget text fit. Text has no JSON contract, so a boundary cut
+        is acceptable — but reserve room for the suffix so the result never
+        exceeds ``max_chars`` (the old ``slice + suffix`` overshot by the suffix
+        length)."""
+        if len(text) <= max_chars:
+            return text
+        suffix = "\n... (truncated)"
+        if max_chars < len(suffix):
+            return text[:max_chars]
+        return text[: max_chars - len(suffix)] + suffix
 
 
 class SchemaPruningCompressor:
