@@ -272,6 +272,57 @@ def test_kept_heading_count_is_monotonic_in_budget(doc: str) -> None:
         prev_kept = kept
 
 
+def _many_sections_short_lines(sections: int = 20, lines: int = 5) -> str:
+    """Many sections, each with several SHORT body lines — the per-section
+    budget fits multiple lines, so a document-order refill would let early
+    sections hog extras and starve later sections of even their first line."""
+    return "".join(
+        f"## S{i:02d}\n" + "\n".join(f"noise line {j}" for j in range(lines)) + "\n\n"
+        for i in range(sections)
+    )
+
+
+def test_first_body_line_is_distributed_before_extras() -> None:
+    """The all-headings refill keeps "heading + first content line per section":
+    when the budget can fit every section's first body line, every section gets
+    one before any section gets a second. A document-order fill instead spent
+    the slack on 4 extra lines for the first few sections and left the rest
+    heading-only."""
+    doc = _many_sections_short_lines(20, 5)
+    out = SkeletonCompressor().compress(doc, max_chars=500)
+    assert len(out) <= 500
+    assert len(_headings(out)) == 20  # all headings (CASE A)
+    # every section retains at least its first body line
+    sections = [s for s in re.split(r"(?=^## S)", out, flags=re.M) if s.startswith("## S")]
+    body_counts = [
+        len([ln for ln in s.rstrip().split("\n")[1:] if ln.strip() and not ln.startswith("(skel")])
+        for s in sections
+    ]
+    assert all(c >= 1 for c in body_counts), (
+        f"a section was starved of its first line: {body_counts}"
+    )
+
+
+def test_partial_tier_keeps_both_marker_and_footer_when_they_fit() -> None:
+    """In the partial regime the footer is appended after the marker when both
+    fit. A few WIDE headings leave slack the greedy prefix cannot spend on more
+    headings, so the marker AND the footer coexist — exercise that branch and
+    check the footer's body_trimmed (the partial tier keeps no body, so it
+    equals the full body) plus the marker accounting."""
+    doc = "".join(f"## {'W' * 80} sec{i}\nbody line here\n\n" for i in range(3))
+    out = SkeletonCompressor().compress(doc, max_chars=207)
+    assert len(out) <= 207
+    assert "sections omitted" in out and "sections)" in out  # both marker AND footer
+    m = re.search(r"\.\.\. \((\d+) of (\d+) sections omitted\)", out)
+    assert m
+    omitted, total = int(m.group(1)), int(m.group(2))
+    assert len(_headings(out)) + omitted == total == 3
+    f = re.search(r"(\d+) body_trimmed_chars, (\d+) sections\)$", out)
+    assert f and int(f.group(2)) == 3
+    # partial tier keeps no body → all body trimmed
+    assert int(f.group(1)) == _doc_body_chars(doc)
+
+
 # ── C. Byte-identity with the pre-query path (load-bearing) ──────────────────
 
 

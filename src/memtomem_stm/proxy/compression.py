@@ -1833,14 +1833,22 @@ class SkeletonCompressor:
             kept_lines: list[list[str]] = [[h] for h in headings]
             kept_chars = [len(h) for h in headings]
             running = all_headings_len
-            for idx, (_heading, body_lines) in enumerate(sections):
-                budget = budgets[idx]
-                for line in body_lines:
-                    # Honor both the per-section budget and the global budget.
-                    if kept_chars[idx] + len(line) + 1 > budget:
-                        break
+            # Layered refill: add EVERY section's first body line before any
+            # section's second, so the skeleton keeps "heading + first content
+            # line per section" rather than letting early sections spend the
+            # global slack on extra lines and starve later sections. A section
+            # whose next line does not fit (its per-section budget or the global
+            # budget) keeps its contiguous prefix and is skipped thereafter.
+            max_body = max((len(body_lines) for _, body_lines in sections), default=0)
+            for layer in range(max_body):
+                for idx, (_heading, body_lines) in enumerate(sections):
+                    if layer >= len(body_lines) or len(kept_lines[idx]) - 1 != layer:
+                        continue
+                    line = body_lines[layer]
+                    if kept_chars[idx] + len(line) + 1 > budgets[idx]:
+                        continue  # this section's per-section budget is full
                     if running + len(line) + 1 + reserve > max_chars:
-                        break
+                        continue  # a line this size no longer fits the budget
                     kept_lines[idx].append(line)
                     kept_chars[idx] += len(line) + 1
                     running += len(line) + 1
