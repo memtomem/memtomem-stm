@@ -352,7 +352,7 @@ class SurfacingEngine:
                             "chunk_count": len(target_ids),
                         },
                     ):
-                        await self._mcp_adapter.increment_access(target_ids)
+                        await self._increment_access_with_timeout(target_ids)
                     # Prune if exceeded cap — evict oldest (first-inserted) entries.
                     if len(self._boosted_event_ids) > self._boosted_event_ids_max:
                         excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
@@ -434,7 +434,7 @@ class SurfacingEngine:
                         "chunk_count": len(helpful_ids),
                     },
                 ):
-                    await self._mcp_adapter.increment_access(helpful_ids)
+                    await self._increment_access_with_timeout(helpful_ids)
                 if len(self._boosted_event_ids) > self._boosted_event_ids_max:
                     excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
                     for k in list(self._boosted_event_ids)[:excess]:
@@ -451,6 +451,18 @@ class SurfacingEngine:
         if errors:
             summary += " — " + "; ".join(errors)
         return summary
+
+    async def _increment_access_with_timeout(self, chunk_ids: list[str]) -> None:
+        """Best-effort LTM boost for helpful feedback.
+
+        Feedback recording must not block behind LTM startup or a stalled
+        network transport. Bound the whole adapter call, including lazy
+        connection setup, with the same surfacing timeout budget.
+        """
+        await asyncio.wait_for(
+            self._mcp_adapter.increment_access(chunk_ids),
+            timeout=self._config.timeout_seconds,
+        )
 
     def _invalidate_cache_for_feedback(self, surfacing_id: str, memory_id: str | None) -> None:
         """Populate ``_invalidated_ids`` from a surfacing event.
@@ -679,12 +691,17 @@ class SurfacingEngine:
         # empty-namespace case.
         if outcome in ("no_session", "transport_error"):
             if not self._warned_ltm_unavailable:
+                if self._config.ltm_mcp_transport == "stdio":
+                    ltm_target = self._config.ltm_mcp_command
+                else:
+                    ltm_target = self._config.ltm_mcp_url
                 logger.warning(
-                    "Surfacing skipped: LTM MCP command %r is not reachable "
+                    "Surfacing skipped: LTM MCP %s target %r is not reachable "
                     "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
                     "in stm_surfacing_stats. Run `mms health` to diagnose or "
                     "set `surfacing.enabled=false` to silence.",
-                    self._config.ltm_mcp_command,
+                    self._config.ltm_mcp_transport,
+                    ltm_target,
                     outcome,
                 )
                 self._warned_ltm_unavailable = True

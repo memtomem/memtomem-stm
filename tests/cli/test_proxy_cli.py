@@ -14,10 +14,12 @@ home directory is touched.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -3813,6 +3815,90 @@ class TestHealth:
         assert result.exit_code == 0
         assert "ltm server: UNREACHABLE" in result.output
         assert "__missing_ltm__ not on PATH" in result.output
+
+    def test_ltm_network_health_uses_url_not_stdio_command(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        captured = {}
+
+        async def fake_probe(transport, command, args, url, headers, timeout, errlog):
+            captured.update(
+                {
+                    "transport": transport,
+                    "command": command,
+                    "args": args,
+                    "url": url,
+                    "headers": headers,
+                    "timeout": timeout,
+                    "errlog": errlog,
+                }
+            )
+            return {"connected": True, "version": "0.3.0-net", "error": None}
+
+        monkeypatch.setattr(proxy_mod, "_probe_ltm_mcp_server", fake_probe)
+
+        status = proxy_mod._ltm_mcp_status(
+            SimpleNamespace(
+                enabled=True,
+                ltm_mcp_transport="sse",
+                ltm_mcp_command="__missing_ltm__",
+                ltm_mcp_args=[],
+                ltm_mcp_url="https://ltm.example/sse",
+                ltm_mcp_headers={"Authorization": "Bearer token"},
+            ),
+            timeout=2,
+        )
+
+        assert status["connected"] is True
+        assert status["transport"] == "sse"
+        assert status["display"] == "https://ltm.example/sse"
+        assert captured["transport"] == "sse"
+        assert captured["command"] == "__missing_ltm__"
+        assert captured["url"] == "https://ltm.example/sse"
+        assert captured["headers"] == {"Authorization": "Bearer token"}
+
+    def test_sse_ltm_probe_timeout_bounds_transport_enter(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        captured = {}
+
+        class HangingTransport:
+            async def __aenter__(self):
+                await asyncio.sleep(60)
+
+            async def __aexit__(self, *_args):
+                return None
+
+        def fake_sse_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
+            captured.update(
+                {
+                    "url": url,
+                    "headers": headers,
+                    "timeout": timeout,
+                    "sse_read_timeout": sse_read_timeout,
+                }
+            )
+            return HangingTransport()
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse_client)
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(
+                proxy_mod._probe_ltm_mcp_server(
+                    "sse",
+                    "",
+                    [],
+                    "https://ltm.example/sse",
+                    {"Authorization": "Bearer token"},
+                    0.1,
+                    sys.stderr,
+                )
+            )
+
+        assert captured["url"] == "https://ltm.example/sse"
+        assert captured["headers"] == {"Authorization": "Bearer token"}
+        assert captured["timeout"] == pytest.approx(0.1, rel=0.1)
+        assert captured["sse_read_timeout"] == pytest.approx(0.1, rel=0.1)
 
     def test_health_reports_connectable_ltm_server(self, config, monkeypatch):
         """Probe a live MCP child via real subprocess.
