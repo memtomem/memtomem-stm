@@ -185,6 +185,17 @@ class SurfacingEngine:
         digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 
+    def _active_min_score(self, tool: str, *, adjust_auto_tuner: bool) -> float:
+        """Return the score floor currently used for surfacing decisions."""
+        tool_cfg = self._config.context_tools.get(tool)
+        if tool_cfg is not None and tool_cfg.min_score is not None:
+            return tool_cfg.min_score
+        if self._auto_tuner is not None:
+            if adjust_auto_tuner:
+                self._auto_tuner.maybe_adjust(tool)
+            return self._auto_tuner.get_effective_min_score(tool)
+        return self._config.min_score
+
     @property
     def injection_mode(self) -> str:
         """Formatter injection mode — ``"prepend"``, ``"append"``, or ``"section"``.
@@ -589,6 +600,7 @@ class SurfacingEngine:
             cached,
             query,
             surfacing_id=surfacing_id,
+            score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
         )
 
     async def _do_surface(
@@ -650,13 +662,7 @@ class SurfacingEngine:
         # When the operator pins per-tool min_score, skip maybe_adjust so the
         # tuner doesn't learn a value that will never be applied.
         tool_cfg = self._config.context_tools.get(tool)
-        if tool_cfg is not None and tool_cfg.min_score is not None:
-            min_score = tool_cfg.min_score
-        elif self._auto_tuner is not None:
-            self._auto_tuner.maybe_adjust(tool)
-            min_score = self._auto_tuner.get_effective_min_score(tool)
-        else:
-            min_score = self._config.min_score
+        min_score = self._active_min_score(tool, adjust_auto_tuner=True)
         max_results = (
             tool_cfg.max_results
             if tool_cfg and tool_cfg.max_results
@@ -820,6 +826,7 @@ class SurfacingEngine:
             query,
             surfacing_id=surfacing_id,
             scratch_items=scratch_items,
+            score_floor=min_score,
         )
 
         self._observability.record_outcome(tool, "surfaced_cache_miss")

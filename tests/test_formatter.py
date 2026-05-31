@@ -110,6 +110,15 @@ class TestFormatterInjection:
         assert "- **notes/test.md** [default] [related]: custom related" in output
         assert "- **notes/test.md** [default] [strong]: custom strong" in output
 
+    def test_relevance_bucket_uses_active_score_floor_when_provided(self):
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.03))
+        results = [FakeResult(FakeChunk(content="near active floor"), 0.70)]
+
+        output = fmt.inject("response", results, "query", score_floor=0.6)
+
+        assert "- **notes/test.md** [default] [weak]: near active floor" in output
+        assert "[strong]" not in output
+
     def test_source_renders_parent_and_basename(self):
         fmt = SurfacingFormatter(SurfacingConfig())
         chunk = FakeChunk(content="ambiguous auth note")
