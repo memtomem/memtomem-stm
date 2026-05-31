@@ -2072,7 +2072,23 @@ class HybridCompressor:
 
         result = head + separator + tail_compressed
         if len(result) > max_chars:
-            result = result[:max_chars]
+            # A sub-compressor can return more than its requested budget — the
+            # SelectiveCompressor TOC envelope is budget-blind, and the
+            # head/separator accounting can drift — so the assembled result can
+            # overshoot. A raw ``result[:max_chars]`` slice would sever the JSON
+            # TOC tail mid-object, emitting INVALID JSON and breaking the
+            # valid-JSON contract the final-tier family upholds. Fall back to a
+            # whole-text truncation (as the budget guards above do) so the output
+            # is structurally sound rather than a half-cut envelope.
+            fallback = TruncateCompressor().compress(
+                text, max_chars=max_chars, context_query=context_query
+            )
+            # TruncateCompressor's section-aware markdown path can overshoot the
+            # budget by a few chars. The fallback carries no JSON contract (the
+            # TOC is abandoned here), so a final codepoint clamp keeps the hard
+            # budget without risking a structural cut. For JSON / plain-text
+            # input the fallback already fits, so the clamp is a no-op there.
+            return fallback[:max_chars]
         return result
 
     def _find_head_break(self, text: str, budget: int) -> int:

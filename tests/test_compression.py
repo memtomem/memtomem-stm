@@ -243,11 +243,35 @@ class TestHybridCompressor:
         result = c.compress(text, max_chars=500)
         assert result.startswith("HEAD CONTENT")
 
+    @staticmethod
+    def _toc_tail(result: str) -> str | None:
+        """Return the JSON TOC tail of a Hybrid result, or None.
+
+        In TOC mode the separator always carries the ``Table of Contents:``
+        label, but the tail itself is a JSON TOC envelope only when the
+        SelectiveCompressor produced one; for a low-chunk tail it falls back to
+        plain truncated text. A JSON envelope is the only tail that starts with
+        ``{`` after the separator, so that is the reliable discriminator."""
+        if "Table of Contents:" not in result:
+            return None
+        tail = result.split("Table of Contents:", 1)[1].strip()
+        return tail if tail.startswith("{") else None
+
     def test_tail_contains_toc_or_truncation(self):
         text = "# Intro\n\nFirst part.\n\n" + "# Detail\n\nDetail content. " * 100
         c = HybridCompressor(head_chars=100)
         result = c.compress(text, max_chars=300)
-        assert "Remaining content" in result or "truncated" in result
+        assert len(result) <= 300
+        # The output is either a head + TOC envelope (when it fits) or, on
+        # overshoot, a whole-text truncation. Each carries a recognizable
+        # marker: the TOC separator ("Remaining content"), the position-based
+        # truncation note ("truncated"), or the section-aware marker
+        # ("(original: N chars)").
+        assert "Remaining content" in result or "truncated" in result or "original:" in result
+        # A JSON TOC tail, if present, must never be severed mid-object.
+        tail = self._toc_tail(result)
+        if tail is not None:
+            json.loads(tail)
 
     def test_falls_back_to_truncate_when_budget_tight(self):
         # head_chars > text length triggers the `len(text) <= self._head_chars` passthrough
@@ -256,6 +280,26 @@ class TestHybridCompressor:
         c = HybridCompressor(head_chars=5000, min_head_chars=5000)
         result = c.compress(text, max_chars=100)
         assert "truncated" in result
+
+    def test_toc_overshoot_stays_valid_json_within_budget(self):
+        """A many-section document makes the budget-blind SelectiveCompressor TOC
+        envelope far exceed its tail budget, so the assembled head + separator +
+        TOC overshoots ``max_chars``. The old ``result[:max_chars]`` slice then
+        severed the ``json.dumps``'d TOC mid-object, emitting INVALID JSON. The
+        fix falls back to a whole-text truncation, so the output stays within
+        budget and never leaves a half-cut JSON envelope."""
+        c = HybridCompressor(head_chars=200)
+        text = "\n\n".join(
+            f"## Section number {i} heading\n\n" + ("lorem ipsum dolor sit amet " * 4)
+            for i in range(40)
+        )
+        for budget in (600, 800, 1000, 1500):
+            result = c.compress(text, max_chars=budget)
+            assert len(result) <= budget, f"@{budget}: +{len(result) - budget}"
+            # A surviving JSON TOC tail must be parseable, never a slice cut.
+            tail = self._toc_tail(result)
+            if tail is not None:
+                json.loads(tail)
 
 
 # ---------------------------------------------------------------------------
