@@ -40,6 +40,11 @@ flowchart TD
 | **llm_summary** | High-value content | Calls an external LLM (OpenAI / Anthropic / Ollama) to summarize |
 | **none** | Passthrough | No compression (cache only) |
 
+JSON-aware tiers emit strict JSON after compression. If Python parses upstream
+extension tokens such as `NaN`, `Infinity`, or `-Infinity`, STM maps those
+non-finite numeric values to `null` before any tier re-serializes the payload.
+Responses that already fit the budget still pass through unchanged.
+
 ## Selective Compression (2-phase)
 
 **Phase 1** — STM parses the response into sections and returns a compact TOC:
@@ -62,6 +67,13 @@ flowchart TD
 The `ttl_seconds_remaining` field tells the agent how many seconds it has to retrieve sections before the stored content expires. Each call to `stm_proxy_select_chunks` resets the TTL.
 
 The proxied tool description automatically includes a convention suffix (`| TOC response: use stm_proxy_select_chunks`) so the agent knows to expect a TOC and which tool to call.
+
+The TOC is budget-aware on the standalone SELECTIVE path. When the full
+80-character previews would exceed `max_chars`, STM shrinks only the per-entry
+preview cap and keeps every entry listed so all sections remain retrievable by
+key. At very high section counts, the zero-preview TOC envelope can still exceed
+the budget; entries are not dropped because that would break the two-phase
+selection contract.
 
 **Phase 2** — Agent calls `stm_proxy_select_chunks` to retrieve only the sections it needs.
 
@@ -124,6 +136,11 @@ Configurable per server:
 | `head_ratio` | 0.6 | Fraction of budget allocated to head when total budget is tight |
 | `min_toc_budget` | 200 | Minimum characters reserved for the tail TOC/truncation |
 | `min_head_chars` | 100 | Absolute minimum head size — if the budget can't fit this, falls back to truncate |
+
+If the assembled head plus TOC tail exceeds the configured budget, Hybrid first
+tries to fit the TOC tail structurally so any surviving JSON envelope remains
+parseable. If no valid fitted TOC can be produced, it falls back to whole-response
+truncation instead of raw-slicing the TOC mid-object.
 
 ## Progressive Delivery (cursor-based)
 

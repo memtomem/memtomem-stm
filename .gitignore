@@ -38,8 +38,12 @@ coverage.xml
 
 # Local-only
 .claude/
+.dev-trio/
 scripts/
 CLAUDE.local.md
+
+# Generated JS dependencies (no root npm project in this repo)
+node_modules/
 
 # bench_qa LLM judge cache (<hash>.json per scenario/model; regenerated on demand)
 tests/bench/.llm_judge_cache/

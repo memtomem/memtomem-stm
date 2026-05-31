@@ -224,6 +224,11 @@ Surfacing tracks which memory IDs have already been shown so the same content do
 
 The in-memory set is **seeded from `seen_memories`** on startup so dedup survives restarts within the TTL, and every new surfacing writes to both layers via `FeedbackStore.mark_surfaced(ids)`.
 
+Negative-feedback demotion is local to STM. It filters only the current candidate
+set after LTM returns results and does not decrement access counts or mutate LTM
+rank. Counts are based on distinct surfacing events, so repeated feedback rows for
+the same event cannot demote a memory by themselves.
+
 > **Why did an old memory re-surface?** Two common causes: (1) the 10k FIFO cap evicted the ID during a long session, so the in-memory layer no longer remembers it; (2) `dedup_ttl_seconds` elapsed, so the persistent row was ignored. Lower the TTL or raise it as needed — setting `dedup_ttl_seconds=0` disables cross-session dedup entirely.
 
 ### Query text lifecycle in `stm_feedback.db`
@@ -399,6 +404,11 @@ hit:
   `no_results_score` so an operator can tell whether to lower
   `min_score` or whether session-dedup is over-aggressive on
   long sessions.
+- `no_results_demoted` — every scored result was filtered by
+  local negative-feedback demotion. Raise
+  `feedback_demotion_negative_threshold` or set
+  `feedback_demotion_enabled=false` if the filter is too
+  aggressive.
 - `no_results_invalidated` — every memory in a cache hit was
   rated `not_relevant` / `already_known` within the cache TTL.
 - `no_results_empty_cache` — the cache stored an empty list
