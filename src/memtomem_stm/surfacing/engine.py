@@ -506,6 +506,30 @@ class SurfacingEngine:
             for k in list(self._invalidated_ids)[:excess]:
                 del self._invalidated_ids[k]
 
+    def _feedback_demoted_ids(self, memory_ids: list[str]) -> set[str]:
+        """Return IDs that accumulated enough durable negative feedback.
+
+        This is STM-side shadow demotion for memories the LTM still ranks
+        above ``min_score`` after repeated ``not_relevant`` / ``already_known``
+        ratings. It deliberately filters only the current candidate set and
+        leaves the LTM rank untouched until core grows a symmetric demotion
+        action.
+        """
+        if (
+            self._feedback_tracker is None
+            or not self._record_feedback_events
+            or not self._config.feedback_demotion_enabled
+            or not memory_ids
+        ):
+            return set()
+        try:
+            counts = self._feedback_tracker.store.get_negative_feedback_counts(memory_ids)
+        except Exception:
+            logger.debug("Failed to load negative feedback counts", exc_info=True)
+            return set()
+        threshold = self._config.feedback_demotion_negative_threshold
+        return {mid for mid, count in counts.items() if count >= threshold}
+
     def _claim_surfaced_ids(self, ids: list[str]) -> None:
         """Record memory IDs as surfaced this session, FIFO-pruning to
         ``_surfaced_ids_max``. Shared by the miss path and the cache-hit path so
@@ -734,11 +758,24 @@ class SurfacingEngine:
                 except Exception:
                     logger.debug("token_tracker.record_hints failed", exc_info=True)
 
-        # Filter by score, then exclude already-surfaced memories in this session
+        # Filter by score, then locally demote memories with repeated durable
+        # negative feedback, then exclude already-surfaced memories in this
+        # session. Demotion sits before cache write so a rejected memory does
+        # not keep reappearing from a cached query after process restart.
         scored = [r for r in results if r.score >= min_score]
+        demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in scored])
+        if demoted_ids:
+            logger.debug(
+                "Surfacing demotion filter: %s/%s skipped %d memory IDs",
+                server,
+                tool,
+                len(demoted_ids),
+            )
         relevant = []
         for r in scored:
             mid = str(r.chunk.id)
+            if mid in demoted_ids:
+                continue
             if mid not in self._surfaced_ids:
                 relevant.append(r)
                 if len(relevant) >= max_results:
@@ -752,7 +789,9 @@ class SurfacingEngine:
             # passed but session-dedup killed everything" so an operator can
             # tell whether to lower min_score (former) or whether the dedup
             # is over-aggressive on long sessions (latter).
-            if scored:
+            if demoted_ids and all(str(r.chunk.id) in demoted_ids for r in scored):
+                self._observability.record_skip(tool, "no_results_demoted")
+            elif scored:
                 self._observability.record_skip(tool, "no_results_dedup")
             else:
                 self._observability.record_skip(tool, "no_results_score")
