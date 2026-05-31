@@ -1143,9 +1143,7 @@ class FieldExtractCompressor:
                 return best
 
             for i, (_k, v) in enumerate(items):
-                marker_after = (
-                    f"... ({n - i - 1} of {n} items omitted)" if i < n - 1 else None
-                )
+                marker_after = f"... ({n - i - 1} of {n} items omitted)" if i < n - 1 else None
                 child = best_child(v, [marker_after] if marker_after else [])
                 if child is None or is_starved(child, v):
                     marker = f"... ({n - i} of {n} items omitted)"
@@ -1185,9 +1183,7 @@ class FieldExtractCompressor:
             return best
 
         for i, (k, v) in enumerate(items):
-            marker_after = (
-                {marker_key: f"{n - i - 1} of {n} keys omitted"} if i < n - 1 else {}
-            )
+            marker_after = {marker_key: f"{n - i - 1} of {n} keys omitted"} if i < n - 1 else {}
             child = best_value(k, v, marker_after)
             if child is None or dict_starved(child, v):
                 marker = f"{n - i} of {n} keys omitted"
