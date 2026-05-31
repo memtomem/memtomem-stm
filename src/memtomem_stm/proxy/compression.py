@@ -2269,24 +2269,115 @@ class HybridCompressor:
 
         result = head + separator + tail_compressed
         if len(result) > max_chars:
-            # A sub-compressor can return more than its requested budget — the
-            # SelectiveCompressor TOC envelope is budget-blind, and the
-            # head/separator accounting can drift — so the assembled result can
-            # overshoot. A raw ``result[:max_chars]`` slice would sever the JSON
-            # TOC tail mid-object, emitting INVALID JSON and breaking the
-            # valid-JSON contract the final-tier family upholds. Fall back to a
-            # whole-text truncation (as the budget guards above do) so the output
-            # is structurally sound rather than a half-cut envelope.
+            # A sub-compressor can return more than its requested budget. Avoid
+            # raw slicing because it can sever a JSON TOC mid-object, but keep
+            # the hybrid shape when possible so the ratio guard still sees a
+            # navigable, budget-filling fallback.
+            tail_budget = max_chars - len(head) - len(separator)
+            fitted_tail = self._fit_toc_tail(tail_compressed, tail_budget, tail_text)
+            if fitted_tail is not None:
+                return head + separator + fitted_tail
+
             fallback = TruncateCompressor().compress(
                 text, max_chars=max_chars, context_query=context_query
             )
-            # TruncateCompressor's section-aware markdown path can overshoot the
-            # budget by a few chars. The fallback carries no JSON contract (the
-            # TOC is abandoned here), so a final codepoint clamp keeps the hard
-            # budget without risking a structural cut. For JSON / plain-text
-            # input the fallback already fits, so the clamp is a no-op there.
             return fallback[:max_chars]
         return result
+
+    @staticmethod
+    def _fit_toc_tail(tail: str, max_chars: int, source_text: str) -> str | None:
+        if max_chars < 2:
+            return None
+
+        try:
+            parsed = json.loads(tail)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or parsed.get("type") != "toc":
+            return None
+
+        def dumps(obj: object) -> str:
+            return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+        def fill_preview(toc: dict) -> str:
+            candidate = dumps(toc)
+            if len(candidate) >= max_chars or not source_text:
+                return candidate
+            lo, hi = 0, len(source_text)
+            best = candidate
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                probe_toc = dict(toc)
+                probe_toc["tail_preview"] = source_text[:mid]
+                probe = dumps(probe_toc)
+                if len(probe) <= max_chars:
+                    best = probe
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if len(best) < max_chars:
+                # JSON permits trailing whitespace. Use it only as a final
+                # single-budget filler so the retention guard does not reject an
+                # otherwise valid TOC for being one or two chars below the floor.
+                best += " " * (max_chars - len(best))
+            return best
+
+        candidate = dumps(parsed)
+        if len(candidate) <= max_chars:
+            return fill_preview(parsed)
+
+        toc = dict(parsed)
+        entries = toc.get("entries")
+        if isinstance(entries, list):
+            toc["entries"] = [dict(e) if isinstance(e, dict) else e for e in entries]
+            for entry in reversed(toc["entries"]):
+                if not isinstance(entry, dict):
+                    continue
+                preview = entry.get("preview")
+                if not isinstance(preview, str) or not preview:
+                    continue
+                original = preview
+                lo, hi = 0, len(original)
+                best: str | None = None
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    entry["preview"] = original[:mid] + ("..." if mid < len(original) else "")
+                    probe = dumps(toc)
+                    if len(probe) <= max_chars:
+                        best = entry["preview"]
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                if best is not None:
+                    entry["preview"] = best
+                    return fill_preview(toc)
+                entry["preview"] = "..."
+                candidate = dumps(toc)
+                if len(candidate) <= max_chars:
+                    return fill_preview(toc)
+
+        hint = toc.get("hint")
+        selection_key = toc.get("selection_key")
+        if isinstance(hint, str) and selection_key:
+            toc["hint"] = f"select_chunks key={selection_key} sections=[...]"
+            candidate = dumps(toc)
+            if len(candidate) <= max_chars:
+                return fill_preview(toc)
+
+        if isinstance(entries, list):
+            while toc["entries"]:
+                original_count = len(entries)
+                toc["entries"] = toc["entries"][:-1]
+                omitted = original_count - len(toc["entries"])
+                toc["truncated_entries"] = omitted
+                candidate = dumps(toc)
+                if len(candidate) <= max_chars:
+                    return fill_preview(toc)
+
+        toc["entries"] = []
+        toc["truncated_entries"] = len(entries) if isinstance(entries, list) else 0
+        candidate = dumps(toc)
+        return fill_preview(toc) if len(candidate) <= max_chars else None
 
     def _find_head_break(self, text: str, budget: int) -> int:
         floor = int(budget * 0.85)
