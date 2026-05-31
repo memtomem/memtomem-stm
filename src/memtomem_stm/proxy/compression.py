@@ -1803,8 +1803,10 @@ class SkeletonCompressor:
         frees reserved bytes for *more* headings).
 
         * **All headings fit** (``all_headings_len <= max_chars``): keep every
-          heading (the primary contract), refill body lines up to the budget,
-          and append the footer only if it still fits.
+          heading (the primary contract), refill body lines up to the RAW budget
+          (the footer is NOT reserved, so it never preempts a body line — else a
+          larger budget that first admits the footer would drop content), then
+          append the footer only if it fits in whatever slack is left.
         * **Partial** (the bare heading lines overflow): keep the longest prefix
           of WHOLE heading lines — reserving room for the ``... (N of M sections
           omitted)`` marker but NOT the footer — then append the marker, and the
@@ -1814,22 +1816,22 @@ class SkeletonCompressor:
           ``TruncateCompressor._fit_with_footer``). Below a single heading's
           width is a budget the retention ladder never produces.
 
-        Reserves use their widest possible width (footer with all body trimmed,
-        marker with max-digit counts), so the actual — never wider — fits and
-        ``len(output) <= max(0, max_chars)`` holds by construction.
+        The marker reserve uses its widest possible width (max-digit counts), so
+        the actual — never wider — fits; the footer is always appended by an
+        explicit fit check. ``len(output) <= max(0, max_chars)`` holds by
+        construction.
         """
         headings = [heading for heading, _ in sections]
         sep = "\n\n"
-        footer_reserve = len(self._footer(text_len, total_body_chars, num_headings))
         marker_reserve = len(self._omitted_marker(num_headings, num_headings))
         all_headings_len = sum(len(h) for h in headings) + len(sep) * (num_headings - 1)
 
         # All headings fit: keep every one (heading preservation outranks the
-        # metadata footer). Refill bodies up to the budget; the footer is
-        # best-effort. Reserve footer room while filling only if it can fit at
-        # all — otherwise fill to the raw budget and drop the footer.
+        # metadata footer). Refill bodies up to the RAW budget — the footer is
+        # best-effort and must never preempt body lines, or a larger budget that
+        # first admits the footer would drop content (non-monotonic). The footer
+        # is appended afterwards only if it fits in whatever slack remains.
         if all_headings_len <= max_chars:
-            reserve = footer_reserve if all_headings_len + footer_reserve <= max_chars else 0
             kept_lines: list[list[str]] = [[h] for h in headings]
             kept_chars = [len(h) for h in headings]
             running = all_headings_len
@@ -1841,17 +1843,24 @@ class SkeletonCompressor:
             # budget) keeps its contiguous prefix and is skipped thereafter.
             max_body = max((len(body_lines) for _, body_lines in sections), default=0)
             for layer in range(max_body):
+                progressed = False
                 for idx, (_heading, body_lines) in enumerate(sections):
                     if layer >= len(body_lines) or len(kept_lines[idx]) - 1 != layer:
                         continue
                     line = body_lines[layer]
                     if kept_chars[idx] + len(line) + 1 > budgets[idx]:
                         continue  # this section's per-section budget is full
-                    if running + len(line) + 1 + reserve > max_chars:
+                    if running + len(line) + 1 > max_chars:
                         continue  # a line this size no longer fits the budget
                     kept_lines[idx].append(line)
                     kept_chars[idx] += len(line) + 1
                     running += len(line) + 1
+                    progressed = True
+                # A layer that adds nothing means no section can advance to the
+                # next layer (a section only becomes eligible by growing here),
+                # so every later layer is a no-op — stop instead of scanning them.
+                if not progressed:
+                    break
             # Same per-section accounting as the fits-case build above
             # (``kept_chars[idx] - len(heading)`` counts each kept body line's
             # joining newline), so body_trimmed_chars is identical across paths.

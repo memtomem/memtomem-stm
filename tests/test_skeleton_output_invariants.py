@@ -171,27 +171,25 @@ def test_no_heading_is_cut_mid_line(name: str, budget: int) -> None:
         assert h in original, f"{name}@{budget}: mid-cut heading {h!r}"
 
 
-# (fixture, budget) pairs where the budget comfortably exceeds all headings +
-# the footer, so the (best-effort) footer is genuinely present. few_rich_sections
-# has 4 short headings → footer fits at every budget here; many_short_headings
-# (80 headings, ~2068 bytes of bare headings) only leaves footer room well above
-# that. In the partial regime the footer is intentionally dropped to keep
-# headings (see test_marker_survives_when_footer_does_not).
+# (fixture, budget) pairs that compress along the fits-case build path, where
+# the footer is part of the normal skeleton output. few_rich_sections has 4
+# sections whose per-section budget is never floored, so the per-section build
+# always fits and the footer is present. (Many-section docs hit the 60-char
+# floor and overflow into the degraded all-headings path, where body content
+# takes priority and the best-effort footer is dropped — covered separately.)
 _FOOTER_PRESENT_CASES = [
     ("few_rich_sections", 4000),
+    ("few_rich_sections", 3000),
     ("few_rich_sections", 2000),
     ("few_rich_sections", 800),
     ("few_rich_sections", 500),
-    ("many_short_headings", 4000),
-    ("many_short_headings", 3000),
 ]
 
 
 @pytest.mark.parametrize("name,budget", _FOOTER_PRESENT_CASES)
 def test_footer_present_when_budget_is_roomy(name: str, budget: int) -> None:
-    """Invariant C: the ``(skeleton — …)`` footer survives when the budget
-    comfortably fits all headings plus the footer. Pre-fix the slice dropped it
-    whenever the body overflowed."""
+    """Invariant C: the ``(skeleton — …)`` footer survives along the fits-case
+    build path. Pre-fix the slice dropped it whenever the body overflowed."""
     out = SkeletonCompressor().compress(_FIXTURES[name], max_chars=budget)
     assert out != _FIXTURES[name]  # genuinely compressed, not passthrough
     assert "sections)" in out and "body_trimmed_chars" in out
@@ -367,14 +365,13 @@ def test_passthrough_when_input_fits() -> None:
     "doc,budget,n",
     [
         (_few_rich_sections(), 3000, 4),  # fits-case build path
-        (_many_short_headings(80), 3000, 80),  # CASE-A degraded path (overflow)
+        (_few_rich_sections(), 1000, 4),  # fits-case, tighter (more trimmed)
     ],
 )
 def test_footer_format_is_byte_exact_and_count_is_accurate(doc: str, budget: int, n: int) -> None:
     """Pin the footer's literal byte format (so a format regression fails) AND
     independently verify body_trimmed_chars (so a refill-accounting regression
-    cannot pass silently) — for BOTH the fits-case build and the degraded
-    all-headings path, which must agree on the metric."""
+    cannot pass silently)."""
     out = SkeletonCompressor().compress(doc, max_chars=budget)
     assert "sections omitted" not in out  # every heading kept → no marker
     assert len(_headings(out)) == n  # all headings present
