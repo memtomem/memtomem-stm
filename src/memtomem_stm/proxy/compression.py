@@ -1212,40 +1212,28 @@ class FieldExtractCompressor:
         return value  # int / float / bool / None
 
     @staticmethod
-    def _is_shape_stub(s: str) -> bool:
-        """True for a placeholder emitted by ``_stub_value`` for a dropped value —
-        ``{N keys}`` / ``[N items]`` / ``""`` — none of which preserves any
-        ORIGINAL scalar content."""
-        return s == "" or (
-            (s.startswith("{") and s.endswith(" keys}"))
-            or (s.startswith("[") and s.endswith(" items]"))
-        )
+    def _is_contentless(obj: object) -> bool:
+        """True if ``obj`` — a ``_fit_monotone`` rendering — preserves NO original
+        scalar: an empty container, the empty-string scalar stub ``""``, or a
+        container holding only omitted-count markers and other contentless values.
 
-    @staticmethod
-    def _content_leaves(obj: object) -> int:
-        """Count preserved ORIGINAL scalar leaves — the metric the monotonicity
-        contract is stated in. PLACEHOLDERS carry no original content and count 0:
-        omitted-count markers (a ``_truncated`` dict member, an ``... omitted``
-        in-array string), shape stubs (``{N keys}`` / ``[N items]`` / ``""``), and
-        empty containers. So showing the COMPLETE value of a key (even an
-        empty-nested one) is never scored below its stub — the stub stands for zero
-        preserved scalars, exactly what an empty-nested full value also preserves."""
+        Provenance-correct by construction: ``_fit_monotone`` only ever emits
+        original values, truncated original strings, ``""`` for an oversized scalar,
+        and omitted-count markers — it NEVER fabricates a ``{N keys}`` / ``[N items]``
+        shape stub (those come only from ``_stub_value``). So a string that merely
+        looks like ``"[2 items]"`` here is a genuine original value and is correctly
+        treated as content — no pattern-matching, no false positives."""
         if isinstance(obj, dict):
-            return sum(
-                FieldExtractCompressor._content_leaves(v)
+            return all(
+                str(k).startswith("_truncated") or FieldExtractCompressor._is_contentless(v)
                 for k, v in obj.items()
-                if not str(k).startswith("_truncated")
-                and not (isinstance(v, str) and "omitted" in v)
             )
         if isinstance(obj, list):
-            return sum(
-                FieldExtractCompressor._content_leaves(e)
+            return all(
+                (isinstance(e, str) and "omitted" in e) or FieldExtractCompressor._is_contentless(e)
                 for e in obj
-                if not (isinstance(e, str) and "omitted" in e)
             )
-        if isinstance(obj, str) and FieldExtractCompressor._is_shape_stub(obj):
-            return 0
-        return 1
+        return obj == ""
 
     def _enrich_dict_monotone(self, data: dict, max_chars: int) -> str:
         """Fill a dict root's budget MONOTONICALLY while keeping EVERY top-level
@@ -1321,16 +1309,15 @@ class FieldExtractCompressor:
         # monotone in it; the assembled frame is re-checked against the budget.
         room = max_chars - len(dump(base)) + len(dump(stub[bkey]))
         filled = self._fit_monotone(bval, room) if room >= 2 else None
-        # Take the boundary fill only when it carries REAL content, OR the source
-        # itself has none (then the truthful empty-nested value is fine). A
-        # content-free fill of a NON-empty source ({} / [] / a marker-only
-        # container) is dropped in favor of the cheaper, equally-informative
-        # ``{N keys}`` stub — keeping it would just spend budget without adding a
-        # leaf. (The stub counts 0 too, so this is a quality choice, not needed for
-        # monotonicity: a full prefix value is never scored below its stub.)
+        # Take the boundary fill unless it is a content-free rendering ({} / [] / a
+        # marker-only container) of a source that DID have content — then the
+        # cheaper, equally-informative ``{N keys}`` stub is kept instead of spending
+        # budget on an empty-looking shell. (Both score zero preserved leaves, so
+        # this is a quality choice, not needed for monotonicity.) When the source
+        # itself is contentless, the truthful empty-nested fill is fine.
         if (
             filled is not None
-            and (self._content_leaves(filled) > 0 or self._content_leaves(bval) == 0)
+            and not (self._is_contentless(filled) and not self._is_contentless(bval))
             and len(dump(frame(n_full, b_idx, filled))) <= max_chars
         ):
             return dump(frame(n_full, b_idx, filled))

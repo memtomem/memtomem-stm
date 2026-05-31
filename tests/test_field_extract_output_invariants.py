@@ -480,32 +480,53 @@ def test_wide_config_dict_routes_to_extract_fields() -> None:
 # ── E3. Monotonicity: a larger budget never shows less content (the 4B fix) ───
 
 
-def _preserved_leaves(obj: object) -> int:
-    """Count preserved ORIGINAL scalar leaves — the true monotonicity metric.
-    PLACEHOLDERS count 0 (they preserve no original content): omitted-count markers
-    (the dict ``_truncated`` member, the in-array ``... omitted`` string), shape
-    stubs (``{N keys}`` / ``[N items]`` / ``""``), and empty containers. Counting a
-    stub as a leaf would falsely score the COMPLETE value of an empty-nested key
-    below its stub. Mirrors ``FieldExtractCompressor._content_leaves``."""
+def _preserved_leaves(obj: object, original: object) -> int:
+    """Count preserved ORIGINAL scalar leaves — the true monotonicity metric, scored
+    by PROVENANCE against ``original`` (not by string pattern, which can't tell a
+    real ``"[2 items]"`` value from a generated ``{N items}`` stub).
 
-    def _is_stub(s: str) -> bool:
-        return (
-            s == ""
-            or (s.startswith("{") and s.endswith(" keys}"))
-            or (s.startswith("[") and s.endswith(" items]"))
-        )
+    An output scalar counts 1 iff it derives from an original scalar — an exact
+    original value, or a ``"…"``-truncated prefix of one. Generated placeholders
+    therefore count 0: omitted-count markers, the empty-string / shape stubs from
+    ``_stub_value`` (none of which appear in ``original``), and empty containers.
+    Mirrors the intent of ``FieldExtractCompressor._is_contentless``."""
+    strings: set[str] = set()
+    others: set = set()
 
-    if isinstance(obj, dict):
-        return sum(
-            _preserved_leaves(v)
-            for k, v in obj.items()
-            if not str(k).startswith("_truncated") and not (isinstance(v, str) and "omitted" in v)
-        )
-    if isinstance(obj, list):
-        return sum(_preserved_leaves(e) for e in obj if not (isinstance(e, str) and "omitted" in e))
-    if isinstance(obj, str) and _is_stub(obj):
-        return 0
-    return 1
+    def collect(o: object) -> None:
+        if isinstance(o, dict):
+            for v in o.values():
+                collect(v)
+        elif isinstance(o, list):
+            for e in o:
+                collect(e)
+        elif isinstance(o, str):
+            strings.add(o)
+        else:
+            others.add(o)
+
+    collect(original)
+
+    def derives(s: str) -> bool:
+        if s in strings:
+            return True
+        return s.endswith("...") and any(o.startswith(s[:-3]) for o in strings)
+
+    def count(o: object) -> int:
+        if isinstance(o, dict):
+            return sum(
+                count(v)
+                for k, v in o.items()
+                if not str(k).startswith("_truncated")
+                and not (isinstance(v, str) and "omitted" in v)
+            )
+        if isinstance(o, list):
+            return sum(count(e) for e in o if not (isinstance(e, str) and "omitted" in e))
+        if isinstance(o, str):
+            return 1 if derives(o) else 0
+        return 1  # numbers / bools / None are emitted verbatim or stubbed away
+
+    return count(obj)
 
 
 _LIST_MONO_FIXTURES: dict[str, object] = {
@@ -547,7 +568,7 @@ def test_list_root_content_is_monotone_in_budget(name: str) -> None:
         out = compressor._fit_extracted(data, budget)
         parsed = json.loads(out)  # always valid JSON
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -633,7 +654,7 @@ def test_list_root_monotone_through_router(name: str) -> None:
         out = c._compress_json(data, budget)
         parsed = json.loads(out)  # always valid JSON
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -663,7 +684,7 @@ def test_flat_dict_monotone_through_router(name: str) -> None:
         out = c._compress_json(data, budget)
         parsed = json.loads(out)
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -698,12 +719,12 @@ def test_router_no_longer_prefers_lossy_preview() -> None:
     boundary, for both a list-of-ints and a list-of-dicts root."""
     c = FieldExtractCompressor()
     ints: list[object] = list(range(50))
-    assert _preserved_leaves(json.loads(c._compress_json(ints, 61))) >= _preserved_leaves(
-        json.loads(c._compress_json(ints, 60))
+    assert _preserved_leaves(json.loads(c._compress_json(ints, 61)), ints) >= _preserved_leaves(
+        json.loads(c._compress_json(ints, 60)), ints
     )
     dicts: list[object] = [{"id": i, "name": f"item{i}"} for i in range(100)]
-    assert _preserved_leaves(json.loads(c._compress_json(dicts, 247))) >= _preserved_leaves(
-        json.loads(c._compress_json(dicts, 246))
+    assert _preserved_leaves(json.loads(c._compress_json(dicts, 247)), dicts) >= _preserved_leaves(
+        json.loads(c._compress_json(dicts, 246)), dicts
     )
 
 
@@ -775,7 +796,7 @@ def test_dict_root_content_is_monotone_in_budget(name: str) -> None:
         out = c._fit_extracted(data, budget)
         parsed = json.loads(out)  # always valid JSON
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -793,7 +814,7 @@ def test_dict_single_partial_boundary_no_cross_key_displacement() -> None:
     }
     prev = -1
     for budget in range(2, 200):
-        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)))
+        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)), data)
         assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
         prev = leaves
 
@@ -839,6 +860,6 @@ def test_dict_empty_nested_value_is_monotone_against_its_stub() -> None:
     data = {"a": {"x": []}, "b": "tail"}
     prev = -1
     for budget in range(2, len(json.dumps(data)) + 5):
-        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)))
+        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)), data)
         assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
         prev = leaves
