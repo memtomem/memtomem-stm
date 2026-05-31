@@ -1231,8 +1231,10 @@ class FieldExtractCompressor:
         """True if ``filled`` (a ``_fit_monotone`` rendering of ``source``) preserves
         at least one ORIGINAL scalar of ``source`` — judged by PROVENANCE, never by
         string pattern. A scalar of ``filled`` is preserved when it equals a source
-        scalar or is a ``"…"``-truncated prefix of one; generated markers, stubs and
-        empty fills are absent from the source pool and so add nothing. A source with
+        scalar or is a NON-EMPTY ``"…"``-truncated prefix of one; generated markers,
+        stubs and empty fills add nothing — including a bare ``"..."`` boundary fill,
+        whose empty prefix preserves zero source characters (an exact source value of
+        ``"..."`` is still matched by the equality check above). A source with
         no scalars at all (empty-nested) is vacuously preserved — the truthful empty
         fill is fine.
 
@@ -1250,7 +1252,8 @@ class FieldExtractCompressor:
             if (
                 isinstance(f, str)
                 and f.endswith("...")
-                and any(o.startswith(f[:-3]) for o in src_strs)
+                and (prefix := f[:-3])  # bare "..." has an empty prefix → not a match
+                and any(o.startswith(prefix) for o in src_strs)
             ):
                 return True
         return False

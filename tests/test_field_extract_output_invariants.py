@@ -509,7 +509,10 @@ def _preserved_leaves(obj: object, original: object) -> int:
     def derives(s: str) -> bool:
         if s in strings:
             return True
-        return s.endswith("...") and any(o.startswith(s[:-3]) for o in strings)
+        if not s.endswith("..."):
+            return False
+        prefix = s[:-3]  # a bare "..." has an empty prefix → preserves no source char
+        return bool(prefix) and any(o.startswith(prefix) for o in strings)
 
     def count(o: object) -> int:
         if isinstance(o, dict):
@@ -521,6 +524,38 @@ def _preserved_leaves(obj: object, original: object) -> int:
         return 1  # numbers / bools / None are emitted verbatim, never fabricated
 
     return count(obj)
+
+
+def test_bare_ellipsis_does_not_count_as_preserved_content() -> None:
+    """A content-free ``"..."`` boundary fill preserves ZERO original characters, so
+    neither the provenance metric nor the runtime guard may treat it as preserved.
+
+    Regression for the empty-prefix bug: ``"..."[:-3] == ""`` and every string
+    ``.startswith("")``, so a bare ``"..."`` was falsely read as a truncated prefix of
+    any source string. An ORIGINAL value that is literally ``"..."`` is still matched
+    by equality and scores 1.
+    """
+    # Metric: a generated bare "..." against a real source scalar -> 0.
+    assert _preserved_leaves({"payload": "..."}, {"payload": "secret"}) == 0
+    # Metric: a genuine "..."-truncated prefix of the source -> 1.
+    assert _preserved_leaves({"payload": "sec..."}, {"payload": "secret"}) == 1
+    # Metric: an original value that is literally "..." -> matched by equality -> 1.
+    assert _preserved_leaves({"payload": "..."}, {"payload": "..."}) == 1
+
+    comp = FieldExtractCompressor()
+    # Runtime guard mirrors the metric on the same cases.
+    assert comp._fill_preserves_source({"payload": "..."}, {"payload": "secret"}) is False
+    assert comp._fill_preserves_source({"payload": "sec..."}, {"payload": "secret"}) is True
+    assert comp._fill_preserves_source({"payload": "..."}, {"payload": "..."}) is True
+
+    # End-to-end (codex's repro): at a tight budget the bulky payload would truncate to
+    # a content-free "..."; the fixed guard rejects that shell in favor of the cheaper
+    # empty stub, so the surviving "id" is the ONLY preserved leaf — never the "...".
+    source = {"id": "abc", "payload": "x" * 100}
+    out = json.loads(comp._fit_extracted(source, 31))
+    assert out["id"] == "abc"
+    assert out["payload"] == ""  # content-free fill dropped to the empty stub
+    assert _preserved_leaves(out, source) == 1  # only "id":"abc", NOT the "..."
 
 
 _LIST_MONO_FIXTURES: dict[str, object] = {
