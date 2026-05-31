@@ -14,6 +14,38 @@ class SurfacingFormatter:
     def __init__(self, config: SurfacingConfig) -> None:
         self._config = config
 
+    def _relevance_bucket(self, score: float, score_floor: float | None = None) -> str:
+        floor = self._config.min_score if score_floor is None else score_floor
+        if floor >= 1.0:
+            return "strong"
+
+        band = 1.0 - floor
+        related_start = floor + band / 3
+        strong_start = floor + 2 * band / 3
+
+        if score < related_start:
+            return "weak"
+        if score < strong_start:
+            return "related"
+        return "strong"
+
+    @staticmethod
+    def _format_source(source_file: Any) -> str:
+        parts = getattr(source_file, "parts", None)
+        if not parts:
+            return str(source_file)
+
+        anchor = getattr(source_file, "anchor", "")
+        path_parts = [part for part in parts if part and part != anchor]
+        if not path_parts:
+            return str(source_file)
+        return "/".join(path_parts[-2:])
+
+    def _format_namespace_badge(self, namespace: str | None) -> str:
+        if not namespace or namespace == self._config.default_namespace:
+            return ""
+        return f" [{namespace}]"
+
     def inject(
         self,
         response_text: str,
@@ -21,6 +53,7 @@ class SurfacingFormatter:
         query: str,
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
+        score_floor: float | None = None,
     ) -> str:
         """Inject surfaced memories into ``response_text``.
 
@@ -62,8 +95,8 @@ class SurfacingFormatter:
         for r in results:
             chunk = r.chunk
             meta = chunk.metadata
-            ns_badge = f" [{meta.namespace}]" if meta.namespace != "default" else ""
-            source = str(meta.source_file.name) if meta.source_file else ""
+            ns_badge = self._format_namespace_badge(meta.namespace)
+            source = self._format_source(meta.source_file) if meta.source_file else ""
 
             ctx = getattr(r, "context", None)
             preview_cap = self._config.preview_max_chars
@@ -83,7 +116,8 @@ class SurfacingFormatter:
                     snippet = ctx.window_after[0].content[:budget].replace("\n", " ")
                     preview = preview + " | " + snippet + "..."
 
-            lines.append(f"- **{source}**{ns_badge} (score={r.score:.2f}): {preview}")
+            bucket = self._relevance_bucket(float(r.score), score_floor)
+            lines.append(f"- **{source}**{ns_badge} [{bucket}]: {preview}")
 
         if scratch_items:
             lines.append("")

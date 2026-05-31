@@ -36,8 +36,14 @@ class SurfacingConfig(BaseModel):
     ``seen_memories`` cross-session dedup. Configurable so tests and
     notebooks can isolate state into a tempdir via
     ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``."""
+    ltm_mcp_transport: Literal["stdio", "sse", "streamable_http"] = "stdio"
+    """Transport used to connect to the LTM MCP server."""
     ltm_mcp_command: str = "memtomem-server"
     ltm_mcp_args: list[str] = []
+    ltm_mcp_url: str = ""
+    """Network endpoint for ``sse`` / ``streamable_http`` LTM transports."""
+    ltm_mcp_headers: dict[str, str] | None = None
+    """Optional static headers for network LTM transports."""
     min_score: float = Field(default=0.03, ge=0.0, le=1.0)
     max_results: int = Field(default=3, gt=0)
     min_query_tokens: int = Field(default=3, gt=0)
@@ -139,6 +145,11 @@ class SurfacingConfig(BaseModel):
         step further is a wait-for-signal concern, not a constructor
         constraint.
         """
+        if self.ltm_mcp_transport != "stdio" and not self.ltm_mcp_url:
+            raise ValueError(
+                f"ltm_mcp_url is required when ltm_mcp_transport is {self.ltm_mcp_transport!r}"
+            )
+
         set_fields = self.model_fields_set
         if "auto_tune_score_ceiling" not in set_fields:
             self.auto_tune_score_ceiling = max(self.auto_tune_score_ceiling, self.min_score)

@@ -29,20 +29,24 @@ from memtomem_stm.proxy.compression import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-API_RESPONSE_JSON = json.dumps({
-    "users": [
-        {"id": 1, "name": "Alice", "email": "alice@example.com", "role": "admin"},
-        {"id": 2, "name": "Bob", "email": "bob@example.com", "role": "editor"},
-        {"id": 3, "name": "Charlie", "email": "charlie@example.com", "role": "viewer"},
-    ] + [
-        {"id": i, "name": f"User{i}", "email": f"user{i}@example.com", "role": "viewer"}
-        for i in range(4, 51)
-    ],
-    "total": 50,
-    "page": 1,
-    "per_page": 50,
-    "has_more": False,
-}, indent=2)
+API_RESPONSE_JSON = json.dumps(
+    {
+        "users": [
+            {"id": 1, "name": "Alice", "email": "alice@example.com", "role": "admin"},
+            {"id": 2, "name": "Bob", "email": "bob@example.com", "role": "editor"},
+            {"id": 3, "name": "Charlie", "email": "charlie@example.com", "role": "viewer"},
+        ]
+        + [
+            {"id": i, "name": f"User{i}", "email": f"user{i}@example.com", "role": "viewer"}
+            for i in range(4, 51)
+        ],
+        "total": 50,
+        "page": 1,
+        "per_page": 50,
+        "has_more": False,
+    },
+    indent=2,
+)
 
 
 CODE_FILE = """# Authentication Module
@@ -284,41 +288,44 @@ Change a user's role. Requires `admin` role.
 """
 
 
-NESTED_CONFIG_JSON = json.dumps({
-    "database": {
-        "host": "db.internal.example.com",
-        "port": 5432,
-        "name": "production_db",
-        "pool": {"min": 5, "max": 20, "idle_timeout": 300},
-        "replicas": [
-            {"host": "replica-1.internal", "port": 5432, "weight": 50},
-            {"host": "replica-2.internal", "port": 5432, "weight": 50},
-        ],
+NESTED_CONFIG_JSON = json.dumps(
+    {
+        "database": {
+            "host": "db.internal.example.com",
+            "port": 5432,
+            "name": "production_db",
+            "pool": {"min": 5, "max": 20, "idle_timeout": 300},
+            "replicas": [
+                {"host": "replica-1.internal", "port": 5432, "weight": 50},
+                {"host": "replica-2.internal", "port": 5432, "weight": 50},
+            ],
+        },
+        "cache": {
+            "provider": "redis",
+            "host": "redis.internal.example.com",
+            "port": 6379,
+            "ttl_seconds": 3600,
+            "max_memory": "2gb",
+        },
+        "auth": {
+            "provider": "jwt",
+            "secret_rotation_days": 90,
+            "session_ttl": 86400,
+            "mfa_required": True,
+            "allowed_origins": [
+                "https://app.example.com",
+                "https://admin.example.com",
+                "https://staging.example.com",
+            ],
+        },
+        "monitoring": {
+            "metrics": {"provider": "prometheus", "port": 9090},
+            "logging": {"provider": "elasticsearch", "level": "info"},
+            "alerting": {"provider": "pagerduty", "escalation_minutes": 15},
+        },
     },
-    "cache": {
-        "provider": "redis",
-        "host": "redis.internal.example.com",
-        "port": 6379,
-        "ttl_seconds": 3600,
-        "max_memory": "2gb",
-    },
-    "auth": {
-        "provider": "jwt",
-        "secret_rotation_days": 90,
-        "session_ttl": 86400,
-        "mfa_required": True,
-        "allowed_origins": [
-            "https://app.example.com",
-            "https://admin.example.com",
-            "https://staging.example.com",
-        ],
-    },
-    "monitoring": {
-        "metrics": {"provider": "prometheus", "port": 9090},
-        "logging": {"provider": "elasticsearch", "level": "info"},
-        "alerting": {"provider": "pagerduty", "escalation_minutes": 15},
-    },
-}, indent=2)
+    indent=2,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -396,9 +403,7 @@ class TestSectionAwareTruncation:
 
     def test_cuts_at_heading_boundary(self):
         """Truncation should not cut mid-section."""
-        text = "\n\n".join(
-            f"## Section {c}\n\n{'Content for section. ' * 5}" for c in "ABCDE"
-        )
+        text = "\n\n".join(f"## Section {c}\n\n{'Content for section. ' * 5}" for c in "ABCDE")
         comp = TruncateCompressor()
         # Budget fits ~2 sections but not all 5
         result = comp.compress(text, max_chars=400)
@@ -455,7 +460,7 @@ class TestHybridInfoLoss:
         # TOC should list section titles from the tail
         has_toc = (
             "selection_key" in result  # JSON TOC from selective
-            or "Decisions" in result   # truncated tail mentioning section
+            or "Decisions" in result  # truncated tail mentioning section
             or "Action Items" in result
         )
         assert has_toc, "Tail sections should be discoverable in compressed output"
@@ -498,7 +503,13 @@ class TestSelectiveInfoLoss:
 
         entry_keys = {e["key"] for e in toc["entries"]}
         # All major sections should appear in TOC
-        expected_sections = {"Attendees", "Agenda", "Sprint 13 Goals", "Decisions Made", "Action Items"}
+        expected_sections = {
+            "Attendees",
+            "Agenda",
+            "Sprint 13 Goals",
+            "Decisions Made",
+            "Action Items",
+        }
         found = expected_sections & entry_keys
         assert len(found) >= 3, f"Expected most sections in TOC, found: {found}"
 
@@ -597,10 +608,13 @@ class TestFieldExtractInfoLoss:
 
     def test_nested_structure_hinted(self):
         """Nested objects are summarized, not discarded."""
-        data = json.dumps({
-            "config": {"database": {"host": "localhost", "port": 5432, "name": "mydb"}},
-            "features": {"auth": True, "cache": True, "logging": False},
-        }, indent=2)
+        data = json.dumps(
+            {
+                "config": {"database": {"host": "localhost", "port": 5432, "name": "mydb"}},
+                "features": {"auth": True, "cache": True, "logging": False},
+            },
+            indent=2,
+        )
         comp = FieldExtractCompressor()
         result = comp.compress(data, max_chars=200)
 
@@ -622,12 +636,12 @@ class TestCrossStrategyComparison:
     def test_meeting_critical_elements(self):
         """Compare preservation of critical meeting elements across strategies."""
         critical = [
-            "JWT migration",           # key decision
-            "Kim Cheolsu",             # assignee
-            "April 15",               # deadline
-            "Grafana",                # tech choice
-            "v1 API deprecation",     # strategy decision
-            "June 30",               # sunset date
+            "JWT migration",  # key decision
+            "Kim Cheolsu",  # assignee
+            "April 15",  # deadline
+            "Grafana",  # tech choice
+            "v1 API deprecation",  # strategy decision
+            "June 30",  # sunset date
         ]
 
         budget = 2000  # ~50% of original
@@ -655,11 +669,11 @@ class TestCrossStrategyComparison:
     def test_code_file_critical_elements(self):
         """Compare preservation of critical code elements."""
         critical = [
-            "create_access_token",    # function name
-            "validate_token",         # function name
-            "HS256",                  # algorithm
+            "create_access_token",  # function name
+            "validate_token",  # function name
+            "HS256",  # algorithm
             "ExpiredSignatureError",  # error type
-            "HTTPS",                  # security note
+            "HTTPS",  # security note
         ]
 
         budget = 1500  # ~30% of original
@@ -690,8 +704,11 @@ class TestCrossStrategyComparison:
             recovered = comp.select(key, all_keys)
 
             critical = [
-                "create_access_token", "validate_token",
-                "HS256", "ExpiredSignatureError", "HTTPS",
+                "create_access_token",
+                "validate_token",
+                "HS256",
+                "ExpiredSignatureError",
+                "HTTPS",
             ]
             recovered_score = self._count_preserved(recovered, critical)
             assert recovered_score == len(critical), (
@@ -710,14 +727,14 @@ class TestCompressionCurve:
     def test_truncate_preserves_more_with_budget(self):
         """More budget → at least as many keywords preserved overall."""
         keywords_by_position = [
-            ("Authentication Module", 0.05),   # top 5%
-            ("AUTH_CONFIG", 0.15),              # ~15%
-            ("create_access_token", 0.30),      # ~30%
-            ("validate_token", 0.45),           # ~45%
-            ("Refresh Flow", 0.60),             # ~60%
-            ("Error Handling", 0.70),           # ~70%
-            ("Security Notes", 0.85),           # ~85%
-            ("Rate limit", 0.90),               # ~90%
+            ("Authentication Module", 0.05),  # top 5%
+            ("AUTH_CONFIG", 0.15),  # ~15%
+            ("create_access_token", 0.30),  # ~30%
+            ("validate_token", 0.45),  # ~45%
+            ("Refresh Flow", 0.60),  # ~60%
+            ("Error Handling", 0.70),  # ~70%
+            ("Security Notes", 0.85),  # ~85%
+            ("Rate limit", 0.90),  # ~90%
         ]
 
         comp = TruncateCompressor()
@@ -756,9 +773,7 @@ class TestCompressionCurve:
 
         # Hybrid's tail should have structural hints (TOC or section names)
         has_tail_hints = (
-            "selection_key" in hybrid
-            or "Remaining content" in hybrid
-            or "truncated" in hybrid
+            "selection_key" in hybrid or "Remaining content" in hybrid or "truncated" in hybrid
         )
         assert has_tail_hints, "Hybrid tail should provide navigability hints"
 
@@ -808,9 +823,14 @@ class TestSkeletonInfoLoss:
         assert "body_trimmed_chars" in result
 
     def test_body_trimmed_chars_positive(self):
-        """body_trimmed_chars is positive when body content is actually trimmed."""
+        """body_trimmed_chars is positive when body content is actually trimmed.
+
+        Uses a budget on the fits-case build path, where the footer is part of
+        the normal skeleton output. (At a tighter budget the doc overflows into
+        the degraded all-headings path, where body content takes priority and
+        the best-effort footer is dropped — so there is no footer to read.)"""
         comp = SkeletonCompressor()
-        result = comp.compress(API_DOCS, max_chars=800)
+        result = comp.compress(API_DOCS, max_chars=1000)
 
         import re
 
@@ -973,8 +993,13 @@ class TestFullCrossStrategy:
 
     def test_api_docs_endpoint_preservation(self):
         """Compare how many API endpoints each strategy preserves."""
-        endpoints = ["GET /users", "POST /users", "PUT /users/{id}",
-                     "DELETE /users/{id}", "PATCH /users/{id}/role"]
+        endpoints = [
+            "GET /users",
+            "POST /users",
+            "PUT /users/{id}",
+            "DELETE /users/{id}",
+            "PATCH /users/{id}/role",
+        ]
         budget = 1000
 
         results = {
@@ -994,8 +1019,17 @@ class TestFullCrossStrategy:
 
     def test_json_strategy_comparison(self):
         """Compare JSON-specific strategies on nested config."""
-        keys = ["database", "cache", "auth", "monitoring",
-                "host", "port", "provider", "pool", "replicas"]
+        keys = [
+            "database",
+            "cache",
+            "auth",
+            "monitoring",
+            "host",
+            "port",
+            "provider",
+            "pool",
+            "replicas",
+        ]
         budget = 800
 
         results = {
