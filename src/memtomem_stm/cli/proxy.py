@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -2200,13 +2200,16 @@ def _version_from_tool_result(result: Any) -> str | None:
     return str(version) if version else None
 
 
-async def _probe_ltm_mcp_command(
+async def _probe_ltm_mcp_server(
+    transport: str,
     command: str,
     args: list[str],
+    url: str,
+    headers: dict[str, str] | None,
     timeout: float,
     errlog: TextIO,
 ) -> dict[str, Any]:
-    """Probe the configured LTM stdio MCP server without starting the proxy.
+    """Probe the configured LTM MCP server without starting the proxy.
 
     *timeout* is an **end-to-end** budget shared across initialize +
     list_tools + the optional ``mem_do(action="version")`` probe — each
@@ -2230,7 +2233,9 @@ async def _probe_ltm_mcp_command(
     ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
     """
     from mcp import ClientSession
+    from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.client.streamable_http import streamablehttp_client
 
     deadline = asyncio.get_running_loop().time() + timeout
 
@@ -2240,8 +2245,27 @@ async def _probe_ltm_mcp_command(
         # returning a bogus result on a zero-budget call.
         return max(1e-3, deadline - asyncio.get_running_loop().time())
 
-    params = StdioServerParameters(command=command, args=args)
-    async with stdio_client(params, errlog=errlog) as streams:
+    sdk_timeout = remaining()
+    if transport == "sse":
+        ctx = sse_client(
+            url,
+            headers=headers,
+            timeout=sdk_timeout,
+            sse_read_timeout=sdk_timeout,
+        )
+    elif transport == "streamable_http":
+        ctx = streamablehttp_client(
+            url,
+            headers=headers,
+            timeout=sdk_timeout,
+            sse_read_timeout=sdk_timeout,
+        )
+    else:
+        params = StdioServerParameters(command=command, args=args)
+        ctx = stdio_client(params, errlog=errlog)
+
+    async with AsyncExitStack() as stack:
+        streams = await asyncio.wait_for(stack.enter_async_context(ctx), timeout=remaining())
         async with ClientSession(streams[0], streams[1]) as session:
             await asyncio.wait_for(session.initialize(), timeout=remaining())
             tools_result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
@@ -2288,12 +2312,23 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     diagnostic past the user-requested ceiling. ``surfacing.timeout_seconds``
     (the runtime-call timeout) is not used here — it's a different SLA.
     """
+    transport = str(getattr(surfacing, "ltm_mcp_transport", "stdio") or "stdio")
     command = str(getattr(surfacing, "ltm_mcp_command", "") or "")
     args = [str(arg) for arg in (getattr(surfacing, "ltm_mcp_args", []) or [])]
-    display = _format_command_for_display(command, args) if command else "(empty command)"
+    url = str(getattr(surfacing, "ltm_mcp_url", "") or "")
+    headers = getattr(surfacing, "ltm_mcp_headers", None)
+    if not isinstance(headers, dict):
+        headers = None
+    display = (
+        _format_command_for_display(command, args)
+        if transport == "stdio" and command
+        else url or "(empty url)"
+    )
     status: dict[str, Any] = {
+        "transport": transport,
         "command": command,
         "args": args,
+        "url": url,
         "display": display,
         "connected": None,
         "version": None,
@@ -2303,11 +2338,15 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     if not getattr(surfacing, "enabled", False):
         status["skipped"] = "surfacing_disabled"
         return status
-    if not command:
+    if transport != "stdio" and not url:
+        status["connected"] = False
+        status["error"] = "ltm_mcp_url is required for network LTM transport"
+        return status
+    if transport == "stdio" and not command:
         status["connected"] = False
         status["error"] = "ltm_mcp_command is empty"
         return status
-    if shutil.which(command) is None:
+    if transport == "stdio" and shutil.which(command) is None:
         status["connected"] = False
         status["error"] = f"{command} not on PATH"
         return status
@@ -2320,7 +2359,17 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         # here. ``os.devnull`` gives us a fd-backed sink so server banners
         # and MCP-SDK stderr can't bleed into ``mms health`` output.
         with open(os.devnull, "w") as errnull, _silenced_mcp_sdk_logs():
-            probe = asyncio.run(_probe_ltm_mcp_command(command, args, probe_timeout, errnull))
+            probe = asyncio.run(
+                _probe_ltm_mcp_server(
+                    transport,
+                    command,
+                    args,
+                    url,
+                    headers,
+                    probe_timeout,
+                    errnull,
+                )
+            )
     except Exception as exc:
         # ``asyncio.wait_for`` inside the probe raises ``TimeoutError``, but
         # anyio's ``TaskGroup`` (wrapped by ``stdio_client``) re-raises it
