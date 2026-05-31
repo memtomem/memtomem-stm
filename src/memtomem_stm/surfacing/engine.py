@@ -185,6 +185,17 @@ class SurfacingEngine:
         digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 
+    def _active_min_score(self, tool: str, *, adjust_auto_tuner: bool) -> float:
+        """Return the score floor currently used for surfacing decisions."""
+        tool_cfg = self._config.context_tools.get(tool)
+        if tool_cfg is not None and tool_cfg.min_score is not None:
+            return tool_cfg.min_score
+        if self._auto_tuner is not None:
+            if adjust_auto_tuner:
+                self._auto_tuner.maybe_adjust(tool)
+            return self._auto_tuner.get_effective_min_score(tool)
+        return self._config.min_score
+
     @property
     def injection_mode(self) -> str:
         """Formatter injection mode — ``"prepend"``, ``"append"``, or ``"section"``.
@@ -352,7 +363,7 @@ class SurfacingEngine:
                             "chunk_count": len(target_ids),
                         },
                     ):
-                        await self._mcp_adapter.increment_access(target_ids)
+                        await self._increment_access_with_timeout(target_ids)
                     # Prune if exceeded cap — evict oldest (first-inserted) entries.
                     if len(self._boosted_event_ids) > self._boosted_event_ids_max:
                         excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
@@ -434,7 +445,7 @@ class SurfacingEngine:
                         "chunk_count": len(helpful_ids),
                     },
                 ):
-                    await self._mcp_adapter.increment_access(helpful_ids)
+                    await self._increment_access_with_timeout(helpful_ids)
                 if len(self._boosted_event_ids) > self._boosted_event_ids_max:
                     excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
                     for k in list(self._boosted_event_ids)[:excess]:
@@ -451,6 +462,18 @@ class SurfacingEngine:
         if errors:
             summary += " — " + "; ".join(errors)
         return summary
+
+    async def _increment_access_with_timeout(self, chunk_ids: list[str]) -> None:
+        """Best-effort LTM boost for helpful feedback.
+
+        Feedback recording must not block behind LTM startup or a stalled
+        network transport. Bound the whole adapter call, including lazy
+        connection setup, with the same surfacing timeout budget.
+        """
+        await asyncio.wait_for(
+            self._mcp_adapter.increment_access(chunk_ids),
+            timeout=self._config.timeout_seconds,
+        )
 
     def _invalidate_cache_for_feedback(self, surfacing_id: str, memory_id: str | None) -> None:
         """Populate ``_invalidated_ids`` from a surfacing event.
@@ -577,6 +600,7 @@ class SurfacingEngine:
             cached,
             query,
             surfacing_id=surfacing_id,
+            score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
         )
 
     async def _do_surface(
@@ -638,13 +662,7 @@ class SurfacingEngine:
         # When the operator pins per-tool min_score, skip maybe_adjust so the
         # tuner doesn't learn a value that will never be applied.
         tool_cfg = self._config.context_tools.get(tool)
-        if tool_cfg is not None and tool_cfg.min_score is not None:
-            min_score = tool_cfg.min_score
-        elif self._auto_tuner is not None:
-            self._auto_tuner.maybe_adjust(tool)
-            min_score = self._auto_tuner.get_effective_min_score(tool)
-        else:
-            min_score = self._config.min_score
+        min_score = self._active_min_score(tool, adjust_auto_tuner=True)
         max_results = (
             tool_cfg.max_results
             if tool_cfg and tool_cfg.max_results
@@ -679,12 +697,17 @@ class SurfacingEngine:
         # empty-namespace case.
         if outcome in ("no_session", "transport_error"):
             if not self._warned_ltm_unavailable:
+                if self._config.ltm_mcp_transport == "stdio":
+                    ltm_target = self._config.ltm_mcp_command
+                else:
+                    ltm_target = self._config.ltm_mcp_url
                 logger.warning(
-                    "Surfacing skipped: LTM MCP command %r is not reachable "
+                    "Surfacing skipped: LTM MCP %s target %r is not reachable "
                     "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
                     "in stm_surfacing_stats. Run `mms health` to diagnose or "
                     "set `surfacing.enabled=false` to silence.",
-                    self._config.ltm_mcp_command,
+                    self._config.ltm_mcp_transport,
+                    ltm_target,
                     outcome,
                 )
                 self._warned_ltm_unavailable = True
@@ -803,6 +826,7 @@ class SurfacingEngine:
             query,
             surfacing_id=surfacing_id,
             scratch_items=scratch_items,
+            score_floor=min_score,
         )
 
         self._observability.record_outcome(tool, "surfaced_cache_miss")

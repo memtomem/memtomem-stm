@@ -80,6 +80,33 @@ class TestProxyNumericConstraints:
         assert cfg.reconnect_delay_seconds == 5
 
 
+class TestSurfacingLtmTransportConfig:
+    def test_stdio_transport_keeps_existing_defaults(self) -> None:
+        cfg = SurfacingConfig()
+
+        assert cfg.ltm_mcp_transport == "stdio"
+        assert cfg.ltm_mcp_command == "memtomem-server"
+        assert cfg.ltm_mcp_url == ""
+        assert cfg.ltm_mcp_headers is None
+
+    def test_network_transport_requires_url(self) -> None:
+        with pytest.raises(ValidationError, match="ltm_mcp_url is required"):
+            SurfacingConfig(ltm_mcp_transport="sse")
+
+        with pytest.raises(ValidationError, match="ltm_mcp_url is required"):
+            SurfacingConfig(ltm_mcp_transport="streamable_http")
+
+    def test_network_transport_accepts_url_and_headers(self) -> None:
+        cfg = SurfacingConfig(
+            ltm_mcp_transport="streamable_http",
+            ltm_mcp_url="https://ltm.example/mcp",
+            ltm_mcp_headers={"Authorization": "Bearer token"},
+        )
+
+        assert cfg.ltm_mcp_url == "https://ltm.example/mcp"
+        assert cfg.ltm_mcp_headers == {"Authorization": "Bearer token"}
+
+
 class TestLLMCompressorApiKey:
     """``provider=openai|anthropic`` with empty ``api_key`` used to send a
     malformed ``Bearer `` header and silently fall back to truncate; validate

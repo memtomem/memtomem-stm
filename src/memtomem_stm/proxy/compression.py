@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -66,6 +67,63 @@ def count_markdown_headings(text: str) -> int:
     comment line, or ``#`` inside prose without a following space).
     """
     return len(_HEADINGS_RE.findall(text))
+
+
+def _sanitize_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (``NaN`` / ``Infinity`` /
+    ``-Infinity``) with ``None`` so the result serializes to valid JSON.
+
+    ``json.dumps`` emits the bareword tokens ``NaN`` / ``Infinity`` /
+    ``-Infinity`` for non-finite floats, which RFC 8259 JSON forbids and strict
+    parsers (browser ``JSON.parse``, Go ``encoding/json``,
+    ``json.loads(parse_constant=...)``) reject. Upstream tool responses that dump
+    numpy/pandas/ML metrics routinely carry these tokens. We sanitize ONCE at
+    parse time (see ``_mm_json_loads``) so every compression tier that re-dumps
+    the parsed payload — including the budget-search probe loops that measure
+    ``len(json.dumps(candidate))`` — sees only finite values and never re-emits
+    an invalid token.
+
+    Returns the input object UNCHANGED (same identity) when it contains no
+    non-finite float, so the common case allocates nothing. ``bool`` is an
+    ``int`` subclass (not ``float``) and is left untouched.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        replaced: dict | None = None
+        for key, value in obj.items():
+            sanitized = _sanitize_nonfinite(value)
+            if sanitized is not value:
+                if replaced is None:
+                    replaced = dict(obj)
+                replaced[key] = sanitized
+        return replaced if replaced is not None else obj
+    if isinstance(obj, (list, tuple)):
+        replaced_seq: list | None = None
+        for index, value in enumerate(obj):
+            sanitized = _sanitize_nonfinite(value)
+            if sanitized is not value:
+                if replaced_seq is None:
+                    replaced_seq = list(obj)
+                replaced_seq[index] = sanitized
+        if replaced_seq is not None:
+            return replaced_seq
+        # A tuple with no non-finite float still round-trips through json as an
+        # array; return it unchanged to preserve the no-copy fast path.
+        return obj
+    return obj
+
+
+def _mm_json_loads(s: str, **kwargs: object) -> object:
+    """``json.loads`` that scrubs non-finite floats from the parsed result.
+
+    Python's ``json.loads`` accepts the ``NaN`` / ``Infinity`` / ``-Infinity``
+    extension tokens and turns them into ``float('nan')`` / ``float('inf')``,
+    which would later re-serialize as those same invalid tokens. Sanitizing here
+    — the single ingest point for every JSON-handling compression tier — keeps
+    all downstream output valid JSON without per-serialization overhead.
+    """
+    return _sanitize_nonfinite(json.loads(s, **kwargs))
 
 
 class Compressor(Protocol):
@@ -132,7 +190,7 @@ class TruncateCompressor:
         stripped = text.strip()
         if stripped and stripped[0] == "{":
             try:
-                data = json.loads(stripped)
+                data = _mm_json_loads(stripped)
                 if (
                     isinstance(data, dict)
                     and len(data) >= 2
@@ -832,7 +890,7 @@ class SelectiveCompressor:
 
     def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
         try:
-            data = json.loads(text)
+            data = _mm_json_loads(text)
             if isinstance(data, dict):
                 return "json", self._parse_json_dict(data, text)
             if isinstance(data, list):
@@ -903,7 +961,7 @@ class SelectiveCompressor:
             return chunks
         key, value = next(iter(chunks.items()))
         try:
-            parsed = json.loads(value)
+            parsed = _mm_json_loads(value)
         except (json.JSONDecodeError, ValueError):
             return chunks
         if isinstance(parsed, dict) and len(parsed) > 1:
@@ -952,7 +1010,7 @@ class FieldExtractCompressor:
         if not text or len(text) <= max_chars:
             return text
         try:
-            data = json.loads(text)
+            data = _mm_json_loads(text)
             return self._compress_json(data, max_chars)
         except (json.JSONDecodeError, ValueError):
             pass
@@ -1393,7 +1451,7 @@ class SchemaPruningCompressor:
         if not text or len(text) <= max_chars:
             return text
         try:
-            data = json.loads(text)
+            data = _mm_json_loads(text)
         except (json.JSONDecodeError, ValueError):
             return TruncateCompressor(scorer=self._scorer).compress(
                 text, max_chars=max_chars, context_query=context_query
@@ -1681,16 +1739,19 @@ class SkeletonCompressor:
 
         budgets = self._section_budgets(sections, max_chars, context_query)
 
-        # Build sections: heading + first content lines up to the budget.
-        parts: list[str] = []
+        # Build sections: heading + first content lines up to the per-section
+        # budget. Keep the per-section line lists (not pre-joined) so the
+        # degraded path can shed body and whole heading lines independently.
+        kept_sections: list[list[str]] = []
         total_body_trimmed = 0
+        total_body_chars = 0
         for (heading, body_lines), budget in zip(sections, budgets):
-            # Always keep the heading
-            kept = [heading]
+            kept = [heading]  # always keep the heading
             kept_chars = len(heading)
 
             # Measure total body content (non-empty, non-heading lines)
             section_body_chars = sum(len(ln) for ln in body_lines)
+            total_body_chars += section_body_chars
 
             # Add content lines until per-section budget
             for line in body_lines:
@@ -1699,21 +1760,20 @@ class SkeletonCompressor:
                 kept.append(line)
                 kept_chars += len(line) + 1
 
-            kept_body_chars = kept_chars - len(heading)
-            total_body_trimmed += max(0, section_body_chars - kept_body_chars)
+            total_body_trimmed += max(0, section_body_chars - (kept_chars - len(heading)))
+            kept_sections.append(kept)
 
-            parts.append("\n".join(kept))
+        result = "\n\n".join("\n".join(kept) for kept in kept_sections)
+        result += self._footer(len(text), total_body_trimmed, len(headings))
+        if len(result) <= max_chars:
+            return result
 
-        result = "\n\n".join(parts)
-        result += (
-            f"\n(skeleton — {len(text)} chars original"
-            f", {total_body_trimmed} body_trimmed_chars"
-            f", {len(headings)} sections)"
+        # The assembled skeleton overshoots the budget. Degrade gracefully
+        # rather than ``result[:max_chars]`` (which dropped trailing headings,
+        # cut a heading mid-line, and sliced the footer marker).
+        return self._fit_skeleton(
+            sections, budgets, len(text), len(headings), total_body_chars, max_chars
         )
-
-        if len(result) > max_chars:
-            result = result[:max_chars]
-        return result
 
     def _section_budgets(
         self,
@@ -1751,6 +1811,143 @@ class SkeletonCompressor:
         floor = 60
         remainder = max(0, content_budget - floor * n)
         return [floor + int(remainder * s / total) for s in scores]
+
+    @staticmethod
+    def _footer(text_len: int, body_trimmed: int, num_headings: int) -> str:
+        """The trailing skeleton-metadata line, kept verbatim in every tier."""
+        return (
+            f"\n(skeleton — {text_len} chars original"
+            f", {body_trimmed} body_trimmed_chars"
+            f", {num_headings} sections)"
+        )
+
+    @staticmethod
+    def _omitted_marker(omitted: int, total: int) -> str:
+        """Marker line recording whole sections dropped under budget pressure."""
+        return f"\n... ({omitted} of {total} sections omitted)"
+
+    @staticmethod
+    def _heading_prefix(headings: list[str], sep: str, max_chars: int, reserve: int) -> int:
+        """Count of leading WHOLE heading lines that fit in ``max_chars`` once
+        ``reserve`` bytes are set aside for a trailing marker/footer."""
+        used = 0
+        kept = 0
+        for i, heading in enumerate(headings):
+            add = len(heading) + (len(sep) if i > 0 else 0)
+            if used + add + reserve > max_chars:
+                break
+            used += add
+            kept += 1
+        return kept
+
+    def _fit_skeleton(
+        self,
+        sections: list[tuple[str, list[str]]],
+        budgets: list[int],
+        text_len: int,
+        num_headings: int,
+        total_body_chars: int,
+        max_chars: int,
+    ) -> str:
+        """Assemble the skeleton within ``max_chars`` preserving WHOLE headings.
+
+        Replaces the old ``result[:max_chars]`` slice, which dropped trailing
+        headings, cut a heading mid-line, and truncated the footer — violating
+        the class's "every heading survives" contract. The footer is metadata,
+        secondary to heading preservation, so it is best-effort (appended only
+        when it still fits); the omission marker — the only piece carrying the
+        heading-drop accounting — is reserved with a constant width so the
+        kept-heading count is monotonic in the budget (a shrinking budget never
+        frees reserved bytes for *more* headings).
+
+        * **All headings fit** (``all_headings_len <= max_chars``): keep every
+          heading (the primary contract), refill body lines up to the RAW budget
+          (the footer is NOT reserved, so it never preempts a body line — else a
+          larger budget that first admits the footer would drop content), then
+          append the footer only if it fits in whatever slack is left.
+        * **Partial** (the bare heading lines overflow): keep the longest prefix
+          of WHOLE heading lines — reserving room for the ``... (N of M sections
+          omitted)`` marker but NOT the footer — then append the marker, and the
+          footer too if it additionally fits.
+        * **Floor** — a budget below one heading + marker: the whole first
+          heading when it fits, else a last-resort hard slice (mirroring
+          ``TruncateCompressor._fit_with_footer``). Below a single heading's
+          width is a budget the retention ladder never produces.
+
+        The marker reserve uses its widest possible width (max-digit counts), so
+        the actual — never wider — fits; the footer is always appended by an
+        explicit fit check. ``len(output) <= max(0, max_chars)`` holds by
+        construction.
+        """
+        headings = [heading for heading, _ in sections]
+        sep = "\n\n"
+        marker_reserve = len(self._omitted_marker(num_headings, num_headings))
+        all_headings_len = sum(len(h) for h in headings) + len(sep) * (num_headings - 1)
+
+        # All headings fit: keep every one (heading preservation outranks the
+        # metadata footer). Refill bodies up to the RAW budget — the footer is
+        # best-effort and must never preempt body lines, or a larger budget that
+        # first admits the footer would drop content (non-monotonic). The footer
+        # is appended afterwards only if it fits in whatever slack remains.
+        if all_headings_len <= max_chars:
+            kept_lines: list[list[str]] = [[h] for h in headings]
+            kept_chars = [len(h) for h in headings]
+            running = all_headings_len
+            # Layered refill: add EVERY section's first body line before any
+            # section's second, so the skeleton keeps "heading + first content
+            # line per section" rather than letting early sections spend the
+            # global slack on extra lines and starve later sections. A section
+            # whose next line does not fit (its per-section budget or the global
+            # budget) keeps its contiguous prefix and is skipped thereafter.
+            max_body = max((len(body_lines) for _, body_lines in sections), default=0)
+            for layer in range(max_body):
+                progressed = False
+                for idx, (_heading, body_lines) in enumerate(sections):
+                    if layer >= len(body_lines) or len(kept_lines[idx]) - 1 != layer:
+                        continue
+                    line = body_lines[layer]
+                    if kept_chars[idx] + len(line) + 1 > budgets[idx]:
+                        continue  # this section's per-section budget is full
+                    if running + len(line) + 1 > max_chars:
+                        continue  # a line this size no longer fits the budget
+                    kept_lines[idx].append(line)
+                    kept_chars[idx] += len(line) + 1
+                    running += len(line) + 1
+                    progressed = True
+                # A layer that adds nothing means no section can advance to the
+                # next layer (a section only becomes eligible by growing here),
+                # so every later layer is a no-op — stop instead of scanning them.
+                if not progressed:
+                    break
+            # Same per-section accounting as the fits-case build above
+            # (``kept_chars[idx] - len(heading)`` counts each kept body line's
+            # joining newline), so body_trimmed_chars is identical across paths.
+            body_trimmed = sum(
+                max(0, sum(len(ln) for ln in body_lines) - (kept_chars[idx] - len(headings[idx])))
+                for idx, (_heading, body_lines) in enumerate(sections)
+            )
+            body = sep.join("\n".join(lines) for lines in kept_lines)
+            footer = self._footer(text_len, body_trimmed, num_headings)
+            return body + footer if running + len(footer) <= max_chars else body
+
+        # Partial: keep the longest whole-heading prefix, reserving room ONLY for
+        # the omission marker (a constant, budget-independent reserve, so the
+        # kept-heading count never rises as the budget falls). Append the marker,
+        # then the footer too if it additionally fits.
+        kept = self._heading_prefix(headings, sep, max_chars, marker_reserve)
+        if kept >= 1:
+            out = sep.join(headings[:kept]) + self._omitted_marker(
+                num_headings - kept, num_headings
+            )
+            footer = self._footer(text_len, total_body_chars, num_headings)
+            if len(out) + len(footer) <= max_chars:
+                out += footer
+            return out
+
+        # Floor: not even one heading + marker fits. ``headings[0][:max_chars]``
+        # is the whole first heading when it fits, and a hard slice only below a
+        # single heading's width — a budget the retention ladder never produces.
+        return (headings[0] if headings else "")[: max(0, max_chars)]
 
 
 class LLMCompressor:
@@ -2162,7 +2359,7 @@ def auto_select_strategy(text: str, *, max_chars: int = 0) -> CompressionStrateg
     # JSON detection
     if stripped[0] in "{[":
         try:
-            data = json.loads(stripped)
+            data = _mm_json_loads(stripped)
             if isinstance(data, list) and len(data) >= 20:
                 return CompressionStrategy.SCHEMA_PRUNING
             if isinstance(data, dict):

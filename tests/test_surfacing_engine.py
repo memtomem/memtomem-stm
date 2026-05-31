@@ -726,6 +726,29 @@ class TestFeedbackBoost:
         # so a future call can retry the boost.
         assert "sid-5" not in engine._boosted_event_ids
 
+    async def test_boost_timeout_does_not_break_feedback(self):
+        """A stalled LTM boost must not stall feedback recording indefinitely."""
+        adapter = _make_mcp_adapter([])
+
+        async def stalled_increment(_ids):
+            await asyncio.sleep(60)
+
+        adapter.increment_access = AsyncMock(side_effect=stalled_increment)
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.01),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback("sid-timeout", "helpful", memory_id="mid-A")
+
+        assert "Feedback recorded" in result
+        adapter.increment_access.assert_awaited_once_with(["mid-A"])
+        # Timeout is treated like any other failed best-effort boost: release
+        # the guard so a later feedback call can retry.
+        assert "sid-timeout" not in engine._boosted_event_ids
+
     async def test_no_boost_when_event_has_no_memories(self):
         """When the surfacing event has no memories, skip the call entirely."""
         adapter = _make_mcp_adapter([])
@@ -887,6 +910,32 @@ class TestHandleFeedbackBatch:
         )
 
         adapter.increment_access.assert_awaited_once_with(["mid-A", "mid-B"])
+
+    async def test_batched_boost_timeout_does_not_break_feedback(self):
+        adapter = _make_mcp_adapter([])
+
+        async def stalled_increment(_ids):
+            await asyncio.sleep(60)
+
+        adapter.increment_access = AsyncMock(side_effect=stalled_increment)
+        tracker = self._make_tracker(memory_ids=["mid-A", "mid-B"])
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.01),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        result = await engine.handle_feedback_batch(
+            "sid-batch-timeout",
+            [
+                {"memory_id": "mid-A", "rating": "helpful"},
+                {"memory_id": "mid-B", "rating": "helpful"},
+            ],
+        )
+
+        assert "2/2 entries" in result
+        adapter.increment_access.assert_awaited_once_with(["mid-A", "mid-B"])
+        assert "sid-batch-timeout" not in engine._boosted_event_ids
 
     async def test_per_event_boost_guard_blocks_batched_after_single(self):
         """A single-call ``helpful`` first claims the guard; a subsequent
@@ -1795,6 +1844,58 @@ class TestPerToolMinScoreOverride:
         assert "barely any score" in out, (
             "per-tool min_score=0.0 must be respected (is-not-None, not truthy)"
         )
+
+    async def test_per_tool_override_drives_bucket_floor(self):
+        """Bucket labels must use the same per-tool floor that filtered results."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        config = _make_config(
+            auto_tune_enabled=False,
+            min_score=0.03,
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.6)},
+        )
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(content="near override floor"), score=0.70)]
+            ),
+        )
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "[weak]: near override floor" in out
+        assert "[strong]: near override floor" not in out
+
+    async def test_auto_tuned_min_score_drives_bucket_floor(self, tmp_path: Path):
+        """Bucket labels must use the adjusted AutoTuner floor, not the global default."""
+        config = _make_config(
+            auto_tune_enabled=True,
+            auto_tune_min_samples=3,
+            auto_tune_score_ceiling=0.6,
+            auto_tune_score_increment=0.57,
+            min_score=0.03,
+        )
+        tracker = self._make_tracker(tmp_path, config)
+        try:
+            tracker.store.record_surfacing("seed-auto", "gh", "read_file", "q", ["m1"], [0.5])
+            for _ in range(5):
+                tracker.store.record_feedback("seed-auto", "not_relevant")
+
+            engine = SurfacingEngine(
+                config=config,
+                mcp_adapter=_make_mcp_adapter(
+                    [FakeSearchResult(chunk=FakeChunk(content="near tuned floor"), score=0.70)]
+                ),
+                feedback_tracker=tracker,
+            )
+
+            out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.6
+            assert "[weak]: near tuned floor" in out
+            assert "[strong]: near tuned floor" not in out
+        finally:
+            tracker.close()
 
 
 class TestSurfacingEngineObservability:

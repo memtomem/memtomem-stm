@@ -43,6 +43,85 @@ def _result_with_text(text: str):
     return r
 
 
+# ── LTM transport selection (#297) ───────────────────────────────────────
+
+
+class TestLtmTransportSelection:
+    def test_stdio_transport_uses_command_and_args(self, monkeypatch):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        captured = {}
+        sentinel = object()
+
+        def fake_stdio_client(params):
+            captured["command"] = params.command
+            captured["args"] = params.args
+            return sentinel
+
+        monkeypatch.setattr(mod, "stdio_client", fake_stdio_client)
+
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(ltm_mcp_command="memtomem-dev", ltm_mcp_args=["--debug"])
+        )
+
+        assert adapter._open_transport() is sentinel
+        assert captured == {"command": "memtomem-dev", "args": ["--debug"]}
+
+    def test_sse_transport_uses_url_and_headers(self, monkeypatch):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        captured = {}
+        sentinel = object()
+
+        def fake_sse_client(url, *, headers=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            return sentinel
+
+        monkeypatch.setattr(mod, "sse_client", fake_sse_client)
+
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(
+                ltm_mcp_transport="sse",
+                ltm_mcp_url="https://ltm.example/sse",
+                ltm_mcp_headers={"Authorization": "Bearer token"},
+            )
+        )
+
+        assert adapter._open_transport() is sentinel
+        assert captured == {
+            "url": "https://ltm.example/sse",
+            "headers": {"Authorization": "Bearer token"},
+        }
+
+    def test_streamable_http_transport_uses_url_and_headers(self, monkeypatch):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        captured = {}
+        sentinel = object()
+
+        def fake_streamablehttp_client(url, *, headers=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            return sentinel
+
+        monkeypatch.setattr(mod, "streamablehttp_client", fake_streamablehttp_client)
+
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(
+                ltm_mcp_transport="streamable_http",
+                ltm_mcp_url="https://ltm.example/mcp",
+                ltm_mcp_headers={"X-Project": "stm"},
+            )
+        )
+
+        assert adapter._open_transport() is sentinel
+        assert captured == {
+            "url": "https://ltm.example/mcp",
+            "headers": {"X-Project": "stm"},
+        }
+
+
 # ── Reconnect retry paths ────────────────────────────────────────────────
 
 

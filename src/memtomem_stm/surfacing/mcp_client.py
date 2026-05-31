@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from mcp import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -219,7 +221,7 @@ _compact_parser = CompactResultParser()
 
 
 class McpClientSearchAdapter:
-    """Connects to a memtomem MCP server via stdio and calls mem_search.
+    """Connects to a memtomem MCP server and calls mem_search.
 
     Implements enough of the SearchPipeline interface for SurfacingEngine.
     """
@@ -253,18 +255,15 @@ class McpClientSearchAdapter:
         stack = AsyncExitStack()
         self._stack = stack
         try:
-            # #297: LTM transport is currently stdio-only. Adding SSE /
-            # streamable HTTP means giving SurfacingConfig a transport field
-            # and branching here, mirroring ``ProxyManager._open_transport``.
-            params = StdioServerParameters(
-                command=self._config.ltm_mcp_command,
-                args=self._config.ltm_mcp_args,
-            )
-            transport = stdio_client(params)
+            transport = self._open_transport()
             streams = await stack.enter_async_context(transport)
             self._session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
             await self._session.initialize()
-            logger.info("MCP client connected to memtomem server: %s", self._config.ltm_mcp_command)
+            logger.info(
+                "MCP client connected to memtomem server via %s: %s",
+                self._config.ltm_mcp_transport,
+                self._target_display(),
+            )
             await self._negotiate_format()
         except BaseException:
             # Roll back any contexts we entered (transport subprocess, session
@@ -277,6 +276,30 @@ class McpClientSearchAdapter:
             self._stack = None
             self._session = None
             raise
+
+    def _open_transport(self):  # noqa: ANN201
+        match self._config.ltm_mcp_transport:
+            case "sse":
+                return sse_client(
+                    self._config.ltm_mcp_url,
+                    headers=self._config.ltm_mcp_headers,
+                )
+            case "streamable_http":
+                return streamablehttp_client(
+                    self._config.ltm_mcp_url,
+                    headers=self._config.ltm_mcp_headers,
+                )
+            case _:
+                params = StdioServerParameters(
+                    command=self._config.ltm_mcp_command,
+                    args=self._config.ltm_mcp_args,
+                )
+                return stdio_client(params)
+
+    def _target_display(self) -> str:
+        if self._config.ltm_mcp_transport == "stdio":
+            return self._config.ltm_mcp_command
+        return self._config.ltm_mcp_url
 
     async def _negotiate_format(self) -> None:
         """Downgrade to compact if core doesn't advertise structured support.
@@ -317,7 +340,11 @@ class McpClientSearchAdapter:
 
     async def _reconnect(self) -> None:
         """Tear down and re-establish the MCP connection."""
-        logger.info("Attempting MCP adapter reconnect to %s", self._config.ltm_mcp_command)
+        logger.info(
+            "Attempting MCP adapter reconnect via %s to %s",
+            self._config.ltm_mcp_transport,
+            self._target_display(),
+        )
         try:
             await self.stop()
         except Exception:
