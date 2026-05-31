@@ -1278,15 +1278,23 @@ class FieldExtractCompressor:
                     out[k] = stub[k]
             return out
 
-        # Largest FULL-value prefix (in priority order) that fits; the rest stay
-        # stubs. ``frame`` length is non-decreasing in ``n_full`` (a full value is
-        # never shorter than its stub), so the first overflow ends the prefix.
+        # Largest FULL-value prefix (in priority order) that fits. ``frame`` length
+        # is NOT monotone in the prefix count: a small container's full form is
+        # SHORTER than its ``{N items}`` / ``{N keys}`` stub, so a longer prefix can
+        # fit after a shorter one overflows — we must take the MAX fitting prefix,
+        # not stop at the first overflow. ``frame(n)`` only swaps a value's stub for
+        # its full form (key + framing unchanged), so its length is the skeleton's
+        # length plus the running (full - stub) deltas; track that in O(n) instead of
+        # re-serializing each candidate. (No fitting prefix is missed: if a prefix
+        # longer than the max fit, the max would not be the max.)
+        skeleton_len = len(dump(stub))
+        running = skeleton_len
         n_full = 0
         for n in range(1, len(items) + 1):
-            if len(dump(frame(n, None, None))) <= max_chars:
+            k, v = items[order[n - 1]]
+            running += len(dump(v)) - len(dump(stub[k]))
+            if running <= max_chars:
                 n_full = n
-            else:
-                break
         if n_full >= len(items):
             return dump(frame(n_full, None, None))  # every value full
 

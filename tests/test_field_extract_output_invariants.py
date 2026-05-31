@@ -794,3 +794,18 @@ def test_dict_oversized_scalar_ranked_last_preserves_short_siblings() -> None:
     assert parsed["name"] == "Alice"
     assert parsed["flag"] is True
     assert parsed["blob"] != "x" * 500  # the huge value is the one that degrades
+
+
+def test_dict_small_container_full_fits_after_larger_prefix_overflows() -> None:
+    """The full-prefix search must take the MAX fitting prefix, not stop at the
+    first overflow: a small container's FULL form is SHORTER than its ``{N items}``
+    stub, so a longer prefix can fit after a shorter one overflows. Here both ``a``
+    and ``b`` fit fully at a budget where the (b-stub) prefix-of-1 overflows — the
+    early-break search wrongly stubbed ``b``."""
+    c = FieldExtractCompressor()
+    data = {"a": [0, 1, 2, 3], "b": [0], "blob": "x" * 100}
+    out = c._fit_extracted(data, 48)
+    parsed = json.loads(out)
+    assert len(out) <= 48
+    assert parsed["a"] == [0, 1, 2, 3]
+    assert parsed["b"] == [0]  # the small container survives FULL, not "[1 items]"
