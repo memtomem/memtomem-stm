@@ -7,7 +7,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [0.1.24] — 2026-05-31
 
-This release extends proactive memory surfacing to **Claude Code's built-in tools** through `mms hook` and a warm background daemon, adds a **network transport** for the LTM connection, makes response **compression query-aware and provably valid** (every tier now returns within-budget, strictly-valid JSON that degrades monotonically), and lands a broad surfacing-quality pass — relevance buckets, persisted auto-tuning, richer feedback ratings — alongside several query-privacy controls.
+This release extends proactive memory surfacing to **Claude Code's built-in tools** through `mms hook` and a warm background daemon, adds a **network transport** for the LTM connection, makes response **compression query-aware and its JSON tiers safer** (the JSON-emitting tiers now return strictly-valid JSON and degrade monotonically, staying within budget except SELECTIVE's documented zero-preview-floor exception), and lands a broad surfacing-quality pass — relevance buckets, persisted auto-tuning, richer feedback ratings — alongside several query-privacy controls.
 
 Citations are the merged PR numbers; an `issue #N` reference is added for source-issue traceability where one exists.
 
@@ -34,7 +34,7 @@ Citations are the merged PR numbers; an `issue #N` reference is added for source
 
 ### Fixed
 
-- **Every compression tier returns valid, within-budget, monotonic output** (#384, #390, #395, #396, #397, #401, #402, #403, #405, #406, #407) — held Truncate invariants; routed multi-array dicts to SCHEMA_PRUNING by summed length; valid-JSON, budget-filling final tiers for SchemaPruning / FieldExtract / Skeleton; NaN/Infinity sanitized to `null`; Hybrid overshoot falls back structurally instead of raw-slicing JSON; standalone SELECTIVE shrinks previews rather than dropping entries; and the FieldExtract final tier + `_compress_json` router degrade monotonically.
+- **Compression tiers degrade safely — valid output, monotonic, budget-aware** (#384, #390, #395, #396, #397, #401, #402, #403, #405, #406, #407) — held Truncate invariants (len≤max_chars, valid JSON, preserved content); routed multi-array dicts to SCHEMA_PRUNING by summed length; budget-filling, monotonic final tiers for SchemaPruning and FieldExtract (valid JSON) and Skeleton (valid, heading-preserving — not JSON); NaN/Infinity sanitized to `null` so the JSON tiers stay strictly parseable; Hybrid overshoot falls back structurally instead of raw-slicing JSON; standalone SELECTIVE shrinks previews rather than dropping entries (its two-phase TOC may still exceed budget at the zero-preview floor — the documented trade-off); and the FieldExtract final tier + `_compress_json` router degrade monotonically.
 - **Compression retention ladder** (#385) — unified heading detection, re-checked the truncate-fallback ratio, and threaded `context_query` through the ladder.
 - **Surfacing query extraction + dedup** (#387, #388, #389) — tokenized Grep/Glob patterns and stabilized query extraction, matched `write_tool_patterns` against the full `server__tool` name, and reclaimed cache-hit memory IDs into the session-dedup set.
 - **Repeated negative feedback locally demotes memories** (#404) — memories with repeated `not_relevant` / `already_known` across distinct events are filtered before injection (STM-side only; configurable via `feedback_demotion_enabled` / threshold).
