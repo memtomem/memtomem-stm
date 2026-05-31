@@ -235,6 +235,146 @@ def test_marker_does_not_clobber_real_truncated_key_in_dropped_tail() -> None:
         assert "keys omitted" not in str(parsed["_truncated"])
 
 
+def test_list_fit_reserves_space_for_omission_marker() -> None:
+    """A tight list budget must prefer fewer leading items plus an omitted-count
+    marker over silently returning a longer prefix with no marker."""
+    payload = json.dumps([{"a": 1} for _ in range(1000)])
+    out = FieldExtractCompressor().compress(payload, max_chars=50)
+    parsed = json.loads(out)
+    marker = next(e for e in parsed if isinstance(e, str) and "items omitted" in e)
+    assert len(out) <= 50
+    assert parsed[0] == {"a": 1}
+    assert "999 of 1000 items omitted" in marker
+
+
+def test_list_fit_allows_exact_marker_fit() -> None:
+    """The marker budget check must use exact JSON length: marker-only output
+    can fit exactly when item-plus-marker cannot."""
+    payload = json.dumps([{"a": 1} for _ in range(1000)])
+    out = FieldExtractCompressor().compress(payload, max_chars=36)
+    parsed = json.loads(out)
+    assert len(out) == 36
+    assert parsed == ["... (1000 of 1000 items omitted)"]
+
+
+def test_list_fit_preserves_truncated_item_before_marker() -> None:
+    """If a smaller first item plus marker fits, keep that leading content
+    instead of dropping straight to marker-only output."""
+    payload = json.dumps(["x" * 1000 for _ in range(100)])
+    out = FieldExtractCompressor().compress(payload, max_chars=100)
+    parsed = json.loads(out)
+    assert len(out) <= 100
+    assert len(parsed) == 2
+    assert parsed[0].startswith("x")
+    assert parsed[0].endswith("...")
+    assert parsed[1] == "... (99 of 100 items omitted)"
+
+
+def test_list_fit_keeps_small_items_when_marker_is_too_large() -> None:
+    """A marker that cannot fit must not prevent later small items from being
+    considered when the list itself can still fit."""
+    assert FieldExtractCompressor()._take([1, 2], 6) == [1, 2]
+
+
+def test_take_keeps_full_container_when_it_fits() -> None:
+    """A fitting container must never be replaced by a longer omission marker."""
+    comp = FieldExtractCompressor()
+    cases = [
+        ([1, 2], 30),
+        ({"a": 1, "b": 2}, 40),
+        ([[1, 2]], 32),
+        ({"x": {"a": 1, "b": 2}}, 44),
+    ]
+    for value, budget in cases:
+        assert len(json.dumps(value, ensure_ascii=False)) <= budget
+        assert comp._take(value, budget) == value
+
+
+def test_dict_fit_reserves_space_for_omission_marker() -> None:
+    """Nested dict fitting must prefer an omitted-count marker over silently
+    returning a longer key prefix with no marker."""
+    payload = json.dumps(
+        {"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"}
+    )
+    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    parsed = json.loads(out)
+    outer = parsed["outer"]
+    marker = outer.get("_truncated", "")
+    retained = len([k for k in outer if k != "_truncated"])
+    omitted = int(marker.split(" of ")[0])
+    assert len(out) <= 80
+    assert parsed["id"] == "abc"
+    assert omitted + retained == 1000
+
+
+def test_dict_fit_allows_exact_marker_fit() -> None:
+    """Dict marker checks use exact JSON length, so marker-only output can fit
+    exactly when key-plus-marker cannot."""
+    data = {f"k{i}": {"a": 1} for i in range(1000)}
+    out = FieldExtractCompressor()._take(data, 43)
+    assert len(json.dumps(out, ensure_ascii=False)) == 43
+    assert out == {"_truncated": "1000 of 1000 keys omitted"}
+
+
+def test_later_short_scalars_survive_after_long_scalar() -> None:
+    """Long early scalar values must not consume the whole enrichment budget
+    before later short identifiers get restored from their stubs."""
+    payload = json.dumps({"description": "x" * 10_000, "id": "abc", "name": "Alice"})
+    out = FieldExtractCompressor().compress(payload, max_chars=100)
+    parsed = json.loads(out)
+    assert len(out) <= 100
+    assert parsed["id"] == "abc"
+    assert parsed["name"] == "Alice"
+    assert parsed["description"]
+
+
+def test_later_short_scalars_survive_after_medium_scalar() -> None:
+    """Even when an early scalar fits whole by itself, shorter later scalars get
+    first claim and the early value is trimmed if necessary."""
+    payload = json.dumps({"description": "x" * 55, "id": "abc", "name": "Alice"})
+    out = FieldExtractCompressor().compress(payload, max_chars=100)
+    parsed = json.loads(out)
+    assert len(out) <= 100
+    assert parsed["id"] == "abc"
+    assert parsed["name"] == "Alice"
+    assert parsed["description"].endswith("...")
+
+
+def test_oversized_non_string_scalar_stub_does_not_hide_later_keys() -> None:
+    """Huge numeric literals are bounded at the skeleton layer so other keys
+    can survive instead of collapsing the whole dict to a marker."""
+    payload = '{"huge": ' + ("1" * 1000) + ', "id": "abc"}'
+    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    parsed = json.loads(out)
+    assert len(out) <= 80
+    assert "huge" in parsed
+    assert parsed["id"] == "abc"
+
+
+def test_nested_oversized_non_string_scalar_stub_preserves_later_keys() -> None:
+    """The same scalar bound applies inside recursive _take() paths, not just
+    top-level skeletons."""
+    payload = '{"outer": {"huge": ' + ("1" * 1000) + ', "id": "abc"}, "name": "foo"}'
+    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    parsed = json.loads(out)
+    assert len(out) <= 80
+    assert parsed["outer"]["huge"] == ""
+    assert parsed["outer"]["id"] == "abc"
+    assert parsed["name"] == "foo"
+
+
+def test_nested_array_oversized_non_string_scalar_stub_preserves_later_keys() -> None:
+    """Objects inside arrays also keep short fields when a huge scalar is
+    bounded to a stub."""
+    payload = '{"items": [{"huge": ' + ("1" * 1000) + ', "id": "abc"}], "name": "foo"}'
+    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    parsed = json.loads(out)
+    assert len(out) <= 80
+    assert parsed["items"][0]["huge"] == ""
+    assert parsed["items"][0]["id"] == "abc"
+    assert parsed["name"] == "foo"
+
+
 # ── E2. Budget-fill: no collapse cliff, keep leading full-length values ───────
 
 
