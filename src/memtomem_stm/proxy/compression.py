@@ -960,24 +960,37 @@ class FieldExtractCompressor:
 
     def _compress_json(self, data: object, max_chars: int) -> str:
         if isinstance(data, dict):
-            summary = self._extract_dict(data, max_chars)
-            result = json.dumps(summary, ensure_ascii=False, indent=2)
+            preview: object = self._extract_dict(data, max_chars)
         elif isinstance(data, list):
-            preview_n = min(5, len(data))
-            preview: list[object] = []
-            for item in data[:preview_n]:
-                if isinstance(item, dict):
-                    preview.append(self._preview_dict(item))
-                else:
-                    preview.append(item)
-            result = json.dumps(preview, ensure_ascii=False, indent=2)
-            if len(data) > preview_n:
-                result += f"\n... ({len(data)} items total, showing first {preview_n})"
+            preview = self._preview_list(data)
         else:
-            result = json.dumps(data, ensure_ascii=False)
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (truncated)"
-        return result
+            preview = data
+        indent = 2 if isinstance(data, (dict, list)) else None
+        result = json.dumps(preview, ensure_ascii=False, indent=indent)
+        if len(result) <= max_chars:
+            return result
+        # Final tier: emit VALID JSON within budget. The old
+        # ``result[:max_chars] + "\n... (truncated)"`` overshot the budget by the
+        # suffix length AND cut the JSON mid-token (invalid output); a top-level
+        # array additionally appended a non-JSON text marker. ``_fit_extracted``
+        # re-derives a valid, within-budget form from the original data.
+        return self._fit_extracted(data, max_chars)
+
+    def _preview_list(self, data: list) -> list[object]:
+        """Head preview of a top-level array as VALID JSON: the first items, then
+        an in-array omitted-count marker (an extra string element). The pre-fix
+        code appended ``"\\n... (N items total ...)"`` as text *after*
+        ``json.dumps``, which left the whole output unparseable for any array
+        over the 5-item preview."""
+        n = len(data)
+        preview_n = min(5, n)
+        preview: list[object] = [
+            self._preview_dict(item) if isinstance(item, dict) else item
+            for item in data[:preview_n]
+        ]
+        if n > preview_n:
+            preview.append(f"... ({n - preview_n} of {n} items omitted)")
+        return preview
 
     def _extract_dict(self, data: dict, budget: int) -> dict:
         """Budget-aware recursive dict extraction — preserves all keys with depth.
@@ -1066,10 +1079,260 @@ class FieldExtractCompressor:
             preview[f"...{remaining} more"] = "..."
         return preview
 
+    def _take(self, value: object, budget: int) -> object:
+        """Greedy prefix-fill: keep the leading, full-detail content of ``value``
+        whose serialized cost fits ``budget`` (COMPACT) chars, dropping the tail
+        into a valid omitted-count marker (an extra ``_truncated`` dict member or
+        an in-array string element, counted against the ORIGINAL length).
+
+        STRICT budget for containers: ``len(json.dumps(_take(value, b))) <= b``
+        always — every child (including the first) is gated, and a child is
+        accepted only if it still fits, so a caller can hand ``_take`` the hard
+        ``max_chars`` directly and trust the result. Leading full-length scalars
+        (names, ids, roles) survive untouched — only a boundary string is ever
+        truncated. A non-string scalar is returned whole when its literal fits,
+        otherwise it becomes the scalar stub ``""`` so sibling keys can still
+        survive.
+        """
+        if isinstance(value, str):
+            if len(value) + 2 <= budget:  # +2 for the surrounding quotes
+                return value
+            keep = budget - 5  # quotes (2) + "..." (3)
+            return value[:keep] + "..." if keep > 0 else ""
+        if not isinstance(value, (dict, list)):
+            literal = json.dumps(value, ensure_ascii=False)
+            return value if len(literal) <= budget else ""
+
+        if len(json.dumps(value, ensure_ascii=False)) <= budget:
+            return value
+
+        # Collision-safe marker key, checked against ALL original keys (a real
+        # "_truncated" key can be in the *dropped* tail, invisible to ``out``).
+        marker_key = "_truncated"
+        if isinstance(value, dict):
+            is_dict = True
+            items: list = list(value.items())
+            existing = set(value)
+            while marker_key in existing:
+                marker_key += "_"
+        else:
+            is_dict = False
+            items = list(enumerate(value))
+        n = len(items)
+
+        if not is_dict:
+            out_list: list = []
+
+            def list_fits(candidate: list) -> bool:
+                return len(json.dumps(candidate, ensure_ascii=False)) <= budget
+
+            def is_starved(child: object, source: object) -> bool:
+                if child == "" and not isinstance(source, (dict, list, str)):
+                    return False
+                return child in ({}, [], "") and source not in (None, {}, [], "", 0, False)
+
+            def best_child(source: object, suffix: list[str]) -> object | None:
+                lo, hi, best = 0, budget, None
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    child = self._take(source, mid)
+                    if list_fits(out_list + [child] + suffix):
+                        best, lo = child, mid + 1
+                    else:
+                        hi = mid - 1
+                return best
+
+            for i, (_k, v) in enumerate(items):
+                marker_after = f"... ({n - i - 1} of {n} items omitted)" if i < n - 1 else None
+                child = best_child(v, [marker_after] if marker_after else [])
+                if child is None or is_starved(child, v):
+                    marker = f"... ({n - i} of {n} items omitted)"
+                    if list_fits(out_list + [marker]):
+                        out_list.append(marker)
+                    else:
+                        child = best_child(v, [])
+                        if child is not None and not is_starved(child, v):
+                            out_list.append(child)
+                            continue
+                    break
+                out_list.append(child)
+            return out_list
+
+        out_dict: dict = {}
+
+        def dict_fits(candidate: dict) -> bool:
+            return len(json.dumps(candidate, ensure_ascii=False)) <= budget
+
+        def dict_starved(child: object, source: object) -> bool:
+            if child == "" and not isinstance(source, (dict, list, str)):
+                return False
+            return child in ({}, [], "") and source not in (None, {}, [], "", 0, False)
+
+        def best_value(key: object, source: object, suffix: dict[str, str]) -> object | None:
+            lo, hi, best = 0, budget, None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                child = self._take(source, mid)
+                candidate = dict(out_dict)
+                candidate[key] = child
+                candidate.update(suffix)
+                if dict_fits(candidate):
+                    best, lo = child, mid + 1
+                else:
+                    hi = mid - 1
+            return best
+
+        for i, (k, v) in enumerate(items):
+            marker_after = {marker_key: f"{n - i - 1} of {n} keys omitted"} if i < n - 1 else {}
+            child = best_value(k, v, marker_after)
+            if child is None or dict_starved(child, v):
+                marker = f"{n - i} of {n} keys omitted"
+                candidate = dict(out_dict)
+                candidate[marker_key] = marker
+                if dict_fits(candidate):
+                    out_dict[marker_key] = marker
+                else:
+                    child = best_value(k, v, {})
+                    if child is not None and not dict_starved(child, v):
+                        out_dict[k] = child
+                        continue
+                break
+            out_dict[k] = child
+        return out_dict
+
+    @staticmethod
+    def _stub_value(value: object) -> object:
+        """Smallest placeholder that keeps a key visible: a shape stub for a
+        container, an empty string for a string, the value itself for a small
+        scalar."""
+        if isinstance(value, dict):
+            return f"{{{len(value)} keys}}" if value else {}
+        if isinstance(value, list):
+            return f"[{len(value)} items]" if value else []
+        if isinstance(value, str):
+            return ""
+        if len(json.dumps(value, ensure_ascii=False)) > 80:
+            return ""
+        return value  # int / float / bool / None
+
+    def _fit_extracted(self, data: object, max_chars: int) -> str:
+        """Re-derive a VALID, within-budget form from the ORIGINAL data, filling
+        the budget with as much leading full-detail content as fits.
+
+        Output is COMPACT JSON (no indent) so ``_take``'s compact cost
+        accounting matches the measured length exactly — the exact match makes
+        length monotonic in the soft budget, so the search fills ``max_chars``
+        instead of landing on a collapse cliff.
+
+        Top-level dict: first lay down a *skeleton* — every key with a minimal
+        stub value — so no top-level key vanishes while the budget allows it
+        (FieldExtract's "preserve key structure" contract). Then restore short
+        scalar values first before enriching keys with as much full-detail
+        content (via ``_take``) as the remaining budget allows — values like
+        names/ids/roles survive in full rather than every value being shrunk to
+        a stub.
+        Only when the stubs themselves overflow are trailing keys dropped into a
+        valid collision-safe marker. List / scalar roots binary-search ``_take``
+        directly. Floors to ``{}`` / ``[]`` / ``""`` / ``null``.
+        """
+
+        def dump(obj: object) -> str:
+            return json.dumps(obj, ensure_ascii=False)
+
+        if isinstance(data, dict) and data:
+            items = list(data.items())
+            skeleton = {k: self._stub_value(v) for k, v in items}
+            if len(dump(skeleton)) <= max_chars:
+                # Enrich keys to fill the budget, but enrich SCALARS before
+                # collections (mirrors _extract_dict's scalar-first ordering):
+                # cheap, high-value scalar fields (ids, names, flags) must
+                # survive a tight budget even when large nested sections precede
+                # them in document order. The output dict keeps the original key
+                # order — only the enrichment *priority* is reordered.
+                out = dict(skeleton)
+                scalars = [(k, v) for k, v in items if not isinstance(v, (dict, list))]
+                collections = [(k, v) for k, v in items if isinstance(v, (dict, list))]
+                for k, v in sorted(scalars, key=lambda item: len(dump(item[1]))):
+                    trial = dict(out)
+                    trial[k] = v
+                    if len(dump(trial)) <= max_chars:
+                        out[k] = v
+
+                for k, v in scalars + collections:
+                    if out[k] == v:
+                        continue
+                    lo, hi, best_v = 0, len(dump(v)), out[k]
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        trial = dict(out)
+                        trial[k] = self._take(v, mid)
+                        if len(dump(trial)) <= max_chars:
+                            best_v, lo = trial[k], mid + 1
+                        else:
+                            hi = mid - 1
+                    out[k] = best_v
+                return dump(out)
+
+            # Even the all-stub skeleton overflows — keep the leading keys that
+            # fit + a valid marker. ``len`` is monotonic in ``keep``. The marker
+            # key is checked against ALL original keys, not just the kept prefix:
+            # a real "_truncated" key can sit in the *dropped* tail (invisible to
+            # ``kept``), and reusing its name would clobber/shadow it.
+            existing = set(data)
+            marker = "_truncated"
+            while marker in existing:
+                marker += "_"
+            lo, hi, best = 0, len(items) - 1, None
+            while lo <= hi:
+                keep = (lo + hi) // 2
+                kept = {k: skeleton[k] for k, _ in items[:keep]}
+                kept[marker] = f"{len(items) - keep} of {len(items)} keys omitted"
+                candidate = dump(kept)
+                if len(candidate) <= max_chars:
+                    best, lo = candidate, keep + 1
+                else:
+                    hi = keep - 1
+            return best if best is not None else "{}"
+
+        if not isinstance(data, (dict, list, str)):
+            # Non-string scalar root (number / bool / null). Emit it verbatim
+            # when it fits; otherwise degrade to a truncated STRING of the
+            # literal. Nested oversized scalars use ``_take``'s empty-string stub,
+            # but root scalars should stay visibly truncated rather than
+            # disappearing behind an unlabelled empty value.
+            literal = json.dumps(data, ensure_ascii=False)
+            if len(literal) <= max_chars:
+                return literal
+            for k in range(len(literal), -1, -1):
+                candidate = json.dumps(literal[:k], ensure_ascii=False)
+                if len(candidate) <= max_chars:
+                    return candidate
+            return '""'
+
+        # List or string root: ``_take`` is strict (<= budget) for containers, so
+        # a single call at the hard budget fills it — no search, no cliff.
+        candidate = dump(self._take(data, max_chars))
+        if len(candidate) <= max_chars:
+            return candidate
+
+        # Even the most compact ``_take`` form overflows. Floor to the smallest
+        # valid JSON within budget.
+        if isinstance(data, dict):
+            return "{}"
+        if isinstance(data, list):
+            return "[]"
+        if isinstance(data, str):
+            for k in range(len(data), -1, -1):
+                candidate = json.dumps(data[:k], ensure_ascii=False)
+                if len(candidate) <= max_chars:
+                    return candidate
+            return '""'
+        return '""'
+
     def _compress_text(self, text: str, max_chars: int) -> str:
         lines = text.split("\n")
         if len(lines) <= 10:
-            return text[:max_chars] + "\n... (truncated)" if len(text) > max_chars else text
+            return self._fit_text(text, max_chars)
         head_count = max(3, len(lines) // 10)
         tail_count = max(3, len(lines) // 10)
         head = "\n".join(lines[:head_count])
@@ -1077,9 +1340,20 @@ class FieldExtractCompressor:
         omitted = len(lines) - head_count - tail_count
         summary = _content_summary(text)
         result = f"{head}\n... ({omitted} lines omitted){summary} ...\n{tail}"
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (truncated)"
-        return result
+        return self._fit_text(result, max_chars)
+
+    @staticmethod
+    def _fit_text(text: str, max_chars: int) -> str:
+        """Within-budget text fit. Text has no JSON contract, so a boundary cut
+        is acceptable — but reserve room for the suffix so the result never
+        exceeds ``max_chars`` (the old ``slice + suffix`` overshot by the suffix
+        length)."""
+        if len(text) <= max_chars:
+            return text
+        suffix = "\n... (truncated)"
+        if max_chars < len(suffix):
+            return text[:max_chars]
+        return text[: max_chars - len(suffix)] + suffix
 
 
 class SchemaPruningCompressor:

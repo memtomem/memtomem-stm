@@ -205,9 +205,13 @@ class TestFieldExtractCompressor:
         data = [{"name": f"item{i}", "value": "x" * 50} for i in range(10)]
         text = json.dumps(data)
         c = FieldExtractCompressor()
-        result = c.compress(text, max_chars=100)
-        # Shows preview of first items
+        # Budget large enough to keep the first preview readable as VALID JSON
+        # (a sub-100 budget can only fit the array by shrinking item0's values
+        # to "...", so the output is valid JSON but item0 is no longer literal).
+        result = c.compress(text, max_chars=400)
+        # Shows preview of first items, and the whole output parses as JSON.
         assert "item0" in result
+        json.loads(result)
 
     def test_plain_text_head_tail(self):
         lines = [f"Line {i}" for i in range(100)]
