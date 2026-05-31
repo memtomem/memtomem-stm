@@ -291,18 +291,37 @@ def test_take_keeps_full_container_when_it_fits() -> None:
 
 
 def test_dict_fit_reserves_space_for_omission_marker() -> None:
-    """Nested dict fitting must prefer an omitted-count marker over silently
-    returning a longer key prefix with no marker."""
+    """A partially-shown nested dict keeps retained keys + an omitted-count marker
+    (never a silent prefix). The budget must leave room to retain >= 1 key: when
+    NONE fit, the monotone fill instead collapses the whole nested dict to the
+    compact ``{N keys}`` stub (a smaller, still-explicit omission indicator that —
+    unlike a marker-only dict — never regresses against the stub as the budget
+    grows; see test_dict_fully_omitted_nested_collapses_to_stub)."""
     payload = json.dumps({"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"})
-    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    out = FieldExtractCompressor().compress(payload, max_chars=120)
     parsed = json.loads(out)
     outer = parsed["outer"]
     marker = outer.get("_truncated", "")
     retained = len([k for k in outer if k != "_truncated"])
     omitted = int(marker.split(" of ")[0])
+    assert len(out) <= 120
+    assert parsed["id"] == "abc"
+    assert retained >= 1  # at this budget at least the leading key survives
+    assert omitted + retained == 1000
+
+
+def test_dict_fully_omitted_nested_collapses_to_stub() -> None:
+    """When a nested dict is too big to retain even ONE key, it collapses to the
+    compact ``{N keys}`` stub rather than a marker-only ``{"_truncated": ...}``
+    dict. The stub is smaller AND carries a content leaf, so the fill never
+    regresses from the stub to a larger-but-emptier marker as the budget grows
+    (the monotonicity contract). The sibling ``id`` still survives."""
+    payload = json.dumps({"outer": {f"k{i}": {"a": 1} for i in range(1000)}, "id": "abc"})
+    out = FieldExtractCompressor().compress(payload, max_chars=80)
+    parsed = json.loads(out)
     assert len(out) <= 80
     assert parsed["id"] == "abc"
-    assert omitted + retained == 1000
+    assert parsed["outer"] == "{1000 keys}"  # compact omission indicator, not a marker dict
 
 
 def test_dict_fit_allows_exact_marker_fit() -> None:
@@ -461,18 +480,82 @@ def test_wide_config_dict_routes_to_extract_fields() -> None:
 # ── E3. Monotonicity: a larger budget never shows less content (the 4B fix) ───
 
 
-def _preserved_leaves(obj: object) -> int:
-    """Count preserved original scalar leaves, EXCLUDING omitted-count markers
-    (the dict ``_truncated`` member and the in-array ``... items omitted`` string)."""
-    if isinstance(obj, dict):
-        return sum(
-            _preserved_leaves(v)
-            for k, v in obj.items()
-            if not str(k).startswith("_truncated") and not (isinstance(v, str) and "omitted" in v)
-        )
-    if isinstance(obj, list):
-        return sum(_preserved_leaves(e) for e in obj if not (isinstance(e, str) and "omitted" in e))
-    return 1
+def _preserved_leaves(obj: object, original: object) -> int:
+    """Count preserved ORIGINAL scalar leaves — the true monotonicity metric, scored
+    purely by PROVENANCE against ``original`` (NO string-pattern filters, which can't
+    tell a real ``"[2 items]"`` / ``"... omitted"`` value or a real ``_truncated_x``
+    key from a generated marker or stub).
+
+    An output scalar counts 1 iff it derives from an original scalar — an exact
+    original value, or a ``"…"``-truncated prefix of one. Generated placeholders
+    therefore count 0 automatically (they are absent from ``original``): omitted-count
+    markers, the empty-string / shape stubs from ``_stub_value``, and empty
+    containers. No key/value is skipped by name, so a real key like ``_truncated_x``
+    or a real value containing ``omitted`` is still scored on its own provenance."""
+    strings: set[str] = set()
+
+    def collect(o: object) -> None:
+        if isinstance(o, dict):
+            for v in o.values():
+                collect(v)
+        elif isinstance(o, list):
+            for e in o:
+                collect(e)
+        elif isinstance(o, str):
+            strings.add(o)
+
+    collect(original)
+
+    def derives(s: str) -> bool:
+        if s in strings:
+            return True
+        if not s.endswith("..."):
+            return False
+        prefix = s[:-3]  # a bare "..." has an empty prefix → preserves no source char
+        return bool(prefix) and any(o.startswith(prefix) for o in strings)
+
+    def count(o: object) -> int:
+        if isinstance(o, dict):
+            return sum(count(v) for v in o.values())
+        if isinstance(o, list):
+            return sum(count(e) for e in o)
+        if isinstance(o, str):
+            return 1 if derives(o) else 0
+        return 1  # numbers / bools / None are emitted verbatim, never fabricated
+
+    return count(obj)
+
+
+def test_bare_ellipsis_does_not_count_as_preserved_content() -> None:
+    """A content-free ``"..."`` boundary fill preserves ZERO original characters, so
+    neither the provenance metric nor the runtime guard may treat it as preserved.
+
+    Regression for the empty-prefix bug: ``"..."[:-3] == ""`` and every string
+    ``.startswith("")``, so a bare ``"..."`` was falsely read as a truncated prefix of
+    any source string. An ORIGINAL value that is literally ``"..."`` is still matched
+    by equality and scores 1.
+    """
+    # Metric: a generated bare "..." against a real source scalar -> 0.
+    assert _preserved_leaves({"payload": "..."}, {"payload": "secret"}) == 0
+    # Metric: a genuine "..."-truncated prefix of the source -> 1.
+    assert _preserved_leaves({"payload": "sec..."}, {"payload": "secret"}) == 1
+    # Metric: an original value that is literally "..." -> matched by equality -> 1.
+    assert _preserved_leaves({"payload": "..."}, {"payload": "..."}) == 1
+
+    comp = FieldExtractCompressor()
+    # Runtime guard mirrors the metric on the same cases.
+    assert comp._fill_preserves_source({"payload": "..."}, {"payload": "secret"}) is False
+    assert comp._fill_preserves_source({"payload": "sec..."}, {"payload": "secret"}) is True
+    assert comp._fill_preserves_source({"payload": "..."}, {"payload": "..."}) is True
+
+    # End-to-end (codex's repro): at a tight budget the bulky payload would truncate to
+    # a content-free "..."; the fixed guard rejects that shell in favor of the cheaper
+    # empty stub, so the surviving "id" is the ONLY preserved leaf — never the "...".
+    source = {"id": "abc", "payload": "x" * 100}
+    out = json.loads(comp._fit_extracted(source, 31))
+    assert out["id"] == "abc"
+    assert out["payload"] == ""  # content-free fill dropped to the empty stub
+    assert _preserved_leaves(out, source) == 1  # only "id":"abc", NOT the "..."
 
 
 _LIST_MONO_FIXTURES: dict[str, object] = {
@@ -514,7 +597,7 @@ def test_list_root_content_is_monotone_in_budget(name: str) -> None:
         out = compressor._fit_extracted(data, budget)
         parsed = json.loads(out)  # always valid JSON
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -600,7 +683,7 @@ def test_list_root_monotone_through_router(name: str) -> None:
         out = c._compress_json(data, budget)
         parsed = json.loads(out)  # always valid JSON
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -630,7 +713,7 @@ def test_flat_dict_monotone_through_router(name: str) -> None:
         out = c._compress_json(data, budget)
         parsed = json.loads(out)
         assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
-        leaves = _preserved_leaves(parsed)
+        leaves = _preserved_leaves(parsed, data)
         if prev is not None:
             assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
         prev = leaves
@@ -665,12 +748,12 @@ def test_router_no_longer_prefers_lossy_preview() -> None:
     boundary, for both a list-of-ints and a list-of-dicts root."""
     c = FieldExtractCompressor()
     ints: list[object] = list(range(50))
-    assert _preserved_leaves(json.loads(c._compress_json(ints, 61))) >= _preserved_leaves(
-        json.loads(c._compress_json(ints, 60))
+    assert _preserved_leaves(json.loads(c._compress_json(ints, 61)), ints) >= _preserved_leaves(
+        json.loads(c._compress_json(ints, 60)), ints
     )
     dicts: list[object] = [{"id": i, "name": f"item{i}"} for i in range(100)]
-    assert _preserved_leaves(json.loads(c._compress_json(dicts, 247))) >= _preserved_leaves(
-        json.loads(c._compress_json(dicts, 246))
+    assert _preserved_leaves(json.loads(c._compress_json(dicts, 247)), dicts) >= _preserved_leaves(
+        json.loads(c._compress_json(dicts, 246)), dicts
     )
 
 
@@ -684,3 +767,156 @@ def test_router_emits_whole_value_pretty_when_it_fits() -> None:
     lst = [1, 2, 3]
     out2 = c._compress_json(lst, 100)
     assert "\n" in out2 and json.loads(out2) == lst
+
+
+# ── E5. Monotonicity: the DICT final tier (the dict analog of the 4B list fix) ─
+#
+# The old dict enrich filled the budget with a per-key greedy ``_take`` search.
+# That was non-monotone two ways: (1) ``_take``'s own content flips to a
+# longer-but-emptier marker as its budget grows (the 4B root cause), and (2) the
+# per-key greedy let a growing budget hand an EARLIER key more budget, displacing
+# a LATER key. ``_enrich_dict_monotone`` replaces it with ``_fit_monotone``'s
+# discipline — a growing full-value prefix plus ONE partial boundary, every other
+# key kept as its stub — so only one key is ever partial and a larger budget never
+# shows fewer leaves on a dict root.
+
+
+_DICT_MONO_FIXTURES: dict[str, object] = {
+    # cfg (a nested dict) used to enrich to a marker-only form that displaced the
+    # trailing ``tags`` content as the budget grew.
+    "displacing_coll": {
+        "name": "app",
+        "cfg": {f"o{i}": i for i in range(15)},
+        "tags": list(range(20)),
+    },
+    # An early bulky collection used to steal budget from a later collection.
+    "early_big_late": {
+        "A": [{"p": i, "q": f"v{i}"} for i in range(15)],
+        "B": {"x": 1, "y": 2, "z": 3},
+    },
+    # A huge leading scalar must not crowd out short later identifiers.
+    "oversized_first": {"blob": "x" * 300, "id": "abc", "name": "Alice", "cfg": {"a": 1, "b": 2}},
+    # Wide config: every value a nested dict; fill must stay tight AND monotone.
+    "wide_config": _wide_config_dict(20),
+    "nested_lists": {
+        "a": 1,
+        "b": 2,
+        "items": [{"x": i, "y": f"v{i}"} for i in range(20)],
+        "tail": "end",
+    },
+    "flat_scalars": {f"k{i}": f"value-{i}" for i in range(25)},
+    "deep": {"l1": {"l2": {"l3": {"l4": [1, 2, 3], "id": "x"}, "k": "v"}, "m": 5}, "n": 9},
+    # Empty-nested values (0 original scalars): a full ``{"x": []}`` must not score
+    # below its ``{1 keys}`` stub — the metric counts both as 0 preserved content.
+    "empty_nested": {"a": {"x": []}, "b": "tail", "c": [[], {}], "d": 5},
+}
+
+
+@pytest.mark.parametrize("name", sorted(_DICT_MONO_FIXTURES))
+def test_dict_root_content_is_monotone_in_budget(name: str) -> None:
+    """For a dict root, a LARGER budget must never preserve FEWER original leaves
+    in the final tier. Budgets are swept CONTIGUOUSLY so a one-char cliff cannot
+    hide between sampled points; output is asserted valid + within budget too."""
+    fixture = _DICT_MONO_FIXTURES[name]
+    data = json.loads(fixture) if isinstance(fixture, str) else fixture
+    c = FieldExtractCompressor()
+    prev: int | None = None
+    for budget in range(2, len(json.dumps(data)) + 5):
+        out = c._fit_extracted(data, budget)
+        parsed = json.loads(out)  # always valid JSON
+        assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
+        leaves = _preserved_leaves(parsed, data)
+        if prev is not None:
+            assert leaves >= prev, f"{name}@{budget}: content regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+def test_dict_single_partial_boundary_no_cross_key_displacement() -> None:
+    """The canonical pre-fix cross-key regression: as the budget grows one char,
+    an early collection used to grab more budget and an emptier-marker form
+    displaced a later key (content dropped). With a single partial boundary the
+    leaf count is non-decreasing across that exact boundary."""
+    c = FieldExtractCompressor()
+    data = {
+        "A": [{"p": i, "q": f"v{i}", "r": [i, i + 1]} for i in range(15)],
+        "B": {"x": 1, "y": 2, "z": 3, "w": 4},
+    }
+    prev = -1
+    for budget in range(2, 200):
+        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)), data)
+        assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+def test_dict_oversized_scalar_ranked_last_preserves_short_siblings() -> None:
+    """A huge scalar value is ranked LAST, so short, high-value siblings land in
+    the full prefix instead of being crowded into the boundary/marker. Mirrors the
+    contract behind test_later_short_scalars_* but through the new enrich path."""
+    c = FieldExtractCompressor()
+    data = {"blob": "x" * 500, "id": "abc", "name": "Alice", "flag": True}
+    out = c._fit_extracted(data, 120)
+    parsed = json.loads(out)
+    assert len(out) <= 120
+    assert parsed["id"] == "abc"
+    assert parsed["name"] == "Alice"
+    assert parsed["flag"] is True
+    assert parsed["blob"] != "x" * 500  # the huge value is the one that degrades
+
+
+def test_dict_small_container_full_fits_after_larger_prefix_overflows() -> None:
+    """The full-prefix search must take the MAX fitting prefix, not stop at the
+    first overflow: a small container's FULL form is SHORTER than its ``{N items}``
+    stub, so a longer prefix can fit after a shorter one overflows. Here both ``a``
+    and ``b`` fit fully at a budget where the (b-stub) prefix-of-1 overflows — the
+    early-break search wrongly stubbed ``b``."""
+    c = FieldExtractCompressor()
+    data = {"a": [0, 1, 2, 3], "b": [0], "blob": "x" * 100}
+    out = c._fit_extracted(data, 48)
+    parsed = json.loads(out)
+    assert len(out) <= 48
+    assert parsed["a"] == [0, 1, 2, 3]
+    assert parsed["b"] == [0]  # the small container survives FULL, not "[1 items]"
+
+
+def test_dict_empty_nested_value_is_monotone_against_its_stub() -> None:
+    """A key whose whole value is empty-nested (``{"x": []}`` — zero original
+    scalars) must not score below its ``{1 keys}`` stub as the budget grows. The
+    stub preserves no original scalar (counts 0); so does the full empty-nested
+    value, so promoting it to full is monotone. Pre-metric-fix this regressed from
+    2 -> 1 'leaves' at the budget where the full value first fit, because the stub
+    string was wrongly counted as a preserved leaf."""
+    c = FieldExtractCompressor()
+    data = {"a": {"x": []}, "b": "tail"}
+    prev = -1
+    for budget in range(2, len(json.dumps(data)) + 5):
+        leaves = _preserved_leaves(json.loads(c._fit_extracted(data, budget)), data)
+        assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
+        prev = leaves
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # A real list value containing the word "omitted" must not be mistaken for a
+        # generated omitted-count marker by the boundary guard.
+        {"a": ["a real omitted note", "tail"], "b": "x" * 40, "c": [1, 2, 3]},
+        # A real string value that reads like the in-array marker.
+        {"a": {"label": "... (2 of 2 items omitted)", "note": "hello"}, "b": "x" * 40},
+        # A real key whose name starts with the collision-safe marker prefix.
+        {"outer": {"_truncated_real": "keep me", "z": "tail"}, "id": "abc", "pad": "y" * 40},
+        # A real top-level _truncated* key.
+        {"_truncated_x": "keep", "data": [{"v": i} for i in range(15)], "id": "z"},
+    ],
+)
+def test_dict_provenance_not_pattern_for_markers(data: object) -> None:
+    """Marker/placeholder detection is by PROVENANCE, not string pattern: a real
+    value containing ``omitted`` or a real ``_truncated*`` key is genuine content,
+    so the boundary guard must not drop it and the budget must stay monotone."""
+    c = FieldExtractCompressor()
+    prev = -1
+    for budget in range(2, len(json.dumps(data)) + 5):
+        out = c._fit_extracted(data, budget)
+        assert len(out) <= max(2, budget), f"@{budget}: over budget"
+        leaves = _preserved_leaves(json.loads(out), data)
+        assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
+        prev = leaves
