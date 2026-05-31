@@ -14,6 +14,21 @@ class SurfacingFormatter:
     def __init__(self, config: SurfacingConfig) -> None:
         self._config = config
 
+    def _relevance_bucket(self, score: float) -> str:
+        floor = self._config.min_score
+        if floor >= 1.0:
+            return "strong"
+
+        band = 1.0 - floor
+        related_start = floor + band / 3
+        strong_start = floor + 2 * band / 3
+
+        if score < related_start:
+            return "weak"
+        if score < strong_start:
+            return "related"
+        return "strong"
+
     def inject(
         self,
         response_text: str,
@@ -83,7 +98,8 @@ class SurfacingFormatter:
                     snippet = ctx.window_after[0].content[:budget].replace("\n", " ")
                     preview = preview + " | " + snippet + "..."
 
-            lines.append(f"- **{source}**{ns_badge} (score={r.score:.2f}): {preview}")
+            bucket = self._relevance_bucket(float(r.score))
+            lines.append(f"- **{source}**{ns_badge} [{bucket}]: {preview}")
 
         if scratch_items:
             lines.append("")

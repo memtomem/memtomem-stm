@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time as _time
 from dataclasses import dataclass, field
 
@@ -698,8 +699,12 @@ class BenchHarness:
         score_with = self._judge.score(task, surfaced)
         qa_with = sum(1 for qa in task.qa_pairs if _fuzzy_contains(qa.answer, surfaced))
 
-        # Count injected memories (check for surfacing marker)
-        memories_injected = surfaced.count("score=0.") if surfaced != compressed else 0
+        # Count injected memories by formatter bucket labels.
+        memories_injected = (
+            len(re.findall(r"\[(?:weak|related|strong)\]:", surfaced))
+            if surfaced != compressed
+            else 0
+        )
 
         return SurfacingValue(
             task_id=task.task_id,

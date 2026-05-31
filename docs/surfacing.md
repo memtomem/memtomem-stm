@@ -57,10 +57,12 @@ When memories are found, they're wrapped in `<surfaced-memories>` XML tags and i
 _surfacing_id: abc123def456_
 > Rate (one of "helpful" | "partially_helpful" | "not_relevant" | "already_known"): `stm_surfacing_feedback(surfacing_id="abc123def456", rating="helpful")`
 
-- **auth_notes.md** [code-notes] (score=0.85): OAuth2 implementation uses PKCE flow...
-- **api_design.md** (score=0.72): Rate limiting is handled by middleware in...
+- **auth_notes.md** [code-notes] [strong]: OAuth2 implementation uses PKCE flow...
+- **api_design.md** [related]: Rate limiting is handled by middleware in...
 </surfaced-memories>
 ```
+
+Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. Exact raw-score distributions remain available through `stm_surfacing_stats`.
 
 The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
 
