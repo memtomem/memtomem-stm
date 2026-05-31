@@ -19,6 +19,10 @@ flowchart LR
 
 The `mms` short form pairs with memtomem core's `mm` CLI: `mm` for long-term memory, `mms` for the STM proxy. Use whichever name you prefer; the docs below use `mms` for brevity.
 
+Bare invocation dispatches on stdin: from a terminal it prints CLI help, while
+piped stdin starts the MCP server. This lets `memtomem-stm`,
+`memtomem-stm-proxy`, and `mms` all work as MCP server commands.
+
 ## `mms` (= `memtomem-stm-proxy`)
 
 ```
@@ -32,7 +36,10 @@ Options:
 
 Commands:
   add       Add an upstream MCP server to the proxy configuration.
+  daemon    Manage the local surfacing daemon.
   health    Check upstream server connectivity.
+  hook      Compress and/or surface for a host's built-in tool call.
+  host      Host-config inspection and sync.
   import    Import MCP definitions from host configs into the mms registry.
   init      Guided first-time setup for memtomem-stm.
   list      List configured upstream servers.
@@ -69,6 +76,9 @@ Options:
                             so tools route through STM only. TTY callers get
                             a single y/N prompt (default No); non-TTY
                             scripted callers must pass the flag explicitly.
+  --lang [en|ko]            Primary content language preset for token-aware
+                            budgets. 'en' writes no language-specific fields.
+                            'ko' sets the calibrated Korean budget preset.
 ```
 
 Interactive wizard for the first-time setup. Prompts for a single upstream server (name, prefix, transport, command/URL), optionally probes connectivity, writes the config, then offers a 3-way MCP-client registration prompt:
@@ -91,6 +101,7 @@ mms init --no-validate            # skip the connectivity probe prompt entirely
 mms init --mcp claude             # scripted: auto-register with Claude Code
 mms init --mcp skip               # scripted: write config, print paste hints, exit
 mms init --mcp claude --prune-originals  # scripted: import, register, and remove direct registrations
+mms init --lang ko                # Korean-content preset for token-aware budgets
 ```
 
 ### `register`
@@ -278,9 +289,66 @@ Options:
                            registration (#261).
 ```
 
-Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running.
+Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running. It also prints a **Surfacing Bootstrap** section that checks surfacing config, feedback DB readiness, and the configured LTM MCP server.
 
 `--names` re-runs the same composed-name overflow check the proxy applies at boot (#261), so an operator diagnosing "one tool from server X went silently missing after registration" can answer the question without restarting STM. The flag uses the default client server name `memtomem-stm` (12 chars) for the `mcp__<client-server>__…` template; if you registered STM under a shorter alias like `mms`, set `MMS_CLIENT_SERVER_NAME=mms` so the budget calculation matches the surface name your client actually composes.
+
+The LTM probe honors the same `--timeout` budget, supports `stdio`, `sse`, and
+`streamable_http`, and requires the target server to advertise `mem_search`.
+When `mem_do` is available, the version probe is best-effort and does not
+decide readiness.
+
+## `mms hook` — Claude Code built-in tool bridge
+
+```
+Usage: mms hook [OPTIONS]
+```
+
+Reads a Claude Code-compatible `PostToolUse` hook payload from stdin and prints
+a hook response. It can add LTM surfacing through `additionalContext` for
+read-like built-ins (`Read`, `Grep`, `Glob`, `Bash`). Bash stdout compression is
+separate and opt-in via `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning
+`updatedToolOutput` while preserving stderr, exit status, interruption state,
+and image markers.
+
+Register it in Claude Code settings with a PostToolUse matcher:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|Bash",
+        "hooks": [{ "type": "command", "command": "mms hook" }]
+      }
+    ]
+  }
+}
+```
+
+The hook always exits `0` and emits `{}` on malformed input, timeout, disabled
+surfacing, or internal errors so the host keeps the original tool output. By
+default it uses the local daemon path; set `MEMTOMEM_STM_HOOK__USE_DAEMON=0`
+for the legacy cold in-process path.
+
+## `mms daemon` — warm surfacing process
+
+`mms daemon` keeps an LTM connection warm for `mms hook`, avoiding a cold LTM
+startup on every built-in tool call.
+
+```
+Usage: mms daemon [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  start    Spawn the daemon detached if one is not already running.
+  status   Report pid/port/uptime/LTM warmth; accepts --json.
+  restart  Stop this config's daemon, then start a fresh one.
+  stop     Ask a running daemon to shut down gracefully.
+  run      Run the long-lived daemon server loop.
+```
+
+Daemons are keyed by config, so starting a daemon for one config does not stop a
+daemon serving another config.
 
 ## `mms project` — project-scoped MCP management
 
@@ -404,20 +472,50 @@ A future `--force` flag for refresh-on-rerun is W2/W3.
 
 A small set of env keys that could enable code injection through the proxied subprocess (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `PYTHONPATH`, `NODE_OPTIONS`, etc.) are filtered from every imported entry — they never reach `~/.mms/registry.toml` regardless of which host they came from.
 
-## MCP Tools (11 + proxied)
+## `mms host` — host-config drift inspection and sync
+
+`mms host` compares the global `~/.mms/registry.toml` catalog and its sidecar
+baseline against MCP entries currently present in host configs.
+
+```
+Usage: mms host [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  scan    List MCP entries discovered across host configs.
+  status  Show drift state of every registry entry vs sidecar baseline.
+  sync    Reconcile registry + sidecar with the union of host scans.
+```
+
+`scan` is host-anchored and read-only; it can be limited with
+`--from claude-code|cursor|codex|claude-desktop|all` and supports `--json`.
+`status` is registry-anchored, read-only, and always exits `0`; drift is an
+observation rather than a CI failure signal. `sync` is the ongoing
+reconciliation path: `--plan` previews, `--apply` writes, `--force` adopts
+entries marked changed, and `--yes` bypasses confirmation prompts for scripts.
+
+## MCP Tools (4 default + 8 opt-in + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
+
+The four model-facing tools are advertised by default:
+
+| Tool | Arguments | Description |
+|------|-----------|-------------|
+| `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
+| `stm_proxy_read_more` | `key`, `offset`, `limit?` | Read next chunk from a progressive delivery response |
+| `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
+| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
+
+Eight observability/admin tools are hidden unless
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before server start:
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
 | `stm_proxy_stats` | — | Token savings, compression stats, cache hit/miss ratio |
-| `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
-| `stm_proxy_read_more` | `key`, `offset`, `limit?` | Read next chunk from a progressive delivery response |
 | `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, by tool, or by server+tool) |
 | `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
-| `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
 | `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio (since process start) |
-| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
+| `stm_index_stats` | `tool?` | INDEX attempt/outcome counts for extraction and auto-index paths |
 | `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
 | `stm_progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
 | `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner |
@@ -441,6 +539,7 @@ sequenceDiagram
     Note over Agent,STM: agent reads memories injected at top of fs__read_file response
     Agent->>STM: stm_surfacing_feedback(surfacing_id, "helpful")
     STM-->>Agent: ack (auto-tuner notes positive sample)
+    Note over Agent,STM: if observability tools are advertised
     Agent->>STM: stm_proxy_stats
     STM-->>Agent: token savings · cache hit ratio · latency p50/p95/p99
 ```

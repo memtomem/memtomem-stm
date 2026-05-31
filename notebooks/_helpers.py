@@ -69,10 +69,13 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
     """Create an isolated tempdir and point STM's state there via env vars.
 
     Sets ``MEMTOMEM_STM_PROXY__CONFIG_PATH``, ``...CACHE__DB_PATH``,
-    ``...METRICS__DB_PATH``, and ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``
+    ``...METRICS__DB_PATH``, ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``,
+    and ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS``
     so that nothing the notebook does touches the user's real
     ``~/.memtomem/`` directory — including the surfacing feedback store
-    that holds cross-session dedup state.
+    that holds cross-session dedup state. Observability tools are enabled only
+    for this tutorial process so the notebook can call ``stm_proxy_stats`` even
+    though installed STM hides operator-facing tools by default.
 
     Parameters
     ----------
@@ -96,6 +99,7 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
     os.environ["MEMTOMEM_STM_PROXY__CACHE__DB_PATH"] = str(tmp / "proxy_cache.db")
     os.environ["MEMTOMEM_STM_PROXY__METRICS__DB_PATH"] = str(tmp / "proxy_metrics.db")
     os.environ["MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH"] = str(tmp / "stm_feedback.db")
+    os.environ["MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"] = "true"
     if not enable_surfacing:
         os.environ["MEMTOMEM_STM_SURFACING__ENABLED"] = "false"
     return config_path

@@ -6,7 +6,7 @@ One quick-start notebook is kept here as a runnable demo of memtomem-stm:
 
 | # | Notebook | Scenario | External deps |
 |---|----------|----------|---------------|
-| 01 | [`01_quickstart_proxy_setup.ipynb`](01_quickstart_proxy_setup.ipynb) | Register an upstream MCP server, call a proxied tool, read `stm_proxy_stats` | None |
+| 01 | [`01_quickstart_proxy_setup.ipynb`](01_quickstart_proxy_setup.ipynb) | Register an upstream MCP server, call a proxied tool, read `stm_proxy_stats` with tutorial-local observability enabled | None |
 
 The other five scenario notebooks (CLI/MCP hybrid, selective compression,
 memory surfacing, LangChain integration, observability + Langfuse) live in
@@ -43,6 +43,7 @@ variables:
 - `MEMTOMEM_STM_PROXY__CACHE__DB_PATH`
 - `MEMTOMEM_STM_PROXY__METRICS__DB_PATH`
 - `MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH`
+- `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`
 
 The notebook is hermetic — your real `~/.memtomem/` is untouched.
 

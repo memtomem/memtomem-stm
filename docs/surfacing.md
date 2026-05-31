@@ -5,7 +5,7 @@ When your agent calls a proxied tool, STM automatically:
 1. **Extracts context** from the tool name and arguments
 2. **Checks relevance** (rate limit, cooldown, write-tool filter)
 3. **Searches LTM** (memtomem) for related memories
-4. **Injects relevant memories** at the top of the response
+4. **Injects relevant memories** at the configured position in the response
 
 ```mermaid
 flowchart LR
@@ -166,7 +166,7 @@ sequenceDiagram
             STM-->>Agent: original response
         else closed / half-open
             STM->>MCP: search(query, top_k, namespace)
-            MCP->>Core: mem_search (via stdio MCP)
+            MCP->>Core: mem_search (via configured MCP transport)
             Core-->>MCP: results
             MCP-->>STM: parsed results
             opt include_session_context
@@ -201,13 +201,22 @@ export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=memtomem-server
 # Pass extra arguments if needed (e.g. point at a custom config)
 export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--config","/etc/memtomem.json"]'
 
-# Or connect to a long-running network MCP service
+# Or connect to a long-running network MCP service over SSE
 export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=sse
 export MEMTOMEM_STM_SURFACING__LTM_MCP_URL=https://ltm.example/sse
 export MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS='{"Authorization":"Bearer ..."}'
+
+# Or connect over Streamable HTTP
+export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=streamable_http
+export MEMTOMEM_STM_SURFACING__LTM_MCP_URL=https://ltm.example/mcp
 ```
 
 This makes memtomem reachable over the same MCP protocol boundary STM uses for other upstreams. Unlike a generic proxied upstream, LTM responses bypass the compression / cache pipeline — they are consumed by STM's surfacing engine (via `McpClientSearchAdapter`, see `src/memtomem_stm/surfacing/mcp_client.py`) to compose context for upstream calls, rather than being passed through to the caller. A memtomem crash never takes down STM's other upstream connections.
+
+`mms health` includes a Surfacing Bootstrap section that probes this configured
+LTM server without starting the proxy. The probe supports `stdio`, `sse`, and
+`streamable_http`, honors `mms health --timeout` as an end-to-end budget, and
+requires the target server to advertise `mem_search`.
 
 > **Note**: prior versions supported an in-process mode that imported memtomem directly. That path was removed so STM has a single LTM retrieval path and so core internals can evolve without breaking STM.
 

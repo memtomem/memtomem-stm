@@ -128,6 +128,44 @@ export MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS='{"Authorization":"Bearer ..."}'
 
 See [Surfacing → Surfacing Controls](surfacing.md#surfacing-controls) for the complete table of fields and defaults.
 
+### Claude Code Hook
+
+`mms hook` bridges Claude Code built-in `PostToolUse` events into STM surfacing.
+It is independent of the MCP proxy path and is configured with
+`MEMTOMEM_STM_HOOK__*`.
+
+```bash
+export MEMTOMEM_STM_HOOK__USE_DAEMON=true              # default: warm daemon path
+export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=2.5
+export MEMTOMEM_STM_HOOK__FALLBACK=skip                # skip | cold
+export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
+export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating prompt by default
+
+# Built-in Bash stdout compression is opt-in and separate from surfacing.
+export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=false
+export MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=16000
+
+# Legacy direct-read allowlist knob; comma-separated Claude Code tool names.
+export MEMTOMEM_STM_HOOK_SURFACE_TOOLS=Read,Grep,Glob,Bash
+```
+
+`fallback=skip` returns `{}` immediately when the daemon is unavailable.
+`fallback=cold` runs the older in-process path, which can pay LTM startup cost
+inside the hook call. Hook compression only targets Bash stdout so later
+`Edit` operations are not broken by replacing file reads.
+
+### Surfacing Daemon
+
+`mms daemon` keeps a local LTM connection warm for `mms hook`.
+
+```bash
+export MEMTOMEM_STM_DAEMON__HOST=127.0.0.1
+export MEMTOMEM_STM_DAEMON__IDLE_TIMEOUT_SECONDS=900
+```
+
+The daemon binds loopback and authenticates requests with a per-start token.
+`idle_timeout_seconds=0` pins it until explicitly stopped.
+
 ### Langfuse Tracing (optional)
 
 ```bash

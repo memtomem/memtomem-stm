@@ -132,7 +132,10 @@ Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
 
 Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, etc.). The CLEAN / COMPRESS / SURFACE stages run automatically — responses are cleaned, compressed, cached, and (when an LTM server is configured) enriched with relevant memories. The INDEX stage (auto_index / extraction) is currently inactive in the standalone server; see [#288](https://github.com/memtomem/memtomem-stm/issues/288).
 
-To check what's happening, ask the agent to call `stm_proxy_stats`.
+To check connectivity and surfacing readiness from your shell, run
+`mms status` or `mms health`. If you want the agent to call operator-facing MCP
+tools such as `stm_proxy_stats`, start STM with
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`.
 
 ## What STM proxies — and what it doesn't
 
@@ -140,10 +143,18 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 
 **STM sees:** any MCP server you register with `mms add` — every tool under the `mcp__<server>__<prefix>__<tool>` namespace — plus LTM surfacing calls to a configured memtomem server.
 
-**STM does NOT see:**
+**STM does NOT see through the MCP proxy path:**
 - **Claude Code's built-in tools** — `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebFetch`. They run inside the client and never reach an MCP server, so their token spend is invisible to STM and unaffected by compression or caching.
 - **Cursor / Windsurf / Claude Desktop built-ins** — same principle: anything the client provides natively bypasses the MCP layer.
 - **Sub-agent built-in calls** — the parent's MCP wiring is inherited, but built-in tool calls inside an `Agent` / `Task` invocation stay client-internal.
+
+For Claude Code, `mms hook` is an optional PostToolUse bridge for that
+client-internal path. It can append LTM surfacing context for read-like
+built-ins (`Read`, `Grep`, `Glob`, `Bash`) and, when explicitly enabled with
+`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, compress built-in `Bash` stdout
+through `updatedToolOutput`. This is separate from the MCP proxy: `Write`,
+`Edit`, and other mutation tools stay out of the surfacing path, and the hook
+always fails open to the original tool output.
 
 **STM does NOT write back to LTM at runtime today.** The standalone `mms` server constructs the proxy without a `FileIndexer` engine, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are tracked in [#288](https://github.com/memtomem/memtomem-stm/issues/288) and require an MCP-protocol-only adapter that doesn't exist yet.
 
@@ -179,7 +190,13 @@ A second tier of management lets you decide *which MCP servers a given project s
 | [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Tune settings without touching code |
-| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands and the 11 MCP tools |
+| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands, host sync, hooks, daemon, and MCP tools |
+
+STM advertises four model-facing MCP tools by default. Eight observability and
+admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, `stm_index_stats`, etc.)
+are hidden unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set,
+which keeps eager-loading clients from paying schema tokens for rarely used
+operator tools.
 
 ## Development
 
