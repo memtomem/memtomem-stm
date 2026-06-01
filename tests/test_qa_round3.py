@@ -162,19 +162,20 @@ class TestParseResultsRegex:
 
 
 class TestDocsToolCount:
-    def test_cli_md_has_11_tools(self):
+    def test_cli_md_has_current_tool_counts(self):
         cli_md = Path(__file__).parent.parent / "docs" / "cli.md"
         content = cli_md.read_text(encoding="utf-8")
-        assert "11 + proxied" in content
+        assert "4 default + 8 opt-in + proxied" in content
         assert "stm_proxy_health" in content
         assert "stm_compression_feedback" in content
         assert "stm_progressive_stats" in content
         assert "stm_tuning_recommendations" in content
 
-    def test_readme_has_11_tools(self):
+    def test_readme_has_current_tool_counts(self):
         readme = Path(__file__).parent.parent / "README.md"
         content = readme.read_text(encoding="utf-8")
-        assert "11 MCP tools" in content
+        assert "four model-facing MCP tools by default" in content
+        assert "Eight observability and" in content
 
 
 # ---------------------------------------------------------------------------
