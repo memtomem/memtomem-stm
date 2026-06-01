@@ -1497,3 +1497,31 @@ class TestMainExceptionBarrier:
         assert not error_records, (
             f"clean exit should not emit ERROR logs; got: {[r.getMessage() for r in error_records]}"
         )
+
+    def test_anyio_cancel_scope_shutdown_error_exits_cleanly(self, caplog):
+        import logging
+
+        from memtomem_stm import server
+
+        errors = (
+            RuntimeError(
+                "Attempted to exit a cancel scope that isn't the current tasks's "
+                "current cancel scope"
+            ),
+            RuntimeError(
+                "Attempted to exit cancel scope in a different task than it was entered in"
+            ),
+        )
+
+        for err in errors:
+            caplog.clear()
+            with (
+                caplog.at_level(logging.WARNING, logger="memtomem_stm.server"),
+                patch.object(server.mcp, "run", side_effect=err),
+            ):
+                server.main()
+
+            error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+            warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert not error_records
+            assert any("AnyIO cancel scope warning" in r.getMessage() for r in warning_records)

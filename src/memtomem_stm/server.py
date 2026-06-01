@@ -31,6 +31,11 @@ from memtomem_stm.surfacing.feedback import FeedbackTracker
 
 logger = logging.getLogger(__name__)
 
+_ANYIO_CANCEL_SCOPE_SHUTDOWN_MESSAGES = (
+    "Attempted to exit a cancel scope that isn't the current tasks's current cancel scope",
+    "Attempted to exit cancel scope in a different task than it was entered in",
+)
+
 _HASHED_QUERY_PREVIEW_RE = re.compile(r"sha256:[0-9a-f]{16}")
 """Exact shape of the opaque ID `FeedbackStore.get_stats` passes through
 verbatim for rows persisted under ``persist_query_text=False`` (#352
@@ -1414,6 +1419,13 @@ async def stm_tuning_recommendations(
 # ---------------------------------------------------------------------------
 
 
+def _is_anyio_cancel_scope_shutdown_error(exc: RuntimeError) -> bool:
+    """Return true for the AnyIO shutdown cleanup error seen on stdio EOF."""
+
+    message = str(exc)
+    return any(marker in message for marker in _ANYIO_CANCEL_SCOPE_SHUTDOWN_MESSAGES)
+
+
 def main() -> None:
     """Run the STM MCP server."""
     level = os.environ.get("MEMTOMEM_STM_LOG_LEVEL", "WARNING").upper()
@@ -1428,6 +1440,14 @@ def main() -> None:
     # after logging so the process still terminates; we only add observability.
     try:
         mcp.run()
+    except RuntimeError as e:
+        if _is_anyio_cancel_scope_shutdown_error(e):
+            logger.warning(
+                "STM MCP server shut down with AnyIO cancel scope warning (ignored): %s", e
+            )
+            return
+        logger.exception("STM MCP server terminated with an unhandled exception")
+        raise
     except Exception:
         logger.exception("STM MCP server terminated with an unhandled exception")
         raise
