@@ -31,9 +31,9 @@ from memtomem_stm.surfacing.feedback import FeedbackTracker
 
 logger = logging.getLogger(__name__)
 
-_ANYIO_CANCEL_SCOPE_SHUTDOWN_MARKERS = (
-    "Attempted to exit a cancel scope",
-    "current cancel scope",
+_ANYIO_CANCEL_SCOPE_SHUTDOWN_MESSAGES = (
+    "Attempted to exit a cancel scope that isn't the current tasks's current cancel scope",
+    "Attempted to exit cancel scope in a different task than it was entered in",
 )
 
 _HASHED_QUERY_PREVIEW_RE = re.compile(r"sha256:[0-9a-f]{16}")
@@ -1423,7 +1423,7 @@ def _is_anyio_cancel_scope_shutdown_error(exc: RuntimeError) -> bool:
     """Return true for the AnyIO shutdown cleanup error seen on stdio EOF."""
 
     message = str(exc)
-    return all(marker in message for marker in _ANYIO_CANCEL_SCOPE_SHUTDOWN_MARKERS)
+    return any(marker in message for marker in _ANYIO_CANCEL_SCOPE_SHUTDOWN_MESSAGES)
 
 
 def main() -> None:
