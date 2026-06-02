@@ -157,6 +157,44 @@ class TestHeuristicExtraction:
         assert result is None
 
 
+class TestShortNonEmptyQueryPadsWithToolName:
+    """KR-4.2: the tool-name fallback fires whenever the extracted args alone
+    fall below ``min_query_tokens``, not only when extraction yields nothing.
+    A short-but-non-empty extraction (e.g. ``/etc/hosts`` → "etc hosts",
+    2 tokens) previously returned None and surfacing never fired for it."""
+
+    def test_short_path_pads_with_tool_name(self):
+        # /etc/hosts → "etc hosts" (2 tokens) < 3; pre-fix returned None.
+        result = _extract("read_file", {"path": "/etc/hosts"}, min_query_tokens=3)
+        assert result is not None
+        assert "etc" in result and "hosts" in result
+        # The tool-name token(s) were appended to clear the floor.
+        assert "read" in result and "file" in result
+        assert len(result.split()) >= 3
+
+    def test_pad_is_appended_after_args_deterministically(self):
+        # The tool name comes after the extracted arg tokens (stable order
+        # keeps the surfacing cache key deterministic).
+        result = _extract("read_file", {"path": "/etc/hosts"}, min_query_tokens=3)
+        assert result == "etc hosts read file"
+
+    def test_still_none_when_args_plus_tool_name_below_floor(self):
+        # Non-empty short extraction + short tool name still below the floor
+        # → None (the final threshold re-check is unchanged). "etc hosts" (2)
+        # + "io" (1) = 3 tokens < 5.
+        result = _extract("io", {"path": "/etc/hosts"}, min_query_tokens=5)
+        assert result is None
+
+    def test_strong_query_not_diluted_by_tool_name(self):
+        # A query that already clears the floor must not get the tool name
+        # appended — no dilution of an already-good query.
+        result = _extract(
+            "read_file", {"query": "authentication token refresh flow"}, min_query_tokens=3
+        )
+        assert result == "authentication token refresh flow"
+        assert "read" not in result and "file" not in result
+
+
 class TestEdgeCases:
     """Edge cases for extract_query — inputs realistic from LLM tool calls."""
 

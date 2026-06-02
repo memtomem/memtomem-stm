@@ -9,6 +9,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 - **Surfaced memories expose a per-memory `memory_id` for feedback** (EN-2/3) — each injected bullet now renders its `chunk.id` as a backticked token, and the feedback preamble adds a batched `stm_surfacing_feedback(ratings=[{"memory_id": ..., "rating": ...}])` example alongside the single-call one, so an agent can rate (and invalidate) individual memories rather than the whole surfacing event. **Behavior change**: the injected bullet format gains a `` `id` `` segment between the namespace badge and the `[bucket]` label; parsers keying on the exact `**source**{ns} [bucket]:` shape must account for it (the preview still follows `[bucket]: `). Injection-size truncation now pins the whole feedback preamble and drops body bullets on whole-line boundaries so a `memory_id` token is never severed mid-string. Under the default `result_format="compact"` the rendered id is a content-derived surrogate (`sha256(content)[:16]`), which drives STM-side invalidation but not the LTM `increment_access` boost; set `result_format="structured"` for the real `chunk_id` end to end.
 
+### Fixed
+
+- **Short tool-call queries surface instead of silently dropping** (KR-4.2) — `ContextExtractor` appended the tool name to clear `min_query_tokens` only when argument extraction yielded *nothing*. A short-but-non-empty extraction — e.g. `read_file {"path": "/etc/hosts"}` tokenizing to `"etc hosts"` (2 tokens, below the default floor of 3) — produced no query, so surfacing never fired for it. The fallback now also fires when the extracted tokens alone fall below `min_query_tokens`, appending the tool-name token(s) after the deterministic argument scan. Queries that already clear the floor are untouched, and a query still too short even with the tool name (e.g. a one-token tool) is still rejected. Trade-off: a marginal query now consumes a surfacing rate-limit / cooldown slot.
+
 ## [0.1.25] — 2026-06-02
 
 A small maintenance release: the standalone `mms` MCP stdio server now exits

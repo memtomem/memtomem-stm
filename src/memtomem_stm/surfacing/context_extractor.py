@@ -74,8 +74,18 @@ class ContextExtractor:
                 # query (inconsistent and a poor search term).
                 parts.append(str(value))
 
-        # Fall back to tool name only if no semantic args found
-        if not parts:
+        # Fall back to the tool name when the extracted args alone do not clear
+        # ``min_query_tokens`` — not only when ``parts`` is empty. KR-4.2: a
+        # short-but-non-empty extraction (e.g. ``/etc/hosts`` → "etc hosts",
+        # 2 tokens < 3) otherwise returned None below and surfacing never fired,
+        # even though appending the tool-name token(s) would clear the floor.
+        # The empty-parts case is subsumed (``"".split()`` → 0 tokens, always
+        # below ``min_query_tokens`` which is validated ``gt=0``), and the
+        # append runs after the deterministic sorted loop so ordering is stable.
+        # Not strictly free: a marginal query now consumes a rate-limit /
+        # cooldown slot, and a large ``min_query_tokens`` widens how often the
+        # tool name dilutes the args — tune it there if this gets noisy.
+        if len(" ".join(parts).split()) < config.min_query_tokens:
             parts.append(tool.replace("_", " "))
 
         query = " ".join(parts).strip()
