@@ -1092,10 +1092,17 @@ class TestInitLangPreset:
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
 
     def test_lang_ko_writes_proxy_and_per_server_fields(self, runner, config, no_discovery):
-        """KO preset writes proxy-level chars_per_token / min_response_chars /
+        """KO preset writes proxy-level chars_per_token /
         default_max_result_chars AND per-server max_result_tokens +
         chars_per_token. The hardcoded manual-flow ``max_result_chars=8000``
-        stays in place — token budget wins via PR #274 precedence."""
+        stays in place — token budget wins via PR #274 precedence.
+
+        The written config is also round-tripped through
+        ``ProxyConfig.load_from_file`` so that a preset key the schema does
+        not actually accept (a silently-dropped top-level field, e.g. the old
+        top-level ``min_response_chars`` that only exists on the nested
+        ``ExtractionConfig``) fails here instead of looking applied in the
+        raw JSON."""
         result = runner.invoke(
             cli,
             ["init", "--no-validate", "--lang", "ko", *_cfg_args(config)],
@@ -1107,8 +1114,12 @@ class TestInitLangPreset:
 
         # Proxy-level fields
         assert data["chars_per_token"] == 1.85
-        assert data["min_response_chars"] == 230
         assert data["default_max_result_chars"] == 8500
+        # The preset must NOT emit a top-level ``min_response_chars``: it is
+        # not a ``ProxyConfig`` field (only ``ExtractionConfig`` has one), so
+        # writing it top-level is silently dropped on load — a no-op that
+        # advertised a budget it never applied.
+        assert "min_response_chars" not in data
 
         # Per-server fields
         srv = data["upstream_servers"]["filesystem"]
@@ -1116,6 +1127,23 @@ class TestInitLangPreset:
         assert srv["chars_per_token"] == 1.85
         # Manual-flow hardcode preserved (token wins at resolution time)
         assert srv["max_result_chars"] == 8000
+
+        # Round-trip every written proxy-level key through schema validation
+        # and assert the *effective* values — this is what catches a
+        # silently-dropped (dead) preset key, which a raw-JSON assertion
+        # cannot.
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        loaded = ProxyConfig.load_from_file(config)
+        assert loaded is not None
+        assert loaded.chars_per_token == 1.85
+        assert loaded.default_max_result_chars == 8500
+        # The extraction gate keeps its default — the KO preset never touched
+        # it (the removed top-level key would not have reached it anyway).
+        assert loaded.extraction.min_response_chars == 500
+        loaded_srv = loaded.upstream_servers["filesystem"]
+        assert loaded_srv.max_result_tokens == 2000
+        assert loaded_srv.chars_per_token == 1.85
 
     def test_lang_en_writes_no_language_specific_fields(self, runner, config, no_discovery):
         """EN preset is a no-op on the data dict — config matches pre-PR

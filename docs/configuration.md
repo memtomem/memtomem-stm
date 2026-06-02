@@ -294,7 +294,7 @@ Full example with all options:
 
 ### Token-equivalent budgets (CJK / non-Latin workloads)
 
-By default, every result-size budget in STM is expressed in **characters** (`max_result_chars`, `default_max_result_chars`, `head_chars`). For Latin-script content this approximates token spend reasonably — English averages ~4 characters per token in modern BPE tokenizers (GPT-3.5/4 cl100k_base, similar for Claude). For Korean, Chinese, and Japanese content it does not: Korean averages ~1.85 chars/token, so the same character budget caps roughly **half** the token spend the operator probably intended, and `min_response_chars`-style gates skip compression on Korean responses that are token-dense but character-light.
+By default, every result-size budget in STM is expressed in **characters** (`max_result_chars`, `default_max_result_chars`, `head_chars`). For Latin-script content this approximates token spend reasonably — English averages ~4 characters per token in modern BPE tokenizers (GPT-3.5/4 cl100k_base, similar for Claude). For Korean, Chinese, and Japanese content it does not: Korean averages ~1.85 chars/token, so the same character budget caps roughly **half** the token spend the operator probably intended, and char-based compression gates trip on Korean responses that are token-dense but character-light.
 
 Two opt-in fields make budgets token-aware without breaking existing char-based configs:
 
@@ -342,7 +342,7 @@ mms init --lang ko
 
 This writes:
 
-- **Proxy-level**: `chars_per_token=1.85`, `min_response_chars=230`, `default_max_result_chars=8500`
+- **Proxy-level**: `chars_per_token=1.85`, `default_max_result_chars=8500`
 - **Per-imported-server**: `max_result_tokens=2000`, `chars_per_token=1.85`
 
 Equivalent JSON (what ends up in `~/.memtomem/stm_proxy.json`). The server key (`<your-server-name>` below) and `prefix` come from whatever `mms init` discovered or you typed in the manual flow — `--lang ko` only adds the four token-aware fields, never invents server names:
@@ -351,7 +351,6 @@ Equivalent JSON (what ends up in `~/.memtomem/stm_proxy.json`). The server key (
 {
   "enabled": true,
   "chars_per_token": 1.85,
-  "min_response_chars": 230,
   "default_max_result_chars": 8500,
   "upstream_servers": {
     "<your-server-name>": {
