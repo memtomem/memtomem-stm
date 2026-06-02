@@ -388,6 +388,11 @@ class TestMcpClientSearchAdapter:
         from memtomem_stm.surfacing.config import SurfacingConfig
 
         adapter = McpClientSearchAdapter(SurfacingConfig())
+        # Mark the lazy-start as already attempted so _heal_if_needed
+        # short-circuits to False without spawning a real memtomem-server
+        # (which lazy-starts on this dev box and would yield 'ok'/'empty_results'
+        # instead of the asserted 'no_session').
+        adapter._start_attempted = True
         results, hints, outcome = await adapter.search("test query")
         assert results == []
         assert hints == []
