@@ -77,7 +77,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `min_score` | `0.03` | Minimum search score to include a result |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
-| `min_response_chars` | `5000` | Skip surfacing for small responses |
+| `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Precision/cost gate — **distinct** from the proxy-level `ExtractionConfig.min_response_chars` (`500`); see the tuning note below. |
 | `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response) |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
@@ -111,6 +111,39 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `feedback_demotion_enabled` | `true` | Locally filter memories that accumulated repeated negative feedback (`not_relevant` or `already_known`) before cache/injection |
 | `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
 | `fire_webhook` | `true` | Fire surfacing event webhooks |
+
+### Tuning `min_response_chars`
+
+`min_response_chars` (default `5000`) gates surfacing on the **size of the
+upstream tool response**: when a response is shorter than this, surfacing is
+skipped before any LTM work and the call is recorded as `response_too_short`
+in `stm_surfacing_stats`. The rationale is that very short responses rarely
+carry enough context for `ContextExtractor` to synthesize a useful query, so
+surfacing on them would spend an LTM round-trip (and a `max_surfacings_per_minute`
+/ `cooldown_seconds` slot) to inject memories that are often noise relative to
+the small response. The gate skips them before that cost is incurred.
+
+The default of `5000` is deliberately conservative — it favors **precision and
+cost** over **coverage**:
+
+- **Leave it high** when surfaced memories on short responses feel like noise,
+  or when you want to spend LTM round-trips only on substantial tool output.
+- **Lower it** when tools you rely on return compact responses (status
+  lookups, short reads, terse command output) and you want memories surfaced
+  for them too. `~2000` is a reasonable floor for short-output workflows;
+  going much below that surfaces on near-trivial responses and increases both
+  LTM cost and low-relevance injections. Pair a lower value with `min_score`,
+  `min_query_tokens`, and `exclude_tools` to widen coverage without losing
+  precision.
+
+**Not the same knob as the proxy's extraction gate.** This setting lives on
+`SurfacingConfig` and decides whether to *surface LTM memories alongside* an
+upstream response. It is independent of the proxy-level
+`ExtractionConfig.min_response_chars` (default `500`), which decides whether a
+response is large enough to *extract and index into LTM* (Stage D ingestion).
+They sit on different pipelines (surfacing vs. ingestion), carry different
+defaults (`5000` vs. `500`), and are tuned for different goals — don't
+conflate them.
 
 ## Per-tool Templates
 
