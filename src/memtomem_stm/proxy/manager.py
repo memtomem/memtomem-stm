@@ -24,6 +24,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy.cache import _make_key as _cache_key
+from memtomem_stm.proxy.cache import response_carries_transient_key
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
     HybridCompressor,
@@ -1990,22 +1991,41 @@ class ProxyManager:
         # Cache writes are an optional fast-path: a SQLite lock timeout, disk
         # full, or any other store error must NOT propagate to the agent and
         # discard a successful upstream response. Log and continue.
+        #
+        # Never cache a response that embeds a TRANSIENT retrieval key
+        # (progressive first-chunk, SELECTIVE/HYBRID TOC): ``compressed`` is a
+        # pointer into the process-local pending store, whose key dies on
+        # restart/eviction or its shorter TTL (progressive 1800s / selective
+        # 300s) well before the cache TTL (3600s). A later cache hit would hand
+        # back a dead ``stm_proxy_read_more`` / ``stm_proxy_select_chunks`` key.
+        # Skipping the store makes the next identical call re-run the pipeline
+        # and mint a fresh, live key. Detection is marker-based (shared with the
+        # startup legacy purge in ``ProxyCache.initialize``); a false positive
+        # only costs one un-cached response, never correctness.
         if self._cache is not None and not non_text_content:
-            try:
-                self._cache.set(
+            if response_carries_transient_key(compressed):
+                logger.debug(
+                    "Skipping cache store for %s/%s: response carries a transient "
+                    "retrieval key (progressive/selective TOC)",
                     server,
                     tool,
-                    cache_args,
-                    compressed,
-                    ttl_seconds=cfg_snap.cache.default_ttl_seconds,
                 )
-            except Exception:
-                logger.warning(
-                    "Cache store failed for %s/%s — response unaffected",
-                    server,
-                    tool,
-                    exc_info=True,
-                )
+            else:
+                try:
+                    self._cache.set(
+                        server,
+                        tool,
+                        cache_args,
+                        compressed,
+                        ttl_seconds=cfg_snap.cache.default_ttl_seconds,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Cache store failed for %s/%s — response unaffected",
+                        server,
+                        tool,
+                        exc_info=True,
+                    )
 
         # Combine compressed text with preserved non-text content
         if non_text_content:
