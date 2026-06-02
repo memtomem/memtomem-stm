@@ -85,14 +85,14 @@ class TestFormatterInjection:
     def test_relevance_bucket_labels_replace_raw_scores(self):
         fmt = SurfacingFormatter(SurfacingConfig())
         results = [
-            FakeResult(FakeChunk(content="near floor"), 0.04),
-            FakeResult(FakeChunk(content="middle band"), 0.50),
-            FakeResult(FakeChunk(content="top band"), 0.95),
+            FakeResult(FakeChunk(content="near floor", id="m-weak"), 0.04),
+            FakeResult(FakeChunk(content="middle band", id="m-related"), 0.50),
+            FakeResult(FakeChunk(content="top band", id="m-strong"), 0.95),
         ]
         output = fmt.inject("response", results, "query")
-        assert "- **notes/test.md** [default] [weak]: near floor" in output
-        assert "- **notes/test.md** [default] [related]: middle band" in output
-        assert "- **notes/test.md** [default] [strong]: top band" in output
+        assert "- **notes/test.md** [default] `m-weak` [weak]: near floor" in output
+        assert "- **notes/test.md** [default] `m-related` [related]: middle band" in output
+        assert "- **notes/test.md** [default] `m-strong` [strong]: top band" in output
         assert "score=" not in output
         assert "0.04" not in output
         assert "0.50" not in output
@@ -101,22 +101,22 @@ class TestFormatterInjection:
     def test_relevance_bucket_boundaries_follow_min_score(self):
         fmt = SurfacingFormatter(SurfacingConfig(min_score=0.4))
         results = [
-            FakeResult(FakeChunk(content="custom weak"), 0.55),
-            FakeResult(FakeChunk(content="custom related"), 0.70),
-            FakeResult(FakeChunk(content="custom strong"), 0.90),
+            FakeResult(FakeChunk(content="custom weak", id="b-weak"), 0.55),
+            FakeResult(FakeChunk(content="custom related", id="b-related"), 0.70),
+            FakeResult(FakeChunk(content="custom strong", id="b-strong"), 0.90),
         ]
         output = fmt.inject("response", results, "query")
-        assert "- **notes/test.md** [default] [weak]: custom weak" in output
-        assert "- **notes/test.md** [default] [related]: custom related" in output
-        assert "- **notes/test.md** [default] [strong]: custom strong" in output
+        assert "- **notes/test.md** [default] `b-weak` [weak]: custom weak" in output
+        assert "- **notes/test.md** [default] `b-related` [related]: custom related" in output
+        assert "- **notes/test.md** [default] `b-strong` [strong]: custom strong" in output
 
     def test_relevance_bucket_uses_active_score_floor_when_provided(self):
         fmt = SurfacingFormatter(SurfacingConfig(min_score=0.03))
-        results = [FakeResult(FakeChunk(content="near active floor"), 0.70)]
+        results = [FakeResult(FakeChunk(content="near active floor", id="f-weak"), 0.70)]
 
         output = fmt.inject("response", results, "query", score_floor=0.6)
 
-        assert "- **notes/test.md** [default] [weak]: near active floor" in output
+        assert "- **notes/test.md** [default] `f-weak` [weak]: near active floor" in output
         assert "[strong]" not in output
 
     def test_source_renders_parent_and_basename(self):
@@ -287,6 +287,130 @@ class TestFormatterInjection:
         output = fmt.inject("response", results, "query", surfacing_id=None)
         assert "stm_surfacing_feedback" not in output
         assert "surfacing_id" not in output
+        assert "ratings=[" not in output  # batched example is gated too
+
+    def test_bullet_renders_memory_id_for_feedback(self):
+        """EN-2/3: each bullet carries its ``chunk.id`` as a backticked token
+        so the agent can pass it as ``memory_id`` to the batched feedback
+        call. The id must render before the ``[bucket]: `` marker so it never
+        bleeds into the preview slice (and ``preview_max_chars`` is measured
+        on the preview alone)."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [FakeResult(FakeChunk(content="rememberable", id="chunk-id-42"), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="sid-1")
+
+        assert "`chunk-id-42`" in output
+        preview_line = _preview_line_after_bucket(output)
+        assert "chunk-id-42" not in preview_line
+        assert preview_line == "rememberable"
+
+    def test_batched_feedback_example_rendered_with_surfacing_id(self):
+        """EN-2/3: when feedback is trackable the injection offers a batched
+        ``ratings=[...]`` example so the per-bullet memory ids are actionable,
+        not just decorative. The legacy single-call example stays present and
+        first (the AST scrape relies on it)."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [FakeResult(FakeChunk(), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="sid-1")
+
+        assert 'ratings=[{"memory_id": "<id from a bullet below>", "rating": "helpful"}]' in output
+        # Single-call example unchanged and still present.
+        assert "stm_surfacing_feedback(surfacing_id='sid-1', rating='helpful')" in output
+        # The single-call example precedes the batched one (AST scrape order).
+        assert output.index("rating='helpful')") < output.index("ratings=[")
+
+    def test_truncation_pins_preamble_and_keeps_ids_whole(self):
+        """EN-2/3: truncation pins the whole feedback preamble (header +
+        surfacing_id + both rating examples) and drops body bullets on
+        whole-line boundaries, so a per-memory ``memory_id`` token is never
+        sliced mid-string — a half-copied id silently no-ops batched feedback
+        invalidation. The old flat ``[:max_chars]`` slice could cut a bullet
+        (and its id) at an arbitrary offset."""
+        import re
+
+        config = SurfacingConfig(max_injection_chars=550)
+        fmt = SurfacingFormatter(config)
+        results = [
+            FakeResult(FakeChunk(content="keep this", id="id-keepme-0001"), 0.5),
+            FakeResult(FakeChunk(content="x" * 5000, id="id-dropme-0002"), 0.5),
+        ]
+        output = fmt.inject("response", results, "query", surfacing_id="sid-xyz")
+        block = output.split("<surfaced-memories>\n", 1)[1].rsplit("\n</surfaced-memories>", 1)[0]
+
+        assert "truncated" in block, "precondition: the block must be truncated"
+        # Whole feedback preamble survives.
+        assert "## Relevant Memories" in block
+        assert "_surfacing_id: sid-xyz_" in block
+        assert "stm_surfacing_feedback(surfacing_id='sid-xyz', rating='helpful')" in block
+        assert 'ratings=[{"memory_id": "<id from a bullet below>", "rating": "helpful"}]' in block
+        # Body cut on a line boundary: the marker is its own final line.
+        assert block.splitlines()[-1] == "... (memory block truncated)"
+        # Short bullet's id survives intact; dropped bullet's id is fully
+        # absent — and no ``id-*`` token appears half-sliced.
+        assert "`id-keepme-0001`" in block
+        assert "id-dropme-0002" not in block
+        for frag in re.findall(r"`([^`]+)`", block):
+            if frag.startswith("id-"):
+                assert frag == "id-keepme-0001", f"partial id token leaked: {frag!r}"
+
+    def test_bullet_without_id_degrades_without_crashing(self):
+        """The id token renders only when the chunk has a truthy id. A chunk
+        without one (the defensive guard — every production chunk does carry an
+        id) must degrade to the legacy id-less bullet, not raise in the hot
+        injection path."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class _NoIdChunk:
+            content: str
+            metadata: FakeChunkMeta
+
+        chunk = _NoIdChunk(content="no id here", metadata=FakeChunkMeta())
+        fmt = SurfacingFormatter(SurfacingConfig())
+        output = fmt.inject("response", [FakeResult(chunk, 0.5)], "query", surfacing_id="sid-1")
+
+        # Legacy id-less bullet: no backticked id segment, no doubled space.
+        assert "- **notes/test.md** [default] [related]: no id here" in output
+        assert "[default]  [related]" not in output
+        assert "[default] `" not in output
+
+    def test_truncation_preamble_overrun_drops_all_bullets(self):
+        """When the pinned preamble alone exceeds the cap, the whole body is
+        dropped (zero bullets) but the entire feedback preamble — both rating
+        examples — survives, with the marker on its own final line. This is the
+        bounded-overrun boundary the preamble-pin design relies on."""
+        config = SurfacingConfig(max_injection_chars=120)  # well below ~380-char preamble
+        fmt = SurfacingFormatter(config)
+        results = [FakeResult(FakeChunk(content="x" * 400, id="id-body"), 0.5)]
+        output = fmt.inject("response", results, "query", surfacing_id="sid-over")
+        block = output.split("<surfaced-memories>\n", 1)[1].rsplit("\n</surfaced-memories>", 1)[0]
+
+        # Whole feedback preamble survives even though it overruns the cap.
+        assert "## Relevant Memories" in block
+        assert "_surfacing_id: sid-over_" in block
+        assert "stm_surfacing_feedback(surfacing_id='sid-over', rating='helpful')" in block
+        assert 'ratings=[{"memory_id": "<id from a bullet below>", "rating": "helpful"}]' in block
+        # Zero body bullets; marker on its own final line.
+        assert "- **" not in block
+        assert "id-body" not in block
+        assert block.splitlines()[-1] == "... (memory block truncated)"
+
+    def test_truncation_trims_orphan_working_memory_header(self):
+        """Scratch lines participate in whole-line truncation. If the cut lands
+        right after the working-memory header, the orphan header (and any
+        dangling blank separator) is trimmed so the truncated block stays
+        well-formed rather than leaving a header with no items beneath it."""
+        config = SurfacingConfig(max_injection_chars=120)
+        fmt = SurfacingFormatter(config)
+        # No surfacing_id → tiny preamble, so the cap lands inside the scratch
+        # section (not the preamble).
+        scratch = [{"key": "current_task", "value": "x" * 300}]
+        output = fmt.inject("response", [], "query", scratch_items=scratch)
+        block = output.split("<surfaced-memories>\n", 1)[1].rsplit("\n</surfaced-memories>", 1)[0]
+
+        assert "truncated" in block
+        assert "**Working Memory:**" not in block  # orphan header trimmed
+        assert block.splitlines()[-1] == "... (memory block truncated)"
 
     def test_scratch_items_included(self):
         fmt = SurfacingFormatter(SurfacingConfig())

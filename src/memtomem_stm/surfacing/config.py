@@ -131,7 +131,20 @@ class SurfacingConfig(BaseModel):
     """Parser format for mem_search output. ``compact`` is the legacy
     core format (``[rank] score | source``). ``structured`` selects the
     machine-parseable JSON format (``{"results": [...]}``) with automatic
-    version negotiation — falls back to compact if core is too old."""
+    version negotiation — falls back to compact if core is too old.
+
+    Per-memory feedback fidelity (EN-2/3): the formatter renders each
+    memory's ``chunk.id`` so the agent can rate memories individually via
+    ``stm_surfacing_feedback(ratings=[{"memory_id": ..., "rating": ...}])``.
+    Under ``compact`` that id is a content-derived surrogate
+    (``sha256(content)[:16]``, see ``mcp_client.py``) rather than the real
+    LTM chunk id, with two consequences: a ``helpful`` boost cannot reach
+    the underlying chunk (``increment_access`` no-ops), and two memories
+    with identical content collide on one id. STM-side cache invalidation
+    (``not_relevant`` / ``already_known``) still works because it keys on
+    the same surrogate within the process. Select ``structured`` when
+    reliable per-memory boost / dedup matters — it carries the real
+    ``chunk_id`` end to end."""
 
     @model_validator(mode="after")
     def _validate_auto_tune_bounds(self) -> SurfacingConfig:

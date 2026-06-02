@@ -56,13 +56,16 @@ When memories are found, they're wrapped in `<surfaced-memories>` XML tags and i
 ## Relevant Memories
 _surfacing_id: abc123def456_
 > Rate (one of "helpful" | "partially_helpful" | "not_relevant" | "already_known"): `stm_surfacing_feedback(surfacing_id="abc123def456", rating="helpful")`
+> Or rate specific memories: `stm_surfacing_feedback(surfacing_id="abc123def456", ratings=[{"memory_id": "<id from a bullet below>", "rating": "helpful"}])`
 
-- **notes/auth_notes.md** [code-notes] [strong]: OAuth2 implementation uses PKCE flow...
-- **design/api_design.md** [default] [related]: Rate limiting is handled by middleware in...
+- **notes/auth_notes.md** [code-notes] `a1b2c3d4e5f6a7b8` [strong]: OAuth2 implementation uses PKCE flow...
+- **design/api_design.md** [default] `9f8e7d6c5b4a3210` [related]: Rate limiting is handled by middleware in...
 </surfaced-memories>
 ```
 
 Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. Exact raw-score distributions remain available through `stm_surfacing_stats`.
+
+Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="compact"` this id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Set `result_format="structured"` to carry the real `chunk_id` end to end.
 
 The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
 

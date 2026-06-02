@@ -52,6 +52,12 @@ class RemoteSearchResult:
         def __init__(self, content: str, source: str, namespace: str):
             self.content = content
             self.metadata = RemoteSearchResult._FakeMeta(source, namespace)
+            # Compact parser has no real chunk id, so derive a stable surrogate
+            # from the content. The formatter renders this as the agent-facing
+            # ``memory_id`` (EN-2/3); the structured parser overwrites it with
+            # the real ``chunk_id`` from core (see ResultParser). The surrogate
+            # is good enough for STM-side invalidation but cannot drive the LTM
+            # ``increment_access`` boost — see ``SurfacingConfig.result_format``.
             self.id = hashlib.sha256(content.encode()).hexdigest()[:16]
 
     def __init__(self, content: str, score: float, source: str = "", namespace: str = "default"):

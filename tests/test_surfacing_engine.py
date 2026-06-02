@@ -994,6 +994,67 @@ class TestHandleFeedbackBatch:
         # The helpful entry did NOT land in the invalidation set.
         assert ("gh", "read_file", "mid-A") not in engine._invalidated_ids
 
+    async def test_rendered_bullet_id_roundtrips_through_batch_feedback(self, tmp_path: Path):
+        """EN-2/3 end-to-end: the ``memory_id`` the formatter renders in a
+        bullet is exactly the token ``handle_feedback_batch`` needs to
+        invalidate that memory. Surface → read the backticked id out of the
+        injected block (as an agent would) → batch-rate it ``not_relevant``
+        → the next cache hit drops it. Proves the rendered id is actionable
+        via the batched path; the single-call path is covered by
+        ``TestCacheInvalidationOnNegativeFeedback``."""
+        import re
+
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        chunk_a = FakeChunk(id="mid-A", content="apple memory")
+        chunk_b = FakeChunk(id="mid-B", content="banana memory")
+        adapter = _make_mcp_adapter(
+            [
+                FakeSearchResult(chunk=chunk_a, score=0.5),
+                FakeSearchResult(chunk=chunk_b, score=0.4),
+            ]
+        )
+
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "fb.db")
+        engine = SurfacingEngine(
+            config=_make_config(cooldown_seconds=0),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+        try:
+            out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            # The formatter renders each memory id as a backticked token the
+            # agent can lift straight into the batched ``ratings`` shape.
+            assert "`mid-A`" in out1
+            assert "`mid-B`" in out1
+
+            sid_match = re.search(r"surfacing_id[:=]\s*\"?([a-f0-9]{16})", out1)
+            assert sid_match, "surfacing_id not found in first output"
+            sid = sid_match.group(1)
+
+            # Close the loop: lift the id off the "apple memory" bullet itself
+            # (as an agent would) and feed THAT back. A formatter that ever
+            # rendered a token other than the ``str(chunk.id)`` invalidation key
+            # would fail here, rather than passing on a shared hardcoded literal.
+            apple_line = next(ln for ln in out1.splitlines() if "apple memory" in ln)
+            apple_id_match = re.search(r"`([^`]+)`", apple_line)
+            assert apple_id_match, f"no backticked id on the apple bullet: {apple_line!r}"
+            apple_id = apple_id_match.group(1)
+            assert apple_id == "mid-A"
+
+            result = await engine.handle_feedback_batch(
+                sid, [{"memory_id": apple_id, "rating": "not_relevant"}]
+            )
+            assert "1/1 entries" in result
+
+            # Next cache hit drops mid-A, keeps mid-B.
+            out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "apple memory" not in out2
+            assert "banana memory" in out2
+            assert "`mid-A`" not in out2
+        finally:
+            tracker.close()
+
     async def test_multiple_helpful_collapse_to_single_boost_with_set(self):
         adapter = _make_mcp_adapter([])
         adapter.increment_access = AsyncMock()
