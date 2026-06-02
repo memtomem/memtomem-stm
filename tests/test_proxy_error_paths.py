@@ -1040,3 +1040,72 @@ class TestCallTimeout:
             f"second attempt used {captured_timeouts[1]:.4f}s but remaining "
             "deadline was smaller; shrink logic not applied"
         )
+
+
+class TestTransientKeyResponsesNotCached:
+    """Responses embedding a TRANSIENT pending-store retrieval key (progressive
+    first-chunk, SELECTIVE/HYBRID TOC) must NOT be cached: the key dies on
+    process restart / pending-store eviction / its shorter TTL, so a cache hit
+    would hand back a dead ``stm_proxy_read_more`` / ``stm_proxy_select_chunks``
+    key with the response tail unrecoverable. Skipping the store makes the next
+    identical call re-run the pipeline and mint a fresh, live key."""
+
+    # Enough markdown sections that SELECTIVE emits a chunk TOC (with a
+    # transient ``selection_key``) rather than falling back to truncation.
+    _TOC_TEXT = "# Doc\n\n" + "\n\n".join(
+        f"## Section {i} heading text\n" + ("alpha beta gamma delta epsilon zeta " * 12)
+        for i in range(12)
+    )
+
+    async def test_selective_toc_response_is_not_cached(self, tmp_path):
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(
+            compression=CompressionStrategy.SELECTIVE,
+            max_result_chars=400,
+            tmp_path=tmp_path,
+        )
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [
+            _make_result(self._TOC_TEXT),
+            _make_result(self._TOC_TEXT),
+        ]
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            r1 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert '"selection_key"' in r1, (
+                "precondition: SELECTIVE must emit a TOC carrying a transient key"
+            )
+            # Identical second call must re-run upstream — the TOC was NOT cached.
+            r2 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert '"selection_key"' in r2
+            assert session.call_tool.call_count == 2, (
+                "transient-key TOC must not be cached; the second identical call "
+                f"should re-run upstream (saw {session.call_tool.call_count})"
+            )
+            assert cache.get("srv", "tool", {"x": 1}) is None
+        finally:
+            cache.close()
+
+    async def test_plain_response_is_still_cached(self, tmp_path):
+        """Over-suppression guard: a key-free response must still be cached."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(tmp_path=tmp_path)  # compression NONE
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [_make_result("plain upstream payload")]
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            r1 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "plain upstream payload" in r1
+            r2 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "plain upstream payload" in r2
+            assert session.call_tool.call_count == 1, (
+                "non-transient response should be cached; second call must hit cache"
+            )
+        finally:
+            cache.close()

@@ -50,6 +50,38 @@ def _make_key(server: str, tool: str, args: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+# Substrings that flag a response embedding a TRANSIENT retrieval key pointing
+# into a process-local pending store. Such payloads must never be cached/served:
+# the key outlives neither a process restart nor the (shorter) pending-store TTL,
+# so a cache hit would hand the agent a dead ``stm_proxy_read_more`` /
+# ``stm_proxy_select_chunks`` key with the response tail unrecoverable.
+#   - progressive first-chunks carry ``progressive.PROGRESSIVE_FOOTER_TOKEN``.
+#   - SELECTIVE / HYBRID chunk TOCs are JSON objects carrying BOTH a
+#     ``"selection_key"`` field and a ``"ttl_seconds_remaining"`` field
+#     (``SelectiveCompressor`` in compression.py). We require the PAIR — not
+#     ``"selection_key"`` alone — so an arbitrary upstream JSON that merely
+#     contains a ``selection_key`` field is not misclassified as transient. The
+#     pair is spacing-invariant, matching both the spaced selective dump and the
+#     compact ``HybridCompressor._fit_toc_tail`` dump (whose abbreviated call
+#     hint drops ``stm_proxy_select_chunks(``, which is why we key on fields).
+# Kept here (the persistence layer) so the store-side guard and the startup
+# legacy purge below can never diverge.
+_PROGRESSIVE_MARKER = "\n---\n[progressive: chars="
+_SELECTION_KEY_MARKER = '"selection_key"'
+_TOC_SHAPE_MARKER = '"ttl_seconds_remaining"'
+
+
+def response_carries_transient_key(text: str) -> bool:
+    """True if ``text`` embeds a transient pending-store retrieval key.
+
+    Used by ``ProxyManager`` to skip caching such responses and by
+    :meth:`ProxyCache.initialize` to purge any that pre-date the guard.
+    """
+    if _PROGRESSIVE_MARKER in text:
+        return True
+    return _SELECTION_KEY_MARKER in text and _TOC_SHAPE_MARKER in text
+
+
 class ProxyCache:
     def __init__(self, db_path: Path, max_entries: int = 10000) -> None:
         self._db_path = db_path
@@ -76,6 +108,19 @@ class ProxyCache:
                 "DELETE FROM proxy_cache WHERE ttl_seconds IS NOT NULL "
                 "AND created_at + ttl_seconds <= ?",
                 (time.time(),),
+            )
+            # One-time purge of legacy rows whose cached result embeds a
+            # transient retrieval key (progressive/SELECTIVE/HYBRID TOC). These
+            # pre-date the store-side guard and would otherwise serve a dead key
+            # after restart/TTL skew until they expire (or forever for no-TTL
+            # caches). ``instr`` is a case-sensitive literal substring match, so
+            # the predicate mirrors ``response_carries_transient_key`` exactly
+            # (progressive footer OR the selection_key + ttl_seconds_remaining
+            # pair) — no LIKE wildcard/case-folding divergence.
+            db.execute(
+                "DELETE FROM proxy_cache WHERE instr(result, ?) > 0 "
+                "OR (instr(result, ?) > 0 AND instr(result, ?) > 0)",
+                (_PROGRESSIVE_MARKER, _SELECTION_KEY_MARKER, _TOC_SHAPE_MARKER),
             )
             db.commit()
         except Exception:
