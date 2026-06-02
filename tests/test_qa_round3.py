@@ -357,12 +357,18 @@ class TestCJKSentenceBoundary:
 
 class TestDoubleStartGuard:
     @pytest.mark.asyncio
-    async def test_double_start_no_leak(self):
+    async def test_double_start_no_leak(self, tmp_path):
         from memtomem_stm.proxy.config import ProxyConfig
         from memtomem_stm.proxy.manager import ProxyManager
         from memtomem_stm.proxy.metrics import TokenTracker
 
-        pm = ProxyManager(ProxyConfig(), TokenTracker())
+        # Point config_path at a non-existent file so start()'s load_from_file
+        # falls back to an empty ProxyConfig (no upstream_servers) instead of
+        # the dev box's real ~/.memtomem/stm_proxy.json. A real config spawns
+        # stdio children whose anyio cancel scopes raise "exit cancel scope in
+        # a different task" on stop() — the production stop() fix (#410) does
+        # not cover test-spawned subprocesses.
+        pm = ProxyManager(ProxyConfig(config_path=tmp_path / "stm_proxy.json"), TokenTracker())
 
         # First start (no servers configured, just creates stack)
         await pm.start()
