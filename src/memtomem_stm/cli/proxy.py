@@ -1619,7 +1619,6 @@ _LANG_PRESETS: dict[str, dict[str, Any]] = {
     "en": {},
     "ko": {
         "chars_per_token": 1.85,
-        "min_response_chars": 230,
         "default_max_result_chars": 8500,
         "_per_server": {
             "max_result_tokens": 2000,
@@ -1709,10 +1708,10 @@ def _prompt_language() -> str:
     help=(
         "Primary content language preset for token-aware budgets. "
         "'en' (default) writes no language-specific fields. 'ko' sets "
-        "chars_per_token=1.85, default_max_result_chars=8500, "
-        "min_response_chars=230, and adds max_result_tokens=2000 + "
-        "chars_per_token=1.85 to each imported server. Omit for the "
-        "interactive prompt; defaults to 'en' on non-TTY callers."
+        "chars_per_token=1.85 and default_max_result_chars=8500, and "
+        "adds max_result_tokens=2000 + chars_per_token=1.85 to each "
+        "imported server. Omit for the interactive prompt; defaults to "
+        "'en' on non-TTY callers."
     ),
 )
 def init(
