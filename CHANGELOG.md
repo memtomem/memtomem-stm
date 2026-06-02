@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.25] — 2026-06-02
+
+A small maintenance release: the standalone `mms` MCP stdio server now exits
+cleanly when the client closes the connection, instead of surfacing a benign
+AnyIO teardown error as an unhandled exception.
+
+### Fixed
+
+- **`mms` server shuts down cleanly on stdio EOF** (#410) — when an MCP client (Claude Code, Codex, etc.) closes the stdio transport, the AnyIO task group occasionally raised `RuntimeError: Attempted to exit a cancel scope that isn't the current task's current cancel scope` (and the sibling "different task than it was entered in" variant) during teardown. `mcp.run()` is correct by then — the only work left is process exit — but the error propagated out of `server.main()` and was logged via `logger.exception(...)` as an unhandled crash, alarming operators tailing logs and producing a non-zero-looking shutdown. `main()` now recognizes the two known AnyIO cancel-scope-shutdown messages, logs them once at WARNING as ignored, and returns 0; any other `RuntimeError` keeps the original `logger.exception(...)` + re-raise path so genuine failures are not masked. Regression coverage in `tests/test_server_tools.py` pins both shutdown-message variants to the swallow path and an unrelated `RuntimeError` to the re-raise path.
+
 ## [0.1.24] — 2026-05-31
 
 This release extends proactive memory surfacing to **Claude Code's built-in tools** through `mms hook` and a warm background daemon, adds a **network transport** for the LTM connection, makes response **compression query-aware and its JSON tiers safer** (the JSON-emitting tiers now return strictly-valid JSON and degrade monotonically, staying within budget except SELECTIVE's documented zero-preview-floor exception), and lands a broad surfacing-quality pass — relevance buckets, persisted auto-tuning, richer feedback ratings — alongside several query-privacy controls.
