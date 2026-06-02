@@ -7,6 +7,10 @@ from typing import Any
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import VALID_RATINGS
 
+# Header for the optional scratch / working-memory section. Shared between the
+# render site and the truncation orphan-trim so the two cannot drift.
+_WORKING_MEMORY_HEADER = "**Working Memory:**"
+
 
 class SurfacingFormatter:
     """Inject surfaced memories into a tool response."""
@@ -90,7 +94,23 @@ class SurfacingFormatter:
                 f"`stm_surfacing_feedback(surfacing_id={surfacing_id!r}, "
                 f"rating={example_rating!r})`"
             )
+            # EN-2/3: per-memory feedback. Every bullet below carries its
+            # ``memory_id`` (the backticked token after the namespace badge);
+            # the batched form rates them individually so ``not_relevant`` /
+            # ``already_known`` invalidate exactly those memories on the next
+            # cache hit instead of the whole event. The single-call line above
+            # stays first so the AST-scraped rating example keeps exactly one
+            # literal ``rating=`` (the batched call uses ``ratings=`` instead).
+            lines.append(
+                f"> Or rate specific memories: "
+                f"`stm_surfacing_feedback(surfacing_id={surfacing_id!r}, "
+                f'ratings=[{{"memory_id": "<id from a bullet below>", '
+                f'"rating": "{example_rating}"}}])`'
+            )
         lines.append("")
+        # Everything appended above is the preamble (header + feedback spec);
+        # it is pinned through truncation below. Bullets/scratch are the body.
+        body_start = len(lines)
 
         for r in results:
             chunk = r.chunk
@@ -117,11 +137,22 @@ class SurfacingFormatter:
                     preview = preview + " | " + snippet + "..."
 
             bucket = self._relevance_bucket(float(r.score), score_floor)
-            lines.append(f"- **{source}**{ns_badge} [{bucket}]: {preview}")
+            # The backticked ``chunk.id`` is the agent-copyable ``memory_id``
+            # for ``stm_surfacing_feedback(ratings=...)`` (EN-2/3). It sits
+            # before the ``[bucket]: `` marker so the preview parse (and the
+            # ``preview_max_chars`` cap) is unaffected, and it matches the
+            # ``str(r.chunk.id)`` key the engine invalidation filters on.
+            # Rendered only when present — every production chunk carries an id
+            # (a content surrogate under compact, the real chunk_id under
+            # structured), but a chunk without one degrades to the id-less
+            # bullet rather than crashing the whole injection.
+            cid = getattr(chunk, "id", None)
+            id_token = f" `{cid}`" if cid else ""
+            lines.append(f"- **{source}**{ns_badge}{id_token} [{bucket}]: {preview}")
 
         if scratch_items:
             lines.append("")
-            lines.append("**Working Memory:**")
+            lines.append(_WORKING_MEMORY_HEADER)
             for item in scratch_items[:3]:
                 key = item.get("key", "")
                 value = str(item.get("value", ""))[:200].replace("\n", " ")
@@ -129,10 +160,34 @@ class SurfacingFormatter:
 
         memory_block = "\n".join(lines)
 
-        # Enforce injection size limit to prevent context bloat
+        # Enforce injection size limit to prevent context bloat. The preamble
+        # (``lines[:body_start]`` — header + surfacing_id + rating spec) is
+        # pinned so the feedback loop survives truncation on the largest, most
+        # expensive surfacings (#350); the body (bullets + scratch) is dropped
+        # on whole-line boundaries so a per-memory ``memory_id`` token is never
+        # severed mid-string — a half-copied id silently no-ops batched
+        # feedback invalidation (EN-2/3). A flat ``[:max_chars]`` slice broke
+        # both. The preamble may overrun ``max_chars`` by a bounded amount,
+        # which only happens at the tiny caps tests use; production caps
+        # (default 3000) dwarf the ~300-char preamble.
         max_chars = self._config.effective_max_injection_chars()
         if max_chars and len(memory_block) > max_chars:
-            memory_block = memory_block[:max_chars] + "\n... (memory block truncated)"
+            marker = "\n... (memory block truncated)"
+            kept = lines[:body_start]
+            used = len("\n".join(kept))
+            for line in lines[body_start:]:
+                # +1 accounts for the newline that joins this line on.
+                if used + len(line) + len(marker) + 1 > max_chars:
+                    break
+                kept.append(line)
+                used += len(line) + 1
+            # A whole-line drop can stop right after the working-memory header
+            # (or a section's blank separator), leaving an orphan header with no
+            # items beneath it. Trim trailing structural-only lines so the
+            # truncated block stays well-formed.
+            while len(kept) > body_start and kept[-1] in ("", _WORKING_MEMORY_HEADER):
+                kept.pop()
+            memory_block = "\n".join(kept) + marker
 
         match self._config.injection_mode:
             case "prepend":

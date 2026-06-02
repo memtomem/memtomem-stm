@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Changed
+
+- **Surfaced memories expose a per-memory `memory_id` for feedback** (EN-2/3) — each injected bullet now renders its `chunk.id` as a backticked token, and the feedback preamble adds a batched `stm_surfacing_feedback(ratings=[{"memory_id": ..., "rating": ...}])` example alongside the single-call one, so an agent can rate (and invalidate) individual memories rather than the whole surfacing event. **Behavior change**: the injected bullet format gains a `` `id` `` segment between the namespace badge and the `[bucket]` label; parsers keying on the exact `**source**{ns} [bucket]:` shape must account for it (the preview still follows `[bucket]: `). Injection-size truncation now pins the whole feedback preamble and drops body bullets on whole-line boundaries so a `memory_id` token is never severed mid-string. Under the default `result_format="compact"` the rendered id is a content-derived surrogate (`sha256(content)[:16]`), which drives STM-side invalidation but not the LTM `increment_access` boost; set `result_format="structured"` for the real `chunk_id` end to end.
+
 ## [0.1.25] — 2026-06-02
 
 A small maintenance release: the standalone `mms` MCP stdio server now exits
