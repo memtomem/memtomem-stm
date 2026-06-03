@@ -154,6 +154,83 @@ def inspect_feedback_db(db_path: Path) -> dict[str, object]:
     return status
 
 
+def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, object]:
+    """Read surfacing event + feedback aggregates read-only from disk.
+
+    Like :func:`inspect_feedback_db`, opens the DB read-only via ``?mode=ro``
+    and never creates or migrates it. Deliberately excludes the ``recent``
+    query previews that :meth:`FeedbackStore.get_stats` can surface — a stats
+    summary must not leak (possibly unredacted) query text — so only counts
+    and the rating distribution are returned.
+
+    ``available`` is ``False`` when the file is missing or has no
+    ``surfacing_events`` table. The optional ``tool`` filter matches the raw
+    tool name.
+    """
+    resolved = db_path.expanduser().resolve()
+    summary: dict[str, object] = {
+        "path": str(resolved),
+        "available": False,
+        "events_total": 0,
+        "distinct_tools": 0,
+        "total_feedback": 0,
+        "rating_distribution": {},
+        "error": None,
+    }
+    if not resolved.exists():
+        return summary
+
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        summary["error"] = str(exc)
+        return summary
+
+    try:
+        tables = {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if "surfacing_events" not in tables:
+            return summary
+
+        params: list[object] = []
+        where = ""
+        if tool is not None:
+            where = " WHERE tool = ?"
+            params.append(tool)
+        summary["events_total"] = db.execute(
+            f"SELECT COUNT(*) FROM surfacing_events{where}", params
+        ).fetchone()[0]
+        summary["distinct_tools"] = db.execute(
+            f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where}", params
+        ).fetchone()[0]
+
+        if "surfacing_feedback" in tables:
+            if tool is not None:
+                rating_rows = db.execute(
+                    "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
+                    "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                    "WHERE e.tool = ? GROUP BY f.rating",
+                    (tool,),
+                ).fetchall()
+            else:
+                rating_rows = db.execute(
+                    "SELECT rating, COUNT(*) FROM surfacing_feedback GROUP BY rating"
+                ).fetchall()
+            distribution = {row[0]: row[1] for row in rating_rows}
+            summary["rating_distribution"] = distribution
+            summary["total_feedback"] = sum(distribution.values())
+
+        summary["available"] = True
+    except sqlite3.Error as exc:
+        summary["error"] = str(exc)
+        return summary
+    finally:
+        db.close()
+
+    return summary
+
+
 class FeedbackStore:
     """SQLite store for surfacing events and feedback ratings."""
 

@@ -40,6 +40,116 @@ def _tristate(value: bool | None) -> int | None:
     return 1 if value else 0
 
 
+def _saved_ratio(original: int, compressed: int) -> float:
+    """Fraction of chars removed by compression, guarding div-by-zero."""
+    if original <= 0:
+        return 0.0
+    return round(1.0 - (compressed / original), 4)
+
+
+def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str, object]:
+    """Aggregate per-``(server, tool)`` compression stats read-only from disk.
+
+    Unlike :meth:`MetricsStore.initialize`, this NEVER creates or migrates the
+    DB — it opens the file read-only via the ``?mode=ro`` URI (mirroring
+    :func:`memtomem_stm.surfacing.feedback_store.inspect_feedback_db`) so a CLI
+    *read* command can't write DDL into the user's store. ``tune_connection``
+    is deliberately not called: ``PRAGMA journal_mode=WAL`` would write, and a
+    server-created DB is already in WAL mode (concurrent reads are safe).
+
+    The returned dict always has the same keys so callers can render a stable
+    shape. ``available`` is ``False`` when the file is missing or isn't a
+    metrics DB; ``schema_outdated`` is ``True`` for a pre-migration DB that
+    lacks the ``is_error`` column (added by :meth:`MetricsStore._migrate`), in
+    which case ``error_count`` degrades to ``0`` rather than crashing.
+
+    The optional ``tool`` filter matches the raw tool name, so it can span
+    multiple servers that expose a same-named tool.
+    """
+    resolved = db_path.expanduser().resolve()
+    summary: dict[str, object] = {
+        "path": str(resolved),
+        "available": False,
+        "schema_outdated": False,
+        "total_calls": 0,
+        "error_count": 0,
+        "total_original_chars": 0,
+        "total_compressed_chars": 0,
+        "saved_chars": 0,
+        "saved_ratio": 0.0,
+        "by_tool": [],
+        "error": None,
+    }
+    if not resolved.exists():
+        return summary
+
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        summary["error"] = str(exc)
+        return summary
+
+    try:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
+        if "original_chars" not in cols:
+            # Missing file would have returned above; an empty column set here
+            # means the file exists but isn't a recognizable metrics DB.
+            return summary
+        has_is_error = "is_error" in cols
+        summary["schema_outdated"] = not has_is_error
+        error_expr = "SUM(is_error)" if has_is_error else "0"
+
+        params: list[object] = []
+        where = ""
+        if tool is not None:
+            where = " WHERE tool = ?"
+            params.append(tool)
+        rows = db.execute(
+            "SELECT server, tool, COUNT(*), SUM(original_chars), "
+            f"SUM(compressed_chars), {error_expr} "
+            f"FROM proxy_metrics{where} GROUP BY server, tool "
+            "ORDER BY COUNT(*) DESC",
+            params,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        summary["error"] = str(exc)
+        return summary
+    finally:
+        db.close()
+
+    by_tool: list[dict[str, object]] = []
+    total_calls = total_error = total_orig = total_comp = 0
+    for server, tool_name, calls, orig, comp, errors in rows:
+        calls = calls or 0
+        orig = orig or 0
+        comp = comp or 0
+        errors = errors or 0
+        total_calls += calls
+        total_error += errors
+        total_orig += orig
+        total_comp += comp
+        by_tool.append(
+            {
+                "server": server,
+                "tool": tool_name,
+                "calls": calls,
+                "original_chars": orig,
+                "compressed_chars": comp,
+                "saved_ratio": _saved_ratio(orig, comp),
+            }
+        )
+
+    summary["available"] = True
+    summary["total_calls"] = total_calls
+    summary["error_count"] = total_error
+    summary["total_original_chars"] = total_orig
+    summary["total_compressed_chars"] = total_comp
+    summary["saved_chars"] = total_orig - total_comp
+    summary["saved_ratio"] = _saved_ratio(total_orig, total_comp)
+    summary["by_tool"] = by_tool
+    return summary
+
+
 class MetricsStore:
     """SQLite-backed persistent metrics for proxy calls."""
 
