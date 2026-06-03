@@ -681,25 +681,40 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
-    # Mirror the server's env > file > defaults precedence so the resolved DB
-    # paths honor MEMTOMEM_STM_* overrides (server.py app_lifespan).
-    proxy_cfg = ProxyConfig.load_from_file(path, env_overrides=collect_proxy_env_overrides())
-    if proxy_cfg is None:
-        # Parse/validation error — fall back to defaults purely to locate the
-        # DB paths to probe, but flag the config as invalid.
-        config_status = "invalid"
-        proxy_cfg = ProxyConfig()
-    elif not resolved.exists():
-        config_status = "missing"
-    else:
-        config_status = "ok"
-
-    # Surfacing config lives outside the proxy JSON file; read it (env-aware)
-    # the same way ``mms health`` does (_surfacing_bootstrap_status).
+    # Resolve config + DB paths exactly as the server does (server.app_lifespan).
+    # ``STMConfig()`` pulls proxy + surfacing from ``MEMTOMEM_STM_*`` env. When
+    # the proxy is enabled via env, the server uses that env-only config and
+    # SKIPS the JSON file entirely (server.py), so honoring a file-level
+    # ``metrics.db_path`` here would point ``mms stats`` at a different
+    # ``proxy_metrics.db`` than the one the server actually writes to.
+    env_enabled = bool(os.environ.get("MEMTOMEM_STM_PROXY__ENABLED"))
     try:
-        feedback_path = STMConfig().surfacing.feedback_db_path
+        stm_config: STMConfig | None = STMConfig()
     except Exception:
-        feedback_path = Path("~/.memtomem/stm_feedback.db")
+        stm_config = None
+    feedback_path = (
+        stm_config.surfacing.feedback_db_path
+        if stm_config is not None
+        else Path("~/.memtomem/stm_feedback.db")
+    )
+
+    if env_enabled and stm_config is not None:
+        # Env-only mode — the JSON file is bypassed, matching the server.
+        proxy_cfg = stm_config.proxy
+        config_status = "env"
+    else:
+        loaded = ProxyConfig.load_from_file(path, env_overrides=collect_proxy_env_overrides())
+        if loaded is None:
+            # Parse/validation error — fall back to defaults purely to locate the
+            # DB paths to probe, but flag the config as invalid.
+            config_status = "invalid"
+            proxy_cfg = ProxyConfig()
+        elif not resolved.exists():
+            config_status = "missing"
+            proxy_cfg = loaded
+        else:
+            config_status = "ok"
+            proxy_cfg = loaded
 
     compression = read_compression_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
@@ -722,7 +737,10 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
         )
         return
 
-    click.echo(f"Config : {resolved} ({config_status})")
+    if config_status == "env":
+        click.echo("Config : MEMTOMEM_STM_PROXY__ENABLED set — env config (JSON file bypassed)")
+    else:
+        click.echo(f"Config : {resolved} ({config_status})")
     click.echo(f"Enabled: {'yes' if proxy_cfg.enabled else 'no'}")
     click.echo(f"Servers: {len(proxy_cfg.upstream_servers)}")
     if tool_filter:
