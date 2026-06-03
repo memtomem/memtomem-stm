@@ -5,12 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.26] — 2026-06-03
+
+A correctness and surfacing-quality maintenance release completing the
+proxy/surfacing review-fixes track (#412–#417): the proxy cache no longer
+serves a response whose progressive/selective retrieval key has already
+expired, surfaced memories expose a per-memory id so an agent can rate or
+invalidate them individually, and short tool-call queries now surface instead
+of silently dropping. Also drops a dead `min_response_chars` key from the
+`mms init --lang ko` preset.
+
 ### Changed
 
 - **Surfaced memories expose a per-memory `memory_id` for feedback** (EN-2/3) — each injected bullet now renders its `chunk.id` as a backticked token, and the feedback preamble adds a batched `stm_surfacing_feedback(ratings=[{"memory_id": ..., "rating": ...}])` example alongside the single-call one, so an agent can rate (and invalidate) individual memories rather than the whole surfacing event. **Behavior change**: the injected bullet format gains a `` `id` `` segment between the namespace badge and the `[bucket]` label; parsers keying on the exact `**source**{ns} [bucket]:` shape must account for it (the preview still follows `[bucket]: `). Injection-size truncation now pins the whole feedback preamble and drops body bullets on whole-line boundaries so a `memory_id` token is never severed mid-string. Under the default `result_format="compact"` the rendered id is a content-derived surrogate (`sha256(content)[:16]`), which drives STM-side invalidation but not the LTM `increment_access` boost; set `result_format="structured"` for the real `chunk_id` end to end.
 
 ### Fixed
 
+- **Proxy cache no longer serves a response whose retrieval key has expired** (#412) — a progressive first-chunk and a SELECTIVE/HYBRID table-of-contents each mint a key into a process-local pending store, but the proxy cached that pre-surfacing `compressed` payload under the cache TTL (3600s) — longer than the pending store's (progressive 1800s, selective 300s) and unable to survive a restart. A later cache hit then returned a TOC / first-chunk whose `stm_proxy_read_more` / `stm_proxy_select_chunks` key was already dead, losing the response tail with no recovery. The cache now skips storing any compressed response carrying a transient-key marker (`PROGRESSIVE_FOOTER_TOKEN` or a `selection_key` JSON field) and purges such legacy rows once in `ProxyCache.initialize()`; the next identical call re-runs the pipeline and mints a fresh, live key. A false positive only costs one un-cached response (re-fetched on the next call), never correctness; progressive passthroughs and truncate fallbacks mint no key, carry no marker, and stay cacheable.
 - **`mms init --lang ko` no longer writes a dead `min_response_chars` key** — the KO token-aware preset emitted a top-level `min_response_chars: 230`, but `ProxyConfig` has no such field (it lives only on the nested `ExtractionConfig`, default `500`), so pydantic's default `extra="ignore"` silently dropped it on load — an advertised budget that never applied. Removed it from the preset, the `--lang` help text, and `docs/configuration.md`; the other KO fields (`chars_per_token`, `default_max_result_chars`, per-server `max_result_tokens`) were and remain effective. The `--lang ko` CLI test now round-trips the written config through `ProxyConfig.load_from_file` and asserts the *effective* fields, so a future silently-dropped preset key fails loudly instead of passing a raw-JSON-only check.
 - **Short tool-call queries surface instead of silently dropping** (KR-4.2) — `ContextExtractor` appended the tool name to clear `min_query_tokens` only when argument extraction yielded *nothing*. A short-but-non-empty extraction — e.g. `read_file {"path": "/etc/hosts"}` tokenizing to `"etc hosts"` (2 tokens, below the default floor of 3) — produced no query, so surfacing never fired for it. The fallback now also fires when the extracted tokens alone fall below `min_query_tokens`, appending the tool-name token(s) after the deterministic argument scan. Queries that already clear the floor are untouched, and a query still too short even with the tool name (e.g. a one-token tool) is still rejected. Trade-off: a marginal query now consumes a surfacing rate-limit / cooldown slot.
 
