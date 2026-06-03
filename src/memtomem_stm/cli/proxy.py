@@ -617,6 +617,122 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     click.echo(f"\n{len(servers)} server(s) configured.")
 
 
+def _render_compression_block(summary: dict[str, Any]) -> None:
+    click.echo(_hdr("Proxy / Compression"))
+    click.echo("=" * 30)
+    if not summary.get("available") or not summary.get("total_calls"):
+        click.echo("  No proxy metrics recorded yet.")
+        return
+    if summary.get("schema_outdated"):
+        click.echo(f"  {_warn('schema outdated')} — error counts unavailable (pre-migration DB).")
+    orig = summary["total_original_chars"]
+    comp = summary["total_compressed_chars"]
+    ratio = float(summary["saved_ratio"]) * 100
+    click.echo(f"  calls: {summary['total_calls']}  (errors: {summary['error_count']})")
+    click.echo(f"  chars: {orig:,} -> {comp:,}  (saved {summary['saved_chars']:,}, {ratio:.1f}%)")
+    by_tool = summary.get("by_tool") or []
+    if by_tool:
+        click.echo("")
+        header = (
+            f"  {'SERVER':<12} {'TOOL':<28} {'CALLS':>6} {'ORIG':>10} {'COMP':>10} {'SAVED%':>7}"
+        )
+        click.echo(_hdr(header))
+        for row in by_tool:
+            saved_pct = float(row["saved_ratio"]) * 100
+            click.echo(
+                f"  {str(row['server'])[:12]:<12} {str(row['tool'])[:28]:<28} "
+                f"{row['calls']:>6} {row['original_chars']:>10,} "
+                f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
+            )
+
+
+def _render_surfacing_block(summary: dict[str, Any]) -> None:
+    click.echo(_hdr("Surfacing"))
+    click.echo("=" * 30)
+    if not summary.get("available"):
+        click.echo("  No surfacing events recorded yet.")
+        return
+    click.echo(
+        f"  surfaced events: {summary['events_total']}  "
+        f"(distinct tools: {summary['distinct_tools']})"
+    )
+    click.echo(f"  feedback ratings: {summary['total_feedback']}")
+    for rating, count in sorted((summary.get("rating_distribution") or {}).items()):
+        click.echo(f"    {rating:<20} {count}")
+
+
+@cli.command()
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--tool", "tool_filter", default=None, help="Filter to one upstream tool name.")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
+def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = False) -> None:
+    """Show proxy compression and surfacing stats from the persistent stores.
+
+    Reads ``proxy_metrics.db`` and ``stm_feedback.db`` read-only (it never
+    creates or migrates them) and reports all-time totals. The live MCP server
+    keeps additional in-memory counters that a separate CLI process cannot see,
+    so the numbers here reflect only what has been written to disk.
+    """
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+    from memtomem_stm.surfacing.feedback_store import read_surfacing_summary
+
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+
+    # Mirror the server's env > file > defaults precedence so the resolved DB
+    # paths honor MEMTOMEM_STM_* overrides (server.py app_lifespan).
+    proxy_cfg = ProxyConfig.load_from_file(path, env_overrides=collect_proxy_env_overrides())
+    if proxy_cfg is None:
+        # Parse/validation error — fall back to defaults purely to locate the
+        # DB paths to probe, but flag the config as invalid.
+        config_status = "invalid"
+        proxy_cfg = ProxyConfig()
+    elif not resolved.exists():
+        config_status = "missing"
+    else:
+        config_status = "ok"
+
+    # Surfacing config lives outside the proxy JSON file; read it (env-aware)
+    # the same way ``mms health`` does (_surfacing_bootstrap_status).
+    try:
+        feedback_path = STMConfig().surfacing.feedback_db_path
+    except Exception:
+        feedback_path = Path("~/.memtomem/stm_feedback.db")
+
+    compression = read_compression_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
+    surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "config_path": str(resolved),
+                    "config_status": config_status,
+                    "enabled": proxy_cfg.enabled,
+                    "servers": len(proxy_cfg.upstream_servers),
+                    "tool_filter": tool_filter,
+                    "compression": compression,
+                    "surfacing": surfacing,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    click.echo(f"Config : {resolved} ({config_status})")
+    click.echo(f"Enabled: {'yes' if proxy_cfg.enabled else 'no'}")
+    click.echo(f"Servers: {len(proxy_cfg.upstream_servers)}")
+    if tool_filter:
+        click.echo(f"Filter : tool={tool_filter}")
+    click.echo("")
+    _render_compression_block(compression)
+    click.echo("")
+    _render_surfacing_block(surfacing)
+
+
 @cli.command()
 @click.argument("name", required=False)
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)

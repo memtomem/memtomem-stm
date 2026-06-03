@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from memtomem_stm.proxy.metrics import CallMetrics
-from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
 
 
 NEW_COLUMNS = {
@@ -310,3 +310,128 @@ class TestReadPathConcurrency:
             assert final_count == total_writes
         finally:
             store.close()
+
+
+class TestReadCompressionSummary:
+    """``read_compression_summary`` aggregates per-(server, tool) compression
+    stats read-only — it must never create or migrate the DB (the CLI ``mms
+    stats`` read path depends on this) and must degrade, not crash, on a
+    missing file or a pre-migration schema."""
+
+    def _seed(self, db_path):
+        store = MetricsStore(db_path)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(server="c7", tool="query-docs", original_chars=1000, compressed_chars=400)
+            )
+            store.record(
+                CallMetrics(server="c7", tool="query-docs", original_chars=1000, compressed_chars=600)
+            )
+            store.record(
+                CallMetrics(server="lf", tool="search", original_chars=500, compressed_chars=500)
+            )
+            store.record(
+                CallMetrics(
+                    server="lf", tool="search", original_chars=0, compressed_chars=0, is_error=True
+                )
+            )
+        finally:
+            store.close()
+
+    def test_totals_and_per_tool(self, tmp_path):
+        db_path = tmp_path / "metrics.db"
+        self._seed(db_path)
+
+        summary = read_compression_summary(db_path)
+
+        assert summary["available"] is True
+        assert summary["schema_outdated"] is False
+        assert summary["total_calls"] == 4
+        assert summary["error_count"] == 1
+        assert summary["total_original_chars"] == 2500
+        assert summary["total_compressed_chars"] == 1500
+        assert summary["saved_chars"] == 1000
+        assert summary["saved_ratio"] == 0.4  # 1 - 1500/2500
+
+        by_tool = {(r["server"], r["tool"]): r for r in summary["by_tool"]}
+        qd = by_tool[("c7", "query-docs")]
+        assert qd["calls"] == 2
+        assert qd["original_chars"] == 2000
+        assert qd["compressed_chars"] == 1000
+        assert qd["saved_ratio"] == 0.5
+        # busiest tool sorts first
+        assert summary["by_tool"][0]["tool"] == "query-docs"
+
+    def test_tool_filter(self, tmp_path):
+        db_path = tmp_path / "metrics.db"
+        self._seed(db_path)
+
+        summary = read_compression_summary(db_path, tool="search")
+
+        assert summary["total_calls"] == 2
+        assert {r["tool"] for r in summary["by_tool"]} == {"search"}
+
+    def test_missing_db_is_unavailable_and_not_created(self, tmp_path):
+        db_path = tmp_path / "does_not_exist.db"
+
+        summary = read_compression_summary(db_path)
+
+        assert summary["available"] is False
+        assert summary["total_calls"] == 0
+        assert not db_path.exists()  # read path must not create the file
+
+    def test_pre_migration_schema_degrades(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        # Original pre-F2 schema: no ``is_error`` column.
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, tool TEXT, "
+            "original_chars INTEGER, compressed_chars INTEGER, "
+            "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+        )
+        db.execute(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, created_at) "
+            "VALUES ('s', 't', 100, 40, 0)"
+        )
+        db.commit()
+        db.close()
+
+        summary = read_compression_summary(db_path)
+
+        assert summary["available"] is True
+        assert summary["schema_outdated"] is True
+        assert summary["error_count"] == 0  # degraded, not crashed
+        assert summary["total_original_chars"] == 100
+        assert summary["saved_ratio"] == 0.6
+
+    def test_unrelated_db_is_unavailable(self, tmp_path):
+        db_path = tmp_path / "other.db"
+        db = sqlite3.connect(db_path)
+        db.execute("CREATE TABLE something_else (x INTEGER)")
+        db.commit()
+        db.close()
+
+        summary = read_compression_summary(db_path)
+
+        assert summary["available"] is False
+
+    def test_does_not_mutate_existing_db(self, tmp_path):
+        db_path = tmp_path / "metrics.db"
+        self._seed(db_path)
+        before = db_path.stat().st_mtime_ns
+        cols_before = self._columns(db_path)
+
+        read_compression_summary(db_path)
+
+        assert db_path.stat().st_mtime_ns == before
+        assert self._columns(db_path) == cols_before
+
+    @staticmethod
+    def _columns(db_path):
+        db = sqlite3.connect(db_path)
+        try:
+            return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
+        finally:
+            db.close()
