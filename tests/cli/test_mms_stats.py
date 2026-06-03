@@ -102,3 +102,35 @@ class TestMmsStats:
         data = json.loads(result.output)
         assert data["tool_filter"] == "query-docs"
         assert data["compression"]["total_calls"] == 2
+
+    def test_env_enabled_bypasses_file_metrics_path(self, runner, tmp_path, monkeypatch):
+        """When ``MEMTOMEM_STM_PROXY__ENABLED`` is set the server uses its
+        env-only proxy config and ignores the JSON file (server.app_lifespan),
+        so ``mms stats`` must too — otherwise it would probe a different
+        ``proxy_metrics.db`` than the one the server writes to."""
+        set_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
+
+        # A config file points metrics at a SEEDED db that the env-enabled
+        # server would ignore.
+        file_db = tmp_path / "file_metrics.db"
+        store = MetricsStore(file_db)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(server="c7", tool="query-docs", original_chars=100, compressed_chars=40)
+            )
+        finally:
+            store.close()
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(json.dumps({"enabled": True, "metrics": {"db_path": str(file_db)}}))
+
+        result = runner.invoke(cli, ["stats", "--config", str(config), "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_status"] == "env"
+        # The env path (default ~/.memtomem/proxy_metrics.db, unseeded under the
+        # patched HOME) is used — NOT the file's seeded db — so its row must not
+        # leak in.
+        assert data["compression"]["total_calls"] == 0
