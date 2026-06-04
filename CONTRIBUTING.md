@@ -48,6 +48,9 @@ The LTM core lives in a separate repository: [memtomem/memtomem](https://github.
 7. Write a clear commit message describing the "why"
 8. Sign the CLA on your first pull request (see below)
 
+We do not accept third-party automated promotional or badge PRs (for example,
+vendor security-scan badges); these will be closed.
+
 ## Adding a bench_qa scenario
 
 `bench_qa` is an end-to-end pytest sub-suite that drives the proxy
