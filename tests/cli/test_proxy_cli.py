@@ -4448,3 +4448,61 @@ class TestRootCauseMessage:
         inner = BaseExceptionGroup("inner", [leaf])
         outer = BaseExceptionGroup("outer", [inner])
         assert _root_cause_message(outer) == "network down"
+
+
+class TestSurfacingCommand:
+    """`mms surfacing <server> [on|off]` toggles per-upstream surfacing in
+    stm_proxy.json; `mms status` renders the effective state."""
+
+    @staticmethod
+    def _seed(config: Path, *, surfacing_enabled: bool | None = None) -> None:
+        entry: dict = {"prefix": "c7", "command": "echo", "args": []}
+        if surfacing_enabled is not None:
+            entry["surfacing_enabled"] = surfacing_enabled
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {"context7": entry}}),
+            encoding="utf-8",
+        )
+
+    def test_show_defaults_to_on(self, runner, config):
+        self._seed(config)
+        result = runner.invoke(cli, ["surfacing", "context7", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "surfacing for 'context7': on" in result.output
+
+    def test_off_persists_flag(self, runner, config):
+        self._seed(config)
+        result = runner.invoke(cli, ["surfacing", "context7", "off", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(config.read_text())
+        assert data["upstream_servers"]["context7"]["surfacing_enabled"] is False
+
+    def test_on_re_enables(self, runner, config):
+        self._seed(config, surfacing_enabled=False)
+        result = runner.invoke(cli, ["surfacing", "context7", "on", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(config.read_text())
+        assert data["upstream_servers"]["context7"]["surfacing_enabled"] is True
+
+    def test_unknown_server_errors(self, runner, config):
+        self._seed(config)
+        result = runner.invoke(cli, ["surfacing", "ghost", "off", *_cfg_args(config)])
+        assert result.exit_code != 0
+        assert "not found" in result.output
+
+    def test_invalid_state_rejected(self, runner, config):
+        self._seed(config)
+        result = runner.invoke(cli, ["surfacing", "context7", "maybe", *_cfg_args(config)])
+        assert result.exit_code != 0
+
+    def test_status_renders_surfacing_off(self, runner, config):
+        self._seed(config, surfacing_enabled=False)
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "surfacing=off" in result.output
+
+    def test_status_renders_surfacing_on_by_default(self, runner, config):
+        self._seed(config)
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "surfacing=on" in result.output

@@ -292,6 +292,20 @@ class UpstreamServerConfig(BaseModel):
     tool_overrides: dict[str, ToolOverrideConfig] = {}
     auto_index: bool | None = None
     extraction: bool | None = None
+    surfacing_enabled: bool = True
+    """Opt this upstream's proxied tool responses in/out of the SURFACE stage
+    (proactive memory surfacing). Default ``True`` preserves existing behavior;
+    ``False`` suppresses surfacing for every tool on this server.
+
+    Useful for third-party upstreams whose calls never match the user's LTM
+    (so the per-call LTM search is pure wasted latency), or to keep a sensitive
+    upstream's request context out of LTM queries entirely.
+
+    Enforced in ``ProxyManager``, which reads this from ``stm_proxy.json`` via
+    the hot-reloaded config — *not* in the ``SurfacingEngine`` relevance gate,
+    which is built once at startup from the top-level ``SurfacingConfig`` and
+    never sees per-upstream config. For tool-grained or glob scope instead, see
+    ``SurfacingConfig.exclude_tools`` (matches ``server__tool``)."""
     max_retries: int = Field(default=3, ge=0)
     reconnect_delay_seconds: float = Field(default=1.0, ge=0.0)
     max_reconnect_delay_seconds: float = Field(default=30.0, ge=0.0)

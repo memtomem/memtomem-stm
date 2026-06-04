@@ -57,6 +57,12 @@ SkipReason = Literal[
     # label is mode-agnostic so a future per-mode constraint can reuse it
     # without a new enum value.
     "progressive_mode_conflict",
+    # Per-upstream opt-out: ``UpstreamServerConfig.surfacing_enabled=False``
+    # short-circuits surfacing for every tool on that server. Recorded by
+    # ``ProxyManager`` before the engine runs (the engine is built once from
+    # the top-level ``SurfacingConfig`` and never sees per-upstream config),
+    # so it lands here rather than as a ``gate_*`` reason.
+    "upstream_disabled",
 ]
 
 # Operator-facing categorization for ``stm_surfacing_stats`` (#362, #351 part 2).
@@ -89,6 +95,7 @@ HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
         "no_results_invalidated",
         "no_results_empty_cache",
         "progressive_mode_conflict",
+        "upstream_disabled",
     }
 )
 FAULT_SKIP_REASONS: frozenset[str] = frozenset(

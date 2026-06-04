@@ -238,6 +238,9 @@ mms status
 # Remove a server
 mms remove github
 
+# Toggle proactive surfacing for an upstream (persisted in stm_proxy.json)
+mms surfacing context7 off  # `on` to re-enable; omit the state to show it
+
 # Check upstream connectivity (probes each server)
 mms health
 mms health --json          # machine-readable output
@@ -260,6 +263,17 @@ Options:
 Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
 
 Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
+
+### `surfacing`
+
+```
+Usage: mms surfacing NAME [on|off]
+
+Options:
+  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+```
+
+Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms status` shows it per server. A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
 
 "Dual-registered" requires both the name **and** the identity to match: the source-client entry must share the STM upstream's `(transport, command, args)` or `(transport, url)` signature. If you've edited either side to point at a different server that happens to share a name, `mms prune` skips it rather than clobbering the unrelated entry.
 

@@ -85,7 +85,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_surfacing_stats`. |
 | `section_header` | `## Relevant Memories` | Header text for injected section |
 | `default_namespace` | `null` | Restrict search to a specific namespace |
-| `exclude_tools` | `[]` | fnmatch patterns to never surface (e.g. `["*debug*"]`) |
+| `exclude_tools` | `[]` | fnmatch patterns to never surface, matched against **both** the bare tool name and `server__tool` — so a server-qualified glob like `["context7__*"]` disables a whole upstream (e.g. `["*debug*", "langfuse-docs__*"]`). See [Scoping surfacing per upstream](#scoping-surfacing-per-upstream). |
 | `write_tool_patterns` | `*write*`, `*create*`, `*delete*`, `*push*`, `*send*`, `*remove*` | Auto-skip write/mutation operations |
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
@@ -111,6 +111,41 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `feedback_demotion_enabled` | `true` | Locally filter memories that accumulated repeated negative feedback (`not_relevant` or `already_known`) before cache/injection |
 | `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
 | `fire_webhook` | `true` | Fire surfacing event webhooks |
+
+### Scoping surfacing per upstream
+
+`exclude_tools` is global config (top-level `SurfacingConfig`), set via env.
+Because its patterns match `server__tool` as well as the bare tool name, a
+server-qualified glob turns surfacing off for a whole upstream:
+
+```bash
+# Per-client env: skip surfacing for every tool on these upstreams
+export MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS='["context7__*","langfuse-docs__*"]'
+```
+
+For a **persistent, client-independent** toggle, set `surfacing_enabled` on the
+upstream itself in `stm_proxy.json` (`UpstreamServerConfig`, default `true`).
+Unlike the env glob — which each MCP client must carry in its own `env` block,
+and which can drift between clients — this lives in the shared proxy config that
+every client reads, hot-reloads without a restart, and shows up in `mms status`:
+
+```bash
+mms surfacing context7 off    # disable surfacing for this upstream
+mms surfacing context7        # show current state
+mms surfacing context7 on     # re-enable
+```
+
+When an upstream is disabled this way the skip happens *before* the LTM search
+(saving the round-trip) and is enforced in `ProxyManager` — not the
+`RelevanceGate` — because the engine is built once at startup from the top-level
+`SurfacingConfig` and never sees per-upstream config. It is counted as
+`upstream_disabled` (a healthy skip) in `stm_surfacing_stats`.
+
+Reach for the env glob for cross-server / tool-grained scope or quick
+experiments; reach for `surfacing_enabled` to durably opt one upstream out —
+e.g. a third-party server whose calls never match your LTM (so the per-call
+search is pure wasted latency), or a sensitive upstream whose request context
+should never become an LTM query.
 
 ### Tuning `min_response_chars`
 
@@ -190,17 +225,17 @@ sequenceDiagram
     participant Core as memtomem core
 
     Agent->>STM: tool response (≥ min_response_chars)
-    STM->>Ext: extract_query(server, tool, args)
-    Ext-->>STM: query
-    STM->>Gate: should_surface(server, tool, query)
-    Gate-->>STM: pass / skip
-    alt skip (write tool / cooldown / rate limit)
+    STM->>CB: check
+    alt circuit open
         STM-->>Agent: original response
-    else pass
-        STM->>CB: check
-        alt circuit open
+    else closed / half-open
+        STM->>Ext: extract_query(server, tool, args)
+        Ext-->>STM: query
+        STM->>Gate: should_surface(server, tool, query)
+        Gate-->>STM: pass / skip
+        alt skip (write tool / cooldown / rate limit)
             STM-->>Agent: original response
-        else closed / half-open
+        else pass
             STM->>MCP: search(query, top_k, namespace)
             MCP->>Core: mem_search (via configured MCP transport)
             Core-->>MCP: results
@@ -435,6 +470,10 @@ hit:
 - `gate_write_tool` / `gate_excluded_tool` / `gate_tool_disabled`
   / `gate_rate_limit` / `gate_cooldown` — a `RelevanceGate`
   reject; check the gate config for the offending bucket.
+- `upstream_disabled` — the upstream's `surfacing_enabled=False`
+  (set via `mms surfacing <server> off`) opted every tool on that
+  server out of surfacing, short-circuited in `ProxyManager` before
+  the LTM search.
 - `circuit_open` — repeated upstream failures opened the circuit
   breaker. Surfacing pauses for `circuit_reset_seconds` (default
   60s) before retrying.

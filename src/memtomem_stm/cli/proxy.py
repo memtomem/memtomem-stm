@@ -553,8 +553,12 @@ def status(config_path: str, *, as_json: bool = False) -> None:
                 detail = cfg.get("url", "")
             compression = cfg.get("compression", "auto")
             max_chars = cfg.get("max_result_chars", 8000)
+            surfacing_on = cfg.get("surfacing_enabled", True)
             click.echo(f"  {name:<20} prefix={prefix}  [{transport}] {detail}")
-            click.echo(f"  {'':<20} compression={compression}  max_chars={max_chars}")
+            click.echo(
+                f"  {'':<20} compression={compression}  max_chars={max_chars}  "
+                f"surfacing={'on' if surfacing_on else 'off'}"
+            )
 
 
 @cli.command(name="list")
@@ -2110,6 +2114,46 @@ def remove(name: str, config_path: str, yes: bool) -> None:
     del servers[name]
     _save(path, data)
     click.echo(f"{_ok('Removed')} server '{name}'.")
+
+
+@cli.command()
+@click.argument("name")
+@click.argument("state", type=click.Choice(["on", "off"]), required=False)
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+def surfacing(name: str, state: str | None, config_path: str) -> None:
+    """Toggle proactive memory surfacing for an upstream server.
+
+    \b
+    mms surfacing <server>          # show current state
+    mms surfacing <server> off      # disable surfacing for this upstream
+    mms surfacing <server> on       # re-enable
+
+    Writes ``surfacing_enabled`` into the upstream's entry in the proxy config
+    (``stm_proxy.json``); a running proxy hot-reloads it without a restart, and
+    `mms status` shows the effective state. Because the flag lives in the shared
+    config file rather than per-client env, every MCP client that proxies
+    through this `mms` sees the same scope.
+
+    For tool-grained or cross-server glob scope instead, set
+    ``MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS`` (matches ``server__tool``).
+    """
+    path = Path(config_path)
+    data = _load(path)
+    servers: dict[str, Any] = data.get("upstream_servers", {})
+
+    if name not in servers:
+        click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
+        sys.exit(1)
+
+    current = bool(servers[name].get("surfacing_enabled", True))
+    if state is None:
+        click.echo(f"surfacing for '{name}': {'on' if current else 'off'}")
+        return
+
+    desired = state == "on"
+    servers[name]["surfacing_enabled"] = desired
+    _save(path, data)
+    click.echo(f"{_ok('Surfacing ' + state)} for '{name}'.")
 
 
 # ── prune command ──────────────────────────────────────────────────────
