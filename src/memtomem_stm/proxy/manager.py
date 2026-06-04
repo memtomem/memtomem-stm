@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from memtomem_stm.proxy.protocols import FileIndexer
     from memtomem_stm.proxy.relevance import RelevanceScorer
     from memtomem_stm.surfacing.engine import SurfacingEngine
+    from memtomem_stm.surfacing.observability import SkipReason
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -777,6 +778,28 @@ class ProxyManager:
 
         return get_compressor(compression).compress(text, max_chars=max_chars), None
 
+    def _surfacing_enabled_for(self, server: str) -> bool:
+        """Whether this upstream opts into surfacing.
+
+        Read from the hot-reloaded ``stm_proxy.json`` (``self._config``) so a
+        ``mms surfacing <server> off`` takes effect without a restart. This is
+        the per-upstream enforcement point the ``SurfacingEngine`` gate cannot
+        be: the engine is built once at startup from the top-level
+        ``SurfacingConfig`` and never sees per-upstream config. Unknown servers
+        fail open (``True``) — surfacing stays best-effort.
+        """
+        cfg = self._config.upstream_servers.get(server)
+        return cfg.surfacing_enabled if cfg is not None else True
+
+    def _record_surfacing_skip(self, tool: str, reason: SkipReason) -> None:
+        """Record a pre-engine surfacing skip so ``stm_surfacing_stats`` shows
+        it (the engine cannot, since we short-circuit before calling it)."""
+        if self._surfacing_engine is None:
+            return
+        obs = self._surfacing_engine.observability
+        if obs is not None:
+            obs.record_skip(tool, reason)
+
     async def _apply_surfacing(
         self,
         server: str,
@@ -789,6 +812,9 @@ class ProxyManager:
     ) -> str:
         """Apply proactive memory surfacing if eligible."""
         if self._surfacing_engine is None:
+            return text
+        if not self._surfacing_enabled_for(server):
+            self._record_surfacing_skip(tool, "upstream_disabled")
             return text
         try:
             return await self._surfacing_engine.surface(
@@ -836,6 +862,9 @@ class ProxyManager:
         which modes are safe.
         """
         if self._surfacing_engine is None:
+            return text, None, None
+        if not self._surfacing_enabled_for(server):
+            self._record_surfacing_skip(tool, "upstream_disabled")
             return text, None, None
         if self._surfacing_engine.injection_mode == "prepend":
             if not self._warned_prepend_on_progressive:
