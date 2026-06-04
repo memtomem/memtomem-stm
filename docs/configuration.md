@@ -60,8 +60,10 @@ export MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS=10000000   # OOM guard before comp
 export MEMTOMEM_STM_PROXY__MIN_RESULT_RETENTION=0.65
 export MEMTOMEM_STM_PROXY__CONSUMER_MODEL=claude-sonnet-4
 export MEMTOMEM_STM_PROXY__CONTEXT_BUDGET_RATIO=0.05
+export MEMTOMEM_STM_PROXY__CHARS_PER_TOKEN=3.5
 export MEMTOMEM_STM_PROXY__MAX_DESCRIPTION_CHARS=200
 export MEMTOMEM_STM_PROXY__STRIP_SCHEMA_DESCRIPTIONS=false
+export MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS=30.0
 export MEMTOMEM_STM_PROXY__CACHE__ENABLED=true
 export MEMTOMEM_STM_PROXY__CACHE__DEFAULT_TTL_SECONDS=3600
 export MEMTOMEM_STM_PROXY__CACHE__DB_PATH=~/.memtomem/proxy_cache.db
@@ -69,6 +71,8 @@ export MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES=10000
 export MEMTOMEM_STM_PROXY__METRICS__ENABLED=true
 export MEMTOMEM_STM_PROXY__METRICS__DB_PATH=~/.memtomem/proxy_metrics.db
 export MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY=10000
+export MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__ENABLED=true
+export MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH=~/.memtomem/stm_feedback.db
 
 # Auto-indexing (Stage 4 — save large responses to LTM)
 # NOTE: In the standalone `mms` server today, `auto_index` and
@@ -195,8 +199,10 @@ Full example with all options:
   "min_result_retention": 0.65,
   "consumer_model": "",
   "context_budget_ratio": 0.05,
+  "chars_per_token": 3.5,
   "max_description_chars": 200,
   "strip_schema_descriptions": false,
+  "lock_timeout_seconds": 30.0,
   "upstream_servers": {
     "filesystem": {
       "command": "npx",
@@ -286,6 +292,10 @@ Full example with all options:
     "max_history": 10000
   },
   "compression_feedback": {
+    "enabled": true,
+    "db_path": "~/.memtomem/stm_feedback.db"
+  },
+  "progressive_reads": {
     "enabled": true,
     "db_path": "~/.memtomem/stm_feedback.db"
   }

@@ -35,20 +35,22 @@ Options:
   -h, --help  Show this message and exit.
 
 Commands:
-  add       Add an upstream MCP server to the proxy configuration.
-  daemon    Manage the local surfacing daemon.
-  health    Check upstream server connectivity.
-  hook      Compress and/or surface for a host's built-in tool call.
-  host      Host-config inspection and sync.
-  import    Import MCP definitions from host configs into the mms registry.
-  init      Guided first-time setup for memtomem-stm.
-  list      List configured upstream servers.
-  project   Project-scoped MCP management (RFC §7.1).
-  prune     Remove dual-registered upstreams from source MCP clients.
-  register  Register memtomem-stm with an MCP client.
-  remove    Remove an upstream MCP server from the proxy configuration.
-  status    Show proxy gateway configuration and server list.
-  version   Show the installed memtomem-stm version.
+  add        Add an upstream MCP server to the proxy configuration.
+  daemon     Manage the local surfacing daemon (warm LTM connection for...
+  health     Check upstream server connectivity.
+  hook       Compress and/or surface for a host's built-in tool call...
+  host       Host-config inspection and sync (RFC §7.3).
+  import     Import MCP definitions from host configs into the mms registry.
+  init       Guided first-time setup for memtomem-stm.
+  list       List configured upstream servers.
+  project    Project-scoped MCP management (RFC §7.1).
+  prune      Remove direct registrations for STM upstreams that are...
+  register   Register memtomem-stm with an MCP client.
+  remove     Remove an upstream MCP server from the proxy configuration.
+  stats      Show proxy compression and surfacing stats from the...
+  status     Show proxy gateway configuration and server list.
+  surfacing  Toggle proactive memory surfacing for an upstream server.
+  version    Show the installed memtomem-stm version.
 ```
 
 All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
@@ -192,6 +194,18 @@ Options:
 
 Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
 
+### `remove`
+
+```
+Usage: mms remove [OPTIONS] NAME
+
+Options:
+  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  -y, --yes      Skip confirmation.
+```
+
+Removes an upstream MCP server from the proxy configuration by name. Prompts for confirmation on a TTY unless `-y` or `--yes` is passed.
+
 ### Examples
 
 ```bash
@@ -311,6 +325,33 @@ The LTM probe honors the same `--timeout` budget, supports `stdio`, `sse`, and
 `streamable_http`, and requires the target server to advertise `mem_search`.
 When `mem_do` is available, the version probe is best-effort and does not
 decide readiness.
+
+### `status`
+
+```
+Usage: mms status [OPTIONS]
+
+Options:
+  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --json         Output as JSON for scripting.
+```
+
+Shows the current proxy gateway configuration file path, enabled flag, and the list of configured upstream servers with their prefix, transport, command or URL, compression strategy, character budget, and surfacing toggle.
+
+### `stats`
+
+```
+Usage: mms stats [OPTIONS]
+
+Options:
+  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --tool TEXT    Filter to one upstream tool name.
+  --json         Output as JSON for scripting.
+```
+
+Shows proxy compression and surfacing statistics from the persistent databases (`proxy_metrics.db` and `stm_feedback.db`). 
+
+It reads these files read-only (without creating or migrating them) and reports all-time totals. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
 
 ## `mms hook` — Claude Code built-in tool bridge
 

@@ -47,6 +47,7 @@ Key details:
 
 - Cache key = SHA-256 of `server:tool:args` (argument order independent)
 - **Pre-surfacing content is cached** — surfacing is re-applied on cache hit, so memories stay fresh
+- **Transient-key exclusion** — to prevent serving expired progressive/selective keys on a cache hit (which would drop the response tail), the cache automatically skips storing any response carrying a transient-key marker (like a `PROGRESSIVE_FOOTER_TOKEN` or a `selection_key` JSON field). The next identical call re-runs the pipeline to generate live keys.
 - Expired entries are purged on startup; oldest entries evicted when `max_entries` is exceeded
 - Clear cache via MCP tool: `stm_proxy_cache_clear(server="gh", tool="search_code")`
 - TTL can be overridden per-tool via `tool_overrides`
