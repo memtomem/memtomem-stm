@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.27] — 2026-06-04
+
+A small feature release: proactive surfacing can now be scoped per upstream.
+`UpstreamServerConfig.surfacing_enabled` — toggled with `mms surfacing <server>
+[on|off]` and shown in `mms status` — opts an upstream's tool responses in or out
+of the SURFACE stage from the shared `stm_proxy.json`, so every MCP client
+proxying through the same `mms` sees one consistent scope. Disabling skips
+surfacing (and the LTM search) for that upstream before the engine runs.
+
 ### Added
 
 - **Per-upstream surfacing toggle** — `UpstreamServerConfig` gains a `surfacing_enabled` flag (default `true`), and `mms surfacing <server> [on|off]` toggles it in `stm_proxy.json` (`mms status` renders it per server). Disabling an upstream short-circuits proactive surfacing for every tool on that server *before* the LTM search runs. It is enforced in `ProxyManager`, which reads the hot-reloaded proxy config — not the `SurfacingEngine` relevance gate, which is built once at startup from the top-level `SurfacingConfig` and never sees per-upstream config — and is counted as a new healthy `upstream_disabled` reason in `stm_surfacing_stats`. Because the flag lives in the shared proxy config rather than per-client `env`, every MCP client proxying through the same `mms` sees one consistent scope, unlike the existing `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` glob (which also matches `server__tool` but must be carried in each client's env). `docs/surfacing.md` now documents both the per-upstream toggle and the server-qualified `exclude_tools` glob, and corrects the circuit-breaker ordering in the surfacing sequence diagram.
