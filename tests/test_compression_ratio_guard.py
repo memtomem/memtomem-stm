@@ -20,6 +20,7 @@ import pytest
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
+    ProgressiveConfig,
     ProxyConfig,
     UpstreamServerConfig,
 )
@@ -155,6 +156,7 @@ def _make_manager_with_store(
     min_retention: float = 0.65,
     compression: CompressionStrategy = CompressionStrategy.TRUNCATE,
     max_result_chars: int = 50000,
+    progressive: ProgressiveConfig | None = None,
 ) -> tuple[ProxyManager, MetricsStore]:
     """Build a ProxyManager wired to a real MetricsStore so tests can read
     persisted rows directly — closer to production than summary dicts."""
@@ -166,6 +168,7 @@ def _make_manager_with_store(
         max_result_chars=max_result_chars,
         max_retries=0,
         reconnect_delay_seconds=0.0,
+        progressive=progressive,
     )
     proxy_cfg = ProxyConfig(
         config_path=tmp_path / "proxy.json",
@@ -209,6 +212,31 @@ class TestProxyManagerRatioGuard:
         await mgr.call_tool("srv", "tool", {})
         row = _latest_row(store)
         assert row["compression_strategy"] == "truncate"
+        assert row["ratio_violation"] == 0
+        store.close()
+
+    async def test_progressive_strategy_call_completes_and_records_metric(self, tmp_path):
+        """End-to-end PROGRESSIVE-strategy call returns a first chunk and
+        records ``"progressive"`` in the metrics row.
+
+        Pre-fix the PROGRESSIVE branch never assigned ``metrics_strategy``,
+        so every call configured with this strategy died with
+        UnboundLocalError at the metrics record — no end-to-end test drove
+        the branch until now.
+        """
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=500),
+        )
+        large_text = "content paragraph. " * 200  # > chunk_size → chunked
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert "stm_proxy_read_more" in result
+        row = _latest_row(store)
+        assert row["compression_strategy"] == "progressive"
         assert row["ratio_violation"] == 0
         store.close()
 

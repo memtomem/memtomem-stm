@@ -1589,6 +1589,11 @@ class ProxyManager:
                 )
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(cleaned)
+            # The metrics record at the bottom reads ``metrics_strategy`` on
+            # every path; mirror the assignment at the top of the compression
+            # branch (pre-fix this branch left it unbound and every
+            # PROGRESSIVE-strategy call died with UnboundLocalError).
+            metrics_strategy = effective_compression.value
             # F6: surface on progressive when ``injection_mode`` is append/section.
             # ``prepend`` stays skipped (offset-shift); helper returns ``ok=None``
             # in that case and logs a one-time WARNING.
