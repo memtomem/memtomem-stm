@@ -33,12 +33,15 @@ import logging
 import os
 import secrets
 import signal
+import subprocess
+import sys
 import time
 from typing import Any
 
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import discovery, locking
+from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_PING,
@@ -65,6 +68,62 @@ async def _quiet(coro: Any, what: str) -> None:
         await coro
     except Exception:
         logger.debug("%s failed", what, exc_info=True)
+
+
+def _direct_child_pids() -> set[int]:
+    """Best-effort set of this process's direct child pids (POSIX only).
+
+    Used by the teardown leak sweep. Returns an empty set on Windows or when
+    ``pgrep`` is unavailable/fails, degrading the sweep to a no-op rather
+    than blocking shutdown. ``pgrep`` never reports its own pid, so the
+    probe doesn't observe itself.
+    """
+    if sys.platform == "win32":
+        return set()
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(os.getpid())],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {int(tok) for tok in out.split() if tok.isdigit()}
+
+
+# Grace window between SIGTERM and SIGKILL for a leaked LTM child — matches
+# the escalation timeout mcp's own stdio shutdown sequence uses.
+_LEAK_KILL_ESCALATE_SECONDS = 2.0
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    """Best-effort signal to *pid*'s process group, or *pid* alone when it
+    shares the daemon's group (never signal our own group). The stdio LTM
+    child is spawned with ``start_new_session=True``, so the group kill also
+    reaches grandchildren (e.g. ``uv run memtomem`` wrappers)."""
+    try:
+        pgid = os.getpgid(pid)
+        if pgid != os.getpgid(0):
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+async def _terminate_leaked_children(pids: set[int]) -> None:
+    """SIGTERM each leaked child's process group, then SIGKILL stragglers."""
+    for pid in pids:
+        _signal_pid(pid, signal.SIGTERM)
+    deadline = asyncio.get_running_loop().time() + _LEAK_KILL_ESCALATE_SECONDS
+    remaining = {pid for pid in pids if discovery.is_pid_alive(pid)}
+    while remaining and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+        remaining = {pid for pid in remaining if discovery.is_pid_alive(pid)}
+    for pid in remaining:
+        _signal_pid(pid, signal.SIGKILL)
 
 
 class DaemonServer:
@@ -238,13 +297,45 @@ class DaemonServer:
             except Exception:
                 logger.debug("tracker close failed", exc_info=True)
         if self._adapter is not None:
-            await _quiet(self._adapter.stop(), "LTM adapter stop")
+            await self._stop_adapter()
         if self._handshake_written:
             discovery.remove_handshake_if_owner(
                 discovery.handshake_path(self._config.data_dir, self._fingerprint),
                 pid=os.getpid(),
                 token=self._token,
             )
+
+    async def _stop_adapter(self) -> None:
+        """Stop the LTM adapter without leaking its warm child process.
+
+        The adapter lazy-starts inside whichever connection-handler task
+        first needed LTM, so the stdio transport's anyio cancel scopes belong
+        to that (long-finished) task. Exiting them here — the serve task —
+        makes anyio raise its cross-task cancel-scope RuntimeError partway
+        through the transport's unwind, leaving the warm LTM child's reaping
+        unverified (today's mcp happens to terminate the child before the
+        scope exit, but that ordering is an implementation detail). When the
+        stop fails for any reason, sweep: a direct child present both before
+        and after a failed stop is the leaked LTM child — this process spawns
+        no other children — so terminate it.
+        """
+        before = _direct_child_pids()
+        try:
+            await self._adapter.stop()
+            return
+        except Exception as exc:
+            if is_clean_cancel_scope_shutdown(exc):
+                logger.warning(
+                    "LTM adapter stop hit the cross-task cancel-scope error — "
+                    "sweeping for a leaked LTM child"
+                )
+            else:
+                logger.debug("LTM adapter stop failed", exc_info=True)
+        leaked = before & _direct_child_pids()
+        if not leaked:
+            return
+        logger.warning("terminating leaked LTM child process(es): %s", sorted(leaked))
+        await _terminate_leaked_children(leaked)
 
     # ── connection handling ──────────────────────────────────────────────
 
