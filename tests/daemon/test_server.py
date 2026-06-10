@@ -9,6 +9,9 @@ RPC. That keeps the suite deterministic even on a dev box with a live LTM.
 from __future__ import annotations
 
 import asyncio
+import logging
+import signal
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,9 +20,15 @@ from uuid import uuid4
 
 import pytest
 
+import memtomem_stm.daemon.server as daemon_server
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
-from memtomem_stm.daemon.discovery import config_fingerprint, handshake_path, read_handshake
+from memtomem_stm.daemon.discovery import (
+    config_fingerprint,
+    handshake_path,
+    is_pid_alive,
+    read_handshake,
+)
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_SURFACE,
@@ -380,6 +389,148 @@ async def test_hook_run_hook_no_autospawn_when_daemon_live(
         assert calls == []  # live daemon → no duplicate spawn
     finally:
         await _stop(cfg, task)
+
+
+# ── teardown leak sweep (E-3) ─────────────────────────────────────────────────
+
+
+_CANCEL_SCOPE_MSG = "Attempted to exit cancel scope in a different task than it was entered in"
+
+_FAKE_LTM_SERVER = Path(__file__).parent.parent / "_fake_memtomem_server.py"
+
+
+class _StopRaisingAdapter:
+    """Adapter stub whose ``stop()`` fails like a cross-task scope exit."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def stop(self) -> None:
+        raise self._exc
+
+
+def _sleeping_child() -> subprocess.Popen:
+    """A real direct child mimicking a leaked warm LTM process: its own
+    session (like mcp's stdio child) and a sleep only a signal can end."""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals/process groups")
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError(_CANCEL_SCOPE_MSG),
+        ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError(_CANCEL_SCOPE_MSG)]),
+    ],
+    ids=["bare", "group"],
+)
+async def test_teardown_kills_leaked_child_on_cancel_scope_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: BaseException,
+) -> None:
+    # The known E-3 shape: the adapter's stdio scopes were entered in a
+    # connection-handler task, stop() from the serve task raises the
+    # cross-task cancel-scope error (bare, or group-wrapped by anyio >= 4)
+    # — teardown must warn and terminate the surviving LTM child.
+    server = DaemonServer(_config(tmp_path))
+    server._adapter = _StopRaisingAdapter(exc)
+    child = _sleeping_child()
+    try:
+        monkeypatch.setattr(daemon_server, "_direct_child_pids", lambda: {child.pid})
+        monkeypatch.setattr(daemon_server, "_LEAK_KILL_ESCALATE_SECONDS", 0.2)
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.daemon.server"):
+            await server._teardown()
+        assert child.wait(timeout=5.0) == -signal.SIGTERM
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("cross-task cancel-scope" in m for m in messages)
+        assert any("leaked LTM child" in m for m in messages)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5.0)
+
+
+async def test_teardown_sweeps_on_generic_stop_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Any stop() failure leaves the unwind incomplete, so the sweep runs —
+    # and kills exactly the children that survived it (before ∩ after).
+    server = DaemonServer(_config(tmp_path))
+    server._adapter = _StopRaisingAdapter(ValueError("boom"))
+    snapshots = iter([{111, 222}, {222}])
+    monkeypatch.setattr(daemon_server, "_direct_child_pids", lambda: next(snapshots))
+    killed: list[set[int]] = []
+
+    async def _record(pids: set[int]) -> None:
+        killed.append(pids)
+
+    monkeypatch.setattr(daemon_server, "_terminate_leaked_children", _record)
+    await server._teardown()
+    assert killed == [{222}]
+
+
+async def test_teardown_clean_adapter_stop_skips_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A successful stop() already awaited the child's exit (mcp's stdio
+    # shutdown sequence) — no second probe, no kill.
+    server = DaemonServer(_config(tmp_path))
+    server._adapter = AsyncMock()
+    probes: list[int] = []
+    monkeypatch.setattr(daemon_server, "_direct_child_pids", lambda: probes.append(1) or set())
+    killed: list[set[int]] = []
+
+    async def _record(pids: set[int]) -> None:
+        killed.append(pids)
+
+    monkeypatch.setattr(daemon_server, "_terminate_leaked_children", _record)
+    await server._teardown()
+    assert probes == [1]  # only the pre-stop snapshot
+    assert killed == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based probe is POSIX-only")
+def test_direct_child_pids_sees_spawned_child() -> None:
+    child = _sleeping_child()
+    try:
+        assert child.pid in daemon_server._direct_child_pids()
+    finally:
+        child.terminate()
+        child.wait(timeout=5.0)
+    # Reaped → no longer listed.
+    assert child.pid not in daemon_server._direct_child_pids()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process probes")
+async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
+    # E-3 end-to-end: real engine wiring with a stdio LTM (the fake memtomem
+    # server). The lazy LTM start happens inside a connection-handler task,
+    # so daemon shutdown exits the transport's cancel scopes from the serve
+    # task — whatever path that unwind takes, no live LTM child may survive.
+    cfg = _config(tmp_path)
+    cfg.surfacing.timeout_seconds = 15.0
+    cfg.surfacing.ltm_mcp_command = sys.executable
+    cfg.surfacing.ltm_mcp_args = [str(_FAKE_LTM_SERVER)]
+    before = daemon_server._direct_child_pids()
+    _, task = await _start(cfg)  # real _build_engine
+    try:
+        out = await client.surface(cfg, _READ_PAYLOAD, timeout=15.0)
+        assert out is not None
+        ltm_children = daemon_server._direct_child_pids() - before
+        assert ltm_children  # the surface call warmed a real stdio LTM child
+    finally:
+        await client.shutdown(cfg)
+        await asyncio.wait_for(task, timeout=20.0)
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while any(is_pid_alive(pid) for pid in ltm_children):
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"leaked LTM child process(es) after teardown: {ltm_children}")
+        await asyncio.sleep(0.1)
 
 
 # ── lifetime ownership lock ───────────────────────────────────────────────────
