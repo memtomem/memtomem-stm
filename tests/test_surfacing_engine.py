@@ -2238,6 +2238,37 @@ class TestSurfacingEngineObservability:
         assert snap["skip_reasons"]["read_file"] == {"no_results_dedup": 1}
         assert snap["cache"] == {"miss": 1}
 
+    async def test_no_results_demoted_records_skip(self, tmp_path: Path):
+        """Results pass the score filter but durable negative feedback
+        demotes every candidate — distinct from ``no_results_dedup`` /
+        ``no_results_score`` (#404) so an operator can tell that feedback
+        demotion, not the score threshold or session-dedup, is suppressing
+        surfacing. Needs a real ``FeedbackTracker`` because the demotion
+        filter reads persisted negative-feedback counts."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "fb.db")
+        try:
+            for i in range(3):
+                sid = f"sid-neg-{i}"
+                tracker.record_surfacing(sid, "gh", "read_file", "q", ["demoted"], [0.9])
+                tracker.record_feedback(sid, "not_relevant", "demoted")
+            results = [FakeSearchResult(chunk=FakeChunk(id="demoted", content="m"), score=0.9)]
+            obs = SurfacingObservability()
+            engine = SurfacingEngine(
+                config=_make_config(feedback_demotion_negative_threshold=3),
+                mcp_adapter=_make_mcp_adapter(results),
+                feedback_tracker=tracker,
+                observability=obs,
+            )
+            await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            snap = obs.snapshot()
+            assert snap["skip_reasons"]["read_file"] == {"no_results_demoted": 1}
+            assert snap["cache"] == {"miss": 1}
+        finally:
+            tracker.close()
+
     async def test_no_results_invalidated_records_skip(self):
         """Cache hit returns results but all are in ``_invalidated_ids``
         (rated ``not_relevant`` / ``already_known`` within the cache TTL) —

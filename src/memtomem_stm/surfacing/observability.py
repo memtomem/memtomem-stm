@@ -41,6 +41,11 @@ SkipReason = Literal[
     "gate_cooldown",
     "no_results_score",
     "no_results_dedup",
+    # #404: durable negative-feedback demotion excluded every candidate
+    # that passed the score filter — distinct from ``no_results_score`` /
+    # ``no_results_dedup`` so an operator can tell the demotion filter
+    # (not the threshold or session-dedup) is suppressing surfacing.
+    "no_results_demoted",
     "no_results_invalidated",
     "no_results_empty_cache",
     # #295: LTM adapter outcome typing — distinguish unreachable from
@@ -92,6 +97,7 @@ HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
         "gate_cooldown",
         "no_results_score",
         "no_results_dedup",
+        "no_results_demoted",
         "no_results_invalidated",
         "no_results_empty_cache",
         "progressive_mode_conflict",

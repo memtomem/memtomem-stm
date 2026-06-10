@@ -238,6 +238,28 @@ class TestSkipReasonCategorization:
         assert "ltm_unavailable: 23" in joined
         assert "circuit_open: 4" in joined
 
+    def test_no_results_demoted_renders_under_healthy_subsection(self):
+        """``no_results_demoted`` (#404) must survive the healthy/fault
+        split. It was originally recorded as a bare string in engine.py
+        with no ``SkipReason`` Literal member and no category assignment,
+        so ``_split_skip_reasons_by_category`` silently dropped it — the
+        exhaustiveness test above only inspects ``get_args(SkipReason)``
+        and stayed green. This pins the full render path so the label
+        cannot leak through unclassified again."""
+        snap = {
+            "any_call": True,
+            "skip_reasons": {
+                "read_file": {"no_results_demoted": 7},
+                "__total__": {"no_results_demoted": 7},
+            },
+            "outcomes": {},
+            "cache": {},
+        }
+        lines = _format_observability_sections(snap, tool_filter=None)
+        joined = "\n".join(lines)
+        assert "Healthy skips" in joined
+        assert "no_results_demoted: 7" in joined
+
     def test_mixed_skips_render_both_subsections_independently(self):
         """When a tool has skips in both categories the formatter must
         emit two subsections — that's the whole point of the split. A
