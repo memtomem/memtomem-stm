@@ -353,6 +353,9 @@ def test_is_pid_alive():
     if sys.platform != "win32":
         # A PID that almost certainly doesn't exist.
         assert discovery.is_pid_alive(2**31 - 1) is False
+        # Beyond pid_t range: os.kill raises OverflowError (not OSError)
+        # before ESRCH — must read as "not alive", not crash.
+        assert discovery.is_pid_alive(10**1000) is False
 
 
 # ── locking ─────────────────────────────────────────────────────────────────
@@ -437,8 +440,8 @@ class TestDaemonStopCli:
 
     @pytest.mark.parametrize(
         "bad_pid",
-        ["garbage", None, float("inf"), float("-inf"), True],
-        ids=["str", "null", "json-Infinity", "json-neg-Infinity", "json-true"],
+        ["garbage", None, float("inf"), float("-inf"), True, 10**1000],
+        ids=["str", "null", "json-Infinity", "json-neg-Infinity", "json-true", "huge-int"],
     )
     def test_corrupted_pid_degrades_and_cleans(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_pid
@@ -456,7 +459,18 @@ class TestDaemonStopCli:
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         _no_daemon(monkeypatch)
         killed: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        def fake_kill(pid: int, sig: int) -> None:
+            # Faithful mimic of the real os.kill, which is also what
+            # ``is_pid_alive``'s signal-0 probe reaches: pids beyond pid_t
+            # raise OverflowError (the real syscall behavior is pinned in
+            # ``test_is_pid_alive``); in-range pids are recorded instead of
+            # signalled.
+            if pid > 2**31 - 1:
+                raise OverflowError("signed integer is greater than maximum")
+            killed.append((pid, sig))
+
+        monkeypatch.setattr(os, "kill", fake_kill)
         hs = _write_handshake({"pid": bad_pid, "port": 1, "token": "t"})
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop"])

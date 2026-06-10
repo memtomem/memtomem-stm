@@ -165,4 +165,10 @@ def is_pid_alive(pid: int) -> bool:
         return True  # exists but owned by another user
     except OSError:
         return False
+    except OverflowError:
+        # A pid beyond the platform's pid_t range (e.g. a huge integer from
+        # a hand-edited handshake) raises OverflowError before ESRCH — it
+        # cannot name a live process. Not an OSError subclass, so it needs
+        # its own arm.
+        return False
     return True
