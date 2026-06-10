@@ -20,6 +20,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -237,6 +238,86 @@ class TestNonTransportErrorsDoNotReconnect:
         await adapter.search("q")
 
         adapter._reconnect.assert_awaited_once()
+
+
+# ── Network transports (#398): httpx errors are transport errors ─────────
+
+
+class TestNetworkTransportErrorsReconnect:
+    """The sse / streamable_http clients raise httpx errors whose MRO has no
+    OSError ancestor. They must be classified as transport errors (reconnect +
+    retry, outcome ``transport_error``) — pre-fix they fell into the generic
+    handler (outcome ``call_error``), the adapter never healed, and surfacing
+    stayed dead over the network path after the first blip."""
+
+    @staticmethod
+    def _network_adapter(transport: str = "sse") -> McpClientSearchAdapter:
+        return McpClientSearchAdapter(
+            SurfacingConfig(ltm_mcp_transport=transport, ltm_mcp_url="http://127.0.0.1:9/mcp")
+        )
+
+    @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+    @pytest.mark.parametrize(
+        "exc_type",
+        [httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError],
+        ids=["ConnectError", "ReadTimeout", "RemoteProtocolError"],
+    )
+    @pytest.mark.asyncio
+    async def test_httpx_error_triggers_reconnect_and_retry(self, exc_type, transport):
+        adapter = self._network_adapter(transport)
+
+        good_result = _result_with_text("[1] 0.95 | [default] src/app.py\nRecovered fine.\n")
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=[exc_type("network blip"), good_result])
+        adapter._session = mock_session
+        adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
+
+        results, hints, outcome = await adapter.search("q")
+
+        adapter._reconnect.assert_awaited_once()
+        assert mock_session.call_tool.await_count == 2
+        assert outcome == "ok"
+        assert len(results) == 1
+
+    @pytest.mark.asyncio
+    async def test_httpx_error_with_failed_reconnect_is_transport_error(self):
+        """Outcome must be ``transport_error`` (reconnect path), not
+        ``call_error`` (generic handler — the pre-fix misclassification)."""
+        adapter = self._network_adapter("streamable_http")
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        adapter._session = mock_session
+        adapter._reconnect = AsyncMock(  # type: ignore[method-assign]
+            side_effect=httpx.ConnectError("still refused")
+        )
+
+        results, hints, outcome = await adapter.search("q")
+
+        assert results == []
+        assert hints == []
+        assert outcome == "transport_error"
+        adapter._reconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_httpx_status_error_does_not_reconnect(self):
+        """An HTTP status error means the server answered — application-level,
+        not a transport failure; reconnecting would mask real errors."""
+        adapter = self._network_adapter()
+
+        request = httpx.Request("POST", "http://127.0.0.1:9/mcp")
+        response = httpx.Response(500, request=request)
+        exc = httpx.HTTPStatusError("server error", request=request, response=response)
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=exc)
+        adapter._session = mock_session
+        adapter._reconnect = AsyncMock()  # type: ignore[method-assign]
+
+        results, hints, outcome = await adapter.search("q")
+
+        assert results == []
+        assert outcome == "call_error"
+        adapter._reconnect.assert_not_awaited()
 
 
 # ── Version negotiation fallback paths ───────────────────────────────────

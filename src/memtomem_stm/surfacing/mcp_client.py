@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import httpx
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -342,7 +343,23 @@ class McpClientSearchAdapter:
             self._stack = None
             self._session = None
 
-    _TRANSPORT_ERRORS = (OSError, ConnectionError, EOFError, BrokenPipeError, asyncio.TimeoutError)
+    # Transient failure modes that warrant tearing down and rebuilding the
+    # connection. stdio pipe failures surface as OSError / EOFError /
+    # BrokenPipeError; the sse and streamable_http clients (#398) raise
+    # httpx.TransportError subclasses (ConnectError, ReadTimeout,
+    # RemoteProtocolError, ...) whose MRO has no OSError ancestor — without
+    # the httpx entry a network blip fell through to the generic handler,
+    # which never reconnects, leaving surfacing dead until restart.
+    # httpx.HTTPStatusError / DecodingError stay OUT: the server answered,
+    # so the transport is healthy and reconnecting would mask real errors.
+    _TRANSPORT_ERRORS = (
+        OSError,
+        ConnectionError,
+        EOFError,
+        BrokenPipeError,
+        asyncio.TimeoutError,
+        httpx.TransportError,
+    )
 
     async def _reconnect(self) -> None:
         """Tear down and re-establish the MCP connection."""
