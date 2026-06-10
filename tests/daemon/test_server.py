@@ -1,9 +1,13 @@
 """End-to-end transport + lifecycle tests for the surfacing daemon.
 
-These never contact a real LTM server: the surface-hit path injects a
+These never contact a *production* LTM server: the surface-hit path injects a
 ``SurfacingEngine`` over a mock adapter, and the real-wiring path exercises a
 non-allowlisted tool so ``run_surfacing_hook`` returns ``{}`` before any LTM
-RPC. That keeps the suite deterministic even on a dev box with a live LTM.
+RPC. The one exception is the teardown leak-sweep e2e
+(``test_real_teardown_reaps_warm_ltm_child``), which deliberately warms a real
+stdio MCP round trip — against the in-repo ``_fake_memtomem_server.py``, never
+an installed memtomem. That keeps the suite deterministic even on a dev box
+with a live LTM.
 """
 
 from __future__ import annotations
