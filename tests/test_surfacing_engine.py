@@ -933,6 +933,102 @@ class TestFeedbackDemotion:
         finally:
             tracker.close()
 
+    async def test_cache_hit_filters_durably_demoted_memory(self, tmp_path: Path):
+        """#404 applies the demotion filter only on the cache-MISS path. A
+        memory that crosses the durable negative-feedback threshold while a
+        cache entry is warm — e.g. feedback recorded by a different process
+        sharing ``stm_feedback.db``, which never touches this engine's
+        in-memory ``_invalidated_ids`` — must not resurface from the cache
+        hit for the rest of the TTL."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "fb.db")
+        try:
+            results = [
+                FakeSearchResult(
+                    chunk=FakeChunk(id="late-demoted", content="memory that crossed mid-TTL"),
+                    score=0.9,
+                )
+            ]
+            obs = SurfacingObservability()
+            engine = SurfacingEngine(
+                config=_make_config(feedback_demotion_negative_threshold=3),
+                mcp_adapter=_make_mcp_adapter(results),
+                feedback_tracker=tracker,
+                observability=obs,
+            )
+            args = {"_context_query": "stable cache key for late demotion"}
+
+            # Miss path: zero negatives — the memory surfaces and is cached.
+            first = await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+            assert "memory that crossed mid-TTL" in first
+
+            # Cross the threshold OUT of band — directly on the shared store,
+            # as another process would. ``_invalidated_ids`` stays empty.
+            for i in range(3):
+                sid = f"sid-ext-{i}"
+                tracker.record_surfacing(sid, "gh", "read_file", "q", ["late-demoted"], [0.9])
+                tracker.record_feedback(sid, "not_relevant", "late-demoted")
+
+            second = await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+            assert "memory that crossed mid-TTL" not in second
+            snap = obs.snapshot()
+            assert snap["cache"] == {"miss": 1, "hit": 1}
+            # Same label the miss path records for an all-demoted result, so
+            # the operator sees demotion (not dedup / score) suppressing it.
+            assert snap["skip_reasons"]["read_file"] == {"no_results_demoted": 1}
+        finally:
+            tracker.close()
+
+    async def test_cache_hit_keeps_non_demoted_memories(self, tmp_path: Path):
+        """Partial demotion on the hit path filters only the offending
+        memory — the remaining cached results still render as a normal
+        cache-hit injection."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "fb.db")
+        try:
+            results = [
+                FakeSearchResult(
+                    chunk=FakeChunk(id="bad", content="memory demoted mid-TTL"),
+                    score=0.9,
+                ),
+                FakeSearchResult(
+                    chunk=FakeChunk(id="good", content="memory that stays useful"),
+                    score=0.8,
+                ),
+            ]
+            obs = SurfacingObservability()
+            engine = SurfacingEngine(
+                config=_make_config(feedback_demotion_negative_threshold=3),
+                mcp_adapter=_make_mcp_adapter(results),
+                feedback_tracker=tracker,
+                observability=obs,
+            )
+            args = {"_context_query": "stable cache key for partial demotion"}
+
+            first = await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+            assert "memory demoted mid-TTL" in first
+            assert "memory that stays useful" in first
+
+            for i in range(3):
+                sid = f"sid-ext-{i}"
+                tracker.record_surfacing(sid, "gh", "read_file", "q", ["bad"], [0.9])
+                tracker.record_feedback(sid, "not_relevant", "bad")
+
+            second = await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+            assert "memory demoted mid-TTL" not in second
+            assert "memory that stays useful" in second
+            snap = obs.snapshot()
+            assert snap["outcomes"]["read_file"] == {
+                "surfaced_cache_miss": 1,
+                "surfaced_cache_hit": 1,
+            }
+        finally:
+            tracker.close()
+
 
 class TestHandleFeedbackBatch:
     """Batched per-memory ratings (#353 part 1).
