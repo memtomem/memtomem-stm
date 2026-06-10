@@ -368,3 +368,257 @@ def test_single_owner_lock_excludes_second(tmp_path: Path):
     # Released → acquirable again.
     with single_owner_lock(p) as c:
         assert c is True
+
+
+# ── daemon stop / status / restart CLI ──────────────────────────────────────
+#
+# Zero direct CliRunner coverage existed for stop_cmd / status_cmd /
+# restart_cmd — the commands carrying the unguarded int()/float() handshake
+# casts and the SIGTERM-fallback + handshake-cleanup branches. These pin the
+# contract that ops commands degrade (exit 0) instead of raising on a
+# corrupted / hand-edited handshake, which read_handshake's docstring calls
+# an anticipated input (it validates dict-ness only, not field types).
+
+
+def _cli():
+    from memtomem_stm.cli.proxy import cli
+
+    return cli
+
+
+def _write_handshake(payload: dict) -> Path:
+    """Write a handshake file for the current env-derived config."""
+    import json
+
+    config = STMConfig()
+    p = discovery.handshake_path(
+        config.data_dir.expanduser(), discovery.config_fingerprint(config)
+    )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def _no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the graceful client paths report 'no responsive daemon'."""
+
+    async def fake_shutdown(config):
+        return False
+
+    async def fake_ping(config, *, timeout=2.0):
+        return None
+
+    monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+
+
+class TestDaemonStopCli:
+    def test_graceful_ack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_shutdown(config):
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        assert result.exit_code == 0, result.output
+        assert "daemon stopped" in result.output
+
+    def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        assert result.exit_code == 0, result.output
+        assert "no running daemon" in result.output
+
+    def test_corrupted_pid_degrades_and_cleans(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The crash repro: a handshake whose pid is a non-numeric string.
+        The tail branch exists precisely to clean a stale/bad handshake, but
+        the unguarded ``int(raw.get("pid", -1))`` crashed before reaching the
+        cleanup when the bad field was pid itself."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        hs = _write_handshake({"pid": "garbage", "port": 1, "token": "t"})
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "cleaned stale handshake" in result.output
+        assert not hs.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
+    def test_stale_handshake_alive_pid_gets_sigterm(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _write_handshake({"pid": 12345, "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "sent SIGTERM" in result.output
+        import signal as _signal
+
+        assert killed == [(12345, _signal.SIGTERM)]
+
+
+class TestDaemonStatusCli:
+    def test_running_json_shape(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import json
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time() - 3.0,
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "running"
+        assert info["pid"] == 11
+        assert info["uptime_seconds"] >= 0.0
+        assert "hook_will_use_daemon" in info
+
+    def test_running_corrupted_created_at_degrades(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A garbage created_at must degrade to uptime 0.0, not a
+        ValueError traceback."""
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {"pid": 11, "host": "h", "port": 1, "ltm": "warm", "created_at": "garbage"}
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "running"
+        assert info["uptime_seconds"] == 0.0
+
+    def test_stale_corrupted_pid_degrades(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Stale-handshake branch with a null pid must report state=stale
+        (pid_alive False), not crash on ``int(None)``."""
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _write_handshake({"pid": None, "port": 1, "token": "t"})
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "stale"
+        assert info["pid_alive"] is False
+
+    def test_stopped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert result.exit_code == 0, result.output
+        assert "stopped" in result.output
+
+
+class TestDaemonRestartCli:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+    def test_stop_then_start(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        calls = {"shutdown": 0, "spawns": 0}
+
+        async def fake_shutdown(config):
+            calls["shutdown"] += 1
+            return True
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {"pid": 7, "port": 9} if calls["spawns"] else None
+
+        def fake_request_spawn(config):
+            calls["spawns"] += 1
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+
+        assert result.exit_code == 0, result.output
+        assert calls["shutdown"] == 1
+        assert calls["spawns"] >= 1
+        assert "daemon started" in result.output
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+    def test_wedged_teardown_reports_clearly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When the old daemon never frees its lifetime lock, restart must
+        report the wedged teardown instead of a misleading start timeout."""
+        from click.testing import CliRunner
+
+        from memtomem_stm.daemon.locking import lock_path
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+
+        # Fast-forward the 5s lock-wait: daemon_cmd's module-level ``time``
+        # is swapped for a fake that advances 1s per time() call and no-ops
+        # sleep(), so the deadline loop exits after ~5 iterations without
+        # wall-clock waiting.
+        class _FakeTime:
+            def __init__(self) -> None:
+                self.now = 1_000.0
+
+            def time(self) -> float:
+                self.now += 1.0
+                return self.now
+
+            def sleep(self, _s: float) -> None:
+                return None
+
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd.time", _FakeTime())
+
+        config = STMConfig()
+        lp = lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        with single_owner_lock(lp) as held:
+            assert held is True
+            result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+
+        assert result.exit_code == 0, result.output
+        assert "still shutting down" in result.output
