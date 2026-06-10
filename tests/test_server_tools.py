@@ -1229,15 +1229,17 @@ class TestLifespan:
         mock_adapter.stop.assert_awaited_once()
         mock_pm_instance.stop.assert_awaited_once()
 
-    async def test_file_config_loaded_even_when_env_enabled(self, monkeypatch):
+    async def test_file_config_loaded_even_when_env_enabled(self, tmp_path, monkeypatch):
         """``MEMTOMEM_STM_PROXY__ENABLED`` used to make app_lifespan skip the
         JSON file load entirely — the proxy started enabled but with zero
-        upstreams (``upstream_servers`` is a file-only field env vars cannot
-        practically populate). The file must be loaded unconditionally; env
-        wins through the ``load_from_file`` overlay instead of a bypass."""
+        upstreams (``upstream_servers`` is a file-only field in practice).
+        An existing file must be loaded regardless of the env var; env wins
+        through the ``load_from_file`` overlay instead of a bypass."""
         from memtomem_stm.server import app_lifespan, mcp
 
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{}", encoding="utf-8")
 
         mock_pm_instance = MagicMock()
         mock_pm_instance.start = AsyncMock()
@@ -1254,7 +1256,7 @@ class TestLifespan:
             mock_cfg = MockConfig.return_value
             mock_cfg.proxy = MagicMock()
             mock_cfg.proxy.enabled = False
-            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.config_path = cfg_file
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = False
             mock_cfg.langfuse = MagicMock()
@@ -1344,6 +1346,32 @@ class TestApplyProxyFileConfig:
         _apply_proxy_file_config(config, {})
 
         assert config.surfacing.consumer_model == "claude-sonnet-4"
+
+    def test_missing_file_keeps_pydantic_settings_env_parse(self, tmp_path, monkeypatch):
+        """Env-only mode with NO config file: ``STMConfig()``'s
+        pydantic-settings parse supports JSON-encoded complex env values
+        (``UPSTREAM_SERVERS``) that the raw-string overlay dict cannot
+        represent. Rebuilding ``config.proxy`` from the overlay would fail
+        validation and silently collapse a working env-only setup to
+        defaults (disabled, zero upstreams) — when the file is missing the
+        helper must leave the env-parsed config untouched."""
+        from memtomem_stm.proxy.config import collect_proxy_env_overrides
+        from memtomem_stm.server import _apply_proxy_file_config
+
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+            '{"gh": {"prefix": "gh", "command": "echo"}}',
+        )
+        config = STMConfig()
+        assert config.proxy.enabled is True
+        assert set(config.proxy.upstream_servers) == {"gh"}
+        config.proxy.config_path = tmp_path / "nonexistent.json"
+
+        _apply_proxy_file_config(config, collect_proxy_env_overrides())
+
+        assert config.proxy.enabled is True
+        assert set(config.proxy.upstream_servers) == {"gh"}
 
 
 # ── advertise_observability_tools flag ──────────────────────────────────

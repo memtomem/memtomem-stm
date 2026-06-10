@@ -68,10 +68,18 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     The documented precedence (env > file > defaults) is enforced by
     ``load_from_file``'s deep-merge: every ``MEMTOMEM_STM_PROXY__*`` var —
     including ``ENABLED`` — wins over its file counterpart, while file-only
-    fields (notably ``upstream_servers``, which env vars cannot practically
-    populate) survive. The load used to be skipped entirely whenever
-    ``MEMTOMEM_STM_PROXY__ENABLED`` was set, which started the proxy enabled
-    but with zero upstreams — proxying nothing.
+    fields (notably ``upstream_servers``) survive. The load used to be
+    skipped entirely whenever ``MEMTOMEM_STM_PROXY__ENABLED`` was set, which
+    started the proxy enabled but with zero upstreams — proxying nothing.
+
+    When the file is MISSING, ``config.proxy`` is deliberately left as
+    constructed: ``STMConfig()``'s pydantic-settings parse already applied
+    every env var, including JSON-encoded complex values (e.g.
+    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS='{"gh": ...}'``) that the
+    raw-string overlay dict cannot represent — rebuilding the config from
+    the overlay alone could only lose information, and a validation failure
+    in that rebuild would silently collapse a working env-only setup to
+    defaults.
 
     Replacing ``config.proxy`` happens after ``STMConfig.model_post_init``
     already ran, so its ``consumer_model`` propagation is re-applied here —
@@ -79,11 +87,12 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     but never surfacing's model-aware budgets
     (``effective_max_injection_chars`` / ``effective_max_results``).
     """
-    file_cfg = ProxyConfig.load_from_file(
-        config.proxy.config_path, env_overrides=proxy_env_overrides
-    )
-    if file_cfg is not None:
-        config.proxy = file_cfg
+    if config.proxy.config_path.expanduser().resolve().exists():
+        file_cfg = ProxyConfig.load_from_file(
+            config.proxy.config_path, env_overrides=proxy_env_overrides
+        )
+        if file_cfg is not None:
+            config.proxy = file_cfg
     if config.proxy.consumer_model and not config.surfacing.consumer_model:
         config.surfacing.consumer_model = config.proxy.consumer_model
 

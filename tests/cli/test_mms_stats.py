@@ -137,3 +137,29 @@ class TestMmsStats:
         assert data["enabled"] is True
         # The file's seeded db is probed — its row shows up.
         assert data["compression"]["total_calls"] == 1
+
+    def test_missing_file_env_only_uses_pydantic_settings_parse(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """Missing config file + env-only setup: the server keeps
+        ``STMConfig()``'s pydantic-settings parse (which decodes
+        JSON-encoded complex env values like ``UPSTREAM_SERVERS``), so
+        ``mms stats`` must mirror that instead of rebuilding from the
+        raw-string env overlay — the rebuild would fail validation and
+        report defaults (disabled, zero servers) for a working setup."""
+        set_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+            '{"gh": {"prefix": "gh", "command": "echo"}}',
+        )
+
+        result = runner.invoke(
+            cli, ["stats", "--config", str(tmp_path / "nonexistent.json"), "--json"]
+        )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_status"] == "missing"
+        assert data["enabled"] is True
+        assert data["servers"] == 1

@@ -709,8 +709,11 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
         config_status = "invalid"
         proxy_cfg = ProxyConfig()
     elif not resolved.exists():
+        # Missing file: mirror the server, which keeps STMConfig()'s
+        # pydantic-settings parse — it handles JSON-encoded complex env
+        # values (e.g. UPSTREAM_SERVERS) that the raw-string overlay can't.
         config_status = "missing"
-        proxy_cfg = loaded
+        proxy_cfg = stm_config.proxy if stm_config is not None else loaded
     else:
         config_status = "ok"
         proxy_cfg = loaded
