@@ -1426,6 +1426,22 @@ def _is_anyio_cancel_scope_shutdown_error(exc: RuntimeError) -> bool:
     return any(marker in message for marker in _ANYIO_CANCEL_SCOPE_SHUTDOWN_MESSAGES)
 
 
+def _is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
+    """True when *exc* consists only of AnyIO cancel-scope shutdown errors.
+
+    ``mcp.run()`` executes the server inside ``anyio.create_task_group()``,
+    and anyio >= 4 (strict task groups) wraps anything escaping a task group
+    in an ``ExceptionGroup`` — on stdio EOF the cancel-scope RuntimeError
+    reaches ``main()`` in that wrapped shape, not bare. Walk groups
+    recursively and treat the tree as a clean shutdown only when EVERY leaf
+    is the cancel-scope error; any other leaf is a real failure that must
+    hit the exception barrier.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return all(_is_clean_cancel_scope_shutdown(sub) for sub in exc.exceptions)
+    return isinstance(exc, RuntimeError) and _is_anyio_cancel_scope_shutdown_error(exc)
+
+
 def main() -> None:
     """Run the STM MCP server."""
     level = os.environ.get("MEMTOMEM_STM_LOG_LEVEL", "WARNING").upper()
@@ -1440,8 +1456,11 @@ def main() -> None:
     # after logging so the process still terminates; we only add observability.
     try:
         mcp.run()
-    except RuntimeError as e:
-        if _is_anyio_cancel_scope_shutdown_error(e):
+    except (RuntimeError, ExceptionGroup) as e:
+        # The bare RuntimeError occurs when the cancel-scope error escapes
+        # outside any task group; the ExceptionGroup shape is what anyio's
+        # strict task groups actually deliver on stdio EOF (#410 follow-up).
+        if _is_clean_cancel_scope_shutdown(e):
             logger.warning(
                 "STM MCP server shut down with AnyIO cancel scope warning (ignored): %s", e
             )

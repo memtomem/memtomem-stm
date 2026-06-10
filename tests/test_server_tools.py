@@ -1525,3 +1525,74 @@ class TestMainExceptionBarrier:
             warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
             assert not error_records
             assert any("AnyIO cancel scope warning" in r.getMessage() for r in warning_records)
+
+    def test_exception_group_wrapped_cancel_scope_error_exits_cleanly(self, caplog):
+        """anyio >= 4 strict task groups wrap the cancel-scope RuntimeError in
+        an ``ExceptionGroup`` before it reaches ``main()`` — the bare shape
+        the test above injects never occurs through ``mcp.run()`` in
+        production. Both the single-wrap and the nested-group shape must be
+        treated as a clean shutdown."""
+        import logging
+
+        from memtomem_stm import server
+
+        cancel_err = RuntimeError(
+            "Attempted to exit cancel scope in a different task than it was entered in"
+        )
+        shapes = (
+            ExceptionGroup("unhandled errors in a TaskGroup", [cancel_err]),
+            ExceptionGroup(
+                "unhandled errors in a TaskGroup",
+                [ExceptionGroup("unhandled errors in a TaskGroup", [cancel_err])],
+            ),
+        )
+
+        for group in shapes:
+            caplog.clear()
+            with (
+                caplog.at_level(logging.WARNING, logger="memtomem_stm.server"),
+                patch.object(server.mcp, "run", side_effect=group),
+            ):
+                server.main()
+
+            error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+            warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert not error_records, (
+                f"wrapped cancel-scope shutdown must not hit the barrier; "
+                f"got: {[r.getMessage() for r in error_records]}"
+            )
+            assert any("AnyIO cancel scope warning" in r.getMessage() for r in warning_records)
+
+    def test_exception_group_with_real_failure_hits_barrier(self, caplog):
+        """A group mixing the cancel-scope error with any other failure is NOT
+        a clean shutdown — the real failure must be logged and re-raised."""
+        import logging
+
+        from memtomem_stm import server
+
+        group = ExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [
+                RuntimeError(
+                    "Attempted to exit cancel scope in a different task than it was entered in"
+                ),
+                ValueError("real bug"),
+            ],
+        )
+
+        caplog.clear()
+        with (
+            caplog.at_level(logging.ERROR, logger="memtomem_stm.server"),
+            patch.object(server.mcp, "run", side_effect=group),
+        ):
+            try:
+                server.main()
+            except ExceptionGroup:
+                pass
+            else:
+                import pytest as _pytest
+
+                _pytest.fail("main() must re-raise a group containing a real failure")
+
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("unhandled exception" in r.getMessage() for r in error_records)
