@@ -117,3 +117,66 @@ class TestPinPurge:
         with caplog.at_level(logging.INFO, logger="memtomem_stm.surfacing.feedback"):
             AutoTuner(cfg, _store(adjustments={"read_file": 0.04}))
         assert any("suppressed 1 persisted adjustment" in r.message for r in caplog.records)
+
+
+class TestClampOnLoad:
+    """Persisted adjustments are re-clamped to the CURRENT config band on
+    load. #392 made the floor/ceiling configurable, but persistence (#332)
+    predates it and resumed values verbatim: an operator narrowing the band
+    between runs (e.g. ceiling 0.05 → 0.03, min_score kept in-band so config
+    validation passes) left the stale out-of-band threshold active until
+    fresh feedback happened to fire ``maybe_adjust`` for that tool — with no
+    feedback, forever."""
+
+    def test_loaded_adjustment_above_ceiling_is_clamped(self):
+        cfg = SurfacingConfig(
+            auto_tune_enabled=True,
+            min_score=0.02,
+            auto_tune_score_floor=0.005,
+            auto_tune_score_ceiling=0.03,
+        )
+        store = _store(adjustments={"read_file": 0.05})
+        tuner = AutoTuner(cfg, store)
+        assert tuner.get_effective_min_score("read_file") == 0.03
+        # The persisted row converges too — not just the in-memory view —
+        # so the clamp doesn't have to re-run on every start.
+        store.save_adjustment.assert_called_once_with("read_file", 0.03)
+
+    def test_loaded_adjustment_below_floor_is_clamped(self):
+        cfg = SurfacingConfig(
+            auto_tune_enabled=True,
+            min_score=0.03,
+            auto_tune_score_floor=0.02,
+        )
+        store = _store(adjustments={"read_file": 0.001})
+        tuner = AutoTuner(cfg, store)
+        assert tuner.get_effective_min_score("read_file") == 0.02
+        store.save_adjustment.assert_called_once_with("read_file", 0.02)
+
+    def test_in_band_adjustment_left_untouched(self):
+        cfg = SurfacingConfig(
+            auto_tune_enabled=True,
+            min_score=0.02,
+            auto_tune_score_ceiling=0.05,
+        )
+        store = _store(adjustments={"read_file": 0.04})
+        tuner = AutoTuner(cfg, store)
+        assert tuner.get_effective_min_score("read_file") == 0.04
+        store.save_adjustment.assert_not_called()
+
+    def test_pinned_tool_is_purged_not_clamped(self):
+        """Purge runs before the clamp: a pinned tool's out-of-band
+        persisted adjustment is dropped from the in-memory map with NO
+        store write — the purge contract leaves the persisted row intact
+        so removing the pin later restores the learned value (which the
+        next load then clamps if still out of band)."""
+        cfg = SurfacingConfig(
+            auto_tune_enabled=True,
+            min_score=0.02,
+            auto_tune_score_ceiling=0.03,
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.5)},
+        )
+        store = _store(adjustments={"read_file": 0.05})
+        tuner = AutoTuner(cfg, store)
+        assert "read_file" not in tuner.adjustments
+        store.save_adjustment.assert_not_called()

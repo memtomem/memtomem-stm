@@ -115,6 +115,38 @@ class AutoTuner:
             config.min_score,
         )
         self._purge_pinned_adjustments()
+        self._clamp_loaded_adjustments()
+
+    def _clamp_loaded_adjustments(self) -> None:
+        """Re-clamp persisted adjustments to the CURRENT config band.
+
+        #392 made the floor/ceiling configurable, but persisted values
+        (#332) were resumed verbatim: narrowing the band between runs left
+        an out-of-band threshold in effect until fresh feedback happened to
+        fire ``maybe_adjust`` for that tool — with no feedback, forever
+        (``_purge_pinned_adjustments`` only drops pinned tools, not
+        out-of-band values). Clamping on load makes the configured bounds
+        authoritative regardless of restart timing. The clamped value is
+        persisted back so the DB row converges instead of re-clamping on
+        every start. Runs after the pin purge, so purged tools keep their
+        persisted row untouched per the purge contract.
+        """
+        floor = self._config.auto_tune_score_floor
+        ceiling = self._config.auto_tune_score_ceiling
+        for tool, score in list(self._adjustments.items()):
+            clamped = min(max(score, floor), ceiling)
+            if clamped != score:
+                self._adjustments[tool] = clamped
+                self._store.save_adjustment(tool, clamped)
+                logger.info(
+                    "AutoTuner: clamped persisted adjustment for %r from %.4f to %.4f "
+                    "(current band [%.4f, %.4f])",
+                    tool,
+                    score,
+                    clamped,
+                    floor,
+                    ceiling,
+                )
 
     def _purge_pinned_adjustments(self) -> None:
         """Suppress persisted adjustments for operator-pinned tools.
