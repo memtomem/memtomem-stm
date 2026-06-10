@@ -561,8 +561,13 @@ class SurfacingEngine:
 
         Filters out memory IDs in ``_invalidated_ids`` — memories the agent
         already rated ``not_relevant`` or ``already_known`` within the cache
-        TTL window. A filtered-empty result pass-throughs like the natural
-        empty case.
+        TTL window — and re-applies the durable feedback-demotion filter,
+        symmetric with the miss path: a memory that crossed the
+        negative-feedback threshold after this entry was cached (e.g.
+        feedback recorded by another process sharing ``stm_feedback.db``,
+        which never reaches this engine's in-memory sets) must not keep
+        resurfacing from a warm entry for the rest of the TTL. A
+        filtered-empty result pass-throughs like the natural empty case.
         """
         # Track whether the entry started non-empty so we can distinguish a
         # ``no_results_invalidated`` outcome (had results, all rejected) from
@@ -582,9 +587,31 @@ class SurfacingEngine:
                     original_count,
                     len(cached),
                 )
+        # ``_feedback_demoted_ids`` gates itself on the tracker /
+        # ``record_feedback_events`` / ``feedback_demotion_enabled``, so the
+        # dedup-only daemon path and no-tracker engines skip the DB read.
+        demoted_all = False
+        if cached:
+            demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in cached])
+            if demoted_ids:
+                original_count = len(cached)
+                cached = [r for r in cached if str(r.chunk.id) not in demoted_ids]
+                demoted_all = not cached
+                logger.debug(
+                    "Surfacing cache filter: %s/%s %d→%d (demoted)",
+                    server,
+                    tool,
+                    original_count,
+                    len(cached),
+                )
         if not cached:
             if was_empty:
                 self._observability.record_skip(tool, "no_results_empty_cache")
+            elif demoted_all:
+                # Same label as the miss path's all-demoted branch: the
+                # operator sees demotion (not invalidation) suppressing the
+                # cached result.
+                self._observability.record_skip(tool, "no_results_demoted")
             else:
                 self._observability.record_skip(tool, "no_results_invalidated")
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
@@ -761,7 +788,9 @@ class SurfacingEngine:
         # Filter by score, then locally demote memories with repeated durable
         # negative feedback, then exclude already-surfaced memories in this
         # session. Demotion sits before cache write so a rejected memory does
-        # not keep reappearing from a cached query after process restart.
+        # not keep reappearing from a cached query after process restart;
+        # ``_render_cached`` re-applies it on the hit path for entries whose
+        # memories cross the threshold mid-TTL (e.g. via another process).
         scored = [r for r in results if r.score >= min_score]
         demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in scored])
         if demoted_ids:
