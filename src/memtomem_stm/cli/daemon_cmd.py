@@ -50,6 +50,40 @@ def _load_config() -> STMConfig:
     return STMConfig()
 
 
+def _as_int(value: Any, default: int = -1) -> int:
+    """Tolerantly coerce a handshake field to int.
+
+    ``read_handshake`` validates only that the parsed JSON is a dict — its
+    docstring calls hand-edited/corrupted files an anticipated input, so
+    field types are NOT guaranteed. A bare ``int(raw.get("pid", -1))``
+    turned a garbage ``pid`` into an uncaught ValueError/TypeError traceback
+    in the very commands whose tail branches exist to clean up bad
+    handshakes. Degrade to *default* instead.
+
+    ``bool`` is rejected explicitly: JSON ``true`` would coerce to pid 1
+    (launchd/init) and could steer the SIGTERM fallback at the wrong
+    process. ``OverflowError`` covers JSON ``Infinity`` — Python's
+    ``json.loads`` accepts it by default, and ``int(float("inf"))`` raises
+    it rather than ValueError.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    """Tolerant float twin of :func:`_as_int` (e.g. ``created_at``)."""
+    if isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     """Route daemon logs to a file under ``data_dir`` when detached (its stdio
     is ``DEVNULL``), otherwise to stderr for foreground debugging."""
@@ -163,7 +197,7 @@ def stop_cmd() -> None:
     if raw is None:
         click.echo("no running daemon")
         return
-    pid = int(raw.get("pid", -1))
+    pid = _as_int(raw.get("pid", -1))
     if os.name != "nt" and is_pid_alive(pid):
         try:
             os.kill(pid, signal.SIGTERM)
@@ -197,7 +231,7 @@ def status_cmd(as_json: bool) -> None:
     use_daemon = config.hook.use_daemon and surfacing_on
     hs = asyncio.run(client.ping(config, timeout=2.0))
     if hs is not None:
-        uptime = max(0.0, time.time() - float(hs.get("created_at", time.time())))
+        uptime = max(0.0, time.time() - _as_float(hs.get("created_at"), time.time()))
         info: dict[str, Any] = {
             "state": "running",
             "pid": hs.get("pid"),
@@ -213,7 +247,7 @@ def status_cmd(as_json: bool) -> None:
             info = {
                 "state": "stale",
                 "pid": raw.get("pid"),
-                "pid_alive": is_pid_alive(int(raw.get("pid", -1))),
+                "pid_alive": is_pid_alive(_as_int(raw.get("pid", -1))),
                 "hook_will_use_daemon": use_daemon,
             }
         else:
