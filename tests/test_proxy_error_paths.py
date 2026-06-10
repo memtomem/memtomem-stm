@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,6 +12,7 @@ import pytest
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
+    ProgressiveConfig,
     ProxyConfig,
     UpstreamServerConfig,
 )
@@ -40,6 +42,7 @@ def _make_manager(
     tmp_path: Path | None = None,
     call_timeout: float = 90.0,
     overall_deadline: float = 180.0,
+    progressive: ProgressiveConfig | None = None,
 ) -> ProxyManager:
     """Create a ProxyManager with a mocked upstream connection."""
     server_cfg = UpstreamServerConfig(
@@ -51,6 +54,7 @@ def _make_manager(
         max_reconnect_delay_seconds=max_reconnect_delay,
         call_timeout_seconds=call_timeout,
         overall_deadline_seconds=overall_deadline,
+        progressive=progressive,
     )
     config_path = (tmp_path / "proxy.json") if tmp_path else Path("/tmp/proxy.json")
     proxy_cfg = ProxyConfig(
@@ -1106,6 +1110,106 @@ class TestTransientKeyResponsesNotCached:
             assert "plain upstream payload" in r2
             assert session.call_tool.call_count == 1, (
                 "non-transient response should be cached; second call must hit cache"
+            )
+        finally:
+            cache.close()
+
+    _READ_MORE_RE = re.compile(r'stm_proxy_read_more\(key="([0-9a-f]+)", offset=(\d+)\)')
+
+    async def test_progressive_first_chunk_is_not_cached(self, tmp_path):
+        """Same invariant on the PROGRESSIVE-strategy branch, end to end.
+
+        Until the ``metrics_strategy`` fix this branch could not be driven
+        through ``call_tool`` at all (UnboundLocalError at the metrics
+        record), so only the detector unit tests covered the progressive
+        marker — not the store guard on a real PROGRESSIVE call."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=500),
+            tmp_path=tmp_path,
+        )
+        session = _get_session(mgr)
+        large = "paragraph sentence here. " * 200  # 5000 chars > chunk_size
+        session.call_tool.side_effect = [_make_result(large), _make_result(large)]
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            r1 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "stm_proxy_read_more" in r1
+            r2 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "stm_proxy_read_more" in r2
+            assert session.call_tool.call_count == 2, (
+                "progressive first-chunk must not be cached; the second identical "
+                f"call should re-run upstream (saw {session.call_tool.call_count})"
+            )
+            assert cache.get("srv", "tool", {"x": 1}) is None
+        finally:
+            cache.close()
+
+    async def test_progressive_repeat_call_mints_live_key_after_store_eviction(self, tmp_path):
+        """The original data-loss shape: progressive-store entry evicted
+        between two identical calls. The second call must mint a fresh key
+        whose tail is readable — not re-serve a chunk pointing at the dead
+        one."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=500),
+            tmp_path=tmp_path,
+        )
+        session = _get_session(mgr)
+        large = "alpha bravo charlie delta. " * 200
+        session.call_tool.side_effect = [_make_result(large), _make_result(large)]
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            first = await mgr.call_tool("srv", "tool", {"x": 1})
+            m1 = self._READ_MORE_RE.search(first)
+            assert m1 is not None
+            key1 = m1.group(1)
+
+            # Simulate TTL / max_stored eviction between the two calls.
+            mgr._get_progressive_store().delete(key1)
+
+            second = await mgr.call_tool("srv", "tool", {"x": 1})
+            m2 = self._READ_MORE_RE.search(second)
+            assert m2 is not None, "second call must be re-chunked, not served from cache"
+            key2, offset2 = m2.group(1), int(m2.group(2))
+            assert key2 != key1
+
+            follow_up = mgr.read_more(key2, offset2)
+            assert "not found or expired" not in follow_up
+            assert follow_up.strip(), "tail content must be reachable via the new key"
+        finally:
+            cache.close()
+
+    async def test_progressive_passthrough_is_still_cached(self, tmp_path):
+        """Content that fits one chunk passes through without a read_more
+        key — the exclusion must stay narrow and keep caching it."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=4000),
+            tmp_path=tmp_path,
+        )
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [_make_result("short response body")]
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            r1 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "stm_proxy_read_more" not in r1
+            r2 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "short response body" in r2
+            assert session.call_tool.call_count == 1, (
+                "single-chunk passthrough carries no key and should be cached"
             )
         finally:
             cache.close()
