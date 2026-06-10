@@ -380,6 +380,44 @@ class TestLLMCompressorFallback:
         await comp.compress("short", max_chars=1000)
         assert comp.last_fallback is None
 
+    @pytest.mark.asyncio
+    async def test_overlength_llm_output_is_bounded(self):
+        """The system prompt only ASKS the model to honor max_chars — a
+        model that overshoots must not leak an over-budget payload through
+        the success path. Every sync tier provably bounds its output to
+        max_chars; the LLM success path was the sole exception (it returned
+        the model string verbatim, and the manager's ratio guard checks
+        only UNDER-retention, never the upper bound)."""
+        comp = _make_llm_compressor()
+        text = "Long document content. " * 50
+        with patch.object(comp, "_call_api", new=AsyncMock(return_value="X" * 1000)):
+            result = await comp.compress(text, max_chars=200)
+        assert len(result) <= 200
+        assert comp.last_fallback == "llm_overlength"
+
+    @pytest.mark.asyncio
+    async def test_overlength_does_not_count_as_breaker_failure(self):
+        """Overshoot is a model-quality event, not an endpoint failure —
+        the API responded fine, so it must not accumulate toward opening
+        the circuit breaker the way timeouts and errors do."""
+        comp = _make_llm_compressor()
+        text = "Long document content. " * 50
+        with patch.object(comp, "_call_api", new=AsyncMock(return_value="X" * 1000)):
+            for _ in range(4):
+                await comp.compress(text, max_chars=200)
+        assert not comp._cb.is_open
+
+    @pytest.mark.asyncio
+    async def test_within_budget_llm_output_returned_verbatim(self):
+        """The clamp must not touch a compliant summary — within-budget
+        output is returned exactly as the model produced it."""
+        comp = _make_llm_compressor()
+        text = "Long document content. " * 50
+        with patch.object(comp, "_call_api", new=AsyncMock(return_value="ok summary")):
+            result = await comp.compress(text, max_chars=200)
+        assert result == "ok summary"
+        assert comp.last_fallback is None
+
 
 # ---------------------------------------------------------------------------
 # LLMCompressor — llm_timeout_seconds guards a slow/hung LLM endpoint (#207)

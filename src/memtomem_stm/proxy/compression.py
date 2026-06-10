@@ -2262,6 +2262,23 @@ class LLMCompressor:
                 timeout=self._cfg.llm_timeout_seconds,
             )
             self._cb.success()
+            if len(result) > max_chars:
+                # The system prompt only ASKS the model to honor max_chars;
+                # models routinely overshoot length constraints, and nothing
+                # downstream clamps the success path (the manager's ratio
+                # guard fires only on UNDER-retention). Bound the summary the
+                # way every sync tier bounds its output — keep the LLM's
+                # distillation, clamped. The breaker is not failed: the API
+                # responded fine, this is a model-quality event.
+                logger.warning(
+                    "LLM summary exceeded budget (%d > %d chars, strategy=llm/%s), "
+                    "truncating the summary",
+                    len(result),
+                    max_chars,
+                    self._cfg.provider.value,
+                )
+                self.last_fallback = "llm_overlength"
+                return TruncateCompressor().compress(result, max_chars=max_chars)
             return result
         except asyncio.TimeoutError:
             self._cb.failure()
