@@ -327,6 +327,74 @@ class TestScanClaudeDesktop:
         assert ih.scan_claude_desktop(tmp_path) == []
 
 
+class TestNonDictMcpServers:
+    """Structurally-valid JSON whose ``mcpServers`` is a list/str/number is
+    truthy, so an ``(config.get("mcpServers") or {})`` guard passes it
+    straight to ``.items()`` — AttributeError. The module docstring contract
+    treats unreadable configs as "no candidates (silent)"; a wrong-typed
+    ``mcpServers`` (another tool's schema, or a hand-edit) must behave like
+    missing, not crash ``mms import`` / ``mms host status`` / ``mms host
+    scan`` / ``mms host sync``. ``scan_codex`` already guards with
+    ``isinstance``; these pin the four JSON scanner sites to the same
+    behavior.
+    """
+
+    BAD_VALUES = pytest.mark.parametrize(
+        "bad", [["entry"], "string", 7], ids=["list", "str", "int"]
+    )
+
+    @BAD_VALUES
+    def test_claude_code_user_scope_returns_empty(self, sandbox_home, tmp_path, bad):
+        (sandbox_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": bad}), encoding="utf-8"
+        )
+        assert ih.scan_claude_code(tmp_path) == []
+
+    @BAD_VALUES
+    def test_claude_code_project_scope_returns_empty(self, sandbox_home, tmp_path, bad):
+        cwd = tmp_path / "proj"
+        cwd.mkdir()
+        cfg = {"projects": {str(cwd): {"mcpServers": bad}}}
+        (sandbox_home / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+        assert ih.scan_claude_code(cwd) == []
+
+    @BAD_VALUES
+    def test_dot_mcp_json_returns_empty(self, sandbox_home, tmp_path, bad):
+        (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": bad}), encoding="utf-8")
+        assert ih.scan_claude_code(tmp_path) == []
+
+    @BAD_VALUES
+    def test_cursor_returns_empty(self, sandbox_home, tmp_path, bad):
+        cwd = tmp_path / "proj"
+        cwd.mkdir()
+        cursor_dir = sandbox_home / ".cursor"
+        cursor_dir.mkdir()
+        (cursor_dir / "mcp.json").write_text(json.dumps({"mcpServers": bad}), encoding="utf-8")
+        assert ih.scan_cursor(cwd) == []
+
+    @BAD_VALUES
+    def test_claude_desktop_returns_empty(self, monkeypatch, tmp_path, bad):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        sandbox_path = tmp_path / "claude_desktop_config.json"
+        sandbox_path.write_text(json.dumps({"mcpServers": bad}), encoding="utf-8")
+        monkeypatch.setattr(ih, "_desktop_config_path", lambda: sandbox_path)
+        assert ih.scan_claude_desktop(tmp_path) == []
+
+    def test_bad_user_scope_does_not_block_other_scopes(self, sandbox_home, tmp_path):
+        """A wrong-typed ``mcpServers`` skips only that scope — the scan
+        continues to the next source (here ``.mcp.json``) instead of
+        aborting the whole scanner."""
+        (sandbox_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": ["bad"]}), encoding="utf-8"
+        )
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"local-tool": {"command": "echo"}}}),
+            encoding="utf-8",
+        )
+        candidates = ih.scan_claude_code(tmp_path)
+        assert [c.name for c in candidates] == ["local-tool"]
+
+
 # ---------------------------------------------------------------------------
 # discover() façade
 # ---------------------------------------------------------------------------
