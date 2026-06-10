@@ -1044,6 +1044,8 @@ class ProxyManager:
             server=server,
             tool=tool,
             trace_id=trace_id,
+            chunk_size=cfg.chunk_size,
+            include_structure_hint=cfg.include_structure_hint,
         )
         store.put(key, resp)
 
@@ -1096,8 +1098,14 @@ class ProxyManager:
             },
         ):
             store.touch(key)
-            chunk_size = limit or 4000
-            chunker = ProgressiveChunker(chunk_size=chunk_size, include_hint=True)
+            # Continue with the chunking the first chunk used (persisted on
+            # the ProgressiveResponse) — an explicit ``limit`` from the agent
+            # still wins. Hardcoding ``4000`` here made follow-ups diverge
+            # from a tuned ``progressive.chunk_size`` / hint preference.
+            chunk_size = limit or resp.chunk_size
+            chunker = ProgressiveChunker(
+                chunk_size=chunk_size, include_hint=resp.include_structure_hint
+            )
             output = chunker.read_chunk(
                 resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
             )

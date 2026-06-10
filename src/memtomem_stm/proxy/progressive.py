@@ -43,6 +43,13 @@ class ProgressiveResponse:
     # ``None`` only for legacy rows deserialized without the key; the live
     # ``call_tool`` path always populates ``trace_id`` via auto-gen UUID.
     trace_id: str | None = None
+    # Chunking parameters from the originating tool's ``ProgressiveConfig``,
+    # persisted so ``read_more`` continues with the same chunk size and
+    # structure-hint preference the first chunk used — without these,
+    # follow-up reads reverted to a hardcoded 4000/hint-on. Defaults match
+    # that historical behavior so legacy rows deserialize unchanged.
+    chunk_size: int = 4000
+    include_structure_hint: bool = True
 
 
 class ProgressiveStoreAdapter:
@@ -66,6 +73,8 @@ class ProgressiveStoreAdapter:
                 "server": resp.server,
                 "tool": resp.tool,
                 "trace_id": resp.trace_id,
+                "chunk_size": resp.chunk_size,
+                "include_structure_hint": resp.include_structure_hint,
             },
             ensure_ascii=False,
         )
@@ -104,6 +113,8 @@ class ProgressiveStoreAdapter:
             server=meta.get("server", ""),
             tool=meta.get("tool", ""),
             trace_id=meta.get("trace_id"),
+            chunk_size=meta.get("chunk_size", 4000),
+            include_structure_hint=meta.get("include_structure_hint", True),
         )
 
     def touch(self, key: str) -> None:
