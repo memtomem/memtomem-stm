@@ -365,6 +365,22 @@ class TestEdges:
             res = _status(runner, *args)
             assert res.exit_code == 0, (args, res.output)
 
+    def test_status_non_dict_mcpservers_exit_0(self, runner, sandbox):
+        """Structurally-valid JSON whose ``mcpServers`` is not a dict (e.g.
+        another tool's schema using a list) must behave like a missing host
+        config — exit 0, no AttributeError traceback. Same contract as the
+        invalid-JSON case above, which ``_read_json_safely`` already covers;
+        this pins the scanner-level type guard."""
+        _seed_claude_code(sandbox, {"x": {"command": "npx"}})
+        _apply_claude_code(runner)
+        (sandbox["home"] / ".claude.json").write_text(
+            json.dumps({"mcpServers": ["not", "a", "dict"]}), encoding="utf-8"
+        )
+
+        for args in ([], ["--json"]):
+            res = _status(runner, *args)
+            assert res.exit_code == 0, (args, res.output)
+
     def test_status_empty_registry(self, runner, sandbox):
         res = _status(runner)
         assert res.exit_code == 0, res.output

@@ -224,13 +224,26 @@ def _wrap(name: str, raw: dict[str, Any], source_label: str) -> ImportCandidate 
     )
 
 
+def _mcp_servers(config: dict[str, Any]) -> dict[str, Any]:
+    """Return ``config["mcpServers"]`` if it is a dict, else ``{}``.
+
+    A structurally-valid JSON whose ``mcpServers`` is a list/str/number is
+    truthy, so an ``or {}`` guard would pass it straight to ``.items()`` and
+    crash the scan with an AttributeError. Wrong-typed entries follow the
+    module contract for unreadable configs — no candidates, silent — same as
+    ``scan_codex``'s ``isinstance`` guard on ``mcp_servers``.
+    """
+    servers = config.get("mcpServers")
+    return servers if isinstance(servers, dict) else {}
+
+
 def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
     """Scan ``~/.claude.json`` (user + per-project) plus ``<cwd>/.mcp.json``."""
     candidates: list[ImportCandidate] = []
 
     user_config = _read_json_safely(Path("~/.claude.json").expanduser())
     if user_config:
-        for name, raw in (user_config.get("mcpServers") or {}).items():
+        for name, raw in _mcp_servers(user_config).items():
             if not isinstance(raw, dict):
                 continue
             cand = _wrap(name, raw, "Claude Code (user)")
@@ -242,7 +255,7 @@ def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
         if isinstance(projects, dict):
             project_entry = projects.get(str(cwd)) or projects.get(str(cwd.resolve())) or {}
             if isinstance(project_entry, dict):
-                for name, raw in (project_entry.get("mcpServers") or {}).items():
+                for name, raw in _mcp_servers(project_entry).items():
                     if not isinstance(raw, dict):
                         continue
                     cand = _wrap(name, raw, "Claude Code (project)")
@@ -251,7 +264,7 @@ def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
 
     project_mcp = _read_json_safely(cwd / ".mcp.json")
     if project_mcp:
-        for name, raw in (project_mcp.get("mcpServers") or {}).items():
+        for name, raw in _mcp_servers(project_mcp).items():
             if not isinstance(raw, dict):
                 continue
             cand = _wrap(name, raw, ".mcp.json (project)")
@@ -272,7 +285,7 @@ def scan_cursor(cwd: Path) -> list[ImportCandidate]:
         config = _read_json_safely(path)
         if not config:
             continue
-        for name, raw in (config.get("mcpServers") or {}).items():
+        for name, raw in _mcp_servers(config).items():
             if not isinstance(raw, dict):
                 continue
             cand = _wrap(name, raw, label)
@@ -309,7 +322,7 @@ def scan_claude_desktop(cwd: Path) -> list[ImportCandidate]:
     if not config:
         return []
     out: list[ImportCandidate] = []
-    for name, raw in (config.get("mcpServers") or {}).items():
+    for name, raw in _mcp_servers(config).items():
         if not isinstance(raw, dict):
             continue
         cand = _wrap(name, raw, "Claude Desktop")
