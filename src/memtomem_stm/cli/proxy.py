@@ -2317,11 +2317,29 @@ def prune(
 
 
 async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
-    """Probe a single upstream server: connect, initialize, list tools."""
+    """Probe a single upstream server: connect, initialize, list tools.
+
+    *timeout* is an **end-to-end** budget shared across transport connect +
+    ``initialize()`` + ``list_tools()`` — each ``wait_for`` gets
+    ``deadline - now`` so a stall in any phase can't push the probe past the
+    ``mms health --timeout`` / ``mms add --validate --timeout`` ceiling.
+    Mirrors ``_probe_ltm_mcp_server``'s deadline pattern; previously only
+    ``initialize()`` was bounded, so a network upstream hanging on TCP
+    connect (or any upstream stalling on ``tools/list``) blocked the probe
+    indefinitely and ``_safe_probe``'s timeout classification never fired.
+    """
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
     from mcp.client.streamable_http import streamablehttp_client
+
+    deadline = asyncio.get_running_loop().time() + timeout
+
+    def remaining() -> float:
+        # ``asyncio.wait_for`` treats <=0 as "fire immediately"; clamp to a
+        # tiny positive so we always raise ``TimeoutError`` rather than
+        # returning a bogus result on an exhausted budget.
+        return max(1e-3, deadline - asyncio.get_running_loop().time())
 
     transport = cfg.get("transport", "stdio")
     if transport == "stdio":
@@ -2333,14 +2351,19 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
             )
         )
     elif transport == "sse":
-        ctx = sse_client(cfg.get("url", ""))
+        sdk_timeout = remaining()
+        ctx = sse_client(cfg.get("url", ""), timeout=sdk_timeout, sse_read_timeout=sdk_timeout)
     else:
-        ctx = streamablehttp_client(cfg.get("url", ""))
+        sdk_timeout = remaining()
+        ctx = streamablehttp_client(
+            cfg.get("url", ""), timeout=sdk_timeout, sse_read_timeout=sdk_timeout
+        )
 
-    async with ctx as streams:
+    async with AsyncExitStack() as stack:
+        streams = await asyncio.wait_for(stack.enter_async_context(ctx), timeout=remaining())
         async with ClientSession(streams[0], streams[1]) as session:
-            await asyncio.wait_for(session.initialize(), timeout=timeout)
-            result = await session.list_tools()
+            await asyncio.wait_for(session.initialize(), timeout=remaining())
+            result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
             prefix = cfg.get("prefix", "")
             overflowing = [
                 t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)

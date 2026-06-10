@@ -4214,6 +4214,117 @@ class TestHealth:
         assert data["servers"]["bad"]["error"]
         assert "surfacing" in data
 
+    @pytest.mark.parametrize(
+        ("transport", "client_path"),
+        [
+            ("sse", "mcp.client.sse.sse_client"),
+            ("streamable_http", "mcp.client.streamable_http.streamablehttp_client"),
+        ],
+    )
+    def test_upstream_probe_timeout_bounds_transport_enter(
+        self, monkeypatch, transport, client_path
+    ):
+        """#398 gave ``_probe_ltm_mcp_server`` an end-to-end deadline, but
+        the older upstream probe ``_probe_one`` only bounded
+        ``initialize()`` — a network upstream hanging on TCP connect
+        blocked ``mms health --timeout N`` / ``mms add --validate``
+        indefinitely, and no ``timeout=``/``sse_read_timeout=`` reached
+        the SDK client. Mirrors
+        ``test_sse_ltm_probe_timeout_bounds_transport_enter``."""
+        import time
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        captured = {}
+
+        class HangingTransport:
+            async def __aenter__(self):
+                await asyncio.sleep(8)
+
+            async def __aexit__(self, *_args):
+                return None
+
+        def fake_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
+            captured.update(
+                {"url": url, "timeout": timeout, "sse_read_timeout": sse_read_timeout}
+            )
+            return HangingTransport()
+
+        monkeypatch.setattr(client_path, fake_client)
+
+        cfg = {"transport": transport, "url": "https://up.example/mcp", "prefix": "up"}
+        start = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(proxy_mod._probe_one(cfg, 0.1))
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"transport-enter stall ran {elapsed:.2f}s past the 0.1s budget"
+        assert captured["url"] == "https://up.example/mcp"
+        assert captured["timeout"] == pytest.approx(0.1, rel=0.1)
+        assert captured["sse_read_timeout"] == pytest.approx(0.1, rel=0.1)
+
+    def test_upstream_probe_timeout_bounds_list_tools(self, monkeypatch):
+        """An upstream that connects and initializes fine but stalls on
+        ``tools/list`` must also resolve within the probe budget — this
+        phase was previously unbounded so ``_safe_probe``'s
+        ``asyncio.TimeoutError`` classification could never fire for it."""
+        import time
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                await asyncio.sleep(8)
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr("mcp.ClientSession", FakeSession)
+
+        cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
+        start = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(proxy_mod._probe_one(cfg, 0.1))
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"list_tools stall ran {elapsed:.2f}s past the 0.1s budget"
+
+    def test_safe_probe_classifies_deadline_timeout(self, monkeypatch):
+        """The end-to-end deadline surfaces through ``_probe_servers`` as
+        the same ``timeout (Ns)`` classification the initialize-phase
+        timeout already gets — DISCONNECTED with a clear cause, not a
+        hang or an unwrapped traceback."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class HangingTransport:
+            async def __aenter__(self):
+                await asyncio.sleep(8)
+
+            async def __aexit__(self, *_args):
+                return None
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: HangingTransport())
+
+        cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
+        results = asyncio.run(proxy_mod._probe_servers({"up": cfg}, 0.1))
+        assert results["up"]["connected"] is False
+        assert results["up"]["error"] == "timeout (0.1s)"
+
     def test_health_error_unwraps_taskgroup_wrapper(self, runner, config):
         """Probe failures inside an anyio TaskGroup are wrapped as
         ``BaseExceptionGroup`` and stringify as ``unhandled errors in a
