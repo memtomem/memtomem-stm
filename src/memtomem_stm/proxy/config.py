@@ -23,7 +23,8 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     Used to layer env-set proxy fields on top of the JSON config file so the
     documented precedence (env > file > defaults) holds end-to-end. Without
     this, the file-load path in ``server.py`` would clobber every env-set
-    field except ``MEMTOMEM_STM_PROXY__ENABLED``.
+    field (``MEMTOMEM_STM_PROXY__ENABLED`` included — the file load is
+    unconditional; env wins purely through this overlay).
 
     The returned dict mirrors the JSON config shape — nested by ``__``
     delimiters, lower-cased — and pydantic's coercion handles type

@@ -62,23 +62,37 @@ class STMContext:
 CtxType = Context[ServerSession, STMContext]
 
 
+def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, Any]) -> None:
+    """Load the JSON config file and overlay env vars on top of it, in place.
+
+    The documented precedence (env > file > defaults) is enforced by
+    ``load_from_file``'s deep-merge: every ``MEMTOMEM_STM_PROXY__*`` var —
+    including ``ENABLED`` — wins over its file counterpart, while file-only
+    fields (notably ``upstream_servers``, which env vars cannot practically
+    populate) survive. The load used to be skipped entirely whenever
+    ``MEMTOMEM_STM_PROXY__ENABLED`` was set, which started the proxy enabled
+    but with zero upstreams — proxying nothing.
+
+    Replacing ``config.proxy`` happens after ``STMConfig.model_post_init``
+    already ran, so its ``consumer_model`` propagation is re-applied here —
+    otherwise a consumer_model set only in the file reaches ``config.proxy``
+    but never surfacing's model-aware budgets
+    (``effective_max_injection_chars`` / ``effective_max_results``).
+    """
+    file_cfg = ProxyConfig.load_from_file(
+        config.proxy.config_path, env_overrides=proxy_env_overrides
+    )
+    if file_cfg is not None:
+        config.proxy = file_cfg
+    if config.proxy.consumer_model and not config.surfacing.consumer_model:
+        config.surfacing.consumer_model = config.proxy.consumer_model
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     config = STMConfig()
     proxy_env_overrides = collect_proxy_env_overrides()
-
-    # Load JSON config file and overlay env vars on top so the documented
-    # precedence (env > file > defaults) holds. The CLI writes
-    # ``"enabled": true`` to the JSON file, so a normal Quick Start enables
-    # the proxy without requiring ``MEMTOMEM_STM_PROXY__ENABLED``. Without
-    # the env overlay every other env-set field would be silently clobbered
-    # by the file values.
-    if not os.environ.get("MEMTOMEM_STM_PROXY__ENABLED"):
-        file_cfg = ProxyConfig.load_from_file(
-            config.proxy.config_path, env_overrides=proxy_env_overrides
-        )
-        if file_cfg is not None:
-            config.proxy = file_cfg
+    _apply_proxy_file_config(config, proxy_env_overrides)
 
     # Shared state — populated only when proxy is enabled
     from memtomem_stm.proxy.cache import ProxyCache
