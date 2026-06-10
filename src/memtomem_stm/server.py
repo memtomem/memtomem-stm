@@ -79,7 +79,9 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     raw-string overlay dict cannot represent — rebuilding the config from
     the overlay alone could only lose information, and a validation failure
     in that rebuild would silently collapse a working env-only setup to
-    defaults.
+    defaults. ``missing_ok=False`` makes that decision inside the single
+    ``load_from_file`` call (missing → ``None`` → no swap), so there is no
+    separate existence pre-check to race with file deletion.
 
     Replacing ``config.proxy`` happens after ``STMConfig.model_post_init``
     already ran, so its ``consumer_model`` propagation is re-applied here —
@@ -87,12 +89,11 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     but never surfacing's model-aware budgets
     (``effective_max_injection_chars`` / ``effective_max_results``).
     """
-    if config.proxy.config_path.expanduser().resolve().exists():
-        file_cfg = ProxyConfig.load_from_file(
-            config.proxy.config_path, env_overrides=proxy_env_overrides
-        )
-        if file_cfg is not None:
-            config.proxy = file_cfg
+    file_cfg = ProxyConfig.load_from_file(
+        config.proxy.config_path, env_overrides=proxy_env_overrides, missing_ok=False
+    )
+    if file_cfg is not None:
+        config.proxy = file_cfg
     if config.proxy.consumer_model and not config.surfacing.consumer_model:
         config.surfacing.consumer_model = config.proxy.consumer_model
 

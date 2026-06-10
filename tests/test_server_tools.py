@@ -1268,6 +1268,9 @@ class TestLifespan:
         mock_load.assert_called_once()
         # The env overlay (not a file bypass) is how env keeps winning.
         assert mock_load.call_args.kwargs["env_overrides"].get("enabled") == "1"
+        # missing → None → no swap is decided inside the single load call,
+        # not by a separate exists() pre-check that races with deletion.
+        assert mock_load.call_args.kwargs["missing_ok"] is False
 
 
 class TestApplyProxyFileConfig:

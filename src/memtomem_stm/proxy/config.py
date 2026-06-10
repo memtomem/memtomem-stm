@@ -589,19 +589,32 @@ class ProxyConfig(BaseModel):
 
     @staticmethod
     def load_from_file(
-        path: Path, env_overrides: dict[str, Any] | None = None
+        path: Path, env_overrides: dict[str, Any] | None = None, *, missing_ok: bool = True
     ) -> ProxyConfig | None:
         """Load config from *path*. Returns ``None`` on parse/validation error
-        (distinct from file-not-found which returns a default ``ProxyConfig``).
+        (with ``missing_ok=True``, distinct from file-not-found which returns
+        a default ``ProxyConfig``).
 
         When *env_overrides* is supplied it is deep-merged on top of the file
         contents so env-set fields win over file-set fields, matching the
         ``env > file > defaults`` precedence documented in
         ``docs/configuration.md``.
+
+        With ``missing_ok=False`` a missing file returns ``None`` instead of
+        the env-only/defaults rebuild. Callers that already hold a better
+        env-aware config than the raw-string overlay can produce — e.g.
+        ``STMConfig()``'s pydantic-settings parse, which decodes JSON-encoded
+        complex env values the overlay cannot — use this to decline the swap
+        in a single atomic call, rather than a separate ``exists()``
+        pre-check that races with file deletion. A file deleted between the
+        existence check and the read also lands on ``None`` here, so every
+        disappearance mode converges on "do not swap".
         """
         resolved = path.expanduser().resolve()
         if not resolved.exists():
             logger.debug("Proxy config file not found: %s", resolved)
+            if not missing_ok:
+                return None
             if env_overrides:
                 try:
                     return ProxyConfig.model_validate(env_overrides)

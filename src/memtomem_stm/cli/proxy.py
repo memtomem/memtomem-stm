@@ -702,21 +702,25 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
         else Path("~/.memtomem/stm_feedback.db")
     )
 
-    loaded = ProxyConfig.load_from_file(path, env_overrides=collect_proxy_env_overrides())
-    if loaded is None:
-        # Parse/validation error — fall back to defaults purely to locate the
-        # DB paths to probe, but flag the config as invalid.
-        config_status = "invalid"
-        proxy_cfg = ProxyConfig()
+    loaded = ProxyConfig.load_from_file(
+        path, env_overrides=collect_proxy_env_overrides(), missing_ok=False
+    )
+    if loaded is not None:
+        config_status = "ok"
+        proxy_cfg = loaded
     elif not resolved.exists():
         # Missing file: mirror the server, which keeps STMConfig()'s
         # pydantic-settings parse — it handles JSON-encoded complex env
         # values (e.g. UPSTREAM_SERVERS) that the raw-string overlay can't.
+        # (``missing_ok=False`` already folded "missing" into ``None``; the
+        # exists() here only picks the status label and fallback source.)
         config_status = "missing"
-        proxy_cfg = stm_config.proxy if stm_config is not None else loaded
+        proxy_cfg = stm_config.proxy if stm_config is not None else ProxyConfig()
     else:
-        config_status = "ok"
-        proxy_cfg = loaded
+        # Parse/validation error — fall back to defaults purely to locate the
+        # DB paths to probe, but flag the config as invalid.
+        config_status = "invalid"
+        proxy_cfg = ProxyConfig()
 
     compression = read_compression_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)

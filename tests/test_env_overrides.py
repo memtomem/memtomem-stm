@@ -96,6 +96,19 @@ class TestLoadFromFileWithEnvOverrides:
         assert cfg is not None
         assert cfg.default_max_result_chars == 7777
 
+    def test_missing_file_returns_none_when_missing_ok_false(self, tmp_path: Path) -> None:
+        """``missing_ok=False`` lets a caller that already holds a better
+        env-aware config (pydantic-settings parse) decline the swap in one
+        atomic call — a missing file must NOT be rebuilt from the raw-string
+        overlay, which can't represent JSON-encoded complex env values."""
+        cfg = ProxyConfig.load_from_file(
+            tmp_path / "nonexistent.json",
+            env_overrides={"default_max_result_chars": "7777"},
+            missing_ok=False,
+        )
+
+        assert cfg is None
+
     def test_nested_env_override_merges_with_file(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "stm_proxy.json"
         cfg_file.write_text(json.dumps({"cache": {"enabled": True, "default_ttl_seconds": 3600.0}}))
