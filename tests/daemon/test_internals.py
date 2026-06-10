@@ -435,24 +435,36 @@ class TestDaemonStopCli:
         assert result.exit_code == 0, result.output
         assert "no running daemon" in result.output
 
+    @pytest.mark.parametrize(
+        "bad_pid",
+        ["garbage", None, float("inf"), float("-inf"), True],
+        ids=["str", "null", "json-Infinity", "json-neg-Infinity", "json-true"],
+    )
     def test_corrupted_pid_degrades_and_cleans(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_pid
     ):
-        """The crash repro: a handshake whose pid is a non-numeric string.
+        """The crash repro family: a handshake whose pid is not a sane int.
         The tail branch exists precisely to clean a stale/bad handshake, but
-        the unguarded ``int(raw.get("pid", -1))`` crashed before reaching the
-        cleanup when the bad field was pid itself."""
+        the unguarded ``int(raw.get("pid", -1))`` crashed before reaching
+        the cleanup — ValueError for strings, TypeError for null, and
+        OverflowError for JSON ``Infinity`` (which Python's ``json.loads``
+        accepts by default). JSON ``true`` coerced to pid 1 (launchd/init)
+        and could steer the SIGTERM fallback at the wrong process; it must
+        degrade instead, with no kill attempted."""
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         _no_daemon(monkeypatch)
-        hs = _write_handshake({"pid": "garbage", "port": 1, "token": "t"})
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        hs = _write_handshake({"pid": bad_pid, "port": 1, "token": "t"})
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop"])
 
         assert result.exit_code == 0, result.output
         assert "cleaned stale handshake" in result.output
         assert not hs.exists()
+        assert killed == []
 
     @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
     def test_stale_handshake_alive_pid_gets_sigterm(

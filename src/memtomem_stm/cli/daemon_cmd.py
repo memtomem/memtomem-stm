@@ -59,18 +59,28 @@ def _as_int(value: Any, default: int = -1) -> int:
     turned a garbage ``pid`` into an uncaught ValueError/TypeError traceback
     in the very commands whose tail branches exist to clean up bad
     handshakes. Degrade to *default* instead.
+
+    ``bool`` is rejected explicitly: JSON ``true`` would coerce to pid 1
+    (launchd/init) and could steer the SIGTERM fallback at the wrong
+    process. ``OverflowError`` covers JSON ``Infinity`` — Python's
+    ``json.loads`` accepts it by default, and ``int(float("inf"))`` raises
+    it rather than ValueError.
     """
+    if isinstance(value, bool):
+        return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _as_float(value: Any, default: float) -> float:
     """Tolerant float twin of :func:`_as_int` (e.g. ``created_at``)."""
+    if isinstance(value, bool):
+        return default
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
