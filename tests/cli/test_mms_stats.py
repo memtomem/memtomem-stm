@@ -103,16 +103,20 @@ class TestMmsStats:
         assert data["tool_filter"] == "query-docs"
         assert data["compression"]["total_calls"] == 2
 
-    def test_env_enabled_bypasses_file_metrics_path(self, runner, tmp_path, monkeypatch):
-        """When ``MEMTOMEM_STM_PROXY__ENABLED`` is set the server uses its
-        env-only proxy config and ignores the JSON file (server.app_lifespan),
-        so ``mms stats`` must too — otherwise it would probe a different
-        ``proxy_metrics.db`` than the one the server writes to."""
+    def test_env_enabled_still_honors_file_metrics_path(self, runner, tmp_path, monkeypatch):
+        """When ``MEMTOMEM_STM_PROXY__ENABLED`` is set the server now loads
+        the JSON file and overlays env on top
+        (``server._apply_proxy_file_config``), so ``mms stats`` must honor a
+        file-level ``metrics.db_path`` too — probing the same
+        ``proxy_metrics.db`` the server writes to. Previously both sides
+        skipped the file wholesale (``config_status: "env"``), which left
+        the proxy enabled with zero upstreams and pointed stats at the
+        wrong db."""
         set_home(monkeypatch, tmp_path)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
 
-        # A config file points metrics at a SEEDED db that the env-enabled
-        # server would ignore.
+        # A config file points metrics at a SEEDED db; env-enabled mode must
+        # still pick it up.
         file_db = tmp_path / "file_metrics.db"
         store = MetricsStore(file_db)
         store.initialize()
@@ -129,8 +133,33 @@ class TestMmsStats:
 
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert data["config_status"] == "env"
-        # The env path (default ~/.memtomem/proxy_metrics.db, unseeded under the
-        # patched HOME) is used — NOT the file's seeded db — so its row must not
-        # leak in.
-        assert data["compression"]["total_calls"] == 0
+        assert data["config_status"] == "ok"
+        assert data["enabled"] is True
+        # The file's seeded db is probed — its row shows up.
+        assert data["compression"]["total_calls"] == 1
+
+    def test_missing_file_env_only_uses_pydantic_settings_parse(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """Missing config file + env-only setup: the server keeps
+        ``STMConfig()``'s pydantic-settings parse (which decodes
+        JSON-encoded complex env values like ``UPSTREAM_SERVERS``), so
+        ``mms stats`` must mirror that instead of rebuilding from the
+        raw-string env overlay — the rebuild would fail validation and
+        report defaults (disabled, zero servers) for a working setup."""
+        set_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+            '{"gh": {"prefix": "gh", "command": "echo"}}',
+        )
+
+        result = runner.invoke(
+            cli, ["stats", "--config", str(tmp_path / "nonexistent.json"), "--json"]
+        )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_status"] == "missing"
+        assert data["enabled"] is True
+        assert data["servers"] == 1
