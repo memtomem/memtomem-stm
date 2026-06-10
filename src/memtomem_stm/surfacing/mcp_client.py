@@ -21,6 +21,16 @@ from mcp.types import TextContent
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.utils.numeric import safe_float
 
+# httpx ships as a dependency of the mcp SDK (its sse/streamable_http
+# clients are built on it), but guard the import so a trimmed stdio-only
+# environment still loads this module.
+try:
+    import httpx
+
+    _HTTPX_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (httpx.TransportError,)
+except ImportError:  # pragma: no cover — httpx comes with mcp
+    _HTTPX_TRANSPORT_ERRORS = ()
+
 logger = logging.getLogger(__name__)
 
 # #295: outcome typing for ``McpClientSearchAdapter.search`` — five
@@ -342,7 +352,23 @@ class McpClientSearchAdapter:
             self._stack = None
             self._session = None
 
-    _TRANSPORT_ERRORS = (OSError, ConnectionError, EOFError, BrokenPipeError, asyncio.TimeoutError)
+    # Transient failure modes that warrant tearing down and rebuilding the
+    # connection. stdio pipe failures surface as OSError / EOFError /
+    # BrokenPipeError; the sse and streamable_http clients (#398) raise
+    # httpx.TransportError subclasses (ConnectError, ReadTimeout,
+    # RemoteProtocolError, ...) whose MRO has no OSError ancestor — without
+    # the httpx entry a network blip fell through to the generic handler,
+    # which never reconnects, leaving surfacing dead until restart.
+    # httpx.HTTPStatusError / DecodingError stay OUT: the server answered,
+    # so the transport is healthy and reconnecting would mask real errors.
+    _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+        OSError,
+        ConnectionError,
+        EOFError,
+        BrokenPipeError,
+        asyncio.TimeoutError,
+        *_HTTPX_TRANSPORT_ERRORS,
+    )
 
     async def _reconnect(self) -> None:
         """Tear down and re-establish the MCP connection."""
