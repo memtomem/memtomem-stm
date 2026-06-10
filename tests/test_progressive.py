@@ -610,6 +610,114 @@ class TestProgressiveTTL:
         assert got.ttl_seconds == 600.0
 
 
+class TestReadMoreRespectsProgressiveConfig:
+    """``read_more`` must continue with the same chunking the first chunk
+    used. ``ProgressiveResponse`` did not persist ``chunk_size`` /
+    ``include_structure_hint``, so ``read_more`` hardcoded ``limit or 4000``
+    and ``include_hint=True``: a tool configured with
+    ``progressive.chunk_size=2000, include_structure_hint=False`` got a
+    2000-char hintless first chunk and then 4000-char hinted follow-ups."""
+
+    def _build_manager(self):
+        from memtomem_stm.proxy.config import ProxyConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+        from memtomem_stm.proxy.metrics import TokenTracker
+
+        return ProxyManager(ProxyConfig(enabled=True), TokenTracker())
+
+    def _apply_and_get_key(self, mgr, text, cfg):
+        first = mgr._apply_progressive(text, cfg, server="srv", tool="tool_c", trace_id="t3")
+        store = mgr._get_progressive_store()
+        key = next(iter(store._store._data.keys()))  # type: ignore[attr-defined]
+        return first, key
+
+    def test_follow_up_uses_configured_chunk_size(self):
+        mgr = self._build_manager()
+        text = "z" * 12000  # no natural boundaries → exact-size chunks
+        cfg = ProgressiveConfig(chunk_size=2000, include_structure_hint=False)
+        first, key = self._apply_and_get_key(mgr, text, cfg)
+        initial = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+        assert initial == 2000
+
+        second = mgr.read_more(key, offset=initial)  # no explicit limit
+        chunk = second.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0]
+        assert len(chunk) == 2000  # pre-fix: reverted to 4000
+
+    def test_follow_up_respects_hint_suppression(self):
+        mgr = self._build_manager()
+        # Headings dense enough that a follow-up footer would carry a
+        # ``[Remaining: ...]`` hint if include_hint were wrongly re-enabled.
+        text = "\n".join(f"## Heading {i}\n" + "body " * 80 for i in range(30))
+        cfg = ProgressiveConfig(chunk_size=1500, include_structure_hint=False)
+        first, key = self._apply_and_get_key(mgr, text, cfg)
+        assert "[Remaining:" not in first
+        initial = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+
+        second = mgr.read_more(key, offset=initial)
+        assert PROGRESSIVE_FOOTER_TOKEN in second
+        assert "[Remaining:" not in second  # pre-fix: hint re-appeared
+
+    def test_explicit_limit_still_overrides(self):
+        """An explicit ``limit`` from the agent keeps winning over the
+        persisted config — only the no-limit default changes."""
+        mgr = self._build_manager()
+        text = "z" * 12000
+        cfg = ProgressiveConfig(chunk_size=2000, include_structure_hint=False)
+        first, key = self._apply_and_get_key(mgr, text, cfg)
+        initial = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+
+        second = mgr.read_more(key, offset=initial, limit=500)
+        chunk = second.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0]
+        assert len(chunk) == 500
+
+    def test_store_adapter_round_trips_chunking_fields(self):
+        store = ProgressiveStoreAdapter(InMemoryPendingStore())
+        resp = ProgressiveResponse(
+            content="hello",
+            total_chars=5,
+            total_lines=1,
+            content_type="text",
+            structure_hint="1 lines",
+            created_at=time.monotonic(),
+            chunk_size=2500,
+            include_structure_hint=False,
+        )
+        store.put("key1", resp)
+        got = store.get("key1")
+        assert got is not None
+        assert got.chunk_size == 2500
+        assert got.include_structure_hint is False
+
+    def test_legacy_meta_rows_default_to_previous_behavior(self):
+        """Rows persisted before these fields existed deserialize to the
+        historical hardcoded behavior (4000 / hint on) — not a crash."""
+        import json
+
+        inner = InMemoryPendingStore()
+        store = ProgressiveStoreAdapter(inner)
+        resp = ProgressiveResponse(
+            content="hello",
+            total_chars=5,
+            total_lines=1,
+            content_type="text",
+            structure_hint="",
+            created_at=time.monotonic(),
+        )
+        store.put("key1", resp)
+        # Strip the new keys to simulate a legacy persisted row.
+        sel = inner.get("key1")
+        assert sel is not None
+        meta = json.loads(sel.chunks["__meta__"])
+        meta.pop("chunk_size", None)
+        meta.pop("include_structure_hint", None)
+        sel.chunks["__meta__"] = json.dumps(meta)
+
+        got = store.get("key1")
+        assert got is not None
+        assert got.chunk_size == 4000
+        assert got.include_structure_hint is True
+
+
 # ---------------------------------------------------------------------------
 # Remaining headings hint
 # ---------------------------------------------------------------------------
