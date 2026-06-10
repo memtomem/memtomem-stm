@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import httpx
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -20,16 +21,6 @@ from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.utils.numeric import safe_float
-
-# httpx ships as a dependency of the mcp SDK (its sse/streamable_http
-# clients are built on it), but guard the import so a trimmed stdio-only
-# environment still loads this module.
-try:
-    import httpx
-
-    _HTTPX_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (httpx.TransportError,)
-except ImportError:  # pragma: no cover — httpx comes with mcp
-    _HTTPX_TRANSPORT_ERRORS = ()
 
 logger = logging.getLogger(__name__)
 
@@ -361,13 +352,13 @@ class McpClientSearchAdapter:
     # which never reconnects, leaving surfacing dead until restart.
     # httpx.HTTPStatusError / DecodingError stay OUT: the server answered,
     # so the transport is healthy and reconnecting would mask real errors.
-    _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    _TRANSPORT_ERRORS = (
         OSError,
         ConnectionError,
         EOFError,
         BrokenPipeError,
         asyncio.TimeoutError,
-        *_HTTPX_TRANSPORT_ERRORS,
+        httpx.TransportError,
     )
 
     async def _reconnect(self) -> None:
