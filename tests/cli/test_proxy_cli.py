@@ -735,6 +735,48 @@ class TestAtomicSave:
     truncate-then-write).
     """
 
+    def test_write_mcp_json_failure_leaves_prior_contents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # .mcp.json is re-read by Claude Code at project load; a failed write
+        # must leave the previous contents intact, not truncated JSON (the
+        # previous Path.write_text path was truncate-then-write).
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        mcp_path = tmp_path / ".mcp.json"
+        prior = '{"mcpServers": {"existing": {"command": "keep-me"}}}\n'
+        mcp_path.write_text(prior, encoding="utf-8")
+
+        def boom(*_a, **_kw):
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", boom)
+        with pytest.raises(OSError, match="simulated rename"):
+            _write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+
+        assert mcp_path.read_text(encoding="utf-8") == prior  # untouched
+        assert list(tmp_path.glob(".mcp.json.*.tmp")) == []  # no temp litter
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_write_mcp_json_preserves_existing_mode(self, tmp_path: Path) -> None:
+        # .mcp.json is a shared (non-secret) project file. The atomic helper's
+        # mkstemp temp is 0600; without an explicit mode that would survive
+        # the rename and silently drop group/other read access (codex catch).
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text("{}", encoding="utf-8")
+        mcp_path.chmod(0o644)
+        _write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+        assert (mcp_path.stat().st_mode & 0o777) == 0o644
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_write_mcp_json_new_file_gets_project_mode(self, tmp_path: Path) -> None:
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        _write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+        assert ((tmp_path / ".mcp.json").stat().st_mode & 0o777) == 0o644
+
     def test_save_writes_payload_and_leaves_no_temp_file(self, tmp_path: Path) -> None:
         from memtomem_stm.cli.proxy import _save
 
@@ -990,6 +1032,22 @@ class TestInit:
         assert srv["transport"] == "stdio"
         assert srv["command"] == "npx"
         assert srv["args"] == ["-y", "@modelcontextprotocol/server-fs"]
+
+    def test_init_custom_config_warns_registered_entry_reads_default(
+        self, runner, config, no_discovery
+    ):
+        # A non-default --config gets the management hints PLUS a note that
+        # any registered MCP client entry boots reading the DEFAULT config —
+        # otherwise the divergence is invisible until tools don't appear.
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Manage this config:" in result.output
+        assert "MEMTOMEM_STM_PROXY__CONFIG_PATH" in result.output
+        assert "DEFAULT config path" in result.output
 
     def test_init_aborts_if_config_exists(self, runner, config):
         """Init is for first-time setup only; `mms add` handles append."""
@@ -3718,6 +3776,17 @@ class TestRemove:
         result = runner.invoke(cli, ["remove", "ghost", "--yes", *_cfg_args(config)])
         assert result.exit_code == 1
         assert "not found" in result.output
+
+    def test_remove_missing_config_reports_config_not_found(self, runner, tmp_path):
+        # A wrong --config path must be diagnosed as a missing CONFIG (like
+        # prune/register), not as a missing server — _load's default empty
+        # config used to make this report "server 'ghost' not found".
+        missing = tmp_path / "nope.json"
+        result = runner.invoke(cli, ["remove", "ghost", "--yes", "--config", str(missing)])
+        assert result.exit_code == 1
+        assert "config not found" in result.output
+        assert "mms init" in result.output
+        assert "server 'ghost'" not in result.output
 
     def test_remove_without_yes_requires_confirm(self, runner, config):
         runner.invoke(cli, ["add", "fs", "--prefix", "fs", "--command", "x", *_cfg_args(config)])

@@ -331,7 +331,18 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
         existing["mcpServers"] = {"memtomem-stm": entry}
     else:
         servers["memtomem-stm"] = entry
-    mcp_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    # Atomic like every sibling config writer (_save, _desktop_json_remove_entry):
+    # Claude Code re-reads .mcp.json at project load, and a crash/disk-full
+    # mid-write must leave the prior contents, not truncated JSON. Unlike
+    # those secret-bearing configs, .mcp.json is a shared project file: keep
+    # an existing file's mode, default new ones to 0o644 — without an
+    # explicit mode the helper's mkstemp temp (0600) survives the rename and
+    # silently makes the file unreadable to group/other.
+    try:
+        file_mode = mcp_path.stat().st_mode & 0o777
+    except OSError:
+        file_mode = 0o644
+    atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode)
     return mcp_path
 
 
@@ -1359,7 +1370,16 @@ def _handle_source_prune(
         return
 
     pruned, failed = _prune_imported_candidates(imported_candidates)
+    _report_prune_results(pruned, failed)
 
+
+def _report_prune_results(
+    pruned: list[tuple[str, str]], failed: list[tuple[str, str, str]]
+) -> bool:
+    """Print the prune outcome — shared by ``_handle_source_prune`` and the
+    ``prune`` command so the operator-facing wording cannot drift between
+    them. Returns ``True`` when any removal failed (the command path exits
+    non-zero on that)."""
     if pruned:
         click.echo("")
         click.echo(f"{_ok('Removed from source client(s):')}")
@@ -1378,6 +1398,7 @@ def _handle_source_prune(
         click.echo("Run the following to remove them manually:", err=True)
         for name, src, _ in failed:
             click.echo(f"  {_source_removal_hint(name, src)}", err=True)
+    return bool(failed)
 
 
 def _find_dual_registered(
@@ -2037,6 +2058,18 @@ def init(
         click.echo(f"    mms list --config {resolved}")
         click.echo(f"    mms health --config {resolved}")
         click.echo(f"    mms add --import --config {resolved}")
+        # The MCP client entry registered below carries no --config reference,
+        # so the registered server boots reading the DEFAULT config and would
+        # silently ignore the file this run just built.
+        click.echo("")
+        click.echo(
+            _warn(
+                "note: any MCP client entry registered by this run reads the DEFAULT "
+                "config path, not this file — set "
+                f"MEMTOMEM_STM_PROXY__CONFIG_PATH={resolved} in the entry's env "
+                "for the server to use this config."
+            )
+        )
 
     click.echo("")
     _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
@@ -2101,6 +2134,14 @@ def register(config_path: str, mcp_mode: str | None) -> None:
 def remove(name: str, config_path: str, yes: bool) -> None:
     """Remove an upstream MCP server from the proxy configuration."""
     path = Path(config_path)
+    # Missing-config guard matching prune/register: _load returns the default
+    # empty config for a missing file, which would misreport a wrong --config
+    # path as "server not found" instead of "config not found".
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
+        click.echo("  Run `mms init` first.", err=True)
+        sys.exit(1)
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
@@ -2291,25 +2332,7 @@ def prune(
         return
 
     pruned, failed = _prune_imported_candidates(dual)
-
-    if pruned:
-        click.echo("")
-        click.echo(f"{_ok('Removed from source client(s):')}")
-        for name, src in pruned:
-            click.echo(f"  {name} — {src}")
-
-    if failed:
-        click.echo("")
-        click.echo(
-            f"{_warn('Warning:')} could not remove {len(failed)} direct registration(s):",
-            err=True,
-        )
-        for name, src, err in failed:
-            click.echo(f"  {name} ({src}): {err}", err=True)
-        click.echo("", err=True)
-        click.echo("Run the following to remove them manually:", err=True)
-        for name, src, _ in failed:
-            click.echo(f"  {_source_removal_hint(name, src)}", err=True)
+    if _report_prune_results(pruned, failed):
         sys.exit(1)
 
 
