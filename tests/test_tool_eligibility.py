@@ -210,6 +210,21 @@ class TestSensitiveMetadata:
         result = filter_tools([cand], STRICT)
         assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
 
+    def test_credential_deep_in_large_schema_still_caught(self):
+        # The scan is a security gate with no downstream backstop on the
+        # advertisement path (telemetry never carries the schema), so it
+        # must NOT be length-capped: a credential buried past any cap in a
+        # huge raw schema still rejects (codex R2).
+        schema = {
+            "type": "object",
+            "properties": {
+                f"field_{i:04d}": {"type": "string", "description": "x" * 40} for i in range(400)
+            }
+            | {"zzz_last": {"type": "string", "default": "ghp_" + "a" * 36}},
+        }
+        result = filter_tools([_cand("a", _server_cfg(), schema=schema)], STRICT)
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
     def test_email_is_not_a_credential(self):
         # PII patterns are deliberately excluded — a contact email in a
         # description must not hide the tool.

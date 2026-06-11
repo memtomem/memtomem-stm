@@ -141,12 +141,12 @@ Reason codes are the only #465 payload in the log — no tool metadata, no
 error text — so the redaction policy below is untouched. `reject_reasons`
 keys are **disjoint from `candidate_tools` by construction**: an entry
 means that composed name was withheld from the client entirely. Same-named
-duplicate occurrences (a pathological state — composed-name uniqueness is
-normally guaranteed by config validation plus the connect-time guard) are
-dropped and logged at WARNING with a `duplicate_name` verdict but never
-recorded here, because the name stays advertised via its first eligible
-occurrence and telemetry must not claim it was both advertised and
-withheld. A rejected tool never appears in `candidate_tools` or
+duplicate occurrences (a pathological state — config validation rejects
+duplicate upstream prefixes, so this needs a misbehaving upstream or a
+bypassed config) are dropped and logged at WARNING with a `duplicate_name`
+verdict but never recorded here, because the name stays advertised via its
+first eligible occurrence and telemetry must not claim it was both
+advertised and withheld. A rejected tool never appears in `candidate_tools` or
 `ranked_candidates`: ranking runs over the filter's eligible output and
 can never resurrect a reject (both pinned by
 `tests/test_tool_eligibility.py`). The codes are additive vocabulary:

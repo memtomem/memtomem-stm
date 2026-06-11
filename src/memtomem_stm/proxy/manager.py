@@ -304,17 +304,18 @@ class ProxyManager:
                     srv_cfg.compression.value,
                 )
 
-        # Defense-in-depth: prefix uniqueness is the primary check in
-        # ``ProxyConfig._check_unique_upstream_prefixes``. This guard still
-        # runs because ``model_construct()`` and any future config source
-        # could bypass validation, in which case dropping (and logging) the
-        # second-loaded tool prevents two handlers from racing for the same
-        # composed name (whether the registry overwrites or raises is an
-        # implementation detail of the downstream MCP server).
-        seen_prefixed: set[str] = set()
+        # Composed-name uniqueness (prefix uniqueness is validated in
+        # ``ProxyConfig._check_unique_upstream_prefixes``; ``model_construct()``
+        # or a future config source could bypass it) and the 64-char overflow
+        # rule are enforced at EXPOSURE time by the #465 eligibility filter
+        # in ``get_proxy_tools()`` — the single choke point, so the verdicts
+        # reach telemetry and the reconnect path gets the same treatment.
+        # Registration iterates the filter's output, so two handlers can
+        # never race for one composed name. ``_connect_server`` keeps every
+        # discovered tool and only logs guidance.
         for name, cfg in servers.items():
             try:
-                await self._connect_server(name, cfg, seen_prefixed)
+                await self._connect_server(name, cfg)
             except Exception:
                 logger.exception("Failed to connect to upstream server '%s'", name)
 
@@ -348,9 +349,7 @@ class ProxyManager:
                     StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
                 )
 
-    async def _connect_server(
-        self, name: str, cfg: UpstreamServerConfig, seen_prefixed: set[str]
-    ) -> None:
+    async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
             raise RuntimeError("ProxyManager.start() not called")
 
@@ -377,23 +376,22 @@ class ProxyManager:
                 )
             raise
 
-        valid_tools = []
+        # #261 operator guidance, logged at discovery where the config
+        # context is at hand. The tool itself stays in ``conn.tools``: the
+        # actual exclusion happens at exposure time in ``get_proxy_tools()``
+        # (eligibility filter, reason ``name_overflow``), so the verdict is
+        # one choke point and reaches telemetry. Clients (Claude Code,
+        # Antigravity, Anthropic SDK) silently drop tools whose composed
+        # name overflows the 64-char regex — better one withheld tool than
+        # a mystery-missing one.
         for t in result.tools:
-            prefixed = f"{cfg.prefix}__{t.name}"
-            if prefixed in seen_prefixed:
-                logger.warning("Skipping duplicate tool: %s", prefixed)
-                continue
-            # #261: clients (Claude Code, Antigravity, Anthropic SDK) silently
-            # drop tools whose composed name overflows the 64-char regex. We
-            # skip here so the rest of the upstream's catalogue still
-            # registers — better one missing tool than the whole upstream.
             if tool_name_budget.overflows(cfg.prefix, t.name):
                 logger.warning(
-                    "Skipping tool '%s' from upstream '%s': composed client "
-                    "name 'mcp__%s__%s__%s' is %d chars, exceeds the %d-char "
-                    "MCP limit. Shorten the '%s' prefix in stm_proxy.json, or "
-                    "register STM under 'mms' (3 chars) in your MCP client "
-                    "config to save 9 chars of overhead.",
+                    "Tool '%s' from upstream '%s' will not be advertised: "
+                    "composed client name 'mcp__%s__%s__%s' is %d chars, "
+                    "exceeds the %d-char MCP limit. Shorten the '%s' prefix "
+                    "in stm_proxy.json, or register STM under 'mms' (3 chars) "
+                    "in your MCP client config to save 9 chars of overhead.",
                     t.name,
                     name,
                     tool_name_budget.client_server_name(),
@@ -403,14 +401,11 @@ class ProxyManager:
                     tool_name_budget.TOOL_NAME_LIMIT,
                     cfg.prefix,
                 )
-                continue
-            seen_prefixed.add(prefixed)
-            valid_tools.append(t)
 
         self._connections[name] = UpstreamConnection(
-            name=name, config=cfg, session=session, tools=valid_tools, stack=conn_stack
+            name=name, config=cfg, session=session, tools=list(result.tools), stack=conn_stack
         )
-        logger.info("Connected to '%s' (%s tools)", name, len(valid_tools))
+        logger.info("Connected to '%s' (%s tools)", name, len(result.tools))
 
     async def _reconnect_server(self, name: str) -> None:
         conn = self._connections[name]

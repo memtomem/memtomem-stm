@@ -3,11 +3,12 @@
 The proxy is the tool-exposure choke point: ``get_proxy_tools()`` decides
 which upstream tools the client model ever sees. This module is that
 decision, factored into a pure, deterministic pass so it can be tested and
-audited in isolation. It consolidates what used to be three scattered
-exposure guards (the per-tool ``hidden`` override, the connect-time
-duplicate-name skip, the connect-time 64-char overflow skip) and adds
-profile- and signal-based rules, with every rejection recorded as a
-structured reason instead of (at best) a log line.
+audited in isolation. It absorbs what used to be three scattered exposure
+guards (the per-tool ``hidden`` override inline in ``get_proxy_tools``, the
+connect-time duplicate-name skip, the connect-time 64-char overflow skip —
+``_connect_server`` now keeps every discovered tool and only logs the #261
+prefix guidance) and adds profile- and signal-based rules, with every
+rejection recorded as a structured reason instead of (at best) a log line.
 
 Rule vocabulary — one reason code per rejected tool, first matching rule in
 this order wins:
@@ -21,14 +22,16 @@ this order wins:
     The composed client-side name exceeds the 64-char MCP limit
     (``tool_name_budget``) — clients silently drop such tools (#261), so
     advertising one is strictly worse than rejecting it. Every profile.
-    The connect-time skip in ``_connect_server`` remains as
-    defense-in-depth; this exposure-time check also covers the reconnect
-    path, which re-populates ``conn.tools`` without the connect-time guard.
+    This filter is the only place such tools are excluded; the connect
+    path logs the prefix-shortening guidance but keeps the tool in
+    ``conn.tools``, so connect and reconnect get identical treatment and
+    the verdict reaches telemetry on the normal startup path (codex R2).
 ``duplicate_name``
     The prefixed name is already claimed by an *eligible* tool earlier in
     the advertisement pass (config order, then upstream catalogue order —
-    first wins, matching the connect-time guard). Two handlers must never
-    race for one composed name. Every profile. Note this verdict is
+    first wins). Two handlers must never race for one composed name; the
+    registration loop consumes this filter's output, which makes that
+    impossible by construction. Every profile. Note this verdict is
     inherently occurrence-level: the NAME stays advertised via its first
     eligible occurrence, so it appears in ``dropped_occurrences`` (operator
     log), never in ``reject_reasons`` (telemetry) — see
@@ -124,12 +127,6 @@ UPSTREAM_ERROR_CATEGORIES: tuple[str, ...] = (
     ErrorCategory.UPSTREAM_ERROR.value,
 )
 
-# Bound the schema text scanned for credentials, mirroring the cap used by
-# tool_relevance for scoring documents: a pathological upstream schema
-# should cost bounded work. Credentials embedded beyond the cap are still
-# caught by the selection log's per-line backstop at telemetry time.
-_MAX_SCAN_CHARS = 20_000
-
 
 @dataclass(frozen=True, slots=True)
 class ExposureCandidate:
@@ -170,8 +167,9 @@ class EligibilityResult:
     name. These never reach telemetry (the client's view of that NAME is
     already described); they exist for operator logging, since silently
     losing an occurrence is how the old connect-time guards hid anomalies.
-    Empty whenever composed names are unique — the normal case, guaranteed
-    by config validation plus the connect-time guard.
+    Empty whenever composed names are unique — the normal case, since
+    config validation rejects duplicate upstream prefixes and an upstream
+    repeating a tool name in one catalogue is itself misbehaving.
     """
 
     eligible: list[ProxyToolInfo]
@@ -226,6 +224,14 @@ def _metadata_scan_text(candidate: ExposureCandidate) -> str:
     may originate from an operator ``description_override`` rather than the
     raw text), and the raw schema. Serialization is deterministic
     (sorted keys) so the same candidate always scans the same text.
+
+    Deliberately UNBOUNDED: this is a security gate, not a scoring
+    document, and unlike payload telemetry there is no downstream backstop
+    for advertisement — whatever passes here goes to the client's context
+    verbatim on every ``tools/list``. The scan runs once per advertisement
+    (not per call), and the advertisement path already serializes the same
+    schema unbounded, so one regex pass over the full text costs nothing
+    the upstream couldn't already inflict (codex R2).
     """
     try:
         schema_text = json.dumps(
@@ -233,9 +239,7 @@ def _metadata_scan_text(candidate: ExposureCandidate) -> str:
         )
     except (TypeError, ValueError):  # pragma: no cover - dict from JSON can't cycle
         schema_text = ""
-    return "\n".join(
-        (candidate.raw_description, candidate.info.description, schema_text[:_MAX_SCAN_CHARS])
-    )
+    return "\n".join((candidate.raw_description, candidate.info.description, schema_text))
 
 
 def filter_tools(
