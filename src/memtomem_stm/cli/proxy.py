@@ -32,7 +32,7 @@ from memtomem_stm.mms.import_hosts import (
 )
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
-from memtomem_stm.utils.redact import redact_url_userinfo
+from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
@@ -2585,7 +2585,10 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         if isinstance(root, TimeoutError):
             status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
         else:
-            status["error"] = f"{display}: {str(root) or type(root).__name__}"
+            # httpx exceptions embed the full request URL — userinfo included
+            # — so the rendered message is scrubbed against the raw url.
+            message = redact_exception_text(str(root), url) or type(root).__name__
+            status["error"] = f"{display}: {message}"
     else:
         status.update(probe)
     return status

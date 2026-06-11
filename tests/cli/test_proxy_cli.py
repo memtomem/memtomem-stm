@@ -3895,7 +3895,8 @@ class TestHealth:
 
         async def fake_probe(transport, command, args, url, headers, timeout, errlog):
             captured["url"] = url
-            raise ConnectionError("connection refused")
+            # httpx-style message embedding the full credentialed request URL
+            raise ConnectionError(f"Client error '401 Unauthorized' for url '{url}'")
 
         monkeypatch.setattr(proxy_mod, "_probe_ltm_mcp_server", fake_probe)
 

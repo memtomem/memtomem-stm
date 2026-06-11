@@ -182,6 +182,49 @@ class TestTargetDisplayRedaction:
         # string could still embed credentials, so it is replaced wholesale.
         assert redact_url_userinfo("https://user:pw@[::1/mcp") == "<unparseable url>"
 
+    def test_schemeless_credential_value_not_echoed(self):
+        from memtomem_stm.utils.redact import redact_url_userinfo
+
+        # urlsplit parses a scheme-less value as a bare path (empty netloc,
+        # no exception) — it must still not be echoed verbatim.
+        assert redact_url_userinfo("alice:s3cret@ltm.example/sse") == "<unparseable url>"
+
+    def test_exception_text_scrubs_userinfo_variants(self):
+        from memtomem_stm.utils.redact import redact_exception_text
+
+        url = "https://alice:s3cret@ltm.example/sse"
+        text = (
+            f"Client error '401 Unauthorized' for url '{url}'; "
+            "retried 'https://alice:s3cret@ltm.example/other'"
+        )
+        out = redact_exception_text(text, url)
+        assert "s3cret" not in out
+        assert out.count("***@ltm.example") == 2  # exact URL and derived variant
+
+    async def test_start_failure_log_scrubs_url_credentials(self, caplog):
+        # httpx exceptions embed the full request URL; the lazy-start failure
+        # WARNING must scrub it rather than logging the exception raw.
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(
+                ltm_mcp_transport="sse",
+                ltm_mcp_url="https://alice:s3cret@ltm.example/sse",
+            )
+        )
+
+        async def _boom():
+            raise RuntimeError(
+                "Server error '502 Bad Gateway' for url 'https://alice:s3cret@ltm.example/sse'"
+            )
+
+        adapter.start = _boom  # type: ignore[method-assign]
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.mcp_client"):
+            ok = await adapter._heal_if_needed()
+        assert ok is False
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "surfacing disabled" in joined
+        assert "s3cret" not in joined
+        assert "***@ltm.example" in joined
+
 
 class TestReconnectRetrySuccess:
     """A transient transport failure followed by a successful reconnect must
