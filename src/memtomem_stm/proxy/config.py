@@ -91,6 +91,11 @@ def _env_override_hint(
       required field missing from an env-built upstream entry), the env
       leaves under it are named — that collapse is env-caused even though
       the failing location itself was never set.
+    - A ROOT-level model-validator error (``loc=()``, e.g. duplicate or
+      empty upstream prefixes) has no path to walk; it is attributed by
+      DIFFERENTIAL validation — if the file alone validates (or there is no
+      file), the env overlay flipped the root check, and every env leaf is
+      named.
     """
     if not env_overrides or not isinstance(exc, ValidationError):
         return ""
@@ -117,8 +122,29 @@ def _env_override_hint(
                         _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
                     )
 
+    env_caused_root: bool | None = None  # lazily computed, shared across errors
+
+    def _root_failure_is_env_caused() -> bool:
+        # Top-level model validators (duplicate / empty upstream prefixes)
+        # report at loc=() — there is no path to walk, so attribute by
+        # DIFFERENTIAL validation: if the file alone validates (or there is
+        # no file at all), the env overlay is what flipped the root check.
+        if file_data is None:
+            return True
+        try:
+            ProxyConfig.model_validate(file_data)
+        except Exception:
+            return False  # the file fails on its own — fix the file first
+        return True
+
     for err in exc.errors():
         loc = err.get("loc", ())
+        if not loc:
+            if env_caused_root is None:
+                env_caused_root = _root_failure_is_env_caused()
+            if env_caused_root:
+                _add_leaves([], env_overrides)
+            continue
         node: Any = env_overrides
         consumed: list[str] = []
         for part in loc:

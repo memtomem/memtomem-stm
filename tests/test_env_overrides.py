@@ -131,8 +131,7 @@ class TestMalformedEnvOverrideDiagnostics:
 
         assert cfg is None  # fallback unchanged: the whole load still degrades
         assert any(
-            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS" in r.getMessage()
-            for r in caplog.records
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS" in r.getMessage() for r in caplog.records
         )
 
     def test_nested_malformed_env_value_named_in_warning(
@@ -140,9 +139,7 @@ class TestMalformedEnvOverrideDiagnostics:
     ) -> None:
         cfg_file = tmp_path / "stm_proxy.json"
         cfg_file.write_text(json.dumps({"cache": {"enabled": True}}))
-        overrides = collect_proxy_env_overrides(
-            {"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-5"}
-        )
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-5"})
 
         with caplog.at_level(logging.WARNING):
             cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
@@ -270,6 +267,63 @@ class TestMalformedEnvOverrideDiagnostics:
         overrides = collect_proxy_env_overrides(
             {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS": "5000"}
         )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_env_caused_duplicate_prefix_names_env_leaves(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Top-level model validators (duplicate upstream prefixes) report at
+        loc=() — no path to walk. When the file alone validates and only the
+        merged config trips the root check, the env overlay flipped it and
+        its leaves must be named."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"upstream_servers": {"a": {"prefix": "a"}}}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX": "a"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_env_caused_whitespace_prefix_names_env_leaves(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 9000}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX": "   "}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_file_caused_root_validator_error_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When the FILE alone already fails the root validator (its own
+        duplicate prefixes), an innocent env var must not be implicated."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps({"upstream_servers": {"a": {"prefix": "x"}, "b": {"prefix": "x"}}})
+        )
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true"})
 
         with caplog.at_level(logging.WARNING):
             cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
