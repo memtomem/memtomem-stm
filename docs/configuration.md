@@ -75,16 +75,19 @@ export MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__ENABLED=true
 export MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH=~/.memtomem/stm_feedback.db
 
 # Auto-indexing (Stage 4 — save large responses to LTM)
-# NOTE: In the standalone `mms` server today, `auto_index` and
-# `extraction` are inert — `ProxyManager` is constructed without an
-# `index_engine`, so Stage 4 is silently skipped. This covers every
+# NOTE: library-mode only, by design. The bundled `mms` server does not
+# wire an LTM write adapter: `ProxyManager` is constructed without an
+# `index_engine`, so in the standalone server `auto_index` and
+# `extraction` are inert and Stage 4 is skipped. This covers every
 # enable-path: the global ENABLED flag below, the per-upstream
 # `auto_index: true` knob on `UpstreamServerConfig`, and the per-tool
 # `auto_index: true` override on `ToolOverrideConfig`. All three are
-# valid config but currently have no runtime effect; the proxy logs a
-# "config is enabled but inert" warning at startup naming each site.
-# Tracking issue for the MCP-protocol-only adapter that will unblock
-# this: #288.
+# valid config but have no runtime effect in the bundled server; the
+# proxy logs a "config is enabled but inert" warning at startup naming
+# each site (history: #288). These settings take effect only for
+# library callers that construct `ProxyManager(..., index_engine=...)`
+# themselves — the hook the `FileIndexer` Protocol
+# (`proxy/protocols.py`) exists for.
 export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=false
 export MEMTOMEM_STM_PROXY__AUTO_INDEX__MIN_CHARS=2000
 export MEMTOMEM_STM_PROXY__AUTO_INDEX__MEMORY_DIR=~/.memtomem/proxy_index
