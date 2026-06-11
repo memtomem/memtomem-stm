@@ -21,6 +21,7 @@ from typing import Any, TextIO
 
 import click
 
+from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
 from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
@@ -856,6 +857,7 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
     "via STM. Default: interactive prompt on TTY, skip on non-TTY. Only "
     "valid with --from-clients/--import.",
 )
+@with_config_write_lock()
 def add(
     name: str | None,
     config_path: str,
@@ -1398,26 +1400,165 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     return _desktop_json_remove_entry(name)
 
 
+_PRUNED_BACKUP_SCHEMA_VERSION = 1
+
+
+def _pruned_backup_path() -> Path:
+    """Append-only backup log of pruned host originals (#475 PR2).
+
+    Deliberately a fixed user-wide path rather than ``--config``-relative:
+    the log records host-side deletions, which exist independently of
+    whichever proxy config drove them. Resolved at call time so
+    monkeypatched ``HOME`` works in tests (mirrors ``state.mms_home``).
+    """
+    return Path.home() / ".memtomem" / "pruned_upstreams.json"
+
+
+def _append_pruned_backup(
+    name: str, source_ref: dict[str, Any], original: dict[str, Any], pruned_at: str
+) -> tuple[bool, str | None]:
+    """Append one verbatim host entry to the prune backup log.
+
+    Runs BEFORE the host delete (backup-before-delete): a crash between the
+    two leaves a stale row — harmless, the log is advisory — while the
+    reverse order would destroy the only verbatim copy of an entry that has
+    no ``origin`` block (pre-#475 imports, manual adds). Returns
+    ``(ok, error_message_or_None)``; on failure the caller must SKIP the
+    delete for the same reason.
+
+    A corrupt or wrong-shape existing log refuses the append rather than
+    clobbering it — the log is a last-resort recovery source, so destroying
+    prior rows to record a new one would invert its purpose. Rows are never
+    deduped or rewritten: it is a chronological event record.
+    """
+    path = _pruned_backup_path()
+    data: dict[str, Any] = {"schema_version": _PRUNED_BACKUP_SCHEMA_VERSION, "entries": []}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            return (False, f"backup log {path} is unreadable ({exc}) — move it aside and retry")
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("entries"), list):
+            return (
+                False,
+                f"backup log {path} has an unexpected shape — move it aside and retry",
+            )
+        data = loaded
+    data["entries"].append(
+        {
+            "name": name,
+            "source": source_ref,
+            "original": original,
+            "pruned_at": pruned_at,
+        }
+    )
+    # 0600 like ``stm_proxy.json`` (``_save``): ``original`` carries verbatim
+    # host env/headers, secrets included.
+    try:
+        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600)
+    except OSError as exc:
+        return (False, f"backup log write failed: {exc}")
+    return (True, None)
+
+
+def _candidate_source_records(
+    cand: dict[str, Any],
+) -> list[tuple[str, dict[str, Any] | None, dict[str, Any] | None]]:
+    """``(label, source_ref, raw)`` for every source registering this candidate.
+
+    Primary source first, then ``duplicate_in`` order — the exact label
+    sequence the prune loop has always acted on (pinned by
+    ``test_duplicate_in_sources_all_pruned``). ``source_ref`` / ``raw``
+    come from the structured ``duplicates`` records discovery captures
+    (#475 PR1); both are ``None`` for old-shape candidates, where there is
+    nothing verbatim to back up or match against an origin row.
+    """
+    records: list[tuple[str, dict[str, Any] | None, dict[str, Any] | None]] = [
+        (cand["source"], cand.get("source_ref"), cand.get("raw"))
+    ]
+    by_label = {
+        dup.get("label"): dup for dup in cand.get("duplicates") or [] if isinstance(dup, dict)
+    }
+    for label in cand.get("duplicate_in") or []:
+        dup = by_label.get(label) or {}
+        records.append((label, dup.get("source_ref"), dup.get("raw")))
+    return records
+
+
 def _prune_imported_candidates(
     imported_candidates: list[dict[str, Any]],
+    *,
+    pruned_at: str,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
     """Prune each imported candidate from every source that registered it.
 
     A single candidate can show up in multiple sources (primary ``source``
     plus ``duplicate_in``) — all are pruned so the dual-path collapses.
+    Per source, the verbatim host entry is appended to the backup log
+    *before* the delete runs (see :func:`_append_pruned_backup` for the
+    ordering rationale); an append failure fails that source's prune
+    outright and the delete is skipped.
+
     Returns ``(pruned, failed)`` where ``pruned`` is ``[(name, source), ...]``
     and ``failed`` is ``[(name, source, error), ...]``.
     """
     pruned: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
     for cand in imported_candidates:
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
+        for src, source_ref, raw in _candidate_source_records(cand):
+            if isinstance(raw, dict) and isinstance(source_ref, dict):
+                ok, err = _append_pruned_backup(cand["name"], source_ref, raw, pruned_at)
+                if not ok:
+                    failed.append((cand["name"], src, err or "backup log append failed"))
+                    continue
             ok, err = _prune_from_source(cand["name"], src)
             if ok:
                 pruned.append((cand["name"], src))
             else:
                 failed.append((cand["name"], src, err or "unknown error"))
     return pruned, failed
+
+
+def _mark_pruned_sources(
+    servers: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    pruned: list[tuple[str, str]],
+    pruned_at: str,
+) -> bool:
+    """Flip per-source ``origin`` ``pruned``/``pruned_at`` for successful prunes.
+
+    Matches each pruned ``(name, source-label)`` against the entry's
+    ``origin.source`` / ``origin.duplicates`` rows by structured
+    ``(kind, path)`` — not by label, which is a human string the origin
+    block deliberately doesn't store. Prune permits partial failure across
+    sources, so only rows whose writer succeeded flip; a failed duplicate
+    keeps ``pruned: false`` and stays visible to ``mms eject`` (PR3).
+    Returns ``True`` when anything changed so the caller knows to save.
+    """
+    refs: dict[tuple[str, str], dict[str, Any]] = {}
+    for cand in candidates:
+        for label, source_ref, _raw in _candidate_source_records(cand):
+            if isinstance(source_ref, dict):
+                refs[(cand["name"], label)] = source_ref
+    changed = False
+    for name, label in pruned:
+        ref = refs.get((name, label))
+        if ref is None:
+            continue
+        entry = servers.get(name)
+        origin = entry.get("origin") if isinstance(entry, dict) else None
+        if not isinstance(origin, dict):
+            continue
+        for row in (origin.get("source"), *(origin.get("duplicates") or [])):
+            if not isinstance(row, dict):
+                continue
+            if row.get("kind") != ref.get("kind") or row.get("path") != ref.get("path"):
+                continue
+            if not row.get("pruned"):
+                row["pruned"] = True
+                row["pruned_at"] = pruned_at
+                changed = True
+    return changed
 
 
 def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
@@ -1450,6 +1591,8 @@ def _handle_source_prune(
     imported_candidates: list[dict[str, Any]],
     *,
     prune: bool,
+    config_path: Path,
+    data: dict[str, Any],
 ) -> None:
     """Post-import prune + reporting.
 
@@ -1464,6 +1607,13 @@ def _handle_source_prune(
     per-entry warning plus the manual-command fallback for the failed rows
     only, so the user always has a path forward even if the writer is
     degraded.
+
+    ``config_path`` / ``data`` are the already-saved import — callers MUST
+    have saved the origin-bearing entries before invoking this
+    (save-import-first, #475): ① import saved with ``pruned: false`` →
+    ② backup append + host delete per source → ③ the per-source ``pruned``
+    metadata save below. Any crash point leaves the entry restorable; even
+    a failed ③ only loses the metadata flip, never the origin or backup.
     """
     if not imported_candidates:
         return
@@ -1479,7 +1629,13 @@ def _handle_source_prune(
         _print_source_removal_hints(imported_candidates)
         return
 
-    pruned, failed = _prune_imported_candidates(imported_candidates)
+    pruned_at = utc_now_iso()
+    pruned, failed = _prune_imported_candidates(imported_candidates, pruned_at=pruned_at)
+    servers = data.get("upstream_servers")
+    if isinstance(servers, dict) and _mark_pruned_sources(
+        servers, imported_candidates, pruned, pruned_at
+    ):
+        _save(config_path, data)
     _report_prune_results(pruned, failed)
 
 
@@ -1876,7 +2032,9 @@ def _add_from_clients(
     # surfacing. ``_handle_source_prune`` picks between the --prune flag,
     # the interactive prompt (TTY), and the hint-only fallback (non-TTY /
     # user declined).
-    _handle_source_prune([new_candidates[i] for i in picks], prune=prune)
+    _handle_source_prune(
+        [new_candidates[i] for i in picks], prune=prune, config_path=config_path, data=data
+    )
 
 
 # Token-aware budget presets keyed by primary content language. KO is the
@@ -1987,6 +2145,7 @@ def _prompt_language() -> str:
         "'en' on non-TTY callers."
     ),
 )
+@with_config_write_lock()
 def init(
     config_path: str,
     no_validate: bool,
@@ -2198,7 +2357,9 @@ def init(
     # * non-TTY + no flag → skip; fall through to the #203 hint-only warning.
     # Matches ``mms add --import --prune`` semantics via ``_handle_source_prune``.
     if imported_candidates:
-        _handle_source_prune(imported_candidates, prune=prune_originals)
+        _handle_source_prune(
+            imported_candidates, prune=prune_originals, config_path=path, data=data
+        )
 
 
 @cli.command()
@@ -2249,6 +2410,7 @@ def register(config_path: str, mcp_mode: str | None) -> None:
 @click.argument("name")
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
+@with_config_write_lock()
 def remove(name: str, config_path: str, yes: bool) -> None:
     """Remove an upstream MCP server from the proxy configuration."""
     path = Path(config_path)
@@ -2279,6 +2441,7 @@ def remove(name: str, config_path: str, yes: bool) -> None:
 @click.argument("name")
 @click.argument("state", type=click.Choice(["on", "off"]), required=False)
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@with_config_write_lock(skip=lambda kwargs: kwargs.get("state") is None)
 def surfacing(name: str, state: str | None, config_path: str) -> None:
     """Toggle proactive memory surfacing for an upstream server.
 
@@ -2348,6 +2511,7 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     is_flag=True,
     help="Print what would be pruned; no writes.",
 )
+@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")))
 def prune(
     names: tuple[str, ...],
     config_path: str,
@@ -2449,7 +2613,14 @@ def prune(
         click.echo("Aborted. No changes made.")
         return
 
-    pruned, failed = _prune_imported_candidates(dual)
+    pruned_at = utc_now_iso()
+    pruned, failed = _prune_imported_candidates(dual, pruned_at=pruned_at)
+    # Same step-③ metadata save as the inline import path: flip the matching
+    # per-source ``origin`` rows for entries that have one. The save only
+    # happens when a row actually flipped — entries without origin leave the
+    # config untouched (the backup rows above are their only record).
+    if _mark_pruned_sources(upstreams, dual, pruned, pruned_at):
+        _save(resolved, data)
     if _report_prune_results(pruned, failed):
         sys.exit(1)
 

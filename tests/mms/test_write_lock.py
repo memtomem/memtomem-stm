@@ -144,6 +144,49 @@ def test_disabled_lock_ignores_a_held_lock(sandbox_home):
 
 
 # ---------------------------------------------------------------------------
+# Generalized seam — lock_path / holder_hint parameterization (#475 PR2)
+# ---------------------------------------------------------------------------
+
+
+def test_custom_lock_path_creates_that_file_with_0600(sandbox_home):
+    custom = sandbox_home / ".memtomem" / ".stm_proxy.lock"
+    with state.write_lock(lock_path=custom):
+        pass
+    assert custom.is_file()
+    assert stat.S_IMODE(custom.stat().st_mode) == 0o600
+    # The default registry lock must not be touched by a custom-path span.
+    assert not (sandbox_home / ".mms" / ".lock").exists()
+
+
+def test_custom_holder_hint_lands_in_timeout_message(sandbox_home):
+    custom = sandbox_home / ".memtomem" / ".stm_proxy.lock"
+    custom.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(custom, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(state.WriteLockTimeout) as exc_info:
+            with state.write_lock(
+                lock_path=custom, holder_hint="a proxy-config writer", timeout=0.1
+            ):
+                pytest.fail("acquisition must not succeed while held")
+    finally:
+        os.close(fd)
+    msg = str(exc_info.value)
+    assert str(custom) in msg
+    assert "a proxy-config writer" in msg
+    assert "mms host sync --apply" not in msg  # default attribution replaced
+
+
+def test_registry_and_custom_locks_are_independent(sandbox_home):
+    """Holding the registry lock must not block a custom-path span — the
+    two domains (mms registry vs proxy config) serialize separately."""
+    custom = sandbox_home / ".memtomem" / ".stm_proxy.lock"
+    with _hold_lock(sandbox_home):
+        with state.write_lock(lock_path=custom, timeout=0.1):
+            pass  # enters immediately: different file, different flock
+
+
+# ---------------------------------------------------------------------------
 # CLI wiring — both mutating commands acquire; --plan never does
 # ---------------------------------------------------------------------------
 
