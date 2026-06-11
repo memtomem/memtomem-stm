@@ -265,7 +265,10 @@ class TruncateCompressor:
         if context_query and context_query.strip():
             sections = [(k, ser) for k, ser, _ in key_sizes]
             raw = self._scorer.score_sections(context_query, sections)
-            if any(s > 0 for s in raw):
+            # A scorer returning the wrong number of scores (custom
+            # RelevanceScorer drift) would IndexError at
+            # relevance_weights[idx] below — treat it as no signal.
+            if len(raw) == len(key_sizes) and any(s > 0 for s in raw):
                 relevance_weights = raw
 
         # Build output: each key gets budget allocation
@@ -807,7 +810,7 @@ class SelectiveCompressor:
             chunks = self._decompose_single_chunk(chunks, fmt)
             if len(chunks) <= 1:
                 return None
-        return self._store_and_build_toc(text, fmt, chunks, context_query)
+        return self._store_and_build_toc(text, fmt, chunks, context_query, max_chars=max_chars)
 
     # Largest per-entry preview length (the historical default).
     _MAX_PREVIEW = 80

@@ -127,6 +127,22 @@ class TestSelectiveCompressor:
         assert toc["type"] == "toc"
         assert any(e["key"] == "Section A" for e in toc["entries"])
 
+    def test_compress_full_toc_honors_max_chars(self):
+        # compress_full_toc accepted max_chars but never forwarded it to
+        # _store_and_build_toc, so the TOC was built with full-size previews
+        # regardless of budget.
+        data = {f"key{i}": f"word{i} " * 60 for i in range(10)}
+        text = json.dumps(data)
+        c = SelectiveCompressor()
+        unbounded = c.compress_full_toc(text, max_chars=10**9)
+        assert unbounded is not None
+        budget = len(unbounded) - 200  # force the preview-shrink path
+        result = c.compress_full_toc(text, max_chars=budget)
+        assert result is not None
+        assert len(result) <= budget
+        toc = json.loads(result)
+        assert len(toc["entries"]) == 10  # every section stays addressable
+
     def test_select_returns_requested_sections(self):
         data = {"alpha": "AAA" * 100, "beta": "BBB" * 100, "gamma": "CCC" * 100}
         text = json.dumps(data)

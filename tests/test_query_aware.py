@@ -40,6 +40,13 @@ class TestBM25Scorer:
         scores = scorer.score_sections("kubernetes deployment", sections)
         assert all(s == 0.0 for s in scores)
 
+    def test_all_empty_sections_no_crash(self):
+        """Symbols-only sections tokenize to nothing, so every doc length is
+        0 and avgdl used to come out 0 — dividing by zero in the BM25
+        denominator. Must return zeros, not raise."""
+        scores = BM25Scorer().score_sections("redis", [("!!!", "@@@"), ("???", "###")])
+        assert scores == [0.0, 0.0]
+
     def test_partial_match(self):
         """Some sections match, others don't → mixed scores."""
         sections = [
@@ -207,6 +214,27 @@ class TestRelevanceScorerProtocol:
         third_len = len(result) - third_start
         # Custom scorer gave 10.0 to Third, 0.0 to others → Third gets most budget
         assert third_len >= first_len
+
+    def test_wrong_length_scorer_treated_as_no_signal(self):
+        """A custom scorer returning the wrong number of scores must not
+        IndexError the JSON budget allocation — it degrades to the
+        size-proportional path as if there were no query signal."""
+        import json as _json
+
+        class ShortScorer:
+            def score_sections(self, query, sections):
+                return [10.0]  # always one score, regardless of section count
+
+        # Config-like dict (>=2 keys, all values dicts) — the only shape
+        # compress() routes into _json_key_truncate's weighted allocation.
+        data = {k: {"field": "x" * 200, "other": "y" * 100} for k in ("alpha", "beta", "gamma")}
+        text = _json.dumps(data)
+        result = TruncateCompressor(scorer=ShortScorer()).compress(
+            text, max_chars=400, context_query="anything"
+        )
+        # No-signal degradation == byte-identical to the query-less path.
+        baseline = TruncateCompressor().compress(text, max_chars=400)
+        assert result == baseline
 
 
 # ── EmbeddingScorer OpenAI response parsing (#68) ──────────────────────
