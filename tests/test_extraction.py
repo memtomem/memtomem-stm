@@ -20,6 +20,7 @@ from memtomem_stm.proxy.extraction import (
     _extract_heuristic,
     _parse_facts_json,
 )
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +342,88 @@ class TestFactExtractorLLM:
                 await extractor.extract("x" * 100, server="s", tool="t")
 
         assert extractor._cb.state == "open"
+
+    async def test_privacy_scan_blocks_call_api_for_credentials(self):
+        # #454: action gate — a credential-bearing response must never reach
+        # the provider; heuristic extraction runs locally instead.
+        cfg = ExtractionConfig(enabled=True, min_response_chars=10)
+        extractor = FactExtractor(cfg)
+
+        with patch.object(extractor, "_call_api", new_callable=AsyncMock) as call_api:
+            text = "creds: password=hunter2\nDecision: rotate the key now. " + "x" * 50
+            facts = await extractor.extract(text, server="s", tool="t")
+
+        call_api.assert_not_awaited()
+        # Heuristic fallback still produced local facts (the Decision line).
+        assert any(f.category == "decision" for f in facts)
+
+    async def test_privacy_scan_is_credentials_only(self):
+        # Emails are PII, not credentials (#461): fine to SHOW the provider,
+        # not fine to persist. The action gate must not fire on an email
+        # alone — persistence-side blocking is memory_ops' job.
+        cfg = ExtractionConfig(enabled=True, min_response_chars=10)
+        extractor = FactExtractor(cfg)
+
+        mock_response = json.dumps([{"content": "f", "category": "c", "confidence": 0.9}])
+        with patch.object(
+            extractor, "_call_api", new_callable=AsyncMock, return_value=mock_response
+        ) as call_api:
+            await extractor.extract("contact dev@example.com " * 10, server="s", tool="t")
+
+        call_api.assert_awaited_once()
+
+    async def test_privacy_scan_disabled_reaches_call_api(self):
+        cfg = ExtractionConfig(
+            enabled=True,
+            min_response_chars=10,
+            llm=LLMCompressorConfig(
+                provider=LLMProvider.OLLAMA,
+                model="qwen3:4b",
+                privacy_scan_enabled=False,
+            ),
+        )
+        extractor = FactExtractor(cfg)
+
+        mock_response = json.dumps([{"content": "f", "category": "c", "confidence": 0.9}])
+        with patch.object(
+            extractor, "_call_api", new_callable=AsyncMock, return_value=mock_response
+        ) as call_api:
+            await extractor.extract("password=hunter2 " * 10, server="s", tool="t")
+
+        call_api.assert_awaited_once()
+
+    async def test_hybrid_privacy_scan_blocks_call_api(self):
+        # HYBRID routes through _extract_llm too — the gate covers it.
+        cfg = ExtractionConfig(
+            enabled=True,
+            strategy=ExtractionStrategy.HYBRID,
+            min_response_chars=10,
+        )
+        extractor = FactExtractor(cfg)
+
+        with patch.object(extractor, "_call_api", new_callable=AsyncMock) as call_api:
+            facts = await extractor.extract("api_key: zzz-secret " * 10, server="s", tool="t")
+
+        call_api.assert_not_awaited()
+        assert isinstance(facts, list)
+
+    async def test_privacy_scan_runs_before_truncation(self):
+        # A credential split at the max_input_chars boundary must still fire
+        # the gate: slicing leaves 15 of the AKIA key's 16 trailing chars, so
+        # the truncated text matches no pattern while a near-complete secret
+        # prefix would ship. The scan must see the pre-truncation text.
+        cfg = ExtractionConfig(enabled=True, min_response_chars=10, max_input_chars=30)
+        extractor = FactExtractor(cfg)
+        text = "x" * 10 + " AKIA" + "A" * 16
+        # Pin the repro shape itself — if either assert breaks, the test no
+        # longer exercises the boundary split and must be reconstructed.
+        assert not contains_sensitive_content(text[:30], CREDENTIAL_PATTERNS)
+        assert contains_sensitive_content(text, CREDENTIAL_PATTERNS)
+
+        with patch.object(extractor, "_call_api", new_callable=AsyncMock) as call_api:
+            await extractor.extract(text, server="s", tool="t")
+
+        call_api.assert_not_awaited()
 
     async def test_hybrid_merges_llm_and_heuristic(self):
         cfg = ExtractionConfig(

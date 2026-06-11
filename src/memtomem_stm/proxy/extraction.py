@@ -17,6 +17,7 @@ from memtomem_stm.proxy.config import (
     ExtractionStrategy,
     LLMProvider,
 )
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.numeric import safe_float
 
@@ -207,6 +208,27 @@ class FactExtractor:
             return []
         if strategy == ExtractionStrategy.HEURISTIC:
             return _extract_heuristic(truncated, max_facts=self._cfg.max_facts)
+
+        # #454: same action gate as the LLM compression route (#289, credential
+        # set per #461) — a credential-bearing response must not cross the
+        # provider trust boundary. The scan runs on the UNSLICED text: slicing
+        # to max_input_chars can split a credential at the boundary so the
+        # truncated text no longer matches a pattern while a near-complete
+        # secret prefix still ships. Sitting before the strategy dispatch it
+        # covers both LLM-bound strategies (LLM and HYBRID). Heuristic
+        # extraction runs locally instead; persistence of its output is
+        # separately gated in memory_ops (#462 scans the extraction input and
+        # every candidate fact file before disk). Operators disable per-config
+        # when the provider is local/trusted (``privacy_scan_enabled=False``).
+        if self._llm_cfg.privacy_scan_enabled and contains_sensitive_content(
+            text, CREDENTIAL_PATTERNS
+        ):
+            logger.info(
+                "Sensitive content detected, skipping LLM extraction (provider=%s)",
+                self._llm_cfg.provider.value,
+            )
+            return _extract_heuristic(truncated, max_facts=self._cfg.max_facts)
+
         if strategy == ExtractionStrategy.HYBRID:
             return await self._extract_hybrid(truncated, server=server, tool=tool)
 
@@ -214,7 +236,11 @@ class FactExtractor:
         return await self._extract_llm(truncated, server=server, tool=tool)
 
     async def _extract_llm(self, text: str, *, server: str, tool: str) -> list[ExtractedFact]:
-        """LLM-based extraction with circuit breaker and fallback."""
+        """LLM-based extraction with circuit breaker and fallback.
+
+        Callers must route through :meth:`extract` — the credential action
+        gate lives there, scanning the pre-truncation text (#454).
+        """
         if self._client is None:
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         if self._cb.is_open:
