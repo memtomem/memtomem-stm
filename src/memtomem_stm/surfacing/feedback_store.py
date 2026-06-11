@@ -232,7 +232,17 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
 
 
 class FeedbackStore:
-    """SQLite store for surfacing events and feedback ratings."""
+    """SQLite store for surfacing events and feedback ratings.
+
+    The write paths (``record_surfacing`` / ``record_feedback`` /
+    ``mark_surfaced`` / ``save_adjustment`` / the ``cleanup_*`` sweeps)
+    do synchronous sqlite I/O on the caller's thread — on the proxy and
+    daemon paths that is the asyncio event loop. Deliberate under the
+    single-MCP-client invariant: a blocking write delays only the call
+    being served. Multi-client serving is the reopen trigger — then move
+    the writes to ``asyncio.to_thread``; ``self._lock`` already makes
+    them thread-safe.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path

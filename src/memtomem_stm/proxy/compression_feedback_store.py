@@ -114,7 +114,14 @@ class CompressionFeedbackStore:
         missing: str,
         trace_id: str | None,
     ) -> None:
-        """Persist a feedback row. ``kind`` is assumed already validated."""
+        """Persist a feedback row. ``kind`` is assumed already validated.
+
+        Synchronous sqlite write on the asyncio event loop — deliberate
+        under the proxy's single-MCP-client invariant (it delays only
+        the feedback call being served). Multi-client serving is the
+        reopen trigger — then move the write to ``asyncio.to_thread``;
+        ``self._lock`` already makes that safe.
+        """
         if self._db is None:
             return
         with self._lock:

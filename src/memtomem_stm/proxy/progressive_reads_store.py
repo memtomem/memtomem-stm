@@ -96,6 +96,12 @@ class ProgressiveReadsStore:
         finally-block close, so hitting a closed store from the hot
         path would be a shutdown-race and losing a row is preferable
         to raising into the response path.
+
+        Synchronous sqlite write on the asyncio event loop — deliberate
+        under the proxy's single-MCP-client invariant (it delays only
+        the request being served). Multi-client serving is the reopen
+        trigger — then move the write to ``asyncio.to_thread``;
+        ``self._lock`` already makes that safe.
         """
         if self._db is None:
             return
