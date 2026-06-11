@@ -274,6 +274,55 @@ class TestMalformedEnvOverrideDiagnostics:
         assert cfg is None
         assert not any("implicated" in r.getMessage() for r in caplog.records)
 
+    def test_file_caused_nested_validator_error_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When the FILE's own hybrid block breaks the ordering validator, an
+        env var that merely set an innocent sibling field (tail_mode) under
+        the same subtree must not be implicated — the file reproduces the
+        identical (loc, type) error on its own."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "gh": {
+                            "prefix": "gh",
+                            "hybrid": {"head_chars": 5000, "min_head_chars": 9000},
+                        }
+                    }
+                }
+            )
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__TAIL_MODE": "toc"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_env_rebreaking_a_file_broken_leaf_is_still_named(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Type-sensitive matching: the file breaks cache.max_entries one way
+        (gt violation) and the env re-breaks the SAME location differently
+        (unparseable int). The env value is what the merged config actually
+        validated, so it must be named despite the shared location."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"max_entries": -5}}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "abc"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in r.getMessage() for r in caplog.records
+        )
+
     def test_env_caused_duplicate_prefix_names_env_leaves(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:

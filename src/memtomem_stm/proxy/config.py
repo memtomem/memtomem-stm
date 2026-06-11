@@ -74,41 +74,38 @@ def _env_override_hint(
     <file>" and debugs the FILE while the file is fine. (Fallback semantics
     are unchanged: this only improves the warning.)
 
-    Hints are derived from the env overlay's LEAVES — the var names the
-    operator actually set — never synthesized from the error location alone:
-    a model-level validator reports its error at the MODEL's path (e.g. a
-    HybridConfig cross-field error at ``upstream_servers.gh.hybrid``), and
-    naming that prefix would point at a var that was never set.
+    Attribution is two-staged:
 
-    - An error location that resolves to an env subtree names every env
-      leaf under it.
-    - One that runs PAST an env leaf (the env string replaced a whole
-      container) names that leaf.
-    - One that leaves the env subtree mid-walk is attributed by PROVENANCE
-      against *file_data* (the pre-merge file contents): if the file also
-      supplies that subtree, the failing value is file-set and nothing is
-      named; if the subtree exists only because the env created it (e.g. a
-      required field missing from an env-built upstream entry), the env
-      leaves under it are named — that collapse is env-caused even though
-      the failing location itself was never set.
-    - A ROOT-level model-validator error (``loc=()``, e.g. duplicate or
-      empty upstream prefixes) has no path to walk; it is attributed by
-      DIFFERENTIAL validation — if the file alone validates (or there is no
-      file), the env overlay flipped the root check, and every env leaf is
-      named.
+    1. DIFFERENTIAL pre-filter — every error of the merged config whose
+       ``(loc, type)`` the file reproduces ON ITS OWN is file-caused and
+       skipped: an env var that merely touched the same subtree (an innocent
+       ``tail_mode`` under a hybrid block whose ordering the file itself
+       breaks) must not be implicated. The file-alone validation runs
+       lazily, once, only on this already-failing path. Matching includes
+       the error TYPE so an env value that re-breaks a file-broken location
+       DIFFERENTLY (gt-violation -> int-parsing) is still attributed. (If
+       the env adds a second instance of an aggregated root error the file
+       already has — e.g. one more duplicate-prefix pair — it stays hidden
+       until the file is fixed; the rerun then re-attributes.)
+
+    2. NAMING — hints are derived from the env overlay's LEAVES, the var
+       names the operator actually set, never synthesized from the error
+       location alone (a model-level validator reports at the MODEL's path,
+       e.g. ``upstream_servers.gh.hybrid``, and naming that prefix would
+       point at a var that was never set):
+
+       - a location resolving to an env leaf names that leaf (also when the
+         location runs PAST it — the env string replaced a container);
+       - a location resolving to an env subtree — a cross-field validator
+         there, or a missing required field of an env-created entry — names
+         every env leaf under it;
+       - a ROOT-level error (``loc=()``, duplicate/empty upstream prefixes)
+         has no path at all and names every env leaf;
+       - a location the env never touched names nothing.
     """
     if not env_overrides or not isinstance(exc, ValidationError):
         return ""
     implicated: set[str] = set()
-
-    def _file_has(path: list[str]) -> bool:
-        node: Any = file_data
-        for part in path:
-            if isinstance(node, dict) and part in node:
-                node = node[part]
-            else:
-                return False
-        return True
 
     def _add_leaves(path: list[str], subtree: dict[str, Any]) -> None:
         stack: list[tuple[list[str], dict[str, Any]]] = [(path, subtree)]
@@ -122,28 +119,29 @@ def _env_override_hint(
                         _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
                     )
 
-    env_caused_root: bool | None = None  # lazily computed, shared across errors
+    file_error_keys: frozenset[tuple[tuple[Any, ...], str]] | None = None
 
-    def _root_failure_is_env_caused() -> bool:
-        # Top-level model validators (duplicate / empty upstream prefixes)
-        # report at loc=() — there is no path to walk, so attribute by
-        # DIFFERENTIAL validation: if the file alone validates (or there is
-        # no file at all), the env overlay is what flipped the root check.
+    def _file_alone_error_keys() -> frozenset[tuple[tuple[Any, ...], str]]:
         if file_data is None:
-            return True
+            return frozenset()  # no file at all: every failure is env-caused
         try:
             ProxyConfig.model_validate(file_data)
-        except Exception:
-            return False  # the file fails on its own — fix the file first
-        return True
+        except ValidationError as file_exc:
+            return frozenset(
+                (tuple(e.get("loc", ())), str(e.get("type", ""))) for e in file_exc.errors()
+            )
+        except Exception:  # non-pydantic failure: attribute nothing to the file
+            return frozenset()
+        return frozenset()
 
     for err in exc.errors():
         loc = err.get("loc", ())
+        if file_error_keys is None:
+            file_error_keys = _file_alone_error_keys()
+        if (tuple(loc), str(err.get("type", ""))) in file_error_keys:
+            continue  # the file fails this same check on its own — file-caused
         if not loc:
-            if env_caused_root is None:
-                env_caused_root = _root_failure_is_env_caused()
-            if env_caused_root:
-                _add_leaves([], env_overrides)
+            _add_leaves([], env_overrides)
             continue
         node: Any = env_overrides
         consumed: list[str] = []
@@ -160,13 +158,13 @@ def _env_override_hint(
             # error location goes deeper, this leaf REPLACED a container the
             # model expected, so it is still the var to fix.
             implicated.add(_PROXY_ENV_PREFIX + "__".join(p.upper() for p in consumed))
-        elif len(consumed) == len(loc) or not _file_has(consumed):
-            # Either a model-level (cross-field) error at a subtree the env
-            # touched, or the walk broke inside a subtree the env CREATED
-            # (the file doesn't supply it) — name the env leaves under it.
+        else:
+            # A subtree the env touched: a cross-field validator error there
+            # (consumed == loc) or a walk that broke inside it (e.g. the
+            # missing required field of an env-created entry — the file-
+            # caused variants were already filtered above). Name the env
+            # leaves under it.
             _add_leaves(consumed, node)
-        # else: the file supplies this subtree, so the failing value is
-        # file-set; implicate nothing.
     if not implicated:
         return ""
     return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
