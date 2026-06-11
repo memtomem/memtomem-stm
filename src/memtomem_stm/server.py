@@ -244,6 +244,16 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 logger.warning("Langfuse init failed, continuing without tracing", exc_info=True)
         else:
             logger.info("Proxy disabled (enabled=false) — only STM control tools available")
+            if config.surfacing.enabled:
+                # Mirror the #288 "enabled but inert" pattern: the surfacing
+                # engine only initializes inside the proxy branch above, so a
+                # surfacing.enabled=true config silently does nothing here —
+                # otherwise visible only on demand via stm_proxy_health.
+                logger.warning(
+                    "surfacing enabled but the proxy is disabled — config is "
+                    "enabled but inert; no memories will be surfaced. Enable "
+                    "the proxy or set surfacing.enabled=false to silence."
+                )
 
         # Initialize proxy manager (always created for STM control tools like stm_proxy_stats)
         proxy_manager = ProxyManager(
