@@ -270,16 +270,12 @@ def test_list_fit_preserves_truncated_item_before_marker() -> None:
     assert parsed[1] == "... (99 of 100 items omitted)"
 
 
-def test_list_fit_keeps_small_items_when_marker_is_too_large() -> None:
-    """A marker that cannot fit must not prevent later small items from being
-    considered when the list itself can still fit."""
-    assert FieldExtractCompressor()._take([1, 2], 6) == [1, 2]
-
-
 def test_take_keeps_full_container_when_it_fits() -> None:
-    """A fitting container must never be replaced by a longer omission marker."""
+    """A fitting container is returned whole — ``_take``'s reduced leaf
+    contract keeps the fits-whole guarantee (including an exact fit)."""
     comp = FieldExtractCompressor()
     cases = [
+        ([1, 2], 6),  # exact fit
         ([1, 2], 30),
         ({"a": 1, "b": 2}, 40),
         ([[1, 2]], 32),
@@ -324,15 +320,6 @@ def test_dict_fully_omitted_nested_collapses_to_stub() -> None:
     assert parsed["outer"] == "{1000 keys}"  # compact omission indicator, not a marker dict
 
 
-def test_dict_fit_allows_exact_marker_fit() -> None:
-    """Dict marker checks use exact JSON length, so marker-only output can fit
-    exactly when key-plus-marker cannot."""
-    data = {f"k{i}": {"a": 1} for i in range(1000)}
-    out = FieldExtractCompressor()._take(data, 43)
-    assert len(json.dumps(out, ensure_ascii=False)) == 43
-    assert out == {"_truncated": "1000 of 1000 keys omitted"}
-
-
 def test_later_short_scalars_survive_after_long_scalar() -> None:
     """Long early scalar values must not consume the whole enrichment budget
     before later short identifiers get restored from their stubs."""
@@ -369,7 +356,7 @@ def test_oversized_non_string_scalar_stub_does_not_hide_later_keys() -> None:
 
 
 def test_nested_oversized_non_string_scalar_stub_preserves_later_keys() -> None:
-    """The same scalar bound applies inside recursive _take() paths, not just
+    """The same scalar bound applies inside recursive fill paths, not just
     top-level skeletons."""
     payload = '{"outer": {"huge": ' + ("1" * 1000) + ', "id": "abc"}, "name": "foo"}'
     out = FieldExtractCompressor().compress(payload, max_chars=80)
@@ -692,10 +679,9 @@ def test_list_root_monotone_through_router(name: str) -> None:
 _FLAT_DICT_FIXTURES: dict[str, object] = {
     # Scalar-only dicts: the dict final tier (skeleton + scalar enrich) is itself
     # monotone, so end-to-end monotonicity holds once the router preview cliff is
-    # gone. Dicts with NESTED collections also lose the router cliff, but their
-    # final tier still inherits ``_take``'s non-monotonicity (the dict analog of
-    # the list 4B fix, tracked as a follow-up) — so they are asserted only via the
-    # weaker pretty-is-lossless invariant below, not full monotonicity.
+    # gone. Dicts with NESTED collections are covered by the E5 dict-final-tier
+    # monotonicity tests below (``_enrich_dict_monotone`` closed the dict analog
+    # of the list 4B fix).
     "string_values_30": {f"k{i}": f"value-{i}" for i in range(30)},
     "mixed_scalars": {f"f{i}": (i if i % 2 else f"s{i}") for i in range(25)},
 }
