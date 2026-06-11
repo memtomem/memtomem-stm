@@ -71,6 +71,12 @@ class BM25Scorer:
             doc_lens.append(len(heading_tokens) * self._HEADING_WEIGHT + len(body_tokens))
 
         avgdl = sum(doc_lens) / len(doc_lens) if doc_lens else 1.0
+        if avgdl == 0.0:
+            # Every section tokenized to nothing (symbols-only content):
+            # dl/avgdl in the BM25 denominator below would divide by zero.
+            # Any positive stand-in works — tf is 0 everywhere, so every
+            # score comes out 0.0 regardless.
+            avgdl = 1.0
 
         # IDF per query term
         n = len(sections)

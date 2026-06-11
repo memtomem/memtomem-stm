@@ -40,6 +40,13 @@ class TestBM25Scorer:
         scores = scorer.score_sections("kubernetes deployment", sections)
         assert all(s == 0.0 for s in scores)
 
+    def test_all_empty_sections_no_crash(self):
+        """Symbols-only sections tokenize to nothing, so every doc length is
+        0 and avgdl used to come out 0 — dividing by zero in the BM25
+        denominator. Must return zeros, not raise."""
+        scores = BM25Scorer().score_sections("redis", [("!!!", "@@@"), ("???", "###")])
+        assert scores == [0.0, 0.0]
+
     def test_partial_match(self):
         """Some sections match, others don't → mixed scores."""
         sections = [
@@ -207,6 +214,94 @@ class TestRelevanceScorerProtocol:
         third_len = len(result) - third_start
         # Custom scorer gave 10.0 to Third, 0.0 to others → Third gets most budget
         assert third_len >= first_len
+
+
+# ── wrong-length scorer degradation (all score_sections consumers) ─────
+
+
+class _ShortScorer:
+    """Misbehaving custom scorer: one score regardless of section count."""
+
+    def score_sections(self, query, sections):
+        return [10.0]
+
+
+class TestWrongLengthScorerDegradation:
+    """A custom scorer returning the wrong number of scores must degrade to
+    the query-less path at EVERY ``score_sections`` consumer — not raise
+    IndexError, not let ``zip()`` truncation pass as real signal, not
+    mis-allocate per-section budgets. All consumers route through
+    ``_scores_or_none``."""
+
+    def test_truncate_json_key_allocation(self):
+        import json as _json
+
+        # Config-like dict (>=2 keys, all values dicts) — the only shape
+        # compress() routes into _json_key_truncate's weighted allocation.
+        data = {k: {"field": "x" * 200, "other": "y" * 100} for k in ("alpha", "beta", "gamma")}
+        text = _json.dumps(data)
+        result = TruncateCompressor(scorer=_ShortScorer()).compress(
+            text, max_chars=400, context_query="anything"
+        )
+        assert result == TruncateCompressor().compress(text, max_chars=400)
+
+    def test_truncate_section_aware_markdown(self):
+        # Multi-line bodies keep the phase-1 minimums (heading + first line)
+        # small, so the enrich phase actually runs — that's where scores[i]
+        # indexes past a short score list.
+        doc = "\n\n".join(
+            f"## Section {i}\n\n" + "\n".join(f"line {j} of section {i}." for j in range(20))
+            for i in range(3)
+        )
+        budget = int(len(doc) * 0.8)
+        result = TruncateCompressor(scorer=_ShortScorer()).compress(
+            doc, max_chars=budget, context_query="anything"
+        )
+        assert result == TruncateCompressor().compress(doc, max_chars=budget)
+
+    def test_selective_toc_ordering(self):
+        import json as _json
+
+        from memtomem_stm.proxy.compression import SelectiveCompressor
+
+        data = {f"key{i}": "x" * 200 for i in range(3)}
+        text = _json.dumps(data)
+        result = SelectiveCompressor(scorer=_ShortScorer()).compress(
+            text, max_chars=100, context_query="anything"
+        )
+        baseline = SelectiveCompressor().compress(text, max_chars=100)
+        # TOCs embed a random selection_key — compare the entry ordering,
+        # which is what the scorer path reorders.
+        result_keys = [e["key"] for e in _json.loads(result)["entries"]]
+        baseline_keys = [e["key"] for e in _json.loads(baseline)["entries"]]
+        assert result_keys == baseline_keys
+
+    def test_schema_pruning_relevant_keys(self):
+        import json as _json
+
+        from memtomem_stm.proxy.compression import SchemaPruningCompressor
+
+        # zip() against a one-score list used to mark ONLY the first key
+        # relevant — fake signal from truncation, not from the query.
+        data = {f"key{i}": {"field": "x" * 200} for i in range(3)}
+        text = _json.dumps(data)
+        result = SchemaPruningCompressor(scorer=_ShortScorer()).compress(
+            text, max_chars=300, context_query="anything"
+        )
+        assert result == SchemaPruningCompressor().compress(text, max_chars=300)
+
+    def test_skeleton_budgets(self):
+        from memtomem_stm.proxy.compression import SkeletonCompressor
+
+        # A one-element budget list used to zip-render only the first
+        # heading, breaking the skeleton's every-heading-survives invariant.
+        doc = "\n\n".join(f"## Section {i}\n\n" + f"body {i} text. " * 30 for i in range(3))
+        result = SkeletonCompressor(scorer=_ShortScorer()).compress(
+            doc, max_chars=len(doc) // 3, context_query="anything"
+        )
+        assert result == SkeletonCompressor().compress(doc, max_chars=len(doc) // 3)
+        for i in range(3):
+            assert f"## Section {i}" in result
 
 
 # ── EmbeddingScorer OpenAI response parsing (#68) ──────────────────────
