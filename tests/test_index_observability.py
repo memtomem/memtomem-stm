@@ -68,23 +68,26 @@ class TestIndexObservabilityCounters:
             "extracted_zero_facts": 1,
         }
 
-    def test_all_four_outcome_labels_independent(self):
-        """The 4-label split must keep each label as a separate slot —
+    def test_all_outcome_labels_independent(self):
+        """The 5-label split must keep each label as a separate slot —
         fusing ``extracted_zero_facts`` into ``stored=0`` would lose the
         signal "extraction fired but produced nothing", which is
         architecturally distinct from "facts existed but were duplicates"
-        (``dedup_skip``) and from "facts existed and were stored"
-        (``stored``)."""
+        (``dedup_skip``), from "facts existed and were stored"
+        (``stored``), and from "content was refused before any write"
+        (``privacy_skip``, #453)."""
         obs = IndexObservability()
         obs.record_outcome("t", "stored")
         obs.record_outcome("t", "dedup_skip")
         obs.record_outcome("t", "extracted_zero_facts")
+        obs.record_outcome("t", "privacy_skip")
         obs.record_outcome("t", "error")
         snap = obs.snapshot()
         assert snap["outcomes"]["t"] == {
             "stored": 1,
             "dedup_skip": 1,
             "extracted_zero_facts": 1,
+            "privacy_skip": 1,
             "error": 1,
         }
 

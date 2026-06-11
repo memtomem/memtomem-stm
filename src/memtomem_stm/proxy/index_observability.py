@@ -49,9 +49,14 @@ from typing import Literal
 # - ``error``: per error event. Outer ``extractor.extract`` failure counts
 #   once (per call); per-fact ``index_file`` failure counts per fact;
 #   auto_index ``index_file`` failure counts once per call.
+# - ``privacy_skip``: per call, terminal — the content matched a privacy
+#   pattern before anything was written (#453), so no file and no
+#   ``index_file`` call exist for this attempt. Fires from both paths:
+#   auto_index scans the exact markdown it would persist; extract scans
+#   the response text + rendered arguments before the extractor runs.
 #
-# Both write paths share this 4-label outcome set deliberately. auto_index
-# only fires ``stored`` and ``error``; ``dedup_skip`` and
+# Both write paths share this 5-label outcome set deliberately. auto_index
+# only fires ``stored``, ``error``, and ``privacy_skip``; ``dedup_skip`` and
 # ``extracted_zero_facts`` are extract-specific. Operators read the raw
 # mem_add count as ``outcomes["__total__"]["stored"]`` regardless of
 # which path produced the write — path attribution lives in ``attempts``.
@@ -75,6 +80,7 @@ IndexOutcome = Literal[
     "stored",
     "dedup_skip",
     "extracted_zero_facts",
+    "privacy_skip",
     "error",
 ]
 

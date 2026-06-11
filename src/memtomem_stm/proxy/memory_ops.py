@@ -17,9 +17,19 @@ from memtomem_stm.proxy.index_observability import (
     IndexObservability,
     _NoOpIndexObservability,
 )
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils.fileio import atomic_write_text
 
 logger = logging.getLogger(__name__)
+
+
+def _render_args(arguments: dict[str, Any]) -> str:
+    """Render call arguments the way the persisted markdown embeds them.
+
+    Shared by the markdown builders AND the privacy gates so the scanned
+    value and the persisted value can never diverge.
+    """
+    return ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,19 +123,19 @@ async def auto_index_response(
     working unchanged. When the manager wires a real
     ``IndexObservability``, this function records one
     ``record_attempt(tool, "auto_index")`` per invocation plus one of
-    ``stored`` / ``error`` outcomes — auto_index has no extraction or
-    dedup phase so the other two ``IndexOutcome`` labels do not fire here.
+    ``stored`` / ``error`` / ``privacy_skip`` outcomes — auto_index has no
+    extraction or dedup phase so the other two ``IndexOutcome`` labels do
+    not fire here.
     """
     observability.record_attempt(tool, "auto_index")
     memory_dir = ai_cfg.memory_dir.expanduser().resolve()
-    memory_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     safe_tool = tool.replace("/", "_")
     fname = f"{server}__{safe_tool}__{ts}.md"
     file_path = memory_dir / fname
 
-    args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
+    args_str = _render_args(arguments)
 
     frontmatter_lines = [
         "---",
@@ -152,8 +162,23 @@ async def auto_index_response(
         f"{intent_section}"
         f"## Content\n\n{text}\n"
     )
+
+    if contains_sensitive_content(md_content):
+        # SECURITY.md: secret-looking content is never indexed into LTM.
+        # Scans the exact markdown that would be persisted — response text,
+        # rendered arguments, and agent intent included. The agent still
+        # receives ``agent_summary`` unchanged; only persistence is skipped.
+        logger.info(
+            "Auto-index skipped for %s/%s: content matches a privacy pattern",
+            server,
+            tool,
+        )
+        observability.record_outcome(tool, "privacy_skip")
+        return AutoIndexOutcome(summary=agent_summary, ok=True, chunks_indexed=0)
+
+    memory_dir.mkdir(parents=True, exist_ok=True)
     # Atomic so the auto-indexer (called next) can't observe a partial file
-    # if the writer is killed mid-flush. Caller has already mkdir'd memory_dir.
+    # if the writer is killed mid-flush. The mkdir above ensured memory_dir.
     atomic_write_text(file_path, md_content, ensure_parent=False)
 
     ns = ai_cfg.namespace.format(server=server, tool=tool)
@@ -217,6 +242,19 @@ async def extract_and_store(
     """
     indexed_count = 0
     observability.record_attempt(tool, "extract")
+    if contains_sensitive_content(f"{_render_args(arguments)}\n{text}"):
+        # SECURITY.md: secret-looking content is never indexed into LTM.
+        # Checked before ``extractor.extract()`` so the (possibly remote)
+        # extraction LLM never sees the text either. The rendered arguments
+        # are part of the scanned value because ``format_fact_md`` embeds
+        # them in every persisted fact file.
+        logger.info(
+            "Fact extraction skipped for %s/%s: content matches a privacy pattern",
+            server,
+            tool,
+        )
+        observability.record_outcome(tool, "privacy_skip")
+        return ExtractOutcome(ok=True, facts_stored=0)
     try:
         facts = await extractor.extract(text, server=server, tool=tool)
         if not facts:
@@ -291,7 +329,7 @@ def format_fact_md(
 ) -> str:
     """Format an extracted fact as a Markdown file with frontmatter."""
     tags_str = ", ".join(fact.tags) if fact.tags else ""
-    args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
+    args_str = _render_args(arguments)
     title = fact.content[:80].rstrip(".")
     lines = [
         "---",
