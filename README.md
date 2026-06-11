@@ -38,12 +38,15 @@ flowchart TB
     STM <-.->|surfacing<br/>via MCP| LTM
 ```
 
-> The **INDEX** stage requires a `FileIndexer` engine. The standalone
-> `mms` server does not wire one today, so `auto_index` and `extraction`
-> config is inert in the default deployment — enabling them logs an
-> `inert` warning at startup but does not write back to LTM. See
-> [#288](https://github.com/memtomem/memtomem-stm/issues/288) for the
-> tracking issue on a future MCP-protocol-only adapter.
+> The **INDEX** stage requires a `FileIndexer` engine, and the bundled
+> `mms` server wires none **by design** — `auto_index` and `extraction`
+> config is inert in the default deployment; enabling them logs an
+> `inert` warning at startup but does not write back to LTM. The hooks
+> are library-mode only: pass `index_engine=` when constructing
+> `ProxyManager` yourself (see
+> [docs/configuration.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md)).
+> [#288](https://github.com/memtomem/memtomem-stm/issues/288) has the
+> history.
 
 ## Installation
 
@@ -156,7 +159,7 @@ through `updatedToolOutput`. This is separate from the MCP proxy: `Write`,
 `Edit`, and other mutation tools stay out of the surfacing path, and the hook
 always fails open to the original tool output.
 
-**STM does NOT write back to LTM at runtime today.** The standalone `mms` server constructs the proxy without a `FileIndexer` engine, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are tracked in [#288](https://github.com/memtomem/memtomem-stm/issues/288) and require an MCP-protocol-only adapter that doesn't exist yet.
+**STM does NOT write back to LTM at runtime.** The bundled `mms` server constructs the proxy without a `FileIndexer` engine by design, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are library-mode only — callers embedding STM as a library can pass `index_engine=` to `ProxyManager` themselves ([#288](https://github.com/memtomem/memtomem-stm/issues/288) has the history).
 
 To bring file or shell operations under STM, register an MCP server that exposes them (the [filesystem example](#1-add-an-upstream-mcp-server) above is the most common case) and steer the agent toward the proxied alias instead of the built-in. This is the same boundary every MCP proxy lives within — it's not specific to STM.
 

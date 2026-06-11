@@ -187,16 +187,17 @@ def test_bundled_server_proxy_manager_omits_index_engine() -> None:
     """The bundled ``mms`` server's ``ProxyManager(...)`` construction in
     ``app_lifespan`` must not pass ``index_engine=``.
 
-    ``docs/configuration.md`` (Stage 4 NOTE block, ~lines 73-87) tells
-    operators that ``AUTO_INDEX__*`` / ``EXTRACTION__*`` are inert in the
-    bundled server because no index engine is wired. That claim is grounded
-    in ``src/memtomem_stm/server.py``'s single ``ProxyManager(...)`` call,
-    which today passes only ``config.proxy`` and ``tracker`` positionally
-    plus a fixed set of unrelated kwargs (#288/#299, PR #339). If a future
-    PR wires an ``index_engine=`` here without also dropping the inert
-    NOTE, the docs silently revalidate against stale prose — operators
-    keep seeing the no-op warning in the docs while the server now writes
-    to LTM.
+    This is a decision, not a gap (2026-06-11): LTM write hooks are
+    **library-mode only** — the bundled server intentionally wires no
+    index engine, and ``docs/configuration.md`` (Stage 4 NOTE block)
+    says so. The pin is grounded in ``src/memtomem_stm/server.py``'s
+    single ``ProxyManager(...)`` call, which passes only ``config.proxy``
+    and ``tracker`` positionally plus a fixed set of unrelated kwargs
+    (#288/#299, PR #339). Wiring an ``index_engine=`` here means the
+    library-only decision was deliberately reversed — do it WITH a docs
+    update (drop the library-only NOTE), not around it; otherwise the
+    docs keep telling operators the env vars are no-ops while the server
+    writes to LTM.
 
     Paired with ``test_configuration_md_stage4_inert_note_pinned`` (the
     inverse direction).
@@ -250,15 +251,18 @@ def test_bundled_server_proxy_manager_omits_index_engine() -> None:
 
 
 def test_configuration_md_stage4_inert_note_pinned() -> None:
-    """``docs/configuration.md``'s Stage 4 NOTE block must keep the inert-
-    state warning that pairs with ``server.py``'s engine-less ``ProxyManager``
-    construction.
+    """``docs/configuration.md``'s Stage 4 NOTE block must keep the
+    library-mode-only framing that pairs with ``server.py``'s engine-less
+    ``ProxyManager`` construction.
 
     PR #339 (resolving the operator-visible half of #288) added a comment
     block immediately above the ``AUTO_INDEX__*`` exports explaining that
-    those env vars currently have no runtime effect because the bundled
-    server constructs ``ProxyManager`` without an ``index_engine``. If
-    that NOTE goes away while the server still has no engine wired
+    those env vars have no runtime effect in the bundled server; the
+    2026-06-11 write-integration decision upgraded that wording from
+    "currently inert, adapter tracked" to "library-mode only, by design"
+    (the env vars apply to callers constructing
+    ``ProxyManager(..., index_engine=...)`` directly). If the NOTE goes
+    away while the server still has no engine wired
     (``test_bundled_server_proxy_manager_omits_index_engine``), operators
     flipping ``AUTO_INDEX__ENABLED=true`` get zero behaviour and zero
     explanation again — the failure mode #288 originally reported.
@@ -284,16 +288,25 @@ def test_configuration_md_stage4_inert_note_pinned() -> None:
         )
     note = block_match.group(1).lower()
 
-    required = ("inert", "index_engine", "#288")
+    required = (
+        "library",
+        "inert",
+        "index_engine",
+        "fileindexer",
+        "bundled",
+        "no runtime effect",
+        "#288",
+    )
     missing = [kw for kw in required if kw.lower() not in note]
     if missing:
         pytest.fail(
             f"docs/configuration.md Stage 4 NOTE is missing keyword(s): "
-            f"{missing!r}. If `mms` now wires `index_engine`, also delete "
-            "`test_bundled_server_proxy_manager_omits_index_engine` and "
-            "close #299. Otherwise restore the inert NOTE — operators "
-            "flipping `AUTO_INDEX__ENABLED=true` need to know the env var "
-            "is currently a no-op in the bundled server (PR #339, #288)."
+            f"{missing!r}. If `mms` now wires `index_engine` (reversing the "
+            "library-only decision), also delete "
+            "`test_bundled_server_proxy_manager_omits_index_engine`. "
+            "Otherwise restore the library-mode NOTE — operators flipping "
+            "`AUTO_INDEX__ENABLED=true` need to know the env var is a no-op "
+            "in the bundled server (PR #339, #288)."
         )
 
 
