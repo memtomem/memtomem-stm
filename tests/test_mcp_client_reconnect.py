@@ -126,6 +126,63 @@ class TestLtmTransportSelection:
 # ── Reconnect retry paths ────────────────────────────────────────────────
 
 
+class TestTargetDisplayRedaction:
+    """_target_display feeds INFO logs in start()/_reconnect() — URL userinfo
+    (basic-auth credentials in front of a network LTM, #398) must not leak."""
+
+    def test_url_userinfo_is_redacted(self):
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(
+                ltm_mcp_transport="sse",
+                ltm_mcp_url="https://alice:s3cret@ltm.example/sse",
+            )
+        )
+        display = adapter._target_display()
+        assert "s3cret" not in display
+        assert "alice" not in display
+        assert display == "https://***@ltm.example/sse"
+
+    def test_url_without_userinfo_unchanged(self):
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(
+                ltm_mcp_transport="streamable_http",
+                ltm_mcp_url="https://ltm.example/mcp",
+            )
+        )
+        assert adapter._target_display() == "https://ltm.example/mcp"
+
+    def test_stdio_returns_command(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig(ltm_mcp_command="memtomem-dev"))
+        assert adapter._target_display() == "memtomem-dev"
+
+    def test_transport_still_receives_raw_url(self, monkeypatch):
+        # Redaction is display-only — the connection must use the verbatim
+        # configured URL, credentials included.
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        captured = {}
+        monkeypatch.setattr(
+            mod,
+            "sse_client",
+            lambda url, *, headers=None: captured.update(url=url) or object(),
+        )
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(
+                ltm_mcp_transport="sse",
+                ltm_mcp_url="https://alice:s3cret@ltm.example/sse",
+            )
+        )
+        adapter._open_transport()
+        assert captured["url"] == "https://alice:s3cret@ltm.example/sse"
+
+    def test_unparseable_url_not_echoed(self):
+        from memtomem_stm.surfacing.mcp_client import _redact_url_userinfo
+
+        # Malformed IPv6 brackets make urlsplit raise ValueError; the raw
+        # string could still embed credentials, so it is replaced wholesale.
+        assert _redact_url_userinfo("https://user:pw@[::1/mcp") == "<unparseable url>"
+
+
 class TestReconnectRetrySuccess:
     """A transient transport failure followed by a successful reconnect must
     deliver the retry's actual results to the caller, not silently drop them."""
