@@ -254,6 +254,25 @@ class TestSecretGuard:
         assert out.startswith(_QUERY_HASH_PREFIX)
         assert engine._persistable_query("ordinary search text") == "ordinary search text"
 
+    async def test_email_query_hashed_pii_not_credential(self):
+        # L278 contrast pin: an email is NOT a credential — the LLM routing
+        # gate (CREDENTIAL_PATTERNS) ignores it — but it IS
+        # persist-sensitive: this guard scans the full default set
+        # (credentials + PII), so an email-bearing query still hashes.
+        from memtomem_stm.proxy import privacy
+
+        query = "email bob.smith@example.com about the outage"
+        assert privacy.contains_sensitive_content(query, privacy.CREDENTIAL_PATTERNS) is False
+
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=_make_tracker(),
+        )
+        out = engine._persistable_query(query)
+        assert out.startswith(_QUERY_HASH_PREFIX)
+        assert "bob.smith@example.com" not in out
+
 
 class TestPersistSitesRouteThroughGuard:
     """Both persistence sites must funnel through ``_persistable_query`` so

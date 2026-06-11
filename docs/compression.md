@@ -266,7 +266,7 @@ Providers: `openai`, `anthropic`, `ollama`. `llm_timeout_seconds` (default 60.0)
 
 > **`api_key` is validated eagerly.** Every `llm` block in the config is validated when the config loads — for `provider: openai` / `anthropic`, a missing `api_key` (and missing `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env var) fails the load even if nothing selects the `llm_summary` strategy or the block sits under a disabled `extraction`. This keeps the startup fail-fast for configs that DO use the LLM. Don't leave placeholder `llm` blocks you aren't using — remove them, or point them at `provider: ollama` (no key required).
 
-Sensitive content (API keys, passwords, PII) is auto-detected and **never** sent to external LLMs — falls back to local truncation.
+Credential-bearing content (API keys, passwords, provider tokens, JWTs, private keys) is auto-detected and **never** sent to external LLMs — falls back to local truncation. Email addresses alone do **not** trigger this fallback: they appear in ordinary compressible content (git logs, issue threads, contact pages), and routing on them silently degraded the chosen strategy to truncation. Emails remain protected where storage is at stake — surfacing query persistence hashes any query matching the full sensitive set (credentials *and* emails) before it reaches disk.
 
 `LLMCompressor` holds a single `httpx.AsyncClient` for the life of the instance. `ProxyManager` caches one compressor per active `llm` config and swaps it (awaiting `close()` on the old one) whenever the config changes at runtime, so integrators generally do not need to manage it directly. If you construct an `LLMCompressor` standalone, `await compressor.close()` before discarding it to release the client.
 

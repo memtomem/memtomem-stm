@@ -185,3 +185,49 @@ class TestDefaultPatternCoverage:
         text = ("safe content " * 900) + "password: hunter2"
         assert len(text) > 10_000
         assert privacy.contains_sensitive_content(text) is True
+
+
+class TestCredentialPiiSplit:
+    """L278: the default set splits into ``CREDENTIAL_PATTERNS`` (gates
+    ACTIONS — e.g. "may this response go to an external LLM?") and
+    ``PII_PATTERNS`` (gates STORAGE — e.g. surfacing query persistence).
+    ``DEFAULT_PATTERNS`` stays the union for callers asking "is anything
+    here sensitive?". The split exists because emails appear in ordinary
+    compressible content (git logs, issue threads) and routing on them
+    silently degraded llm_summary to truncation.
+    """
+
+    def test_default_is_credentials_then_pii(self):
+        assert privacy.DEFAULT_PATTERNS == [
+            *privacy.CREDENTIAL_PATTERNS,
+            *privacy.PII_PATTERNS,
+        ]
+
+    def test_sets_are_disjoint_and_nonempty(self):
+        assert privacy.CREDENTIAL_PATTERNS
+        assert privacy.PII_PATTERNS
+        assert not set(privacy.CREDENTIAL_PATTERNS) & set(privacy.PII_PATTERNS)
+
+    @pytest.mark.parametrize(
+        "sample",
+        [
+            "user@example.com",
+            "contact: alice.bob+tag@sub.example.co.uk",
+        ],
+    )
+    def test_email_is_pii_not_credential(self, sample: str) -> None:
+        assert privacy.contains_sensitive_content(sample, privacy.PII_PATTERNS) is True
+        assert privacy.contains_sensitive_content(sample, privacy.CREDENTIAL_PATTERNS) is False
+
+    @pytest.mark.parametrize(
+        "sample",
+        [
+            "ghp_" + "A" * 36,
+            "api_key=sk-" + "a" * 48,
+            "psql password=hunter2",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ],
+    )
+    def test_credentials_match_via_credential_set_alone(self, sample: str) -> None:
+        assert privacy.contains_sensitive_content(sample, privacy.CREDENTIAL_PATTERNS) is True
