@@ -195,6 +195,73 @@ class TestTracing:
         finally:
             tracing_mod._langfuse_client = old
 
+    def test_traced_degrades_when_client_method_raises(self) -> None:
+        # The proxy/surfacing hot paths wrap calls in `with traced(...)`; an
+        # SDK that raises while constructing the observation must degrade to
+        # untraced, never fail the proxied call.
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        try:
+            tracing_mod._sampling_rate = 1.0  # an earlier init test leaves a MagicMock here
+            client = MagicMock()
+            client.start_as_current_observation.side_effect = RuntimeError("exporter down")
+            tracing_mod._langfuse_client = client
+            ran = False
+            with tracing_mod.traced("span"):
+                ran = True
+            assert ran
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+
+    def test_traced_degrades_when_observation_enter_raises(self) -> None:
+        # Langfuse CMs do their real work in __enter__ (OTEL context attach,
+        # exporter I/O) — a raising __enter__ must not break the traced body,
+        # and the never-entered inner CM must not get an __exit__ call.
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        try:
+            tracing_mod._sampling_rate = 1.0
+            broken_cm = MagicMock()
+            broken_cm.__enter__ = MagicMock(side_effect=RuntimeError("otel context corrupt"))
+            client = MagicMock()
+            client.start_as_current_observation.return_value = broken_cm
+            tracing_mod._langfuse_client = client
+            ran = False
+            with tracing_mod.traced("span"):
+                ran = True
+            assert ran
+            broken_cm.__exit__.assert_not_called()
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+
+    def test_traced_body_exception_still_propagates(self) -> None:
+        # Only SDK enter/exit failures are swallowed — an exception raised by
+        # the traced body must propagate through the safe wrapper.
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        try:
+            tracing_mod._sampling_rate = 1.0
+            healthy_cm = MagicMock()
+            healthy_cm.__exit__ = MagicMock(return_value=False)
+            client = MagicMock()
+            client.start_as_current_observation.return_value = healthy_cm
+            tracing_mod._langfuse_client = client
+            with pytest.raises(ValueError, match="body error"):
+                with tracing_mod.traced("span"):
+                    raise ValueError("body error")
+            healthy_cm.__exit__.assert_called_once()
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+
     def test_shutdown_langfuse_calls_shutdown(self) -> None:
         import memtomem_stm.observability.tracing as tracing_mod
 

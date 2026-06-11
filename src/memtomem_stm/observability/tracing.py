@@ -5,10 +5,13 @@ If langfuse is not installed or disabled, all functions gracefully return None/n
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 from contextlib import nullcontext
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _langfuse_client: Any = None
 _sampling_rate: float = 1.0
@@ -56,6 +59,42 @@ def shutdown_langfuse(client: Any = None) -> None:
         c.shutdown()
 
 
+class _SafeObservation:
+    """Delegate to a Langfuse observation context manager, degrading to a
+    no-op when the SDK raises.
+
+    ``traced()`` wraps the proxy and surfacing hot paths, whose contract is
+    that tracing must never break the proxied call. The SDK's context
+    manager typically does its real work in ``__enter__`` (OTEL context
+    attach, exporter I/O), so guarding only the constructor would still let
+    a misconfigured exporter fail the call at ``with`` time. Exceptions
+    raised by the traced *body* still propagate normally — only the SDK's
+    own enter/exit failures are swallowed.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._entered = False
+
+    def __enter__(self) -> Any:
+        try:
+            result = self._inner.__enter__()
+            self._entered = True
+            return result
+        except Exception:
+            logger.warning("Langfuse observation start failed — proceeding untraced", exc_info=True)
+            return None
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if not self._entered:
+            return False
+        try:
+            return bool(self._inner.__exit__(exc_type, exc, tb))
+        except Exception:
+            logger.warning("Langfuse observation exit failed (ignored)", exc_info=True)
+            return False
+
+
 def traced(name: str, **kwargs: Any) -> Any:
     """Return a Langfuse observation context manager.
 
@@ -63,11 +102,17 @@ def traced(name: str, **kwargs: Any) -> Any:
     sampled out (``sampling_rate < 1.0``).  Nested calls within an
     existing ``traced()`` block automatically create parent-child
     relationships via OpenTelemetry context propagation (Langfuse
-    ≥ 4.x).
+    ≥ 4.x). A raising SDK degrades to a no-op (``_SafeObservation``) —
+    per the module contract, tracing failures must never break the
+    traced call.
     """
     client = _langfuse_client
     if client is None:
         return nullcontext()
     if _sampling_rate < 1.0 and random.random() >= _sampling_rate:  # noqa: S311
         return nullcontext()
-    return client.start_as_current_observation(name=name, **kwargs)
+    try:
+        return _SafeObservation(client.start_as_current_observation(name=name, **kwargs))
+    except Exception:
+        logger.warning("Langfuse traced() failed — proceeding untraced", exc_info=True)
+        return nullcontext()

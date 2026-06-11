@@ -68,3 +68,34 @@ def test_tag_title_falls_back_to_original_when_model_copy_raises() -> None:
     broken = _BrokenCopy()
     tagged = _tag_annotations_title(broken, "playwright")
     assert tagged is broken
+
+
+def test_register_proxy_tool_degrades_when_schema_fields_renamed(caplog) -> None:
+    # The .parameters/.fn_metadata overrides poke fastmcp internals; a future
+    # fastmcp that renames those pydantic fields raises on assignment. The
+    # caller loops register_proxy_tool over every proxied tool with no
+    # per-tool guard, so this must degrade to a warning — not abort the
+    # whole registration loop and fail server startup.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+
+    class _FrozenTool:
+        def __setattr__(self, name: str, value: object) -> None:
+            raise ValueError(f"pydantic: {name!r} is not a field")
+
+    server = MagicMock()
+    server._tool_manager._tools.get.return_value = _FrozenTool()
+    info = SimpleNamespace(
+        prefixed_name="srv_tool",
+        description="desc",
+        annotations=None,
+        server="srv",
+        input_schema={"type": "object"},
+    )
+
+    register_proxy_tool(server, lambda: None, info)  # must not raise
+
+    assert "Cannot override schema for 'srv_tool'" in caplog.text
+    server.add_tool.assert_called_once()  # the tool itself stayed registered
