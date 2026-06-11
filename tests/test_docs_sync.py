@@ -523,3 +523,102 @@ def test_compression_md_llm_section_documents_timeout_fallback() -> None:
             "`llm_summary→timeout_fallback` metric label has no "
             "documented origin."
         )
+
+
+def test_cli_md_commands_index_matches_click_group() -> None:
+    """The Commands index in docs/cli.md must match the ``mms`` click group:
+    the exact command-name set (both directions) and, per command, a
+    description that is a verbatim prefix of the command's actual short
+    help (#475 PR4).
+
+    A command added without a docs entry (or documented after removal) is
+    invisible drift — the reference reads as complete, so nobody goes
+    looking for what's missing — and a stale description misleads even
+    when the name survives. Prefix comparison rather than byte equality
+    because click's help wrapping (and the ``...`` truncation point)
+    shifts with the rendering width, which is not deterministic across
+    environments; the words themselves are.
+    """
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    cli_md = _read("docs/cli.md")
+    blocks = re.findall(r"```\n(Usage: mms \[OPTIONS\] COMMAND.*?)```", cli_md, re.DOTALL)
+    if len(blocks) != 1:
+        pytest.fail(
+            "Expected exactly one fenced `Usage: mms [OPTIONS] COMMAND` block "
+            f"in docs/cli.md (the top-level help), found {len(blocks)} — the "
+            "reference was restructured; update this test alongside it."
+        )
+    commands_match = re.search(r"Commands:\n(.*)\Z", blocks[0], re.DOTALL)
+    assert commands_match, "The top-level help block lost its `Commands:` listing"
+    documented = dict(re.findall(r"^ {2}(\S+) +(.+?)\s*$", commands_match.group(1), re.MULTILINE))
+    registered = mms_cli.commands
+    assert set(documented) == set(registered), (
+        "docs/cli.md Commands index is out of sync with the `mms` click "
+        f"group.\n  missing from docs: {sorted(set(registered) - set(documented))}\n"
+        f"  documented but not registered: {sorted(set(documented) - set(registered))}\n"
+        "Regenerate the block from `mms --help`."
+    )
+    for name, desc in documented.items():
+        prefix = desc[:-3].rstrip() if desc.endswith("...") else desc
+        actual = registered[name].get_short_help_str(limit=500)
+        assert actual.startswith(prefix), (
+            f"docs/cli.md Commands index line for `{name}` no longer matches "
+            f"its short help.\n  documented: {desc!r}\n  actual:     {actual!r}\n"
+            "Regenerate the block from `mms --help`."
+        )
+
+
+def test_cli_md_eject_usage_block_flags_match_command() -> None:
+    """docs/cli.md's ``### `eject` `` usage block must list exactly the
+    options ``mms eject`` exposes — both directions — plus the prune
+    backup log the section points at (#475 PR4).
+
+    ``mms eject`` is the data-loss-sensitive end of the #475 round-trip:
+    its guards (``--accept-schema-loss``, ``--allow-argv-secrets``,
+    ``--force``) exist to make destructive variants explicit. A flag added
+    to the command but absent from the docs leaves users discovering
+    safety semantics from error messages; a documented flag the command
+    dropped is worse — copy-pasted commands fail.
+    """
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    eject_cmd = mms_cli.commands.get("eject")
+    assert eject_cmd is not None, "`mms eject` is gone — update docs/cli.md and this test"
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `eject`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    assert section_match, "docs/cli.md must have a ### `eject` section"
+    section = section_match.group(1)
+    block_match = re.search(r"```\n(Usage: mms eject .*?)```", section, re.DOTALL)
+    assert block_match, "the eject section lost its fenced usage block"
+
+    # Option lines sit at exactly two spaces of indent (`  --to TARGET`,
+    # `  -y, --yes`); wrapped continuation lines are indented deeper, so
+    # flag mentions inside option help text don't count as documented.
+    documented = set(re.findall(r"^ {2}(?:-\w, )?(--[\w-]+)", block_match.group(1), re.MULTILINE))
+    registered = {
+        opt
+        for param in eject_cmd.params
+        for opt in getattr(param, "opts", [])
+        if opt.startswith("--")
+    }
+    assert registered, "eject lost all its options? update this test"
+    assert documented == registered, (
+        "docs/cli.md eject usage block is out of sync with `mms eject`.\n"
+        f"  missing from docs: {sorted(registered - documented)}\n"
+        f"  documented but not on the command: {sorted(documented - registered)}\n"
+        "Regenerate the block from `mms eject --help` (drop the `-h, --help` "
+        "line, matching the other sections)."
+    )
+
+    # The no-origin fallback story leans on the prune backup log; keep the
+    # filename in the section so the suggestion in eject's error output has
+    # a documented home. The literal is pinned against the source so a
+    # rename fails here instead of silently splitting the two.
+    backup_name = "pruned_upstreams.json"
+    assert backup_name in _read("src/memtomem_stm/cli/proxy.py")
+    assert backup_name in section, (
+        "docs/cli.md eject section must mention the prune backup log "
+        f"({backup_name}) — eject suggests it for entries without an origin."
+    )

@@ -539,6 +539,118 @@ class TestListServers:
         # The COMPRESSION column starts at the same offset on header
         # and row — drift used to put them several chars apart.
         assert header.index("COMPRESSION") == row.index("auto")
+        # Same pin for the ORIGIN column added in #475 PR4 ("-" is the
+        # no-provenance cell; this entry was added manually).
+        assert row[header.index("ORIGIN")] == "-"
+
+    def test_list_origin_column_summarizes_provenance(self, runner, config):
+        """The ORIGIN column shows the recorded source kind for imported
+        entries, ``*`` when the host original was pruned, and ``-`` for
+        entries without provenance (#475 PR4). The pruned legend points
+        at ``mms eject``."""
+
+        def _entry(kind: str, pruned: bool) -> dict:
+            return {
+                "prefix": "xx",
+                "transport": "stdio",
+                "command": "npx",
+                "origin": {
+                    "schema_version": 1,
+                    "source": {"kind": kind, "pruned": pruned},
+                    "duplicates": [],
+                    "imported_at": "2026-06-11T00:00:00Z",
+                    "original": {"command": "npx"},
+                },
+            }
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "manual": {"prefix": "mn", "command": "npx"},
+                        "stm-only": _entry("claude-user", pruned=True),
+                        "dual": _entry("claude-desktop", pruned=False),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        header = next(line for line in lines if "NAME" in line and "ORIGIN" in line)
+        names = ("manual", "stm-only", "dual")
+        rows = {n: next(line for line in lines if line.startswith(n)) for n in names}
+        assert "claude-user*" in rows["stm-only"]
+        assert "claude-desktop" in rows["dual"]
+        assert "claude-desktop*" not in rows["dual"]
+        assert rows["manual"][header.index("ORIGIN")] == "-"
+        assert "mms eject" in result.output
+
+    def test_list_no_pruned_marker_when_unpruned_duplicate_remains(self, runner, config):
+        """Partial prune (primary source pruned, duplicate source not) must
+        NOT star the row: an un-pruned duplicate still registers the server,
+        so 'exists only behind STM' would be false — and the marker would
+        contradict ``mms remove``'s orphaning hint, which shares the same
+        every-source predicate (codex R1)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "partial": {
+                            "prefix": "pa",
+                            "command": "npx",
+                            "origin": {
+                                "schema_version": 1,
+                                "source": {"kind": "claude-user", "pruned": True},
+                                "duplicates": [{"kind": "claude-desktop", "pruned": False}],
+                                "imported_at": "2026-06-11T00:00:00Z",
+                                "original": {"command": "npx"},
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        row = next(line for line in result.output.splitlines() if line.startswith("partial"))
+        assert "claude-user" in row
+        assert "claude-user*" not in row
+        assert "mms eject" not in result.output
+
+    def test_list_origin_legend_absent_without_pruned_entries(self, runner, config):
+        """The ``mms eject`` legend only appears when some row actually
+        carries the pruned marker — an all-dual / all-manual table stays
+        free of restore advice that doesn't apply."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "manual": {"prefix": "mn", "command": "npx"},
+                        "dual": {
+                            "prefix": "du",
+                            "command": "npx",
+                            "origin": {
+                                "schema_version": 1,
+                                "source": {"kind": "claude-user", "pruned": False},
+                                "duplicates": [],
+                                "imported_at": "2026-06-11T00:00:00Z",
+                                "original": {"command": "npx"},
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms eject" not in result.output
 
     def test_json_output(self, runner, config):
         """``list --json`` mirrors ``status --json`` shape for scripting."""
@@ -5464,6 +5576,149 @@ class TestRemove:
         assert result.exit_code != 0
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "fs" in data["upstream_servers"]
+
+
+class TestOriginFullyPruned:
+    """The shared every-source predicate behind the ``mms list`` pruned
+    marker and the ``mms remove`` orphaning hint. Strict types by design:
+    provenance is written by our own pydantic-backed writers, so malformed
+    shapes mean a hand-edited config — the predicate answers False rather
+    than letting truthiness back an unproven "registered nowhere" claim
+    (codex R2)."""
+
+    def _origin(self, *, pruned=True, duplicates=None) -> dict:
+        return {
+            "schema_version": 1,
+            "source": {"kind": "claude-user", "pruned": pruned},
+            "duplicates": [] if duplicates is None else duplicates,
+            "imported_at": "2026-06-11T00:00:00Z",
+            "original": {"command": "npx"},
+        }
+
+    def test_fully_pruned_with_and_without_duplicates(self):
+        from memtomem_stm.cli.proxy import _origin_fully_pruned
+
+        assert _origin_fully_pruned(self._origin()) is True
+        assert (
+            _origin_fully_pruned(
+                self._origin(duplicates=[{"kind": "claude-desktop", "pruned": True}])
+            )
+            is True
+        )
+
+    def test_unpruned_source_or_duplicate(self):
+        from memtomem_stm.cli.proxy import _origin_fully_pruned
+
+        assert _origin_fully_pruned(self._origin(pruned=False)) is False
+        assert (
+            _origin_fully_pruned(
+                self._origin(duplicates=[{"kind": "claude-desktop", "pruned": False}])
+            )
+            is False
+        )
+
+    def test_malformed_provenance_is_never_fully_pruned(self):
+        """Truthy-but-not-True values and wrong container shapes must not
+        classify as pruned: `"false"` is a truthy string, a dict
+        ``duplicates`` would iterate its keys, and a non-dict duplicate
+        row can't prove anything about its source."""
+        from memtomem_stm.cli.proxy import _origin_fully_pruned
+
+        assert _origin_fully_pruned(None) is False
+        assert _origin_fully_pruned("pruned") is False
+        assert _origin_fully_pruned({"source": "claude-user"}) is False
+        assert _origin_fully_pruned(self._origin(pruned="false")) is False
+        assert _origin_fully_pruned(self._origin(pruned=1)) is False
+        assert (
+            _origin_fully_pruned(self._origin(duplicates={"kind": "x", "pruned": False})) is False
+        )
+        assert _origin_fully_pruned(self._origin(duplicates=["claude-desktop"])) is False
+        assert (
+            _origin_fully_pruned(self._origin(duplicates=[{"kind": "x", "pruned": "false"}]))
+            is False
+        )
+
+
+class TestRemoveEjectHint:
+    """``mms remove`` warns before deleting the only registration of an
+    imported entry whose host original was pruned — the exact scenario
+    #475 exists for ("registered nowhere"). The hint is advisory: it
+    precedes the confirm prompt and never blocks the removal."""
+
+    def _imported_entry(self, *, pruned: bool = True, duplicates: list | None = None) -> dict:
+        return {
+            "prefix": "gh",
+            "transport": "stdio",
+            "command": "npx",
+            "origin": {
+                "schema_version": 1,
+                "source": {"kind": "claude-user", "pruned": pruned},
+                "duplicates": duplicates or [],
+                "imported_at": "2026-06-11T00:00:00Z",
+                "original": {"command": "npx"},
+            },
+        }
+
+    def _seed(self, config, entry: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {"gh": entry}}),
+            encoding="utf-8",
+        )
+
+    def test_hint_shown_and_removal_proceeds_under_yes(self, runner, config):
+        self._seed(config, self._imported_entry())
+        result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "registered nowhere" in result.output
+        assert "mms eject gh" in result.output
+        # The recorded kind resolves to its human label, not the raw kind.
+        assert "Claude Code (user)" in result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "gh" not in data["upstream_servers"]
+
+    def test_hint_precedes_confirm_so_decline_keeps_entry(self, runner, config):
+        """The point of hinting before the prompt: a TTY user who meant
+        'stop proxying, keep the server' can abort and run eject instead."""
+        self._seed(config, self._imported_entry())
+        result = runner.invoke(cli, ["remove", "gh", *_cfg_args(config)], input="n\n")
+        assert result.exit_code != 0
+        assert "mms eject gh" in result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "gh" in data["upstream_servers"]
+
+    def test_no_hint_without_origin(self, runner, config):
+        self._seed(config, {"prefix": "gh", "transport": "stdio", "command": "npx"})
+        result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms eject" not in result.output
+
+    def test_no_hint_when_host_original_remains(self, runner, config):
+        """Un-pruned origin → the host still has the direct registration;
+        removing the STM entry just stops proxying."""
+        self._seed(config, self._imported_entry(pruned=False))
+        result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms eject" not in result.output
+
+    def test_no_hint_when_unpruned_duplicate_remains(self, runner, config):
+        """A duplicate source that was never pruned still registers the
+        server somewhere — removal does not orphan it."""
+        self._seed(
+            config,
+            self._imported_entry(duplicates=[{"kind": "claude-desktop", "pruned": False}]),
+        )
+        result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms eject" not in result.output
+
+    def test_hint_when_every_source_was_pruned(self, runner, config):
+        self._seed(
+            config,
+            self._imported_entry(duplicates=[{"kind": "claude-desktop", "pruned": True}]),
+        )
+        result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms eject gh" in result.output
 
 
 # ── End-to-end ───────────────────────────────────────────────────────────
