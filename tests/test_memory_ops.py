@@ -11,6 +11,7 @@ touched.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,6 +29,13 @@ from memtomem_stm.proxy.memory_ops import (
     format_fact_md,
 )
 from memtomem_stm.proxy.protocols import IndexResult
+
+# The #456 mode tests assert POSIX bits; the traversal/slug tests stay
+# cross-platform (same split as test_sqlite_private / test_utils_fileio).
+_skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX 0o700/0o600 modes are unenforceable on Windows; chmod only toggles read-only",
+)
 
 
 # ── Stubs ────────────────────────────────────────────────────────────────
@@ -230,6 +238,7 @@ class TestAutoIndexResponse:
         assert written_path.name.startswith(".._.._tmp_evil__t__")
         assert written_path.exists()
 
+    @_skip_on_windows
     async def test_memory_dir_and_response_files_are_private(self, config):
         """0o700 dir / 0o600 files (#456): indexed responses are user
         conversation content, private like the SQLite stores (#458). The
@@ -380,6 +389,7 @@ class TestExtractAndStore:
         assert written_path.parent == config.memory_dir.expanduser().resolve()
         assert written_path.name.startswith(".._.._tmp_evil__ns_inner__fact__")
 
+    @_skip_on_windows
     async def test_fact_dir_and_files_are_private(self, config):
         """Same 0o700 dir / 0o600 file policy as auto_index_response (#456)."""
         extractor = FakeExtractor([self._fact("one insight")])
