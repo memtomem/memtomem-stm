@@ -389,6 +389,33 @@ class MetricsStore:
                 )
         return profiles
 
+    def get_tool_error_stats(
+        self, since_seconds: float, error_categories: tuple[str, ...]
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        """Per ``(server, tool)``: ``(call_count, matching_error_count)``.
+
+        Counts rows inside the look-back window; an error row contributes to
+        ``matching_error_count`` only when its ``error_category`` is in
+        *error_categories* — the tool-exposure health filter (#465) passes
+        the upstream-attributable categories so a proxy-internal pipeline
+        failure never counts against the upstream tool. An empty category
+        tuple therefore yields zero matching errors (calls still counted).
+        ``tool`` keys are raw upstream names, matching ``record()``.
+        """
+        if self._db is None:
+            return {}
+        cutoff = time.time() - since_seconds
+        placeholders = ",".join("?" for _ in error_categories) or "NULL"
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT server, tool, COUNT(*), "
+                "SUM(CASE WHEN is_error = 1 AND error_category IN "
+                f"({placeholders}) THEN 1 ELSE 0 END) "
+                "FROM proxy_metrics WHERE created_at >= ? GROUP BY server, tool",
+                (*error_categories, cutoff),
+            ).fetchall()
+        return {(r[0], r[1]): (r[2], r[3] or 0) for r in rows}
+
     def get_history(self, limit: int = 100) -> list[dict]:
         if self._db is None:
             return []
