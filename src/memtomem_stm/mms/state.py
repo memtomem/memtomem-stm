@@ -22,7 +22,11 @@ sandbox.
 
 from __future__ import annotations
 
+import os
+import time
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +34,11 @@ import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from memtomem_stm.utils.fileio import atomic_write_text
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — Windows builds lack fcntl
+    fcntl = None  # type: ignore[assignment]
 
 SCHEMA_VERSION = 1
 """Version constant for the three RFC §5.3 files (registry / projects index /
@@ -76,6 +85,11 @@ def import_state_path() -> Path:
     return mms_home() / "import_state.toml"
 
 
+def write_lock_path() -> Path:
+    """Advisory cross-process write lock for registry + sidecar mutations."""
+    return mms_home() / ".lock"
+
+
 PROJECT_MARKER_RELPATH = Path(".mms") / "project.toml"
 """Per-project marker relative path. Detection walks parents looking for this."""
 
@@ -118,6 +132,85 @@ class CorruptedConfig(MmsConfigError):
         super().__init__(f"{path}: {reason}")
         self.path = path
         self.reason = reason
+
+
+class WriteLockTimeout(MmsConfigError):
+    """Another process held the mms write lock past the acquisition timeout."""
+
+    def __init__(self, path: Path, timeout: float) -> None:
+        super().__init__(
+            f"timed out after {timeout:.0f}s waiting for the mms write lock ({path}) — "
+            "another `mms host sync --apply` or `mms import --apply` appears to be "
+            "running (possibly waiting at its confirmation prompt). Retry after it "
+            "finishes; the lock releases automatically when that process exits."
+        )
+        self.path = path
+        self.timeout = timeout
+
+
+# ---------------------------------------------------------------------------
+# Cross-process write lock
+# ---------------------------------------------------------------------------
+
+WRITE_LOCK_TIMEOUT_SECONDS = 10.0
+"""Default :func:`write_lock` acquisition timeout. Module-level so tests (and
+desperate operators via monkeypatching) can shrink it without threading a
+parameter through the CLI."""
+
+_WRITE_LOCK_POLL_SECONDS = 0.05
+
+
+@contextmanager
+def write_lock(*, enabled: bool = True, timeout: float | None = None) -> Iterator[None]:
+    """Hold the cross-process mms write lock for a load→mutate→save span.
+
+    ``mms host sync --apply`` and ``mms import --apply`` both read the
+    registry + sidecar, decide, and write both files back. The individual
+    writes are atomic (:func:`memtomem_stm.utils.fileio.atomic_write_text`),
+    but the read-modify-write spans are not: two concurrent ``--apply`` runs
+    interleave and the loser's load goes stale — its save silently drops the
+    winner's mutation. The lock serializes the whole span, *including* the
+    TTY confirmation prompt (releasing around the prompt would re-open the
+    stale-load window the lock exists to close).
+
+    ``flock`` is advisory and auto-releases when the holding process exits,
+    so a crashed holder cannot wedge later runs — no stale-lock cleanup
+    exists or is needed. Acquisition polls non-blocking so a held lock turns
+    into :class:`WriteLockTimeout` after ``timeout`` seconds (default
+    :data:`WRITE_LOCK_TIMEOUT_SECONDS`) instead of hanging the CLI behind an
+    unattended prompt.
+
+    No-ops when ``enabled`` is False (``--plan`` runs read but never write)
+    and on Windows (no ``fcntl``; single-user CLI, the lock is best-effort
+    hardening there, not a correctness guarantee).
+    """
+    if not enabled or fcntl is None:
+        yield
+        return
+    wait = WRITE_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    lock_path = write_lock_path()
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                # EWOULDBLOCK (held elsewhere) is the expected case; rarer
+                # flock failures (e.g. ENOLCK) retry the same way and
+                # surface as the same timeout — the operator action is
+                # identical either way.
+                if time.monotonic() >= deadline:
+                    raise WriteLockTimeout(lock_path, wait) from None
+                time.sleep(_WRITE_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
