@@ -330,6 +330,93 @@ class TestPrivacyGate:
         finally:
             cache.close()
 
+    def test_get_evicts_expired_sensitive_row(self, tmp_path):
+        # The sensitivity check must run BEFORE the expiry check: an
+        # already-expired sensitive row would otherwise return a miss while
+        # the secret keeps resting on disk until the next startup purge.
+        db_path = tmp_path / "expired_secret.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            raw = sqlite3.connect(str(db_path))
+            try:
+                raw.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _make_key("s", "sec", {}),
+                        "s",
+                        "sec",
+                        "login password=hunter2",
+                        time.time() - 100.0,
+                        1.0,
+                    ),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+
+            assert cache.get("s", "sec", {}) is None
+
+            check = sqlite3.connect(str(db_path))
+            try:
+                count = check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            finally:
+                check.close()
+            assert count == 0
+        finally:
+            cache.close()
+
+    def test_get_serves_miss_when_eviction_is_blocked(self, tmp_path):
+        # A concurrent writer holding the SQLite write lock makes the
+        # privacy-eviction DELETE raise OperationalError; get() must degrade
+        # to a plain miss (never propagate), keep the row for a later sweep,
+        # and evict it once the writer releases the lock.
+        db_path = tmp_path / "blocked_eviction.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            assert cache._db is not None
+            # Shrink the busy timeout so the blocked DELETE fails fast
+            # instead of stalling the test for the 3 s default.
+            cache._db.execute("PRAGMA busy_timeout=50")
+
+            raw = sqlite3.connect(str(db_path))
+            try:
+                raw.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _make_key("s", "sec", {}),
+                        "s",
+                        "sec",
+                        "login password=hunter2",
+                        time.time(),
+                        None,
+                    ),
+                )
+                raw.commit()
+
+                raw.execute("BEGIN IMMEDIATE")  # hold the write lock
+                assert cache.get("s", "sec", {}) is None  # miss, no raise
+                count = raw.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+                assert count == 1  # eviction failed, row still present
+                raw.rollback()  # release the lock
+            finally:
+                raw.close()
+
+            assert cache.get("s", "sec", {}) is None  # retried eviction
+            check = sqlite3.connect(str(db_path))
+            try:
+                count = check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            finally:
+                check.close()
+            assert count == 0
+        finally:
+            cache.close()
+
 
 class TestMakeKey:
     def test_deterministic(self):

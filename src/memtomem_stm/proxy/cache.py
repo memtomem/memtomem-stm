@@ -167,22 +167,36 @@ class ProxyCache:
         if row is None:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
-        if entry.is_expired():
-            return None
         if contains_sensitive_content(entry.result):
             # Read-side mirror of the ``set()`` gate: a row can land here
             # without passing ``set()`` — written by an older still-running
             # pre-gate process or an external SQL writer — and the startup
             # purge only covers rows present at ``initialize()``. Serving it
             # would break the SECURITY.md exclusion, so evict and miss.
-            with self._lock:
-                self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
-                self._db.commit()
+            # Checked BEFORE expiry: an expired sensitive row must still be
+            # deleted, not left resting on disk until the next startup.
+            try:
+                with self._lock:
+                    self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+                    self._db.commit()
+            except sqlite3.Error:
+                # Eviction is best-effort: a concurrent writer holding the
+                # file lock must degrade this to a plain miss, never abort
+                # the caller's request. The row is retried on the next
+                # ``get()`` and swept by the next startup purge.
+                logger.warning(
+                    "Privacy eviction failed for %s/%s — serving a miss",
+                    server,
+                    tool,
+                    exc_info=True,
+                )
             logger.debug(
                 "Evicted cached response for %s/%s: result matches a privacy pattern",
                 server,
                 tool,
             )
+            return None
+        if entry.is_expired():
             return None
         return entry.result
 
