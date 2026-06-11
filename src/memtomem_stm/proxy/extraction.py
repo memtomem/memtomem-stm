@@ -17,6 +17,7 @@ from memtomem_stm.proxy.config import (
     ExtractionStrategy,
     LLMProvider,
 )
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.numeric import safe_float
 
@@ -216,6 +217,20 @@ class FactExtractor:
     async def _extract_llm(self, text: str, *, server: str, tool: str) -> list[ExtractedFact]:
         """LLM-based extraction with circuit breaker and fallback."""
         if self._client is None:
+            return _extract_heuristic(text, max_facts=self._cfg.max_facts)
+        if self._llm_cfg.privacy_scan_enabled and contains_sensitive_content(
+            text, CREDENTIAL_PATTERNS
+        ):
+            # #454: same action gate as the LLM compression route (#289,
+            # credential set per #461) — a credential-bearing response must
+            # not cross the provider trust boundary. Heuristic extraction
+            # runs locally instead; persistence of its output is separately
+            # gated in memory_ops. Operators disable per-config when the
+            # provider is local/trusted (``privacy_scan_enabled=False``).
+            logger.info(
+                "Sensitive content detected, skipping LLM extraction (provider=%s)",
+                self._llm_cfg.provider.value,
+            )
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         if self._cb.is_open:
             logger.debug("Extraction circuit open, falling back to heuristic")
