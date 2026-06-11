@@ -231,7 +231,13 @@ def maybe_compress_builtin(
         # at/near ``max_chars`` (TruncateCompressor's own suffix may still add a
         # small, bounded overage — the budget is a target, not a hard cap).
         prefix = f"{_COMPRESS_SENTINEL}\n"
-        body_budget = max(1, cfg.max_chars - len(prefix))
+        if cfg.max_chars <= len(prefix):
+            # A budget that cannot even hold the sentinel cannot produce a
+            # meaningful replacement — prepending anyway would EXPAND the
+            # configured cap many-fold (max_chars=1 → ~18 chars of sentinel).
+            # Leave the output unchanged instead.
+            return None
+        body_budget = cfg.max_chars - len(prefix)
         compressed = TruncateCompressor().compress(stdout, max_chars=body_budget)
         clone = dict(original)
         clone["stdout"] = prefix + compressed
@@ -486,13 +492,15 @@ async def _run_hook(
             return out
         # Daemon unreachable. Kick off a lock-guarded background spawn so the
         # next call is warm (this call still degrades below). request_spawn is a
-        # quick flock probe + detached Popen — fire-and-forget, never blocking
-        # the hook budget, never raising into the hot path.
+        # quick flock probe + detached Popen — fire-and-forget, never raising
+        # into the hot path. Both steps are blocking syscalls (flock; fork/exec
+        # with a close_fds scan), so run them in a thread to keep the event
+        # loop free while the outer wait_for budget clock runs.
         if config.hook.auto_spawn:
             try:
                 from memtomem_stm.daemon.spawn import request_spawn
 
-                request_spawn(config)
+                await asyncio.to_thread(request_spawn, config)
             except Exception:
                 logger.debug("daemon auto-spawn failed", exc_info=True)
         if config.hook.fallback != "cold":
@@ -505,14 +513,16 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one ``hookSpecificOutput``.
 
-    Ordering matters. Compression runs **first and in-process** so a multi-MB
-    Bash result is shrunk before it could be sent whole to the daemon's 4 MiB
-    frame, and it is **independent of the surfacing gate** — it still runs when
-    surfacing is disabled or Bash is not in the *surface* allowlist. Surfacing
-    then runs on a frame-bounded copy of the payload, wrapped so that a
-    surfacing failure degrades to "no memories" while still returning the
-    compression half (``maybe_compress_builtin`` is itself non-raising). The CLI
-    wrapper backstops the whole call.
+    The two stages are independent. Compression is an opt-in, Bash-only
+    ``updatedToolOutput`` stage that clones the payload — it never alters
+    what surfacing (or the daemon) receives, and it still runs when
+    surfacing is disabled or Bash is not in the *surface* allowlist.
+    Daemon-frame protection comes solely from ``_bounded_surfacing_payload``
+    (:data:`_SAFE_DAEMON_BUDGET`), which caps the payload copy handed to
+    surfacing whether or not compression ran. Surfacing is wrapped so a
+    failure degrades to "no memories" while still returning the compression
+    half (``maybe_compress_builtin`` is itself non-raising). The CLI wrapper
+    backstops the whole call.
     """
     from memtomem_stm.config import STMConfig
 

@@ -401,6 +401,15 @@ def test_compress_reserves_sentinel_from_budget(monkeypatch: pytest.MonkeyPatch)
     assert out["stdout"] == f"{_COMPRESS_SENTINEL}\nBODY"
 
 
+def test_compress_skipped_when_budget_below_sentinel():
+    # max_chars only validates gt=0, so it can be configured below the
+    # sentinel prefix length. Prepending the sentinel anyway would EXPAND
+    # the configured cap many-fold (max_chars=1 → ~18 chars) — the stage
+    # must skip instead of "compressing" past its own budget.
+    cfg = HookCompressionConfig(enabled=True, max_chars=len(_COMPRESS_SENTINEL))
+    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), cfg) is None
+
+
 def test_compress_noop_for_plain_string_response():
     # For the built-in Bash tool, updatedToolOutput must be a structured object;
     # a bare string would be ignored by the host, so an unstructured response is
