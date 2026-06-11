@@ -102,3 +102,51 @@ jobs:
           path: bench-qa-report/
           if-no-files-found: warn
           retention-days: 14
+
+  bench_qa_pr_comment:
+    # Surface the bench_qa summary.md table as a sticky PR comment (item 5 of
+    # the post-gate roadmap). Deliberately a *separate* job from the required
+    # bench_qa gate so that (a) pull-requests:write is scoped to this job only,
+    # keeping the gate least-privilege, and (b) a comment failure can never
+    # turn the required check red. Runs even when the gate fails (always() +
+    # needs) so reviewers still see the table on a regression. Skipped on push
+    # and on fork PRs, whose GITHUB_TOKEN is read-only and cannot comment.
+    needs: bench_qa
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download bench_qa report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-qa-report
+          path: bench-qa-report
+      - name: Upsert sticky summary comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- bench-qa-summary -->'
+          FILE=bench-qa-report/summary.md
+          if [ ! -f "$FILE" ]; then
+            echo "no summary.md in artifact; nothing to post"
+            exit 0
+          fi
+          { printf '%s\n\n' "$MARKER"; cat "$FILE"; } > body.md
+          CID="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+                  --jq 'map(select((.body // "") | startswith("'"$MARKER"'"))) | .[0].id // empty')"
+          if [ -n "$CID" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -F body=@body.md >/dev/null
+            echo "updated sticky bench_qa comment ($CID)"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@body.md >/dev/null
+            echo "created sticky bench_qa comment"
+          fi
