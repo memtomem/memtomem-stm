@@ -275,6 +275,16 @@ class TokenTracker:
         self._surface_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
         self._total_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
 
+    @property
+    def metrics_store(self) -> MetricsStore | None:
+        """The persistent store this tracker writes through, if any.
+
+        Read-only access for consumers that need the persisted history
+        (e.g. the #465 exposure health filter) without a second wiring
+        path for the same object.
+        """
+        return self._metrics_store
+
     def record(self, metrics: CallMetrics) -> None:
         self._rps_tracker.record()
         self._total_calls += 1

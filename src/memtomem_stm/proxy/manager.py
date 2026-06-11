@@ -42,6 +42,7 @@ from memtomem_stm.proxy.compression import (
 from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
+    ExposureProfile,
     HybridConfig,
     LLMCompressorConfig,
     ProgressiveConfig,
@@ -64,8 +65,16 @@ from memtomem_stm.proxy.memory_ops import (
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
+from memtomem_stm.proxy.tool_eligibility import (
+    REASON_CONFIG_HIDDEN,
+    REASON_PROFILE_EXCLUDED,
+    ExposureCandidate,
+    compute_health_flags,
+    filter_tools,
+)
 from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25,
+    RANKER_VERSION_BM25_RISK,
     ToolRelevanceRanker,
     build_candidate_features,
     derive_query,
@@ -170,10 +179,19 @@ class ProxyManager:
         # Snapshots of the advertisement last returned by
         # ``get_proxy_tools()`` — the candidate set the client model picked
         # from: names go into selection telemetry (#467), the full infos
-        # feed tool-relevance ranking (#466). Empty until the first
-        # advertisement.
+        # feed tool-relevance ranking (#466), the hard filter's verdict
+        # (#465) rides along as reject reasons + review-profile risk
+        # penalties. Empty until the first advertisement.
         self._advertised_tools: list[str] = []
         self._advertised_infos: list[ProxyToolInfo] = []
+        self._advertised_reject_reasons: dict[str, str] = {}
+        self._advertised_risk_penalties: dict[str, float] = {}
+        # Health flags for the #465 filter, computed ONCE per start() from
+        # the persisted metrics store and held for the session — exposure
+        # must not drift between the startup advertisement (what the client
+        # registered) and later get_proxy_tools() calls (teardown, tests),
+        # or telemetry would lie about the candidate set the client saw.
+        self._unhealthy_tools: frozenset[tuple[str, str]] = frozenset()
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
@@ -298,6 +316,25 @@ class ProxyManager:
                 await self._connect_server(name, cfg, seen_prefixed)
             except Exception:
                 logger.exception("Failed to connect to upstream server '%s'", name)
+
+        # #465: evaluate per-tool health once per session, before the first
+        # advertisement. get_proxy_tools() applies this cached snapshot so
+        # the advertised set stays stable for the session; the next start()
+        # re-evaluates (startup-grained half-open probing — see
+        # proxy/tool_eligibility.py). Without a metrics store (metrics
+        # disabled) there is no health signal and the filter runs on
+        # config/structural rules alone.
+        exposure_cfg = self._config.exposure
+        self._unhealthy_tools = compute_health_flags(self.tracker.metrics_store, exposure_cfg)
+        if (
+            self.tracker.metrics_store is None
+            and exposure_cfg.profile is not ExposureProfile.EXPLORE
+        ):
+            logger.info(
+                "Exposure profile '%s' active without a metrics store — "
+                "health-based eligibility signals unavailable",
+                exposure_cfg.profile.value,
+            )
 
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
         match cfg.transport:
@@ -472,7 +509,18 @@ class ProxyManager:
     _convention_suffix = staticmethod(convention_suffix)
 
     def get_proxy_tools(self) -> list[ProxyToolInfo]:
-        result: list[ProxyToolInfo] = []
+        """Advertise upstream tools, gated by the #465 eligibility filter.
+
+        Builds the would-be advertisement for EVERY discovered tool (hidden
+        ones included — they used to be skipped inline here, and now become
+        structured ``config_hidden`` rejects instead) and hands the set to
+        ``tool_eligibility.filter_tools``, the single exposure choke point.
+        Only the filter's eligible output is returned/registered; the
+        reject reasons and review-profile risk penalties are snapshotted
+        alongside the advertisement so selection telemetry (#467) and
+        relevance ranking (#466) describe exactly this exposure decision.
+        """
+        candidates: list[ExposureCandidate] = []
         global_max_desc = self._config.max_description_chars
         global_strip = self._config.strip_schema_descriptions
 
@@ -482,10 +530,7 @@ class ProxyManager:
             strip = cfg.strip_schema_descriptions or global_strip
 
             for t in conn.tools:
-                # Check per-tool hidden override
                 override = cfg.tool_overrides.get(t.name)
-                if override is not None and override.hidden:
-                    continue
 
                 # Resolve effective compression + hybrid config for convention suffix
                 effective_compression = cfg.compression
@@ -515,19 +560,53 @@ class ProxyManager:
                 if strip:
                     schema = self._distill_schema(schema, True)
 
-                result.append(
-                    ProxyToolInfo(
-                        prefixed_name=f"{cfg.prefix}__{t.name}",
-                        description=desc,
-                        input_schema=schema,
-                        server=conn.name,
-                        original_name=t.name,
-                        annotations=getattr(t, "annotations", None),
+                candidates.append(
+                    ExposureCandidate(
+                        info=ProxyToolInfo(
+                            prefixed_name=f"{cfg.prefix}__{t.name}",
+                            description=desc,
+                            input_schema=schema,
+                            server=conn.name,
+                            original_name=t.name,
+                            annotations=getattr(t, "annotations", None),
+                        ),
+                        raw_description=t.description or "",
+                        raw_schema=t.inputSchema,
+                        server_config=cfg,
                     )
                 )
-        self._advertised_infos = result
-        self._advertised_tools = [info.prefixed_name for info in result]
-        return result
+
+        verdict = filter_tools(candidates, self._config.exposure, self._unhealthy_tools)
+        if verdict.reject_reasons != self._advertised_reject_reasons:
+            self._log_exposure_rejects(verdict.reject_reasons)
+        self._advertised_infos = verdict.eligible
+        self._advertised_tools = [info.prefixed_name for info in verdict.eligible]
+        self._advertised_reject_reasons = verdict.reject_reasons
+        self._advertised_risk_penalties = verdict.risk_penalties
+        return verdict.eligible
+
+    @staticmethod
+    def _log_exposure_rejects(reject_reasons: dict[str, str]) -> None:
+        """One line per advertisement *change*, so operators see what was
+        withheld and why without per-call noise. Config-driven rejects
+        (``hidden``, profile scoping) are the operator's own choices — those
+        log at DEBUG; everything else (structural, signal) is news and logs
+        at WARNING."""
+        if not reject_reasons:
+            return
+        expected = {REASON_CONFIG_HIDDEN, REASON_PROFILE_EXCLUDED}
+        news = {t: r for t, r in reject_reasons.items() if r not in expected}
+        if news:
+            logger.warning(
+                "Exposure filter withheld %d tool(s): %s",
+                len(news),
+                ", ".join(f"{t} ({r})" for t, r in sorted(news.items())),
+            )
+        if len(news) < len(reject_reasons):
+            logger.debug(
+                "Exposure filter applied config rejects: %s",
+                ", ".join(f"{t} ({r})" for t, r in sorted(reject_reasons.items()) if r in expected),
+            )
 
     @staticmethod
     def _create_scorer(config: ProxyConfig) -> RelevanceScorer:
@@ -1319,10 +1398,21 @@ class ProxyManager:
             if derived is None:
                 return None, None
             query, source = derived
-            ranked = ToolRelevanceRanker(top_n=trc.top_n).rank(query, self._advertised_infos)
+            penalties = self._advertised_risk_penalties
+            ranked = ToolRelevanceRanker(top_n=trc.top_n).rank(
+                query, self._advertised_infos, penalties
+            )
             if not ranked:
                 return None, None
-            return build_candidate_features(query, source, ranked), RANKER_VERSION_BM25
+            # The risk-penalty pathway changes the scoring function, so the
+            # cohort stamp must change with it — but only when a penalty
+            # actually shaped the scores (an all-zero map is v1 math).
+            version = (
+                RANKER_VERSION_BM25_RISK
+                if any(p > 0.0 for p in penalties.values())
+                else RANKER_VERSION_BM25
+            )
+            return build_candidate_features(query, source, ranked), version
         except Exception:
             logger.debug("Tool-relevance ranking failed", exc_info=True)
             return None, None
@@ -1354,6 +1444,7 @@ class ProxyManager:
                 trace_id=trace_id,
                 candidate_features=candidate_features,
                 ranker_version=ranker_version,
+                reject_reasons=self._advertised_reject_reasons,
             )
         except Exception:
             logger.debug("Selection telemetry write failed", exc_info=True)

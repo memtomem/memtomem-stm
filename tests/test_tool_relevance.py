@@ -149,9 +149,7 @@ class TestRanker:
         query = "read the config file"
         a = ToolRelevanceRanker().rank(query, CANDIDATES)
         b = ToolRelevanceRanker().rank(query, CANDIDATES, risk_penalties={})
-        c = ToolRelevanceRanker().rank(
-            query, CANDIDATES, risk_penalties={"test__read_file": 0.0}
-        )
+        c = ToolRelevanceRanker().rank(query, CANDIDATES, risk_penalties={"test__read_file": 0.0})
         assert json.dumps(a) == json.dumps(b) == json.dumps(c)
 
 
@@ -218,11 +216,7 @@ def _make_manager(
 
 
 def _events(log: SelectionTelemetryLog) -> list[dict]:
-    return [
-        json.loads(line)
-        for line in log.path.read_text(encoding="utf-8").splitlines()
-        if line
-    ]
+    return [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines() if line]
 
 
 class TestManagerWireIn:

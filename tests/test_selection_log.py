@@ -198,8 +198,12 @@ class TestSchemaStability:
         key sets must NOT change — candidate_features is populated, not
         added, and ranker_version is stamped per record on both halves."""
         log = _make_log(tmp_path)
-        feats = {"query_source": "args", "query_sha256": "0" * 64, "query_chars": 4,
-                 "ranked_candidates": []}
+        feats = {
+            "query_source": "args",
+            "query_sha256": "0" * 64,
+            "query_chars": 4,
+            "ranked_candidates": [],
+        }
         sid = log.log_selection(
             server="srv",
             selected_tool="test__tool",

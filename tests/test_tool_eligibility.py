@@ -5,23 +5,33 @@ recorded, rule precedence is stable, the profile ladder behaves
 (``strict`` rejects / ``review`` demotes via ``risk_penalties`` /
 ``explore`` ignores signal rules), structural and config rules apply in
 every profile, health flags come from upstream-attributable errors only,
-and the whole pass is deterministic and side-effect-free.
+and the whole pass is deterministic and side-effect-free. The manager
+wire-in section pins the cross-issue contract: reject reasons land in
+selection telemetry (#467), review penalties land in relevance ranking
+(#466), and a hard-rejected tool can never be resurrected by ranking.
 """
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 from memtomem_stm.proxy.config import (
+    CompressionStrategy,
     ExposureConfig,
     ExposureProfile,
+    ProxyConfig,
     ToolOverrideConfig,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ProxyToolInfo
-from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory
+from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo, UpstreamConnection
+from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
     REASON_DUPLICATE_NAME,
@@ -34,6 +44,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     compute_health_flags,
     filter_tools,
 )
+from memtomem_stm.proxy.tool_relevance import RANKER_VERSION_BM25_RISK
 
 
 def _server_cfg(prefix: str = "test", **kwargs: Any) -> UpstreamServerConfig:
@@ -108,9 +119,7 @@ class TestConfigRules:
         # Server restricts to explore; the tool-level list re-admits strict.
         cfg = _server_cfg(
             expose_in_profiles=[ExposureProfile.EXPLORE],
-            tool_overrides={
-                "a": ToolOverrideConfig(expose_in_profiles=[ExposureProfile.STRICT])
-            },
+            tool_overrides={"a": ToolOverrideConfig(expose_in_profiles=[ExposureProfile.STRICT])},
         )
         result = filter_tools([_cand("a", cfg), _cand("b", cfg)], STRICT)
         assert _names(result) == ["test__a"]
@@ -413,3 +422,147 @@ class TestGetToolErrorStats:
     def test_uninitialized_store_returns_empty(self, tmp_path):
         store = MetricsStore(tmp_path / "metrics.db")
         assert store.get_tool_error_stats(3600.0, UPSTREAM_ERROR_CATEGORIES) == {}
+
+
+# ── ProxyManager wire-in ─────────────────────────────────────────────────
+
+
+def _make_result(text: str):
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+
+
+def _make_manager(
+    tmp_path: Path,
+    *,
+    exposure: ExposureConfig | None = None,
+    tool_overrides: dict[str, ToolOverrideConfig] | None = None,
+    unhealthy: frozenset[tuple[str, str]] = frozenset(),
+) -> tuple[ProxyManager, SelectionTelemetryLog]:
+    server_cfg = UpstreamServerConfig(
+        prefix="test",
+        compression=CompressionStrategy.NONE,
+        max_retries=0,
+        reconnect_delay_seconds=0.0,
+        tool_overrides=tool_overrides or {},
+    )
+    proxy_cfg = ProxyConfig(
+        config_path=tmp_path / "proxy.json",
+        upstream_servers={"srv": server_cfg},
+        exposure=exposure or ExposureConfig(),
+    )
+    log = SelectionTelemetryLog(tmp_path / "log.jsonl")
+    log.initialize()
+    mgr = ProxyManager(proxy_cfg, TokenTracker(), selection_log=log)
+
+    tools = [
+        SimpleNamespace(
+            name="send_message",
+            description="Send a message to a Slack channel",
+            inputSchema={"type": "object", "properties": {"channel": {"type": "string"}}},
+        ),
+        SimpleNamespace(
+            name="read_file",
+            description="Read a file from the local filesystem",
+            inputSchema={"type": "object"},
+        ),
+    ]
+    session = AsyncMock()
+    session.call_tool.return_value = _make_result("ok!")
+    mgr._connections["srv"] = UpstreamConnection(
+        name="srv", config=server_cfg, session=session, tools=tools
+    )
+    mgr._unhealthy_tools = unhealthy
+    mgr.get_proxy_tools()  # advertise → snapshot eligibility verdict
+    return mgr, log
+
+
+def _events(log: SelectionTelemetryLog) -> list[dict]:
+    return [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines() if line]
+
+
+class TestManagerWireIn:
+    async def test_hidden_reject_reaches_telemetry_and_never_ranks(self, tmp_path):
+        """The resurrection invariant end-to-end: a hard-rejected tool is
+        absent from exposure, absent from candidate_tools, absent from
+        ranked_candidates — present only in reject_reasons."""
+        mgr, log = _make_manager(
+            tmp_path, tool_overrides={"read_file": ToolOverrideConfig(hidden=True)}
+        )
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == ["test__send_message"]
+
+        await mgr.call_tool("srv", "send_message", {"_context_query": "read a file"})
+        selection, _execution = _events(log)
+        assert selection["candidate_tools"] == ["test__send_message"]
+        assert selection["reject_reasons"] == {"test__read_file": REASON_CONFIG_HIDDEN}
+        ranked = selection["candidate_features"]["ranked_candidates"]
+        assert {r["tool"] for r in ranked} == {"test__send_message"}
+
+    async def test_unhealthy_strict_rejected_and_recorded(self, tmp_path):
+        mgr, log = _make_manager(tmp_path, unhealthy=frozenset({("srv", "read_file")}))
+        mgr.get_proxy_tools()
+        assert mgr._advertised_tools == ["test__send_message"]
+
+        await mgr.call_tool("srv", "send_message", {})
+        selection, _execution = _events(log)
+        assert selection["reject_reasons"] == {"test__read_file": REASON_UNHEALTHY}
+
+    async def test_review_penalty_flows_into_ranking_and_version(self, tmp_path):
+        mgr, log = _make_manager(
+            tmp_path,
+            exposure=ExposureConfig(profile=ExposureProfile.REVIEW, review_risk_penalty=0.5),
+            unhealthy=frozenset({("srv", "read_file")}),
+        )
+        mgr.get_proxy_tools()
+        # review: still advertised, nothing rejected.
+        assert mgr._advertised_tools == ["test__send_message", "test__read_file"]
+
+        await mgr.call_tool("srv", "read_file", {"_context_query": "read the file"})
+        selection, execution = _events(log)
+        assert selection["reject_reasons"] == {}
+        assert selection["ranker_version"] == RANKER_VERSION_BM25_RISK
+        assert execution["ranker_version"] == RANKER_VERSION_BM25_RISK
+        entry = next(
+            r
+            for r in selection["candidate_features"]["ranked_candidates"]
+            if r["tool"] == "test__read_file"
+        )
+        assert entry["risk_penalty"] == 0.5
+        assert entry["final_score"] == round(entry["relevance_score"] * 0.5, 6)
+        clean = next(
+            r
+            for r in selection["candidate_features"]["ranked_candidates"]
+            if r["tool"] == "test__send_message"
+        )
+        assert clean["risk_penalty"] == 0.0
+        assert clean["final_score"] == clean["relevance_score"]
+
+    async def test_strict_without_flags_keeps_v1_version(self, tmp_path):
+        mgr, log = _make_manager(tmp_path)
+        await mgr.call_tool("srv", "read_file", {"_context_query": "read the file"})
+        (selection, _execution) = _events(log)
+        assert selection["ranker_version"] == "v1-bm25-tool-relevance"
+        assert selection["reject_reasons"] == {}
+
+    async def test_advertisement_is_stable_across_calls(self, tmp_path):
+        """Teardown calls get_proxy_tools() again — same session state must
+        produce the identical advertisement and verdict."""
+        mgr, _log = _make_manager(tmp_path, unhealthy=frozenset({("srv", "read_file")}))
+        first = [i.prefixed_name for i in mgr.get_proxy_tools()]
+        rejects = dict(mgr._advertised_reject_reasons)
+        second = [i.prefixed_name for i in mgr.get_proxy_tools()]
+        assert first == second
+        assert mgr._advertised_reject_reasons == rejects
+
+    async def test_start_computes_health_flags_from_metrics_store(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        for _ in range(5):
+            _record(store, "broken", error=ErrorCategory.UPSTREAM_ERROR)
+        cfg = ProxyConfig(config_path=tmp_path / "proxy.json", upstream_servers={})
+        mgr = ProxyManager(cfg, TokenTracker(metrics_store=store))
+        await mgr.start()
+        try:
+            assert mgr._unhealthy_tools == frozenset({("srv", "broken")})
+        finally:
+            await mgr.stop()
+            store.close()
