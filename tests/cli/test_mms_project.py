@@ -274,6 +274,36 @@ def test_enable_appends_unique(runner, sandbox):
     assert cfg.mcp.enabled == ["a", "b", "c"]
 
 
+def test_show_duplicate_name_is_ambiguous(runner, sandbox):
+    # The index is keyed by canonical path, so two projects can share a name.
+    # `show NAME` must refuse like enable/disable do, not silently pick one.
+    a = sandbox["home"] / "proj-a"
+    b = sandbox["home"] / "proj-b"
+    a.mkdir()
+    b.mkdir()
+    runner.invoke(project_group, ["init", str(a), "--name", "same"])
+    runner.invoke(project_group, ["init", str(b), "--name", "same"])
+
+    res = runner.invoke(project_group, ["show", "same"])
+    assert res.exit_code != 0
+    assert "ambiguous (2 matches)" in res.output
+
+
+def test_enable_unknown_name_rejected_with_hint(runner, sandbox):
+    # A typo must not be silently persisted to the enabled list — it would
+    # resolve to nothing at proxy time with no signal to the user.
+    runner.invoke(project_group, ["init"])
+    _seed_registry("filesystem")
+
+    res = runner.invoke(project_group, ["enable", "filesytem"])  # typo
+    assert res.exit_code != 0
+    assert "Unknown MCP name(s): filesytem" in res.output
+    assert "filesystem" in res.output  # registered set shown as the hint
+
+    cfg = state.load_project_config(sandbox["cwd"] / state.PROJECT_MARKER_RELPATH)
+    assert cfg.mcp.enabled == []  # nothing persisted
+
+
 def test_enable_with_project_flag(runner, sandbox):
     other = sandbox["home"] / "other-proj"
     other.mkdir()

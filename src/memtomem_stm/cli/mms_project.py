@@ -182,6 +182,15 @@ def show_cmd(name: str | None, json_output: bool) -> None:
             raise click.ClickException(
                 f"Project '{name}' not found in {state.projects_index_path()}."
             )
+        # The index is keyed by canonical path, so two projects can share a
+        # name — mirror _resolve_project_for_mutation's ambiguity error
+        # instead of silently showing an arbitrary one of them.
+        if len(matches) > 1:
+            raise click.ClickException(
+                f"Project name '{name}' is ambiguous ({len(matches)} matches). "
+                "Run `mms project show` without NAME from inside the "
+                "target project root instead."
+            )
         entry = matches[0]
         marker = Path(entry.path) / state.PROJECT_MARKER_RELPATH
         if not marker.is_file():
@@ -305,6 +314,18 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
         # mode (PR2 has not landed yet). Pinned literal text per plan.
         click.echo(_REGISTRY_EMPTY_MSG, nl=False, err=True)
         raise click.exceptions.Exit(1)
+
+    # Reject names absent from the registry: a typo would otherwise be
+    # silently persisted to the enabled list and resolve to nothing at proxy
+    # time, with no signal to the user. `disable` stays registry-agnostic by
+    # design (its docstring: must work against an empty registry).
+    unknown = [m for m in mcps if m not in registry.servers]
+    if unknown:
+        known = ", ".join(sorted(registry.servers))
+        raise click.ClickException(
+            f"Unknown MCP name(s): {', '.join(unknown)}. "
+            f"Registered: {known}. Run `mms list` to inspect the registry."
+        )
 
     assert proj.config is not None  # _resolve_project_for_mutation guarantees MARKER
     current = list(proj.config.mcp.enabled)
