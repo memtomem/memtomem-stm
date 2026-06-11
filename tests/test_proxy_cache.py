@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
+
+import pytest
 
 from memtomem_stm.proxy.cache import (
     ProxyCache,
@@ -218,6 +221,201 @@ class TestLegacyTransientPurge:
             assert reopened.get("s", "upper", {}) == upper_row
         finally:
             reopened.close()
+
+
+class TestPrivacyGate:
+    """``set()`` refuses secret-looking results (SECURITY.md exclusion, #453)
+    and ``initialize`` purges matching rows that pre-date the gate."""
+
+    @pytest.mark.parametrize(
+        "secret_text",
+        [
+            "api_key: abc123-def",
+            "password=hunter2",
+            "token sk-" + "a" * 24,
+            "creds AKIA" + "B" * 16 + " end",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ],
+    )
+    def test_set_skips_secret_bearing_result(self, proxy_cache: ProxyCache, secret_text: str):
+        proxy_cache.set("s", "t", {}, secret_text, ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {}) is None
+
+    def test_set_stores_clean_result(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {}, "ordinary tool response", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {}) == "ordinary tool response"
+
+    def test_email_bearing_result_is_not_cached(self, proxy_cache: ProxyCache):
+        # The cache is a STORAGE consumer, so it scans the full
+        # DEFAULT_PATTERNS (credentials + PII) per the #461 split: an email
+        # is fine to show an external summarizer but not fine to persist.
+        # The cost is one pipeline re-run per repeat call, never correctness.
+        proxy_cache.set("s", "t", {}, "contact: dev@example.com", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {}) is None
+
+    def test_initialize_purges_legacy_secret_rows(self, tmp_path):
+        db_path = tmp_path / "legacy_secrets.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "plain", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+        # Seed the secret row via raw SQL: it models a row written by a
+        # pre-gate release — ``set()`` itself now refuses such content.
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _make_key("s", "sec", {}),
+                    "s",
+                    "sec",
+                    "login password=hunter2",
+                    time.time(),
+                    None,
+                ),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        # Re-open the SAME db: the startup purge runs in initialize().
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened.get("s", "sec", {}) is None
+            assert reopened.get("s", "plain", {}) == "ordinary cached response"
+        finally:
+            reopened.close()
+
+    def test_get_refuses_and_evicts_sensitive_row_written_after_startup(self, tmp_path):
+        # An older still-running pre-gate process (or an external SQL writer)
+        # can insert AFTER this process's startup purge ran — the read-side
+        # guard must refuse to serve the row and evict it.
+        db_path = tmp_path / "live_writer.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            raw = sqlite3.connect(str(db_path))
+            try:
+                raw.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _make_key("s", "sec", {}),
+                        "s",
+                        "sec",
+                        "login password=hunter2",
+                        time.time(),
+                        None,
+                    ),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+
+            assert cache.get("s", "sec", {}) is None
+
+            # Evicted, not just hidden: the row is gone from the table.
+            check = sqlite3.connect(str(db_path))
+            try:
+                count = check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            finally:
+                check.close()
+            assert count == 0
+        finally:
+            cache.close()
+
+    def test_get_evicts_expired_sensitive_row(self, tmp_path):
+        # The sensitivity check must run BEFORE the expiry check: an
+        # already-expired sensitive row would otherwise return a miss while
+        # the secret keeps resting on disk until the next startup purge.
+        db_path = tmp_path / "expired_secret.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            raw = sqlite3.connect(str(db_path))
+            try:
+                raw.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _make_key("s", "sec", {}),
+                        "s",
+                        "sec",
+                        "login password=hunter2",
+                        time.time() - 100.0,
+                        1.0,
+                    ),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+
+            assert cache.get("s", "sec", {}) is None
+
+            check = sqlite3.connect(str(db_path))
+            try:
+                count = check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            finally:
+                check.close()
+            assert count == 0
+        finally:
+            cache.close()
+
+    def test_get_serves_miss_when_eviction_is_blocked(self, tmp_path):
+        # A concurrent writer holding the SQLite write lock makes the
+        # privacy-eviction DELETE raise OperationalError; get() must degrade
+        # to a plain miss (never propagate), keep the row for a later sweep,
+        # and evict it once the writer releases the lock.
+        db_path = tmp_path / "blocked_eviction.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            assert cache._db is not None
+            # Shrink the busy timeout so the blocked DELETE fails fast
+            # instead of stalling the test for the 3 s default.
+            cache._db.execute("PRAGMA busy_timeout=50")
+
+            raw = sqlite3.connect(str(db_path))
+            try:
+                raw.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _make_key("s", "sec", {}),
+                        "s",
+                        "sec",
+                        "login password=hunter2",
+                        time.time(),
+                        None,
+                    ),
+                )
+                raw.commit()
+
+                raw.execute("BEGIN IMMEDIATE")  # hold the write lock
+                assert cache.get("s", "sec", {}) is None  # miss, no raise
+                count = raw.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+                assert count == 1  # eviction failed, row still present
+                raw.rollback()  # release the lock
+            finally:
+                raw.close()
+
+            assert cache.get("s", "sec", {}) is None  # retried eviction
+            check = sqlite3.connect(str(db_path))
+            try:
+                count = check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            finally:
+                check.close()
+            assert count == 0
+        finally:
+            cache.close()
 
 
 class TestMakeKey:

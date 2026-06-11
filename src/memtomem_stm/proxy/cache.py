@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -134,6 +135,27 @@ class ProxyCache:
                 (_PROGRESSIVE_MARKER, _SELECTION_KEY_MARKER, _TOC_SHAPE_MARKER),
             )
             db.commit()
+            # Purge of legacy rows cached before the privacy gate in ``set()``
+            # (#453) — they may embed secret-looking content that SECURITY.md
+            # promises is never persisted. Privacy patterns are Python regexes,
+            # so unlike the marker purge above this scans rows in Python; the
+            # scan and the gate share ``contains_sensitive_content`` so they
+            # can never diverge. Runs on every startup (matching the marker
+            # purge) — after the first pass it finds nothing, because ``set()``
+            # refuses new matching rows. Rows written LATER by an older
+            # still-running pre-gate process are outside this purge's reach;
+            # the read-side guard in ``get()`` refuses and evicts those.
+            stale_keys = [
+                key
+                for key, result in db.execute("SELECT cache_key, result FROM proxy_cache")
+                if contains_sensitive_content(result)
+            ]
+            if stale_keys:
+                db.executemany(
+                    "DELETE FROM proxy_cache WHERE cache_key = ?",
+                    [(key,) for key in stale_keys],
+                )
+                db.commit()
         except Exception:
             db.close()
             raise
@@ -156,6 +178,35 @@ class ProxyCache:
         if row is None:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
+        if contains_sensitive_content(entry.result):
+            # Read-side mirror of the ``set()`` gate: a row can land here
+            # without passing ``set()`` — written by an older still-running
+            # pre-gate process or an external SQL writer — and the startup
+            # purge only covers rows present at ``initialize()``. Serving it
+            # would break the SECURITY.md exclusion, so evict and miss.
+            # Checked BEFORE expiry: an expired sensitive row must still be
+            # deleted, not left resting on disk until the next startup.
+            try:
+                with self._lock:
+                    self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+                    self._db.commit()
+                logger.debug(
+                    "Evicted cached response for %s/%s: result matches a privacy pattern",
+                    server,
+                    tool,
+                )
+            except sqlite3.Error:
+                # Eviction is best-effort: a concurrent writer holding the
+                # file lock must degrade this to a plain miss, never abort
+                # the caller's request. The row is retried on the next
+                # ``get()`` and swept by the next startup purge.
+                logger.warning(
+                    "Privacy eviction failed for %s/%s — serving a miss",
+                    server,
+                    tool,
+                    exc_info=True,
+                )
+            return None
         if entry.is_expired():
             return None
         return entry.result
@@ -169,6 +220,17 @@ class ProxyCache:
         ttl_seconds: float | None,
     ) -> None:
         if self._db is None:
+            return
+        if contains_sensitive_content(result):
+            # SECURITY.md: responses that look like secrets are never
+            # persisted to the response cache. Enforced at the store
+            # chokepoint so no caller can bypass it (#453); a false positive
+            # only costs one un-cached response, never correctness.
+            logger.debug(
+                "Skipping cache store for %s/%s: response matches a privacy pattern",
+                server,
+                tool,
+            )
             return
         key = _make_key(server, tool, args)
         now = time.time()
