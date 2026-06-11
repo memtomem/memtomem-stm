@@ -150,6 +150,7 @@ class TestTracing:
         import memtomem_stm.observability.tracing as tracing_mod
 
         old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
         old_env = os.environ.get("OTEL_SERVICE_NAME")
         try:
             mock_langfuse_cls = MagicMock()
@@ -163,6 +164,10 @@ class TestTracing:
             config.public_key = "pk-test"
             config.secret_key = "sk-test"
             config.host = "http://localhost:3000"
+            # A real float: init_langfuse writes this into the module-global
+            # _sampling_rate, and a leaked MagicMock breaks every later
+            # traced() sampling comparison in the suite.
+            config.sampling_rate = 1.0
 
             os.environ.pop("OTEL_SERVICE_NAME", None)
             with patch.dict(sys.modules, {"langfuse": mock_module}):
@@ -177,6 +182,7 @@ class TestTracing:
             assert os.environ.get("OTEL_SERVICE_NAME") == "memtomem-stm"
         finally:
             tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
             if old_env is not None:
                 os.environ["OTEL_SERVICE_NAME"] = old_env
             else:
@@ -194,6 +200,107 @@ class TestTracing:
                 pass
         finally:
             tracing_mod._langfuse_client = old
+
+    def test_traced_degrades_when_client_method_raises(self) -> None:
+        # The proxy/surfacing hot paths wrap calls in `with traced(...)`; an
+        # SDK that raises while constructing the observation must degrade to
+        # untraced, never fail the proxied call.
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        old_warned = tracing_mod._warned_observation_failure
+        try:
+            tracing_mod._sampling_rate = 1.0
+            tracing_mod._warned_observation_failure = False
+            client = MagicMock()
+            client.start_as_current_observation.side_effect = RuntimeError("exporter down")
+            tracing_mod._langfuse_client = client
+            ran = False
+            with tracing_mod.traced("span"):
+                ran = True
+            assert ran
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+            tracing_mod._warned_observation_failure = old_warned
+
+    def test_traced_degrades_when_observation_enter_raises(self) -> None:
+        # Langfuse CMs do their real work in __enter__ (OTEL context attach,
+        # exporter I/O) — a raising __enter__ must not break the traced body,
+        # and the never-entered inner CM must not get an __exit__ call.
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        old_warned = tracing_mod._warned_observation_failure
+        try:
+            tracing_mod._sampling_rate = 1.0
+            tracing_mod._warned_observation_failure = False
+            broken_cm = MagicMock()
+            broken_cm.__enter__ = MagicMock(side_effect=RuntimeError("otel context corrupt"))
+            client = MagicMock()
+            client.start_as_current_observation.return_value = broken_cm
+            tracing_mod._langfuse_client = client
+            ran = False
+            with tracing_mod.traced("span"):
+                ran = True
+            assert ran
+            broken_cm.__exit__.assert_not_called()
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+            tracing_mod._warned_observation_failure = old_warned
+
+    def test_traced_body_exception_still_propagates(self) -> None:
+        # Only SDK enter/exit failures are swallowed — an exception raised by
+        # the traced body must propagate through the safe wrapper.
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        try:
+            tracing_mod._sampling_rate = 1.0
+            healthy_cm = MagicMock()
+            healthy_cm.__exit__ = MagicMock(return_value=False)
+            client = MagicMock()
+            client.start_as_current_observation.return_value = healthy_cm
+            tracing_mod._langfuse_client = client
+            with pytest.raises(ValueError, match="body error"):
+                with tracing_mod.traced("span"):
+                    raise ValueError("body error")
+            healthy_cm.__exit__.assert_called_once()
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+
+    def test_traced_sdk_failure_warns_once_then_debug(self, caplog) -> None:
+        # traced() sits on the hot path: a persistently broken exporter must
+        # warn exactly once, with repeats demoted to DEBUG.
+        import logging
+
+        import memtomem_stm.observability.tracing as tracing_mod
+
+        old = tracing_mod._langfuse_client
+        old_rate = tracing_mod._sampling_rate
+        old_warned = tracing_mod._warned_observation_failure
+        try:
+            tracing_mod._sampling_rate = 1.0
+            tracing_mod._warned_observation_failure = False
+            client = MagicMock()
+            client.start_as_current_observation.side_effect = RuntimeError("exporter down")
+            tracing_mod._langfuse_client = client
+            with caplog.at_level(logging.DEBUG, logger="memtomem_stm.observability.tracing"):
+                with tracing_mod.traced("a"):
+                    pass
+                with tracing_mod.traced("b"):
+                    pass
+            records = [r for r in caplog.records if "Langfuse observation" in r.getMessage()]
+            assert [r.levelname for r in records] == ["WARNING", "DEBUG"]
+        finally:
+            tracing_mod._langfuse_client = old
+            tracing_mod._sampling_rate = old_rate
+            tracing_mod._warned_observation_failure = old_warned
 
     def test_shutdown_langfuse_calls_shutdown(self) -> None:
         import memtomem_stm.observability.tracing as tracing_mod

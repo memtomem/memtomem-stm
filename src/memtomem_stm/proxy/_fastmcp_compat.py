@@ -104,6 +104,30 @@ def register_proxy_tool(
         )
         return
     if registered is not None:
-        if info.input_schema:
-            registered.parameters = info.input_schema
-        registered.fn_metadata = _PASSTHROUGH_METADATA
+        # Same version-drift posture as the two guards above: a future
+        # fastmcp that renames/removes these pydantic fields raises on
+        # assignment (pydantic v2 rejects setattr to a non-field), and the
+        # caller loops register_proxy_tool with no per-tool guard — one
+        # renamed field would otherwise abort registration of every
+        # remaining proxied tool and fail server startup.
+        #
+        # Order matters for a partial failure: fn_metadata (permissive
+        # passthrough validation) is written FIRST, so if the parameters
+        # write then fails the tool merely advertises a stale default
+        # schema while accepting real args. The reverse partial state —
+        # advertising the upstream schema while still validating with the
+        # original signature-derived model — would reject the very args
+        # the advertised schema invites.
+        try:
+            registered.fn_metadata = _PASSTHROUGH_METADATA
+            if info.input_schema:
+                registered.parameters = info.input_schema
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Cannot override schema for '%s' — FastMCP internal API changed. "
+                "Tool is registered but may show incorrect parameter schema.",
+                info.prefixed_name,
+                exc_info=True,
+            )
