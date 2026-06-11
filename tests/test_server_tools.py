@@ -1121,6 +1121,50 @@ class TestLifespan:
                 # ProxyManager.start() should NOT be called when proxy is disabled
                 mock_pm_instance.start.assert_not_awaited()
 
+    async def test_proxy_disabled_warns_when_surfacing_explicitly_on(self, caplog):
+        """An EXPLICITLY surfacing-enabled config under a disabled proxy
+        silently does nothing (the engine only initializes inside the proxy
+        branch), previously visible only on demand via stm_proxy_health —
+        startup must emit the #288-style "enabled but inert" warning. And
+        ONLY then: surfacing.enabled defaults to True, so the plain
+        control-only default startup (enabled-by-default, not explicitly
+        set) must stay warning-free, as must an explicit opt-out."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        cases = [
+            # (enabled, explicitly set?, expect warning)
+            (True, {"enabled"}, True),  # operator turned it on → warn
+            (True, set(), False),  # default-on, never touched → quiet
+            (False, {"enabled"}, False),  # explicit opt-out → quiet
+        ]
+        for enabled, fields_set, expect_warning in cases:
+            caplog.clear()
+            mock_pm_instance = MagicMock()
+            mock_pm_instance.start = AsyncMock()
+            mock_pm_instance.stop = AsyncMock()
+            mock_pm_instance.get_proxy_tools.return_value = []
+
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                mock_cfg = MockConfig.return_value
+                mock_cfg.proxy = MagicMock()
+                mock_cfg.proxy.enabled = False
+                mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+                mock_cfg.surfacing = MagicMock()
+                mock_cfg.surfacing.enabled = enabled
+                mock_cfg.surfacing.model_fields_set = fields_set
+                mock_cfg.langfuse = MagicMock()
+                mock_cfg.langfuse.enabled = False
+
+                with caplog.at_level("WARNING", logger="memtomem_stm.server"):
+                    async with app_lifespan(mcp) as _ctx:
+                        pass
+
+            inert = [r for r in caplog.records if "enabled but inert" in r.getMessage()]
+            assert bool(inert) is expect_warning, (enabled, fields_set)
+
     async def test_feedback_tracker_init_failure_degrades_gracefully(self):
         """FeedbackTracker raising at init should log and fall back to
         feedback_tracker=None — learning-loop feature must not crash the
