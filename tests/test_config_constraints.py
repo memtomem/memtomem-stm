@@ -9,6 +9,7 @@ from memtomem_stm.config import LangfuseConfig, STMConfig
 from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     ExtractionConfig,
+    HybridConfig,
     LLMCompressorConfig,
     LLMProvider,
     ProxyConfig,
@@ -78,6 +79,21 @@ class TestProxyNumericConstraints:
             prefix="x", reconnect_delay_seconds=5, max_reconnect_delay_seconds=5
         )
         assert cfg.reconnect_delay_seconds == 5
+
+    def test_hybrid_min_head_must_not_exceed_head(self) -> None:
+        """min_head_chars > head_chars makes HybridCompressor's head-budget
+        guard fall back to truncation on EVERY call — the operator's chosen
+        hybrid strategy silently never runs. Rejected at load instead."""
+        with pytest.raises(ValidationError, match="min_head_chars"):
+            HybridConfig(head_chars=5000, min_head_chars=9000)
+
+    def test_hybrid_min_head_equal_to_head_is_valid(self) -> None:
+        cfg = HybridConfig(head_chars=500, min_head_chars=500)
+        assert cfg.min_head_chars == cfg.head_chars
+
+    def test_hybrid_defaults_are_valid(self) -> None:
+        cfg = HybridConfig()
+        assert cfg.min_head_chars <= cfg.head_chars
 
 
 class TestSurfacingLtmTransportConfig:

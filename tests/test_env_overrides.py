@@ -7,6 +7,7 @@ win over file values both at startup and on hot-reload.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -108,6 +109,79 @@ class TestLoadFromFileWithEnvOverrides:
         )
 
         assert cfg is None
+
+
+class TestMalformedEnvOverrideDiagnostics:
+    """A malformed MEMTOMEM_STM_PROXY__* value still collapses the load to
+    defaults / None (the fallback semantics are deliberately unchanged), but
+    the warning must name the env var — otherwise the operator debugs the
+    healthy FILE while the env overlay is what broke the merged validation."""
+
+    def test_malformed_env_value_named_in_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 9000}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "abc"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None  # fallback unchanged: the whole load still degrades
+        assert any(
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_nested_malformed_env_value_named_in_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"enabled": True}}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-5"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in r.getMessage() for r in caplog.records
+        )
+
+    def test_file_caused_error_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A validation error caused by the FILE (no env override at that
+        location) must not implicate env vars."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": "abc"}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_env_only_path_names_the_env_var(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """File missing: the env-only rebuild degrades to defaults and the
+        warning names the malformed var."""
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS": "x"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(tmp_path / "nonexistent.json", overrides)
+
+        assert cfg is not None  # env-only path degrades to defaults, not None
+        assert cfg.lock_timeout_seconds == 30.0
+        assert any(
+            "MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS" in r.getMessage() for r in caplog.records
+        )
 
     def test_nested_env_override_merges_with_file(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "stm_proxy.json"

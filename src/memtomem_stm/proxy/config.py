@@ -9,7 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,36 @@ def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, An
         else:
             out[k] = v
     return out
+
+
+def _env_override_hint(exc: Exception, env_overrides: dict[str, Any] | None) -> str:
+    """Name the env var(s) implicated in a config ValidationError.
+
+    A malformed ``MEMTOMEM_STM_PROXY__*`` value fails validation of the
+    MERGED config, and the load falls back to defaults with a single warning
+    — without this hint the operator sees "Failed to parse proxy config
+    <file>" and debugs the FILE while the file is fine. Every error location
+    that resolves to a value supplied by the env overlay is mapped back to
+    its env var name. (Fallback semantics are unchanged: this only improves
+    the warning.)
+    """
+    if not env_overrides or not isinstance(exc, ValidationError):
+        return ""
+    implicated: set[str] = set()
+    for err in exc.errors():
+        node: Any = env_overrides
+        loc = err.get("loc", ())
+        for part in loc:
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                break
+        else:
+            if loc:
+                implicated.add(_PROXY_ENV_PREFIX + "__".join(str(p).upper() for p in loc))
+    if not implicated:
+        return ""
+    return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
 
 
 class CompressionStrategy(StrEnum):
@@ -119,6 +149,15 @@ class LLMCompressorConfig(BaseModel):
 
     @model_validator(mode="after")
     def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:
+        # Deliberately EAGER: every llm block in the config is validated at
+        # load, even when the strategy that would use it is not selected
+        # (compression: truncate with an attached llm block, or
+        # extraction.enabled: false). The trade was reviewed 2026-06-11 and
+        # kept: deferring the key check to first use would also defer the
+        # failure of a genuinely-enabled compressor from startup to the first
+        # tool call. Operators pasting an example llm block they don't use
+        # yet should remove it (or use provider: ollama) — documented in
+        # docs/compression.md.
         if self.provider not in (LLMProvider.OPENAI, LLMProvider.ANTHROPIC):
             return self
         if self.api_key:
@@ -147,6 +186,19 @@ class HybridConfig(BaseModel):
     min_toc_budget: int = Field(default=200, gt=0)
     min_head_chars: int = Field(default=100, gt=0)
     head_ratio: float = Field(default=0.6, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _check_ordering(self) -> Self:
+        # min_head_chars > head_chars makes HybridCompressor's head-budget
+        # guard fire on every call, silently degrading the operator's chosen
+        # hybrid strategy to plain truncation. Reject the combination at load
+        # like UpstreamServerConfig does for its dependent numeric fields,
+        # instead of accepting a config that is structurally a no-op.
+        if self.min_head_chars > self.head_chars:
+            raise ValueError(
+                f"min_head_chars ({self.min_head_chars}) must be <= head_chars ({self.head_chars})"
+            )
+        return self
 
 
 class SelectiveConfig(BaseModel):
@@ -585,6 +637,14 @@ class ProxyConfig(BaseModel):
         if ctx_tokens is None:
             return self.default_max_result_chars
         model_budget = int(ctx_tokens * self.context_budget_ratio * self.chars_per_token)
+        if model_budget <= 0:
+            # context_budget_ratio is validated ge=0.0, so 0 is a legal value —
+            # but a 0-char budget would flow into every per-server max_chars
+            # and compress responses to nothing whenever min_result_retention
+            # (itself disable-able with 0) doesn't rescue it. A degenerate
+            # model budget means "model scaling effectively off", not "no
+            # output": fall back to the static default, which is gt=0.
+            return self.default_max_result_chars
         return min(model_budget, self.default_max_result_chars)
 
     @staticmethod
@@ -620,7 +680,9 @@ class ProxyConfig(BaseModel):
                     return ProxyConfig.model_validate(env_overrides)
                 except Exception as exc:
                     logger.warning(
-                        "Env-only proxy config failed validation: %s — using defaults", exc
+                        "Env-only proxy config failed validation: %s%s — using defaults",
+                        exc,
+                        _env_override_hint(exc, env_overrides),
                     )
             return ProxyConfig()
         # Warn if config is group/world-readable (may contain API keys)
@@ -640,7 +702,12 @@ class ProxyConfig(BaseModel):
                 data = _deep_merge(data, env_overrides)
             return ProxyConfig.model_validate(data)
         except (json.JSONDecodeError, Exception) as exc:
-            logger.warning("Failed to parse proxy config %s: %s", resolved, exc)
+            logger.warning(
+                "Failed to parse proxy config %s: %s%s",
+                resolved,
+                exc,
+                _env_override_hint(exc, env_overrides),
+            )
             return None
 
 
