@@ -561,14 +561,22 @@ def _origin_fully_pruned(origin: Any) -> bool:
     duplicate still registers). Advisory by construction — flags are as
     recorded at prune time; ``mms eject``'s live no-clobber check stays the
     authoritative guard.
+
+    Strict types, not truthiness: the block is pydantic-built by our own
+    writers, so anything else is a hand-edited or corrupt config — e.g.
+    ``"pruned": "false"`` (truthy string) or a non-list ``duplicates`` —
+    and a claim this drives ("registered nowhere") must not rest on it.
+    Malformed provenance answers False (codex R2).
     """
     if not isinstance(origin, dict):
         return False
     source = origin.get("source")
-    if not isinstance(source, dict) or not source.get("pruned"):
+    if not isinstance(source, dict) or source.get("pruned") is not True:
         return False
-    duplicates = [d for d in origin.get("duplicates") or [] if isinstance(d, dict)]
-    return all(d.get("pruned") for d in duplicates)
+    duplicates = origin.get("duplicates") or []
+    if not isinstance(duplicates, list):
+        return False
+    return all(isinstance(d, dict) and d.get("pruned") is True for d in duplicates)
 
 
 def _origin_cell(cfg: Any) -> str:

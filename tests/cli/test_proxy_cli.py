@@ -5578,6 +5578,67 @@ class TestRemove:
         assert "fs" in data["upstream_servers"]
 
 
+class TestOriginFullyPruned:
+    """The shared every-source predicate behind the ``mms list`` pruned
+    marker and the ``mms remove`` orphaning hint. Strict types by design:
+    provenance is written by our own pydantic-backed writers, so malformed
+    shapes mean a hand-edited config — the predicate answers False rather
+    than letting truthiness back an unproven "registered nowhere" claim
+    (codex R2)."""
+
+    def _origin(self, *, pruned=True, duplicates=None) -> dict:
+        return {
+            "schema_version": 1,
+            "source": {"kind": "claude-user", "pruned": pruned},
+            "duplicates": [] if duplicates is None else duplicates,
+            "imported_at": "2026-06-11T00:00:00Z",
+            "original": {"command": "npx"},
+        }
+
+    def test_fully_pruned_with_and_without_duplicates(self):
+        from memtomem_stm.cli.proxy import _origin_fully_pruned
+
+        assert _origin_fully_pruned(self._origin()) is True
+        assert (
+            _origin_fully_pruned(
+                self._origin(duplicates=[{"kind": "claude-desktop", "pruned": True}])
+            )
+            is True
+        )
+
+    def test_unpruned_source_or_duplicate(self):
+        from memtomem_stm.cli.proxy import _origin_fully_pruned
+
+        assert _origin_fully_pruned(self._origin(pruned=False)) is False
+        assert (
+            _origin_fully_pruned(
+                self._origin(duplicates=[{"kind": "claude-desktop", "pruned": False}])
+            )
+            is False
+        )
+
+    def test_malformed_provenance_is_never_fully_pruned(self):
+        """Truthy-but-not-True values and wrong container shapes must not
+        classify as pruned: `"false"` is a truthy string, a dict
+        ``duplicates`` would iterate its keys, and a non-dict duplicate
+        row can't prove anything about its source."""
+        from memtomem_stm.cli.proxy import _origin_fully_pruned
+
+        assert _origin_fully_pruned(None) is False
+        assert _origin_fully_pruned("pruned") is False
+        assert _origin_fully_pruned({"source": "claude-user"}) is False
+        assert _origin_fully_pruned(self._origin(pruned="false")) is False
+        assert _origin_fully_pruned(self._origin(pruned=1)) is False
+        assert (
+            _origin_fully_pruned(self._origin(duplicates={"kind": "x", "pruned": False})) is False
+        )
+        assert _origin_fully_pruned(self._origin(duplicates=["claude-desktop"])) is False
+        assert (
+            _origin_fully_pruned(self._origin(duplicates=[{"kind": "x", "pruned": "false"}]))
+            is False
+        )
+
+
 class TestRemoveEjectHint:
     """``mms remove`` warns before deleting the only registration of an
     imported entry whose host original was pruned — the exact scenario
