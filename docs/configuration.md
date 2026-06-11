@@ -263,6 +263,9 @@ Full example with all options:
         "search_code": {
           "compression": "selective",
           "max_result_chars": 8000
+        },
+        "delete_repository": {
+          "expose_in_profiles": ["explore"]
         }
       }
     }
@@ -309,6 +312,13 @@ Full example with all options:
   "tool_relevance": {
     "enabled": true,
     "top_n": 20
+  },
+  "exposure": {
+    "profile": "strict",
+    "health_window_hours": 24.0,
+    "health_min_calls": 5,
+    "health_error_rate_threshold": 0.95,
+    "review_risk_penalty": 0.5
   }
 }
 ```
@@ -326,6 +336,24 @@ startup, like `metrics.enabled` — toggling it requires a restart.
 `candidate_features` — telemetry input only, exposure never changes. It is
 inert unless `selection_telemetry` is enabled, hot-reloadable, and bounded
 by `top_n`. Details in [selection-telemetry.md](selection-telemetry.md).
+
+`exposure` configures the tool-exposure hard filter: at advertisement time
+the proxy rejects tools that are config-hidden, scoped out of the active
+profile via `expose_in_profiles` (per-upstream or per-tool — tool wins),
+structurally broken (composed name over the 64-char MCP limit, duplicate
+composed names), or — under the `strict` profile — flagged by a signal:
+credential-looking text in the tool's description/schema, or a
+consistently-failing recent history in `proxy_metrics.db`
+(`health_error_rate_threshold` over `health_min_calls`+ calls within
+`health_window_hours`; only upstream-attributable errors count). Under
+`review`, signal-flagged tools stay advertised but carry
+`review_risk_penalty` in tool-relevance telemetry; under `explore`, signal
+rules are off. Health is evaluated once at startup, so the advertised set
+is stable for the session — a health-hidden tool is re-evaluated at the
+next restart and returns once its failures age out of the window. Reject
+reasons land in each selection event's `reject_reasons` when
+`selection_telemetry` is enabled; see
+[selection-telemetry.md](selection-telemetry.md) for the reason vocabulary.
 
 ### Token-equivalent budgets (CJK / non-Latin workloads)
 

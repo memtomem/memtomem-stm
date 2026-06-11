@@ -652,7 +652,10 @@ async def stm_proxy_health(
     lines = ["Upstream Server Health", "====================="]
     for name, info in health.items():
         status = "connected" if info["connected"] else "DISCONNECTED"
-        lines.append(f"  {name}: {status} ({info['tools']} tools)")
+        lines.append(
+            f"  {name}: {status} "
+            f"({info['tools']} tools discovered, {info['advertised_tools']} advertised)"
+        )
 
     surfacing = app.surfacing_engine
     if surfacing is not None:

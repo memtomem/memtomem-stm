@@ -167,6 +167,24 @@ class TestSchemaStability:
         assert execution["cost"] is None
         assert execution["cache_hit"] is None
 
+    def test_reject_reasons_are_per_call_populatable(self, tmp_path):
+        """#465 wires the hard filter's verdict into the reserved seam: the
+        top-level key set must NOT change — reject_reasons is populated,
+        not added — and omitting it keeps the v0 empty-map default."""
+        log = _make_log(tmp_path)
+        rejects = {"test__hidden": "config_hidden", "test__flaky": "unhealthy"}
+        log.log_selection(
+            server="srv",
+            selected_tool="test__tool",
+            candidate_tools=["test__tool"],
+            arguments={},
+            trace_id=None,
+            reject_reasons=rejects,
+        )
+        (selection,) = _read_events(log)
+        assert set(selection) == SELECTION_KEYS
+        assert selection["reject_reasons"] == rejects
+
     def test_lines_are_sorted_key_compact_json(self, tmp_path):
         log = _make_log(tmp_path)
         _log_pair(log)
@@ -180,8 +198,12 @@ class TestSchemaStability:
         key sets must NOT change — candidate_features is populated, not
         added, and ranker_version is stamped per record on both halves."""
         log = _make_log(tmp_path)
-        feats = {"query_source": "args", "query_sha256": "0" * 64, "query_chars": 4,
-                 "ranked_candidates": []}
+        feats = {
+            "query_source": "args",
+            "query_sha256": "0" * 64,
+            "query_chars": 4,
+            "ranked_candidates": [],
+        }
         sid = log.log_selection(
             server="srv",
             selected_tool="test__tool",

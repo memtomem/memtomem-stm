@@ -85,7 +85,7 @@ class TestStart:
             }
         )
 
-        async def _conditional_connect(name, cfg, seen):
+        async def _conditional_connect(name, cfg):
             if name == "bad":
                 raise ConnectionError("unreachable")
 
@@ -227,7 +227,7 @@ class TestConnectTimeout:
             patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
         ):
             with _pt.raises(asyncio.TimeoutError):
-                await mgr._connect_server("slow", cfg, set())
+                await mgr._connect_server("slow", cfg)
 
     async def test_start_logs_timeout_and_continues(self, caplog):
         """start() catches TimeoutError from _connect_server and continues."""
@@ -238,7 +238,7 @@ class TestConnectTimeout:
             }
         )
 
-        async def _conditional_connect(name, cfg, seen):
+        async def _conditional_connect(name, cfg):
             if name == "slow":
                 raise asyncio.TimeoutError()
 
@@ -276,23 +276,25 @@ class TestConnectServerCleanup:
             patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
         ):
             with _pt.raises(RuntimeError, match="catalog failed"):
-                await mgr._connect_server("bad", cfg, set())
+                await mgr._connect_server("bad", cfg)
 
         assert "bad" not in mgr._connections
         mock_session.__aexit__.assert_awaited_once()
         mock_transport.__aexit__.assert_awaited_once()
 
 
-# ── tool name overflow skip (#261) ───────────────────────────────────────
+# ── tool name overflow (#261 → exposure-time enforcement via #465) ──────
 
 
 class TestConnectServerOverflowSkip:
-    """Boot-time enforcement: when an upstream returns a tool whose
-    composed name (`mcp__<server>__<prefix>__<tool>`) would exceed the
-    64-char MCP regex, skip *that one tool* and register the rest.
-    Failing the entire upstream would be too aggressive — one bad name
-    shouldn't make every other tool from the same upstream invisible
-    (#261).
+    """When an upstream returns a tool whose composed name
+    (`mcp__<server>__<prefix>__<tool>`) would exceed the 64-char MCP regex,
+    only *that one tool* is withheld and the rest still register — one bad
+    name shouldn't make every other tool from the same upstream invisible
+    (#261). Since #465 the enforcement point is the exposure-time
+    eligibility filter (reason ``name_overflow``, visible to telemetry):
+    ``_connect_server`` keeps every discovered tool in ``conn.tools`` and
+    only logs the prefix-shortening guidance.
     """
 
     async def _stub_session(self, tool_names: list[str]) -> AsyncMock:
@@ -323,11 +325,12 @@ class TestConnectServerOverflowSkip:
         transport.__aexit__ = AsyncMock(return_value=False)
         return transport
 
-    async def test_overflowing_tool_is_skipped_others_register(self, caplog, monkeypatch) -> None:
+    async def test_overflowing_tool_is_withheld_others_register(self, caplog, monkeypatch) -> None:
         """Mixed catalogue: a 40-char tool with the original ``docs_langchain``
         prefix (14 chars) overflows the 64-char limit, while a short tool from
-        the same upstream fits. Expect: short tool registered, long tool
-        logged + skipped, manager keeps running."""
+        the same upstream fits. Expect: both tools kept in ``conn.tools``,
+        guidance logged at connect, and the long tool withheld at exposure
+        with a ``name_overflow`` reject on the normal startup path."""
         monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
 
         cfg = UpstreamServerConfig(prefix="docs_langchain")
@@ -351,11 +354,19 @@ class TestConnectServerOverflowSkip:
             patch("memtomem_stm.proxy.manager.ClientSession", return_value=session),
             caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"),
         ):
-            await mgr._connect_server("docs", cfg, set())
+            await mgr._connect_server("docs", cfg)
 
-        # Short tool registered, long tool not registered.
-        registered = [t.name for t in mgr._connections["docs"].tools]
-        assert registered == ["search"]
+        # Discovery keeps the full catalogue; exclusion is the filter's job.
+        discovered = [t.name for t in mgr._connections["docs"].tools]
+        assert discovered == ["search", "query_docs_filesystem_docs_by_lang_chain"]
+        # The first advertisement withholds the overflowing tool, with the
+        # verdict recorded for selection telemetry (#465 / codex R2: the
+        # structural reject must be observable on the NORMAL startup path).
+        advertised = [info.prefixed_name for info in mgr.get_proxy_tools()]
+        assert advertised == ["docs_langchain__search"]
+        assert mgr._advertised_reject_reasons == {
+            "docs_langchain__query_docs_filesystem_docs_by_lang_chain": "name_overflow"
+        }
         # Warning identifies the overflowing tool by name + composed length.
         warning_text = caplog.text
         assert "query_docs_filesystem_docs_by_lang_chain" in warning_text
@@ -367,7 +378,8 @@ class TestConnectServerOverflowSkip:
 
     async def test_short_prefix_lets_long_tool_through(self, caplog, monkeypatch) -> None:
         """With the recommended ``lc`` prefix the same long tool fits
-        (composed = 61 chars), so the skip path doesn't fire."""
+        (composed = 61 chars), so neither the guidance warning nor the
+        exposure reject fires."""
         monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
 
         cfg = UpstreamServerConfig(prefix="lc")
@@ -386,9 +398,10 @@ class TestConnectServerOverflowSkip:
             patch("memtomem_stm.proxy.manager.ClientSession", return_value=session),
             caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"),
         ):
-            await mgr._connect_server("docs", cfg, set())
+            await mgr._connect_server("docs", cfg)
 
-        registered = [t.name for t in mgr._connections["docs"].tools]
-        assert registered == ["query_docs_filesystem_docs_by_lang_chain"]
-        # No skip-warning in the log — no overflow happened.
-        assert "Skipping tool" not in caplog.text
+        advertised = [info.prefixed_name for info in mgr.get_proxy_tools()]
+        assert advertised == ["lc__query_docs_filesystem_docs_by_lang_chain"]
+        assert mgr._advertised_reject_reasons == {}
+        # No overflow guidance in the log — no overflow happened.
+        assert "will not be advertised" not in caplog.text

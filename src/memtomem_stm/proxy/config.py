@@ -197,6 +197,29 @@ class TransportType(StrEnum):
     STREAMABLE_HTTP = "streamable_http"
 
 
+class ExposureProfile(StrEnum):
+    """Operating mode for the tool-exposure hard filter (#465).
+
+    Controls how *signal-based* eligibility rules (runtime health,
+    sensitive-metadata scan) are enforced at tool-advertisement time.
+    Structural rules (composed-name overflow, duplicate names) and explicit
+    config rules (``hidden``, ``expose_in_profiles``) apply in every profile
+    — a profile never overrides what the operator wrote or what would break
+    the client.
+
+    - ``strict`` (default): signal rules hard-reject — flagged tools are not
+      advertised, with the reason recorded in selection telemetry.
+    - ``review``: signal rules demote instead of reject — flagged tools stay
+      advertised but carry a ``risk_penalty`` in tool-relevance telemetry
+      (#466), so an operator can observe what *would* be hidden.
+    - ``explore``: signal rules are off.
+    """
+
+    STRICT = "strict"
+    REVIEW = "review"
+    EXPLORE = "explore"
+
+
 class LLMProvider(StrEnum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
@@ -396,6 +419,16 @@ class ToolOverrideConfig(BaseModel):
     extraction: bool | None = None
     hidden: bool = False
     description_override: str | None = None
+    expose_in_profiles: list[ExposureProfile] | None = None
+    """Exposure profiles in which this tool is advertised (#465).
+
+    ``None`` (default) means every profile. A set list restricts the tool to
+    those profiles — e.g. ``["explore"]`` keeps a destructive admin tool out
+    of production exposure. Overrides the upstream-level
+    ``expose_in_profiles`` when both are set. An empty list is equivalent to
+    ``hidden: true``. This is a visibility constraint only; it does not
+    exempt the tool from signal-based rules in the profiles where it is
+    visible."""
 
 
 class UpstreamServerConfig(BaseModel):
@@ -427,6 +460,11 @@ class UpstreamServerConfig(BaseModel):
     tool_overrides: dict[str, ToolOverrideConfig] = {}
     auto_index: bool | None = None
     extraction: bool | None = None
+    expose_in_profiles: list[ExposureProfile] | None = None
+    """Exposure profiles in which this upstream's tools are advertised
+    (#465). ``None`` (default) means every profile. Per-tool
+    ``expose_in_profiles`` overrides this when set. See
+    ``ToolOverrideConfig.expose_in_profiles``."""
     surfacing_enabled: bool = True
     """Opt this upstream's proxied tool responses in/out of the SURFACE stage
     (proactive memory surfacing). Default ``True`` preserves existing behavior;
@@ -568,6 +606,45 @@ class ToolRelevanceConfig(BaseModel):
     set is already in ``candidate_tools``; this bounds the scored list)."""
 
 
+class ExposureConfig(BaseModel):
+    """Configuration for the STM-native tool-exposure hard filter (#465).
+
+    The filter runs at advertisement time (``ProxyManager.get_proxy_tools``)
+    — the proxy's tool-exposure choke point — and decides which upstream
+    tools the client model gets to see. Rejected tools are not registered;
+    their reject reasons land in selection telemetry (#467,
+    ``reject_reasons``) when it is enabled. Relevance ranking (#466) runs
+    over the filter's *output*, so a hard-rejected tool can never be
+    resurrected by ranking.
+
+    Health signals are evaluated once at proxy startup from the persisted
+    metrics store (``proxy_metrics.db``), so the advertised set is stable
+    for the lifetime of the session — MCP clients are not guaranteed to
+    re-list tools, and a mid-session change would make telemetry lie about
+    what the client saw. A tool hidden for health is re-evaluated at the
+    next startup: once its failures age out of ``health_window_hours`` it
+    is advertised again (startup-grained half-open probing).
+    """
+
+    profile: ExposureProfile = ExposureProfile.STRICT
+    health_window_hours: float = Field(default=24.0, gt=0.0)
+    """Look-back window over ``proxy_metrics.db`` for per-tool health."""
+    health_min_calls: int = Field(default=5, gt=0)
+    """Minimum calls inside the window before health is judged at all —
+    below this the tool is presumed healthy (insufficient evidence)."""
+    health_error_rate_threshold: float = Field(default=0.95, gt=0.0, le=1.0)
+    """Upstream-attributable error rate (transport / timeout / protocol /
+    upstream_error — proxy-internal pipeline errors do not count against
+    the tool) at or above which a tool is flagged unhealthy. The default
+    is deliberately conservative: only consistently failing tools
+    (≥95% of recent calls) are flagged."""
+    review_risk_penalty: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Multiplicative demotion recorded for signal-flagged tools under the
+    ``review`` profile: ``final_score = relevance_score * (1 - penalty)``
+    in tool-relevance telemetry (#466). Exposure itself never changes in
+    ``review``."""
+
+
 # Static context window sizes (tokens) for known model families.
 # Used by ProxyConfig.effective_max_result_chars() to scale compression budget.
 # Prefix-matched: "claude-sonnet-4-20250514" matches "claude-sonnet-4".
@@ -702,6 +779,7 @@ class ProxyConfig(BaseModel):
     progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
     selection_telemetry: SelectionTelemetryConfig = Field(default_factory=SelectionTelemetryConfig)
     tool_relevance: ToolRelevanceConfig = Field(default_factory=ToolRelevanceConfig)
+    exposure: ExposureConfig = Field(default_factory=ExposureConfig)
 
     @model_validator(mode="after")
     def _check_nonempty_upstream_prefixes(self) -> Self:

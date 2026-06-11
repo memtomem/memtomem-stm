@@ -124,6 +124,34 @@ class TestRanker:
     def test_empty_candidates(self):
         assert ToolRelevanceRanker().rank("anything", []) == []
 
+    def test_risk_penalty_demotes_by_final_score(self):
+        """#465 review-profile demotion: order follows final_score =
+        relevance * (1 - penalty), and both inputs stay in the record."""
+        query = "send a slack message to the channel"
+        baseline = ToolRelevanceRanker().rank(query, CANDIDATES)
+        assert baseline[0]["tool"] == "test__send_message"
+
+        ranked = ToolRelevanceRanker().rank(
+            query, CANDIDATES, risk_penalties={"test__send_message": 1.0}
+        )
+        flagged = next(r for r in ranked if r["tool"] == "test__send_message")
+        assert flagged["rank"] > 1  # fully penalized → sinks below the rest
+        assert flagged["risk_penalty"] == 1.0
+        assert flagged["final_score"] == 0.0
+        assert flagged["relevance_score"] == baseline[0]["relevance_score"]
+        # Unflagged candidates are untouched: penalty 0, final == relevance.
+        for entry in ranked:
+            if entry["tool"] != "test__send_message":
+                assert entry["risk_penalty"] == 0.0
+                assert entry["final_score"] == entry["relevance_score"]
+
+    def test_zero_penalty_map_is_identical_to_no_map(self):
+        query = "read the config file"
+        a = ToolRelevanceRanker().rank(query, CANDIDATES)
+        b = ToolRelevanceRanker().rank(query, CANDIDATES, risk_penalties={})
+        c = ToolRelevanceRanker().rank(query, CANDIDATES, risk_penalties={"test__read_file": 0.0})
+        assert json.dumps(a) == json.dumps(b) == json.dumps(c)
+
 
 # ── build_candidate_features ─────────────────────────────────────────────
 
@@ -188,11 +216,7 @@ def _make_manager(
 
 
 def _events(log: SelectionTelemetryLog) -> list[dict]:
-    return [
-        json.loads(line)
-        for line in log.path.read_text(encoding="utf-8").splitlines()
-        if line
-    ]
+    return [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines() if line]
 
 
 class TestManagerWireIn:

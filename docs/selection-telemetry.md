@@ -5,8 +5,9 @@ proxy sits in the call path, so it can record what an advisory analyzer never
 sees: which tool the client model actually called, out of which advertised
 candidate set, and how the call went. This log is the substrate for offline
 replay/eval (#468) and later learning stages (#469/#470), and the landing
-zone for hard-filter reject reasons once the STM-native selector ships
-(#465).
+zone for the STM-native hard filter's reject reasons (#465) — replay sees
+the tools that were withheld from the advertisement, not just the ones in
+it.
 
 Off by default — it is a new disk write path, so the operator opts in:
 
@@ -39,8 +40,11 @@ One JSON object per line, keys sorted, every record self-describing via
 by `tests/test_selection_log.py`) and `ranker_version`, a per-call cohort
 marker stamped on both halves of a pair: `"v0-passthrough"` when no ranking
 informed the call (the client model picked from the full advertised set
-unaided — the unranked baseline) and `"v1-bm25-tool-relevance"` when the
-#466 ranking ran (see [Tool-relevance ranking](#tool-relevance-ranking-466-v0)).
+unaided — the unranked baseline), `"v1-bm25-tool-relevance"` when the #466
+ranking ran (see [Tool-relevance ranking](#tool-relevance-ranking-466-v0)),
+and `"v2-bm25-risk-penalty"` when at least one nonzero #465 risk penalty
+shaped the scores (an all-zero penalty map is v1 math and keeps the v1
+stamp).
 
 ### `selection` — one per proxied call
 
@@ -50,7 +54,7 @@ unaided — the unranked baseline) and `"v1-bm25-tool-relevance"` when the
 | `trace_id` | joins `proxy_metrics.db` for per-stage diagnostics |
 | `server`, `selected_tool` | prefixed name, same vocabulary as `candidate_tools` |
 | `candidate_tools`, `candidate_count` | what the proxy last advertised (`get_proxy_tools()` snapshot) |
-| `reject_reasons` | `{}` until the #465 hard filter populates it (tool → reason) |
+| `reject_reasons` | prefixed tool → reason code for every tool the #465 filter withheld from that advertisement (see [Hard-filter reject reasons](#hard-filter-reject-reasons-465)); `{}` when nothing was rejected |
 | `candidate_features` | ranking output object when #466 ranking ran (shape below); `null` otherwise |
 | `graph_generation` | reserved `null` until toolgraph#13 integration |
 | `args_sha256`, `args_chars` | canonical-JSON hash + length of the call arguments |
@@ -106,10 +110,48 @@ query signal and recorded in `candidate_features`:
   call's top-level string argument values (sorted by key, capped); no
   signal → no ranking, and the pair keeps the `v0-passthrough` baseline.
   The raw query never enters the log — `query_source`/sha256/length only.
-- `risk_penalty` is a `0.0` placeholder: no risk table exists in this repo;
-  a real penalty input arrives with #465's STM-native filter signals.
+- `risk_penalty` is the #465 hard filter's demotion input: under the
+  `review` exposure profile a signal-flagged tool stays advertised but
+  carries the configured penalty, and `final_score = relevance_score *
+  (1 - risk_penalty)` (ordering follows `final_score`). Multiplicative
+  because BM25 scores are unbounded. Penalties are session-stable (health
+  flags are computed once at startup), so records stay deterministic
+  within a session and self-describing across sessions. When any nonzero
+  penalty applied, both pair halves stamp `"v2-bm25-risk-penalty"`.
 - `top_n` (default 20) bounds `ranked_candidates`; the full advertised set
   is already in `candidate_tools`.
+
+## Hard-filter reject reasons (#465)
+
+The exposure filter (`proxy/tool_eligibility.py`, configured by the
+`exposure` block — see [configuration.md](configuration.md)) decides at
+advertisement time which discovered tools the client model gets to see.
+Every withheld tool appears in `reject_reasons` as `prefixed_name →
+reason code`:
+
+| code | meaning | profiles |
+|---|---|---|
+| `duplicate_name` | composed name carried by more than one discovered tool — the entire ambiguous group is withheld | all |
+| `config_hidden` | per-tool `hidden: true` override | all |
+| `profile_excluded` | `expose_in_profiles` does not include the active profile | all |
+| `name_overflow` | composed client-side name exceeds the 64-char MCP limit | all |
+| `sensitive_metadata` | credential-pattern match in the tool's description/schema | rejects under `strict`; demotes under `review` |
+| `unhealthy` | upstream-attributable error rate over the recent metrics window crossed the threshold | rejects under `strict`; demotes under `review` |
+
+Reason codes are the only #465 payload in the log — no tool metadata, no
+error text — so the redaction policy below is untouched. `reject_reasons`
+keys are **disjoint from `candidate_tools` by construction**: an entry
+means that composed name was withheld from the client entirely. Ambiguous
+names are never auto-exposed in any profile: upstream calls route by raw
+tool name, so same-named occurrences (a pathological state — config
+validation rejects duplicate upstream prefixes, so this needs a
+misbehaving upstream or a bypassed config) are one callable entity wearing
+several metadata claims, and advertising a "clean" copy would attach
+metadata that does not bind to what executes. A rejected tool never
+appears in `candidate_tools` or `ranked_candidates`: ranking runs over the
+filter's eligible output and can never resurrect a reject (both pinned by
+`tests/test_tool_eligibility.py`). The codes are additive vocabulary:
+replay tooling should treat unknown codes as opaque.
 
 ## Redaction policy
 
