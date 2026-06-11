@@ -61,7 +61,11 @@ def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, An
     return out
 
 
-def _env_override_hint(exc: Exception, env_overrides: dict[str, Any] | None) -> str:
+def _env_override_hint(
+    exc: Exception,
+    env_overrides: dict[str, Any] | None,
+    file_data: dict[str, Any] | None = None,
+) -> str:
     """Name the env var(s) implicated in a config ValidationError.
 
     A malformed ``MEMTOMEM_STM_PROXY__*`` value fails validation of the
@@ -74,14 +78,45 @@ def _env_override_hint(exc: Exception, env_overrides: dict[str, Any] | None) -> 
     operator actually set — never synthesized from the error location alone:
     a model-level validator reports its error at the MODEL's path (e.g. a
     HybridConfig cross-field error at ``upstream_servers.gh.hybrid``), and
-    naming that prefix would point at a var that was never set. An error
-    location that resolves to an env subtree names every env leaf under it;
-    one that runs PAST an env leaf (the env string replaced a whole
-    container) names that leaf; one the env never touched names nothing.
+    naming that prefix would point at a var that was never set.
+
+    - An error location that resolves to an env subtree names every env
+      leaf under it.
+    - One that runs PAST an env leaf (the env string replaced a whole
+      container) names that leaf.
+    - One that leaves the env subtree mid-walk is attributed by PROVENANCE
+      against *file_data* (the pre-merge file contents): if the file also
+      supplies that subtree, the failing value is file-set and nothing is
+      named; if the subtree exists only because the env created it (e.g. a
+      required field missing from an env-built upstream entry), the env
+      leaves under it are named — that collapse is env-caused even though
+      the failing location itself was never set.
     """
     if not env_overrides or not isinstance(exc, ValidationError):
         return ""
     implicated: set[str] = set()
+
+    def _file_has(path: list[str]) -> bool:
+        node: Any = file_data
+        for part in path:
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                return False
+        return True
+
+    def _add_leaves(path: list[str], subtree: dict[str, Any]) -> None:
+        stack: list[tuple[list[str], dict[str, Any]]] = [(path, subtree)]
+        while stack:
+            prefix, node = stack.pop()
+            for key, value in node.items():
+                if isinstance(value, dict):
+                    stack.append(([*prefix, str(key)], value))
+                else:
+                    implicated.add(
+                        _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
+                    )
+
     for err in exc.errors():
         loc = err.get("loc", ())
         node: Any = env_overrides
@@ -94,24 +129,18 @@ def _env_override_hint(exc: Exception, env_overrides: dict[str, Any] | None) -> 
                 break
         if not consumed:
             continue  # the env overlay never touched this error's path
-        if isinstance(node, dict):
-            if len(consumed) < len(loc):
-                continue  # walk left the env subtree: the failing value is file-set
-            stack: list[tuple[list[str], dict[str, Any]]] = [(consumed, node)]
-            while stack:
-                path, sub = stack.pop()
-                for key, value in sub.items():
-                    if isinstance(value, dict):
-                        stack.append(([*path, str(key)], value))
-                    else:
-                        implicated.add(
-                            _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*path, str(key)])
-                        )
-        else:
+        if not isinstance(node, dict):
             # Landed on an env leaf — exact when consumed == loc; when the
             # error location goes deeper, this leaf REPLACED a container the
             # model expected, so it is still the var to fix.
             implicated.add(_PROXY_ENV_PREFIX + "__".join(p.upper() for p in consumed))
+        elif len(consumed) == len(loc) or not _file_has(consumed):
+            # Either a model-level (cross-field) error at a subtree the env
+            # touched, or the walk broke inside a subtree the env CREATED
+            # (the file doesn't supply it) — name the env leaves under it.
+            _add_leaves(consumed, node)
+        # else: the file supplies this subtree, so the failing value is
+        # file-set; implicate nothing.
     if not implicated:
         return ""
     return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
@@ -722,17 +751,17 @@ class ProxyConfig(BaseModel):
                 )
         except OSError:
             pass
+        file_data: dict[str, Any] | None = None
         try:
-            data: dict[str, Any] = json.loads(resolved.read_text(encoding="utf-8"))
-            if env_overrides:
-                data = _deep_merge(data, env_overrides)
+            file_data = json.loads(resolved.read_text(encoding="utf-8"))
+            data = _deep_merge(file_data, env_overrides) if env_overrides else file_data
             return ProxyConfig.model_validate(data)
         except (json.JSONDecodeError, Exception) as exc:
             logger.warning(
                 "Failed to parse proxy config %s: %s%s",
                 resolved,
                 exc,
-                _env_override_hint(exc, env_overrides),
+                _env_override_hint(exc, env_overrides, file_data),
             )
             return None
 

@@ -236,6 +236,47 @@ class TestMalformedEnvOverrideDiagnostics:
         assert cfg is None
         assert not any("implicated" in r.getMessage() for r in caplog.records)
 
+    def test_missing_field_in_env_created_entry_names_env_leaves(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An env var can CREATE an upstream entry that then fails on a
+        missing required field (prefix). The error loc points at the absent
+        field — outside the env subtree — but the collapse is env-caused:
+        the entry exists only because the env built it, so the env leaves
+        under it must be named."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 9000}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS": "5000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_missing_field_in_file_entry_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The provenance counterpart: when the FILE supplies the entry that
+        is missing its required field, an env var that merely touched the
+        same entry is innocent and must not be implicated."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"upstream_servers": {"gh": {"command": "gh-mcp"}}}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS": "5000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
     def test_env_only_path_names_the_env_var(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
