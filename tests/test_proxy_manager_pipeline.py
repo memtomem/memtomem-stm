@@ -180,8 +180,9 @@ class TestApplyCompression:
             api_key="k",
             # default privacy_scan_enabled = True
         )
-        # Real LLMCompressor instance — privacy scan runs against real
-        # DEFAULT_PATTERNS. Patch _call_api to fail loudly if reached.
+        # Real LLMCompressor instance — privacy scan runs against the real
+        # CREDENTIAL_PATTERNS the gate passes (L278 split). Patch _call_api
+        # to fail loudly if reached.
         with patch.object(
             compression_mod.LLMCompressor,
             "_call_api",
