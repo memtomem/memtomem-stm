@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import threading
 from contextlib import nullcontext
 from typing import Any
 
@@ -21,14 +22,17 @@ _SERVICE_NAME = "memtomem-stm"
 # hot paths, so a persistently broken exporter must not emit a stack trace
 # per call — the first failure warns, repeats go to DEBUG.
 _warned_observation_failure = False
+_warned_observation_failure_lock = threading.Lock()
 
 
 def _log_observation_failure(stage: str) -> None:
     global _warned_observation_failure
-    if _warned_observation_failure:
+    with _warned_observation_failure_lock:
+        first = not _warned_observation_failure
+        _warned_observation_failure = True
+    if not first:
         logger.debug("Langfuse observation %s failed (repeat, ignored)", stage, exc_info=True)
         return
-    _warned_observation_failure = True
     logger.warning(
         "Langfuse observation %s failed — proceeding untraced (repeats logged at DEBUG)",
         stage,

@@ -209,6 +209,7 @@ class TestTracing:
 
         old = tracing_mod._langfuse_client
         old_rate = tracing_mod._sampling_rate
+        old_warned = tracing_mod._warned_observation_failure
         try:
             tracing_mod._sampling_rate = 1.0
             tracing_mod._warned_observation_failure = False
@@ -222,6 +223,7 @@ class TestTracing:
         finally:
             tracing_mod._langfuse_client = old
             tracing_mod._sampling_rate = old_rate
+            tracing_mod._warned_observation_failure = old_warned
 
     def test_traced_degrades_when_observation_enter_raises(self) -> None:
         # Langfuse CMs do their real work in __enter__ (OTEL context attach,
@@ -231,6 +233,7 @@ class TestTracing:
 
         old = tracing_mod._langfuse_client
         old_rate = tracing_mod._sampling_rate
+        old_warned = tracing_mod._warned_observation_failure
         try:
             tracing_mod._sampling_rate = 1.0
             tracing_mod._warned_observation_failure = False
@@ -247,6 +250,7 @@ class TestTracing:
         finally:
             tracing_mod._langfuse_client = old
             tracing_mod._sampling_rate = old_rate
+            tracing_mod._warned_observation_failure = old_warned
 
     def test_traced_body_exception_still_propagates(self) -> None:
         # Only SDK enter/exit failures are swallowed — an exception raised by
