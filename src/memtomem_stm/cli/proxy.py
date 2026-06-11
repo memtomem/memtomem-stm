@@ -332,8 +332,16 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
         servers["memtomem-stm"] = entry
     # Atomic like every sibling config writer (_save, _desktop_json_remove_entry):
     # Claude Code re-reads .mcp.json at project load, and a crash/disk-full
-    # mid-write must leave the prior contents, not truncated JSON.
-    atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n")
+    # mid-write must leave the prior contents, not truncated JSON. Unlike
+    # those secret-bearing configs, .mcp.json is a shared project file: keep
+    # an existing file's mode, default new ones to 0o644 — without an
+    # explicit mode the helper's mkstemp temp (0600) survives the rename and
+    # silently makes the file unreadable to group/other.
+    try:
+        file_mode = mcp_path.stat().st_mode & 0o777
+    except OSError:
+        file_mode = 0o644
+    atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode)
     return mcp_path
 
 

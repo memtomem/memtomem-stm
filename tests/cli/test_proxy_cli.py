@@ -757,6 +757,26 @@ class TestAtomicSave:
         assert mcp_path.read_text(encoding="utf-8") == prior  # untouched
         assert list(tmp_path.glob(".mcp.json.*.tmp")) == []  # no temp litter
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_write_mcp_json_preserves_existing_mode(self, tmp_path: Path) -> None:
+        # .mcp.json is a shared (non-secret) project file. The atomic helper's
+        # mkstemp temp is 0600; without an explicit mode that would survive
+        # the rename and silently drop group/other read access (codex catch).
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text("{}", encoding="utf-8")
+        mcp_path.chmod(0o644)
+        _write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+        assert (mcp_path.stat().st_mode & 0o777) == 0o644
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_write_mcp_json_new_file_gets_project_mode(self, tmp_path: Path) -> None:
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        _write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+        assert ((tmp_path / ".mcp.json").stat().st_mode & 0o777) == 0o644
+
     def test_save_writes_payload_and_leaves_no_temp_file(self, tmp_path: Path) -> None:
         from memtomem_stm.cli.proxy import _save
 
