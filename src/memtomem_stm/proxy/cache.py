@@ -179,6 +179,11 @@ class ProxyCache:
                 with self._lock:
                     self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
                     self._db.commit()
+                logger.debug(
+                    "Evicted cached response for %s/%s: result matches a privacy pattern",
+                    server,
+                    tool,
+                )
             except sqlite3.Error:
                 # Eviction is best-effort: a concurrent writer holding the
                 # file lock must degrade this to a plain miss, never abort
@@ -190,11 +195,6 @@ class ProxyCache:
                     tool,
                     exc_info=True,
                 )
-            logger.debug(
-                "Evicted cached response for %s/%s: result matches a privacy pattern",
-                server,
-                tool,
-            )
             return None
         if entry.is_expired():
             return None
