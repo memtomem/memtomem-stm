@@ -64,6 +64,12 @@ from memtomem_stm.proxy.memory_ops import (
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
+from memtomem_stm.proxy.tool_relevance import (
+    RANKER_VERSION_BM25,
+    ToolRelevanceRanker,
+    build_candidate_features,
+    derive_query,
+)
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
     distill_schema,
@@ -161,11 +167,13 @@ class ProxyManager:
         self._cache = cache
         self._progressive_reads_tracker = progressive_reads_tracker
         self._selection_log = selection_log
-        # Snapshot of the prefixed tool names last returned by
+        # Snapshots of the advertisement last returned by
         # ``get_proxy_tools()`` — the candidate set the client model picked
-        # from, recorded in selection telemetry (#467). Empty until the
-        # first advertisement.
+        # from: names go into selection telemetry (#467), the full infos
+        # feed tool-relevance ranking (#466). Empty until the first
+        # advertisement.
         self._advertised_tools: list[str] = []
+        self._advertised_infos: list[ProxyToolInfo] = []
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
@@ -517,6 +525,7 @@ class ProxyManager:
                         annotations=getattr(t, "annotations", None),
                     )
                 )
+        self._advertised_infos = result
         self._advertised_tools = [info.prefixed_name for info in result]
         return result
 
@@ -1213,7 +1222,10 @@ class ProxyManager:
         # ``candidate_tools`` vocabulary, so replay tooling can match the
         # selected tool against the advertised set verbatim.
         selected_tool = f"{self._connections[server].config.prefix}__{tool}"
-        selection_id = self._log_selection(server, selected_tool, arguments, trace_id)
+        candidate_features, ranker_version = self._rank_candidates(arguments)
+        selection_id = self._log_selection(
+            server, selected_tool, arguments, trace_id, candidate_features, ranker_version
+        )
         started = _time.perf_counter()
         with traced(
             "proxy_call",
@@ -1269,10 +1281,51 @@ class ProxyManager:
                     started,
                     ok=False,
                     error_type=type(exc).__name__,
+                    ranker_version=ranker_version,
                 )
                 raise
-            self._log_execution(selection_id, server, selected_tool, trace_id, started, ok=True)
+            self._log_execution(
+                selection_id,
+                server,
+                selected_tool,
+                trace_id,
+                started,
+                ok=True,
+                ranker_version=ranker_version,
+            )
             return result
+
+    def _rank_candidates(
+        self, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Tool-relevance ranking for one call (#466 v0) — telemetry input only.
+
+        Returns ``(candidate_features, ranker_version)`` for the selection
+        event, or ``(None, None)`` when ranking did not run: telemetry off,
+        ranking disabled, nothing advertised yet, no query signal in the
+        call, or the ranker failed — the event then keeps the
+        unranked-baseline ``ranker_version`` so replay can split cohorts.
+        Runs before the sink's sampling decision, so a sampled-out call
+        wastes one cheap BM25 pass rather than leaking the sampling
+        decision out of the sink.
+        """
+        if self._selection_log is None:
+            return None, None
+        trc = self._config.tool_relevance
+        if not trc.enabled or not self._advertised_infos:
+            return None, None
+        try:
+            derived = derive_query(arguments)
+            if derived is None:
+                return None, None
+            query, source = derived
+            ranked = ToolRelevanceRanker(top_n=trc.top_n).rank(query, self._advertised_infos)
+            if not ranked:
+                return None, None
+            return build_candidate_features(query, source, ranked), RANKER_VERSION_BM25
+        except Exception:
+            logger.debug("Tool-relevance ranking failed", exc_info=True)
+            return None, None
 
     def _log_selection(
         self,
@@ -1280,6 +1333,8 @@ class ProxyManager:
         selected_tool: str,
         arguments: dict[str, Any],
         trace_id: str,
+        candidate_features: dict[str, Any] | None = None,
+        ranker_version: str | None = None,
     ) -> str | None:
         """Emit the selection-telemetry event for one proxied call (#467).
 
@@ -1297,6 +1352,8 @@ class ProxyManager:
                 candidate_tools=self._advertised_tools,
                 arguments=arguments,
                 trace_id=trace_id,
+                candidate_features=candidate_features,
+                ranker_version=ranker_version,
             )
         except Exception:
             logger.debug("Selection telemetry write failed", exc_info=True)
@@ -1312,12 +1369,15 @@ class ProxyManager:
         *,
         ok: bool,
         error_type: str | None = None,
+        ranker_version: str | None = None,
     ) -> None:
         """Emit the execution-outcome event paired to ``selection_id``.
 
         ``error_type`` is the exception class name only; the typed error
         category and message live in ``proxy_metrics.db``, joinable via
         ``trace_id`` — telemetry never duplicates (or leaks) error text.
+        ``ranker_version`` mirrors the paired selection so replay groups
+        both halves under the same cohort.
         """
         if self._selection_log is None or selection_id is None:
             return
@@ -1330,6 +1390,7 @@ class ProxyManager:
                 ok=ok,
                 latency_ms=(_time.perf_counter() - started) * 1000.0,
                 error_type=error_type,
+                ranker_version=ranker_version,
             )
         except Exception:
             logger.debug("Execution telemetry write failed", exc_info=True)

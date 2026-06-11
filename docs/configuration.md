@@ -305,6 +305,10 @@ Full example with all options:
     "sample_rate": 1.0,
     "max_bytes": 50000000,
     "max_backups": 3
+  },
+  "tool_relevance": {
+    "enabled": true,
+    "top_n": 20
   }
 }
 ```
@@ -316,6 +320,12 @@ redaction policy (no raw arguments, results, or error text ever reach the
 log), and the replay-join contract are documented in
 [selection-telemetry.md](selection-telemetry.md). The flag is read at
 startup, like `metrics.enabled` — toggling it requires a restart.
+
+`tool_relevance` ranks the advertised tools against each call's query signal
+(deterministic BM25) and records the result into the selection event's
+`candidate_features` — telemetry input only, exposure never changes. It is
+inert unless `selection_telemetry` is enabled, hot-reloadable, and bounded
+by `top_n`. Details in [selection-telemetry.md](selection-telemetry.md).
 
 ### Token-equivalent budgets (CJK / non-Latin workloads)
 

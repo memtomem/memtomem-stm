@@ -78,9 +78,12 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# Bump when the selection-scoring logic changes. v0 records no ranking at
-# all — the client model picks from the full advertised set — so replay
-# tooling can treat this version as the unranked baseline.
+# Per-record default when no ranking informed the call — the client model
+# picked from the full advertised set unaided — so replay tooling can treat
+# this version as the unranked baseline. Calls where a ranker ran stamp
+# their own version (e.g. ``tool_relevance.RANKER_VERSION_BM25``) on BOTH
+# halves of the pair via the ``ranker_version`` parameter, letting replay
+# split cohorts on this field alone.
 RANKER_VERSION = "v0-passthrough"
 
 
@@ -171,11 +174,16 @@ class SelectionTelemetryLog:
         candidate_tools: list[str],
         arguments: dict[str, Any] | None,
         trace_id: str | None,
+        candidate_features: dict[str, Any] | None = None,
+        ranker_version: str | None = None,
     ) -> str | None:
         """Record a selection event; returns its ``selection_id``.
 
         Returns ``None`` when the call is sampled out — the caller must then
-        skip ``log_execution`` so pairs stay atomic.
+        skip ``log_execution`` so pairs stay atomic. ``candidate_features``
+        is the ranker's output object (#466) — the caller guarantees it
+        carries no raw text, only scores/hashes; ``ranker_version`` stamps
+        which ranker produced it (``None`` = the unranked default).
         """
         if not self._sampled_in():
             with self._lock:
@@ -186,7 +194,7 @@ class SelectionTelemetryLog:
         appended = self._append(
             {
                 "schema_version": SCHEMA_VERSION,
-                "ranker_version": RANKER_VERSION,
+                "ranker_version": ranker_version or RANKER_VERSION,
                 "event": "selection",
                 "ts": time.time(),
                 "selection_id": selection_id,
@@ -196,7 +204,7 @@ class SelectionTelemetryLog:
                 "candidate_tools": list(candidate_tools),
                 "candidate_count": len(candidate_tools),
                 "reject_reasons": {},
-                "candidate_features": None,
+                "candidate_features": candidate_features,
                 "graph_generation": None,
                 "args_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
                 "args_chars": len(canonical),
@@ -219,11 +227,12 @@ class SelectionTelemetryLog:
         ok: bool,
         latency_ms: float,
         error_type: str | None = None,
+        ranker_version: str | None = None,
     ) -> None:
         self._append(
             {
                 "schema_version": SCHEMA_VERSION,
-                "ranker_version": RANKER_VERSION,
+                "ranker_version": ranker_version or RANKER_VERSION,
                 "event": "execution",
                 "ts": time.time(),
                 "selection_id": selection_id,

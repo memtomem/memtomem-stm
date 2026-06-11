@@ -551,6 +551,23 @@ class SelectionTelemetryConfig(BaseModel):
     """Rotated files kept (``.1`` … ``.N``); ``0`` truncates instead."""
 
 
+class ToolRelevanceConfig(BaseModel):
+    """Configuration for per-call tool-relevance ranking (#466 v0).
+
+    Deterministic BM25 ranking of the advertised tool set against the
+    call's query signal, recorded ONLY into selection telemetry
+    (``candidate_features``) — exposure never changes. Inert unless
+    ``selection_telemetry.enabled`` is also on (there is nowhere else for
+    the ranking to go in v0), so the default-on here adds no write path
+    by itself. Read per call via the hot-reloaded proxy config.
+    """
+
+    enabled: bool = True
+    top_n: int = Field(default=20, gt=0)
+    """Ranked candidates recorded per selection event (full advertised
+    set is already in ``candidate_tools``; this bounds the scored list)."""
+
+
 # Static context window sizes (tokens) for known model families.
 # Used by ProxyConfig.effective_max_result_chars() to scale compression budget.
 # Prefix-matched: "claude-sonnet-4-20250514" matches "claude-sonnet-4".
@@ -684,6 +701,7 @@ class ProxyConfig(BaseModel):
     )
     progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
     selection_telemetry: SelectionTelemetryConfig = Field(default_factory=SelectionTelemetryConfig)
+    tool_relevance: ToolRelevanceConfig = Field(default_factory=ToolRelevanceConfig)
 
     @model_validator(mode="after")
     def _check_nonempty_upstream_prefixes(self) -> Self:

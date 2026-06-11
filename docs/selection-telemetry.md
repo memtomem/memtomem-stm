@@ -36,10 +36,11 @@ failures produce orphan halves.
 
 One JSON object per line, keys sorted, every record self-describing via
 `schema_version` (bumped on any shape change — the exact key sets are pinned
-by `tests/test_selection_log.py`) and `ranker_version` (`"v0-passthrough"`
-today: no in-proxy ranking exists, the client model picks from the full
-advertised set, so replay tooling can treat this version as the unranked
-baseline).
+by `tests/test_selection_log.py`) and `ranker_version`, a per-call cohort
+marker stamped on both halves of a pair: `"v0-passthrough"` when no ranking
+informed the call (the client model picked from the full advertised set
+unaided — the unranked baseline) and `"v1-bm25-tool-relevance"` when the
+#466 ranking ran (see [Tool-relevance ranking](#tool-relevance-ranking-466-v0)).
 
 ### `selection` — one per proxied call
 
@@ -50,7 +51,8 @@ baseline).
 | `server`, `selected_tool` | prefixed name, same vocabulary as `candidate_tools` |
 | `candidate_tools`, `candidate_count` | what the proxy last advertised (`get_proxy_tools()` snapshot) |
 | `reject_reasons` | `{}` until the #465 hard filter populates it (tool → reason) |
-| `candidate_features`, `graph_generation` | reserved `null` until toolgraph#13/#15 integration |
+| `candidate_features` | ranking output object when #466 ranking ran (shape below); `null` otherwise |
+| `graph_generation` | reserved `null` until toolgraph#13 integration |
 | `args_sha256`, `args_chars` | canonical-JSON hash + length of the call arguments |
 | `ts` | unix seconds |
 
@@ -69,6 +71,45 @@ baseline).
 `selection_id`, optional `trace_id`, `user_corrected`, `operator_override`.
 Nothing in the proxy produces this signal today; emitters arrive with their
 signal sources (e.g. an operator-facing rating tool).
+
+## Tool-relevance ranking (#466 v0)
+
+When `tool_relevance.enabled` (default `true`, inert without
+`selection_telemetry.enabled` — there is nowhere else for the output to go
+in v0), each call's advertised candidate set is ranked against the call's
+query signal and recorded in `candidate_features`:
+
+```json
+{
+  "query_source": "context_query | args",
+  "query_sha256": "…",
+  "query_chars": 42,
+  "ranked_candidates": [
+    {"tool": "gh__create_issue", "rank": 1, "relevance_score": 2.41,
+     "risk_penalty": 0.0, "final_score": 2.41}
+  ]
+}
+```
+
+- **Telemetry input only — exposure never changes.** No `tools/list`
+  reorder, no `list_changed`, no meta-tool. Whether the ranking is worth
+  acting on is what offline replay (#468) decides from these records;
+  dynamic exposure is deferred until that evidence exists.
+- **Deterministic by construction**: BM25 only (the embedding scorer is
+  deliberately excluded — its scores drift across providers/model versions,
+  which would poison replay comparisons), candidates are the *advertised*
+  artifacts (post-truncation description, post-distill schema — what the
+  client actually saw), ties break on the prefixed name, never discovery
+  order. Same inputs → byte-identical output, pinned by
+  `tests/test_tool_relevance.py`.
+- **Query signal**: `_context_query` when the caller attaches one, else the
+  call's top-level string argument values (sorted by key, capped); no
+  signal → no ranking, and the pair keeps the `v0-passthrough` baseline.
+  The raw query never enters the log — `query_source`/sha256/length only.
+- `risk_penalty` is a `0.0` placeholder: no risk table exists in this repo;
+  a real penalty input arrives with #465's STM-native filter signals.
+- `top_n` (default 20) bounds `ranked_candidates`; the full advertised set
+  is already in `candidate_tools`.
 
 ## Redaction policy
 
