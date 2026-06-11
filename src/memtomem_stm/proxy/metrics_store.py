@@ -249,6 +249,19 @@ class MetricsStore:
             self._db = None
 
     def record(self, metrics: CallMetrics) -> None:
+        """Persist one per-call metrics row.
+
+        Synchronous sqlite write on the asyncio event loop: while it
+        runs, every runnable coroutine stalls — other in-flight proxied
+        calls included, not just the one that produced the row.
+        Accepted for the current local single-MCP-client deployment,
+        where call volume is low and a local WAL insert is far cheaper
+        than the upstream call it accounts for. Multi-client serving
+        (or materially higher concurrency) is the reopen trigger: move
+        persistence off-loop (e.g. ``asyncio.to_thread``) — readers and
+        writers here already share ``self._lock`` (see ``__init__``),
+        so this store is lock-ready for that move.
+        """
         if self._db is None:
             return
         now = time.time()

@@ -232,7 +232,23 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
 
 
 class FeedbackStore:
-    """SQLite store for surfacing events and feedback ratings."""
+    """SQLite store for surfacing events and feedback ratings.
+
+    The write paths (``record_surfacing`` / ``record_feedback`` /
+    ``mark_surfaced`` / ``save_adjustment`` / the ``cleanup_*`` sweeps)
+    do synchronous sqlite I/O on the asyncio event loop (proxy and
+    daemon paths alike): while one runs, every runnable coroutine
+    stalls — other in-flight calls included, not just the one being
+    served. Accepted for the current local single-MCP-client
+    deployment, where call volume is low and the writes are cheap local
+    inserts. Multi-client serving (or materially higher concurrency) is
+    the reopen trigger: move the writes off-loop (e.g.
+    ``asyncio.to_thread``) — and note ``self._lock`` serializes the
+    write paths only; the read/stat methods share the connection
+    unlocked, so a thread move also needs every connection access
+    locked (the ``MetricsStore.__init__`` reader/writer convention) or
+    per-thread connections.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path

@@ -96,6 +96,18 @@ class ProgressiveReadsStore:
         finally-block close, so hitting a closed store from the hot
         path would be a shutdown-race and losing a row is preferable
         to raising into the response path.
+
+        Synchronous sqlite write on the asyncio event loop: while it
+        runs, every runnable coroutine stalls — other in-flight proxied
+        calls included, not just the request being served. Accepted for
+        the current local single-MCP-client deployment (low call
+        volume; far cheaper than the upstream call). Multi-client
+        serving (or materially higher concurrency) is the reopen
+        trigger: move the write off-loop (e.g. ``asyncio.to_thread``) —
+        and note ``self._lock`` serializes the write paths only; reads
+        share the connection unlocked, so a thread move also needs
+        every connection access locked (the ``MetricsStore.__init__``
+        reader/writer convention) or per-thread connections.
         """
         if self._db is None:
             return

@@ -83,6 +83,19 @@ def response_carries_transient_key(text: str) -> bool:
 
 
 class ProxyCache:
+    """SQLite-backed cross-restart cache for proxied tool results.
+
+    Every method does synchronous sqlite I/O on the asyncio event loop:
+    while a ``get``/``set`` runs, every runnable coroutine stalls — other
+    in-flight proxied calls included, not just the one being served.
+    Accepted for the current local single-MCP-client deployment, where
+    call volume is low and the I/O is far cheaper than the upstream call
+    a hit avoids. Multi-client serving (or materially higher concurrency)
+    is the reopen trigger: move the I/O off-loop (e.g.
+    ``asyncio.to_thread``) — all connection access here already goes
+    through ``self._lock``, so this store is lock-ready for that move.
+    """
+
     def __init__(self, db_path: Path, max_entries: int = 10000) -> None:
         self._db_path = db_path
         self._max_entries = max_entries
