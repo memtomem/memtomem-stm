@@ -549,6 +549,25 @@ def _redacted_servers_json(servers: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _origin_cell(cfg: Any) -> str:
+    """ORIGIN table cell for one ``mms list`` row (#475 PR4).
+
+    ``-`` for entries without provenance (manual ``mms add``, pre-#475
+    imports); otherwise the recorded ``origin.source.kind`` — the
+    machine-readable identifier, not the human label, so the cell stays
+    within one column and matches what ``--json`` exposes. A trailing ``*``
+    marks a primary source whose host original was pruned (the entry now
+    exists only behind STM); the legend under the table points at
+    ``mms eject``. Unknown kinds print as recorded — the cell is a display
+    of stored provenance, not a validation of it.
+    """
+    origin = cfg.get("origin") if isinstance(cfg, dict) else None
+    source = origin.get("source") if isinstance(origin, dict) else None
+    if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
+        return "-"
+    return source["kind"] + ("*" if source.get("pruned") else "")
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
@@ -649,23 +668,33 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     # COMPRESSION and COMMAND/URL columns out of alignment with the
     # header. ``<16`` fits every Choice value the ``--transport`` flag
     # accepts (``stdio`` / ``sse`` / ``streamable_http``) with at least
-    # one space of padding.
-    click.echo(
-        _hdr(f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<16} {'COMPRESSION':<12} COMMAND / URL")
+    # one space of padding. ORIGIN ``<16`` likewise fits the widest
+    # source kind plus the pruned marker (``claude-desktop*``, 15).
+    header = (
+        f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<16} {'COMPRESSION':<12} "
+        f"{'ORIGIN':<16} COMMAND / URL"
     )
-    click.echo("-" * 80)
+    click.echo(_hdr(header))
+    click.echo("-" * len(header))
+    any_pruned = False
     for name, cfg in servers.items():
         transport = cfg.get("transport", "stdio")
         prefix = cfg.get("prefix", "")
         compression = cfg.get("compression", "auto")
+        origin_cell = _origin_cell(cfg)
+        any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
             cmd = cfg.get("command", "")
             args_str = " ".join(cfg.get("args", []))
             detail = f"{cmd} {args_str}".strip()
         else:
             detail = cfg.get("url", "")
-        click.echo(f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} {detail}")
+        click.echo(
+            f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} {origin_cell:<16} {detail}"
+        )
     click.echo(f"\n{len(servers)} server(s) configured.")
+    if any_pruned:
+        click.echo("* host original pruned — `mms eject NAME` restores it (see `mms eject -h`).")
 
 
 def _render_compression_block(summary: dict[str, Any]) -> None:
@@ -2423,6 +2452,43 @@ def register(config_path: str, mcp_mode: str | None) -> None:
     _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
 
 
+def _remove_eject_hint(name: str, entry: Any) -> str | None:
+    """Eject hint printed before removing an imported entry (#475 PR4).
+
+    Fires only when the recorded provenance says removal would leave the
+    server registered **nowhere**: the primary source was pruned and no
+    un-pruned duplicate source remains. Entries without an ``origin`` block
+    (manual ``mms add``, pre-#475 imports) and entries whose host original
+    still exists get no hint — removing those just stops proxying.
+
+    Advisory only: the flags are as recorded at prune time (a manually
+    re-added host entry isn't detected), and ``mms eject``'s live
+    no-clobber check stays the authoritative guard. The removal itself is
+    never blocked — the hint precedes the confirm prompt so a TTY user can
+    still abort.
+    """
+    if not isinstance(entry, dict):
+        return None
+    origin = entry.get("origin")
+    if not isinstance(origin, dict):
+        return None
+    source = origin.get("source")
+    if not isinstance(source, dict) or not source.get("pruned"):
+        return None
+    duplicates = [d for d in origin.get("duplicates") or [] if isinstance(d, dict)]
+    if any(not d.get("pruned") for d in duplicates):
+        return None
+    kind = source.get("kind")
+    spec = _SOURCE_BY_KIND.get(kind) if isinstance(kind, str) else None
+    label = spec.label if spec else (kind if isinstance(kind, str) else "its host client")
+    return (
+        f"{_warn('Note:')} '{name}' was imported from {label} and the host original "
+        "was pruned —\n"
+        "  removing it from STM leaves it registered nowhere.\n"
+        f"  To restore it to the host instead, run: mms eject {name}"
+    )
+
+
 @cli.command()
 @click.argument("name")
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
@@ -2445,6 +2511,10 @@ def remove(name: str, config_path: str, yes: bool) -> None:
     if name not in servers:
         click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
         sys.exit(1)
+
+    hint = _remove_eject_hint(name, servers[name])
+    if hint:
+        click.echo(hint)
 
     if not yes:
         click.confirm(f"Remove server '{name}'?", abort=True)
