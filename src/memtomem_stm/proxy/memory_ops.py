@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,23 @@ def _render_args(arguments: dict[str, Any]) -> str:
     value and the persisted value can never diverge.
     """
     return ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
+
+
+_PATH_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _path_slug(name: str) -> str:
+    """Collapse a server/tool name into one filesystem-safe path component.
+
+    Server keys and tool names come from trusted config / import flows, but
+    a hand-edited config can carry path separators (or a bare ``..``) that
+    make the write target under ``memory_dir`` unpredictable (#456). The
+    slug keeps ``[A-Za-z0-9._-]`` and replaces everything else with ``_``:
+    with separators gone, dots cannot climb directories, and the composed
+    ``{server}__{tool}__{ts}`` filename never collapses to ``.`` or ``..``.
+    Empty input becomes ``_`` so the filename keeps its field structure.
+    """
+    return _PATH_SLUG_RE.sub("_", name) or "_"
 
 
 def index_content_matches_privacy(
@@ -166,8 +184,7 @@ async def auto_index_response(
     memory_dir = ai_cfg.memory_dir.expanduser().resolve()
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-    safe_tool = tool.replace("/", "_")
-    fname = f"{server}__{safe_tool}__{ts}.md"
+    fname = f"{_path_slug(server)}__{_path_slug(tool)}__{ts}.md"
     file_path = memory_dir / fname
 
     args_str = _render_args(arguments)
@@ -198,10 +215,15 @@ async def auto_index_response(
         f"## Content\n\n{text}\n"
     )
 
-    memory_dir.mkdir(parents=True, exist_ok=True)
+    # 0o700 dir / 0o600 files: indexed responses are user conversation
+    # content under ``~/.memtomem``, private to the user like the SQLite
+    # stores (#458). The dir mode only applies at creation, so the file
+    # mode is set explicitly too — a pre-existing permissive memory_dir
+    # must not leave fresh response files at the umask default (#456).
+    memory_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Atomic so the auto-indexer (called next) can't observe a partial file
     # if the writer is killed mid-flush. The mkdir above ensured memory_dir.
-    atomic_write_text(file_path, md_content, ensure_parent=False)
+    atomic_write_text(file_path, md_content, ensure_parent=False, mode=0o600)
 
     ns = ai_cfg.namespace.format(server=server, tool=tool)
 
@@ -285,7 +307,7 @@ async def extract_and_store(
             return ExtractOutcome(ok=True, facts_stored=0)
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-        safe_tool = tool.replace("/", "_")
+        safe_server, safe_tool = _path_slug(server), _path_slug(tool)
 
         # Build every candidate fact file BEFORE any disk or indexer
         # interaction: the extractor (typically an LLM) can reassemble or
@@ -307,7 +329,8 @@ async def extract_and_store(
             return ExtractOutcome(ok=True, facts_stored=0)
 
         memory_dir = ext_cfg.memory_dir.expanduser().resolve()
-        memory_dir.mkdir(parents=True, exist_ok=True)
+        # Same 0o700 dir / 0o600 file policy as auto_index_response (#456).
+        memory_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         ns = ext_cfg.namespace.format(server=server, tool=tool)
 
         # Dedup: skip facts already in the index
@@ -328,10 +351,10 @@ async def extract_and_store(
                 except Exception:
                     pass  # on dedup failure, proceed with indexing
 
-            fname = f"{server}__{safe_tool}__fact__{ts}__{i:02d}.md"
+            fname = f"{safe_server}__{safe_tool}__fact__{ts}__{i:02d}.md"
             file_path = memory_dir / fname
             # Atomic so a kill between write and index_file leaves no partial.
-            atomic_write_text(file_path, md_content, ensure_parent=False)
+            atomic_write_text(file_path, md_content, ensure_parent=False, mode=0o600)
 
             if index_engine is None:
                 continue
