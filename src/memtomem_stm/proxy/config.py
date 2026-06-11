@@ -753,7 +753,14 @@ class ProxyConfig(BaseModel):
             pass
         file_data: dict[str, Any] | None = None
         try:
-            file_data = json.loads(resolved.read_text(encoding="utf-8"))
+            loaded = json.loads(resolved.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                # Reject non-object roots BEFORE the env merge: ``[]`` would
+                # otherwise slip through ``_deep_merge`` (``dict([])`` is
+                # ``{}``) and an env override on top would validate cleanly,
+                # silently accepting an invalid config file.
+                raise ValueError(f"config root must be a JSON object, got {type(loaded).__name__}")
+            file_data = loaded
             data = _deep_merge(file_data, env_overrides) if env_overrides else file_data
             return ProxyConfig.model_validate(data)
         except (json.JSONDecodeError, Exception) as exc:

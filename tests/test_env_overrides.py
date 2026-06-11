@@ -277,6 +277,23 @@ class TestMalformedEnvOverrideDiagnostics:
         assert cfg is None
         assert not any("implicated" in r.getMessage() for r in caplog.records)
 
+    def test_non_dict_config_root_rejected_even_with_env_overrides(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ``[]`` config root must fail the load even when env overrides
+        are present: ``dict([])`` is ``{}``, so the deep merge used to turn
+        the invalid file into a valid env-only config, silently dropping the
+        fact that the file is broken."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("[]")
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__ENABLED": "true"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any("JSON object" in r.getMessage() for r in caplog.records)
+
     def test_env_only_path_names_the_env_var(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
