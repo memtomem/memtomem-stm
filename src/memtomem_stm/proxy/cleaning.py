@@ -61,15 +61,17 @@ class DefaultContentCleaner:
         """Log a warning if the text contains likely prompt injection patterns.
 
         Detection-only: the output is never altered or blocked, so a miss
-        costs a log line, not an exploit. The scan is cost-bounded to the
+        costs a log line, not an exploit. The scan cost is bounded to 20,000
+        chars: a response up to that size is scanned in FULL (one window, so
+        a pattern straddling any offset is still seen); a larger one gets the
         first and last 10,000 chars — appending the payload after a large
-        benign body is the cheap way around a head-only window, so the tail
-        is scanned too, but an injection buried in the MIDDLE of a response
-        larger than 20,000 chars still goes unlogged by design.
+        benign body is the cheap way around a head-only window — while an
+        injection buried in its MIDDLE goes unlogged by design.
         """
-        samples = [text[:10_000]]
-        if len(text) > 10_000:
-            samples.append(text[-10_000:])
+        if len(text) <= 20_000:
+            samples = [text]
+        else:
+            samples = [text[:10_000], text[-10_000:]]
         for raw in samples:
             # NFKC-normalize to defeat Unicode confusable bypasses (e.g.
             # Cyrillic or fullwidth substitutions for ASCII letters).
