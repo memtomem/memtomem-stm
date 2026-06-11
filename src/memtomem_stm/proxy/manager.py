@@ -60,7 +60,7 @@ from memtomem_stm.proxy.memory_ops import (
     extract_and_store,
     format_fact_md,
 )
-from memtomem_stm.proxy.privacy import DEFAULT_PATTERNS as PRIVACY_DEFAULT_PATTERNS
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
@@ -731,9 +731,13 @@ class ProxyManager:
                 # #289: scan for API keys / JWT / private keys before sending
                 # the response to the LLM provider. Default-on; operators
                 # disable per-config when the upstream is known sensitive-free
-                # or the provider is local/trusted.
+                # or the provider is local/trusted. CREDENTIALS only — email
+                # addresses (the PII set) appear in ordinary compressible
+                # content (git logs, issue threads) and routing on them
+                # silently degraded the chosen strategy to truncation; the
+                # surfacing persistence path still scans the full default set.
                 privacy_patterns = (
-                    PRIVACY_DEFAULT_PATTERNS if llm_cfg.privacy_scan_enabled else None
+                    PRIVACY_CREDENTIAL_PATTERNS if llm_cfg.privacy_scan_enabled else None
                 )
                 result = await compressor.compress(
                     text, max_chars=max_chars, privacy_patterns=privacy_patterns
