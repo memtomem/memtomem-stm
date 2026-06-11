@@ -67,25 +67,51 @@ def _env_override_hint(exc: Exception, env_overrides: dict[str, Any] | None) -> 
     A malformed ``MEMTOMEM_STM_PROXY__*`` value fails validation of the
     MERGED config, and the load falls back to defaults with a single warning
     — without this hint the operator sees "Failed to parse proxy config
-    <file>" and debugs the FILE while the file is fine. Every error location
-    that resolves to a value supplied by the env overlay is mapped back to
-    its env var name. (Fallback semantics are unchanged: this only improves
-    the warning.)
+    <file>" and debugs the FILE while the file is fine. (Fallback semantics
+    are unchanged: this only improves the warning.)
+
+    Hints are derived from the env overlay's LEAVES — the var names the
+    operator actually set — never synthesized from the error location alone:
+    a model-level validator reports its error at the MODEL's path (e.g. a
+    HybridConfig cross-field error at ``upstream_servers.gh.hybrid``), and
+    naming that prefix would point at a var that was never set. An error
+    location that resolves to an env subtree names every env leaf under it;
+    one that runs PAST an env leaf (the env string replaced a whole
+    container) names that leaf; one the env never touched names nothing.
     """
     if not env_overrides or not isinstance(exc, ValidationError):
         return ""
     implicated: set[str] = set()
     for err in exc.errors():
-        node: Any = env_overrides
         loc = err.get("loc", ())
+        node: Any = env_overrides
+        consumed: list[str] = []
         for part in loc:
             if isinstance(node, dict) and part in node:
                 node = node[part]
+                consumed.append(str(part))
             else:
                 break
+        if not consumed:
+            continue  # the env overlay never touched this error's path
+        if isinstance(node, dict):
+            if len(consumed) < len(loc):
+                continue  # walk left the env subtree: the failing value is file-set
+            stack: list[tuple[list[str], dict[str, Any]]] = [(consumed, node)]
+            while stack:
+                path, sub = stack.pop()
+                for key, value in sub.items():
+                    if isinstance(value, dict):
+                        stack.append(([*path, str(key)], value))
+                    else:
+                        implicated.add(
+                            _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*path, str(key)])
+                        )
         else:
-            if loc:
-                implicated.add(_PROXY_ENV_PREFIX + "__".join(str(p).upper() for p in loc))
+            # Landed on an env leaf — exact when consumed == loc; when the
+            # error location goes deeper, this leaf REPLACED a container the
+            # model expected, so it is still the var to fix.
+            implicated.add(_PROXY_ENV_PREFIX + "__".join(p.upper() for p in consumed))
     if not implicated:
         return ""
     return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"

@@ -167,6 +167,75 @@ class TestMalformedEnvOverrideDiagnostics:
         assert cfg is None
         assert not any("implicated" in r.getMessage() for r in caplog.records)
 
+    def test_model_validator_error_names_env_leaves_not_the_model_prefix(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A cross-field model validator reports its error at the MODEL's
+        path (upstream_servers.gh.hybrid), not the field. The hint must name
+        the env LEAF actually set under that subtree, never synthesize a
+        non-leaf var (MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID) that
+        was never in the environment."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                {"upstream_servers": {"gh": {"prefix": "gh", "hybrid": {"head_chars": 5000}}}}
+            )
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS": "9000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        messages = [r.getMessage() for r in caplog.records]
+        leaf = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS"
+        assert any(leaf in m for m in messages)
+        assert not any("HYBRID," in m or m.rstrip(")").endswith("HYBRID") for m in messages)
+
+    def test_env_leaf_replacing_a_container_names_that_leaf(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An env string clobbering a whole sub-model (cache='oops') is named
+        as the leaf the operator set, even though the error location may sit
+        at or below the container."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"enabled": True}}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE": "oops"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any("MEMTOMEM_STM_PROXY__CACHE" in r.getMessage() for r in caplog.records)
+
+    def test_env_untouched_error_path_names_nothing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An error in an upstream entry the env never touched must not be
+        attributed to env overrides set on a SIBLING entry."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "good": {"prefix": "good"},
+                        "bad": {"prefix": "bad", "hybrid": {"head_chars": -1}},
+                    }
+                }
+            )
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GOOD__MAX_RESULT_CHARS": "5000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
     def test_env_only_path_names_the_env_var(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
