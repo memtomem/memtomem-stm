@@ -300,6 +300,33 @@ async def test_hook_run_hook_skips_when_daemon_absent(
     assert calls == [1]  # fire-and-forget spawn requested
 
 
+async def test_hook_run_hook_autospawn_runs_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # request_spawn does blocking work (flock probe + fork/exec); _run_hook
+    # must offload it via asyncio.to_thread so the event loop stays free
+    # while the outer wait_for budget clock runs.
+    import threading
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+
+    from memtomem_stm.daemon import spawn
+
+    threads: list[bool] = []
+    monkeypatch.setattr(
+        spawn,
+        "request_spawn",
+        lambda cfg: threads.append(threading.current_thread() is not threading.main_thread()),
+    )
+
+    from memtomem_stm.cli.hook_cmd import _run_hook
+
+    out = await _run_hook(_READ_PAYLOAD)
+    assert out == {}
+    assert threads == [True]  # ran in a worker thread, not on the loop thread
+
+
 async def test_hook_run_hook_no_autospawn_when_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
