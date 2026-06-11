@@ -188,7 +188,7 @@ def show_cmd(name: str | None, json_output: bool) -> None:
         if len(matches) > 1:
             raise click.ClickException(
                 f"Project name '{name}' is ambiguous ({len(matches)} matches). "
-                "Run `mms project show` without --project from inside the "
+                "Run `mms project show` without NAME from inside the "
                 "target project root instead."
             )
         entry = matches[0]
