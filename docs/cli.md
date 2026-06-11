@@ -37,6 +37,7 @@ Options:
 Commands:
   add        Add an upstream MCP server to the proxy configuration.
   daemon     Manage the local surfacing daemon (warm LTM connection for...
+  eject      Restore imported upstream(s) to their host MCP client, then...
   health     Check upstream server connectivity.
   hook       Compress and/or surface for a host's built-in tool call...
   host       Host-config inspection and sync (RFC §7.3).
@@ -180,6 +181,8 @@ Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the
 
 To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or Claude Desktop edit to retry. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
+The import→prune transition is reversible: every import records an `origin` provenance block per entry (the structured source plus the verbatim host entry), and every prune backs the deleted host entry up to `~/.memtomem/pruned_upstreams.json` before removing it. [`mms eject`](#eject) walks the whole path back — it restores the captured host entry to where it came from and removes the entry from STM.
+
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
 ### `list`
@@ -192,7 +195,9 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, origin, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+
+The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose host original was pruned — it now exists only behind STM, and [`mms eject`](#eject) can restore it. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets.
 
 ### `remove`
 
@@ -205,6 +210,8 @@ Options:
 ```
 
 Removes an upstream MCP server from the proxy configuration by name. Prompts for confirmation on a TTY unless `-y` or `--yes` is passed.
+
+`remove` only edits the STM config — it never touches host configs. If the entry was imported and every host original was pruned, removing it would leave the server registered **nowhere**, so the command prints a note (before the confirmation prompt) pointing at [`mms eject`](#eject), which restores the host entry instead. The hint is advisory; the removal itself is never blocked.
 
 ### Examples
 
@@ -249,8 +256,12 @@ mms list --json            # machine-readable: {config_path, servers}
 # Show full status
 mms status
 
-# Remove a server
+# Remove a server (STM config only)
 mms remove github
+
+# Stop proxying an imported server WITHOUT losing it: restore the captured
+# host entry to where it came from, then remove it from STM
+mms eject github
 
 # Toggle proactive surfacing for an upstream (persisted in stm_proxy.json)
 mms surfacing context7 off  # `on` to re-enable; omit the state to show it
@@ -278,6 +289,66 @@ Removes direct registrations for STM upstreams that are still registered in a so
 
 Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
 
+"Dual-registered" requires both the name **and** the identity to match: the source-client entry must share the STM upstream's `(transport, command, args)` or `(transport, url)` signature. If you've edited either side to point at a different server that happens to share a name, `mms prune` skips it rather than clobbering the unrelated entry.
+
+STM's own config (`stm_proxy.json`) is never modified. Only source-client files change. Failures are surfaced via non-zero exit and the exact manual `claude mcp remove` command for each failed entry, so scripting callers can retry.
+
+Before deleting a host entry, every prune path appends the verbatim entry (with its source and timestamp) to `~/.memtomem/pruned_upstreams.json` (mode `0600`) — backup-before-delete, so a crash mid-prune never loses the only copy. The log is append-only and advisory: [`mms eject`](#eject) suggests it when an entry has no recorded origin, but never restores from it without your confirmation.
+
+```bash
+mms prune --all              # remove every dual-registered upstream (TTY: confirm prompt)
+mms prune --all --yes        # same, skip the prompt (CI / scripts)
+mms prune --all --dry-run    # preview without writes
+mms prune docs-langchain     # target specific upstreams
+```
+
+### `eject`
+
+```
+Usage: mms eject [OPTIONS] NAMES...
+
+Options:
+  --config TEXT         [default: ~/.memtomem/stm_proxy.json]
+  --to TARGET           Restore target for entries without a usable origin:
+                        claude-user | claude-project[:PATH] | mcp-json[:PATH]
+                        | claude-desktop. Entries with a recorded origin
+                        ignore this.
+  --keep                Restore to the host but keep the STM entry (dual
+                        registration).
+  --force               Overwrite a same-name host entry whose identity
+                        differs.
+  --allow-argv-secrets  Permit `claude mcp add-json` shell-outs whose payload
+                        carries secret-classified values (argv is visible in
+                        the process list). The only override for the secret
+                        gate — --yes does not bypass it.
+  --accept-schema-loss  Proceed with STM removal even when the restored host
+                        entry does not structurally match the original (the
+                        claude CLI strips fields it does not know). Default is
+                        to keep the STM entry and fail.
+  --dry-run             Print the plan; no writes.
+  -y, --yes             Skip the confirm prompt (scripts / CI / non-TTY
+                        callers).
+```
+
+The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from, verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
+
+`origin.original` may carry secrets (`env`, `headers`), so `mms list --json` / `mms status --json` redact it — the summary keys stay, plus `has_original` so scripts can tell a redacted block from one that never captured an original.
+
+Key semantics:
+
+- **Targets.** Entries restore to their recorded origin. Claude Code scopes go through `claude mcp add-json` (the project scope runs at the recorded project path); `.mcp.json` and Claude Desktop are direct atomic JSON edits. Entries without a usable origin (manual `mms add`, imports predating provenance capture, a vanished project directory) need an explicit `--to`; the restore is then a reconstructed entry, with warnings for what import-time normalization lost (filtered env keys, HTTP headers).
+- **No-clobber.** A same-name entry already at the target is compared structurally: identical → idempotent skip; different or not comparable → that entry fails with a hint unless `--force` (which replaces it).
+- **Verified release.** The STM entry is only removed once the host entry deep-equals the restore payload. The claude CLI re-serializes through its own schema and silently drops fields it doesn't know, so a clean `add-json` exit isn't proof; on mismatch the entry stays in STM (dual registration) unless you pass `--accept-schema-loss`.
+- **Secret gate.** Payloads with secret-classified `env`/`headers` values would appear on the `claude` argv (visible in the process list). On a TTY you get an explicit per-entry confirmation; non-TTY callers must pass `--allow-argv-secrets`. `--yes` never bypasses this gate.
+- **Failures are per-entry and non-fatal.** Each failed entry keeps its STM registration and prints an exact manual restore command; the run exits 1 if anything failed. When an entry has no origin, the [prune backup log](#prune) (`~/.memtomem/pruned_upstreams.json`) is suggested as a starting point for `--to` — verify it's current first; eject never auto-adopts it.
+
+```bash
+mms eject github                   # restore to its recorded origin, then remove from STM
+mms eject github --keep            # restore but keep proxying (dual registration)
+mms eject legacy --to claude-user  # no recorded origin: pick the restore target
+mms eject github --dry-run         # preview the per-entry plan; no writes
+```
+
 ### `surfacing`
 
 ```
@@ -288,17 +359,6 @@ Options:
 ```
 
 Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms status` shows it per server. A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
-
-"Dual-registered" requires both the name **and** the identity to match: the source-client entry must share the STM upstream's `(transport, command, args)` or `(transport, url)` signature. If you've edited either side to point at a different server that happens to share a name, `mms prune` skips it rather than clobbering the unrelated entry.
-
-STM's own config (`stm_proxy.json`) is never modified. Only source-client files change. Failures are surfaced via non-zero exit and the exact manual `claude mcp remove` command for each failed entry, so scripting callers can retry.
-
-```bash
-mms prune --all              # remove every dual-registered upstream (TTY: confirm prompt)
-mms prune --all --yes        # same, skip the prompt (CI / scripts)
-mms prune --all --dry-run    # preview without writes
-mms prune docs-langchain     # target specific upstreams
-```
 
 ### `health`
 

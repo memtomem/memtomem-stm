@@ -84,7 +84,7 @@ mms add filesystem \
 
 `--prefix` is required: it's the namespace under which the upstream server's tools will appear (e.g. `fs__read_file`). Repeat for each MCP server you want to proxy.
 
-If you've already configured MCP servers in Claude Desktop, Claude Code, or a project `.mcp.json`, `mms add --import` (alias `--from-clients`) reuses the init wizard to bulk-select them — skipping anything already registered.
+If you've already configured MCP servers in Claude Desktop, Claude Code, or a project `.mcp.json`, `mms add --import` (alias `--from-clients`) reuses the init wizard to bulk-select them — skipping anything already registered. Moving behind the proxy is reversible: imports capture where each entry came from, and `mms eject NAME` restores it to its host client if you later want to stop proxying it (see [docs/cli.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md#eject)).
 
 ```bash
 mms list      # show what you've added
