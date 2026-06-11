@@ -2345,7 +2345,7 @@ class TestInitMcpRegistration:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -2817,7 +2817,7 @@ class TestRegisterCommand:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -3256,7 +3256,7 @@ class TestAddFromClientsPrune:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -3579,7 +3579,7 @@ class TestPruneCommand:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -4005,7 +4005,7 @@ class TestPruneBackupLog:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -4238,7 +4238,7 @@ class TestPerSourcePrunedMetadata:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -4390,6 +4390,701 @@ class TestPerSourcePrunedMetadata:
         assert ["claude", "mcp", "remove", "github", "-s", "user"] in fake_claude["calls"]
 
 
+# ── mms eject (#475 PR3) ────────────────────────────────────────────────
+
+
+def _eject_entry(
+    *,
+    kind: str = "claude-user",
+    path: str | None = None,
+    original: dict | None = None,
+    duplicates: list[dict] | None = None,
+    command: str = "npx",
+    args: list[str] | None = None,
+) -> dict:
+    """STM config entry with an origin block, shaped like a real import."""
+    if original is None:
+        original = {"command": command, "args": args or ["-y", "@demo"]}
+    source: dict = {"kind": kind, "pruned": True, "pruned_at": "2026-06-11T00:00:00Z"}
+    if path is not None:
+        source["path"] = path
+    return {
+        "prefix": "dm",
+        "transport": "stdio",
+        "command": command,
+        "args": args or ["-y", "@demo"],
+        "origin": {
+            "schema_version": 1,
+            "source": source,
+            "duplicates": duplicates or [],
+            "imported_at": "2026-06-11T00:00:00Z",
+            "original": original,
+        },
+    }
+
+
+class TestEjectCommand:
+    """``mms eject`` restores the verbatim host entry, verifies the restore
+    against the backing host config, and only then removes the STM entry
+    (#475 PR3). Order invariant: host write first, STM removal second —
+    every failure mode is dual registration, never disappearance."""
+
+    def _seed_config(self, config: Path, servers: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    def _stm_servers(self, config: Path) -> dict:
+        return json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+
+    @pytest.fixture
+    def fake_claude_host(self, monkeypatch, _hermetic_home):
+        """``_run_claude_mcp`` fake that emulates the claude CLI's writes.
+
+        ``add-json`` applies the payload to the hermetic ``~/.claude.json``
+        (user scope to top-level ``mcpServers``, local scope under
+        ``projects[<cwd>]``) so the post-write verify exercises a real
+        re-read. ``strip_keys`` simulates the CLI's schema-strip of unknown
+        fields (probed on 2.1.173); ``write=False`` simulates a clean exit
+        that wrote nowhere we can see (wrong project slot).
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "rc": 0, "stderr": "", "strip_keys": [], "write": True}
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            state["calls"].append({"cmd": list(cmd), "cwd": cwd})
+            if state["rc"] != 0:
+                return _FakeClaudeResult(returncode=state["rc"], stderr=state["stderr"])
+            if cmd[:3] == ["claude", "mcp", "add-json"] and state["write"]:
+                name, payload = cmd[3], json.loads(cmd[4])
+                scope = cmd[cmd.index("-s") + 1]
+                for key in state["strip_keys"]:
+                    payload.pop(key, None)
+                cc_path = _hermetic_home / ".claude.json"
+                cc = json.loads(cc_path.read_text(encoding="utf-8")) if cc_path.exists() else {}
+                if scope == "user":
+                    cc.setdefault("mcpServers", {})[name] = payload
+                else:
+                    proj = cc.setdefault("projects", {}).setdefault(cwd, {})
+                    proj.setdefault("mcpServers", {})[name] = payload
+                cc_path.write_text(json.dumps(cc), encoding="utf-8")
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def _claude_user_servers(self, home: Path) -> dict:
+        cc = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        return cc.get("mcpServers", {})
+
+    # ── round trip + verify ──
+
+    def test_mcp_json_round_trip_deep_equal(self, runner, config, tmp_path):
+        """Direct-edit restore is byte-for-byte the verbatim original —
+        including fields STM's normalization drops (the round-trip
+        invariant the origin block exists to guarantee)."""
+        target = tmp_path / "proj" / ".mcp.json"
+        target.parent.mkdir()
+        original = {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@demo"],
+            "env": {"PLAIN": "1"},
+            "hostOnly": True,
+        }
+        self._seed_config(
+            config,
+            {"demo": _eject_entry(kind="mcp-json", path=str(target), original=original)},
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        written = json.loads(target.read_text(encoding="utf-8"))
+        assert written["mcpServers"]["demo"] == original
+        assert "demo" not in self._stm_servers(config)
+        # Last upstream gone → STM self-deregistration hint.
+        assert "claude mcp remove memtomem-stm" in result.output
+
+    def test_claude_user_shell_out_writes_and_removes(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        original = {"type": "stdio", "command": "npx", "args": ["-y", "@demo"]}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        add_calls = [c for c in fake_claude_host["calls"] if c["cmd"][:3][2:] == ["add-json"]]
+        assert len(add_calls) == 1
+        cmd = add_calls[0]["cmd"]
+        assert cmd[3] == "demo"
+        assert json.loads(cmd[4]) == original
+        assert cmd[-2:] == ["-s", "user"]
+        assert self._claude_user_servers(_hermetic_home)["demo"] == original
+        assert "demo" not in self._stm_servers(config)
+
+    def test_desktop_direct_edit_round_trip(self, runner, config, _hermetic_home):
+        from memtomem_stm.mms.import_hosts import _desktop_config_path
+
+        desktop = _desktop_config_path()
+        original = {"command": "npx", "args": ["-y", "@demo"], "env": {"X": "1"}}
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-desktop", original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        written = json.loads(desktop.read_text(encoding="utf-8"))
+        assert written["mcpServers"]["demo"] == original
+
+    # ── schema-loss hard gate ──
+
+    def test_schema_strip_fails_entry_and_keeps_stm(
+        self, runner, config, fake_claude_host
+    ):
+        """The claude CLI silently drops unknown fields — a clean add-json
+        exit is NOT proof the verbatim contract held. Default: the entry
+        stays in STM (dual registration) and eject fails loudly."""
+        original = {"type": "stdio", "command": "npx", "hostOnly": True}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+        fake_claude_host["strip_keys"] = ["hostOnly"]
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "demo" in self._stm_servers(config)
+        assert "hostOnly (dropped)" in result.output
+        assert "--accept-schema-loss" in result.output
+        assert "dual registration" in result.output
+
+    def test_accept_schema_loss_removes_with_warning(
+        self, runner, config, fake_claude_host
+    ):
+        original = {"type": "stdio", "command": "npx", "hostOnly": True}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+        fake_claude_host["strip_keys"] = ["hostOnly"]
+
+        result = runner.invoke(
+            cli, ["eject", "demo", "--yes", "--accept-schema-loss", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "demo" not in self._stm_servers(config)
+        assert "schema loss" in result.output
+
+    def test_clean_exit_but_no_visible_write_fails(self, runner, config, fake_claude_host):
+        """rc=0 with the entry absent from the expected host slot is a full
+        mismatch — the safety net for a CLI writing somewhere unexpected."""
+        self._seed_config(config, {"demo": _eject_entry()})
+        fake_claude_host["write"] = False
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "demo" in self._stm_servers(config)
+        assert "not found at the expected host location" in result.output
+
+    # ── host-write failure / capability message ──
+
+    def test_host_write_failure_keeps_stm_and_prints_fallback(
+        self, runner, config, fake_claude_host
+    ):
+        self._seed_config(config, {"demo": _eject_entry()})
+        fake_claude_host["rc"] = 1
+        fake_claude_host["stderr"] = "unknown command add-json"
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "demo" in self._stm_servers(config)
+        assert "unknown command add-json" in result.output
+        assert "claude mcp add-json demo" in result.output  # manual fallback
+        assert "2.1.173" in result.output  # capability-oriented hint
+
+    # ── no-clobber guard ──
+
+    def test_idempotent_skip_when_host_identical(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """Same signature already in the target → skip the write, proceed
+        with STM removal (idempotent re-run after a crashed first eject)."""
+        original = {"type": "stdio", "command": "npx", "args": ["-y", "@demo"]}
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": dict(original)}}), encoding="utf-8"
+        )
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert fake_claude_host["calls"] == []  # no shell-out at all
+        assert "demo" not in self._stm_servers(config)
+        assert "skip write" in result.output
+
+    def test_no_clobber_different_entry_requires_force(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": {"command": "other-server"}}}),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"demo": _eject_entry()})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--force" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_force_overwrites_via_remove_then_add(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": {"command": "other-server"}}}),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"demo": _eject_entry()})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        verbs = [c["cmd"][2] for c in fake_claude_host["calls"]]
+        assert verbs == ["remove", "add-json"]
+        assert "demo" not in self._stm_servers(config)
+
+    def test_signature_none_is_never_an_idempotent_match(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """No command/url on either side → only full structural equality may
+        skip; anything else aborts (R1 M1 — ``None == None`` must not pass)."""
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": {"broken": "entry"}}}), encoding="utf-8"
+        )
+        self._seed_config(
+            config, {"demo": _eject_entry(original={"type": "stdio", "command": "npx"})}
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--force" in result.output
+        assert "demo" in self._stm_servers(config)
+
+    def test_same_signature_different_content_never_releases_stm(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """A host entry matching by signature (command/args) but NOT
+        structurally (missing env / host-only fields) must not satisfy the
+        verbatim-restore invariant: the write is skipped, but the pre-removal
+        verify keeps the STM entry — signature alone ignores exactly the
+        fields the original exists to preserve (codex R1 Blocker)."""
+        original = {
+            "command": "npx",
+            "args": ["-y", "@demo"],
+            "env": {"PLAIN": "1"},
+            "hostOnly": True,
+        }
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": {"command": "npx", "args": ["-y", "@demo"]}}}),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert fake_claude_host["calls"] == []  # write was skipped...
+        assert "demo" in self._stm_servers(config)  # ...and removal blocked
+        assert "existing host entry does not match" in result.output
+        assert "--accept-schema-loss" in result.output
+
+        accepted = runner.invoke(
+            cli, ["eject", "demo", "--yes", "--accept-schema-loss", *_cfg_args(config)]
+        )
+        assert accepted.exit_code == 0, accepted.output
+        assert "demo" not in self._stm_servers(config)
+
+    def test_signature_none_deep_equal_skips(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        weird = {"weird": "shape"}
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": dict(weird)}}), encoding="utf-8"
+        )
+        self._seed_config(config, {"demo": _eject_entry(original=weird)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" not in self._stm_servers(config)
+
+    # ── secret gate (§7) ──
+
+    def test_secret_gate_non_tty_yes_does_not_bypass(
+        self, runner, config, fake_claude_host
+    ):
+        original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--allow-argv-secrets" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_secret_gate_allow_flag_proceeds(self, runner, config, fake_claude_host):
+        original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(
+            cli, ["eject", "demo", "--yes", "--allow-argv-secrets", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "demo" not in self._stm_servers(config)
+
+    def test_secret_gate_tty_confirm_default_no(
+        self, runner, config, monkeypatch, fake_claude_host
+    ):
+        """TTY path: declining the dedicated secret confirm fails the entry
+        even after the main eject confirm was accepted."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", *_cfg_args(config)], input="y\nn\n")
+
+        assert result.exit_code == 1
+        assert "secret gate declined" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_secret_gate_direct_edit_scope_unaffected(self, runner, config, tmp_path):
+        """mcp-json/desktop restores never shell out — no argv exposure, no gate."""
+        target = tmp_path / ".mcp.json"
+        original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
+        self._seed_config(
+            config, {"demo": _eject_entry(kind="mcp-json", path=str(target), original=original)}
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(target.read_text(encoding="utf-8"))["mcpServers"]["demo"] == original
+
+    # ── claude-project cwd rule ──
+
+    def test_claude_project_shell_out_runs_at_recorded_path(
+        self, runner, config, tmp_path, fake_claude_host
+    ):
+        """`-s local` resolves its project slot from the process cwd, and the
+        recorded path is used EXACTLY as written — a symlinked alias must not
+        be resolved away (the claude CLI keyed the slot, not us)."""
+        real = tmp_path / "real-proj"
+        real.mkdir()
+        alias = tmp_path / "alias-proj"
+        alias.symlink_to(real)
+        recorded = str(alias)
+        self._seed_config(
+            config, {"demo": _eject_entry(kind="claude-project", path=recorded)}
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        add = [c for c in fake_claude_host["calls"] if c["cmd"][2] == "add-json"][0]
+        assert add["cwd"] == recorded  # verbatim, not str(real)
+        assert add["cmd"][-2:] == ["-s", "local"]
+        assert "demo" not in self._stm_servers(config)
+
+    def test_force_pre_remove_runs_at_recorded_path_too(
+        self, runner, config, tmp_path, fake_claude_host, _hermetic_home
+    ):
+        """`--force` remove-then-add: BOTH verbs need the recorded cwd —
+        `claude mcp remove -s local` run from elsewhere would delete a
+        same-named entry from the wrong project (codex R1 Blocker). The
+        test process cwd is unrelated to the recorded path by construction."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        recorded = str(proj)
+        cc = {
+            "projects": {
+                recorded: {"mcpServers": {"demo": {"command": "other-server"}}},
+            }
+        }
+        (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=recorded)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        by_verb = {c["cmd"][2]: c for c in fake_claude_host["calls"]}
+        assert set(by_verb) == {"remove", "add-json"}
+        assert by_verb["remove"]["cwd"] == recorded
+        assert by_verb["add-json"]["cwd"] == recorded
+
+    def test_claude_project_vanished_path_aborts_entry(self, runner, config, tmp_path):
+        gone = str(tmp_path / "deleted-proj")
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=gone)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "no longer exists" in result.output
+        assert "--to" in result.output
+        assert "demo" in self._stm_servers(config)
+
+    # ── --to / origin-less entries ──
+
+    def test_origin_less_requires_to(self, runner, config):
+        self._seed_config(config, {"plain": {"prefix": "p", "command": "npx"}})
+
+        result = runner.invoke(cli, ["eject", "plain", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--to" in result.output
+
+    def test_origin_less_suggests_backup_log_row(
+        self, runner, config, _hermetic_home
+    ):
+        log = _hermetic_home / ".memtomem" / "pruned_upstreams.json"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entries": [
+                        {
+                            "name": "plain",
+                            "source": {"kind": "claude-user"},
+                            "original": {"command": "npx"},
+                            "pruned_at": "2026-06-10T00:00:00Z",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"plain": {"prefix": "p", "command": "npx"}})
+
+        result = runner.invoke(cli, ["eject", "plain", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "backup log has a row" in result.output
+        assert "kind=claude-user" in result.output
+
+    def test_to_denormalizes_and_strips_stm_fields(self, runner, config, tmp_path):
+        target = tmp_path / ".mcp.json"
+        self._seed_config(
+            config,
+            {
+                "plain": {
+                    "prefix": "p",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@p"],
+                    "env": {"A": "1"},
+                    "compression": "auto",
+                    "max_result_chars": 8000,
+                }
+            },
+        )
+
+        result = runner.invoke(
+            cli, ["eject", "plain", "--yes", "--to", f"mcp-json:{target}", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        written = json.loads(target.read_text(encoding="utf-8"))["mcpServers"]["plain"]
+        assert written == {"type": "stdio", "command": "npx", "args": ["-y", "@p"], "env": {"A": "1"}}
+        assert "reconstructed" in result.output
+
+    def test_to_usage_errors(self, runner, config):
+        self._seed_config(config, {"plain": {"prefix": "p", "command": "npx"}})
+        bad_kind = runner.invoke(
+            cli, ["eject", "plain", "--yes", "--to", "cursor", *_cfg_args(config)]
+        )
+        assert bad_kind.exit_code == 2
+        assert "--to must be one of" in bad_kind.output
+        bad_path = runner.invoke(
+            cli, ["eject", "plain", "--yes", "--to", "claude-user:/x", *_cfg_args(config)]
+        )
+        assert bad_path.exit_code == 2
+        assert "does not take a :PATH" in bad_path.output
+
+    # ── drift guard / duplicates / --keep ──
+
+    def test_drift_guard_warns_and_restores_original(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        original = {"type": "stdio", "command": "npx", "args": ["-y", "@demo"]}
+        entry = _eject_entry(original=original)
+        entry["args"] = ["-y", "@demo", "--edited-after-import"]
+        self._seed_config(config, {"demo": entry})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "modified after import" in result.output
+        assert self._claude_user_servers(_hermetic_home)["demo"] == original
+
+    def test_pruned_duplicates_reported_not_restored(
+        self, runner, config, fake_claude_host
+    ):
+        self._seed_config(
+            config,
+            {
+                "demo": _eject_entry(
+                    duplicates=[
+                        {"kind": "claude-desktop", "pruned": True, "pruned_at": "x"},
+                        {"kind": "mcp-json", "path": "/p/.mcp.json", "pruned": False},
+                    ]
+                )
+            },
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "also pruned from Claude Desktop" in result.output
+        assert "pruned_upstreams.json" in result.output
+        # Only the primary restore shell-out — duplicates are not written.
+        assert len([c for c in fake_claude_host["calls"] if c["cmd"][2] == "add-json"]) == 1
+
+    def test_keep_restores_but_retains_stm_entry(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        self._seed_config(config, {"demo": _eject_entry()})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--keep", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "demo" in self._claude_user_servers(_hermetic_home)
+        assert "demo" in self._stm_servers(config)
+        assert "dual-registered" in result.output
+        assert "mms prune" in result.output
+
+    # ── command plumbing ──
+
+    def test_dry_run_writes_nothing(self, runner, config, fake_claude_host):
+        self._seed_config(config, {"demo": _eject_entry()})
+
+        result = runner.invoke(cli, ["eject", "demo", "--dry-run", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "Dry run" in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_non_tty_without_yes_exits_1(self, runner, config, fake_claude_host):
+        self._seed_config(config, {"demo": _eject_entry()})
+
+        result = runner.invoke(cli, ["eject", "demo", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--yes" in result.output
+        assert fake_claude_host["calls"] == []
+
+    def test_self_reference_refused(self, runner, config):
+        entry = _eject_entry(command="memtomem-stm", args=[])
+        entry["origin"]["original"] = {"command": "memtomem-stm"}
+        self._seed_config(config, {"self": entry})
+
+        result = runner.invoke(cli, ["eject", "self", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "STM's own registration" in result.output
+
+    def test_unknown_name_errors(self, runner, config):
+        self._seed_config(config, {"demo": _eject_entry()})
+
+        result = runner.invoke(cli, ["eject", "ghost", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "not configured: ghost" in result.output
+
+    def test_partial_failure_exits_1_but_completes_others(
+        self, runner, config, tmp_path, fake_claude_host
+    ):
+        """One entry failing must not stop the others — per-entry isolation
+        with a non-zero exit, matching the prune reporting convention."""
+        target = tmp_path / ".mcp.json"
+        ok_original = {"command": "npx", "args": ["-y", "@ok"]}
+        self._seed_config(
+            config,
+            {
+                "ok": _eject_entry(kind="mcp-json", path=str(target), original=ok_original),
+                "bad": _eject_entry(),
+            },
+        )
+        fake_claude_host["rc"] = 1
+        fake_claude_host["stderr"] = "boom"
+
+        result = runner.invoke(cli, ["eject", "ok", "bad", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        servers = self._stm_servers(config)
+        assert "ok" not in servers  # succeeded and was removed
+        assert "bad" in servers  # failed and was kept
+        assert json.loads(target.read_text(encoding="utf-8"))["mcpServers"]["ok"] == ok_original
+
+
+class TestDenormalizeClientEntry:
+    """Unit pins for the degraded inverse of ``_normalize_client_entry``."""
+
+    def test_stdio_strips_stm_fields_and_warns_on_env_filter(self):
+        from memtomem_stm.cli.proxy import _denormalize_client_entry
+
+        payload, warnings = _denormalize_client_entry(
+            {
+                "prefix": "p",
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@p"],
+                "env": {"A": "1"},
+                "compression": "auto",
+                "max_result_chars": 8000,
+                "surfacing_enabled": False,
+            }
+        )
+        assert payload == {"type": "stdio", "command": "npx", "args": ["-y", "@p"], "env": {"A": "1"}}
+        assert any("filtered at import time" in w for w in warnings)
+
+    def test_streamable_http_maps_to_host_http_type(self):
+        from memtomem_stm.cli.proxy import _denormalize_client_entry
+
+        payload, warnings = _denormalize_client_entry(
+            {"prefix": "p", "transport": "streamable_http", "url": "https://x/mcp"}
+        )
+        assert payload == {"type": "http", "url": "https://x/mcp"}
+        assert any("headers" in w for w in warnings)
+
+    def test_headers_carried_when_present(self):
+        from memtomem_stm.cli.proxy import _denormalize_client_entry
+
+        payload, warnings = _denormalize_client_entry(
+            {
+                "prefix": "p",
+                "transport": "sse",
+                "url": "https://x/sse",
+                "headers": {"Authorization": "Bearer t"},
+            }
+        )
+        assert payload == {
+            "type": "sse",
+            "url": "https://x/sse",
+            "headers": {"Authorization": "Bearer t"},
+        }
+        assert not any("headers" in w for w in warnings)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
@@ -4444,8 +5139,9 @@ class TestConfigWriteLock:
             ["surfacing", "srv", "off"],
             ["prune", "--all", "--yes"],
             ["init"],
+            ["eject", "srv", "--yes"],
         ],
-        ids=["add", "remove", "surfacing-write", "prune", "init"],
+        ids=["add", "remove", "surfacing-write", "prune", "init", "eject"],
     )
     def test_mutators_fail_cleanly_when_lock_held(
         self, runner, config, argv, _hermetic_home
@@ -4475,9 +5171,14 @@ class TestConfigWriteLock:
         with self._hold_lock(_hermetic_home):
             read = runner.invoke(cli, ["surfacing", "srv", *_cfg_args(config)])
             dry = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
+            eject_dry = runner.invoke(
+                cli,
+                ["eject", "srv", "--dry-run", "--to", "claude-user", *_cfg_args(config)],
+            )
         assert read.exit_code == 0, read.output
         assert "surfacing for 'srv': on" in read.output
         assert dry.exit_code == 0, dry.output
+        assert eject_dry.exit_code == 0, eject_dry.output
 
     def test_concurrent_prunes_serialize_and_lose_no_backup_rows(
         self, config, monkeypatch, _hermetic_home
@@ -4587,7 +5288,7 @@ class TestInitPruneOriginals:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
