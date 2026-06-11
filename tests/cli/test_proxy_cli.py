@@ -4044,7 +4044,8 @@ class TestPruneBackupLog:
         assert result.exit_code == 0, result.output
 
         log_path = _backup_log_path(_hermetic_home)
-        assert stat_mod.S_IMODE(log_path.stat().st_mode) == 0o600
+        if sys.platform != "win32":  # chmod is a near-no-op on Windows
+            assert stat_mod.S_IMODE(log_path.stat().st_mode) == 0o600
         log = _read_backup_log(_hermetic_home)
         assert log["schema_version"] == 1
         assert [(r["name"], r["source"], r["original"]) for r in log["entries"]] == [
