@@ -170,8 +170,16 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
 # visible.
 
 
-def _run_claude_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
-    """Invoke the ``claude`` CLI — isolated so tests replace a single seam."""
+def _run_claude_mcp(
+    cmd: list[str], timeout: int = 5, cwd: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the ``claude`` CLI — isolated so tests replace a single seam.
+
+    ``cwd`` exists for ``claude mcp add-json -s local`` (eject, #475 PR3):
+    the local scope resolves its ``~/.claude.json`` ``projects.<path>`` slot
+    from the process cwd, so the restore must run from the recorded origin
+    path or it lands in the wrong project.
+    """
     # ``encoding="utf-8"`` is explicit so non-ASCII bytes from the child don't
     # hit the platform default codec (cp1252/cp949 on Windows). See #302 P0.
     return subprocess.run(
@@ -181,6 +189,7 @@ def _run_claude_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedPro
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        cwd=cwd,
     )
 
 
@@ -1146,6 +1155,7 @@ _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
     _SourceSpec("Claude Desktop", "claude-desktop", None),
 )
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
+_SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
 
 
 def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
@@ -2622,6 +2632,722 @@ def prune(
     if _mark_pruned_sources(upstreams, dual, pruned, pruned_at):
         _save(resolved, data)
     if _report_prune_results(pruned, failed):
+        sys.exit(1)
+
+
+# ── eject command (#475 PR3) ───────────────────────────────────────────────
+#
+# Reverse of the import(+prune) forward path: write the entry back to its
+# host config (``origin.original`` verbatim when captured), then remove it
+# from STM. Order invariant: host write FIRST, STM removal SECOND — every
+# failure mode degrades to dual registration (visible, recoverable), never
+# to a server registered nowhere. Like prune, this is an explicit opt-in
+# writer; discovery itself stays read-only (#202/#226 lineage).
+
+
+def _denormalize_client_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Reconstruct a host-config entry from an STM upstream entry.
+
+    Degraded inverse of :func:`_normalize_client_entry` for entries without
+    an ``origin.original`` (manual ``mms add``, pre-#475 imports). Forward
+    normalization is lossy — HTTP ``headers`` are never imported and
+    ``_DANGEROUS_ENV_KEYS`` are filtered — so the reconstruction cannot
+    recover those; the returned warnings name what may be missing. STM-only
+    fields (prefix, compression, budgets, ...) are dropped by construction:
+    the host entry is built from the transport-identifying fields alone.
+    """
+    transport = entry.get("transport", "stdio")
+    warnings: list[str] = []
+    if transport == "stdio":
+        payload: dict[str, Any] = {"type": "stdio", "command": entry.get("command", "")}
+        args = entry.get("args")
+        if isinstance(args, list) and args:
+            payload["args"] = [str(a) for a in args]
+        env = entry.get("env")
+        if isinstance(env, dict) and env:
+            payload["env"] = {str(k): str(v) for k, v in env.items()}
+        warnings.append("env keys filtered at import time (LD_PRELOAD etc.) are not recoverable")
+    else:
+        # STM calls streamable HTTP ``streamable_http``; host configs and the
+        # claude CLI call it ``http`` (``_normalize_client_entry`` accepts both).
+        payload = {
+            "type": "sse" if transport == "sse" else "http",
+            "url": entry.get("url", ""),
+        }
+        headers = entry.get("headers")
+        if isinstance(headers, dict) and headers:
+            payload["headers"] = {str(k): str(v) for k, v in headers.items()}
+        else:
+            warnings.append("HTTP headers are not captured by import — the restored entry has none")
+    return payload, warnings
+
+
+def _parse_eject_to(value: str) -> tuple[_SourceSpec, str | None]:
+    """Parse ``--to kind[:PATH]`` into a source spec + resolved path.
+
+    User-supplied paths are resolved here (relative paths, ``~``) — unlike
+    ``origin.source.path``, which is used exactly as recorded because the
+    claude CLI keyed it (already realpath'd; re-deriving could relocate the
+    restore). Raises :class:`click.UsageError` on an unknown kind or a path
+    on a kind that doesn't take one.
+    """
+    kind, _, path_part = value.partition(":")
+    spec = _SOURCE_BY_KIND.get(kind)
+    if spec is None:
+        kinds = " | ".join(s.kind for s in _SOURCE_SPECS)
+        raise click.UsageError(f"--to must be one of: {kinds} (got {value!r})")
+    if kind == "claude-project":
+        return spec, str(Path(path_part or ".").expanduser().resolve())
+    if kind == "mcp-json":
+        return spec, str(Path(path_part or ".mcp.json").expanduser().resolve())
+    if path_part:
+        raise click.UsageError(f"--to {kind} does not take a :PATH suffix")
+    return spec, None
+
+
+def _read_host_servers(kind: str, path: str | None) -> dict[str, Any] | None:
+    """Read-only ``mcpServers`` map for one host target; ``None`` when absent.
+
+    Same backing files as :func:`_discover_candidates`. Eject's no-clobber
+    pre-check and post-write verify both read the host config directly
+    rather than parsing ``claude mcp get`` output — the latter has no
+    machine-readable contract, and a parse drift could false-pass the
+    verify or leak secret values through diagnostics.
+    """
+    if kind == "mcp-json":
+        data = _read_json_safely(Path(path)) if path else None
+    elif kind == "claude-desktop":
+        data = _read_json_safely(_desktop_config_path())
+    elif kind == "claude-user":
+        data = _read_json_safely(Path("~/.claude.json").expanduser())
+    elif kind == "claude-project":
+        cc = _read_json_safely(Path("~/.claude.json").expanduser())
+        projects = cc.get("projects") if cc else None
+        candidate = projects.get(path) if isinstance(projects, dict) else None
+        data = candidate if isinstance(candidate, dict) else None
+    else:
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("mcpServers")
+    return servers if isinstance(servers, dict) else None
+
+
+def _host_existing_entry(kind: str, path: str | None, name: str) -> dict[str, Any] | None:
+    servers = _read_host_servers(kind, path)
+    entry = servers.get(name) if servers else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _payload_secret_keys(payload: dict[str, Any]) -> list[str]:
+    """``env`` / ``headers`` keys whose values classify as secrets.
+
+    Reuses the ``mms import`` classifier so the two flows agree on what
+    counts as a credential. Decides whether the ``claude mcp add-json``
+    shell-out would put a secret on argv (visible in the process list) —
+    the §7 gate that ``--yes`` must never bypass.
+    """
+    from memtomem_stm.mms.secrets import classify_env
+
+    found: list[str] = []
+    for section in ("env", "headers"):
+        block = payload.get(section)
+        if not isinstance(block, dict):
+            continue
+        text = {str(k): str(v) for k, v in block.items()}
+        for key, cls in classify_env(text).items():
+            if cls.is_secret:
+                found.append(f"{section}.{key}")
+    return found
+
+
+def _dict_diff_paths(
+    expected: dict[str, Any], actual: dict[str, Any], prefix: str = ""
+) -> list[str]:
+    """Dotted paths where ``actual`` deviates from ``expected`` (post-write verify)."""
+    paths: list[str] = []
+    for key in expected.keys() | actual.keys():
+        dotted = f"{prefix}{key}"
+        if key not in actual:
+            paths.append(f"{dotted} (dropped)")
+        elif key not in expected:
+            paths.append(f"{dotted} (added)")
+        elif isinstance(expected[key], dict) and isinstance(actual[key], dict):
+            paths.extend(_dict_diff_paths(expected[key], actual[key], prefix=f"{dotted}."))
+        elif expected[key] != actual[key]:
+            paths.append(f"{dotted} (changed)")
+    return sorted(paths)
+
+
+def _json_config_set_entry(
+    path: Path, name: str, entry: dict[str, Any], *, default_mode: int
+) -> tuple[bool, str | None]:
+    """Set ``mcpServers[name]`` in a plain JSON host config, atomic write.
+
+    Restore counterpart of :func:`_desktop_json_remove_entry`; also the
+    ``.mcp.json`` writer (direct edit by design — argv non-exposure plus
+    writing exactly the recorded path, where ``claude mcp add-json -s
+    project`` would resolve by cwd). A corrupt existing file refuses the
+    write rather than clobbering — restoring one entry must not destroy a
+    config the user can still fix by hand. An existing file keeps its mode
+    (a restore shouldn't change permissions); ``default_mode`` only applies
+    to newly created files.
+    """
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return (False, f"read error: {exc}")
+        try:
+            loaded = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return (False, f"parse error: {exc} — fix or move {path} aside and retry")
+        if not isinstance(loaded, dict):
+            return (False, f"{path} top-level is not an object")
+        existing = loaded
+        try:
+            default_mode = path.stat().st_mode & 0o777
+        except OSError:
+            pass
+    servers = existing.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        existing["mcpServers"] = servers
+    servers[name] = entry
+    try:
+        atomic_write_text(
+            path,
+            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+            mode=default_mode,
+        )
+    except OSError as exc:
+        return (False, f"write error: {exc}")
+    return (True, None)
+
+
+def _claude_mcp_add_json(
+    name: str, payload: dict[str, Any], scope: str, cwd: str | None = None
+) -> tuple[bool, str | None]:
+    """Shell out to ``claude mcp add-json <name> '<json>' -s <scope>``.
+
+    Returns ``(ok, error_message_or_None)`` — non-fatal failure contract
+    matching :func:`_claude_mcp_remove`, so eject leaves the STM entry put
+    and prints the manual command instead of aborting the run. ``cwd`` is
+    set for the ``local`` scope only (see :func:`_run_claude_mcp`).
+    """
+    cmd = ["claude", "mcp", "add-json", name, json.dumps(payload, ensure_ascii=False)]
+    cmd += ["-s", scope]
+    try:
+        result = _run_claude_mcp(cmd, cwd=cwd)
+    except FileNotFoundError:
+        return (False, "`claude` CLI not on PATH")
+    except subprocess.TimeoutExpired:
+        return (False, "`claude mcp add-json` timed out")
+    except OSError as exc:
+        return (False, f"OS error invoking `claude`: {exc}")
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout or "").strip()
+        return (False, msg or f"`claude mcp add-json` exited {result.returncode}")
+    return (True, None)
+
+
+def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str, Any]) -> str:
+    """Copy-paste restore fallback when a host writer fails or is declined.
+
+    Prints the full restore JSON (secrets included) — terminal output for
+    the operator's own paste-back, per the RFC fallback UX; this is not the
+    argv-exposure surface the secret gate covers.
+    """
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    if kind == "claude-user":
+        return f"claude mcp add-json {name} {shlex.quote(payload_json)} -s user"
+    if kind == "claude-project":
+        return (
+            f"cd {shlex.quote(path or '.')} && "
+            f"claude mcp add-json {name} {shlex.quote(payload_json)} -s local"
+        )
+    target = path if kind == "mcp-json" else str(_desktop_config_path())
+    return f'# Edit {target} and add under mcpServers: "{name}": {payload_json}'
+
+
+@dataclass
+class _EjectPlan:
+    """Resolved restore action for one entry (or the reason it can't run)."""
+
+    name: str
+    kind: str = ""
+    path: str | None = None
+    payload: dict[str, Any] | None = None
+    verbatim: bool = False
+    skip_write: bool = False
+    overwrite: bool = False
+    needs_secret_confirm: bool = False
+    warnings: list[str] | None = None
+    pruned_duplicates: list[str] | None = None
+    error: str | None = None
+
+
+def _latest_backup_row(name: str) -> dict[str, Any] | None:
+    """Most recent prune-backup row for ``name``, or None.
+
+    Suggestion source only (RFC §4.2): eject never auto-adopts a backup row
+    — it may be stale relative to what the host had last — so the caller
+    prints it and asks the user to re-run with ``--to`` after checking.
+    """
+    path = _pruned_backup_path()
+    data = _read_json_safely(path)
+    entries = data.get("entries") if data else None
+    if not isinstance(entries, list):
+        return None
+    for row in reversed(entries):
+        if isinstance(row, dict) and row.get("name") == name:
+            return row
+    return None
+
+
+def _resolve_eject_plan(
+    name: str,
+    entry: Any,
+    to_spec: tuple[_SourceSpec, str | None] | None,
+    *,
+    force: bool,
+    allow_argv_secrets: bool,
+) -> _EjectPlan:
+    """Decide target, payload, and guards for one entry — no writes.
+
+    Implements RFC #475 §4.3 steps 1–3 plus the secret gate's non-TTY
+    branch. TTY secret confirmation is deferred to execution time so the
+    prompt sits next to the write it authorizes.
+    """
+    if not isinstance(entry, dict):
+        return _EjectPlan(name=name, error="entry is not an object — fix the config by hand")
+    if _is_self_reference(entry):
+        return _EjectPlan(name=name, error="refusing to eject STM's own registration")
+
+    origin = entry.get("origin") if isinstance(entry.get("origin"), dict) else None
+    source = origin.get("source") if origin and isinstance(origin.get("source"), dict) else None
+    warnings: list[str] = []
+
+    # Step 1 — target: origin.source wins; --to is the escape hatch for
+    # origin-less entries or a vanished origin path.
+    kind = path = None
+    no_origin = "no usable origin recorded"
+    if source and source.get("kind") in _SOURCE_BY_KIND:
+        kind = source["kind"]
+        path = source.get("path") if isinstance(source.get("path"), str) else None
+    if kind == "claude-project" and (path is None or not Path(path).is_dir()):
+        no_origin = f"origin project directory no longer exists: {path}"
+        kind = path = None
+    if kind == "mcp-json" and (path is None or not Path(path).parent.is_dir()):
+        no_origin = f"origin .mcp.json directory no longer exists: {path}"
+        kind = path = None
+    if kind is None:
+        if to_spec is None:
+            row = _latest_backup_row(name)
+            if row is not None:
+                src = row.get("source") or {}
+                hint = src.get("kind", "?") if isinstance(src, dict) else "?"
+                return _EjectPlan(
+                    name=name,
+                    error=(
+                        f"{no_origin} — the prune backup log has a row "
+                        f"for '{name}' (kind={hint}, pruned_at={row.get('pruned_at')}); "
+                        "verify it is current, then re-run with --to"
+                    ),
+                )
+            return _EjectPlan(
+                name=name,
+                error=f"{no_origin} — pass --to to choose a restore target",
+            )
+        spec, to_path = to_spec
+        kind, path = spec.kind, to_path
+        if kind == "claude-project" and (path is None or not Path(path).is_dir()):
+            return _EjectPlan(name=name, error=f"--to project directory does not exist: {path}")
+
+    # Step 2 — payload: verbatim original first; reconstructed otherwise.
+    original = origin.get("original") if origin else None
+    if isinstance(original, dict):
+        payload: dict[str, Any] = copy.deepcopy(original)
+        verbatim = True
+        normalized = _normalize_client_entry(original)
+        if normalized is not None:
+            stm_sig = _server_signature(entry)
+            orig_sig = _server_signature(normalized)
+            if stm_sig is not None and orig_sig is not None and stm_sig != orig_sig:
+                warnings.append(
+                    "STM entry was modified after import — restoring the original "
+                    "host entry as imported (STM-side changes are not carried over)"
+                )
+    else:
+        payload, loss = _denormalize_client_entry(entry)
+        verbatim = False
+        warnings.append("no verbatim original captured — restoring a reconstructed entry")
+        warnings.extend(loss)
+
+    # Step 3 — no-clobber guard against the live host config.
+    skip_write = overwrite = False
+    existing = _host_existing_entry(kind, path, name)
+    if existing is not None:
+        existing_norm = _normalize_client_entry(existing)
+        payload_norm = _normalize_client_entry(payload)
+        existing_sig = _server_signature(existing_norm) if existing_norm else None
+        payload_sig = _server_signature(payload_norm) if payload_norm else None
+        if existing_sig is not None and payload_sig is not None:
+            if existing_sig == payload_sig:
+                skip_write = True
+            elif force:
+                overwrite = True
+            else:
+                return _EjectPlan(
+                    name=name,
+                    error=(
+                        f"a different '{name}' already exists in the target "
+                        "(command/url mismatch) — pass --force to overwrite it"
+                    ),
+                )
+        # A missing signature on either side is NEVER an idempotent match:
+        # full structural equality is the only skip condition (#475 R1 M1).
+        elif existing == payload:
+            skip_write = True
+        elif force:
+            overwrite = True
+        else:
+            return _EjectPlan(
+                name=name,
+                error=(
+                    f"the target already has '{name}' and its identity can't be "
+                    "compared (no command/url signature) — pass --force to overwrite"
+                ),
+            )
+
+    # Secret gate (§7) — shell-out scopes only, and only when a write will
+    # actually run. --yes never bypasses this; --allow-argv-secrets is the
+    # single override for both TTY and non-TTY.
+    needs_secret_confirm = False
+    spec = _SOURCE_BY_KIND[kind]
+    shell_out = spec.kind in ("claude-user", "claude-project")
+    if shell_out and not skip_write and not allow_argv_secrets:
+        secret_keys = _payload_secret_keys(payload)
+        if secret_keys:
+            if not _should_use_tui():
+                return _EjectPlan(
+                    name=name,
+                    error=(
+                        f"payload carries secret-classified values ({', '.join(secret_keys)}) "
+                        "that `claude mcp add-json` would expose on argv — pass "
+                        "--allow-argv-secrets to proceed (--yes does not cover this)"
+                    ),
+                )
+            needs_secret_confirm = True
+            warnings.append(
+                f"secret-classified values on argv if confirmed: {', '.join(secret_keys)}"
+            )
+
+    pruned_dups: list[str] = []
+    for dup in (origin.get("duplicates") or []) if origin else []:
+        if isinstance(dup, dict) and dup.get("pruned"):
+            label_spec = _SOURCE_BY_KIND.get(dup.get("kind", ""))
+            pruned_dups.append(label_spec.label if label_spec else str(dup.get("kind")))
+
+    return _EjectPlan(
+        name=name,
+        kind=kind,
+        path=path,
+        payload=payload,
+        verbatim=verbatim,
+        skip_write=skip_write,
+        overwrite=overwrite,
+        needs_secret_confirm=needs_secret_confirm,
+        warnings=warnings,
+        pruned_duplicates=pruned_dups,
+    )
+
+
+def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
+    """Dispatch the host write for one resolved plan (RFC §4.1 writer table)."""
+    assert plan.payload is not None
+    spec = _SOURCE_BY_KIND[plan.kind]
+    if plan.kind in ("claude-user", "claude-project"):
+        scope = spec.claude_scope or "user"
+        cwd = plan.path if plan.kind == "claude-project" else None
+        if plan.overwrite:
+            # `claude mcp add-json` has no overwrite flag (same probe lineage
+            # as `claude mcp add`, cli/proxy.py:274) — remove-then-add.
+            ok, err = _claude_mcp_remove(plan.name, scope)
+            if not ok:
+                return (False, f"--force pre-remove failed: {err}")
+        return _claude_mcp_add_json(plan.name, plan.payload, scope, cwd=cwd)
+    # ``plan.path`` is always set for mcp-json by plan resolution (the
+    # preflight rejected pathless targets); mypy can't see that invariant.
+    target = Path(plan.path or "") if plan.kind == "mcp-json" else _desktop_config_path()
+    # .mcp.json is a shared project file (0644 precedent in
+    # _write_mcp_json_for_stm); the Desktop config carries secrets (0600).
+    default_mode = 0o644 if plan.kind == "mcp-json" else 0o600
+    return _json_config_set_entry(target, plan.name, plan.payload, default_mode=default_mode)
+
+
+def _eject_verify(plan: _EjectPlan) -> list[str]:
+    """Post-write verify: re-read the host config, deep-compare to the payload.
+
+    Returns the list of deviating paths (empty = verbatim restore). The
+    claude CLI re-serializes through its own schema and silently drops
+    unknown fields (probed on 2.1.173), so a clean `add-json` exit does not
+    prove the verbatim-restore contract held — only re-reading the backing
+    file does. A `None` read (entry not where expected) reports as a full
+    mismatch rather than crashing.
+    """
+    assert plan.payload is not None
+    actual = _host_existing_entry(plan.kind, plan.path, plan.name)
+    if actual is None:
+        return ["<entry not found at the expected host location after write>"]
+    return _dict_diff_paths(plan.payload, actual)
+
+
+@cli.command()
+@click.argument("names", nargs=-1, required=True)
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option(
+    "--to",
+    "to_target",
+    default=None,
+    metavar="TARGET",
+    help=(
+        "Restore target for entries without a usable origin: claude-user | "
+        "claude-project[:PATH] | mcp-json[:PATH] | claude-desktop. Entries "
+        "with a recorded origin ignore this."
+    ),
+)
+@click.option(
+    "--keep",
+    is_flag=True,
+    help="Restore to the host but keep the STM entry (dual registration).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite a same-name host entry whose identity differs.",
+)
+@click.option(
+    "--allow-argv-secrets",
+    "allow_argv_secrets",
+    is_flag=True,
+    help=(
+        "Permit `claude mcp add-json` shell-outs whose payload carries "
+        "secret-classified values (argv is visible in the process list). "
+        "The only override for the secret gate — --yes does not bypass it."
+    ),
+)
+@click.option(
+    "--accept-schema-loss",
+    "accept_schema_loss",
+    is_flag=True,
+    help=(
+        "Proceed with STM removal even when the restored host entry does not "
+        "structurally match the original (the claude CLI strips fields it "
+        "does not know). Default is to keep the STM entry and fail."
+    ),
+)
+@click.option("--dry-run", "dry_run", is_flag=True, help="Print the plan; no writes.")
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    help="Skip the confirm prompt (scripts / CI / non-TTY callers).",
+)
+@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")))
+def eject(
+    names: tuple[str, ...],
+    config_path: str,
+    to_target: str | None,
+    keep: bool,
+    force: bool,
+    allow_argv_secrets: bool,
+    accept_schema_loss: bool,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Restore imported upstream(s) to their host MCP client, then remove from STM.
+
+    Reverse of ``mms add --import --prune``: writes the verbatim host entry
+    captured at import time (``origin.original``) back to where it came
+    from, verifies the restore against the host config, and only then
+    removes the STM entry. Any failure leaves the server registered in at
+    least one place — worst case is dual registration, never disappearance.
+    """
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
+        click.echo("  Run `mms init` first.", err=True)
+        sys.exit(1)
+
+    data = _load(resolved)
+    servers: dict[str, Any] = data.get("upstream_servers", {})
+    missing = [n for n in names if n not in servers]
+    if missing:
+        click.echo(f"{_err('Error:')} not configured: {', '.join(missing)}.", err=True)
+        sys.exit(1)
+
+    to_spec = _parse_eject_to(to_target) if to_target else None
+    plans = [
+        _resolve_eject_plan(
+            n, servers[n], to_spec, force=force, allow_argv_secrets=allow_argv_secrets
+        )
+        for n in names
+    ]
+
+    # Plan display — every entry, actionable or not, before any consent.
+    click.echo(_hdr(f"Eject plan ({len(plans)} entr{'y' if len(plans) == 1 else 'ies'}):"))
+    for plan in plans:
+        if plan.error:
+            click.echo(f"  {plan.name}: {_bad('cannot eject')} — {plan.error}")
+            continue
+        spec = _SOURCE_BY_KIND[plan.kind]
+        where = f"{spec.label}" + (f" [{plan.path}]" if plan.path else "")
+        action = (
+            "already present — skip write"
+            if plan.skip_write
+            else ("overwrite" if plan.overwrite else "restore")
+        )
+        body = "verbatim original" if plan.verbatim else "reconstructed entry"
+        click.echo(f"  {plan.name}: {action} → {where}  ({body})")
+        for w in plan.warnings or []:
+            click.echo(f"    {_warn('warning:')} {w}")
+        if plan.pruned_duplicates:
+            click.echo(
+                f"    {_warn('note:')} also pruned from {', '.join(plan.pruned_duplicates)} — "
+                "not restored here; originals remain in "
+                f"{_pruned_backup_path()} (restore manually if needed)"
+            )
+
+    errors = [p for p in plans if p.error]
+    actionable = [p for p in plans if not p.error]
+
+    if dry_run:
+        click.echo("")
+        click.echo(f"{_ok('Dry run:')} no writes performed.")
+        if errors:
+            sys.exit(1)
+        return
+
+    if not actionable:
+        sys.exit(1)
+
+    if assume_yes:
+        proceed = True
+    elif _should_use_tui():
+        click.echo("")
+        verb = (
+            "Restore to host(s) and keep in STM?"
+            if keep
+            else "Restore to host(s) and remove from STM?"
+        )
+        proceed = click.confirm(verb, default=False)
+    else:
+        click.echo(
+            f"{_err('Error:')} no TTY; pass --yes to confirm (or --dry-run to preview).",
+            err=True,
+        )
+        sys.exit(1)
+    if not proceed:
+        click.echo("Aborted. No changes made.")
+        return
+
+    restored: list[_EjectPlan] = []
+    failed: list[tuple[_EjectPlan, str]] = []
+    config_changed = False
+    for plan in actionable:
+        assert plan.payload is not None
+        if plan.needs_secret_confirm:
+            ok = click.confirm(
+                f"  '{plan.name}': pass the secret value(s) above on `claude` argv "
+                "(visible in the process list while it runs)?",
+                default=False,
+            )
+            if not ok:
+                failed.append((plan, "secret gate declined"))
+                continue
+
+        wrote = False
+        if not plan.skip_write:
+            ok, err = _eject_host_write(plan)
+            if not ok:
+                failed.append((plan, err or "host write failed"))
+                continue
+            wrote = True
+
+        if wrote:
+            mismatches = _eject_verify(plan)
+            if mismatches:
+                detail = ", ".join(mismatches)
+                if not accept_schema_loss:
+                    failed.append(
+                        (
+                            plan,
+                            "restored host entry does not match the original "
+                            f"({detail}) — the host now has the stripped copy and the "
+                            "STM entry is kept (dual registration); re-run with "
+                            "--accept-schema-loss to remove from STM anyway",
+                        )
+                    )
+                    continue
+                click.echo(
+                    f"  {_warn('Warning:')} '{plan.name}' restored with schema loss: {detail}",
+                    err=True,
+                )
+
+        if not keep:
+            del servers[plan.name]
+            config_changed = True
+        restored.append(plan)
+
+    if config_changed:
+        _save(resolved, data)
+
+    if restored:
+        click.echo("")
+        if keep:
+            click.echo(f"{_ok('Restored to host (kept in STM):')}")
+        else:
+            click.echo(f"{_ok('Restored to host and removed from STM:')}")
+        for plan in restored:
+            spec = _SOURCE_BY_KIND[plan.kind]
+            click.echo(f"  {plan.name} — {spec.label}")
+        if keep:
+            click.echo(
+                f"{_warn('Note:')} entries are now dual-registered (direct + via STM). "
+                "Run `mms prune NAME` to collapse back to STM-only routing."
+            )
+
+    if failed:
+        click.echo("")
+        click.echo(f"{_warn('Warning:')} could not eject {len(failed)} entr(ies):", err=True)
+        for plan, err in failed:
+            click.echo(f"  {plan.name}: {err}", err=True)
+        click.echo("", err=True)
+        click.echo("Restore manually (entry remains in STM):", err=True)
+        click.echo(
+            "  (a failing `claude mcp add-json` may also mean the installed claude "
+            "CLI predates json/http support — probed working on 2.1.173)",
+            err=True,
+        )
+        for plan, _err_msg in failed:
+            if plan.payload is not None:
+                click.echo(
+                    f"  {_eject_manual_hint(plan.name, plan.kind, plan.path, plan.payload)}",
+                    err=True,
+                )
+
+    if config_changed and not servers:
+        click.echo("")
+        click.echo(
+            f"{_warn('Note:')} no upstream servers remain. To also remove STM's own "
+            "client registration, run: claude mcp remove memtomem-stm"
+        )
+
+    if failed or errors:
         sys.exit(1)
 
 
