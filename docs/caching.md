@@ -106,6 +106,9 @@ The namespace supports `{server}` and `{tool}` placeholders. Can be toggled per-
 Setting `background: true` (default `false`) schedules the indexing task off the request path: the agent receives a `[Indexing…] · scheduled` placeholder footer immediately, while indexing runs in the background. Trade-off: read-your-own-writes consistency is no longer guaranteed until the task completes — opt in only if agents tolerate the gap.
 
 > **Note:** Auto-indexing requires a `FileIndexer` wired into
-> `ProxyManager`.  The default deployment does not wire one — wiring
-> instructions and the protocol contract are kept in the private
-> `memtomem-docs/memtomem-stm/guides-archived/custom-integration.md`.
+> `ProxyManager`, and the bundled `mms` server wires none by design —
+> these settings are library-mode only. The protocol contract lives in
+> `src/memtomem_stm/proxy/protocols.py`; pass an implementation as
+> `ProxyManager(..., index_engine=...)` when embedding STM as a
+> library. See [configuration.md](configuration.md) for the inert
+> behavior in the bundled server.

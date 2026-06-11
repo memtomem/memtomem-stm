@@ -635,3 +635,47 @@ def test_cli_md_eject_usage_block_flags_match_command() -> None:
         "docs/cli.md eject section must mention the prune backup log "
         f"({backup_name}) — eject suggests it for entries without an origin."
     )
+
+
+def test_user_facing_surfaces_carry_no_private_docs_paths() -> None:
+    """README, CHANGELOG, docs/, and src/ must not reference the private
+    docs repo by path.
+
+    A path like ``memtomem-docs/<...>.md`` points readers at a file they
+    cannot access (the repo is private) — docs/caching.md did exactly
+    that for auto-index wiring instructions until 2026-06-11, and an RFC
+    path sat in ``mms/__init__``'s module docstring. Bare repo-name
+    mentions explicitly marked private (CONTRIBUTING, notebooks/README,
+    CLAUDE.md) are deliberate and stay allowed — the pin matches the
+    path form only (``memtomem-docs/``, with separator) and only on the
+    user-facing surfaces.
+
+    Scope = **git-tracked** files: that is exactly the published repo.
+    Untracked local artifacts (the ``docs/reports/`` review-report
+    convention) are excluded by construction rather than by a hardcoded
+    subtree carve-out, while nested *committed* docs under any future
+    ``docs/<subdir>/`` are covered — git pathspec ``*`` crosses ``/``.
+    """
+    import subprocess
+
+    listed = subprocess.run(
+        ["git", "ls-files", "--", "README.md", "CHANGELOG.md", "docs/*.md", "src/*.py"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert len(listed) > 10, f"git ls-files returned suspiciously few files: {listed!r}"
+    offenders = []
+    for relative in listed:
+        path = REPO_ROOT / relative
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if "memtomem-docs/" in line:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}")
+    assert not offenders, (
+        "Private docs-repo path reference(s) in user-facing files: "
+        f"{offenders!r}. Replace with public guidance (code paths, "
+        "protocol references, public docs links) — readers cannot open "
+        "memtomem-docs files."
+    )
