@@ -288,7 +288,15 @@ def test_configuration_md_stage4_inert_note_pinned() -> None:
         )
     note = block_match.group(1).lower()
 
-    required = ("library", "inert", "index_engine", "#288")
+    required = (
+        "library",
+        "inert",
+        "index_engine",
+        "fileindexer",
+        "bundled",
+        "no runtime effect",
+        "#288",
+    )
     missing = [kw for kw in required if kw.lower() not in note]
     if missing:
         pytest.fail(
