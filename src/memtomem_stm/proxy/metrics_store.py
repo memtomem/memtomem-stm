@@ -251,14 +251,16 @@ class MetricsStore:
     def record(self, metrics: CallMetrics) -> None:
         """Persist one per-call metrics row.
 
-        Synchronous sqlite write on the caller's thread — in the proxy
-        that is the asyncio event loop. Deliberate under the proxy's
-        single-MCP-client invariant: blocking the loop here delays only
-        the one in-flight call that produced the row, and a local WAL
-        insert is far cheaper than the upstream tool call it accounts
-        for. Multi-client serving is the reopen trigger — then move the
-        write to ``asyncio.to_thread``; ``self._lock`` (see the note in
-        ``__init__``) already makes that safe.
+        Synchronous sqlite write on the asyncio event loop: while it
+        runs, every runnable coroutine stalls — other in-flight proxied
+        calls included, not just the one that produced the row.
+        Accepted for the current local single-MCP-client deployment,
+        where call volume is low and a local WAL insert is far cheaper
+        than the upstream call it accounts for. Multi-client serving
+        (or materially higher concurrency) is the reopen trigger: move
+        persistence off-loop (e.g. ``asyncio.to_thread``) — readers and
+        writers here already share ``self._lock`` (see ``__init__``),
+        so this store is lock-ready for that move.
         """
         if self._db is None:
             return

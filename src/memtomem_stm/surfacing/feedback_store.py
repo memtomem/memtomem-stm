@@ -236,12 +236,18 @@ class FeedbackStore:
 
     The write paths (``record_surfacing`` / ``record_feedback`` /
     ``mark_surfaced`` / ``save_adjustment`` / the ``cleanup_*`` sweeps)
-    do synchronous sqlite I/O on the caller's thread — on the proxy and
-    daemon paths that is the asyncio event loop. Deliberate under the
-    single-MCP-client invariant: a blocking write delays only the call
-    being served. Multi-client serving is the reopen trigger — then move
-    the writes to ``asyncio.to_thread``; ``self._lock`` already makes
-    them thread-safe.
+    do synchronous sqlite I/O on the asyncio event loop (proxy and
+    daemon paths alike): while one runs, every runnable coroutine
+    stalls — other in-flight calls included, not just the one being
+    served. Accepted for the current local single-MCP-client
+    deployment, where call volume is low and the writes are cheap local
+    inserts. Multi-client serving (or materially higher concurrency) is
+    the reopen trigger: move the writes off-loop (e.g.
+    ``asyncio.to_thread``) — and note ``self._lock`` serializes the
+    write paths only; the read/stat methods share the connection
+    unlocked, so a thread move also needs every connection access
+    locked (the ``MetricsStore.__init__`` reader/writer convention) or
+    per-thread connections.
     """
 
     def __init__(self, db_path: Path) -> None:
