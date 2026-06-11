@@ -588,6 +588,40 @@ class TestListServers:
         assert rows["manual"][header.index("ORIGIN")] == "-"
         assert "mms eject" in result.output
 
+    def test_list_no_pruned_marker_when_unpruned_duplicate_remains(self, runner, config):
+        """Partial prune (primary source pruned, duplicate source not) must
+        NOT star the row: an un-pruned duplicate still registers the server,
+        so 'exists only behind STM' would be false — and the marker would
+        contradict ``mms remove``'s orphaning hint, which shares the same
+        every-source predicate (codex R1)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "partial": {
+                            "prefix": "pa",
+                            "command": "npx",
+                            "origin": {
+                                "schema_version": 1,
+                                "source": {"kind": "claude-user", "pruned": True},
+                                "duplicates": [{"kind": "claude-desktop", "pruned": False}],
+                                "imported_at": "2026-06-11T00:00:00Z",
+                                "original": {"command": "npx"},
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        row = next(line for line in result.output.splitlines() if line.startswith("partial"))
+        assert "claude-user" in row
+        assert "claude-user*" not in row
+        assert "mms eject" not in result.output
+
     def test_list_origin_legend_absent_without_pruned_entries(self, runner, config):
         """The ``mms eject`` legend only appears when some row actually
         carries the pruned marker — an all-dual / all-manual table stays

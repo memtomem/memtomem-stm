@@ -549,6 +549,28 @@ def _redacted_servers_json(servers: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _origin_fully_pruned(origin: Any) -> bool:
+    """True when provenance records *every* host source as pruned (#475 PR4).
+
+    The primary ``origin.source`` plus all recorded ``duplicates`` — the
+    condition under which the entry exists only behind STM, so removing it
+    from STM would leave the server registered nowhere. One predicate
+    shared by the ``mms list`` pruned marker and the ``mms remove`` eject
+    hint: the two surfaces must not contradict each other on what "pruned"
+    means (a primary-only check would star an entry that an un-pruned
+    duplicate still registers). Advisory by construction — flags are as
+    recorded at prune time; ``mms eject``'s live no-clobber check stays the
+    authoritative guard.
+    """
+    if not isinstance(origin, dict):
+        return False
+    source = origin.get("source")
+    if not isinstance(source, dict) or not source.get("pruned"):
+        return False
+    duplicates = [d for d in origin.get("duplicates") or [] if isinstance(d, dict)]
+    return all(d.get("pruned") for d in duplicates)
+
+
 def _origin_cell(cfg: Any) -> str:
     """ORIGIN table cell for one ``mms list`` row (#475 PR4).
 
@@ -556,16 +578,17 @@ def _origin_cell(cfg: Any) -> str:
     imports); otherwise the recorded ``origin.source.kind`` — the
     machine-readable identifier, not the human label, so the cell stays
     within one column and matches what ``--json`` exposes. A trailing ``*``
-    marks a primary source whose host original was pruned (the entry now
-    exists only behind STM); the legend under the table points at
-    ``mms eject``. Unknown kinds print as recorded — the cell is a display
-    of stored provenance, not a validation of it.
+    marks an entry whose every recorded host source was pruned (the entry
+    now exists only behind STM — see :func:`_origin_fully_pruned`); the
+    legend under the table points at ``mms eject``. Unknown kinds print as
+    recorded — the cell is a display of stored provenance, not a
+    validation of it.
     """
     origin = cfg.get("origin") if isinstance(cfg, dict) else None
     source = origin.get("source") if isinstance(origin, dict) else None
     if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
         return "-"
-    return source["kind"] + ("*" if source.get("pruned") else "")
+    return source["kind"] + ("*" if _origin_fully_pruned(origin) else "")
 
 
 @cli.command()
@@ -2456,10 +2479,11 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
     """Eject hint printed before removing an imported entry (#475 PR4).
 
     Fires only when the recorded provenance says removal would leave the
-    server registered **nowhere**: the primary source was pruned and no
-    un-pruned duplicate source remains. Entries without an ``origin`` block
-    (manual ``mms add``, pre-#475 imports) and entries whose host original
-    still exists get no hint — removing those just stops proxying.
+    server registered **nowhere** — :func:`_origin_fully_pruned`, the same
+    predicate behind the ``mms list`` pruned marker. Entries without an
+    ``origin`` block (manual ``mms add``, pre-#475 imports) and entries
+    some host still registers get no hint — removing those just stops
+    proxying.
 
     Advisory only: the flags are as recorded at prune time (a manually
     re-added host entry isn't detected), and ``mms eject``'s live
@@ -2470,14 +2494,9 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
     if not isinstance(entry, dict):
         return None
     origin = entry.get("origin")
-    if not isinstance(origin, dict):
+    if not _origin_fully_pruned(origin):
         return None
     source = origin.get("source")
-    if not isinstance(source, dict) or not source.get("pruned"):
-        return None
-    duplicates = [d for d in origin.get("duplicates") or [] if isinstance(d, dict)]
-    if any(not d.get("pruned") for d in duplicates):
-        return None
     kind = source.get("kind")
     spec = _SOURCE_BY_KIND.get(kind) if isinstance(kind, str) else None
     label = spec.label if spec else (kind if isinstance(kind, str) else "its host client")
