@@ -77,16 +77,18 @@ def _env_override_hint(
     Attribution is two-staged:
 
     1. DIFFERENTIAL pre-filter — every error of the merged config whose
-       ``(loc, type)`` the file reproduces ON ITS OWN is file-caused and
-       skipped: an env var that merely touched the same subtree (an innocent
-       ``tail_mode`` under a hybrid block whose ordering the file itself
-       breaks) must not be implicated. The file-alone validation runs
-       lazily, once, only on this already-failing path. Matching includes
-       the error TYPE so an env value that re-breaks a file-broken location
-       DIFFERENTLY (gt-violation -> int-parsing) is still attributed. (If
-       the env adds a second instance of an aggregated root error the file
-       already has — e.g. one more duplicate-prefix pair — it stays hidden
-       until the file is fixed; the rerun then re-attributes.)
+       ``(loc, type, msg)`` the file reproduces ON ITS OWN is file-caused
+       and skipped: an env var that merely touched the same subtree (an
+       innocent ``tail_mode`` under a hybrid block whose ordering the file
+       itself breaks) must not be implicated. The file-alone validation runs
+       lazily, once, only on this already-failing path. The error TYPE keeps
+       an env value that re-breaks a file-broken location DIFFERENTLY
+       (gt-violation -> int-parsing) attributed; the MESSAGE disambiguates
+       model validators, which all share ``type="value_error"`` — a
+       file-caused duplicate-prefix error must not mask a separate
+       env-caused empty-prefix error at the same root location (and an env
+       var that changes an aggregated root message, e.g. adds a collision,
+       is attributed too).
 
     2. NAMING — hints are derived from the env overlay's LEAVES, the var
        names the operator actually set, never synthesized from the error
@@ -119,17 +121,18 @@ def _env_override_hint(
                         _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
                     )
 
-    file_error_keys: frozenset[tuple[tuple[Any, ...], str]] | None = None
+    def _error_key(e: dict[str, Any]) -> tuple[tuple[Any, ...], str, str]:
+        return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
 
-    def _file_alone_error_keys() -> frozenset[tuple[tuple[Any, ...], str]]:
+    file_error_keys: frozenset[tuple[tuple[Any, ...], str, str]] | None = None
+
+    def _file_alone_error_keys() -> frozenset[tuple[tuple[Any, ...], str, str]]:
         if file_data is None:
             return frozenset()  # no file at all: every failure is env-caused
         try:
             ProxyConfig.model_validate(file_data)
         except ValidationError as file_exc:
-            return frozenset(
-                (tuple(e.get("loc", ())), str(e.get("type", ""))) for e in file_exc.errors()
-            )
+            return frozenset(_error_key(e) for e in file_exc.errors())
         except Exception:  # non-pydantic failure: attribute nothing to the file
             return frozenset()
         return frozenset()
@@ -138,7 +141,7 @@ def _env_override_hint(
         loc = err.get("loc", ())
         if file_error_keys is None:
             file_error_keys = _file_alone_error_keys()
-        if (tuple(loc), str(err.get("type", ""))) in file_error_keys:
+        if _error_key(err) in file_error_keys:
             continue  # the file fails this same check on its own — file-caused
         if not loc:
             _add_leaves([], env_overrides)

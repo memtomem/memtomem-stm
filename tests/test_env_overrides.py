@@ -323,6 +323,29 @@ class TestMalformedEnvOverrideDiagnostics:
             "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in r.getMessage() for r in caplog.records
         )
 
+    def test_file_root_error_does_not_mask_a_different_env_root_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Model validators all share type="value_error", so the differential
+        key includes the MESSAGE: the file's duplicate-prefix root error must
+        not mask a separate env-caused empty-prefix root error."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps({"upstream_servers": {"a": {"prefix": "x"}, "b": {"prefix": "x"}}})
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__C__PREFIX": "   "}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__C__PREFIX" in r.getMessage()
+            for r in caplog.records
+        )
+
     def test_env_caused_duplicate_prefix_names_env_leaves(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
