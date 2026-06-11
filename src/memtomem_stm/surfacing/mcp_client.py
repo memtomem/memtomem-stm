@@ -21,6 +21,7 @@ from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.utils.numeric import safe_float
+from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 logger = logging.getLogger(__name__)
 
@@ -304,9 +305,25 @@ class McpClientSearchAdapter:
                 return stdio_client(params)
 
     def _target_display(self) -> str:
+        """Loggable connection target — URL userinfo is redacted.
+
+        ``ltm_mcp_url`` may carry ``user:password@`` credentials (basic-auth
+        proxies in front of a network LTM, #398), and this string goes to
+        INFO logs in ``start()`` and ``_reconnect()``. Only the display is
+        redacted; the transport itself receives the configured URL verbatim.
+        """
         if self._config.ltm_mcp_transport == "stdio":
             return self._config.ltm_mcp_command
-        return self._config.ltm_mcp_url
+        return redact_url_userinfo(self._config.ltm_mcp_url)
+
+    def _scrub_exc(self, exc: BaseException) -> str:
+        """Render *exc* for logging with URL userinfo scrubbed.
+
+        httpx exceptions embed the full request URL (credentials included),
+        so every log line in this module that interpolates an exception must
+        go through here rather than passing ``exc`` to the logger raw.
+        """
+        return redact_exception_text(str(exc), self._config.ltm_mcp_url)
 
     async def _negotiate_format(self) -> None:
         """Downgrade to compact if core doesn't advertise structured support.
@@ -331,7 +348,7 @@ class McpClientSearchAdapter:
                     logger.info("Core supports structured format — keeping StructuredResultParser")
                     return
         except Exception as exc:
-            logger.debug("Version negotiation failed (older core?): %s", exc)
+            logger.debug("Version negotiation failed (older core?): %s", self._scrub_exc(exc))
 
         logger.info("Core does not advertise structured format — falling back to compact")
         self._parser = CompactResultParser()
@@ -417,7 +434,10 @@ class McpClientSearchAdapter:
                     self._start_attempted = False
                     raise
                 except Exception as exc:
-                    logger.warning("Lazy MCP adapter start failed — surfacing disabled: %s", exc)
+                    logger.warning(
+                        "Lazy MCP adapter start failed — surfacing disabled: %s",
+                        self._scrub_exc(exc),
+                    )
                     return False
                 return True
         if not self._needs_reconnect:
@@ -425,7 +445,9 @@ class McpClientSearchAdapter:
         try:
             await self._reconnect()
         except Exception as exc:
-            logger.warning("Lazy reconnect after mid-RPC cancellation failed: %s", exc)
+            logger.warning(
+                "Lazy reconnect after mid-RPC cancellation failed: %s", self._scrub_exc(exc)
+            )
             return False
         self._needs_reconnect = False
         return True
@@ -477,14 +499,16 @@ class McpClientSearchAdapter:
         try:
             result = await self._session.call_tool("mem_search", args)
         except self._TRANSPORT_ERRORS as exc:
-            logger.warning("MCP transport error, attempting reconnect: %s", exc)
+            logger.warning("MCP transport error, attempting reconnect: %s", self._scrub_exc(exc))
             try:
                 await self._reconnect()
                 assert self._session is not None
                 result = await self._session.call_tool("mem_search", args)
             except Exception as retry_exc:
                 # Upstream LTM is unreachable; surfacing will return empty.
-                logger.warning("MCP mem_search failed after reconnect: %s", retry_exc)
+                logger.warning(
+                    "MCP mem_search failed after reconnect: %s", self._scrub_exc(retry_exc)
+                )
                 return [], [], "transport_error"
         except asyncio.CancelledError:
             # #290: outer wait_for cancelled us mid-RPC. Mark for lazy
@@ -494,7 +518,7 @@ class McpClientSearchAdapter:
             self._needs_reconnect = True
             raise
         except Exception as exc:
-            logger.warning("MCP mem_search failed: %s", exc)
+            logger.warning("MCP mem_search failed: %s", self._scrub_exc(exc))
             return [], [], "call_error"
 
         # Parse text response into results
@@ -541,20 +565,25 @@ class McpClientSearchAdapter:
         try:
             await self._session.call_tool("mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
-            logger.warning("MCP transport error in increment_access, reconnecting: %s", exc)
+            logger.warning(
+                "MCP transport error in increment_access, reconnecting: %s", self._scrub_exc(exc)
+            )
             try:
                 await self._reconnect()
                 assert self._session is not None
                 await self._session.call_tool("mem_do", call_args)
             except Exception as retry_exc:
-                logger.debug("MCP mem_do(increment_access) failed after reconnect: %s", retry_exc)
+                logger.debug(
+                    "MCP mem_do(increment_access) failed after reconnect: %s",
+                    self._scrub_exc(retry_exc),
+                )
         except asyncio.CancelledError:
             # #290: see search() — mid-RPC cancellation marks the session
             # for lazy reconnect; propagate per the cooperative model.
             self._needs_reconnect = True
             raise
         except Exception as exc:
-            logger.debug("MCP mem_do(increment_access) failed: %s", exc)
+            logger.debug("MCP mem_do(increment_access) failed: %s", self._scrub_exc(exc))
 
     async def scratch_list(self, *, trace_id: str | None = None) -> list[dict]:
         """Fetch working memory entries via mem_do(action="scratch_get").
@@ -580,7 +609,9 @@ class McpClientSearchAdapter:
         try:
             result = await self._session.call_tool("mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
-            logger.warning("MCP transport error in scratch_list, reconnecting: %s", exc)
+            logger.warning(
+                "MCP transport error in scratch_list, reconnecting: %s", self._scrub_exc(exc)
+            )
             try:
                 await self._reconnect()
                 assert self._session is not None
@@ -593,7 +624,7 @@ class McpClientSearchAdapter:
             self._needs_reconnect = True
             raise
         except Exception as exc:
-            logger.debug("MCP mem_do(scratch_get) failed: %s", exc)
+            logger.debug("MCP mem_do(scratch_get) failed: %s", self._scrub_exc(exc))
             return []
 
         # ``result.content or []`` tolerates spec-noncompliant upstreams that

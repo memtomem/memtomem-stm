@@ -3885,6 +3885,40 @@ class TestHealth:
         assert captured["url"] == "https://ltm.example/sse"
         assert captured["headers"] == {"Authorization": "Bearer token"}
 
+    def test_ltm_network_health_redacts_url_credentials(self, monkeypatch):
+        # ``status`` feeds both the text lines and the ``--json`` dump, so a
+        # basic-auth URL must be redacted in url/display/error — while the
+        # probe itself still receives the raw configured URL.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        captured = {}
+
+        async def fake_probe(transport, command, args, url, headers, timeout, errlog):
+            captured["url"] = url
+            # httpx-style message embedding the full credentialed request URL
+            raise ConnectionError(f"Client error '401 Unauthorized' for url '{url}'")
+
+        monkeypatch.setattr(proxy_mod, "_probe_ltm_mcp_server", fake_probe)
+
+        status = proxy_mod._ltm_mcp_status(
+            SimpleNamespace(
+                enabled=True,
+                ltm_mcp_transport="sse",
+                ltm_mcp_command="",
+                ltm_mcp_args=[],
+                ltm_mcp_url="https://alice:s3cret@ltm.example/sse",
+                ltm_mcp_headers=None,
+            ),
+            timeout=2,
+        )
+
+        assert captured["url"] == "https://alice:s3cret@ltm.example/sse"  # probe stays raw
+        assert status["connected"] is False
+        for field in ("url", "display", "error"):
+            assert "s3cret" not in str(status[field]), field
+        assert status["display"] == "https://***@ltm.example/sse"
+        assert "***@ltm.example" in status["error"]
+
     def test_sse_ltm_probe_timeout_bounds_transport_enter(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
 

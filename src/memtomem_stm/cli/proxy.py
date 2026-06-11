@@ -32,6 +32,7 @@ from memtomem_stm.mms.import_hosts import (
 )
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
+from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
@@ -2518,16 +2519,19 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     headers = getattr(surfacing, "ltm_mcp_headers", None)
     if not isinstance(headers, dict):
         headers = None
+    # ``status`` is the operator-facing payload (text lines AND ``--json``
+    # dump), so the URL fields are userinfo-redacted; only the local ``url``
+    # stays raw for the probe's actual connection below.
     display = (
         _format_command_for_display(command, args)
         if transport == "stdio" and command
-        else url or "(empty url)"
+        else redact_url_userinfo(url) or "(empty url)"
     )
     status: dict[str, Any] = {
         "transport": transport,
         "command": command,
         "args": args,
-        "url": url,
+        "url": redact_url_userinfo(url),
         "display": display,
         "connected": None,
         "version": None,
@@ -2581,7 +2585,10 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         if isinstance(root, TimeoutError):
             status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
         else:
-            status["error"] = f"{display}: {str(root) or type(root).__name__}"
+            # httpx exceptions embed the full request URL — userinfo included
+            # — so the rendered message is scrubbed against the raw url.
+            message = redact_exception_text(str(root), url) or type(root).__name__
+            status["error"] = f"{display}: {message}"
     else:
         status.update(probe)
     return status
