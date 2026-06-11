@@ -96,7 +96,7 @@ def _value_looks_secret(value: str) -> str | None:
     """
     if len(value) < _VALUE_HEURISTIC_MIN_LEN:
         return None
-    if not value or any(c.isspace() for c in value):
+    if any(c.isspace() for c in value):
         return None
     if _HEX_RE.match(value):
         return "hex"
