@@ -74,11 +74,16 @@ jobs:
             --nbmake-timeout=180 --tb=short -q
 
   bench_qa:
-    # Advisory for the first 1–2 weeks while per-scenario thresholds
-    # settle. Do not promote to a required check until qa_gate_min /
-    # compressed_chars floors have been ratcheted up from observed data.
+    # Required gate. Per-scenario floors (qa_gate_min, ratio_violation) are
+    # hard-asserted at the pytest level and were ratcheted up from observed
+    # data over a multi-week advisory period (2026-04..06). The floors live
+    # in tests/bench/fixtures/<scenario>.json; the suite is deterministic
+    # (fake upstream, no network/LLM — the LLM judge runs under a separate
+    # opt-in marker). A failure here now blocks merge: it signals a real
+    # compression/surfacing regression, so adjust the code or, if the new
+    # behaviour is intended, re-baseline the affected fixture's floor.
     runs-on: ubuntu-latest
-    continue-on-error: true
+    continue-on-error: false
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
