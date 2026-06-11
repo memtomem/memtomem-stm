@@ -18,6 +18,7 @@ import pytest
 
 from memtomem_stm.proxy.config import AutoIndexConfig, ExtractionConfig
 from memtomem_stm.proxy.extraction import ExtractedFact
+from memtomem_stm.proxy.index_observability import IndexObservability
 from memtomem_stm.proxy.memory_ops import (
     AutoIndexOutcome,
     ExtractOutcome,
@@ -581,3 +582,228 @@ class TestFormatFactMd:
         fact = ExtractedFact(content="Fact", category="c", confidence=0.5)
         md = format_fact_md(fact, "s", "t", {})
         assert "extracted_from: s/t((none))" in md
+
+
+# ── privacy gates (#453) ─────────────────────────────────────────────────
+
+
+class TestAutoIndexPrivacyGate:
+    """Secret-looking content must never be written to the memory dir or
+    indexed into LTM (SECURITY.md exclusion, #453). The gate scans the
+    exact markdown that would be persisted, so arg-borne secrets count."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> AutoIndexConfig:
+        return AutoIndexConfig(
+            enabled=True,
+            memory_dir=tmp_path / "proxy_index",
+            namespace="proxy-{server}",
+        )
+
+    async def test_secret_text_skips_write_and_index(self, config):
+        indexer = FakeIndexer()
+        obs = IndexObservability()
+        outcome = await auto_index_response(
+            indexer,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={"path": "deploy.env"},
+            text="DB_PASSWORD=hunter2\nAPI_HOST=internal",
+            agent_summary="env file summary",
+            observability=obs,
+        )
+        assert outcome == AutoIndexOutcome(summary="env file summary", ok=True, chunks_indexed=0)
+        assert indexer.indexed_paths == []
+        # mkdir happens after the gate: nothing of the response touches disk.
+        assert not config.memory_dir.exists()
+        snap = obs.snapshot()
+        assert snap["attempts"]["read_file"] == {"auto_index": 1}
+        assert snap["outcomes"]["read_file"] == {"privacy_skip": 1}
+
+    async def test_secret_in_arguments_skips(self, config):
+        # The persisted markdown embeds the rendered call arguments, so an
+        # arg-borne secret must trip the gate even when the text is clean.
+        indexer = FakeIndexer()
+        outcome = await auto_index_response(
+            indexer,
+            config,
+            server="gh",
+            tool="fetch",
+            arguments={"auth": "password=hunter2"},
+            text="clean response body",
+            agent_summary="summary",
+        )
+        assert outcome.chunks_indexed == 0
+        assert indexer.indexed_paths == []
+        assert not config.memory_dir.exists()
+
+    async def test_email_bearing_text_skips_persistence(self, config):
+        # Persistence gates scan the full DEFAULT_PATTERNS (credentials +
+        # PII): per the #461 split, an email is fine to show an external
+        # summarizer but not fine to store, so STORAGE consumers keep the
+        # union while ACTION gates (LLM routing) use credentials only.
+        indexer = FakeIndexer()
+        outcome = await auto_index_response(
+            indexer,
+            config,
+            server="gh",
+            tool="fetch",
+            arguments={},
+            text="maintainer contact: dev@example.com",
+            agent_summary="summary",
+        )
+        assert outcome.chunks_indexed == 0
+        assert indexer.indexed_paths == []
+
+    async def test_secret_in_context_query_skips(self, config):
+        # The agent-intent section persists context_query verbatim.
+        indexer = FakeIndexer()
+        outcome = await auto_index_response(
+            indexer,
+            config,
+            server="gh",
+            tool="fetch",
+            arguments={},
+            text="clean response body",
+            agent_summary="summary",
+            context_query="log in with password=hunter2 and retry",
+        )
+        assert outcome.chunks_indexed == 0
+        assert indexer.indexed_paths == []
+
+    async def test_clean_text_still_indexes_and_counts_stored(self, config):
+        indexer = FakeIndexer()
+        obs = IndexObservability()
+        outcome = await auto_index_response(
+            indexer,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={"path": "src/app.py"},
+            text="ordinary file contents",
+            agent_summary="summary",
+            observability=obs,
+        )
+        assert outcome.ok and outcome.chunks_indexed == 3
+        assert len(indexer.indexed_paths) == 1
+        snap = obs.snapshot()
+        assert snap["outcomes"]["read_file"] == {"stored": 1}
+
+
+class TestExtractPrivacyGate:
+    """The extraction gate fires before ``extractor.extract`` so the
+    (possibly remote) extraction LLM never sees secret-bearing text, and
+    no fact file is persisted (#453)."""
+
+    @pytest.fixture
+    def config(self, tmp_path) -> ExtractionConfig:
+        return ExtractionConfig(
+            enabled=True,
+            memory_dir=tmp_path / "facts",
+            namespace="facts-{server}",
+            max_facts=10,
+            dedup_threshold=0.92,
+        )
+
+    async def test_secret_text_skips_extractor_entirely(self, config):
+        extractor = FakeExtractor([ExtractedFact(content="f", category="c", confidence=0.5)])
+        indexer = FakeIndexer()
+        obs = IndexObservability()
+        outcome = await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={"path": "x"},
+            text="creds: api_key: zzz-123",
+            observability=obs,
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=0)
+        assert extractor.calls == []  # the extractor (and its LLM) never ran
+        assert indexer.indexed_paths == []
+        assert not config.memory_dir.exists()
+        snap = obs.snapshot()
+        assert snap["attempts"]["read_file"] == {"extract": 1}
+        assert snap["outcomes"]["read_file"] == {"privacy_skip": 1}
+
+    async def test_secret_in_arguments_skips(self, config):
+        # ``format_fact_md`` embeds the rendered arguments in every fact
+        # file, so arg-borne secrets are part of the scanned value.
+        extractor = FakeExtractor([ExtractedFact(content="f", category="c", confidence=0.5)])
+        indexer = FakeIndexer()
+        outcome = await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="gh",
+            tool="fetch",
+            arguments={"auth": "password=hunter2"},
+            text="clean response body",
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=0)
+        assert extractor.calls == []
+        assert indexer.indexed_paths == []
+
+    async def test_clean_text_still_extracts(self, config):
+        extractor = FakeExtractor([ExtractedFact(content="A fact", category="c", confidence=0.5)])
+        indexer = FakeIndexer()
+        outcome = await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={"path": "src/app.py"},
+            text="ordinary response",
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=1)
+        assert len(extractor.calls) == 1
+
+    async def test_secret_in_extractor_output_skips_whole_batch(self, config):
+        # The extractor (an LLM) can reassemble or normalize sensitive
+        # content that evaded the input scan — the actual fact markdown is
+        # scanned before any disk or indexer interaction, and one hit skips
+        # the whole batch (per-call-terminal privacy_skip contract).
+        facts = [
+            ExtractedFact(content="A clean fact about flask", category="c", confidence=0.5),
+            ExtractedFact(content="login password=hunter2", category="c", confidence=0.5),
+        ]
+        extractor = FakeExtractor(facts)
+        indexer = FakeIndexer()
+        obs = IndexObservability()
+        outcome = await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={"path": "clean.txt"},
+            text="ordinary response that passes the input scan",
+            observability=obs,
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=0)
+        assert len(extractor.calls) == 1  # input was clean — extractor ran
+        assert indexer.indexed_paths == []
+        assert indexer.dedup_calls == []  # scan precedes ALL indexer interaction
+        assert not config.memory_dir.exists()  # nothing touched disk
+        snap = obs.snapshot()
+        assert snap["outcomes"]["read_file"] == {"privacy_skip": 1}
+
+    async def test_secret_in_extractor_output_skips_without_indexer_too(self, config):
+        # index_engine=None still writes fact files — the output scan must
+        # gate that path as well.
+        facts = [ExtractedFact(content="token sk-" + "a" * 24, category="c", confidence=0.5)]
+        extractor = FakeExtractor(facts)
+        outcome = await extract_and_store(
+            None,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={},
+            text="ordinary response",
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=0)
+        assert not config.memory_dir.exists()

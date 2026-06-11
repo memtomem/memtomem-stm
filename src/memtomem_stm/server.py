@@ -1165,10 +1165,10 @@ async def stm_index_stats(
 
     - ``attempts[tool][path]`` per-tool / per-path call counts; path is
       ``extract`` or ``auto_index``. ``__total__`` aggregates across tools.
-    - ``outcomes[tool][label]`` per-tool 4-label outcomes shared across
-      both paths. ``stored`` and ``error`` fire for both; ``dedup_skip``
-      and ``extracted_zero_facts`` only fire for the extract path
-      (auto_index has no extraction or dedup phase).
+    - ``outcomes[tool][label]`` per-tool 5-label outcomes shared across
+      both paths. ``stored``, ``error``, and ``privacy_skip`` fire for
+      both; ``dedup_skip`` and ``extracted_zero_facts`` only fire for the
+      extract path (auto_index has no extraction or dedup phase).
 
     **Quality signal absent by design.** SURFACE has surfacing-feedback;
     INDEX has no equivalent. Adding one would have to choose between
@@ -1219,7 +1219,7 @@ def _format_index_observability_sections(snapshot: dict, *, tool_filter: str | N
     Mirror of ``_format_observability_sections`` for surfacing, but with
     the INDEX shape: ``attempts`` is per-tool / per-path
     (``{tool: {path: count}}``) so operators see the
-    extract / auto_index breakdown; ``outcomes`` is per-tool 4-label.
+    extract / auto_index breakdown; ``outcomes`` is per-tool 5-label.
     No cache section — INDEX has no caching layer.
     """
     attempts: dict[str, dict[str, int]] = snapshot["attempts"]

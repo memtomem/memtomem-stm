@@ -59,6 +59,7 @@ from memtomem_stm.proxy.memory_ops import (
     compose_index_footer,
     extract_and_store,
     format_fact_md,
+    index_content_matches_privacy,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
@@ -1890,7 +1891,26 @@ class ProxyManager:
             and self._index_engine is not None
             and len(cleaned) >= ai_cfg.min_chars
         ):
-            if ai_cfg.background:
+            if ai_cfg.background and index_content_matches_privacy(
+                server, tool, upstream_args, cleaned, context_query=context_query
+            ):
+                # #453: the ``[Indexing…] · scheduled`` placeholder below
+                # would promise an indexing run that the task's own privacy
+                # gate is about to decline — pre-check with the SAME
+                # predicate and return the un-footered response instead of
+                # scheduling. Records what the skipped task would have
+                # recorded, and mirrors the sync skip's metrics shape
+                # (ok=True / 0 chunks).
+                logger.info(
+                    "Auto-index skipped for %s/%s: content matches a privacy pattern",
+                    server,
+                    tool,
+                )
+                self.index_observability.record_attempt(tool, "auto_index")
+                self.index_observability.record_outcome(tool, "privacy_skip")
+                final_result = surfaced
+                index_ok = True
+            elif ai_cfg.background:
                 # F4: schedule indexing off the request path. The placeholder
                 # footer ([Indexing…] … · scheduled, namespace dropped) ships
                 # to the agent synchronously while the indexing task runs in
