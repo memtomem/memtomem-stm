@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from memtomem_stm.proxy.metrics import CallMetrics
+from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -170,10 +171,7 @@ class MetricsStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
         try:
-            try:
-                self._db_path.chmod(0o600)
-            except OSError:
-                pass
+            ensure_private_db_files(self._db_path)
             tune_connection(db)
             db.execute(_CREATE)
             db.execute(_INDEX)
@@ -249,6 +247,19 @@ class MetricsStore:
             self._db = None
 
     def record(self, metrics: CallMetrics) -> None:
+        """Persist one per-call metrics row.
+
+        Synchronous sqlite write on the asyncio event loop: while it
+        runs, every runnable coroutine stalls — other in-flight proxied
+        calls included, not just the one that produced the row.
+        Accepted for the current local single-MCP-client deployment,
+        where call volume is low and a local WAL insert is far cheaper
+        than the upstream call it accounts for. Multi-client serving
+        (or materially higher concurrency) is the reopen trigger: move
+        persistence off-loop (e.g. ``asyncio.to_thread``) — readers and
+        writers here already share ``self._lock`` (see ``__init__``),
+        so this store is lock-ready for that move.
+        """
         if self._db is None:
             return
         now = time.time()

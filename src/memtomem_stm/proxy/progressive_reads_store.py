@@ -21,6 +21,7 @@ import threading
 import time
 from pathlib import Path
 
+from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ class ProgressiveReadsStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False)
         try:
+            ensure_private_db_files(self._db_path)
             tune_connection(db)
             db.executescript(_SCHEMA)
             db.commit()
@@ -96,6 +98,18 @@ class ProgressiveReadsStore:
         finally-block close, so hitting a closed store from the hot
         path would be a shutdown-race and losing a row is preferable
         to raising into the response path.
+
+        Synchronous sqlite write on the asyncio event loop: while it
+        runs, every runnable coroutine stalls — other in-flight proxied
+        calls included, not just the request being served. Accepted for
+        the current local single-MCP-client deployment (low call
+        volume; far cheaper than the upstream call). Multi-client
+        serving (or materially higher concurrency) is the reopen
+        trigger: move the write off-loop (e.g. ``asyncio.to_thread``) —
+        and note ``self._lock`` serializes the write paths only; reads
+        share the connection unlocked, so a thread move also needs
+        every connection access locked (the ``MetricsStore.__init__``
+        reader/writer convention) or per-thread connections.
         """
         if self._db is None:
             return

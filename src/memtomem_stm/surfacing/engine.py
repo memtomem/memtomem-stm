@@ -166,13 +166,17 @@ class SurfacingEngine:
         disk**, nothing about the in-process surface call.
 
         Secret guard: regardless of ``persist_query_text``, a query whose
-        text matches a known secret pattern (API key, bearer token, JWT,
-        ``password=``/``api_key=`` assignment, private-key header) is
-        hashed before persistence, so an inline credential in a Bash
-        ``command`` argument or a tokenized URL never reaches disk verbatim
-        on the proxy path (the hook/daemon cold paths already disable
-        persistence). Only the persisted value is affected — the in-flight
-        ``query`` keeps its raw text as described above.
+        text matches a known sensitive pattern (API key, bearer token, JWT,
+        ``password=``/``api_key=`` assignment, private-key header, email
+        address) is hashed before persistence, so an inline credential in a
+        Bash ``command`` argument or a tokenized URL never reaches disk
+        verbatim on the proxy path (the hook/daemon cold paths already
+        disable persistence). This deliberately scans the FULL default set
+        — credentials *and* PII — unlike the LLM compression routing gate,
+        which scans ``CREDENTIAL_PATTERNS`` only: an email is fine to show
+        an external summarizer but not fine to persist. Only the persisted
+        value is affected — the in-flight ``query`` keeps its raw text as
+        described above.
         """
         if not self._config.persist_query_text:
             return self._hashed_query(query)

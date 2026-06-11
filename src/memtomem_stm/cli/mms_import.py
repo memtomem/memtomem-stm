@@ -59,6 +59,7 @@ from pathlib import Path
 
 import click
 
+from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
 from memtomem_stm.mms.import_hosts import (
@@ -166,6 +167,7 @@ def _classify_against_registry(
     is_flag=True,
     help="In --plan mode, reveal secret values instead of redacting.",
 )
+@with_write_lock
 def import_command(from_host: str, is_plan: bool, show_imported: bool) -> None:
     """Import MCP definitions from host configs into the mms registry."""
     cwd = Path.cwd().resolve()

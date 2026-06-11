@@ -180,8 +180,9 @@ class TestApplyCompression:
             api_key="k",
             # default privacy_scan_enabled = True
         )
-        # Real LLMCompressor instance — privacy scan runs against real
-        # DEFAULT_PATTERNS. Patch _call_api to fail loudly if reached.
+        # Real LLMCompressor instance — privacy scan runs against the real
+        # CREDENTIAL_PATTERNS the gate passes (L278 split). Patch _call_api
+        # to fail loudly if reached.
         with patch.object(
             compression_mod.LLMCompressor,
             "_call_api",
@@ -233,6 +234,50 @@ class TestApplyCompression:
         assert fallback is None
         assert result == "llm-output"
         mock_call.assert_awaited_once()
+
+    async def test_llm_summary_email_only_content_reaches_llm(self, tmp_path):
+        """L278: the routing gate scans CREDENTIAL_PATTERNS only — an email
+        address alone (PII, ubiquitous in git logs / issue threads) no longer
+        silently degrades llm_summary to truncation. The scan still RUNS
+        (privacy_scan_enabled defaults True); it just has nothing to match."""
+        from memtomem_stm.proxy import compression as compression_mod
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        llm_cfg = LLMCompressorConfig(
+            provider=LLMProvider.OPENAI,
+            api_key="k",
+        )
+        with patch.object(
+            compression_mod.LLMCompressor,
+            "_call_api",
+            new_callable=AsyncMock,
+            return_value="llm-output",
+        ) as mock_call:
+            text = "commit log: Author: Alice <alice@example.com> fixed the bug " * 30
+            result, fallback = await mgr._apply_compression(
+                text,
+                CompressionStrategy.LLM_SUMMARY,
+                max_chars=200,
+                sel_cfg=None,
+                llm_cfg=llm_cfg,
+                hybrid_cfg=None,
+                server="srv",
+                tool="t",
+            )
+        assert fallback is None
+        assert result == "llm-output"
+        mock_call.assert_awaited_once()
+
+    def test_apply_compression_gates_llm_on_credential_set(self):
+        """Source pin: the #289 routing gate must reference the credential
+        set, not the full default set — DEFAULT would reintroduce the email
+        over-routing the L278 split removed. (Source-inspection precedent:
+        test_observability.py's shape-identical call-site pins.)"""
+        import inspect
+
+        src = inspect.getsource(ProxyManager._apply_compression)
+        assert "PRIVACY_CREDENTIAL_PATTERNS" in src
+        assert "PRIVACY_DEFAULT_PATTERNS" not in src
 
 
 # ── LLMCompressor lifecycle (regression for #61) ────────────────────────
