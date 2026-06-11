@@ -30,6 +30,25 @@ from helpers import set_home
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_home(monkeypatch, tmp_path: Path) -> Path:
+    """Repoint ``$HOME`` at a sandbox for every test in this module.
+
+    The mutating commands acquire the cross-process write lock at
+    ``~/.memtomem/.stm_proxy.lock`` and prune appends to
+    ``~/.memtomem/pruned_upstreams.json`` (#475 PR2) — both resolved via
+    ``Path.home()`` at call time, so without this the suite would write
+    into the developer's real home (violating the module contract above).
+    Tests that build their own sandbox home still win: class/function
+    fixtures run after module-level autouse ones. Named ``hermetic-home``
+    so tests that ``mkdir`` their own ``tmp_path / "home"`` don't collide.
+    """
+    home = tmp_path / "hermetic-home"
+    home.mkdir()
+    set_home(monkeypatch, home)
+    return home
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> Path:
     """Fresh config path inside a tmp dir — never collides with $HOME."""
@@ -3929,6 +3948,621 @@ class TestPruneCommand:
         assert "could not remove 1 direct registration" in result.output
         assert "boom" in result.output
         assert "claude mcp remove docs-langchain -s user" in result.output
+
+
+# ── prune backup log + per-source pruned metadata (#475 PR2) ─────────────
+
+
+def _backup_log_path(home: Path) -> Path:
+    return home / ".memtomem" / "pruned_upstreams.json"
+
+
+def _read_backup_log(home: Path) -> dict:
+    return json.loads(_backup_log_path(home).read_text(encoding="utf-8"))
+
+
+def _user_candidate(name: str = "alpha", *, secret: str = "tok_secret") -> dict:
+    """Discovery-shaped candidate from Claude Code (user) with verbatim raw.
+
+    ``raw`` deliberately differs from ``entry`` (env secret + a field
+    normalization drops) so verbatim-copy assertions can't pass by accident.
+    """
+    return {
+        "name": name,
+        "source": "Claude Code (user)",
+        "entry": {"transport": "stdio", "command": "npx", "args": ["-y", f"@{name}"]},
+        "raw": {
+            "command": "npx",
+            "args": ["-y", f"@{name}"],
+            "env": {"TOKEN": secret},
+            "host_only_field": True,
+        },
+        "source_ref": {"kind": "claude-user"},
+    }
+
+
+class TestPruneBackupLog:
+    """Every prune path appends the verbatim host entry to
+    ``~/.memtomem/pruned_upstreams.json`` BEFORE the host delete runs
+    (#475 PR2). The log is the only recovery source for entries without an
+    ``origin`` block, so backup-before-delete is the load-bearing order and
+    a failed append must skip the delete."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def _seed_config(self, config: Path, servers: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def test_import_prune_appends_verbatim_row_per_source(
+        self, runner, config, monkeypatch, fake_claude, _hermetic_home
+    ):
+        """`add --import --prune` writes one row per pruned source — primary
+        and duplicate each with their OWN verbatim raw — at 0600."""
+        import stat as stat_mod
+
+        cand = _user_candidate("github")
+        cand["duplicate_in"] = ["Claude Code (project)"]
+        cand["duplicates"] = [
+            {
+                "label": "Claude Code (project)",
+                "source_ref": {"kind": "claude-project", "path": "/proj"},
+                "raw": {"command": "npx", "args": ["-y", "@github"], "type": "stdio"},
+            }
+        ]
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [cand])
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        log_path = _backup_log_path(_hermetic_home)
+        assert stat_mod.S_IMODE(log_path.stat().st_mode) == 0o600
+        log = _read_backup_log(_hermetic_home)
+        assert log["schema_version"] == 1
+        assert [(r["name"], r["source"], r["original"]) for r in log["entries"]] == [
+            ("github", {"kind": "claude-user"}, cand["raw"]),
+            (
+                "github",
+                {"kind": "claude-project", "path": "/proj"},
+                cand["duplicates"][0]["raw"],
+            ),
+        ]
+        assert all(r["pruned_at"] for r in log["entries"])
+
+    def test_backup_log_accumulates_across_runs(
+        self, runner, config, monkeypatch, fake_claude, _hermetic_home
+    ):
+        """Append-only: a second prune run adds rows, never rewrites."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [_user_candidate("one")])
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        self._stub_candidates(monkeypatch, [_user_candidate("two")])
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        log = _read_backup_log(_hermetic_home)
+        assert [r["name"] for r in log["entries"]] == ["one", "two"]
+
+    def test_crash_between_append_and_delete_keeps_row_and_host_entry(
+        self, runner, config, tmp_path, monkeypatch, _hermetic_home
+    ):
+        """Backup-before-delete pin (RFC acceptance): crash AFTER the append
+        but BEFORE the host delete → the backup row exists and the host file
+        still holds the entry. The reverse order would leave neither."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        desktop_entry = {"command": "npx", "args": ["-y", "@d"], "env": {"K": "v"}}
+        desktop_path.write_text(
+            json.dumps({"mcpServers": {"crashy": desktop_entry}}, indent=2),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        cand = {
+            "name": "crashy",
+            "source": "Claude Desktop",
+            "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+            "raw": dict(desktop_entry),
+            "source_ref": {"kind": "claude-desktop"},
+        }
+        self._seed_config(config, {"crashy": {"prefix": "cr", **cand["entry"]}})
+        self._stub_candidates(monkeypatch, [cand])
+
+        def boom(name, source):
+            raise RuntimeError("simulated crash between backup append and host delete")
+
+        monkeypatch.setattr(proxy_mod, "_prune_from_source", boom)
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+        assert isinstance(result.exception, RuntimeError)
+
+        # Row landed before the crash...
+        log = _read_backup_log(_hermetic_home)
+        assert [(r["name"], r["original"]) for r in log["entries"]] == [
+            ("crashy", desktop_entry)
+        ]
+        # ...and the host entry survived untouched.
+        host = json.loads(desktop_path.read_text(encoding="utf-8"))
+        assert host["mcpServers"]["crashy"] == desktop_entry
+
+    def test_failed_delete_leaves_stale_row_and_pruned_false(
+        self, runner, config, monkeypatch, fake_claude, _hermetic_home
+    ):
+        """A failed host delete leaves the already-appended row in place
+        (stale, harmless — the log is advisory) and must NOT flip the
+        origin row's ``pruned`` flag."""
+        cand = _user_candidate("flaky")
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [cand])
+        fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="nope")]
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        log = _read_backup_log(_hermetic_home)
+        assert [r["name"] for r in log["entries"]] == ["flaky"]
+
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        origin = saved["upstream_servers"]["flaky"]["origin"]
+        assert origin["source"]["pruned"] is False
+        assert "pruned_at" not in origin["source"]
+
+    def test_corrupt_backup_log_refuses_append_and_skips_delete(
+        self, runner, config, tmp_path, monkeypatch, _hermetic_home
+    ):
+        """A corrupt log is never clobbered (it's the last-resort recovery
+        source) — the append fails, and the host delete is SKIPPED so the
+        original keeps existing somewhere."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        log_path = _backup_log_path(_hermetic_home)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("{not json", encoding="utf-8")
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        desktop_entry = {"command": "npx", "args": ["-y", "@d"]}
+        desktop_path.write_text(
+            json.dumps({"mcpServers": {"keep": desktop_entry}}), encoding="utf-8"
+        )
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        cand = {
+            "name": "keep",
+            "source": "Claude Desktop",
+            "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+            "raw": dict(desktop_entry),
+            "source_ref": {"kind": "claude-desktop"},
+        }
+        self._seed_config(config, {"keep": {"prefix": "k", **cand["entry"]}})
+        self._stub_candidates(monkeypatch, [cand])
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "move it aside" in result.output
+
+        # No clobber, no delete.
+        assert log_path.read_text(encoding="utf-8") == "{not json"
+        host = json.loads(desktop_path.read_text(encoding="utf-8"))
+        assert "keep" in host["mcpServers"]
+
+    def test_old_shape_candidate_without_raw_prunes_without_backup(
+        self, runner, config, monkeypatch, fake_claude, _hermetic_home
+    ):
+        """Candidates lacking verbatim ``raw`` (pre-#475 shape) still prune —
+        there is just nothing to back up. Pins backward compatibility for
+        the hand-constructed-candidate paths."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "legacy",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                }
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Removed from source client(s)" in result.output
+        assert not _backup_log_path(_hermetic_home).exists()
+
+
+class TestPerSourcePrunedMetadata:
+    """Successful prunes flip the matching ``origin`` row's per-source
+    ``pruned``/``pruned_at`` (#475 PR2) — a single ``pruned`` boolean would
+    misreport partial failure across primary + duplicate sources."""
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def _seed_config(self, config: Path, servers: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5):
+            state["calls"].append(list(cmd))
+            if state["script"]:
+                nxt = state["script"].pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def test_inline_import_prune_marks_origin_source(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        cand = _user_candidate("github")
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [cand])
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        origin = saved["upstream_servers"]["github"]["origin"]
+        assert origin["source"]["pruned"] is True
+        assert origin["source"]["pruned_at"]
+        # The verbatim restore payload must survive the metadata save.
+        assert origin["original"] == cand["raw"]
+
+    def test_partial_failure_marks_only_successful_source(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Primary (claude-user) succeeds, duplicate (claude-desktop, file
+        missing) fails → only the primary row flips."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod, "_desktop_config_path", lambda: Path("/nonexistent/desktop.json")
+        )
+        cand = _user_candidate("github")
+        cand["duplicate_in"] = ["Claude Desktop"]
+        cand["duplicates"] = [
+            {
+                "label": "Claude Desktop",
+                "source_ref": {"kind": "claude-desktop"},
+                "raw": {"command": "npx", "args": ["-y", "@github"]},
+            }
+        ]
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [cand])
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        origin = saved["upstream_servers"]["github"]["origin"]
+        assert origin["source"]["pruned"] is True
+        assert origin["duplicates"] == [{"kind": "claude-desktop", "pruned": False}]
+
+    def test_standalone_prune_updates_origin_and_saves(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """``mms prune`` (post-hoc) flips the origin row of an entry imported
+        earlier, matching by structured ``(kind, path)``."""
+        cand = _user_candidate("github")
+        entry = {
+            "prefix": "gh",
+            **cand["entry"],
+            "origin": {
+                "schema_version": 1,
+                "source": {"kind": "claude-user", "pruned": False},
+                "duplicates": [],
+                "imported_at": "2026-06-11T00:00:00+00:00",
+                "original": cand["raw"],
+            },
+        }
+        self._seed_config(config, {"github": entry})
+        self._stub_candidates(monkeypatch, [cand])
+
+        result = runner.invoke(cli, ["prune", "github", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        origin = saved["upstream_servers"]["github"]["origin"]
+        assert origin["source"]["pruned"] is True
+        assert origin["source"]["pruned_at"]
+        assert origin["original"] == cand["raw"]
+
+    def test_standalone_prune_without_origin_leaves_config_untouched(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """No origin row to flip → no config rewrite (byte-identical)."""
+        cand = _user_candidate("github")
+        self._seed_config(config, {"github": {"prefix": "gh", **cand["entry"]}})
+        before = config.read_text(encoding="utf-8")
+        self._stub_candidates(monkeypatch, [cand])
+
+        result = runner.invoke(cli, ["prune", "github", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert config.read_text(encoding="utf-8") == before
+
+    def test_metadata_save_failure_leaves_origin_and_backup_restorable(
+        self, runner, config, monkeypatch, fake_claude, _hermetic_home
+    ):
+        """Save-import-first order pin (RFC acceptance): the import (with
+        origin, ``pruned: false``) is saved BEFORE any host delete, so a
+        step-③ metadata-save failure still leaves the entry restorable —
+        origin on disk + backup row appended + host delete done."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        cand = _user_candidate("github")
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [cand])
+
+        real_save = proxy_mod._save
+        calls = {"n": 0}
+
+        def flaky_save(path, data):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("disk full at metadata save")
+            real_save(path, data)
+
+        monkeypatch.setattr(proxy_mod, "_save", flaky_save)
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert isinstance(result.exception, OSError)
+        assert calls["n"] == 2  # import save succeeded, metadata save crashed
+
+        # Step-① save survived: origin (with verbatim original) is on disk.
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        origin = saved["upstream_servers"]["github"]["origin"]
+        assert origin["original"] == cand["raw"]
+        assert origin["source"]["pruned"] is False
+        # Step ② ran: backup row appended and host delete executed.
+        log = _read_backup_log(_hermetic_home)
+        assert [r["name"] for r in log["entries"]] == ["github"]
+        assert ["claude", "mcp", "remove", "github", "-s", "user"] in fake_claude["calls"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
+class TestConfigWriteLock:
+    """Every ``stm_proxy.json`` mutator runs under the cross-process
+    ``~/.memtomem/.stm_proxy.lock`` (#475 PR2). Locking only prune/eject
+    would leave a hole: an unlocked ``add`` holding a stale load could save
+    over a locked command's result. Read paths and ``--dry-run`` skip it."""
+
+    @staticmethod
+    def _hold_lock(home: Path):
+        """Hold the config lock through a raw fd, as a foreign process would."""
+        import fcntl
+        from contextlib import contextmanager
+
+        @contextmanager
+        def held():
+            lock = home / ".memtomem" / ".stm_proxy.lock"
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                yield
+            finally:
+                os.close(fd)
+
+        return held()
+
+    @pytest.fixture(autouse=True)
+    def _fast_timeout(self, monkeypatch):
+        from memtomem_stm.mms import state as mms_state
+
+        monkeypatch.setattr(mms_state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    def _seed(self, config: Path) -> None:
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"srv": {"prefix": "s", "command": "npx"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["add", "other", "--prefix", "o", "--command", "npx"],
+            ["remove", "srv", "--yes"],
+            ["surfacing", "srv", "off"],
+            ["prune", "--all", "--yes"],
+            ["init"],
+        ],
+        ids=["add", "remove", "surfacing-write", "prune", "init"],
+    )
+    def test_mutators_fail_cleanly_when_lock_held(
+        self, runner, config, argv, _hermetic_home
+    ):
+        self._seed(config)
+        if argv == ["init"]:
+            # init aborts on an existing config before doing anything; give
+            # it a fresh path so it reaches the lock acquisition.
+            cfg_args = ["--config", str(config.parent / "fresh.json")]
+        else:
+            cfg_args = _cfg_args(config)
+        with self._hold_lock(_hermetic_home):
+            result = runner.invoke(cli, [*argv, *cfg_args])
+        assert result.exit_code == 1
+        assert "timed out" in result.output
+        assert "mutating the proxy config" in result.output
+
+    def test_read_and_dry_run_paths_skip_lock(
+        self, runner, config, monkeypatch, _hermetic_home
+    ):
+        """`surfacing NAME` (read) and `prune --dry-run` never write, so a
+        held lock must not block them — mirrors the mms ``--plan`` skip."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed(config)
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: [])
+        with self._hold_lock(_hermetic_home):
+            read = runner.invoke(cli, ["surfacing", "srv", *_cfg_args(config)])
+            dry = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
+        assert read.exit_code == 0, read.output
+        assert "surfacing for 'srv': on" in read.output
+        assert dry.exit_code == 0, dry.output
+
+    def test_concurrent_prunes_serialize_and_lose_no_backup_rows(
+        self, config, monkeypatch, _hermetic_home
+    ):
+        """Two concurrent prune spans serialize on the lock: the second's
+        backup append happens strictly after the first's host delete
+        finishes, so the read-modify-write log append can't lose rows."""
+        import threading
+
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.mms import state as mms_state
+
+        # Override this class's 0.2s `_fast_timeout`: t2 must keep polling
+        # while t1 deliberately parks inside its span.
+        monkeypatch.setattr(mms_state, "WRITE_LOCK_TIMEOUT_SECONDS", 10.0)
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "alpha": {"prefix": "a", "command": "npx", "args": ["-y", "@alpha"]},
+                        "beta": {"prefix": "b", "command": "npx", "args": ["-y", "@beta"]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            proxy_mod,
+            "_discover_candidates",
+            lambda _cwd: [_user_candidate("alpha"), _user_candidate("beta")],
+        )
+
+        t1_in_span = threading.Event()
+        release_t1 = threading.Event()
+        events: list[str] = []
+        events_lock = threading.Lock()
+
+        def fake_remove(name, scope):
+            with events_lock:
+                events.append(f"remove:{name}")
+            if name == "alpha":
+                t1_in_span.set()
+                assert release_t1.wait(timeout=10)
+            return (True, None)
+
+        monkeypatch.setattr(proxy_mod, "_claude_mcp_remove", fake_remove)
+
+        prune_cb = cli.commands["prune"].callback
+        errors: list[BaseException] = []
+
+        def run(name: str) -> None:
+            try:
+                prune_cb(
+                    names=(name,),
+                    config_path=str(config),
+                    all_servers=False,
+                    assume_yes=True,
+                    dry_run=False,
+                )
+            except BaseException as exc:  # noqa: BLE001 — surfaced via `errors`
+                errors.append(exc)
+
+        t1 = threading.Thread(target=run, args=("alpha",))
+        t2 = threading.Thread(target=run, args=("beta",))
+        t1.start()
+        assert t1_in_span.wait(timeout=10)
+        t2.start()
+        # t1 is parked inside its host delete, still holding the lock; give
+        # t2 time to reach acquisition. It must not have appended: its whole
+        # span waits on the lock.
+        t2.join(timeout=0.5)
+        assert t2.is_alive(), "t2 must block on the lock while t1 holds it"
+        log = _read_backup_log(_hermetic_home)
+        assert [r["name"] for r in log["entries"]] == ["alpha"]
+
+        release_t1.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+        assert errors == []
+        assert events == ["remove:alpha", "remove:beta"]
+
+        log = _read_backup_log(_hermetic_home)
+        assert [r["name"] for r in log["entries"]] == ["alpha", "beta"]
 
 
 # ── init --prune-originals integration ───────────────────────────────────

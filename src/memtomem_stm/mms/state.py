@@ -134,14 +134,25 @@ class CorruptedConfig(MmsConfigError):
         self.reason = reason
 
 
+_REGISTRY_LOCK_HOLDER_HINT = (
+    "another `mms host sync --apply` or `mms import --apply` appears to be "
+    "running (possibly waiting at its confirmation prompt)"
+)
+"""Default :class:`WriteLockTimeout` attribution — names the registry/sidecar
+mutators that hold the default ``~/.mms/.lock``. Locks over other domains
+(the proxy-config lock, #475 PR2) pass their own hint so the operator is
+pointed at the right family of commands."""
+
+
 class WriteLockTimeout(MmsConfigError):
     """Another process held the mms write lock past the acquisition timeout."""
 
-    def __init__(self, path: Path, timeout: float) -> None:
+    def __init__(
+        self, path: Path, timeout: float, holder_hint: str = _REGISTRY_LOCK_HOLDER_HINT
+    ) -> None:
         super().__init__(
             f"timed out after {timeout:.0f}s waiting for the mms write lock ({path}) — "
-            "another `mms host sync --apply` or `mms import --apply` appears to be "
-            "running (possibly waiting at its confirmation prompt). Retry after it "
+            f"{holder_hint}. Retry after it "
             "finishes; the lock releases automatically when that process exits."
         )
         self.path = path
@@ -161,7 +172,13 @@ _WRITE_LOCK_POLL_SECONDS = 0.05
 
 
 @contextmanager
-def write_lock(*, enabled: bool = True, timeout: float | None = None) -> Iterator[None]:
+def write_lock(
+    *,
+    enabled: bool = True,
+    timeout: float | None = None,
+    lock_path: Path | None = None,
+    holder_hint: str | None = None,
+) -> Iterator[None]:
     """Hold the cross-process mms write lock for a load→mutate→save span.
 
     ``mms host sync --apply`` and ``mms import --apply`` both read the
@@ -183,12 +200,19 @@ def write_lock(*, enabled: bool = True, timeout: float | None = None) -> Iterato
     No-ops when ``enabled`` is False (``--plan`` runs read but never write)
     and on Windows (no ``fcntl``; single-user CLI, the lock is best-effort
     hardening there, not a correctness guarantee).
+
+    ``lock_path`` / ``holder_hint`` generalize the mechanism beyond the
+    ``~/.mms`` registry domain (#475 PR2): the proxy-config CLI serializes
+    its ``stm_proxy.json`` + prune-backup-log mutators under a separate
+    ``~/.memtomem`` lock file with its own timeout attribution. Defaults
+    keep the original registry/sidecar behavior.
     """
     if not enabled or fcntl is None:
         yield
         return
     wait = WRITE_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
-    lock_path = write_lock_path()
+    if lock_path is None:
+        lock_path = write_lock_path()
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -203,7 +227,9 @@ def write_lock(*, enabled: bool = True, timeout: float | None = None) -> Iterato
                 # surface as the same timeout — the operator action is
                 # identical either way.
                 if time.monotonic() >= deadline:
-                    raise WriteLockTimeout(lock_path, wait) from None
+                    if holder_hint is None:
+                        raise WriteLockTimeout(lock_path, wait) from None
+                    raise WriteLockTimeout(lock_path, wait, holder_hint) from None
                 time.sleep(_WRITE_LOCK_POLL_SECONDS)
         try:
             yield
