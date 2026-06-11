@@ -11,6 +11,7 @@ previous permissive run — at 0600.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,18 @@ def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
 
 
+# POSIX 0600 modes are unenforceable on Windows: ``os.chmod`` only toggles the
+# read-only bit, so a writable DB file always reports ``0o666``. The production
+# helper is a best-effort no-op there; only the mode-equality assertions need to
+# skip (``test_missing_db_does_not_raise`` still runs to prove no Windows crash).
+_skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX 0600 modes are unenforceable on Windows; chmod only toggles the read-only bit",
+)
+
+
 class TestEnsurePrivateDbFiles:
+    @_skip_on_windows
     def test_chmods_db_and_existing_sidecars(self, tmp_path: Path) -> None:
         db = tmp_path / "x.db"
         wal = tmp_path / "x.db-wal"
@@ -43,6 +55,7 @@ class TestEnsurePrivateDbFiles:
         assert _mode(wal) == 0o600
         assert _mode(shm) == 0o600
 
+    @_skip_on_windows
     def test_missing_sidecars_are_ignored(self, tmp_path: Path) -> None:
         db = tmp_path / "x.db"
         db.touch()
@@ -55,6 +68,7 @@ class TestEnsurePrivateDbFiles:
     def test_missing_db_does_not_raise(self, tmp_path: Path) -> None:
         ensure_private_db_files(tmp_path / "absent.db")
 
+    @_skip_on_windows
     def test_unrelated_files_untouched(self, tmp_path: Path) -> None:
         db = tmp_path / "x.db"
         db.touch()
@@ -77,6 +91,7 @@ STORE_FACTORIES = [
 ]
 
 
+@_skip_on_windows
 @pytest.mark.parametrize("store_cls", STORE_FACTORIES)
 class TestStoreDbModes:
     def test_fresh_db_is_private(self, store_cls, tmp_path: Path) -> None:
