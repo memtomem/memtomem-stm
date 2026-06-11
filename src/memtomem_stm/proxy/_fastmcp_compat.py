@@ -110,10 +110,18 @@ def register_proxy_tool(
         # caller loops register_proxy_tool with no per-tool guard — one
         # renamed field would otherwise abort registration of every
         # remaining proxied tool and fail server startup.
+        #
+        # Order matters for a partial failure: fn_metadata (permissive
+        # passthrough validation) is written FIRST, so if the parameters
+        # write then fails the tool merely advertises a stale default
+        # schema while accepting real args. The reverse partial state —
+        # advertising the upstream schema while still validating with the
+        # original signature-derived model — would reject the very args
+        # the advertised schema invites.
         try:
+            registered.fn_metadata = _PASSTHROUGH_METADATA
             if info.input_schema:
                 registered.parameters = info.input_schema
-            registered.fn_metadata = _PASSTHROUGH_METADATA
         except Exception:
             import logging
 

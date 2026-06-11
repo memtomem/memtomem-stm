@@ -99,3 +99,37 @@ def test_register_proxy_tool_degrades_when_schema_fields_renamed(caplog) -> None
 
     assert "Cannot override schema for 'srv_tool'" in caplog.text
     server.add_tool.assert_called_once()  # the tool itself stayed registered
+
+
+def test_register_proxy_tool_partial_failure_keeps_default_schema(caplog) -> None:
+    # fn_metadata is written FIRST: if that write fails, parameters must not
+    # be written either. The reverse partial state — advertising the
+    # upstream schema while still validating with the original
+    # signature-derived model — would reject the very args the advertised
+    # schema invites, which is worse than staying on the default schema.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+
+    class _MetadataFrozenTool:
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "fn_metadata":
+                raise ValueError("pydantic: 'fn_metadata' is not a field")
+            object.__setattr__(self, name, value)
+
+    tool = _MetadataFrozenTool()
+    server = MagicMock()
+    server._tool_manager._tools.get.return_value = tool
+    info = SimpleNamespace(
+        prefixed_name="srv_tool",
+        description="desc",
+        annotations=None,
+        server="srv",
+        input_schema={"type": "object"},
+    )
+
+    register_proxy_tool(server, lambda: None, info)
+
+    assert not hasattr(tool, "parameters")  # no partial patch
+    assert "Cannot override schema for 'srv_tool'" in caplog.text

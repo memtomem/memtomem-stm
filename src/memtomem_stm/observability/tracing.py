@@ -17,6 +17,24 @@ _langfuse_client: Any = None
 _sampling_rate: float = 1.0
 _SERVICE_NAME = "memtomem-stm"
 
+# One-shot escalation for SDK failures: traced() sits on the proxy/surfacing
+# hot paths, so a persistently broken exporter must not emit a stack trace
+# per call — the first failure warns, repeats go to DEBUG.
+_warned_observation_failure = False
+
+
+def _log_observation_failure(stage: str) -> None:
+    global _warned_observation_failure
+    if _warned_observation_failure:
+        logger.debug("Langfuse observation %s failed (repeat, ignored)", stage, exc_info=True)
+        return
+    _warned_observation_failure = True
+    logger.warning(
+        "Langfuse observation %s failed — proceeding untraced (repeats logged at DEBUG)",
+        stage,
+        exc_info=True,
+    )
+
 
 def init_langfuse(config: object, *, service_name: str = _SERVICE_NAME) -> Any:
     """Initialize Langfuse client if enabled and installed. Returns client or None."""
@@ -82,7 +100,7 @@ class _SafeObservation:
             self._entered = True
             return result
         except Exception:
-            logger.warning("Langfuse observation start failed — proceeding untraced", exc_info=True)
+            _log_observation_failure("start")
             return None
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
@@ -91,7 +109,7 @@ class _SafeObservation:
         try:
             return bool(self._inner.__exit__(exc_type, exc, tb))
         except Exception:
-            logger.warning("Langfuse observation exit failed (ignored)", exc_info=True)
+            _log_observation_failure("exit")
             return False
 
 
@@ -114,5 +132,5 @@ def traced(name: str, **kwargs: Any) -> Any:
     try:
         return _SafeObservation(client.start_as_current_observation(name=name, **kwargs))
     except Exception:
-        logger.warning("Langfuse traced() failed — proceeding untraced", exc_info=True)
+        _log_observation_failure("creation")
         return nullcontext()
