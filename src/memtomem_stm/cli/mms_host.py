@@ -60,6 +60,7 @@ from pathlib import Path
 
 import click
 
+from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
@@ -893,6 +894,7 @@ def _render_orphan_no_baseline_footer(n: int) -> None:
         "prompt)."
     ),
 )
+@with_write_lock
 def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
     """Reconcile registry + sidecar with the union of host scans.
 
