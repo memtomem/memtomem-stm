@@ -9,7 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,118 @@ def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, An
         else:
             out[k] = v
     return out
+
+
+def _env_override_hint(
+    exc: Exception,
+    env_overrides: dict[str, Any] | None,
+    file_data: dict[str, Any] | None = None,
+) -> str:
+    """Name the env var(s) implicated in a config ValidationError.
+
+    A malformed ``MEMTOMEM_STM_PROXY__*`` value fails validation of the
+    MERGED config, and the load falls back to defaults with a single warning
+    — without this hint the operator sees "Failed to parse proxy config
+    <file>" and debugs the FILE while the file is fine. (Fallback semantics
+    are unchanged: this only improves the warning.)
+
+    Attribution is two-staged:
+
+    1. DIFFERENTIAL pre-filter — every error of the merged config whose
+       ``(loc, type, msg)`` the file reproduces ON ITS OWN is file-caused
+       and skipped: an env var that merely touched the same subtree (an
+       innocent ``tail_mode`` under a hybrid block whose ordering the file
+       itself breaks) must not be implicated. The file-alone validation runs
+       lazily, once, only on this already-failing path. The error TYPE keeps
+       an env value that re-breaks a file-broken location DIFFERENTLY
+       (gt-violation -> int-parsing) attributed; the MESSAGE disambiguates
+       model validators, which all share ``type="value_error"`` — a
+       file-caused duplicate-prefix error must not mask a separate
+       env-caused empty-prefix error at the same root location (and an env
+       var that changes an aggregated root message, e.g. adds a collision,
+       is attributed too).
+
+    2. NAMING — hints are derived from the env overlay's LEAVES, the var
+       names the operator actually set, never synthesized from the error
+       location alone (a model-level validator reports at the MODEL's path,
+       e.g. ``upstream_servers.gh.hybrid``, and naming that prefix would
+       point at a var that was never set):
+
+       - a location resolving to an env leaf names that leaf (also when the
+         location runs PAST it — the env string replaced a container);
+       - a location resolving to an env subtree — a cross-field validator
+         there, or a missing required field of an env-created entry — names
+         every env leaf under it;
+       - a ROOT-level error (``loc=()``, duplicate/empty upstream prefixes)
+         has no path at all and names every env leaf;
+       - a location the env never touched names nothing.
+    """
+    if not env_overrides or not isinstance(exc, ValidationError):
+        return ""
+    implicated: set[str] = set()
+
+    def _add_leaves(path: list[str], subtree: dict[str, Any]) -> None:
+        stack: list[tuple[list[str], dict[str, Any]]] = [(path, subtree)]
+        while stack:
+            prefix, node = stack.pop()
+            for key, value in node.items():
+                if isinstance(value, dict):
+                    stack.append(([*prefix, str(key)], value))
+                else:
+                    implicated.add(
+                        _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
+                    )
+
+    def _error_key(e: dict[str, Any]) -> tuple[tuple[Any, ...], str, str]:
+        return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
+
+    file_error_keys: frozenset[tuple[tuple[Any, ...], str, str]] | None = None
+
+    def _file_alone_error_keys() -> frozenset[tuple[tuple[Any, ...], str, str]]:
+        if file_data is None:
+            return frozenset()  # no file at all: every failure is env-caused
+        try:
+            ProxyConfig.model_validate(file_data)
+        except ValidationError as file_exc:
+            return frozenset(_error_key(e) for e in file_exc.errors())
+        except Exception:  # non-pydantic failure: attribute nothing to the file
+            return frozenset()
+        return frozenset()
+
+    for err in exc.errors():
+        loc = err.get("loc", ())
+        if file_error_keys is None:
+            file_error_keys = _file_alone_error_keys()
+        if _error_key(err) in file_error_keys:
+            continue  # the file fails this same check on its own — file-caused
+        if not loc:
+            _add_leaves([], env_overrides)
+            continue
+        node: Any = env_overrides
+        consumed: list[str] = []
+        for part in loc:
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+                consumed.append(str(part))
+            else:
+                break
+        if not consumed:
+            continue  # the env overlay never touched this error's path
+        if not isinstance(node, dict):
+            # Landed on an env leaf — exact when consumed == loc; when the
+            # error location goes deeper, this leaf REPLACED a container the
+            # model expected, so it is still the var to fix.
+            implicated.add(_PROXY_ENV_PREFIX + "__".join(p.upper() for p in consumed))
+        else:
+            # A subtree the env touched: a cross-field validator error there
+            # (consumed == loc) or a walk that broke inside it (e.g. the
+            # missing required field of an env-created entry — the file-
+            # caused variants were already filtered above). Name the env
+            # leaves under it.
+            _add_leaves(consumed, node)
+    if not implicated:
+        return ""
+    return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
 
 
 class CompressionStrategy(StrEnum):
@@ -119,6 +231,15 @@ class LLMCompressorConfig(BaseModel):
 
     @model_validator(mode="after")
     def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:
+        # Deliberately EAGER: every llm block in the config is validated at
+        # load, even when the strategy that would use it is not selected
+        # (compression: truncate with an attached llm block, or
+        # extraction.enabled: false). The trade was reviewed 2026-06-11 and
+        # kept: deferring the key check to first use would also defer the
+        # failure of a genuinely-enabled compressor from startup to the first
+        # tool call. Operators pasting an example llm block they don't use
+        # yet should remove it (or use provider: ollama) — documented in
+        # docs/compression.md.
         if self.provider not in (LLMProvider.OPENAI, LLMProvider.ANTHROPIC):
             return self
         if self.api_key:
@@ -147,6 +268,19 @@ class HybridConfig(BaseModel):
     min_toc_budget: int = Field(default=200, gt=0)
     min_head_chars: int = Field(default=100, gt=0)
     head_ratio: float = Field(default=0.6, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _check_ordering(self) -> Self:
+        # min_head_chars > head_chars makes HybridCompressor's head-budget
+        # guard fire on every call, silently degrading the operator's chosen
+        # hybrid strategy to plain truncation. Reject the combination at load
+        # like UpstreamServerConfig does for its dependent numeric fields,
+        # instead of accepting a config that is structurally a no-op.
+        if self.min_head_chars > self.head_chars:
+            raise ValueError(
+                f"min_head_chars ({self.min_head_chars}) must be <= head_chars ({self.head_chars})"
+            )
+        return self
 
 
 class SelectiveConfig(BaseModel):
@@ -585,6 +719,14 @@ class ProxyConfig(BaseModel):
         if ctx_tokens is None:
             return self.default_max_result_chars
         model_budget = int(ctx_tokens * self.context_budget_ratio * self.chars_per_token)
+        if model_budget <= 0:
+            # context_budget_ratio is validated ge=0.0, so 0 is a legal value —
+            # but a 0-char budget would flow into every per-server max_chars
+            # and compress responses to nothing whenever min_result_retention
+            # (itself disable-able with 0) doesn't rescue it. A degenerate
+            # model budget means "model scaling effectively off", not "no
+            # output": fall back to the static default, which is gt=0.
+            return self.default_max_result_chars
         return min(model_budget, self.default_max_result_chars)
 
     @staticmethod
@@ -620,7 +762,9 @@ class ProxyConfig(BaseModel):
                     return ProxyConfig.model_validate(env_overrides)
                 except Exception as exc:
                     logger.warning(
-                        "Env-only proxy config failed validation: %s — using defaults", exc
+                        "Env-only proxy config failed validation: %s%s — using defaults",
+                        exc,
+                        _env_override_hint(exc, env_overrides),
                     )
             return ProxyConfig()
         # Warn if config is group/world-readable (may contain API keys)
@@ -634,13 +778,25 @@ class ProxyConfig(BaseModel):
                 )
         except OSError:
             pass
+        file_data: dict[str, Any] | None = None
         try:
-            data: dict[str, Any] = json.loads(resolved.read_text(encoding="utf-8"))
-            if env_overrides:
-                data = _deep_merge(data, env_overrides)
+            loaded = json.loads(resolved.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                # Reject non-object roots BEFORE the env merge: ``[]`` would
+                # otherwise slip through ``_deep_merge`` (``dict([])`` is
+                # ``{}``) and an env override on top would validate cleanly,
+                # silently accepting an invalid config file.
+                raise ValueError(f"config root must be a JSON object, got {type(loaded).__name__}")
+            file_data = loaded
+            data = _deep_merge(file_data, env_overrides) if env_overrides else file_data
             return ProxyConfig.model_validate(data)
         except (json.JSONDecodeError, Exception) as exc:
-            logger.warning("Failed to parse proxy config %s: %s", resolved, exc)
+            logger.warning(
+                "Failed to parse proxy config %s: %s%s",
+                resolved,
+                exc,
+                _env_override_hint(exc, env_overrides, file_data),
+            )
             return None
 
 

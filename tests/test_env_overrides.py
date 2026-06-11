@@ -7,6 +7,7 @@ win over file values both at startup and on hot-reload.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -108,6 +109,332 @@ class TestLoadFromFileWithEnvOverrides:
         )
 
         assert cfg is None
+
+
+class TestMalformedEnvOverrideDiagnostics:
+    """A malformed MEMTOMEM_STM_PROXY__* value still collapses the load to
+    defaults / None (the fallback semantics are deliberately unchanged), but
+    the warning must name the env var — otherwise the operator debugs the
+    healthy FILE while the env overlay is what broke the merged validation."""
+
+    def test_malformed_env_value_named_in_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 9000}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "abc"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None  # fallback unchanged: the whole load still degrades
+        assert any(
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS" in r.getMessage() for r in caplog.records
+        )
+
+    def test_nested_malformed_env_value_named_in_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"enabled": True}}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-5"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in r.getMessage() for r in caplog.records
+        )
+
+    def test_file_caused_error_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A validation error caused by the FILE (no env override at that
+        location) must not implicate env vars."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": "abc"}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_model_validator_error_names_env_leaves_not_the_model_prefix(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A cross-field model validator reports its error at the MODEL's
+        path (upstream_servers.gh.hybrid), not the field. The hint must name
+        the env LEAF actually set under that subtree, never synthesize a
+        non-leaf var (MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID) that
+        was never in the environment."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                {"upstream_servers": {"gh": {"prefix": "gh", "hybrid": {"head_chars": 5000}}}}
+            )
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS": "9000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        messages = [r.getMessage() for r in caplog.records]
+        leaf = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS"
+        assert any(leaf in m for m in messages)
+        assert not any("HYBRID," in m or m.rstrip(")").endswith("HYBRID") for m in messages)
+
+    def test_env_leaf_replacing_a_container_names_that_leaf(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An env string clobbering a whole sub-model (cache='oops') is named
+        as the leaf the operator set, even though the error location may sit
+        at or below the container."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"enabled": True}}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE": "oops"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any("MEMTOMEM_STM_PROXY__CACHE" in r.getMessage() for r in caplog.records)
+
+    def test_env_untouched_error_path_names_nothing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An error in an upstream entry the env never touched must not be
+        attributed to env overrides set on a SIBLING entry."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "good": {"prefix": "good"},
+                        "bad": {"prefix": "bad", "hybrid": {"head_chars": -1}},
+                    }
+                }
+            )
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GOOD__MAX_RESULT_CHARS": "5000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_missing_field_in_env_created_entry_names_env_leaves(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An env var can CREATE an upstream entry that then fails on a
+        missing required field (prefix). The error loc points at the absent
+        field — outside the env subtree — but the collapse is env-caused:
+        the entry exists only because the env built it, so the env leaves
+        under it must be named."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 9000}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS": "5000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_missing_field_in_file_entry_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The provenance counterpart: when the FILE supplies the entry that
+        is missing its required field, an env var that merely touched the
+        same entry is innocent and must not be implicated."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"upstream_servers": {"gh": {"command": "gh-mcp"}}}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RESULT_CHARS": "5000"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_file_caused_nested_validator_error_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When the FILE's own hybrid block breaks the ordering validator, an
+        env var that merely set an innocent sibling field (tail_mode) under
+        the same subtree must not be implicated — the file reproduces the
+        identical (loc, type) error on its own."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "gh": {
+                            "prefix": "gh",
+                            "hybrid": {"head_chars": 5000, "min_head_chars": 9000},
+                        }
+                    }
+                }
+            )
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__TAIL_MODE": "toc"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_env_rebreaking_a_file_broken_leaf_is_still_named(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Type-sensitive matching: the file breaks cache.max_entries one way
+        (gt violation) and the env re-breaks the SAME location differently
+        (unparseable int). The env value is what the merged config actually
+        validated, so it must be named despite the shared location."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"max_entries": -5}}))
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "abc"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in r.getMessage() for r in caplog.records
+        )
+
+    def test_file_root_error_does_not_mask_a_different_env_root_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Model validators all share type="value_error", so the differential
+        key includes the MESSAGE: the file's duplicate-prefix root error must
+        not mask a separate env-caused empty-prefix root error."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps({"upstream_servers": {"a": {"prefix": "x"}, "b": {"prefix": "x"}}})
+        )
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__C__PREFIX": "   "}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__C__PREFIX" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_env_caused_duplicate_prefix_names_env_leaves(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Top-level model validators (duplicate upstream prefixes) report at
+        loc=() — no path to walk. When the file alone validates and only the
+        merged config trips the root check, the env overlay flipped it and
+        its leaves must be named."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"upstream_servers": {"a": {"prefix": "a"}}}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX": "a"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_env_caused_whitespace_prefix_names_env_leaves(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 9000}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX": "   "}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_file_caused_root_validator_error_carries_no_env_hint(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When the FILE alone already fails the root validator (its own
+        duplicate prefixes), an innocent env var must not be implicated."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(
+            json.dumps({"upstream_servers": {"a": {"prefix": "x"}, "b": {"prefix": "x"}}})
+        )
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_non_dict_config_root_rejected_even_with_env_overrides(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ``[]`` config root must fail the load even when env overrides
+        are present: ``dict([])`` is ``{}``, so the deep merge used to turn
+        the invalid file into a valid env-only config, silently dropping the
+        fact that the file is broken."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("[]")
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__ENABLED": "true"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is None
+        assert any("JSON object" in r.getMessage() for r in caplog.records)
+
+    def test_env_only_path_names_the_env_var(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """File missing: the env-only rebuild degrades to defaults and the
+        warning names the malformed var."""
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS": "x"})
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(tmp_path / "nonexistent.json", overrides)
+
+        assert cfg is not None  # env-only path degrades to defaults, not None
+        assert cfg.lock_timeout_seconds == 30.0
+        assert any(
+            "MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS" in r.getMessage() for r in caplog.records
+        )
 
     def test_nested_env_override_merges_with_file(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "stm_proxy.json"

@@ -76,9 +76,16 @@ class TestEffectiveMaxResultChars:
         # 200K * 0.05 * 3.5 = 35000 → capped at 5000
         assert cfg.effective_max_result_chars() == 5000
 
-    def test_zero_ratio(self):
+    def test_zero_ratio_falls_back_to_default(self):
+        """context_budget_ratio=0 is a legal value (``ge=0.0``), but the 0-char
+        model budget it used to return flowed into every per-server max_chars
+        and compressed responses to ~nothing whenever min_result_retention
+        (itself disable-able with 0) didn't rescue it. A degenerate model
+        budget now means "model scaling off", not "no output": the static
+        default (``gt=0``) is used instead. (This flips the old
+        characterization pin ``== 0``.)"""
         cfg = ProxyConfig(consumer_model="o1-mini", context_budget_ratio=0.0)
-        assert cfg.effective_max_result_chars() == 0
+        assert cfg.effective_max_result_chars() == 16000
 
     def test_gpt4o_budget(self):
         """gpt-4o: 128K * 0.05 * 3.5 = 22400 → capped at 16000."""
