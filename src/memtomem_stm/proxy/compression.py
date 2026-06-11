@@ -143,6 +143,24 @@ class NoopCompressor:
         return text
 
 
+def _scores_or_none(
+    scorer: RelevanceScorer, query: str, sections: list[tuple[str, str]]
+) -> list[float] | None:
+    """Score *sections*, returning ``None`` when there is no usable signal.
+
+    No-signal covers both an all-non-positive score vector AND a scorer
+    returning the wrong number of scores (custom ``RelevanceScorer`` drift).
+    Every consumer indexes, sorts, or ``zip()``s the scores against its
+    sections, so a wrong-length list would raise IndexError, silently
+    truncate, or mis-allocate budgets — all consumers must obtain scores
+    through this helper and fall back to their query-less path on ``None``.
+    """
+    scores = scorer.score_sections(query, sections)
+    if len(scores) != len(sections) or not any(s > 0 for s in scores):
+        return None
+    return scores
+
+
 class TruncateCompressor:
     """Character limit with sentence/word boundary awareness.
 
@@ -264,12 +282,7 @@ class TruncateCompressor:
         relevance_weights: list[float] | None = None
         if context_query and context_query.strip():
             sections = [(k, ser) for k, ser, _ in key_sizes]
-            raw = self._scorer.score_sections(context_query, sections)
-            # A scorer returning the wrong number of scores (custom
-            # RelevanceScorer drift) would IndexError at
-            # relevance_weights[idx] below — treat it as no signal.
-            if len(raw) == len(key_sizes) and any(s > 0 for s in raw):
-                relevance_weights = raw
+            relevance_weights = _scores_or_none(self._scorer, context_query, sections)
 
         # Build output: each key gets budget allocation
         parts: list[str] = []
@@ -476,9 +489,7 @@ class TruncateCompressor:
             # Compute per-section relevance scores if query is provided
             scores: list[float] | None = None
             if context_query and context_query.strip():
-                raw_scores = self._scorer.score_sections(context_query, sections)
-                if any(s > 0 for s in raw_scores):
-                    scores = raw_scores
+                scores = _scores_or_none(self._scorer, context_query, sections)
 
             if scores is not None:
                 # ── Query-aware: allocate budget proportional to relevance ──
@@ -845,8 +856,8 @@ class SelectiveCompressor:
         # search below rebuilds the same entries in the same order.
         items = list(chunks.items())
         if context_query and context_query.strip():
-            scores = self._scorer.score_sections(context_query, items)
-            if any(s > 0 for s in scores):
+            scores = _scores_or_none(self._scorer, context_query, items)
+            if scores is not None:
                 order = sorted(range(len(items)), key=lambda i: -scores[i])
                 items = [items[i] for i in order]
 
@@ -1721,8 +1732,8 @@ class SchemaPruningCompressor:
         caller to fall back to the uniform path for byte-identical output.
         """
         sections = [(k, json.dumps(v, ensure_ascii=False)) for k, v in data.items()]
-        scores = self._scorer.score_sections(context_query, sections)
-        if not any(s > 0 for s in scores):
+        scores = _scores_or_none(self._scorer, context_query, sections)
+        if scores is None:
             return None
         return {k for (k, _), s in zip(sections, scores) if s > 0}
 
@@ -2026,13 +2037,16 @@ class SkeletonCompressor:
             return [base] * n
 
         scored = [(heading, "\n".join(body)) for heading, body in sections]
+        raw = _scores_or_none(self._scorer, context_query, scored)
+        if raw is None:
+            return [base] * n
         # Clamp to non-negative: BM25 scores are always >= 0 (no-op, preserves
         # byte-identity), but an EmbeddingScorer returns cosine similarities that
         # can be negative. Raw negatives would skew the proportional split into
         # negative/huge per-section budgets, overfilling early sections so the
         # final hard slice drops trailing headings — breaking the skeleton's
         # every-heading-survives invariant.
-        scores = [max(0.0, s) for s in self._scorer.score_sections(context_query, scored)]
+        scores = [max(0.0, s) for s in raw]
         total = sum(scores)
         if total <= 0:
             return [base] * n
