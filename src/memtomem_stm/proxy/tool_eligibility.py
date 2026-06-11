@@ -183,8 +183,7 @@ def compute_health_flags(
     flagged = {
         key
         for key, (calls, errors) in stats.items()
-        if calls >= cfg.health_min_calls
-        and (errors / calls) >= cfg.health_error_rate_threshold
+        if calls >= cfg.health_min_calls and (errors / calls) >= cfg.health_error_rate_threshold
     }
     if flagged:
         logger.warning(
