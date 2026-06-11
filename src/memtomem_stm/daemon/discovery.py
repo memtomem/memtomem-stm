@@ -75,13 +75,15 @@ def config_fingerprint(config: STMConfig) -> str:
     reads directly (so it isn't in any model), and exactly the one ``hook``
     field the daemon engine wiring consumes: ``record_feedback_events``.
 
-    Deliberately **excluded**: the client-only ``hook`` fields ``use_daemon``,
-    ``fallback`` and ``daemon_timeout_seconds``. They govern how the *hook*
-    talks to the daemon, never what the daemon does — the daemon's behavior is
-    independent of them (``mms daemon start`` warms the same daemon whether or
-    not the hook has opted out via ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``).
-    Including them would make a live daemon look stale and the hook would reject
-    it (then, under the default ``fallback=skip``, return ``{}`` forever).
+    Deliberately **excluded**: every other ``hook`` field — the client-only
+    ``use_daemon``, ``fallback``, ``daemon_timeout_seconds`` and ``auto_spawn``,
+    plus the whole ``compression`` sub-block (it runs in the hook process,
+    never in the daemon). They govern how the *hook* behaves or talks to the
+    daemon, never what the daemon does — the daemon's behavior is independent
+    of them (``mms daemon start`` warms the same daemon whether or not the
+    hook has opted out via ``MEMTOMEM_STM_HOOK__USE_DAEMON=0``). Including
+    them would make a live daemon look stale and the hook would reject it
+    (then, under the default ``fallback=skip``, return ``{}`` forever).
     ``mode="json"`` makes ``Path``/enum values serializable.
     """
     material = {

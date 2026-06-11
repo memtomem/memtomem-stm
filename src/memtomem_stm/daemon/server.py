@@ -61,6 +61,12 @@ logger = logging.getLogger(__name__)
 # handler open forever; well above a warm surface round trip.
 _READ_TIMEOUT_SECONDS = 30.0
 
+# Outbound write+drain budget — symmetric to the read bound. A peer that sent
+# its request and then stopped reading (half-open socket, full receive buffer)
+# would otherwise block drain() forever, pinning the handler task and its
+# buffered response for the process lifetime.
+_WRITE_TIMEOUT_SECONDS = 30.0
+
 
 async def _quiet(coro: Any, what: str) -> None:
     """Await a cleanup coroutine, swallowing (and debug-logging) any error."""
@@ -353,7 +359,9 @@ class DaemonServer:
             resp = await self._dispatch(req)
             if resp is not None:
                 writer.write(encode_line(resp))
-                await writer.drain()
+                # Timeout → the generic handler below logs it and the finally
+                # block closes the writer, dropping the stuck consumer.
+                await asyncio.wait_for(writer.drain(), timeout=_WRITE_TIMEOUT_SECONDS)
         except Exception:
             logger.debug("daemon connection handler error", exc_info=True)
         finally:
@@ -395,7 +403,11 @@ class DaemonServer:
     async def _idle_watch(self) -> None:
         if self._idle_timeout <= 0:
             return
-        interval = min(30.0, max(1.0, self._idle_timeout / 2))
+        # Poll at half the timeout, floored low enough that sub-second
+        # idle_timeout values (tests, aggressive resource configs) shut down
+        # near the configured threshold instead of ~1s late, and capped so a
+        # huge timeout still notices the shutdown event reasonably often.
+        interval = min(30.0, max(0.05, self._idle_timeout / 2))
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)

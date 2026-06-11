@@ -128,6 +128,13 @@ def run_cmd(detached: bool, foreground: bool) -> None:
     raise SystemExit(run_daemon(config))
 
 
+# Cap on detached children `mms daemon start` may launch in one invocation.
+# A crashed child releases the lifetime lock, making "lock free" ambiguous
+# (mid-shutdown handoff vs crash loop); 3 covers the handoff with margin while
+# a persistently-failing config produces a handful of children, not dozens.
+_START_MAX_SPAWNS = 3
+
+
 @daemon_group.command(name="start")
 def start_cmd() -> None:
     """Spawn the daemon detached if one isn't already running for this config.
@@ -154,6 +161,7 @@ def start_cmd() -> None:
         return
 
     deadline = time.time() + 10.0
+    spawns = 0
     while time.time() < deadline:
         hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
@@ -162,9 +170,15 @@ def start_cmd() -> None:
         # request_spawn launches a detached child iff our config's lock is free;
         # it returns False only when a same-config daemon already holds it
         # (mid-startup → ping succeeds soon, or mid-shutdown → the lock frees and
-        # the next attempt wins). Either way we just keep retrying. We never hold
-        # the lock, so the spawned child can take ownership.
-        request_spawn(config)
+        # the next attempt wins). We never hold the lock, so the spawned child
+        # can take ownership. BUT a free lock can also mean the child we just
+        # spawned crashed on startup (bad config) — without a cap, a
+        # crash-looping config would fire a detached child every 0.3s for the
+        # whole window (~33 processes). Cap actual spawns and keep only
+        # ping-polling afterwards; the mid-shutdown handoff needs at most one
+        # respawn after the old daemon releases.
+        if spawns < _START_MAX_SPAWNS and request_spawn(config):
+            spawns += 1
         time.sleep(0.3)
     click.echo(
         _warn(

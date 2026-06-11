@@ -131,6 +131,12 @@ def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest
         c = STMConfig()
         setattr(c.hook, field, value)
         assert discovery.config_fingerprint(c) == fp, field
+    # The whole compression sub-block runs in the hook process, never in the
+    # daemon — toggling it must not move the fingerprint either.
+    c = STMConfig()
+    c.hook.compression.enabled = True
+    c.hook.compression.max_chars = 123
+    assert discovery.config_fingerprint(c) == fp
     # record_feedback_events DOES drive daemon engine wiring → must move it.
     c = STMConfig()
     c.hook.record_feedback_events = True
@@ -173,6 +179,50 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
     assert state["spawns"] >= 3  # retried past the initial declines
     assert all(state["lock_free_seen"])  # start never held the lock
     assert "daemon started" in result.output
+
+
+def test_start_caps_spawn_attempts_for_crash_looping_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A child that crashes on startup (bad config) releases the lifetime lock
+    # immediately, so every retry iteration finds it free. Without a cap,
+    # `start` fired a detached child every 0.3s for the whole 10s window
+    # (~33 crash-looping processes).
+    from types import SimpleNamespace
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+    spawns = {"n": 0}
+
+    def crash_looping_spawn(config):
+        spawns["n"] += 1
+        return True  # lock free every time — the spawned child died instantly
+
+    async def never_ready(config, *, timeout=2.0):
+        return None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", crash_looping_spawn)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", never_ready)
+    # Compress the 10s wall-clock window: sleep advances a fake clock.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "memtomem_stm.cli.daemon_cmd.time",
+        SimpleNamespace(
+            time=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 0
+    assert "did not become ready" in result.output
+    from memtomem_stm.cli.daemon_cmd import _START_MAX_SPAWNS
+
+    assert spawns["n"] == _START_MAX_SPAWNS  # capped, not ~33
 
 
 def test_start_coexists_with_different_config_daemon(
@@ -394,9 +444,7 @@ def _write_handshake(payload: dict) -> Path:
     import json
 
     config = STMConfig()
-    p = discovery.handshake_path(
-        config.data_dir.expanduser(), discovery.config_fingerprint(config)
-    )
+    p = discovery.handshake_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(payload), encoding="utf-8")
     return p
@@ -610,9 +658,7 @@ class TestDaemonRestartCli:
         assert "daemon started" in result.output
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
-    def test_wedged_teardown_reports_clearly(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_wedged_teardown_reports_clearly(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """When the old daemon never frees its lifetime lock, restart must
         report the wedged teardown instead of a misleading start timeout."""
         from click.testing import CliRunner
