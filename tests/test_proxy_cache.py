@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
+
+import pytest
 
 from memtomem_stm.proxy.cache import (
     ProxyCache,
@@ -216,6 +219,75 @@ class TestLegacyTransientPurge:
         try:
             assert reopened.get("s", "field", {}) == field_row
             assert reopened.get("s", "upper", {}) == upper_row
+        finally:
+            reopened.close()
+
+
+class TestPrivacyGate:
+    """``set()`` refuses secret-looking results (SECURITY.md exclusion, #453)
+    and ``initialize`` purges matching rows that pre-date the gate."""
+
+    @pytest.mark.parametrize(
+        "secret_text",
+        [
+            "api_key: abc123-def",
+            "password=hunter2",
+            "token sk-" + "a" * 24,
+            "creds AKIA" + "B" * 16 + " end",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ],
+    )
+    def test_set_skips_secret_bearing_result(self, proxy_cache: ProxyCache, secret_text: str):
+        proxy_cache.set("s", "t", {}, secret_text, ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {}) is None
+
+    def test_set_stores_clean_result(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {}, "ordinary tool response", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {}) == "ordinary tool response"
+
+    def test_email_bearing_result_is_not_cached(self, proxy_cache: ProxyCache):
+        # DEFAULT_PATTERNS include an email regex, so email-bearing responses
+        # are deliberately uncacheable — the gate shares the sensitivity set
+        # of the LLM-route scan rather than maintaining a second definition.
+        # The cost is one pipeline re-run per repeat call, never correctness.
+        proxy_cache.set("s", "t", {}, "contact: dev@example.com", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {}) is None
+
+    def test_initialize_purges_legacy_secret_rows(self, tmp_path):
+        db_path = tmp_path / "legacy_secrets.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "plain", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+        # Seed the secret row via raw SQL: it models a row written by a
+        # pre-gate release — ``set()`` itself now refuses such content.
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _make_key("s", "sec", {}),
+                    "s",
+                    "sec",
+                    "login password=hunter2",
+                    time.time(),
+                    None,
+                ),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        # Re-open the SAME db: the startup purge runs in initialize().
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened.get("s", "sec", {}) is None
+            assert reopened.get("s", "plain", {}) == "ordinary cached response"
         finally:
             reopened.close()
 

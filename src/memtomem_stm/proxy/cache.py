@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,26 @@ class ProxyCache:
                 (_PROGRESSIVE_MARKER, _SELECTION_KEY_MARKER, _TOC_SHAPE_MARKER),
             )
             db.commit()
+            # Purge of legacy rows cached before the privacy gate in ``set()``
+            # (#453) — they may embed secret-looking content that SECURITY.md
+            # promises is never persisted. Privacy patterns are Python regexes,
+            # so unlike the marker purge above this scans rows in Python; the
+            # scan and the gate share ``contains_sensitive_content`` so they
+            # can never diverge. Runs on every startup (matching the marker
+            # purge) — after the first pass it finds nothing, because ``set()``
+            # refuses new matching rows; the rescan also covers rows written by
+            # older processes still running pre-gate code against this file.
+            stale_keys = [
+                key
+                for key, result in db.execute("SELECT cache_key, result FROM proxy_cache")
+                if contains_sensitive_content(result)
+            ]
+            if stale_keys:
+                db.executemany(
+                    "DELETE FROM proxy_cache WHERE cache_key = ?",
+                    [(key,) for key in stale_keys],
+                )
+                db.commit()
         except Exception:
             db.close()
             raise
@@ -158,6 +179,17 @@ class ProxyCache:
         ttl_seconds: float | None,
     ) -> None:
         if self._db is None:
+            return
+        if contains_sensitive_content(result):
+            # SECURITY.md: responses that look like secrets are never
+            # persisted to the response cache. Enforced at the store
+            # chokepoint so no caller can bypass it (#453); a false positive
+            # only costs one un-cached response, never correctness.
+            logger.debug(
+                "Skipping cache store for %s/%s: response matches a privacy pattern",
+                server,
+                tool,
+            )
             return
         key = _make_key(server, tool, args)
         now = time.time()
