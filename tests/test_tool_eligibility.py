@@ -146,23 +146,41 @@ class TestStructuralRules:
             assert result.reject_reasons == {f"test__{long_name}": REASON_NAME_OVERFLOW}
 
     def test_duplicate_name_first_wins(self):
+        # The advertised NAME must never also be claimed withheld:
+        # the duplicate occurrence is a log-only drop, not a telemetry
+        # reject (codex R1 — reject_reasons keys ⊥ candidate_tools).
         cfg = _server_cfg()
         first = _cand("dup", cfg, desc="first copy")
         second = _cand("dup", cfg, desc="second copy")
         result = filter_tools([first, second], STRICT)
         assert result.eligible == [first.info]
-        assert result.reject_reasons == {"test__dup": REASON_DUPLICATE_NAME}
+        assert result.reject_reasons == {}
+        assert result.dropped_occurrences == [("test__dup", REASON_DUPLICATE_NAME)]
 
     def test_rejected_tool_does_not_claim_its_name(self):
         # The first copy is signal-rejected (credential in metadata); the
         # clean second copy must be the one advertised, not dropped as a
-        # duplicate of a tool that never got exposed.
+        # duplicate of a tool that never got exposed — and since the name
+        # IS advertised, the flagged occurrence is a drop, not a reject.
         cfg = _server_cfg()
         flagged = _cand("dup", cfg, raw_desc="api_key=sk-" + "a" * 24)
         clean = _cand("dup", cfg, desc="clean copy")
         result = filter_tools([flagged, clean], STRICT)
         assert result.eligible == [clean.info]
-        assert result.reject_reasons == {"test__dup": REASON_SENSITIVE_METADATA}
+        assert result.reject_reasons == {}
+        assert result.dropped_occurrences == [("test__dup", REASON_SENSITIVE_METADATA)]
+
+    def test_fully_withheld_name_keeps_first_reason(self):
+        # Every occurrence of the name is rejected → the NAME was withheld:
+        # reject_reasons carries the first occurrence's reason, the second
+        # occurrence is an occurrence-level drop (one name, one reason).
+        cfg = _server_cfg(tool_overrides={"dup": ToolOverrideConfig(hidden=True)})
+        hidden_a = _cand("dup", cfg)
+        hidden_b = _cand("dup", cfg)
+        result = filter_tools([hidden_a, hidden_b], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__dup": REASON_CONFIG_HIDDEN}
+        assert result.dropped_occurrences == [("test__dup", REASON_CONFIG_HIDDEN)]
 
 
 # ── signal rules: sensitive metadata ─────────────────────────────────────
@@ -277,6 +295,24 @@ class TestResultInvariants:
         for exposure in (STRICT, REVIEW, EXPLORE):
             result = self._mixed_result(exposure)
             assert set(_names(result)).isdisjoint(result.reject_reasons)
+            # Unique composed names (the normal case) → no occurrence drops.
+            assert result.dropped_occurrences == []
+
+    def test_disjointness_holds_with_same_named_occurrences(self):
+        """Telemetry must never claim a name was both advertised and
+        withheld, whichever occurrence survives in whichever profile."""
+        cfg = _server_cfg()
+        cands = [
+            _cand("dup", cfg, raw_desc="api_key=sk-" + "c" * 24),  # signal-flagged
+            _cand("dup", cfg, desc="clean copy"),
+            _cand("dup", cfg, desc="clean again"),  # duplicate of whoever claimed
+        ]
+        for exposure in (STRICT, REVIEW, EXPLORE):
+            result = filter_tools(cands, exposure)
+            assert len(_names(result)) == 1  # exactly one occurrence advertised
+            assert set(result.reject_reasons).isdisjoint(_names(result))
+            assert result.reject_reasons == {}  # name advertised → never withheld
+            assert len(result.dropped_occurrences) == 2
 
     def test_penalties_only_name_eligible_tools(self):
         for exposure in (STRICT, REVIEW, EXPLORE):

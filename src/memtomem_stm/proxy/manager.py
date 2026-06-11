@@ -186,6 +186,7 @@ class ProxyManager:
         self._advertised_infos: list[ProxyToolInfo] = []
         self._advertised_reject_reasons: dict[str, str] = {}
         self._advertised_risk_penalties: dict[str, float] = {}
+        self._advertised_dropped_occurrences: list[tuple[str, str]] = []
         # Health flags for the #465 filter, computed ONCE per start() from
         # the persisted metrics store and held for the session — exposure
         # must not drift between the startup advertisement (what the client
@@ -577,23 +578,28 @@ class ProxyManager:
                 )
 
         verdict = filter_tools(candidates, self._config.exposure, self._unhealthy_tools)
-        if verdict.reject_reasons != self._advertised_reject_reasons:
-            self._log_exposure_rejects(verdict.reject_reasons)
+        if (
+            verdict.reject_reasons != self._advertised_reject_reasons
+            or verdict.dropped_occurrences != self._advertised_dropped_occurrences
+        ):
+            self._log_exposure_rejects(verdict.reject_reasons, verdict.dropped_occurrences)
         self._advertised_infos = verdict.eligible
         self._advertised_tools = [info.prefixed_name for info in verdict.eligible]
         self._advertised_reject_reasons = verdict.reject_reasons
         self._advertised_risk_penalties = verdict.risk_penalties
+        self._advertised_dropped_occurrences = verdict.dropped_occurrences
         return verdict.eligible
 
     @staticmethod
-    def _log_exposure_rejects(reject_reasons: dict[str, str]) -> None:
+    def _log_exposure_rejects(
+        reject_reasons: dict[str, str], dropped_occurrences: list[tuple[str, str]]
+    ) -> None:
         """One line per advertisement *change*, so operators see what was
         withheld and why without per-call noise. Config-driven rejects
         (``hidden``, profile scoping) are the operator's own choices — those
-        log at DEBUG; everything else (structural, signal) is news and logs
-        at WARNING."""
-        if not reject_reasons:
-            return
+        log at DEBUG; everything else (structural rejects, signal rejects,
+        and same-named occurrence drops, which never reach telemetry) is
+        news and logs at WARNING."""
         expected = {REASON_CONFIG_HIDDEN, REASON_PROFILE_EXCLUDED}
         news = {t: r for t, r in reject_reasons.items() if r not in expected}
         if news:
@@ -601,6 +607,13 @@ class ProxyManager:
                 "Exposure filter withheld %d tool(s): %s",
                 len(news),
                 ", ".join(f"{t} ({r})" for t, r in sorted(news.items())),
+            )
+        if dropped_occurrences:
+            logger.warning(
+                "Exposure filter dropped %d same-named tool occurrence(s) "
+                "(name stays advertised via its first eligible occurrence): %s",
+                len(dropped_occurrences),
+                ", ".join(f"{t} ({r})" for t, r in sorted(dropped_occurrences)),
             )
         if len(news) < len(reject_reasons):
             logger.debug(

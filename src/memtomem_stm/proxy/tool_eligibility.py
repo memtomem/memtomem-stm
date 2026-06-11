@@ -28,7 +28,11 @@ this order wins:
     The prefixed name is already claimed by an *eligible* tool earlier in
     the advertisement pass (config order, then upstream catalogue order —
     first wins, matching the connect-time guard). Two handlers must never
-    race for one composed name. Every profile.
+    race for one composed name. Every profile. Note this verdict is
+    inherently occurrence-level: the NAME stays advertised via its first
+    eligible occurrence, so it appears in ``dropped_occurrences`` (operator
+    log), never in ``reject_reasons`` (telemetry) — see
+    :class:`EligibilityResult`.
 ``sensitive_metadata``
     The tool's metadata (original description, advertised description, raw
     schema) matches a credential pattern (``privacy.CREDENTIAL_PATTERNS``
@@ -51,11 +55,16 @@ hard rejects; ``review`` keeps flagged tools advertised but assigns them a
 observe what strict *would* hide; ``explore`` skips signal rules entirely.
 Config and structural rules apply in every profile.
 
-Two invariants this module exists to uphold:
+Three invariants this module exists to uphold:
 
 - **Ranking may never resurrect a hard reject.** Relevance ranking (#466)
   runs over ``EligibilityResult.eligible`` — the filter's output — so a
   rejected tool is structurally outside the ranker's candidate set.
+- **Telemetry never contradicts the advertisement.** ``reject_reasons``
+  keys are disjoint from the eligible names by construction: a name with
+  any advertised occurrence routes its rejected same-named occurrences to
+  ``dropped_occurrences`` (log-only) instead of claiming the name was
+  withheld.
 - **The advertised set is stable for the session.** Health flags are
   computed once at proxy startup (``compute_health_flags``) from the
   persisted metrics store, not per call: MCP clients are not guaranteed to
@@ -147,14 +156,28 @@ class EligibilityResult:
     ``eligible`` preserves input order (config order, then upstream
     catalogue order). ``reject_reasons`` and ``risk_penalties`` are keyed by
     prefixed name — the same vocabulary as ``candidate_tools`` in selection
-    telemetry. A name never appears in both ``eligible`` and
-    ``reject_reasons``; ``risk_penalties`` only ever names eligible tools
+    telemetry — and describe NAMES: ``reject_reasons`` only ever names tools
+    the client did not get (its key set is disjoint from the eligible names
+    by construction — telemetry must never claim a name was both advertised
+    and withheld), and ``risk_penalties`` only ever names eligible tools
     (``review``-profile demotions).
+
+    ``dropped_occurrences`` is the occurrence-level remainder: ``(name,
+    reason)`` for each rejected candidate whose composed name is NOT in
+    ``reject_reasons`` — a same-named duplicate of an advertised tool, a
+    same-named sibling rejected by another rule while one occurrence made
+    it through, or the second-plus rejected occurrence of a fully-withheld
+    name. These never reach telemetry (the client's view of that NAME is
+    already described); they exist for operator logging, since silently
+    losing an occurrence is how the old connect-time guards hid anomalies.
+    Empty whenever composed names are unique — the normal case, guaranteed
+    by config validation plus the connect-time guard.
     """
 
     eligible: list[ProxyToolInfo]
     reject_reasons: dict[str, str]
     risk_penalties: dict[str, float]
+    dropped_occurrences: list[tuple[str, str]]
 
 
 def compute_health_flags(
@@ -227,9 +250,13 @@ def filter_tools(
     is the cached startup snapshot from :func:`compute_health_flags`.
     """
     eligible: list[ProxyToolInfo] = []
-    reject_reasons: dict[str, str] = {}
     risk_penalties: dict[str, float] = {}
     claimed_names: set[str] = set()
+    # Per-OCCURRENCE verdicts in input order; folded into the name-level
+    # ``reject_reasons`` map after the pass, because whether a rejected
+    # occurrence means "this NAME was withheld" depends on whether some
+    # other occurrence of the same name ended up advertised.
+    occurrence_rejects: list[tuple[str, str]] = []
 
     for candidate in candidates:
         info = candidate.info
@@ -238,7 +265,7 @@ def filter_tools(
 
         # ── config rules (every profile) ─────────────────────────────────
         if override is not None and override.hidden:
-            reject_reasons[info.prefixed_name] = REASON_CONFIG_HIDDEN
+            occurrence_rejects.append((info.prefixed_name, REASON_CONFIG_HIDDEN))
             continue
         profiles = (
             override.expose_in_profiles
@@ -246,15 +273,15 @@ def filter_tools(
             else server_cfg.expose_in_profiles
         )
         if profiles is not None and cfg.profile not in profiles:
-            reject_reasons[info.prefixed_name] = REASON_PROFILE_EXCLUDED
+            occurrence_rejects.append((info.prefixed_name, REASON_PROFILE_EXCLUDED))
             continue
 
         # ── structural rules (every profile) ─────────────────────────────
         if tool_name_budget.overflows(server_cfg.prefix, info.original_name):
-            reject_reasons[info.prefixed_name] = REASON_NAME_OVERFLOW
+            occurrence_rejects.append((info.prefixed_name, REASON_NAME_OVERFLOW))
             continue
         if info.prefixed_name in claimed_names:
-            reject_reasons[info.prefixed_name] = REASON_DUPLICATE_NAME
+            occurrence_rejects.append((info.prefixed_name, REASON_DUPLICATE_NAME))
             continue
 
         # ── signal rules (profile-dependent) ─────────────────────────────
@@ -266,7 +293,7 @@ def filter_tools(
                 flagged_reason = REASON_UNHEALTHY
             if flagged_reason is not None:
                 if cfg.profile is ExposureProfile.STRICT:
-                    reject_reasons[info.prefixed_name] = flagged_reason
+                    occurrence_rejects.append((info.prefixed_name, flagged_reason))
                     continue
                 # review: advertise, but demote in ranking telemetry.
                 risk_penalties[info.prefixed_name] = cfg.review_risk_penalty
@@ -277,6 +304,24 @@ def filter_tools(
         claimed_names.add(info.prefixed_name)
         eligible.append(info)
 
+    # Name-level fold. ``reject_reasons`` may only name tools the client
+    # did NOT get — a name some occurrence of which was advertised routes
+    # its rejected occurrences to ``dropped_occurrences`` instead, keeping
+    # ``reject_reasons`` keys disjoint from ``candidate_tools`` by
+    # construction. For a fully-withheld name the first rejected
+    # occurrence's reason wins; later occurrences of the same withheld
+    # name are occurrence drops too (one name, one reason).
+    reject_reasons: dict[str, str] = {}
+    dropped_occurrences: list[tuple[str, str]] = []
+    for name, reason in occurrence_rejects:
+        if name in claimed_names or name in reject_reasons:
+            dropped_occurrences.append((name, reason))
+        else:
+            reject_reasons[name] = reason
+
     return EligibilityResult(
-        eligible=eligible, reject_reasons=reject_reasons, risk_penalties=risk_penalties
+        eligible=eligible,
+        reject_reasons=reject_reasons,
+        risk_penalties=risk_penalties,
+        dropped_occurrences=dropped_occurrences,
     )

@@ -134,16 +134,23 @@ reason code`:
 | `config_hidden` | per-tool `hidden: true` override | all |
 | `profile_excluded` | `expose_in_profiles` does not include the active profile | all |
 | `name_overflow` | composed client-side name exceeds the 64-char MCP limit | all |
-| `duplicate_name` | composed name already claimed by an earlier eligible tool | all |
 | `sensitive_metadata` | credential-pattern match in the tool's description/schema | rejects under `strict`; demotes under `review` |
 | `unhealthy` | upstream-attributable error rate over the recent metrics window crossed the threshold | rejects under `strict`; demotes under `review` |
 
 Reason codes are the only #465 payload in the log — no tool metadata, no
-error text — so the redaction policy below is untouched. A rejected tool
-never appears in `candidate_tools` or `ranked_candidates`: ranking runs
-over the filter's eligible output and can never resurrect a reject
-(pinned by `tests/test_tool_eligibility.py`). The codes are additive
-vocabulary: replay tooling should treat unknown codes as opaque.
+error text — so the redaction policy below is untouched. `reject_reasons`
+keys are **disjoint from `candidate_tools` by construction**: an entry
+means that composed name was withheld from the client entirely. Same-named
+duplicate occurrences (a pathological state — composed-name uniqueness is
+normally guaranteed by config validation plus the connect-time guard) are
+dropped and logged at WARNING with a `duplicate_name` verdict but never
+recorded here, because the name stays advertised via its first eligible
+occurrence and telemetry must not claim it was both advertised and
+withheld. A rejected tool never appears in `candidate_tools` or
+`ranked_candidates`: ranking runs over the filter's eligible output and
+can never resurrect a reject (both pinned by
+`tests/test_tool_eligibility.py`). The codes are additive vocabulary:
+replay tooling should treat unknown codes as opaque.
 
 ## Redaction policy
 
