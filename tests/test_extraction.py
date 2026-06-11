@@ -20,6 +20,7 @@ from memtomem_stm.proxy.extraction import (
     _extract_heuristic,
     _parse_facts_json,
 )
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +406,24 @@ class TestFactExtractorLLM:
 
         call_api.assert_not_awaited()
         assert isinstance(facts, list)
+
+    async def test_privacy_scan_runs_before_truncation(self):
+        # A credential split at the max_input_chars boundary must still fire
+        # the gate: slicing leaves 15 of the AKIA key's 16 trailing chars, so
+        # the truncated text matches no pattern while a near-complete secret
+        # prefix would ship. The scan must see the pre-truncation text.
+        cfg = ExtractionConfig(enabled=True, min_response_chars=10, max_input_chars=30)
+        extractor = FactExtractor(cfg)
+        text = "x" * 10 + " AKIA" + "A" * 16
+        # Pin the repro shape itself — if either assert breaks, the test no
+        # longer exercises the boundary split and must be reconstructed.
+        assert not contains_sensitive_content(text[:30], CREDENTIAL_PATTERNS)
+        assert contains_sensitive_content(text, CREDENTIAL_PATTERNS)
+
+        with patch.object(extractor, "_call_api", new_callable=AsyncMock) as call_api:
+            await extractor.extract(text, server="s", tool="t")
+
+        call_api.assert_not_awaited()
 
     async def test_hybrid_merges_llm_and_heuristic(self):
         cfg = ExtractionConfig(
