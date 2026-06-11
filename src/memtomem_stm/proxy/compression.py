@@ -745,6 +745,14 @@ class TruncateCompressor:
         return cut + sentinel + footer
 
 
+def _plain_truncate(text: str, *, max_chars: int, context_query: str | None = None) -> str:
+    """Run a default ``TruncateCompressor`` over ``text``: the single
+    construction site for the plain-truncation degrade path every richer
+    compressor falls back to (and for the ``truncate`` tail mode), so a future
+    change to that path is a one-line edit instead of a many-site sweep."""
+    return TruncateCompressor().compress(text, max_chars=max_chars, context_query=context_query)
+
+
 @dataclass
 class PendingSelection:
     """Stores original chunks while waiting for section selection."""
@@ -807,9 +815,7 @@ class SelectiveCompressor:
         if len(chunks) <= 1:
             chunks = self._decompose_single_chunk(chunks, fmt)
             if len(chunks) <= 1:
-                return TruncateCompressor().compress(
-                    text, max_chars=max_chars, context_query=context_query
-                )
+                return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
 
         return self._store_and_build_toc(text, fmt, chunks, context_query, max_chars=max_chars)
 
@@ -1084,131 +1090,31 @@ class FieldExtractCompressor:
         # against this tier: at a budget where the bulky pretty preview just fits it
         # carries fewer leaves than the compact final tier carries at a SMALLER
         # budget, so a larger ``max_chars`` could show LESS content. Preferring this
-        # tier for every overflow removes that cliff. (The dict final tier still
-        # inherits ``_take``'s own non-monotonicity — tracked separately, the dict
-        # analog of the list fix.)
+        # tier for every overflow removes that cliff.
         return self._fit_extracted(data, max_chars)
 
     def _take(self, value: object, budget: int) -> object:
-        """Greedy prefix-fill: keep the leading, full-detail content of ``value``
-        whose serialized cost fits ``budget`` (COMPACT) chars, dropping the tail
-        into a valid omitted-count marker (an extra ``_truncated`` dict member or
-        an in-array string element, counted against the ORIGINAL length).
+        """Truncate a LEAF to fit ``budget`` COMPACT chars: a string keeps its
+        largest prefix plus ``"..."``, a non-string scalar is returned whole
+        when its literal fits and otherwise becomes the scalar stub ``""`` so
+        sibling keys can still survive. A container (defensive — production
+        callers pass strings) is returned whole only when its compact dump
+        fits, and floors to ``""`` otherwise.
 
-        STRICT budget for containers: ``len(json.dumps(_take(value, b))) <= b``
-        always — every child (including the first) is gated, and a child is
-        accepted only if it still fits, so a caller can hand ``_take`` the hard
-        ``max_chars`` directly and trust the result. Leading full-length scalars
-        (names, ids, roles) survive untouched — only a boundary string is ever
-        truncated. A non-string scalar is returned whole when its literal fits,
-        otherwise it becomes the scalar stub ``""`` so sibling keys can still
-        survive.
+        The greedy container prefix-fill that used to live here was deleted as
+        unreachable: the monotone wave routed dict roots through
+        ``_enrich_dict_monotone`` and list roots / nested containers through
+        ``_fit_monotone``, precisely because this function's budget search was
+        content-non-monotone (a larger budget could flip a child into a
+        longer-but-emptier omitted marker).
         """
         if isinstance(value, str):
             if len(value) + 2 <= budget:  # +2 for the surrounding quotes
                 return value
             keep = budget - 5  # quotes (2) + "..." (3)
             return value[:keep] + "..." if keep > 0 else ""
-        if not isinstance(value, (dict, list)):
-            literal = json.dumps(value, ensure_ascii=False)
-            return value if len(literal) <= budget else ""
-
-        if len(json.dumps(value, ensure_ascii=False)) <= budget:
-            return value
-
-        # Collision-safe marker key, checked against ALL original keys (a real
-        # "_truncated" key can be in the *dropped* tail, invisible to ``out``).
-        marker_key = "_truncated"
-        if isinstance(value, dict):
-            is_dict = True
-            items: list = list(value.items())
-            existing = set(value)
-            while marker_key in existing:
-                marker_key += "_"
-        else:
-            is_dict = False
-            items = list(enumerate(value))
-        n = len(items)
-
-        if not is_dict:
-            out_list: list = []
-
-            def list_fits(candidate: list) -> bool:
-                return len(json.dumps(candidate, ensure_ascii=False)) <= budget
-
-            def is_starved(child: object, source: object) -> bool:
-                if child == "" and not isinstance(source, (dict, list, str)):
-                    return False
-                return child in ({}, [], "") and source not in (None, {}, [], "", 0, False)
-
-            def best_child(source: object, suffix: list[str]) -> object | None:
-                lo, hi, best = 0, budget, None
-                while lo <= hi:
-                    mid = (lo + hi) // 2
-                    child = self._take(source, mid)
-                    if list_fits(out_list + [child] + suffix):
-                        best, lo = child, mid + 1
-                    else:
-                        hi = mid - 1
-                return best
-
-            for i, (_k, v) in enumerate(items):
-                marker_after = f"... ({n - i - 1} of {n} items omitted)" if i < n - 1 else None
-                child = best_child(v, [marker_after] if marker_after else [])
-                if child is None or is_starved(child, v):
-                    marker = f"... ({n - i} of {n} items omitted)"
-                    if list_fits(out_list + [marker]):
-                        out_list.append(marker)
-                    else:
-                        child = best_child(v, [])
-                        if child is not None and not is_starved(child, v):
-                            out_list.append(child)
-                            continue
-                    break
-                out_list.append(child)
-            return out_list
-
-        out_dict: dict = {}
-
-        def dict_fits(candidate: dict) -> bool:
-            return len(json.dumps(candidate, ensure_ascii=False)) <= budget
-
-        def dict_starved(child: object, source: object) -> bool:
-            if child == "" and not isinstance(source, (dict, list, str)):
-                return False
-            return child in ({}, [], "") and source not in (None, {}, [], "", 0, False)
-
-        def best_value(key: object, source: object, suffix: dict[str, str]) -> object | None:
-            lo, hi, best = 0, budget, None
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                child = self._take(source, mid)
-                candidate = dict(out_dict)
-                candidate[key] = child
-                candidate.update(suffix)
-                if dict_fits(candidate):
-                    best, lo = child, mid + 1
-                else:
-                    hi = mid - 1
-            return best
-
-        for i, (k, v) in enumerate(items):
-            marker_after = {marker_key: f"{n - i - 1} of {n} keys omitted"} if i < n - 1 else {}
-            child = best_value(k, v, marker_after)
-            if child is None or dict_starved(child, v):
-                marker = f"{n - i} of {n} keys omitted"
-                candidate = dict(out_dict)
-                candidate[marker_key] = marker
-                if dict_fits(candidate):
-                    out_dict[marker_key] = marker
-                else:
-                    child = best_value(k, v, {})
-                    if child is not None and not dict_starved(child, v):
-                        out_dict[k] = child
-                        continue
-                break
-            out_dict[k] = child
-        return out_dict
+        literal = json.dumps(value, ensure_ascii=False)
+        return value if len(literal) <= budget else ""
 
     @staticmethod
     def _stub_value(value: object) -> object:
@@ -1365,7 +1271,7 @@ class FieldExtractCompressor:
         """Re-derive a VALID, within-budget form from the ORIGINAL data, filling
         the budget with as much leading full-detail content as fits.
 
-        Output is COMPACT JSON (no indent) so ``_take``'s compact cost
+        Output is COMPACT JSON (no indent) so the fill's compact cost
         accounting matches the measured length exactly — the exact match makes
         length monotonic in the soft budget, so the search fills ``max_chars``
         instead of landing on a collapse cliff.
@@ -1416,8 +1322,8 @@ class FieldExtractCompressor:
         if not isinstance(data, (dict, list, str)):
             # Non-string scalar root (number / bool / null). Emit it verbatim
             # when it fits; otherwise degrade to a truncated STRING of the
-            # literal. Nested oversized scalars use ``_take``'s empty-string stub,
-            # but root scalars should stay visibly truncated rather than
+            # literal. Nested oversized scalars degrade to the empty-string
+            # stub, but root scalars should stay visibly truncated rather than
             # disappearing behind an unlabelled empty value.
             literal = json.dumps(data, ensure_ascii=False)
             if len(literal) <= max_chars:
@@ -1429,14 +1335,9 @@ class FieldExtractCompressor:
             return '""'
 
         if isinstance(data, list):
-            # ``_take`` content is NON-monotone in its budget: a larger child
-            # budget can flip a value into a longer-but-emptier omitted marker
-            # (e.g. ``_take({"a": 1, "b": {...}}, 37)`` -> ``{"_truncated": ...}``),
-            # so a search that maximizes the budget handed to ``_take`` can show
-            # LESS content at a LARGER ``max_chars``. ``_fit_monotone`` is the
-            # monotone analog (breadth-preserving, shared-cap depth fill), leaving
-            # ``_take`` — which the dict-enrich search at the top relies on —
-            # untouched.
+            # List roots fill the budget MONOTONICALLY via ``_fit_monotone``;
+            # the greedy prefix-fill it replaced could show LESS content at a
+            # LARGER ``max_chars`` (see the ``_fit_monotone`` docstring).
             return dump(self._fit_monotone(data, max(2, max_chars)))
 
         if isinstance(data, str):
@@ -1450,26 +1351,25 @@ class FieldExtractCompressor:
                     return candidate
             return '""'
 
-        # Defensive: any other container type.
-        candidate = dump(self._take(data, max_chars))
-        if len(candidate) <= max_chars:
-            return candidate
-        return "{}" if isinstance(data, dict) else '""'
+        # Only an EMPTY dict reaches here (non-empty dict / list / str / scalar
+        # roots are all handled above): floor it like the other empty roots.
+        return "{}"
 
     def _fit_monotone(self, value: object, budget: int) -> object:
-        """Monotone analog of ``_take``: the preserved-leaf content of the result
+        """Monotone container fill: the preserved-leaf content of the result
         is NON-DECREASING in ``budget``, so a larger budget never shows less.
         Returns a compact-JSON-serializable object whose ``json.dumps`` length is
         ``<= budget`` (callers pass ``max(2, max_chars)``).
 
-        ``_take`` hands each child the largest budget that fits and assumes more
-        budget means more content — false, because ``_take`` itself flips a value
-        into a longer-but-emptier omitted marker as its own budget grows (e.g.
-        ``_take({"a": 1, "b": {...}}, 37)`` -> ``{"_truncated": "..."}``). A search
-        that maximizes the per-child budget inherits that regression, so a LARGER
-        ``max_chars`` can show LESS content.
+        The greedy prefix-fill this replaced (``_take``'s deleted container
+        branch) handed each child the largest budget that fits and assumed more
+        budget means more content — false, because that search itself flipped a
+        value into a longer-but-emptier omitted marker as its own budget grew
+        (e.g. ``{"a": 1, "b": {...}}`` at budget 37 -> ``{"_truncated": "..."}``).
+        A search that maximizes the per-child budget inherits that regression,
+        so a LARGER ``max_chars`` could show LESS content.
 
-        The fix keeps ``_take``'s prefix shape — leading items in FULL detail, a
+        The fix keeps the same prefix shape — leading items in FULL detail, a
         single truncated boundary item, then an omitted-count marker — but makes
         every degree of freedom monotone:
 
@@ -1479,7 +1379,8 @@ class FieldExtractCompressor:
           element, which never has less content.
         - **Boundary**: the first item that does not fit full is filled by RECURSING
           (``_fit_monotone``), whose content is monotone in its own budget — unlike
-          ``_take``, it never collapses to an emptier marker as the budget grows.
+          the greedy search, it never collapses to an emptier marker as the
+          budget grows.
         - **Marker**: counts the items AFTER the boundary; a dropped tail is
           content-free, so the prefix/boundary/marker split is monotone overall.
 
@@ -1515,7 +1416,7 @@ class FieldExtractCompressor:
 
         # Narrow ``value`` for both the type checker and key/index handling, and
         # pick a collision-safe marker key checked against ALL original keys (a
-        # real "_truncated" may sit in the dropped tail) — mirroring ``_take``.
+        # real "_truncated" may sit in the dropped tail).
         marker_key = "_truncated"
         if isinstance(value, dict):
             is_dict = True
@@ -2259,13 +2160,13 @@ class LLMCompressor:
                     self._cfg.provider.value,
                 )
                 self.last_fallback = "privacy"
-                return TruncateCompressor().compress(text, max_chars=max_chars)
+                return _plain_truncate(text, max_chars=max_chars)
         if self._cb.is_open:
             self.last_fallback = "circuit_breaker"
-            return TruncateCompressor().compress(text, max_chars=max_chars)
+            return _plain_truncate(text, max_chars=max_chars)
         if self._closed:
             self.last_fallback = "closed"
-            return TruncateCompressor().compress(text, max_chars=max_chars)
+            return _plain_truncate(text, max_chars=max_chars)
         # Register as in-flight so a concurrent close() blocks on ``_idle``
         # until we finish touching ``_client``. The increment+clear pair is
         # sync — no ``await`` between the ``_closed`` check above and the
@@ -2295,7 +2196,7 @@ class LLMCompressor:
                     self._cfg.provider.value,
                 )
                 self.last_fallback = "llm_overlength"
-                return TruncateCompressor().compress(result, max_chars=max_chars)
+                return _plain_truncate(result, max_chars=max_chars)
             return result
         except asyncio.TimeoutError:
             self._cb.failure()
@@ -2305,7 +2206,7 @@ class LLMCompressor:
                 self._cfg.provider.value,
             )
             self.last_fallback = "timeout"
-            return TruncateCompressor().compress(text, max_chars=max_chars)
+            return _plain_truncate(text, max_chars=max_chars)
         except Exception as exc:
             self._cb.failure()
             logger.warning(
@@ -2315,7 +2216,7 @@ class LLMCompressor:
                 exc,
             )
             self.last_fallback = "llm_error"
-            return TruncateCompressor().compress(text, max_chars=max_chars)
+            return _plain_truncate(text, max_chars=max_chars)
         finally:
             self._in_flight -= 1
             if self._in_flight == 0:
@@ -2483,9 +2384,7 @@ class HybridCompressor:
         available = max_chars - separator_overhead
 
         if available <= 0:
-            return TruncateCompressor().compress(
-                text, max_chars=max_chars, context_query=context_query
-            )
+            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
 
         if self._head_chars + self._min_toc_budget <= available:
             head_budget = self._head_chars
@@ -2493,14 +2392,10 @@ class HybridCompressor:
             head_budget = max(self._min_head_chars, int(available * self._head_ratio))
 
         if head_budget > available or head_budget < self._min_head_chars:
-            return TruncateCompressor().compress(
-                text, max_chars=max_chars, context_query=context_query
-            )
+            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
 
         if available - head_budget < _MIN_TAIL:
-            return TruncateCompressor().compress(
-                text, max_chars=max_chars, context_query=context_query
-            )
+            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
 
         head_end = self._find_head_break(text, head_budget)
         head = text[:head_end]
@@ -2514,16 +2409,14 @@ class HybridCompressor:
 
         toc_budget = max_chars - len(head) - len(separator)
         if toc_budget < _MIN_TAIL:
-            return TruncateCompressor().compress(
-                text, max_chars=max_chars, context_query=context_query
-            )
+            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
 
         if self._tail_mode == TailMode.TOC:
             tail_compressed = self._selective.compress(
                 tail_text, max_chars=toc_budget, context_query=context_query
             )
         else:
-            tail_compressed = TruncateCompressor().compress(
+            tail_compressed = _plain_truncate(
                 tail_text, max_chars=toc_budget, context_query=context_query
             )
 
@@ -2538,9 +2431,7 @@ class HybridCompressor:
             if fitted_tail is not None:
                 return head + separator + fitted_tail
 
-            fallback = TruncateCompressor().compress(
-                text, max_chars=max_chars, context_query=context_query
-            )
+            fallback = _plain_truncate(text, max_chars=max_chars, context_query=context_query)
             return fallback[:max_chars]
         return result
 
