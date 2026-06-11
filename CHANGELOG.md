@@ -5,6 +5,64 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+## [0.1.28] — 2026-06-11
+
+A security-hardening, correctness, and tool-selection release. A targeted audit across four issue classes — SQLite file permissions, sensitive-value caching, secret-content persistence, and extraction-call privacy — produced six security fixes. Thirteen correctness fixes address critical paths found in the implementation review (PROGRESSIVE metrics assignment, network LTM reconnects, shutdown ExceptionGroup handling) and the remaining medium and low backlog items across daemon, surfacing, compression, config, and CLI layers. Two new opt-in features instrument the tool-selection path (JSONL telemetry sink and BM25 relevance scoring), and a third hardens what the proxy advertises to MCP clients via an STM-native eligibility filter at exposure time.
+
+Citations are the merged PR numbers; an `issue #N` reference is added for source-issue traceability where one exists.
+
+### Added
+
+- **Opt-in selection/execution telemetry JSONL sink** (#471, issue #467) — `SelectionTelemetry` writes per-call tool-selection events (eligible pool, scored ranking, selected set) to a configurable JSONL file when `selection_telemetry.enabled=true` (default `false`). **Behavior change**: when enabled, a JSONL file is written on every proxied tool call.
+- **Deterministic BM25 tool-relevance ranking in selection telemetry** (#472, issue #466) — adds a BM25-based relevance score for each tool in the eligible pool to the telemetry record, enabling offline analysis of tool-selection quality. Inert when `selection_telemetry.enabled=false`.
+- **STM-native tool-eligibility hard filter at exposure time** (#473, issue #465) — the proxy filters the advertised tool list at `tools/list` time using three eligibility axes: sustained connection failures, credential-bearing metadata, and duplicate-name conflicts within the same group. **Behavior change**: tools failing any eligibility axis are removed from the advertised set without per-call errors; `stm_proxy_health` now reports "N discovered, M advertised" to distinguish catalog size from what clients see; the connect-time skip is removed so `conn.tools` reflects the full upstream catalog.
+
+### Fixed
+
+- **PROGRESSIVE strategy branch no longer crashes every call** (#426) — `metrics_strategy` was unbound on the `PROGRESSIVE` branch, raising `UnboundLocalError` on every progressive tool call.
+- **Network LTM transport reconnects after httpx errors** (#427) — httpx `HTTPStatusError` and `RequestError` were misclassified as internal errors; reclassifying them as transport errors lets the LTM reconnect logic kick in.
+- **Shutdown no longer propagates ExceptionGroup-wrapped cancel-scope errors** (#428) — `ExceptionGroup`-wrapped AnyIO cancel-scope errors during server shutdown are now recognized and swallowed, matching the non-wrapped handling from #410.
+- **`no_results_demoted` survives the surfacing stats healthy/fault split** (#429) — the skip reason was not assigned to either the healthy or fault bucket, causing it to vanish from `stm_surfacing_stats` after the #366 split.
+- **Non-dict `mcpServers` in host configs no longer crashes `mms import`** (#430) — a host config file with `"mcpServers": null` or a non-dict value now yields zero candidates instead of a `TypeError`.
+- **`mms health --timeout` is now honored end-to-end** (#431) — the upstream MCP probe ran without a deadline; it now shares the `--timeout` budget so `mms health` reliably exits within the requested window.
+- **JSON config file loads when `MEMTOMEM_STM_PROXY__ENABLED` env var is set** (#432) — the env-var-only branch skipped `load_from_file`, so `consumer_model` and other file-only fields were silently missing; the file path is now always read first and env vars overlay it.
+- **Durable feedback demotion re-applied on cache-hit path** (#433) — the in-memory demotion filter ran before the cache was consulted, so a cached response bypassed feedback demotion entirely; the filter now runs after cache retrieval.
+- **LLM summary over-length responses capped to `max_chars`** (#434) — the LLM compression path returned summaries longer than `max_chars` when the model response exceeded the budget.
+- **`stm_proxy_read_more` continues with the originating tool's `chunk_size` and hint preference** (#435) — `read_more` used the proxy-global defaults instead of those stored with the progressive key, causing inconsistent chunk sizing on multi-step reads.
+- **Persisted AutoTuner adjustments clamped to the current band on load** (#436) — adjustments written under a previous band configuration could land outside the current band limits, breaking the per-tool adjustment contract.
+- **`mms daemon stop/status` degrades on corrupted handshake fields** (#437) — malformed or missing fields in the daemon socket response raised an unhandled exception; the ops CLI now logs a warning and returns a degraded status.
+- **Leaked LTM child process swept up when adapter teardown unwinds cross-task** (#438) — if the LTM child was spawned by one task and the cancel scope unwound in a sibling task, the child was never terminated; `_stop_adapter()` now guards against this.
+- **Extractor nulled on stop; `_context_query` sanitized on cache miss** (#439) — the `ContextExtractor` was retained after `ProxyManager.stop()`, holding a live embedding session; `_context_query` could carry stale content into the next unrelated call on the cache-miss path.
+- **`InMemoryPendingStore` eviction order kept in sync across `put`/`touch`/`delete`** (#440) — the LRU eviction heap could diverge from the store map after `touch` or `delete`, silently evicting the wrong entry.
+- **URL userinfo redacted from LTM connection log lines** (#441) — the LTM MCP command or URL was logged verbatim; credentials embedded in a network transport URL were visible in INFO logs.
+- **TOC budget forwarded, scorer length guarded, all-empty BM25 sections handled** (#442) — three compression edge cases: the SELECTIVE/Hybrid TOC budget was not propagated to the inner compressor; the BM25 scorer crashed on zero-length section text; an all-empty-body sections list produced a silent empty ranking.
+- **`mms hook` skips compression below the sentinel budget and offloads spawn** (#443) — compression was attempted even when the result was at or below the no-op sentinel; daemon spawn was synchronous and could block the hook timeout path.
+- **Daemon `start` respawns capped, response drain bounded, sub-second idle timeouts honored** (#444) — unbounded respawn loops on repeated start failures could spin indefinitely; the response drain had no timeout; `idle_timeout_seconds < 1` was silently rounded to zero (immediate exit).
+- **`mms proxy` CLI config-file handling aligned with server startup; atomic `.mcp.json` writes preserve file mode** (#445) — `--config` was not applied before the config file was loaded in some subcommands. **Behavior change**: atomic `.mcp.json` writes now preserve the original file mode.
+- **Unknown names in `mms project enable` rejected; ambiguous `project show` refused** (#446) — `project enable <name>` silently no-oped on an unregistered name; `project show` with a name matching multiple entries returned the first match. **Behavior change**: `mms project enable <unknown>` now exits non-zero.
+- **Startup warns when surfacing is enabled but the proxy is disabled** (#447) — the combination was silent; the proxy now logs a WARNING so operators know surfacing events will never fire.
+- **Proxy degrades on third-party API drift in tool registration and tracing** (#448) — unexpected `None` values from an upstream's `tools/list` or tracing calls now degrade gracefully instead of raising `AttributeError`.
+- **`_take`'s unreachable container machinery removed; truncate fallback unified** (#449) — dead code paths in the compression `_take` helper and a duplicated truncate fallback were removed.
+- **Freed budget refilled after `_json_key_truncate` drops keys** (#450) — keys dropped by the key-truncation pass freed space that was not credited back to the compressor budget, causing under-utilization on the subsequent fill pass.
+- **Injection scan bounded honestly across full payload** (#451) — the comment claimed a "20 k char cap" but the scan ran on the full injection string; it now scans the first 20 k chars plus a head+tail window on longer inputs.
+- **Hybrid ordering validated; zero model budgets rescued; env overrides named in load warnings** (#452) — `ProxyConfig` now rejects invalid hybrid ordering at load time; a zero `model_budget` is reset to the default instead of crashing; env-override load warnings name the environment variable. **Behavior change**: configs with invalid hybrid ordering are rejected at startup.
+- **Concurrent `sync --apply` / `import --apply` serialized behind a cross-process write lock** (#457) — simultaneous invocations raced on the registry and sidecar; a 10-second lock acquisition timeout now serializes them, returning an error to the second caller if the lock is not acquired in time. **Behavior change**: a concurrent `--apply` fails with a lock-timeout error after 10 seconds instead of silently corrupting state.
+
+### Security
+
+- **SQLite store files set to mode `0600` at creation** (#458, issue #453) — the feedback, progressive, and pending SQLite files were created with the process umask (typically `0644`), making them world-readable. All three stores now `os.chmod` to `0o600` on first open.
+- **Secret-looking responses never persisted to the response cache** (#460, issue #455) — the privacy scan ran on the raw upstream response but the cache stored the result regardless; a response flagged as credential-bearing now bypasses the cache write, and existing rows carrying the detection marker are purged once at `ProxyCache.initialize()`.
+- **LLM routing gated on credentials only — emails are PII, not secrets** (#461, issue #456) — the privacy router sent any email-address-bearing response through the LLM path, which could persist a sanitized form; emails are now treated as PII (a logging concern) rather than secrets (a routing concern), so they no longer trigger the LLM fallback. **Behavior change**: email-only responses are no longer routed through the LLM compression path.
+- **Auto-index and extraction never persist secret-looking content** (#462, issue #454) — the extraction LLM call was gated on privacy, but the raw candidate text was written to the pending store before the call; the store write is now skipped for credential-bearing candidates, and auto-index applies the same guard.
+- **Credential scan runs before the extraction LLM call** (#463) — the privacy scan order was inverted: text was sent to the LLM and the scan ran on the result; the scan now runs first and short-circuits to skip the LLM on a hit.
+- **Memory-ops filenames slugged; private directory and file modes enforced** (#464, issue #453) — persisted memory filenames now use a safe slug derived from server/tool names instead of raw strings, preventing path-traversal via crafted tool names; the memory-ops directory is created at `0o700` and files at `0o600`.
+
+### Internal
+
+- Decline policy for third-party automated promotional and badge PRs added to `CONTRIBUTING.md` (#424).
+- Reference guides for `mms stats`, `mms status`, `mms remove`, and new config parameters updated and modernized (#425).
+- The sync-SQLite-on-event-loop invariant documented inline at every store write path (#459).
+
 ## [0.1.27] — 2026-06-04
 
 A small feature release: proactive surfacing can now be scoped per upstream.
