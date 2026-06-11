@@ -58,19 +58,32 @@ class DefaultContentCleaner:
 
     @staticmethod
     def _check_injection(text: str) -> None:
-        """Log a warning if the text contains likely prompt injection patterns."""
-        sample = text[:10_000]
-        # NFKC-normalize to defeat Unicode confusable bypasses (e.g.
-        # Cyrillic or fullwidth substitutions for ASCII letters).
-        sample = unicodedata.normalize("NFKC", sample)
-        for pat in _INJECTION_PATTERNS:
-            m = pat.search(sample)
-            if m:
-                _logger.warning(
-                    "Possible prompt injection detected in upstream response: %r",
-                    m.group(0)[:80],
-                )
-                break
+        """Log a warning if the text contains likely prompt injection patterns.
+
+        Detection-only: the output is never altered or blocked, so a miss
+        costs a log line, not an exploit. The scan cost is bounded to 20,000
+        chars: a response up to that size is scanned in FULL (one window, so
+        a pattern straddling any offset is still seen); a larger one gets the
+        first and last 10,000 chars — appending the payload after a large
+        benign body is the cheap way around a head-only window — while an
+        injection buried in its MIDDLE goes unlogged by design.
+        """
+        if len(text) <= 20_000:
+            samples = [text]
+        else:
+            samples = [text[:10_000], text[-10_000:]]
+        for raw in samples:
+            # NFKC-normalize to defeat Unicode confusable bypasses (e.g.
+            # Cyrillic or fullwidth substitutions for ASCII letters).
+            sample = unicodedata.normalize("NFKC", raw)
+            for pat in _INJECTION_PATTERNS:
+                m = pat.search(sample)
+                if m:
+                    _logger.warning(
+                        "Possible prompt injection detected in upstream response: %r",
+                        m.group(0)[:80],
+                    )
+                    return
 
     def _strip_html_jsx(self, text: str) -> str:
         fences: list[str] = []
