@@ -490,12 +490,14 @@ async def _run_hook(
             out = None
         if out is not None:
             return out
-        # Daemon unreachable. Kick off a lock-guarded background spawn so the
-        # next call is warm (this call still degrades below). request_spawn is a
-        # quick flock probe + detached Popen — fire-and-forget, never raising
-        # into the hot path. Both steps are blocking syscalls (flock; fork/exec
-        # with a close_fds scan), so run them in a thread to keep the event
-        # loop free while the outer wait_for budget clock runs.
+        # Daemon unreachable. Request a lock-guarded spawn so the NEXT call is
+        # warm (this call still degrades below). request_spawn is a quick flock
+        # probe + detached Popen that returns right after fork — the daemon
+        # itself comes up detached — and never raises into the hot path. The
+        # probe and fork/exec are blocking syscalls (flock; close_fds scan), so
+        # they run in a worker thread, awaited only for that brief offloaded
+        # call, keeping the event loop free while the outer wait_for budget
+        # clock runs.
         if config.hook.auto_spawn:
             try:
                 from memtomem_stm.daemon.spawn import request_spawn
