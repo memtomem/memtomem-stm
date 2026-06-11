@@ -175,6 +175,38 @@ class TestSchemaStability:
             json.loads(first), sort_keys=True, ensure_ascii=False, separators=(",", ":")
         )
 
+    def test_ranker_fields_are_per_call_overridable(self, tmp_path):
+        """#466 wires real values into the reserved seams: the top-level
+        key sets must NOT change — candidate_features is populated, not
+        added, and ranker_version is stamped per record on both halves."""
+        log = _make_log(tmp_path)
+        feats = {"query_source": "args", "query_sha256": "0" * 64, "query_chars": 4,
+                 "ranked_candidates": []}
+        sid = log.log_selection(
+            server="srv",
+            selected_tool="test__tool",
+            candidate_tools=["test__tool"],
+            arguments={},
+            trace_id=None,
+            candidate_features=feats,
+            ranker_version="v1-bm25-tool-relevance",
+        )
+        log.log_execution(
+            selection_id=sid,
+            trace_id=None,
+            server="srv",
+            selected_tool="test__tool",
+            ok=True,
+            latency_ms=1.0,
+            ranker_version="v1-bm25-tool-relevance",
+        )
+        selection, execution = _read_events(log)
+        assert set(selection) == SELECTION_KEYS
+        assert set(execution) == EXECUTION_KEYS
+        assert selection["candidate_features"] == feats
+        assert selection["ranker_version"] == "v1-bm25-tool-relevance"
+        assert execution["ranker_version"] == "v1-bm25-tool-relevance"
+
 
 # ── Redaction ────────────────────────────────────────────────────────────
 
