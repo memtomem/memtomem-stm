@@ -760,3 +760,50 @@ class TestExtractPrivacyGate:
         )
         assert outcome == ExtractOutcome(ok=True, facts_stored=1)
         assert len(extractor.calls) == 1
+
+    async def test_secret_in_extractor_output_skips_whole_batch(self, config):
+        # The extractor (an LLM) can reassemble or normalize sensitive
+        # content that evaded the input scan — the actual fact markdown is
+        # scanned before any disk or indexer interaction, and one hit skips
+        # the whole batch (per-call-terminal privacy_skip contract).
+        facts = [
+            ExtractedFact(content="A clean fact about flask", category="c", confidence=0.5),
+            ExtractedFact(content="login password=hunter2", category="c", confidence=0.5),
+        ]
+        extractor = FakeExtractor(facts)
+        indexer = FakeIndexer()
+        obs = IndexObservability()
+        outcome = await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={"path": "clean.txt"},
+            text="ordinary response that passes the input scan",
+            observability=obs,
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=0)
+        assert len(extractor.calls) == 1  # input was clean — extractor ran
+        assert indexer.indexed_paths == []
+        assert indexer.dedup_calls == []  # scan precedes ALL indexer interaction
+        assert not config.memory_dir.exists()  # nothing touched disk
+        snap = obs.snapshot()
+        assert snap["outcomes"]["read_file"] == {"privacy_skip": 1}
+
+    async def test_secret_in_extractor_output_skips_without_indexer_too(self, config):
+        # index_engine=None still writes fact files — the output scan must
+        # gate that path as well.
+        facts = [ExtractedFact(content="token sk-" + "a" * 24, category="c", confidence=0.5)]
+        extractor = FakeExtractor(facts)
+        outcome = await extract_and_store(
+            None,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={},
+            text="ordinary response",
+        )
+        assert outcome == ExtractOutcome(ok=True, facts_stored=0)
+        assert not config.memory_dir.exists()

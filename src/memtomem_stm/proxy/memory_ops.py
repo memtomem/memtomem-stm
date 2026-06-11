@@ -32,6 +32,28 @@ def _render_args(arguments: dict[str, Any]) -> str:
     return ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
 
 
+def index_content_matches_privacy(
+    server: str,
+    tool: str,
+    arguments: dict[str, Any],
+    text: str,
+    context_query: str | None = None,
+) -> bool:
+    """True when the caller-controlled content that the INDEX paths would
+    persist matches a privacy pattern (#453).
+
+    Scans every variable field that reaches the persisted markdown —
+    server/tool names, rendered arguments, agent intent, response text;
+    the static scaffolding cannot match a pattern. Shared by the
+    in-function gates below and ``ProxyManager``'s background pre-check,
+    so the scheduled-footer decision and the task's own gate can never
+    diverge. Scans the full ``DEFAULT_PATTERNS`` (credentials + PII):
+    these are STORAGE consumers per the #461 split.
+    """
+    probe = f"{server}/{tool}\n{_render_args(arguments)}\n{context_query or ''}\n{text}"
+    return contains_sensitive_content(probe)
+
+
 @dataclass(frozen=True, slots=True)
 class AutoIndexOutcome:
     """Structured result of a single ``auto_index_response`` call.
@@ -128,6 +150,19 @@ async def auto_index_response(
     not fire here.
     """
     observability.record_attempt(tool, "auto_index")
+    if index_content_matches_privacy(server, tool, arguments, text, context_query):
+        # SECURITY.md: secret-looking content is never indexed into LTM.
+        # The predicate covers every caller-controlled field of the
+        # markdown built below. The agent still receives ``agent_summary``
+        # unchanged; only persistence is skipped, and nothing touches disk.
+        logger.info(
+            "Auto-index skipped for %s/%s: content matches a privacy pattern",
+            server,
+            tool,
+        )
+        observability.record_outcome(tool, "privacy_skip")
+        return AutoIndexOutcome(summary=agent_summary, ok=True, chunks_indexed=0)
+
     memory_dir = ai_cfg.memory_dir.expanduser().resolve()
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
@@ -162,19 +197,6 @@ async def auto_index_response(
         f"{intent_section}"
         f"## Content\n\n{text}\n"
     )
-
-    if contains_sensitive_content(md_content):
-        # SECURITY.md: secret-looking content is never indexed into LTM.
-        # Scans the exact markdown that would be persisted — response text,
-        # rendered arguments, and agent intent included. The agent still
-        # receives ``agent_summary`` unchanged; only persistence is skipped.
-        logger.info(
-            "Auto-index skipped for %s/%s: content matches a privacy pattern",
-            server,
-            tool,
-        )
-        observability.record_outcome(tool, "privacy_skip")
-        return AutoIndexOutcome(summary=agent_summary, ok=True, chunks_indexed=0)
 
     memory_dir.mkdir(parents=True, exist_ok=True)
     # Atomic so the auto-indexer (called next) can't observe a partial file
@@ -242,12 +264,13 @@ async def extract_and_store(
     """
     indexed_count = 0
     observability.record_attempt(tool, "extract")
-    if contains_sensitive_content(f"{_render_args(arguments)}\n{text}"):
+    if index_content_matches_privacy(server, tool, arguments, text):
         # SECURITY.md: secret-looking content is never indexed into LTM.
         # Checked before ``extractor.extract()`` so the (possibly remote)
         # extraction LLM never sees the text either. The rendered arguments
         # are part of the scanned value because ``format_fact_md`` embeds
-        # them in every persisted fact file.
+        # them in every persisted fact file. (``context_query`` is not part
+        # of the probe here: fact files never persist it.)
         logger.info(
             "Fact extraction skipped for %s/%s: content matches a privacy pattern",
             server,
@@ -261,6 +284,28 @@ async def extract_and_store(
             observability.record_outcome(tool, "extracted_zero_facts")
             return ExtractOutcome(ok=True, facts_stored=0)
 
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        safe_tool = tool.replace("/", "_")
+
+        # Build every candidate fact file BEFORE any disk or indexer
+        # interaction: the extractor (typically an LLM) can reassemble or
+        # normalize sensitive content that evaded the input scan above, so
+        # the actual bytes to be persisted are scanned too. Any hit skips
+        # the whole batch terminally — no partial writes, matching the
+        # per-call-terminal ``privacy_skip`` contract.
+        candidates = [
+            (fact, format_fact_md(fact, server, tool, arguments))
+            for fact in facts[: ext_cfg.max_facts]
+        ]
+        if any(contains_sensitive_content(md) for _, md in candidates):
+            logger.info(
+                "Fact persistence skipped for %s/%s: extracted content matches a privacy pattern",
+                server,
+                tool,
+            )
+            observability.record_outcome(tool, "privacy_skip")
+            return ExtractOutcome(ok=True, facts_stored=0)
+
         memory_dir = ext_cfg.memory_dir.expanduser().resolve()
         memory_dir.mkdir(parents=True, exist_ok=True)
         ns = ext_cfg.namespace.format(server=server, tool=tool)
@@ -268,10 +313,7 @@ async def extract_and_store(
         # Dedup: skip facts already in the index
         dedup = ext_cfg.dedup_threshold > 0 and hasattr(index_engine, "is_duplicate")
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-        safe_tool = tool.replace("/", "_")
-
-        for i, fact in enumerate(facts[: ext_cfg.max_facts]):
+        for i, (fact, md_content) in enumerate(candidates):
             if dedup and index_engine is not None:
                 try:
                     is_dup = await index_engine.is_duplicate(
@@ -288,7 +330,6 @@ async def extract_and_store(
 
             fname = f"{server}__{safe_tool}__fact__{ts}__{i:02d}.md"
             file_path = memory_dir / fname
-            md_content = format_fact_md(fact, server, tool, arguments)
             # Atomic so a kill between write and index_file leaves no partial.
             atomic_write_text(file_path, md_content, ensure_parent=False)
 

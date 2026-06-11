@@ -113,6 +113,30 @@ class TestBackgroundAutoIndex:
         finally:
             await mgr.stop()
 
+    async def test_background_privacy_skip_returns_unfootered_response(self, tmp_path):
+        """A secret-bearing response must not get the ``[Indexing…] ·
+        scheduled`` placeholder: the task's privacy gate would decline, so
+        the footer would promise an indexing run that never happens (#453).
+        The manager pre-checks with the same predicate the task uses and
+        returns the un-footered response without scheduling anything."""
+        mgr, indexer = _bg_manager(tmp_path, background=True)
+        mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="config dump: password=hunter2 " * 10)],
+            isError=False,
+        )
+        try:
+            result = await mgr.call_tool("srv", "some_tool", {})
+
+            assert "[Indexing…]" not in result
+            assert "scheduled" not in result
+            assert mgr._background_tasks == set()
+            indexer.index_file.assert_not_awaited()
+            snap = mgr.index_observability.snapshot()
+            assert snap["attempts"]["__total__"] == {"auto_index": 1}
+            assert snap["outcomes"]["__total__"] == {"privacy_skip": 1}
+        finally:
+            await mgr.stop()
+
     async def test_background_drains_on_stop(self, tmp_path):
         """``stop()`` cancels in-flight background indexing tasks via the
         existing extraction drain loop — no new infrastructure."""
