@@ -74,6 +74,43 @@ class TestInMemoryPendingStore:
         store.delete("k1")
         assert len(store) == 0
 
+    def test_reput_refreshes_recency_for_eviction(self):
+        # A re-put key must count as the NEWEST entry (SQLite: INSERT OR
+        # REPLACE rewrites created_at). A duplicate _order entry used to make
+        # evict_oldest pop the re-put key first — dropping the fresh data.
+        store = InMemoryPendingStore()
+        store.put("k1", _make_selection())
+        store.put("k2", _make_selection())
+        store.put("k1", _make_selection({"sec": "fresh"}))
+        store.evict_oldest(max_size=1)
+        assert store.get("k2") is None  # oldest
+        fresh = store.get("k1")
+        assert fresh is not None and fresh.chunks == {"sec": "fresh"}
+
+    def test_touch_moves_key_to_back_of_eviction_order(self):
+        # touch() refreshes created_at; eviction order must follow (SQLite
+        # orders by created_at), else a just-touched entry is dropped first.
+        store = InMemoryPendingStore()
+        store.put("k1", _make_selection())
+        store.put("k2", _make_selection())
+        store.touch("k1")
+        store.evict_oldest(max_size=1)
+        assert store.get("k2") is None
+        assert store.get("k1") is not None
+
+    def test_delete_then_reput_does_not_leave_stale_order_entry(self):
+        # delete() must drop the _order entry too: a stale entry plus a later
+        # re-put would otherwise duplicate the key and resurface the
+        # evict-the-fresh-entry bug through the delete path.
+        store = InMemoryPendingStore()
+        store.put("k1", _make_selection())
+        store.delete("k1")
+        store.put("k2", _make_selection())
+        store.put("k1", _make_selection({"sec": "fresh"}))
+        store.evict_oldest(max_size=1)
+        assert store.get("k2") is None  # oldest live entry
+        assert store.get("k1") is not None
+
 
 # ── SQLitePendingStore ──────────────────────────────────────────────────
 
@@ -231,7 +268,13 @@ class TestSelectiveCompressorWithStore:
         comp2 = SelectiveCompressor(store=store2)
 
         # comp1 creates a TOC
-        text = "# Title\n\n## Section1\n" + "Hello world " * 50 + "\n\n## Section2\n" + "Goodbye " * 50 + "\n"
+        text = (
+            "# Title\n\n## Section1\n"
+            + "Hello world " * 50
+            + "\n\n## Section2\n"
+            + "Goodbye " * 50
+            + "\n"
+        )
         result = comp1.compress(text, max_chars=50)
         toc = json.loads(result)
         key = toc["selection_key"]

@@ -37,8 +37,16 @@ class InMemoryPendingStore:
         self._order: deque[str] = deque()
         self._lock = threading.Lock()
 
+    # Invariant: ``_order`` holds exactly the keys of ``_data``, once each,
+    # in recency order (oldest left) — matching the SQLite backend, whose
+    # evict_oldest keeps the most recent ``created_at`` rows. Every mutation
+    # below maintains it; a duplicate or stale ``_order`` entry makes
+    # evict_oldest silently drop a fresh entry.
+
     def put(self, key: str, selection: PendingSelection) -> None:
         with self._lock:
+            if key in self._data:
+                self._order.remove(key)
             self._data[key] = selection
             self._order.append(key)
 
@@ -51,10 +59,13 @@ class InMemoryPendingStore:
             sel = self._data.get(key)
             if sel is not None:
                 sel.created_at = time.monotonic()
+                self._order.remove(key)
+                self._order.append(key)
 
     def delete(self, key: str) -> None:
         with self._lock:
-            self._data.pop(key, None)
+            if self._data.pop(key, None) is not None:
+                self._order.remove(key)
 
     def evict_expired(self, ttl: float) -> None:
         with self._lock:
