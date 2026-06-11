@@ -2508,6 +2508,28 @@ class TestSurfacingLtmOutcomeDispatch:
         assert snap["skip_reasons"]["read_file"]["ltm_unavailable"] == 2
         assert snap["skip_reasons"]["another_tool"]["ltm_unavailable"] == 1
 
+    async def test_unavailable_warning_redacts_url_credentials(self, caplog):
+        """The one-time unreachable-LTM WARNING renders a network target
+        through redact_url_userinfo — a basic-auth ``ltm_mcp_url`` must not
+        leak credentials into operator logs."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        engine = SurfacingEngine(
+            config=_make_config(
+                ltm_mcp_transport="sse",
+                ltm_mcp_url="https://alice:s3cret@ltm.example/sse",
+            ),
+            mcp_adapter=_make_mcp_adapter(None, outcome="no_session"),
+            observability=SurfacingObservability(),
+        )
+        with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.engine"):
+            await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        warnings = [r for r in caplog.records if "is not reachable" in r.message]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "s3cret" not in message
+        assert "***@ltm.example" in message
+
     async def test_call_error_outcome_does_not_log_unavailable_warning(self, caplog):
         """The WARNING is scoped to the no-session / transport-error bucket
         (LTM not reachable). A mid-call ``call_error`` means the session

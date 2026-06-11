@@ -176,11 +176,11 @@ class TestTargetDisplayRedaction:
         assert captured["url"] == "https://alice:s3cret@ltm.example/sse"
 
     def test_unparseable_url_not_echoed(self):
-        from memtomem_stm.surfacing.mcp_client import _redact_url_userinfo
+        from memtomem_stm.utils.redact import redact_url_userinfo
 
         # Malformed IPv6 brackets make urlsplit raise ValueError; the raw
         # string could still embed credentials, so it is replaced wholesale.
-        assert _redact_url_userinfo("https://user:pw@[::1/mcp") == "<unparseable url>"
+        assert redact_url_userinfo("https://user:pw@[::1/mcp") == "<unparseable url>"
 
 
 class TestReconnectRetrySuccess:

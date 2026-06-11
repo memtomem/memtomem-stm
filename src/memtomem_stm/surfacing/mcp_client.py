@@ -11,7 +11,6 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp import ClientSession
@@ -22,6 +21,7 @@ from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.utils.numeric import safe_float
+from memtomem_stm.utils.redact import redact_url_userinfo
 
 logger = logging.getLogger(__name__)
 
@@ -228,22 +228,6 @@ def get_parser(fmt: str = "compact") -> ResultParser:
 _compact_parser = CompactResultParser()
 
 
-def _redact_url_userinfo(url: str) -> str:
-    """Strip ``user:password@`` userinfo from *url* for log display.
-
-    A URL the stdlib cannot parse is replaced wholesale rather than echoed —
-    an unparseable value could still embed credentials.
-    """
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<unparseable url>"
-    if "@" not in parts.netloc:
-        return url
-    host = parts.netloc.rpartition("@")[2]
-    return urlunsplit(parts._replace(netloc=f"***@{host}"))
-
-
 class McpClientSearchAdapter:
     """Connects to a memtomem MCP server and calls mem_search.
 
@@ -330,7 +314,7 @@ class McpClientSearchAdapter:
         """
         if self._config.ltm_mcp_transport == "stdio":
             return self._config.ltm_mcp_command
-        return _redact_url_userinfo(self._config.ltm_mcp_url)
+        return redact_url_userinfo(self._config.ltm_mcp_url)
 
     async def _negotiate_format(self) -> None:
         """Downgrade to compact if core doesn't advertise structured support.

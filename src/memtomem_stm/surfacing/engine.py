@@ -18,6 +18,7 @@ from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.redact import redact_url_userinfo
 
 logger = logging.getLogger(__name__)
 
@@ -751,7 +752,9 @@ class SurfacingEngine:
                 if self._config.ltm_mcp_transport == "stdio":
                     ltm_target = self._config.ltm_mcp_command
                 else:
-                    ltm_target = self._config.ltm_mcp_url
+                    # Display-only: a network URL may carry basic-auth
+                    # credentials that must not reach the WARNING line.
+                    ltm_target = redact_url_userinfo(self._config.ltm_mcp_url)
                 logger.warning(
                     "Surfacing skipped: LTM MCP %s target %r is not reachable "
                     "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
