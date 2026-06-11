@@ -298,9 +298,24 @@ Full example with all options:
   "progressive_reads": {
     "enabled": true,
     "db_path": "~/.memtomem/stm_feedback.db"
+  },
+  "selection_telemetry": {
+    "enabled": false,
+    "path": "~/.memtomem/stm_selection_log.jsonl",
+    "sample_rate": 1.0,
+    "max_bytes": 50000000,
+    "max_backups": 3
   }
 }
 ```
+
+`selection_telemetry` (off by default) appends one `selection` + one
+`execution` JSONL record per proxied call — which tool the client picked out
+of the advertised candidate set, and how the call went. The schema, the
+redaction policy (no raw arguments, results, or error text ever reach the
+log), and the replay-join contract are documented in
+[selection-telemetry.md](selection-telemetry.md). The flag is read at
+startup, like `metrics.enabled` — toggling it requires a restart.
 
 ### Token-equivalent budgets (CJK / non-Latin workloads)
 

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
     from memtomem_stm.proxy.protocols import FileIndexer
     from memtomem_stm.proxy.relevance import RelevanceScorer
+    from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
     from memtomem_stm.surfacing.engine import SurfacingEngine
     from memtomem_stm.surfacing.observability import SkipReason
 
@@ -150,6 +151,7 @@ class ProxyManager:
         cache: ProxyCache | None = None,
         env_overrides: dict[str, Any] | None = None,
         progressive_reads_tracker: ProgressiveReadsTracker | None = None,
+        selection_log: SelectionTelemetryLog | None = None,
     ) -> None:
         self._config_loader = ProxyConfigLoader(config.config_path, env_overrides=env_overrides)
         self._config_loader.seed(config)
@@ -158,6 +160,12 @@ class ProxyManager:
         self._surfacing_engine = surfacing_engine
         self._cache = cache
         self._progressive_reads_tracker = progressive_reads_tracker
+        self._selection_log = selection_log
+        # Snapshot of the prefixed tool names last returned by
+        # ``get_proxy_tools()`` — the candidate set the client model picked
+        # from, recorded in selection telemetry (#467). Empty until the
+        # first advertisement.
+        self._advertised_tools: list[str] = []
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
@@ -509,6 +517,7 @@ class ProxyManager:
                         annotations=getattr(t, "annotations", None),
                     )
                 )
+        self._advertised_tools = [info.prefixed_name for info in result]
         return result
 
     @staticmethod
@@ -1200,12 +1209,18 @@ class ProxyManager:
             raise KeyError(f"Unknown upstream server: '{server}'")
         if trace_id is None:
             trace_id = uuid.uuid4().hex[:16]
+        # Selection telemetry (#467): the prefixed name shares the
+        # ``candidate_tools`` vocabulary, so replay tooling can match the
+        # selected tool against the advertised set verbatim.
+        selected_tool = f"{self._connections[server].config.prefix}__{tool}"
+        selection_id = self._log_selection(server, selected_tool, arguments, trace_id)
+        started = _time.perf_counter()
         with traced(
             "proxy_call",
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
         ):
             try:
-                return await self._call_tool_guarded(server, tool, arguments, trace_id=trace_id)
+                result = await self._call_tool_guarded(server, tool, arguments, trace_id=trace_id)
             except Exception as exc:
                 # Upstream/transport/timeout/protocol errors are already
                 # recorded inside _call_tool_inner via record_error(); a raise
@@ -1246,7 +1261,78 @@ class ProxyManager:
                             pipeline_category.value,
                             exc_info=True,
                         )
+                self._log_execution(
+                    selection_id,
+                    server,
+                    selected_tool,
+                    trace_id,
+                    started,
+                    ok=False,
+                    error_type=type(exc).__name__,
+                )
                 raise
+            self._log_execution(selection_id, server, selected_tool, trace_id, started, ok=True)
+            return result
+
+    def _log_selection(
+        self,
+        server: str,
+        selected_tool: str,
+        arguments: dict[str, Any],
+        trace_id: str,
+    ) -> str | None:
+        """Emit the selection-telemetry event for one proxied call (#467).
+
+        Returns ``None`` when telemetry is disabled, the call was sampled
+        out, or the write failed — the caller then skips the paired
+        execution event so the log never contains orphan halves. A
+        telemetry failure must never affect the proxied call.
+        """
+        if self._selection_log is None:
+            return None
+        try:
+            return self._selection_log.log_selection(
+                server=server,
+                selected_tool=selected_tool,
+                candidate_tools=self._advertised_tools,
+                arguments=arguments,
+                trace_id=trace_id,
+            )
+        except Exception:
+            logger.debug("Selection telemetry write failed", exc_info=True)
+            return None
+
+    def _log_execution(
+        self,
+        selection_id: str | None,
+        server: str,
+        selected_tool: str,
+        trace_id: str,
+        started: float,
+        *,
+        ok: bool,
+        error_type: str | None = None,
+    ) -> None:
+        """Emit the execution-outcome event paired to ``selection_id``.
+
+        ``error_type`` is the exception class name only; the typed error
+        category and message live in ``proxy_metrics.db``, joinable via
+        ``trace_id`` — telemetry never duplicates (or leaks) error text.
+        """
+        if self._selection_log is None or selection_id is None:
+            return
+        try:
+            self._selection_log.log_execution(
+                selection_id=selection_id,
+                trace_id=trace_id,
+                server=server,
+                selected_tool=selected_tool,
+                ok=ok,
+                latency_ms=(_time.perf_counter() - started) * 1000.0,
+                error_type=error_type,
+            )
+        except Exception:
+            logger.debug("Execution telemetry write failed", exc_info=True)
 
     async def _call_tool_guarded(
         self,

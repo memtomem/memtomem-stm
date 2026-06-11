@@ -190,6 +190,7 @@ A second tier of management lets you decide *which MCP servers a given project s
 | [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Tune settings without touching code |
+| [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) | Opt-in JSONL log of tool selection + execution outcomes |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands, host sync, hooks, daemon, and MCP tools |
 
 STM advertises four model-facing MCP tools by default. Eight observability and
