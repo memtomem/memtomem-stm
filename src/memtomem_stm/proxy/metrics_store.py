@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from memtomem_stm.proxy.metrics import CallMetrics
+from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -170,10 +171,7 @@ class MetricsStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
         try:
-            try:
-                self._db_path.chmod(0o600)
-            except OSError:
-                pass
+            ensure_private_db_files(self._db_path)
             tune_connection(db)
             db.execute(_CREATE)
             db.execute(_INDEX)

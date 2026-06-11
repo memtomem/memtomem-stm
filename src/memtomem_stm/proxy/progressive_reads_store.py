@@ -21,6 +21,7 @@ import threading
 import time
 from pathlib import Path
 
+from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ class ProgressiveReadsStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False)
         try:
+            ensure_private_db_files(self._db_path)
             tune_connection(db)
             db.executescript(_SCHEMA)
             db.commit()
