@@ -352,12 +352,12 @@ class TruncateCompressor:
             # max_chars=80 through 1500 on a one-huge-key payload). Grow the
             # boundary to the largest ``_truncate_json_value`` form that still
             # fits: the rendered length is monotone in the value budget, so
-            # binary-search it. Only ONE key is refilled: a full-form boundary
-            # would re-create the ``keep + 1`` candidate this loop already
-            # rejected, so (apart from the few-char window where a truncated
-            # string render exceeds its full form by up to 3 chars) the
-            # boundary stays partial and no room is left for the keys after
-            # it.
+            # binary-search it (sound because ``_truncate_json_value`` never
+            # expands a value, so the rendered length is monotone in the value
+            # budget). Only ONE key is refilled: a full-form boundary would
+            # re-create the ``keep + 1`` candidate this loop already rejected
+            # with a smaller-or-equal boundary, so the boundary always stays
+            # partial and no room is left for the keys after it.
             omitted = len(parts) - keep - 1
             lo, hi, best = 0, max_chars, None
             while lo <= hi:
@@ -373,10 +373,18 @@ class TruncateCompressor:
         return "{}"
 
     def _truncate_json_value(self, value: object, budget: int) -> object:
-        """Truncate a JSON value to fit within character budget."""
+        """Truncate a JSON value to fit within character budget.
+
+        The truncated form must never be LONGER than the full value (the
+        no-expand rule from #395): ``value[:budget] + "..."`` would render
+        budget+3 chars, overshooting the full value by up to 3 near the
+        full-value crossing — which made the rendered length non-monotone in
+        ``budget`` and broke the refill binary search in
+        ``_json_key_truncate`` (a probe at ``len(value) - 1`` failed to fit
+        and discarded the fitting full-value region above it)."""
         if isinstance(value, str):
             if len(value) > budget:
-                return value[:budget] + "..."
+                return value[: max(0, budget - 3)] + "..."
             return value
         if isinstance(value, dict):
             preview: dict = {}

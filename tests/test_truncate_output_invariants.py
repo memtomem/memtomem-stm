@@ -191,14 +191,27 @@ def test_json_key_truncate_refills_boundary_key() -> None:
                 "s": {"x": "y"},
             },
         ),
+        # The full-value crossing: pre-fix, _truncate_json_value rendered
+        # budget+3 chars just below a string's full length, so the refill
+        # binary search probed a non-monotone domain and discarded the fitting
+        # full-value region (preserved content shrank 60 -> 58 chars going
+        # from max_chars=147 to 148).
+        ("ellipsis_crossing", {"a": {"v": "X" * 10}, "b": {"v": "X" * 50}, "c": {"v": "X" * 50}}),
     ],
 )
 def test_json_key_truncate_content_is_monotone_in_budget(name: str, data: dict) -> None:
-    """Preserved ORIGINAL content never shrinks as the budget grows, swept
-    contiguously so a one-char cliff cannot hide between sampled points. Raw
-    length may wobble by a few framing chars where the allocator crosses its
-    everything-fits threshold; preserved content is the contract. Output stays
-    valid JSON and within budget at every step."""
+    """Preserved ORIGINAL content never shrinks as the budget grows on these
+    curated defect shapes, swept contiguously so a one-char cliff cannot hide
+    between sampled points. Output stays valid JSON and within budget at every
+    step.
+
+    Scope note: across ARBITRARY shapes the proportional allocator's integer
+    rounding can still trade a few chars between two kept keys as the budget
+    grows (net wobble bounded by framing overhead — observed -2 chars on a
+    random-shape probe). That is allocation noise, not a cliff, and is
+    accepted: this path's contract is proportional/relevance-weighted
+    distribution without the freeze/whole-key-discard defects pinned here, not
+    the strict global monotonicity of the structural final tiers."""
     text = json.dumps(data)
     prev = -1
     for budget in range(40, len(text) + 40):
