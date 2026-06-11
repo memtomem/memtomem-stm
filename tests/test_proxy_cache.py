@@ -291,6 +291,45 @@ class TestPrivacyGate:
         finally:
             reopened.close()
 
+    def test_get_refuses_and_evicts_sensitive_row_written_after_startup(self, tmp_path):
+        # An older still-running pre-gate process (or an external SQL writer)
+        # can insert AFTER this process's startup purge ran — the read-side
+        # guard must refuse to serve the row and evict it.
+        db_path = tmp_path / "live_writer.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            raw = sqlite3.connect(str(db_path))
+            try:
+                raw.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _make_key("s", "sec", {}),
+                        "s",
+                        "sec",
+                        "login password=hunter2",
+                        time.time(),
+                        None,
+                    ),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+
+            assert cache.get("s", "sec", {}) is None
+
+            # Evicted, not just hidden: the row is gone from the table.
+            check = sqlite3.connect(str(db_path))
+            try:
+                count = check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            finally:
+                check.close()
+            assert count == 0
+        finally:
+            cache.close()
+
 
 class TestMakeKey:
     def test_deterministic(self):

@@ -131,8 +131,9 @@ class ProxyCache:
             # scan and the gate share ``contains_sensitive_content`` so they
             # can never diverge. Runs on every startup (matching the marker
             # purge) — after the first pass it finds nothing, because ``set()``
-            # refuses new matching rows; the rescan also covers rows written by
-            # older processes still running pre-gate code against this file.
+            # refuses new matching rows. Rows written LATER by an older
+            # still-running pre-gate process are outside this purge's reach;
+            # the read-side guard in ``get()`` refuses and evicts those.
             stale_keys = [
                 key
                 for key, result in db.execute("SELECT cache_key, result FROM proxy_cache")
@@ -167,6 +168,21 @@ class ProxyCache:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
         if entry.is_expired():
+            return None
+        if contains_sensitive_content(entry.result):
+            # Read-side mirror of the ``set()`` gate: a row can land here
+            # without passing ``set()`` — written by an older still-running
+            # pre-gate process or an external SQL writer — and the startup
+            # purge only covers rows present at ``initialize()``. Serving it
+            # would break the SECURITY.md exclusion, so evict and miss.
+            with self._lock:
+                self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+                self._db.commit()
+            logger.debug(
+                "Evicted cached response for %s/%s: result matches a privacy pattern",
+                server,
+                tool,
+            )
             return None
         return entry.result
 
