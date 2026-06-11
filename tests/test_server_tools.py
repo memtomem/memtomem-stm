@@ -223,7 +223,10 @@ class TestHealth:
         assert "No upstream servers configured" in result
 
     async def test_with_servers(self):
-        """Reports connection status for each server."""
+        """Reports connection status with discovered vs advertised counts —
+        since #465 the discovered catalogue can exceed what the eligibility
+        filter actually exposed, and operators must be able to tell a
+        withheld tool from a missing one."""
         pm = _make_proxy_manager()
         conn = UpstreamConnection(
             name="srv",
@@ -234,7 +237,7 @@ class TestHealth:
         pm._connections["srv"] = conn
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_health(ctx=ctx)
-        assert "srv: connected (2 tools)" in result
+        assert "srv: connected (2 tools discovered, 0 advertised)" in result
 
     @staticmethod
     def _proxy_enabled_config() -> STMConfig:
@@ -1295,9 +1298,7 @@ class TestLifespan:
         with (
             patch("memtomem_stm.server.STMConfig") as MockConfig,
             patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
-            patch(
-                "memtomem_stm.server.ProxyConfig.load_from_file", return_value=None
-            ) as mock_load,
+            patch("memtomem_stm.server.ProxyConfig.load_from_file", return_value=None) as mock_load,
         ):
             mock_cfg = MockConfig.return_value
             mock_cfg.proxy = MagicMock()

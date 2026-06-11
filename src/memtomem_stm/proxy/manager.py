@@ -186,7 +186,6 @@ class ProxyManager:
         self._advertised_infos: list[ProxyToolInfo] = []
         self._advertised_reject_reasons: dict[str, str] = {}
         self._advertised_risk_penalties: dict[str, float] = {}
-        self._advertised_dropped_occurrences: list[tuple[str, str]] = []
         # Health flags for the #465 filter, computed ONCE per start() from
         # the persisted metrics store and held for the session — exposure
         # must not drift between the startup advertisement (what the client
@@ -405,7 +404,7 @@ class ProxyManager:
         self._connections[name] = UpstreamConnection(
             name=name, config=cfg, session=session, tools=list(result.tools), stack=conn_stack
         )
-        logger.info("Connected to '%s' (%s tools)", name, len(result.tools))
+        logger.info("Connected to '%s' (%s tools discovered)", name, len(result.tools))
 
     async def _reconnect_server(self, name: str) -> None:
         conn = self._connections[name]
@@ -438,7 +437,7 @@ class ProxyManager:
         conn.session = session
         conn.stack = conn_stack
         conn.tools = list(result.tools)
-        logger.info("Reconnected to '%s' (%s tools)", name, len(conn.tools))
+        logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
 
     async def stop(self) -> None:
         # Cancel and drain background tasks (extraction, etc.). Loop until
@@ -573,28 +572,23 @@ class ProxyManager:
                 )
 
         verdict = filter_tools(candidates, self._config.exposure, self._unhealthy_tools)
-        if (
-            verdict.reject_reasons != self._advertised_reject_reasons
-            or verdict.dropped_occurrences != self._advertised_dropped_occurrences
-        ):
-            self._log_exposure_rejects(verdict.reject_reasons, verdict.dropped_occurrences)
+        if verdict.reject_reasons != self._advertised_reject_reasons:
+            self._log_exposure_rejects(verdict.reject_reasons)
         self._advertised_infos = verdict.eligible
         self._advertised_tools = [info.prefixed_name for info in verdict.eligible]
         self._advertised_reject_reasons = verdict.reject_reasons
         self._advertised_risk_penalties = verdict.risk_penalties
-        self._advertised_dropped_occurrences = verdict.dropped_occurrences
         return verdict.eligible
 
     @staticmethod
-    def _log_exposure_rejects(
-        reject_reasons: dict[str, str], dropped_occurrences: list[tuple[str, str]]
-    ) -> None:
+    def _log_exposure_rejects(reject_reasons: dict[str, str]) -> None:
         """One line per advertisement *change*, so operators see what was
         withheld and why without per-call noise. Config-driven rejects
         (``hidden``, profile scoping) are the operator's own choices — those
-        log at DEBUG; everything else (structural rejects, signal rejects,
-        and same-named occurrence drops, which never reach telemetry) is
-        news and logs at WARNING."""
+        log at DEBUG; everything else (structural, signal) is news and logs
+        at WARNING."""
+        if not reject_reasons:
+            return
         expected = {REASON_CONFIG_HIDDEN, REASON_PROFILE_EXCLUDED}
         news = {t: r for t, r in reject_reasons.items() if r not in expected}
         if news:
@@ -602,13 +596,6 @@ class ProxyManager:
                 "Exposure filter withheld %d tool(s): %s",
                 len(news),
                 ", ".join(f"{t} ({r})" for t, r in sorted(news.items())),
-            )
-        if dropped_occurrences:
-            logger.warning(
-                "Exposure filter dropped %d same-named tool occurrence(s) "
-                "(name stays advertised via its first eligible occurrence): %s",
-                len(dropped_occurrences),
-                ", ".join(f"{t} ({r})" for t, r in sorted(dropped_occurrences)),
             )
         if len(news) < len(reject_reasons):
             logger.debug(
@@ -1243,12 +1230,24 @@ class ProxyManager:
             return output
 
     def get_upstream_health(self) -> dict[str, dict]:
-        """Return per-server health: connection status, tool count."""
+        """Return per-server health: connection status, tool counts.
+
+        ``tools`` counts the DISCOVERED catalogue (everything the upstream
+        listed — since #465 ``conn.tools`` is no longer pre-filtered at
+        connect time); ``advertised_tools`` counts how many of them the
+        last advertisement actually exposed, so operators can tell a
+        withheld tool from a missing one. ``advertised_tools`` reflects
+        the most recent ``get_proxy_tools()`` pass — in the server it runs
+        at startup registration, before any health probe can observe it.
+        """
         health: dict[str, dict] = {}
         for name, conn in self._connections.items():
             health[name] = {
                 "connected": conn.session is not None,
                 "tools": len(conn.tools),
+                "advertised_tools": sum(
+                    1 for info in self._advertised_infos if info.server == name
+                ),
             }
         return health
 
