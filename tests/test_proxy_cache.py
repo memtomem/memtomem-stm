@@ -246,9 +246,9 @@ class TestPrivacyGate:
         assert proxy_cache.get("s", "t", {}) == "ordinary tool response"
 
     def test_email_bearing_result_is_not_cached(self, proxy_cache: ProxyCache):
-        # DEFAULT_PATTERNS include an email regex, so email-bearing responses
-        # are deliberately uncacheable — the gate shares the sensitivity set
-        # of the LLM-route scan rather than maintaining a second definition.
+        # The cache is a STORAGE consumer, so it scans the full
+        # DEFAULT_PATTERNS (credentials + PII) per the #461 split: an email
+        # is fine to show an external summarizer but not fine to persist.
         # The cost is one pipeline re-run per repeat call, never correctness.
         proxy_cache.set("s", "t", {}, "contact: dev@example.com", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {}) is None
