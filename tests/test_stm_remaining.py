@@ -283,6 +283,7 @@ class TestTracing:
 
         old = tracing_mod._langfuse_client
         old_rate = tracing_mod._sampling_rate
+        old_warned = tracing_mod._warned_observation_failure
         try:
             tracing_mod._sampling_rate = 1.0
             tracing_mod._warned_observation_failure = False
@@ -299,7 +300,7 @@ class TestTracing:
         finally:
             tracing_mod._langfuse_client = old
             tracing_mod._sampling_rate = old_rate
-            tracing_mod._warned_observation_failure = False
+            tracing_mod._warned_observation_failure = old_warned
 
     def test_shutdown_langfuse_calls_shutdown(self) -> None:
         import memtomem_stm.observability.tracing as tracing_mod
