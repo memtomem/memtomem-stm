@@ -163,6 +163,17 @@ class TestStop:
 
         mock_ext.close.assert_awaited_once()
 
+    async def test_stop_nulls_extractor_so_restart_rebuilds(self):
+        """stop() nulls _extractor (like _llm_compressor) — _get_extractor()
+        rebuilds on None, so a stop->start cycle gets a fresh httpx client
+        instead of the closed instance whose extract() would AssertionError."""
+        mgr = _make_manager(servers={})
+        mgr._extractor = AsyncMock()
+
+        await mgr.stop()
+
+        assert mgr._extractor is None
+
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""
         mgr = _make_manager(servers={})

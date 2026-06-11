@@ -905,6 +905,37 @@ class TestAutoIndex:
         assert "Auto-index failed" in caplog.text
 
 
+# ── _context_query sanitization ──────────────────────────────────────────
+
+
+class TestContextQuerySanitization:
+    async def test_non_str_context_query_coerced_to_none_on_miss_path(self, tmp_path):
+        """A non-str ``_context_query`` reaches downstream stages as None on
+        the miss path — mirroring the cache-hit path's isinstance guard, so
+        whether a malformed value raises no longer depends on cache state —
+        and is still stripped from the upstream arguments."""
+        mgr = _make_manager(tmp_path=tmp_path)
+        session = _inject_connection(mgr, text="upstream content " * 5)
+        captured: dict[str, object] = {}
+
+        async def _spy_surfacing(
+            server, tool, arguments, text, *, trace_id=None, context_query=None
+        ):
+            captured["context_query"] = context_query
+            return text
+
+        with patch.object(mgr, "_apply_surfacing", side_effect=_spy_surfacing):
+            result = await mgr.call_tool(
+                "srv", "some_tool", {"q": 1, "_context_query": {"not": "a str"}}
+            )
+
+        assert isinstance(result, str)
+        assert captured["context_query"] is None
+        upstream_args = session.call_tool.call_args.args[1]
+        assert "_context_query" not in upstream_args
+        assert upstream_args["q"] == 1  # real args still forwarded (plus _trace_id, #204)
+
+
 # ── _extract_and_store ────────────────────────────────────────────────────
 
 

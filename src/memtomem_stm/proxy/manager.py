@@ -421,6 +421,10 @@ class ProxyManager:
             self._llm_compressor = None
         if self._extractor is not None:
             await self._extractor.close()
+            # Null it like _llm_compressor above: _get_extractor() rebuilds on
+            # None, so a stop->start cycle gets a fresh httpx client instead of
+            # the closed instance (whose extract() asserts _client is not None).
+            self._extractor = None
         for conn in self._connections.values():
             if conn.stack is not None:
                 try:
@@ -1306,8 +1310,13 @@ class ProxyManager:
         # hot-reload changing the config between accesses.
         cfg_snap = self._config
 
-        # Extract _context_query before forwarding
-        context_query = arguments.get("_context_query") if arguments else None
+        # Extract _context_query before forwarding. Coerce non-str values to
+        # None at the single extraction point — the cache-hit path already
+        # sanitizes this way, and without the mirror here the same malformed
+        # argument reaches scorers/compressors raw on a miss but is dropped on
+        # a hit, so whether it raises depends on cache state.
+        raw_context_query = arguments.get("_context_query") if arguments else None
+        context_query = raw_context_query if isinstance(raw_context_query, str) else None
         upstream_args = (
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
