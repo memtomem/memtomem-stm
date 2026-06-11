@@ -35,6 +35,7 @@ from memtomem_stm.daemon.discovery import (
 )
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
+    OP_PING,
     OP_SURFACE,
     build_request,
     encode_line,
@@ -263,6 +264,56 @@ async def test_build_engine_dedup_only_wiring(tmp_path: Path) -> None:
         if server._tracker is not None:
             server._tracker.close()
         await server._adapter.stop()
+
+
+async def test_handler_write_timeout_drops_stuck_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A peer that sends its request then never reads must not pin the handler
+    # task for the process lifetime — the bounded drain drops the connection
+    # and the finally block closes the writer.
+    server = DaemonServer(_config(tmp_path))
+    monkeypatch.setattr(daemon_server, "_WRITE_TIMEOUT_SECONDS", 0.1)
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(encode_line(build_request(server._token, OP_PING)))
+    reader.feed_eof()
+
+    class _StuckWriter:
+        closed = False
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            await asyncio.Event().wait()  # peer never reads; buffer never drains
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+    writer = _StuckWriter()
+    await asyncio.wait_for(server._handle_conn(reader, writer), timeout=5.0)
+    assert writer.closed
+
+
+async def test_sub_second_idle_timeout_shuts_down_promptly(tmp_path: Path) -> None:
+    # The idle poll used to floor at 1.0s, so idle_timeout=0.2 shut down ~1s+
+    # after start (the test below only proves *eventual* shutdown). With the
+    # lowered floor the daemon exits near the configured threshold.
+    cfg = _config(tmp_path)
+    cfg.daemon.idle_timeout_seconds = 0.2
+    server = DaemonServer(cfg)
+    server._build_engine = lambda: setattr(server, "_engine", _engine_with_result())  # type: ignore[method-assign]
+    task = asyncio.create_task(server.serve())
+    await _await_handshake(cfg)
+    t0 = asyncio.get_running_loop().time()
+    await asyncio.wait_for(task, timeout=5.0)
+    elapsed = asyncio.get_running_loop().time() - t0
+    # Pre-fix lower bound was the 1.0s poll floor; expected now ≈ 0.2-0.4s.
+    assert elapsed < 0.9, f"idle shutdown took {elapsed:.2f}s — poll floor regressed?"
 
 
 async def test_idle_shutdown_stops_daemon(tmp_path: Path) -> None:
