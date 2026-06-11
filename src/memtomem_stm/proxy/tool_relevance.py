@@ -17,9 +17,19 @@ availability varies, which would make #468 replay comparisons meaningless.
 The scored document per candidate is what the client actually saw: the
 prefixed tool name (BM25 heading position, 3x weight) plus the advertised —
 post-truncation, post-distill — description and stable-serialized schema.
-``risk_penalty`` is a ``0.0`` placeholder: no risk table exists in this repo
-(the one in the toolgraph report is not a repo artifact); a real penalty
-input arrives with #465's STM-native filter signals.
+
+``risk_penalty`` is the #465 hard filter's demotion input (``review``
+profile flags a tool instead of rejecting it): ``final_score =
+relevance_score * (1 - risk_penalty)`` and the ordering follows
+``final_score``, so a flagged tool sinks without leaving the record.
+Multiplicative because BM25 scores are unbounded — an absolute penalty
+would mean nothing across queries. Calls where any nonzero penalty applied
+stamp :data:`RANKER_VERSION_BM25_RISK` so replay can split cohorts; the
+penalties themselves are session-stable (health flags are computed once at
+startup), making records deterministic within a session and self-describing
+across sessions (each candidate carries the penalty that shaped its score).
+A hard-rejected tool never reaches this module at all — ranking runs over
+the filter's output, so it can never resurrect a reject.
 
 Privacy: the derived query is used in memory for scoring only — callers
 persist its sha256/length/source via ``build_candidate_features``, never the
@@ -30,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.proxy.relevance import BM25Scorer
@@ -42,6 +53,13 @@ if TYPE_CHECKING:
 # selection log's "v0-passthrough" default, so replay can split cohorts by
 # this field alone.
 RANKER_VERSION_BM25 = "v1-bm25-tool-relevance"
+
+# Stamped instead of RANKER_VERSION_BM25 when at least one candidate carried
+# a nonzero risk penalty — the scoring function then differs from plain v1
+# (final_score = relevance * (1 - penalty)), and replay must not pool the
+# two. With an all-zero penalty map the math degenerates to v1 exactly, so
+# such calls keep the v1 stamp.
+RANKER_VERSION_BM25_RISK = "v2-bm25-risk-penalty"
 
 # Bound the schema text folded into each candidate document. Schemas are
 # advertised (possibly distilled) client-facing artifacts, but a pathological
@@ -96,25 +114,38 @@ class ToolRelevanceRanker:
         self._top_n = top_n
         self._scorer = BM25Scorer()
 
-    def rank(self, query: str, candidates: list[ProxyToolInfo]) -> list[dict[str, Any]]:
+    def rank(
+        self,
+        query: str,
+        candidates: list[ProxyToolInfo],
+        risk_penalties: Mapping[str, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rank *candidates* against *query*; order follows ``final_score``.
+
+        *risk_penalties* maps prefixed names to the #465 filter's demotion
+        for tools flagged-but-advertised (``review`` profile); absent tools
+        carry ``0.0`` and the math degenerates to plain relevance order.
+        """
         if not candidates:
             return []
+        penalties = risk_penalties or {}
         sections = [_candidate_document(c) for c in candidates]
         scores = self._scorer.score_sections(query, sections)
+        finals = [
+            scores[i] * (1.0 - penalties.get(c.prefixed_name, 0.0))
+            for i, c in enumerate(candidates)
+        ]
         order = sorted(
             range(len(candidates)),
-            key=lambda i: (-scores[i], candidates[i].prefixed_name),
+            key=lambda i: (-finals[i], candidates[i].prefixed_name),
         )
         return [
             {
                 "tool": candidates[i].prefixed_name,
                 "rank": rank,
                 "relevance_score": round(scores[i], 6),
-                # Placeholder until a repo-local risk signal exists (#465);
-                # recorded explicitly so replay code never special-cases
-                # its absence.
-                "risk_penalty": 0.0,
-                "final_score": round(scores[i], 6),
+                "risk_penalty": round(penalties.get(candidates[i].prefixed_name, 0.0), 6),
+                "final_score": round(finals[i], 6),
             }
             for rank, i in enumerate(order[: self._top_n], start=1)
         ]

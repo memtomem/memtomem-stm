@@ -4,8 +4,9 @@ The proxy is the one component in the call path, so it can record what an
 advisory analyzer never sees: which tool the client model actually called,
 out of which advertised candidate set, and how the call went. This log is
 the substrate for offline replay/eval (#468) and every later learning stage
-(#469/#470) — and for the STM-native hard filter (#465), whose reject
-reasons land in the ``reject_reasons`` field once it exists.
+(#469/#470) — and the landing zone for the STM-native hard filter's (#465)
+``reject_reasons``, so replay sees the tools that were withheld, not just
+the ones advertised.
 
 Schema v1 — three event types, every record self-describing via
 ``schema_version`` + ``ranker_version``; one JSON object per line, keys
@@ -17,11 +18,13 @@ sorted, so a replay harness can stream-parse and diff runs:
     ``server``, ``selected_tool`` (prefixed name, same vocabulary as
     ``candidate_tools``), ``candidate_tools`` (what the proxy last
     advertised — today the client model does the selecting),
-    ``candidate_count``, ``reject_reasons`` (tool → reason; empty until
-    the #465 hard filter populates it), ``candidate_features`` /
-    ``graph_generation`` (reserved ``null`` until toolgraph#13/#15),
-    ``args_sha256`` + ``args_chars`` (canonical-JSON hash — see
-    redaction below), ``ts``.
+    ``candidate_count``, ``reject_reasons`` (prefixed tool → reason code
+    for every tool the #465 hard filter withheld from that advertisement;
+    ``{}`` when nothing was rejected or the filter never ran — reason
+    vocabulary in ``proxy/tool_eligibility.py``), ``candidate_features``
+    (#466 ranking output) / ``graph_generation`` (reserved ``null`` until
+    toolgraph#13/#15), ``args_sha256`` + ``args_chars`` (canonical-JSON
+    hash — see redaction below), ``ts``.
 
 ``execution``
     ``selection_id`` / ``trace_id`` / ``server`` / ``selected_tool``
@@ -176,6 +179,7 @@ class SelectionTelemetryLog:
         trace_id: str | None,
         candidate_features: dict[str, Any] | None = None,
         ranker_version: str | None = None,
+        reject_reasons: dict[str, str] | None = None,
     ) -> str | None:
         """Record a selection event; returns its ``selection_id``.
 
@@ -184,6 +188,9 @@ class SelectionTelemetryLog:
         is the ranker's output object (#466) — the caller guarantees it
         carries no raw text, only scores/hashes; ``ranker_version`` stamps
         which ranker produced it (``None`` = the unranked default).
+        ``reject_reasons`` is the #465 hard filter's verdict for the
+        advertisement this call selected from — reason codes only, no tool
+        metadata (``None`` records the empty map).
         """
         if not self._sampled_in():
             with self._lock:
@@ -203,7 +210,7 @@ class SelectionTelemetryLog:
                 "selected_tool": selected_tool,
                 "candidate_tools": list(candidate_tools),
                 "candidate_count": len(candidate_tools),
-                "reject_reasons": {},
+                "reject_reasons": dict(reject_reasons) if reject_reasons else {},
                 "candidate_features": candidate_features,
                 "graph_generation": None,
                 "args_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
