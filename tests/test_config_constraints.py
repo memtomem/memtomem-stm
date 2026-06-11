@@ -12,9 +12,11 @@ from memtomem_stm.proxy.config import (
     HybridConfig,
     LLMCompressorConfig,
     LLMProvider,
+    OriginSource,
     ProxyConfig,
     RelevanceScorerConfig,
     SelectiveConfig,
+    UpstreamOrigin,
     UpstreamServerConfig,
 )
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -94,6 +96,68 @@ class TestProxyNumericConstraints:
     def test_hybrid_defaults_are_valid(self) -> None:
         cfg = HybridConfig()
         assert cfg.min_head_chars <= cfg.head_chars
+
+
+class TestUpstreamOrigin:
+    """`origin` import-provenance block (#475) — schema documented server-side.
+
+    The proxy runtime never reads `origin`; these pins exist so the shape the
+    CLI import paths write keeps validating here (the CLI constructs it via
+    this model) and so compat with configs written by newer/older versions
+    cannot silently regress.
+    """
+
+    _FULL_ORIGIN = {
+        "schema_version": 1,
+        "source": {"kind": "claude-user", "pruned": False},
+        "duplicates": [
+            {"kind": "claude-desktop", "pruned": False},
+            {"kind": "mcp-json", "path": "/proj/.mcp.json", "pruned": False},
+        ],
+        "imported_at": "2026-06-11T05:00:00Z",
+        "original": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github"],
+            "env": {"GITHUB_TOKEN": "ghp_x"},
+        },
+    }
+
+    def test_full_origin_block_validates_on_upstream_entry(self) -> None:
+        cfg = UpstreamServerConfig(prefix="gh", command="npx", origin=self._FULL_ORIGIN)
+        assert cfg.origin is not None
+        assert cfg.origin.source.kind == "claude-user"
+        assert cfg.origin.source.pruned is False
+        assert [d.kind for d in cfg.origin.duplicates] == ["claude-desktop", "mcp-json"]
+        assert cfg.origin.duplicates[1].path == "/proj/.mcp.json"
+        # Verbatim original survives validation untouched — it is what
+        # `mms eject` restores.
+        assert cfg.origin.original == self._FULL_ORIGIN["original"]
+
+    def test_origin_defaults(self) -> None:
+        origin = UpstreamOrigin(source=OriginSource(kind="claude-user"))
+        assert origin.schema_version == 1
+        assert origin.duplicates == []
+        assert origin.source.pruned is False
+        assert origin.source.pruned_at is None
+        assert origin.original is None
+
+    def test_unknown_origin_keys_ignored_for_forward_compat(self) -> None:
+        """A config written by a newer CLI (schema_version bump adding keys,
+        or a new source kind) must still load in this server — pydantic's
+        default ``extra="ignore"`` is the compat mechanism (#475)."""
+        block = {
+            "schema_version": 2,
+            "source": {"kind": "some-future-host", "pruned": False, "new_field": 1},
+            "future_top_level": {"x": 1},
+        }
+        cfg = UpstreamServerConfig(prefix="gh", command="npx", origin=block)
+        assert cfg.origin is not None
+        assert cfg.origin.schema_version == 2
+        assert cfg.origin.source.kind == "some-future-host"
+
+    def test_entry_without_origin_still_valid(self) -> None:
+        cfg = UpstreamServerConfig(prefix="gh", command="npx")
+        assert cfg.origin is None
 
 
 class TestSurfacingLtmTransportConfig:

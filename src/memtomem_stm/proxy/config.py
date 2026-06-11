@@ -431,6 +431,44 @@ class ToolOverrideConfig(BaseModel):
     visible."""
 
 
+class OriginSource(BaseModel):
+    """One host-config location an imported upstream entry came from (#475)."""
+
+    kind: str
+    """Machine-readable source kind: ``claude-user`` / ``claude-project`` /
+    ``mcp-json`` / ``claude-desktop``. Kept in lockstep with the CLI's shared
+    source table (``cli/proxy.py``); a plain ``str`` rather than an enum so a
+    config written by a newer CLI with a new kind still validates here."""
+    path: str | None = None
+    """Filesystem anchor for path-scoped kinds: the resolved project dir for
+    ``claude-project``, the ``.mcp.json`` path for ``mcp-json``."""
+    pruned: bool = False
+    """``True`` once this source's host entry was removed by a prune writer.
+    Per-source rather than per-entry because prune permits partial failure
+    across the primary source and its duplicates."""
+    pruned_at: str | None = None
+
+
+class UpstreamOrigin(BaseModel):
+    """Import provenance for an upstream entry (#475).
+
+    Written by the CLI import paths (``mms init`` / ``mms add --import``) so
+    the entry can later be restored to its host config verbatim (``mms
+    eject``). The proxy runtime never reads it — the field exists here to
+    document the schema and give the CLI a validated constructor.
+
+    ``original`` is the verbatim host entry and may contain secrets
+    (``env`` / ``headers``); CLI ``--json`` outputs must strip it (see the
+    redacted serializer in ``cli/proxy.py``) rather than dumping it.
+    """
+
+    schema_version: int = 1
+    source: OriginSource
+    duplicates: list[OriginSource] = []
+    imported_at: str | None = None
+    original: dict[str, Any] | None = None
+
+
 class UpstreamServerConfig(BaseModel):
     command: str = ""
     args: list[str] = []
@@ -507,6 +545,12 @@ class UpstreamServerConfig(BaseModel):
     """
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
+    origin: UpstreamOrigin | None = None
+    """Import provenance (#475) — see :class:`UpstreamOrigin`. CLI-owned
+    metadata: the server validates the shape but never reads it at runtime.
+    Older binaries that predate the field ignore it via pydantic's default
+    ``extra="ignore"``; the CLI's raw-dict load/save preserves it through
+    every config mutation."""
 
     @model_validator(mode="after")
     def _check_ordering(self) -> Self:
