@@ -46,6 +46,33 @@ def _cfg_args(config: Path) -> list[str]:
     return ["--config", str(config)]
 
 
+def _config_with_origin() -> dict:
+    """Config payload with one origin-bearing entry (secret in
+    ``origin.original.env``) and one plain entry — shared by the
+    ``status --json`` / ``list --json`` redaction tests (#475)."""
+    return {
+        "enabled": True,
+        "upstream_servers": {
+            "gh": {
+                "prefix": "gh",
+                "transport": "stdio",
+                "command": "npx",
+                "origin": {
+                    "schema_version": 1,
+                    "source": {"kind": "claude-user", "pruned": False},
+                    "duplicates": [{"kind": "claude-desktop", "pruned": False}],
+                    "imported_at": "2026-06-11T05:00:00Z",
+                    "original": {
+                        "command": "npx",
+                        "env": {"GITHUB_TOKEN": "ghp_supersecret"},
+                    },
+                },
+            },
+            "plain": {"prefix": "pl", "command": "uvx"},
+        },
+    }
+
+
 # ── version command ─────────────────────────────────────────────────────
 
 
@@ -381,6 +408,27 @@ class TestStatus:
         data = json.loads(result.output)
         assert data["error"] == "config_not_found"
 
+    def test_json_redacts_origin_original(self, runner, config):
+        """``origin.original`` is the verbatim host entry and may carry
+        secrets — ``status --json`` must emit only the provenance summary
+        plus ``has_original`` (#475)."""
+        config.write_text(json.dumps(_config_with_origin()), encoding="utf-8")
+        result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        origin = json.loads(result.output)["servers"]["gh"]["origin"]
+        assert "original" not in origin
+        assert origin["has_original"] is True
+        assert "ghp_supersecret" not in result.output
+        # Summary keys survive — scripts can still read provenance.
+        assert origin["source"] == {"kind": "claude-user", "pruned": False}
+        assert origin["duplicates"] == [{"kind": "claude-desktop", "pruned": False}]
+        assert origin["imported_at"] == "2026-06-11T05:00:00Z"
+        # Redaction is output-only: the config file keeps the original.
+        on_disk = json.loads(config.read_text(encoding="utf-8"))
+        assert on_disk["upstream_servers"]["gh"]["origin"]["original"]["env"] == {
+            "GITHUB_TOKEN": "ghp_supersecret"
+        }
+
     def test_shows_server_details(self, runner, config):
         config.write_text(
             json.dumps(
@@ -511,6 +559,19 @@ class TestListServers:
         data = json.loads(result.output)
         assert data["error"] == "config_not_found"
         assert str(config) in data["path"]
+
+    def test_json_redacts_origin_original(self, runner, config):
+        """Same redaction contract as ``status --json`` (#475) — entries
+        without an origin pass through byte-identical."""
+        config.write_text(json.dumps(_config_with_origin()), encoding="utf-8")
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        servers = json.loads(result.output)["servers"]
+        assert "original" not in servers["gh"]["origin"]
+        assert servers["gh"]["origin"]["has_original"] is True
+        assert "ghp_supersecret" not in result.output
+        assert servers["plain"] == {"prefix": "pl", "command": "uvx"}
+        assert "origin" not in servers["plain"]
 
 
 # ── add command — validation paths ───────────────────────────────────────
@@ -1455,6 +1516,62 @@ class TestInitDiscoverySources:
         fs = next(c for c in cands if c["name"] == "filesystem")
         assert fs["source"] == "Claude Code (user)"
         assert fs["entry"]["transport"] == "stdio"
+        # Origin capture (#475): verbatim raw + structured source ref.
+        assert fs["raw"] == {"command": "npx", "args": ["-y", "@fs"]}
+        assert fs["source_ref"] == {"kind": "claude-user"}
+
+    def test_discovers_claude_code_project_scope_with_path(self, tmp_path, monkeypatch):
+        """Per-project entries in ``~/.claude.json`` carry the resolved cwd in
+        ``source_ref.path`` — ``mms eject`` restores via ``claude mcp add-json
+        -s local``, which resolves the project by cwd (#475)."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "projects": {
+                        str(cwd.resolve()): {
+                            "mcpServers": {"proj-tool": {"command": "node", "args": ["a.js"]}}
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["source"] == "Claude Code (project)"
+        assert cands[0]["source_ref"] == {
+            "kind": "claude-project",
+            "path": str(cwd.resolve()),
+        }
+        assert cands[0]["raw"] == {"command": "node", "args": ["a.js"]}
+
+    def test_raw_is_verbatim_where_normalization_is_lossy(self, tmp_path, monkeypatch):
+        """``_normalize_client_entry`` drops HTTP ``headers``, dangerous env
+        keys, and unknown fields. ``raw`` must keep all of them — it is the
+        restore payload for ``mms eject`` (#475)."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        raw_entry = {
+            "type": "http",
+            "url": "https://api.example/mcp",
+            "headers": {"Authorization": "Bearer tok"},
+            "unknown_host_field": True,
+        }
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"api": raw_entry}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["raw"] == raw_entry
+        assert "headers" not in cands[0]["entry"]
+        assert "unknown_host_field" not in cands[0]["entry"]
 
     def test_discovers_desktop_config(self, tmp_path, monkeypatch):
         from memtomem_stm.cli.proxy import _discover_candidates
@@ -1482,6 +1599,10 @@ class TestInitDiscoverySources:
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
         assert cands[0]["source"] == ".mcp.json (project)"
+        assert cands[0]["source_ref"] == {
+            "kind": "mcp-json",
+            "path": str((cwd / ".mcp.json").resolve()),
+        }
 
     def test_dedupes_by_name_priority(self, tmp_path, monkeypatch):
         """Same name in multiple sources → first-priority wins, others
@@ -1506,6 +1627,21 @@ class TestInitDiscoverySources:
         assert len(cands) == 1
         assert cands[0]["entry"]["command"] == "a"  # .mcp.json wins
         assert cands[0]["duplicate_in"] == ["Claude Code (user)", "Claude Desktop"]
+        # Structured duplicate records (#475): every losing source keeps its
+        # kind + verbatim raw so origin.duplicates and the prune backup log
+        # (PR2) can address each source individually.
+        assert cands[0]["duplicates"] == [
+            {
+                "label": "Claude Code (user)",
+                "source_ref": {"kind": "claude-user"},
+                "raw": {"command": "b"},
+            },
+            {
+                "label": "Claude Desktop",
+                "source_ref": {"kind": "claude-desktop"},
+                "raw": {"command": "c"},
+            },
+        ]
 
     def test_skips_self_reference(self, tmp_path, monkeypatch):
         """Imports of STM (``mms``) or LTM (``memtomem-server``, either as
@@ -1965,6 +2101,203 @@ class _FakeClaudeResult:
         self.returncode = returncode
         self.stdout = ""
         self.stderr = stderr
+
+
+class TestImportOriginCapture:
+    """Both import paths (``mms init`` + ``mms add --import``) persist an
+    ``origin`` provenance block per imported entry (#475 PR1): structured
+    source kind(s), import timestamp, and the **verbatim** host entry — the
+    restore payload for ``mms eject``. Manual entries get none.
+
+    ``_run_mcp_integration`` / ``_handle_source_prune`` are stubbed as in
+    ``TestInitImportFlow`` — this class is about what gets persisted, not the
+    post-save steps."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_post_save(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: None)
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    @staticmethod
+    def _github_candidate() -> dict:
+        """Full discovery-shaped candidate: lossy-normalized entry + verbatim
+        raw (keeps the env secret + a field normalization drops) + one
+        duplicate source."""
+        return {
+            "name": "github",
+            "source": "Claude Code (user)",
+            "entry": {
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@gh"],
+                "compression": "auto",
+                "max_result_chars": 8000,
+            },
+            "raw": {
+                "command": "npx",
+                "args": ["-y", "@gh"],
+                "env": {"GITHUB_TOKEN": "ghp_secret"},
+                "host_only_field": True,
+            },
+            "source_ref": {"kind": "claude-user"},
+            "duplicate_in": ["Claude Desktop"],
+            "duplicates": [
+                {
+                    "label": "Claude Desktop",
+                    "source_ref": {"kind": "claude-desktop"},
+                    "raw": {"command": "npx", "args": ["-y", "@gh"]},
+                }
+            ],
+        }
+
+    def _assert_origin_block(self, entry: dict, cand: dict) -> None:
+        origin = entry["origin"]
+        assert origin["schema_version"] == 1
+        assert origin["source"] == {"kind": "claude-user", "pruned": False}
+        assert origin["duplicates"] == [{"kind": "claude-desktop", "pruned": False}]
+        # Verbatim deep-equality — normalization loss must not leak into the
+        # provenance copy.
+        assert origin["original"] == cand["raw"]
+        assert origin["imported_at"].endswith("Z")
+        # Lockstep pin: what the CLI wrote validates against the schema the
+        # server documents.
+        from memtomem_stm.proxy.config import UpstreamOrigin
+
+        assert UpstreamOrigin.model_validate(origin).source.kind == "claude-user"
+
+    def test_init_import_writes_origin_block(self, runner, config, monkeypatch):
+        cand = self._github_candidate()
+        self._stub_candidates(monkeypatch, [cand])
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        self._assert_origin_block(data["upstream_servers"]["github"], cand)
+
+    def test_add_import_writes_origin_block(self, runner, config, monkeypatch):
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        cand = self._github_candidate()
+        self._stub_candidates(monkeypatch, [cand])
+        result = runner.invoke(
+            cli,
+            ["add", "--import", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        self._assert_origin_block(data["upstream_servers"]["github"], cand)
+
+    def test_candidate_without_raw_gets_no_origin(self, runner, config, monkeypatch):
+        """A candidate that never captured a verbatim raw (hand-constructed)
+        produces no origin block at all — a partial block could not drive a
+        faithful restore."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "legacy",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                }
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "origin" not in data["upstream_servers"]["legacy"]
+
+    def test_manual_init_flow_writes_no_origin(self, runner, config, no_discovery):
+        """Origin is import-only provenance — the manual prompt flow has no
+        host entry to record."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @fs\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "origin" not in data["upstream_servers"]["filesystem"]
+
+    def test_init_roundtrip_preserves_verbatim_original_from_real_files(
+        self, tmp_path, monkeypatch, runner
+    ):
+        """End-to-end through real discovery (no stubs): host file → init →
+        config. ``origin.original`` deep-equals the host entry including
+        fields the STM entry drops."""
+        home = tmp_path / "home"
+        home.mkdir()
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        set_home(monkeypatch, home)
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: home / "no_desktop.json")
+        host_entry = {
+            "command": "npx",
+            "args": ["-y", "@gh"],
+            "env": {"GITHUB_TOKEN": "ghp_secret", "LD_PRELOAD": "/evil.so"},
+        }
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"github": host_entry}}), encoding="utf-8"
+        )
+        monkeypatch.chdir(cwd)
+
+        config = tmp_path / "stm_proxy.json"
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        entry = data["upstream_servers"]["github"]
+        assert entry["origin"]["original"] == host_entry
+        assert entry["origin"]["source"] == {"kind": "claude-user", "pruned": False}
+        # The dangerous env key is filtered from the *active* entry (forward
+        # import) but kept verbatim in the provenance copy — eject restores
+        # what the host originally had (#475 §7).
+        assert "LD_PRELOAD" not in (entry.get("env") or {})
+
+    def test_other_cli_commands_preserve_origin(self, runner, config, monkeypatch):
+        """The CLI's raw-dict load/save passthrough keeps origin intact across
+        unrelated mutations (``mms surfacing``, ``mms remove`` of a sibling)."""
+        cand = self._github_candidate()
+        self._stub_candidates(monkeypatch, [cand])
+        runner.invoke(cli, ["init", "--no-validate", *_cfg_args(config)], input="all\n\n")
+        runner.invoke(
+            cli,
+            ["add", "other", "--prefix", "ot", "--command", "uvx", *_cfg_args(config)],
+        )
+        before = json.loads(config.read_text(encoding="utf-8"))
+        origin_before = before["upstream_servers"]["github"]["origin"]
+
+        result = runner.invoke(cli, ["surfacing", "github", "off", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        result = runner.invoke(cli, ["remove", "other", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        after = json.loads(config.read_text(encoding="utf-8"))
+        assert after["upstream_servers"]["github"]["origin"] == origin_before
+        assert after["upstream_servers"]["github"]["surfacing_enabled"] is False
 
 
 class TestInitMcpRegistration:

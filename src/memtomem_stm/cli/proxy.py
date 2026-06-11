@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import sys
 import tomllib
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -30,6 +32,7 @@ from memtomem_stm.mms.import_hosts import (
     _is_self_reference,
     _read_json_safely,
 )
+from memtomem_stm.mms.state import utc_now_iso
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
@@ -514,6 +517,28 @@ def version() -> None:
     click.echo(f"memtomem-stm {pkg_version('memtomem-stm')}")
 
 
+def _redacted_servers_json(servers: dict[str, Any]) -> dict[str, Any]:
+    """Server map for ``--json`` output with ``origin.original`` stripped (#475).
+
+    ``origin.original`` is the verbatim host entry an import captured and may
+    carry secrets (``env`` / ``headers``), so the machine-readable outputs
+    must not dump it. The summary keys (``source`` kinds, ``pruned`` flags,
+    ``imported_at``) stay, plus ``has_original`` so scripts can tell a
+    redacted block from one that never captured an original. Human output is
+    unaffected — it only prints selected fields. (Entries' own ``env`` is
+    exposed here as before — pre-existing surface, out of scope per #475.)
+    """
+    redacted: dict[str, Any] = {}
+    for name, cfg in servers.items():
+        if isinstance(cfg, dict) and isinstance(cfg.get("origin"), dict):
+            origin = dict(cfg["origin"])
+            origin["has_original"] = isinstance(origin.pop("original", None), dict)
+            redacted[name] = {**cfg, "origin": origin}
+        else:
+            redacted[name] = cfg
+    return redacted
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
@@ -540,7 +565,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
                 {
                     "config_path": str(resolved),
                     "enabled": enabled,
-                    "servers": servers,
+                    "servers": _redacted_servers_json(servers),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -598,7 +623,7 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     if as_json:
         click.echo(
             json.dumps(
-                {"config_path": str(resolved), "servers": servers},
+                {"config_path": str(resolved), "servers": _redacted_servers_json(servers)},
                 indent=2,
                 ensure_ascii=False,
             )
@@ -1097,41 +1122,83 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
     return entry
 
 
+# One definition of the source-client locations the import flow can read,
+# keeping three consumers in lockstep (#475): the discovery labels below,
+# the removal hint (`_source_removal_hint`), and the prune writer
+# (`_prune_from_source`). ``kind`` is the machine-readable identifier
+# persisted in ``origin.source.kind`` (see ``UpstreamOrigin`` in
+# ``proxy/config.py``); ``claude_scope`` is the ``claude mcp remove -s``
+# scope for shell-out sources, ``None`` marking the one source (Claude
+# Desktop) handled by direct JSON edit instead.
+@dataclass(frozen=True)
+class _SourceSpec:
+    label: str
+    kind: str
+    claude_scope: str | None
+
+
+_SOURCE_SPECS: tuple[_SourceSpec, ...] = (
+    _SourceSpec(".mcp.json (project)", "mcp-json", "project"),
+    _SourceSpec("Claude Code (user)", "claude-user", "user"),
+    _SourceSpec("Claude Code (project)", "claude-project", "local"),
+    _SourceSpec("Claude Desktop", "claude-desktop", None),
+)
+_SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
+
+
 def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     """Scan known MCP-client configs and return importable candidates.
 
-    Each candidate dict is ``{name, source, entry}`` where ``entry`` is an
-    already-normalized STM upstream-server entry (sans prefix). The first
-    source to claim a name wins; later duplicates are dropped with a
-    ``duplicate_in`` note so the UI can indicate the overlap.
+    Each candidate dict is ``{name, source, entry, raw, source_ref}`` where
+    ``entry`` is an already-normalized STM upstream-server entry (sans
+    prefix), ``raw`` is the **verbatim** host entry (normalization is lossy —
+    the original is what ``mms eject`` restores, #475), and ``source_ref``
+    is the structured ``{kind, path?}`` record persisted as
+    ``origin.source``. The first source to claim a name wins; later
+    duplicates are dropped with a ``duplicate_in`` label note for the UI
+    plus a structured ``duplicates`` record (``{label, source_ref, raw}``)
+    so provenance and the prune backup log can address every source.
     """
-    sources: list[tuple[str, dict[str, Any]]] = []
+    sources: list[tuple[_SourceSpec, str | None, dict[str, Any]]] = []
 
     # 1. Project-scope ``.mcp.json`` in cwd (Claude Code project config).
-    proj = _read_json_safely(cwd / ".mcp.json")
+    mcp_json_path = cwd / ".mcp.json"
+    proj = _read_json_safely(mcp_json_path)
     if proj and isinstance(proj.get("mcpServers"), dict):
-        sources.append((".mcp.json (project)", proj["mcpServers"]))
+        sources.append(
+            (
+                _SOURCE_BY_LABEL[".mcp.json (project)"],
+                str(mcp_json_path.resolve()),
+                proj["mcpServers"],
+            )
+        )
 
     # 2. Claude Code ~/.claude.json user-scope + per-project entries.
     cc = _read_json_safely(Path("~/.claude.json").expanduser())
     if cc:
         if isinstance(cc.get("mcpServers"), dict):
-            sources.append(("Claude Code (user)", cc["mcpServers"]))
+            sources.append((_SOURCE_BY_LABEL["Claude Code (user)"], None, cc["mcpServers"]))
         projects = cc.get("projects")
         if isinstance(projects, dict):
             # Match on resolved cwd so we don't duplicate entries across sibling projects.
             resolved_cwd = str(cwd.resolve())
             proj_entry = projects.get(resolved_cwd)
             if isinstance(proj_entry, dict) and isinstance(proj_entry.get("mcpServers"), dict):
-                sources.append(("Claude Code (project)", proj_entry["mcpServers"]))
+                sources.append(
+                    (
+                        _SOURCE_BY_LABEL["Claude Code (project)"],
+                        resolved_cwd,
+                        proj_entry["mcpServers"],
+                    )
+                )
 
     # 3. Claude Desktop (macOS path only; non-macOS → file absent → skipped).
     desktop = _read_json_safely(_desktop_config_path())
     if desktop and isinstance(desktop.get("mcpServers"), dict):
-        sources.append(("Claude Desktop", desktop["mcpServers"]))
+        sources.append((_SOURCE_BY_LABEL["Claude Desktop"], None, desktop["mcpServers"]))
 
     seen: dict[str, dict[str, Any]] = {}
-    for source_label, servers in sources:
+    for spec, src_path, servers in sources:
         if not isinstance(servers, dict):
             continue
         for name, raw in servers.items():
@@ -1140,11 +1207,58 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             entry = _normalize_client_entry(raw)
             if entry is None or _is_self_reference(entry):
                 continue
+            source_ref: dict[str, Any] = {"kind": spec.kind}
+            if src_path is not None:
+                source_ref["path"] = src_path
             if name in seen:
-                seen[name].setdefault("duplicate_in", []).append(source_label)
+                seen[name].setdefault("duplicate_in", []).append(spec.label)
+                seen[name].setdefault("duplicates", []).append(
+                    {"label": spec.label, "source_ref": source_ref, "raw": copy.deepcopy(raw)}
+                )
                 continue
-            seen[name] = {"name": name, "source": source_label, "entry": entry}
+            seen[name] = {
+                "name": name,
+                "source": spec.label,
+                "entry": entry,
+                "raw": copy.deepcopy(raw),
+                "source_ref": source_ref,
+            }
     return list(seen.values())
+
+
+def _build_origin(cand: dict[str, Any], imported_at: str) -> dict[str, Any] | None:
+    """Build the per-entry ``origin`` provenance block for an import (#475).
+
+    Returns ``None`` when the candidate carries no verbatim ``raw`` /
+    ``source_ref`` (hand-constructed candidates) — a partial block could not
+    drive a faithful restore, so none is written.
+
+    Construction goes through the ``UpstreamOrigin`` pydantic model so the
+    shape the CLI writes cannot drift from the schema the server documents
+    (``proxy/config.py``). ``pruned`` / ``pruned_at`` stay at their defaults
+    here; the prune writers update them per source (PR2 of #475).
+    """
+    raw = cand.get("raw")
+    source_ref = cand.get("source_ref")
+    if not isinstance(raw, dict) or not isinstance(source_ref, dict):
+        return None
+
+    # Deferred import: ``proxy.config`` materializes the full pydantic model
+    # tree, which only the two import commands need — keep it off the CLI's
+    # cold-start path.
+    from memtomem_stm.proxy.config import OriginSource, UpstreamOrigin
+
+    origin = UpstreamOrigin(
+        source=OriginSource(**source_ref),
+        duplicates=[
+            OriginSource(**dup["source_ref"])
+            for dup in cand.get("duplicates") or []
+            if isinstance(dup.get("source_ref"), dict)
+        ],
+        imported_at=imported_at,
+        original=raw,
+    )
+    return origin.model_dump(mode="json", exclude_none=True)
 
 
 def _format_candidate_detail(entry: dict[str, Any]) -> str:
@@ -1161,19 +1275,17 @@ def _source_removal_hint(name: str, source: str) -> str:
     from the client that originated it.
 
     STM never edits source client configs itself — the hint is copy-paste
-    only. Scope-label mapping matches the ``claude mcp remove -s`` flag:
-    ``Claude Code (project)`` is the per-project entry in ``~/.claude.json``,
-    which the Claude Code CLI calls ``local``.
+    only. Scope-label mapping comes from ``_SOURCE_SPECS`` and matches the
+    ``claude mcp remove -s`` flag: ``Claude Code (project)`` is the
+    per-project entry in ``~/.claude.json``, which the Claude Code CLI calls
+    ``local``.
     """
-    if source == "Claude Code (user)":
-        return f"claude mcp remove {name} -s user"
-    if source == "Claude Code (project)":
-        return f"claude mcp remove {name} -s local"
-    if source == ".mcp.json (project)":
-        return f"claude mcp remove {name} -s project"
-    if source == "Claude Desktop":
-        return f"# Edit {_desktop_config_path()} and remove '{name}' under mcpServers."
-    return f"# Remove '{name}' from {source}."
+    spec = _SOURCE_BY_LABEL.get(source)
+    if spec is None:
+        return f"# Remove '{name}' from {source}."
+    if spec.claude_scope is not None:
+        return f"claude mcp remove {name} -s {spec.claude_scope}"
+    return f"# Edit {_desktop_config_path()} and remove '{name}' under mcpServers."
 
 
 def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
@@ -1273,19 +1385,17 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
 def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     """Dispatch the prune action per source label used by ``_discover_candidates``.
 
-    Scope-label mapping matches :func:`_source_removal_hint` — the remediation
-    hint and the prune writer agree on which ``claude mcp remove -s <scope>``
-    flag maps to which label. Unknown sources are refused rather than guessed.
+    Scope-label mapping comes from the same ``_SOURCE_SPECS`` table as
+    :func:`_source_removal_hint` — the remediation hint and the prune writer
+    cannot disagree on which ``claude mcp remove -s <scope>`` flag maps to
+    which label. Unknown sources are refused rather than guessed.
     """
-    if source == "Claude Code (user)":
-        return _claude_mcp_remove(name, "user")
-    if source == "Claude Code (project)":
-        return _claude_mcp_remove(name, "local")
-    if source == ".mcp.json (project)":
-        return _claude_mcp_remove(name, "project")
-    if source == "Claude Desktop":
-        return _desktop_json_remove_entry(name)
-    return (False, f"unknown source label: {source}")
+    spec = _SOURCE_BY_LABEL.get(source)
+    if spec is None:
+        return (False, f"unknown source label: {source}")
+    if spec.claude_scope is not None:
+        return _claude_mcp_remove(name, spec.claude_scope)
+    return _desktop_json_remove_entry(name)
 
 
 def _prune_imported_candidates(
@@ -1727,6 +1837,7 @@ def _add_from_clients(
     # suggestions don't collide with prior registrations.
     used_prefixes: set[str] = {p for srv_cfg in servers.values() if (p := srv_cfg.get("prefix"))}
     imported: dict[str, dict[str, Any]] = {}
+    imported_at = utc_now_iso()
     click.echo("")
     for idx in picks:
         cand = new_candidates[idx]
@@ -1735,6 +1846,9 @@ def _add_from_clients(
         prefix = _prompt_prefix(default=suggested)
         used_prefixes.add(prefix)
         entry = {"prefix": prefix, **cand["entry"]}
+        origin = _build_origin(cand, imported_at)
+        if origin is not None:
+            entry["origin"] = origin
         imported[cand["name"]] = entry
 
     if validate:
@@ -1940,6 +2054,7 @@ def init(
 
         click.echo("")
         used_prefixes: set[str] = set()
+        imported_at = utc_now_iso()
         for idx in picks:
             cand = candidates[idx]
             click.echo(_hdr(f"Configuring '{cand['name']}'"))
@@ -1947,6 +2062,9 @@ def init(
             prefix = _prompt_prefix(default=suggested)
             used_prefixes.add(prefix)
             entry = {"prefix": prefix, **cand["entry"]}
+            origin = _build_origin(cand, imported_at)
+            if origin is not None:
+                entry["origin"] = origin
             imported[cand["name"]] = entry
             imported_candidates.append(cand)
     else:
