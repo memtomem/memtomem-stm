@@ -336,7 +336,9 @@ class TestFilesystemPosture:
             arguments={},
             trace_id=None,
         )
-        assert sid is not None  # caller contract intact
+        # Nothing reached disk, so the caller must skip the paired
+        # execution event — write failures never produce orphan halves.
+        assert sid is None
         assert log.write_errors == 1
         assert log.events_written == 0
 
@@ -424,6 +426,31 @@ class TestManagerWireIn:
         assert result == "ok!"
         assert _read_events(log) == []
         assert log.events_sampled_out == 1
+        assert log.events_written == 0
+
+    async def test_selection_write_failure_skips_execution_event(self, tmp_path):
+        """A failed selection write must not leave an orphan execution
+        record: the pair is skipped atomically. ``write_errors == 2``
+        would mean the execution write was still attempted."""
+        server_cfg = UpstreamServerConfig(
+            prefix="test", compression=CompressionStrategy.NONE, max_retries=0
+        )
+        proxy_cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": server_cfg},
+        )
+        broken_dir = tmp_path / "log-as-dir"
+        broken_dir.mkdir()
+        log = SelectionTelemetryLog(broken_dir)  # every append fails
+        mgr = ProxyManager(proxy_cfg, TokenTracker(), selection_log=log)
+        session = AsyncMock()
+        session.call_tool.return_value = _make_result("ok!")
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=server_cfg, session=session, tools=[]
+        )
+
+        assert await mgr.call_tool("srv", "tool", {}) == "ok!"
+        assert log.write_errors == 1
         assert log.events_written == 0
 
     async def test_no_selection_log_is_default_noop(self, tmp_path):

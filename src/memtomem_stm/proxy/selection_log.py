@@ -45,14 +45,18 @@ char count. As a belt-and-suspenders backstop (the storage-gating rule from
 ``privacy.py``), every serialized line is screened with
 ``contains_sensitive_content`` before persisting and dropped (counted) on a
 match, mirroring the never-persist-secrets rule from #460/#462. Files are
-created ``0o600`` with a ``0o700`` parent (#458).
+created ``0o600`` (#458); the parent directory is created ``0o700``, but a
+pre-existing parent's mode is left untouched — the same posture as every
+other STM store (``MetricsStore``, ``memory_ops`` #456/#464): ``mkdir`` mode
+applies at creation time only, and the file mode alone guards the content.
 
-Sampling applies to the whole selection+execution pair at selection time —
-``log_selection`` returning ``None`` means the call is sampled out and the
-caller skips the execution event, so sampling never produces orphan halves.
-Redaction drops, by contrast, are per-record (never-persist beats pairing):
-an execution whose paired selection was dropped can appear alone, so replay
-tooling must treat ``selection_id`` joins as left-outer.
+Sampling and write failures apply to the whole selection+execution pair at
+selection time — ``log_selection`` returning ``None`` means the call was
+sampled out or its record never reached disk, and the caller skips the
+execution event, so neither produces orphan halves. Redaction drops, by
+contrast, are per-record (never-persist beats pairing): an execution whose
+paired selection was dropped can appear alone, so replay tooling must treat
+``selection_id`` joins as left-outer.
 """
 
 from __future__ import annotations
@@ -137,11 +141,12 @@ class SelectionTelemetryLog:
         return self._path
 
     def initialize(self) -> None:
-        """Create the log file privately (0600 file, 0700 parent).
+        """Create the log file privately (0600 file; parent created 0700).
 
-        Also tightens a pre-existing file left at a permissive mode by an
+        Also tightens a pre-existing *file* left at a permissive mode by an
         older run or umask — same rationale as
-        ``sqlite_private.ensure_private_db_files``.
+        ``sqlite_private.ensure_private_db_files``. A pre-existing *parent
+        directory* keeps its mode (see module docstring).
         """
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -178,7 +183,7 @@ class SelectionTelemetryLog:
             return None
         selection_id = uuid.uuid4().hex
         canonical = _canonical_args(arguments)
-        self._append(
+        appended = self._append(
             {
                 "schema_version": SCHEMA_VERSION,
                 "ranker_version": RANKER_VERSION,
@@ -197,7 +202,12 @@ class SelectionTelemetryLog:
                 "args_chars": len(canonical),
             }
         )
-        return selection_id
+        # A write failure means the selection never reached disk — report
+        # ``None`` so the caller skips the paired execution event rather
+        # than persisting an orphan half (a transient failure could let the
+        # execution write succeed). An intentional redaction drop still
+        # returns the id: that is the documented left-outer case.
+        return selection_id if appended else None
 
     def log_execution(
         self,
@@ -259,7 +269,14 @@ class SelectionTelemetryLog:
             return False
         return self._rng.random() < self._sample_rate
 
-    def _append(self, record: dict[str, Any]) -> None:
+    def _append(self, record: dict[str, Any]) -> bool:
+        """Persist one record; ``False`` only on a write failure.
+
+        An intentional redaction drop returns ``True`` — the record was
+        consumed, not failed — so ``log_selection`` keeps the documented
+        left-outer pairing semantics, while a write failure tells it that
+        nothing reached disk and the pair must be skipped.
+        """
         line = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         # Structural redaction means no payload text should ever be here;
         # this screen is the storage-gating backstop (full DEFAULT_PATTERNS
@@ -272,7 +289,7 @@ class SelectionTelemetryLog:
             logger.warning(
                 "Dropped a selection-telemetry record that matched a sensitive-content pattern"
             )
-            return
+            return True
         data = (line + "\n").encode("utf-8")
         # Synchronous file append on the asyncio event loop: while it runs,
         # every runnable coroutine stalls — other in-flight proxied calls
@@ -300,6 +317,8 @@ class SelectionTelemetryLog:
                     )
                 else:
                     logger.debug("Selection telemetry write failed", exc_info=True)
+                return False
+        return True
 
     def _rotate_if_needed_locked(self) -> None:
         """Size-based rotation: ``log → log.1 → … → log.N``, oldest dropped.

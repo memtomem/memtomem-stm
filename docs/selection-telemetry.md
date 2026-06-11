@@ -23,11 +23,14 @@ Off by default — it is a new disk write path, so the operator opts in:
 ```
 
 The flag is read at startup (like `metrics.enabled`); toggling it requires a
-restart. Files are created `0600` with a `0700` parent directory. When the
-log reaches `max_bytes` it rotates (`log → log.1 → … → log.N`, oldest
-dropped; `max_backups: 0` truncates instead). `sample_rate` keeps the given
-fraction of calls and applies to the selection+execution pair atomically, so
-sampling never produces orphan halves.
+restart. Files are created `0600`; the parent directory is created `0700`
+(a pre-existing parent keeps its mode, matching the other STM stores — the
+file mode alone guards the content). When the log reaches `max_bytes` it
+rotates (`log → log.1 → … → log.N`, oldest dropped; `max_backups: 0`
+truncates instead). `sample_rate` keeps the given fraction of calls and
+applies to the selection+execution pair atomically — and a selection whose
+write failed also skips its execution event — so neither sampling nor write
+failures produce orphan halves.
 
 ## Schema v1
 
