@@ -211,6 +211,46 @@ class TestAutoIndexResponse:
         assert "/" not in written_path.name
         assert "ns_inner" in written_path.name
 
+    async def test_server_with_path_separators_is_sanitized_in_filename(self, config):
+        """The server key is interpolated into the filename too (#456). A
+        hand-edited config can hold separators or ``..``; the slug must
+        keep the write target inside ``memory_dir``."""
+        indexer = FakeIndexer()
+        await auto_index_response(
+            indexer,
+            config,
+            server="../../tmp/evil",
+            tool="t",
+            arguments={},
+            text="body",
+            agent_summary="sum",
+        )
+        written_path, _ = indexer.indexed_paths[0]
+        assert written_path.parent == config.memory_dir.expanduser().resolve()
+        assert written_path.name.startswith(".._.._tmp_evil__t__")
+        assert written_path.exists()
+
+    async def test_memory_dir_and_response_files_are_private(self, config):
+        """0o700 dir / 0o600 files (#456): indexed responses are user
+        conversation content, private like the SQLite stores (#458). The
+        file mode is exact (chmod ignores umask); the dir assert pins the
+        security property — no group/other bits — because mkdir's mode is
+        masked by the process umask."""
+        indexer = FakeIndexer()
+        await auto_index_response(
+            indexer,
+            config,
+            server="s",
+            tool="t",
+            arguments={},
+            text="body",
+            agent_summary="sum",
+        )
+        memory_dir = config.memory_dir.expanduser().resolve()
+        assert memory_dir.stat().st_mode & 0o077 == 0
+        written_path, _ = indexer.indexed_paths[0]
+        assert written_path.stat().st_mode & 0o777 == 0o600
+
 
 # ── compose_index_footer ─────────────────────────────────────────────────
 
@@ -319,6 +359,46 @@ class TestExtractAndStore:
         for path, _ in indexer.indexed_paths:
             content = path.read_text(encoding="utf-8")
             assert any(fact.content in content for fact in facts)
+
+    async def test_server_with_path_separators_is_sanitized_in_fact_filenames(self, config):
+        """Fact filenames interpolate the server key too (#456) — the same
+        slug as auto_index_response keeps writes inside ``memory_dir``."""
+        extractor = FakeExtractor([self._fact("one insight")])
+        indexer = FakeIndexer()
+
+        await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="../../tmp/evil",
+            tool="ns/inner",
+            arguments={},
+            text="long response text",
+        )
+
+        written_path, _ = indexer.indexed_paths[0]
+        assert written_path.parent == config.memory_dir.expanduser().resolve()
+        assert written_path.name.startswith(".._.._tmp_evil__ns_inner__fact__")
+
+    async def test_fact_dir_and_files_are_private(self, config):
+        """Same 0o700 dir / 0o600 file policy as auto_index_response (#456)."""
+        extractor = FakeExtractor([self._fact("one insight")])
+        indexer = FakeIndexer()
+
+        await extract_and_store(
+            indexer,
+            extractor,
+            config,
+            server="gh",
+            tool="read_file",
+            arguments={},
+            text="long response text",
+        )
+
+        memory_dir = config.memory_dir.expanduser().resolve()
+        assert memory_dir.stat().st_mode & 0o077 == 0
+        written_path, _ = indexer.indexed_paths[0]
+        assert written_path.stat().st_mode & 0o777 == 0o600
 
     async def test_dedup_skips_duplicates(self, config):
         facts = [
