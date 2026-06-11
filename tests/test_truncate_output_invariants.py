@@ -123,6 +123,104 @@ def test_json_key_truncate_records_omitted_keys() -> None:
     assert "omitted" in parsed["_truncated"]
 
 
+# ── JSON path: budget refill after key drops (the freeze regression) ──────────
+
+
+def _skewed_config() -> str:
+    """One huge key between small ones. Pre-fix, every budget from 80 through
+    1500 returned the same 66-char output (key ``a`` + marker): the per-key
+    parts were sized against the FULL key set, and the assembler only dropped
+    whole keys — it never re-spent the freed budget."""
+    return json.dumps({"a": {"x": "aaa"}, "b": {"big": "B" * 3000}, "c": {"y": "ccc"}})
+
+
+def _preserved_chars(truncated: object, original: object) -> int:
+    """Chars of ORIGINAL leaf content preserved in the truncated form."""
+    if isinstance(original, str):
+        if not isinstance(truncated, str):
+            return 0
+        s = truncated[:-3] if truncated.endswith("...") else truncated
+        return len(s) if original.startswith(s) else 0
+    if isinstance(original, dict):
+        if not isinstance(truncated, dict):
+            return 0
+        return sum(_preserved_chars(truncated[k], v) for k, v in original.items() if k in truncated)
+    if isinstance(original, list):
+        if not isinstance(truncated, list):
+            return 0
+        return sum(_preserved_chars(t, o) for t, o in zip(truncated, original))
+    return len(json.dumps(original)) if truncated == original else 0
+
+
+@pytest.mark.parametrize("lo,hi", [(80, 200), (200, 400), (400, 800), (800, 1500)])
+def test_json_key_truncate_output_grows_with_budget(lo: int, hi: int) -> None:
+    """A larger budget must produce more output, not freeze at the key-drop
+    point (pre-fix: 66 chars at every budget in [80, 1500] for this payload)."""
+    text = _skewed_config()
+    out_lo = TruncateCompressor().compress(text, max_chars=lo)
+    out_hi = TruncateCompressor().compress(text, max_chars=hi)
+    json.loads(out_lo)
+    json.loads(out_hi)
+    assert len(out_lo) <= lo
+    assert len(out_hi) <= hi
+    assert len(out_hi) > len(out_lo)
+
+
+def test_json_key_truncate_refills_boundary_key() -> None:
+    """The freed budget is re-spent on a truncated form of the first dropped
+    key instead of dropping it whole."""
+    out = TruncateCompressor().compress(_skewed_config(), max_chars=800)
+    parsed = json.loads(out)
+    assert parsed["a"] == {"x": "aaa"}
+    assert parsed["b"]["big"].startswith("B")
+    assert parsed["b"]["big"].endswith("...")
+    assert parsed["_truncated"] == "1 of 3 keys omitted"
+    assert len(out) > 700  # fills the budget instead of freezing at 66
+
+
+@pytest.mark.parametrize(
+    "name,data",
+    [
+        ("skewed", {"a": {"x": "aaa"}, "b": {"big": "B" * 3000}, "c": {"y": "ccc"}}),
+        (
+            "tail_smalls",
+            {
+                "big": {"v": "B" * 400},
+                "m1": {"v": "M" * 50},
+                "m2": {"v": "N" * 50},
+                "s": {"x": "y"},
+            },
+        ),
+    ],
+)
+def test_json_key_truncate_content_is_monotone_in_budget(name: str, data: dict) -> None:
+    """Preserved ORIGINAL content never shrinks as the budget grows, swept
+    contiguously so a one-char cliff cannot hide between sampled points. Raw
+    length may wobble by a few framing chars where the allocator crosses its
+    everything-fits threshold; preserved content is the contract. Output stays
+    valid JSON and within budget at every step."""
+    text = json.dumps(data)
+    prev = -1
+    for budget in range(40, len(text) + 40):
+        out = TruncateCompressor().compress(text, max_chars=budget)
+        parsed = json.loads(out)
+        assert len(out) <= max(2, budget), f"{name}@{budget}: {len(out)} over budget"
+        preserved = _preserved_chars(parsed, data)
+        assert preserved >= prev, f"{name}@{budget}: content shrank {prev} -> {preserved}"
+        prev = preserved
+
+
+def test_json_key_truncate_marker_key_is_collision_safe() -> None:
+    """A real top-level ``_truncated`` key is never clobbered by the synthetic
+    omitted-count marker."""
+    data: dict = {"_truncated": {"real": "VALUE"}}
+    data.update({f"k{i}": {"v": "x" * 80} for i in range(10)})
+    out = TruncateCompressor().compress(json.dumps(data), max_chars=300)
+    parsed = json.loads(out)
+    assert parsed["_truncated"] == {"real": "VALUE"}
+    assert "keys omitted" in parsed["_truncated_"]
+
+
 @pytest.mark.parametrize("budget", [1, 2, 5])
 def test_json_path_stays_valid_json_at_pathological_budget(budget: int) -> None:
     """Contract floor: valid JSON cannot be shorter than ``{}`` (2 chars), so a

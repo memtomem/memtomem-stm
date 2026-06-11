@@ -310,27 +310,66 @@ class TruncateCompressor:
         # Assemble as valid JSON. The old path sliced the assembled string to
         # max_chars and appended a note — producing INVALID JSON and STILL
         # overshooting the budget. Instead drop whole trailing keys (recording
-        # the count in a valid ``_truncated`` member) until the object fits, so
-        # the result always parses and stays within budget.
+        # the count in a valid, collision-safe ``_truncated`` member) until the
+        # object fits, so the result always parses and stays within budget.
         #
         # Contract floor: valid JSON cannot be shorter than ``{}`` (2 chars).
         # For any ``max_chars >= 2`` the result is ``<= max_chars``; at a
         # pathological sub-2-char budget (never produced by config or the
         # manager retention ladder, which raises tiny budgets) JSON validity
         # takes precedence and we still return ``{}``.
+        key_items = list(data.items())
+        marker_key = "_truncated"
+        while marker_key in data:
+            marker_key += "_"
+
         def _assemble(kept: list[str], omitted: int) -> str:
             members = list(kept)
             if omitted:
-                members.append(f'"_truncated": "{omitted} of {len(parts)} keys omitted"')
+                members.append(f'"{marker_key}": "{omitted} of {len(parts)} keys omitted"')
             return "{\n" + ",\n".join(members) + "\n}"
 
         result = _assemble(parts, 0)
         if len(result) <= max_chars:
             return result
+
+        def _render(idx: int, value_budget: int) -> str:
+            k, v = key_items[idx]
+            part = json.dumps(
+                {k: self._truncate_json_value(v, value_budget)}, ensure_ascii=False, indent=2
+            )
+            return part.strip()[1:-1].strip()
+
         for keep in range(len(parts) - 1, -1, -1):
             candidate = _assemble(parts[:keep], len(parts) - keep)
-            if len(candidate) <= max_chars:
-                return candidate
+            if len(candidate) > max_chars:
+                continue
+            # Refill the freed budget into the BOUNDARY key (the first dropped
+            # one). Each part was sized against the FULL key set, so once
+            # trailing keys are dropped the assembly could sit far below
+            # ``max_chars`` and stay there no matter how much the budget grew
+            # (the output used to freeze at the drop point — 66 chars from
+            # max_chars=80 through 1500 on a one-huge-key payload). Grow the
+            # boundary to the largest ``_truncate_json_value`` form that still
+            # fits: the rendered length is monotone in the value budget, so
+            # binary-search it. Only ONE key is refilled: a full-form boundary
+            # would re-create the ``keep + 1`` candidate this loop already
+            # rejected, so (apart from the few-char window where a truncated
+            # string render exceeds its full form by up to 3 chars) the
+            # boundary stays partial and no room is left for the keys after
+            # it.
+            omitted = len(parts) - keep - 1
+            lo, hi, best = 0, max_chars, None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand_part = _render(keep, mid)
+                if len(_assemble([*parts[:keep], cand_part], omitted)) <= max_chars:
+                    best, lo = cand_part, mid + 1
+                else:
+                    hi = mid - 1
+            if best is not None:
+                return _assemble([*parts[:keep], best], omitted)
+            return candidate
         return "{}"
 
     def _truncate_json_value(self, value: object, budget: int) -> object:
