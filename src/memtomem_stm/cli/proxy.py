@@ -1341,15 +1341,22 @@ def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> No
 # put and the user is shown the manual-command fallback.
 
 
-def _claude_mcp_remove(name: str, scope: str) -> tuple[bool, str | None]:
+def _claude_mcp_remove(name: str, scope: str, cwd: str | None = None) -> tuple[bool, str | None]:
     """Shell out to ``claude mcp remove <name> -s <scope>``.
 
     Returns ``(ok, error_message_or_None)``. Treats any non-zero exit or
     subprocess error as a non-fatal failure so the caller can surface the
     manual command instead of aborting the import.
+
+    ``cwd`` matters for ``-s local``: the claude CLI picks the
+    ``~/.claude.json`` project slot from the process cwd, so a remove run
+    from the wrong directory deletes a same-named entry from the wrong
+    project (or nothing). Prune leaves it unset because its discovery
+    matched the current cwd by construction; eject passes the recorded
+    origin path (#475 PR3).
     """
     try:
-        result = _run_claude_mcp(["claude", "mcp", "remove", name, "-s", scope], timeout=5)
+        result = _run_claude_mcp(["claude", "mcp", "remove", name, "-s", scope], timeout=5, cwd=cwd)
     except FileNotFoundError:
         return (False, "`claude` CLI not on PATH")
     except subprocess.TimeoutExpired:
@@ -3073,8 +3080,10 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
         cwd = plan.path if plan.kind == "claude-project" else None
         if plan.overwrite:
             # `claude mcp add-json` has no overwrite flag (same probe lineage
-            # as `claude mcp add`, cli/proxy.py:274) — remove-then-add.
-            ok, err = _claude_mcp_remove(plan.name, scope)
+            # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The
+            # pre-remove needs the same cwd as the add: `-s local` resolves
+            # its project slot from the process cwd on both verbs.
+            ok, err = _claude_mcp_remove(plan.name, scope, cwd=cwd)
             if not ok:
                 return (False, f"--force pre-remove failed: {err}")
         return _claude_mcp_add_json(plan.name, plan.payload, scope, cwd=cwd)
@@ -3088,14 +3097,16 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
 
 
 def _eject_verify(plan: _EjectPlan) -> list[str]:
-    """Post-write verify: re-read the host config, deep-compare to the payload.
+    """Pre-removal verify: re-read the host config, deep-compare to the payload.
 
-    Returns the list of deviating paths (empty = verbatim restore). The
-    claude CLI re-serializes through its own schema and silently drops
-    unknown fields (probed on 2.1.173), so a clean `add-json` exit does not
-    prove the verbatim-restore contract held — only re-reading the backing
-    file does. A `None` read (entry not where expected) reports as a full
-    mismatch rather than crashing.
+    Returns the list of deviating paths (empty = verbatim restore). Runs
+    after a write — the claude CLI re-serializes through its own schema and
+    silently drops unknown fields (probed on 2.1.173), so a clean
+    `add-json` exit does not prove the verbatim-restore contract held —
+    AND on the skipped-write path, where the no-clobber signature match
+    ignores env/headers/unknown fields. Only a host entry deep-equal to
+    the payload may release the STM entry. A `None` read (entry not where
+    expected) reports as a full mismatch rather than crashing.
     """
     assert plan.payload is not None
     actual = _host_existing_entry(plan.kind, plan.path, plan.name)
@@ -3278,25 +3289,31 @@ def eject(
                 continue
             wrote = True
 
-        if wrote:
-            mismatches = _eject_verify(plan)
-            if mismatches:
-                detail = ", ".join(mismatches)
-                if not accept_schema_loss:
-                    failed.append(
-                        (
-                            plan,
-                            "restored host entry does not match the original "
-                            f"({detail}) — the host now has the stripped copy and the "
-                            "STM entry is kept (dual registration); re-run with "
-                            "--accept-schema-loss to remove from STM anyway",
-                        )
+        # Verify on BOTH paths — written and skipped. A same-signature host
+        # entry is not necessarily structurally equal to the original
+        # (signatures ignore env/headers/unknown fields), so removing the
+        # STM entry on signature alone could destroy the only complete copy.
+        # The invariant: STM removal requires a host entry deep-equal to the
+        # payload, or the operator's explicit --accept-schema-loss.
+        mismatches = _eject_verify(plan)
+        if mismatches:
+            detail = ", ".join(mismatches)
+            state = "restored host entry" if wrote else "existing host entry"
+            if not accept_schema_loss:
+                failed.append(
+                    (
+                        plan,
+                        f"{state} does not match the captured original "
+                        f"({detail}) — the STM entry is kept (dual registration); "
+                        "re-run with --accept-schema-loss to remove from STM anyway",
                     )
-                    continue
-                click.echo(
-                    f"  {_warn('Warning:')} '{plan.name}' restored with schema loss: {detail}",
-                    err=True,
                 )
+                continue
+            click.echo(
+                f"  {_warn('Warning:')} '{plan.name}' {state} deviates from the "
+                f"original (schema loss accepted): {detail}",
+                err=True,
+            )
 
         if not keep:
             del servers[plan.name]

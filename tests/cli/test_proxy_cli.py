@@ -2345,7 +2345,7 @@ class TestInitMcpRegistration:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -2817,7 +2817,7 @@ class TestRegisterCommand:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -3256,7 +3256,7 @@ class TestAddFromClientsPrune:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -3579,7 +3579,7 @@ class TestPruneCommand:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -4005,7 +4005,7 @@ class TestPruneBackupLog:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -4238,7 +4238,7 @@ class TestPerSourcePrunedMetadata:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
@@ -4673,6 +4673,40 @@ class TestEjectCommand:
         assert "--force" in result.output
         assert "demo" in self._stm_servers(config)
 
+    def test_same_signature_different_content_never_releases_stm(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """A host entry matching by signature (command/args) but NOT
+        structurally (missing env / host-only fields) must not satisfy the
+        verbatim-restore invariant: the write is skipped, but the pre-removal
+        verify keeps the STM entry — signature alone ignores exactly the
+        fields the original exists to preserve (codex R1 Blocker)."""
+        original = {
+            "command": "npx",
+            "args": ["-y", "@demo"],
+            "env": {"PLAIN": "1"},
+            "hostOnly": True,
+        }
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": {"command": "npx", "args": ["-y", "@demo"]}}}),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert fake_claude_host["calls"] == []  # write was skipped...
+        assert "demo" in self._stm_servers(config)  # ...and removal blocked
+        assert "existing host entry does not match" in result.output
+        assert "--accept-schema-loss" in result.output
+
+        accepted = runner.invoke(
+            cli, ["eject", "demo", "--yes", "--accept-schema-loss", *_cfg_args(config)]
+        )
+        assert accepted.exit_code == 0, accepted.output
+        assert "demo" not in self._stm_servers(config)
+
     def test_signature_none_deep_equal_skips(
         self, runner, config, fake_claude_host, _hermetic_home
     ):
@@ -4769,6 +4803,32 @@ class TestEjectCommand:
         assert add["cwd"] == recorded  # verbatim, not str(real)
         assert add["cmd"][-2:] == ["-s", "local"]
         assert "demo" not in self._stm_servers(config)
+
+    def test_force_pre_remove_runs_at_recorded_path_too(
+        self, runner, config, tmp_path, fake_claude_host, _hermetic_home
+    ):
+        """`--force` remove-then-add: BOTH verbs need the recorded cwd —
+        `claude mcp remove -s local` run from elsewhere would delete a
+        same-named entry from the wrong project (codex R1 Blocker). The
+        test process cwd is unrelated to the recorded path by construction."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        recorded = str(proj)
+        cc = {
+            "projects": {
+                recorded: {"mcpServers": {"demo": {"command": "other-server"}}},
+            }
+        }
+        (_hermetic_home / ".claude.json").write_text(json.dumps(cc), encoding="utf-8")
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=recorded)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        by_verb = {c["cmd"][2]: c for c in fake_claude_host["calls"]}
+        assert set(by_verb) == {"remove", "add-json"}
+        assert by_verb["remove"]["cwd"] == recorded
+        assert by_verb["add-json"]["cwd"] == recorded
 
     def test_claude_project_vanished_path_aborts_entry(self, runner, config, tmp_path):
         gone = str(tmp_path / "deleted-proj")
@@ -5228,7 +5288,7 @@ class TestInitPruneOriginals:
 
         state: dict = {"calls": [], "script": []}
 
-        def fake_run(cmd, timeout=5):
+        def fake_run(cmd, timeout=5, cwd=None):
             state["calls"].append(list(cmd))
             if state["script"]:
                 nxt = state["script"].pop(0)
