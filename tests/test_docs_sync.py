@@ -178,6 +178,7 @@ _PROXY_MANAGER_EXPECTED_KWARGS = frozenset(
         "cache",
         "env_overrides",
         "progressive_reads_tracker",
+        "selection_log",
     }
 )
 

@@ -103,8 +103,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     # Shared state — populated only when proxy is enabled
     from memtomem_stm.proxy.cache import ProxyCache
     from memtomem_stm.proxy.metrics_store import MetricsStore
+    from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 
     metrics_store: MetricsStore | None = None
+    selection_log: SelectionTelemetryLog | None = None
     proxy_cache: ProxyCache | None = None
     surfacing_engine: SurfacingEngine | None = None
     mcp_adapter = None
@@ -162,6 +164,27 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         exc_info=True,
                     )
                     progressive_reads_tracker = None
+
+            # Selection/execution telemetry (#467) — append-only JSONL log
+            # of which tool the client picked from the advertised set and
+            # how the call went. Opt-in; read at startup like
+            # ``metrics.enabled`` (no hot-reload).
+            if config.proxy.selection_telemetry.enabled:
+                try:
+                    st_cfg = config.proxy.selection_telemetry
+                    selection_log = SelectionTelemetryLog(
+                        st_cfg.path,
+                        max_bytes=st_cfg.max_bytes,
+                        max_backups=st_cfg.max_backups,
+                        sample_rate=st_cfg.sample_rate,
+                    )
+                    selection_log.initialize()
+                except Exception:
+                    logger.warning(
+                        "Selection telemetry init failed — telemetry disabled",
+                        exc_info=True,
+                    )
+                    selection_log = None
 
             # Surfacing engine — LTM access is always remote-only via the
             # MCP client adapter. The adapter spawns (or connects to) a
@@ -267,6 +290,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             cache=proxy_cache,
             env_overrides=proxy_env_overrides,
             progressive_reads_tracker=progressive_reads_tracker,
+            selection_log=selection_log,
         )
 
         if config.proxy.enabled:
@@ -324,6 +348,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             (feedback_tracker, "feedback_tracker"),
             (compression_feedback_tracker, "compression_feedback_tracker"),
             (progressive_reads_tracker, "progressive_reads_tracker"),
+            (selection_log, "selection_log"),
         ]:
             if resource is not None:
                 try:

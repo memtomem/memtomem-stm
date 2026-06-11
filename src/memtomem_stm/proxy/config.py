@@ -529,6 +529,28 @@ class ProgressiveReadsConfig(BaseModel):
     db_path: Path = Path("~/.memtomem/stm_feedback.db")
 
 
+class SelectionTelemetryConfig(BaseModel):
+    """Configuration for tool-selection telemetry (#467).
+
+    When enabled, the proxy appends one ``selection`` + one ``execution``
+    JSONL record per proxied call to ``path`` (schema and redaction policy
+    in ``proxy/selection_log.py``). Off by default: it is a new disk write
+    path, so the operator opts in explicitly. The flag is read at startup
+    (lifespan wiring, like ``metrics.enabled``) — toggling it requires a
+    restart, not a hot-reload.
+    """
+
+    enabled: bool = False
+    path: Path = Path("~/.memtomem/stm_selection_log.jsonl")
+    sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Fraction of calls recorded; applies to the selection+execution pair
+    atomically so the log never contains orphan halves."""
+    max_bytes: int = Field(default=50_000_000, gt=0)
+    """Rotate the log when it reaches this size."""
+    max_backups: int = Field(default=3, ge=0)
+    """Rotated files kept (``.1`` … ``.N``); ``0`` truncates instead."""
+
+
 # Static context window sizes (tokens) for known model families.
 # Used by ProxyConfig.effective_max_result_chars() to scale compression budget.
 # Prefix-matched: "claude-sonnet-4-20250514" matches "claude-sonnet-4".
@@ -661,6 +683,7 @@ class ProxyConfig(BaseModel):
         default_factory=CompressionFeedbackConfig
     )
     progressive_reads: ProgressiveReadsConfig = Field(default_factory=ProgressiveReadsConfig)
+    selection_telemetry: SelectionTelemetryConfig = Field(default_factory=SelectionTelemetryConfig)
 
     @model_validator(mode="after")
     def _check_nonempty_upstream_prefixes(self) -> Self:

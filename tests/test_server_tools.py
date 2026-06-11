@@ -1208,6 +1208,7 @@ class TestLifespan:
             mock_cfg.proxy.metrics.enabled = False
             mock_cfg.proxy.compression_feedback.enabled = False
             mock_cfg.proxy.progressive_reads.enabled = False
+            mock_cfg.proxy.selection_telemetry.enabled = False
             mock_cfg.proxy.cache.enabled = False
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = True
@@ -1258,6 +1259,7 @@ class TestLifespan:
             mock_cfg.proxy.metrics.enabled = False
             mock_cfg.proxy.compression_feedback.enabled = False
             mock_cfg.proxy.progressive_reads.enabled = False
+            mock_cfg.proxy.selection_telemetry.enabled = False
             mock_cfg.proxy.cache.enabled = False
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = True
