@@ -143,6 +143,36 @@ Can this question be answered from the document above?"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Response parsing
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _loads_lenient(raw: str) -> dict:
+    """Parse one JSON object from an LLM response.
+
+    Tolerates two shapes a bare ``json.loads`` rejects but judge models emit
+    routinely: a markdown code fence around the object, and trailing prose
+    *after* the object (``json.JSONDecodeError: Extra data``). The OpenAI judge
+    sets ``response_format={"type": "json_object"}`` and never hits either, but
+    the Anthropic Messages API has no equivalent mode, so Haiku appends a
+    sentence often enough to fail real runs. Strip a leading fence, then decode
+    just the first JSON value from the first ``{`` — anything after the object
+    is discarded.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("no JSON object in response", text or raw, 0)
+    obj, _end = json.JSONDecoder().raw_decode(text, start)
+    return obj
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # LLM providers
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -282,15 +312,7 @@ class LLMJudge:
 
     def _parse_score_response(self, raw: str) -> tuple[float, list[JudgeDimension]]:
         """Parse JSON score response from LLM."""
-        # Strip markdown code fences if present
-        text = raw.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-        data = json.loads(text)
+        data = _loads_lenient(raw)
         dims = []
         for key in ("factual_completeness", "structural_coherence", "answer_sufficiency"):
             d = data.get(key, {})
@@ -330,12 +352,7 @@ class LLMJudge:
                     qa_raw, qp, qc = await self._call_llm(_QA_SYSTEM_PROMPT, qa_prompt)
                     total_qa_tokens = (total_qa_tokens[0] + qp, total_qa_tokens[1] + qc)
                     try:
-                        qa_text = qa_raw.strip()
-                        if qa_text.startswith("```"):
-                            qa_text = qa_text.split("\n", 1)[1] if "\n" in qa_text else qa_text[3:]
-                            if qa_text.endswith("```"):
-                                qa_text = qa_text[:-3]
-                        qa_data = json.loads(qa_text.strip())
+                        qa_data = _loads_lenient(qa_raw)
                         qa_results.append(
                             {
                                 "question": qa.question,
