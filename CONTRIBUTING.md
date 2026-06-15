@@ -81,6 +81,32 @@ short version follows. When adding a new scenario:
    must stay green. If you changed anything the LLM judge touches,
    also run `OPENAI_API_KEY=… uv run pytest -m bench_qa_llm_judge`
    and sanity-check the correlation log.
+6. Add the scenario id to `SUITE_SCENARIOS` in
+   `tests/bench/bench_qa/replay.py` (the shared roster behind both the
+   determinism and drift gates), then regenerate the drift baseline (see
+   below) — adding a scenario changes the merged `report.json`.
+
+## The cross-version drift gate
+
+`bench_qa_drift` (advisory) pins the whole canonical `report.json` to the
+committed `tests/bench/fixtures/drift_baseline.json`. The per-PR `bench_qa`
+gate only enforces *absolute* per-scenario floors; the drift gate catches a
+metric sliding the wrong way across PRs while still above its floor, by
+forcing every report change through a reviewed baseline diff.
+
+When `uv run pytest -m bench_qa_drift` (or the advisory CI job) reds and the
+change is **intended** — a compressor/surfacing change, a new scenario, a
+re-baselined floor — regenerate and commit the baseline in the same PR:
+
+```bash
+uv run python tests/bench/bench_qa/regen_drift_baseline.py
+```
+
+The script prints a directional REGRESSION / IMPROVEMENT / NEUTRAL summary of
+what moved; read it, confirm the direction is intended, then commit
+`drift_baseline.json` with a `## Baseline change` callout in the PR body
+explaining each moved field. Never hand-edit the baseline — byte-stability is
+the gate's contract and the regen script is its only writer.
 
 ## Contributor License Agreement (CLA)
 
