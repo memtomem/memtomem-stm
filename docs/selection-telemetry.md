@@ -68,7 +68,8 @@ stamp).
 | `ok` | `true`/`false` |
 | `latency_ms` | proxy-side wall time for the full pipeline (what the agent experienced) |
 | `error_type` | exception class name only; the typed category stays in `proxy_metrics.db` |
-| `retry_count`, `cost`, `cache_hit` | reserved `null` in v0 |
+| `cache_hit` | `true` when the result was served from the proxy response cache, `false` on a live upstream call, `null` when a raise escaped before the hit/miss was attributable |
+| `retry_count`, `cost` | reserved `null` |
 
 ### `feedback` — schema pinned, no emitter yet
 
@@ -197,7 +198,8 @@ it reports two views:
 - **Persisted aggregate** — read off the active log file: event counts,
   selections **by ranker version** (the #468 cohort split — confirm each
   cohort has enough samples before replay), by server and tool, execution
-  ok/error rate and latency p50/p95/p99, and the #465 reject-reason tally.
+  ok/error rate, latency p50/p95/p99, cache hit/miss rate, and the #465
+  reject-reason tally.
 
 Rotated backups (`log.1` …) are noted but not parsed — the summary covers the
 active log only. For the full history, or any join against `proxy_metrics.db`,

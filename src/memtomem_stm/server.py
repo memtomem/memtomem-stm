@@ -1394,6 +1394,13 @@ def _format_selection_stats_sections(agg: dict, live: dict[str, int]) -> list[st
                 f"  latency_ms p50/p95/p99: {lat['p50']} / {lat['p95']} / {lat['p99']} "
                 f"(n={lat['count']})"
             )
+        cache = agg["cache"]
+        if cache["hit"] or cache["miss"] or cache["unknown"]:
+            unknown = f", unknown {cache['unknown']}" if cache["unknown"] else ""
+            lines.append(
+                f"  cache hit/miss: {cache['hit']} / {cache['miss']} "
+                f"(hit_rate {cache['hit_rate']:.4f}{unknown})"
+            )
     _append_top_section(
         lines, "Execution error types", agg["by_error_type"], agg["by_error_type_distinct"]
     )

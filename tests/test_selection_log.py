@@ -156,7 +156,7 @@ class TestSchemaStability:
 
     def test_v0_reserved_fields(self, tmp_path):
         """Reserved-until-later fields are present and null/empty in v0 so
-        the schema doesn't change shape when #465/toolgraph populate them."""
+        the schema doesn't change shape when later work populates them."""
         log = _make_log(tmp_path)
         _log_pair(log)
 
@@ -166,7 +166,25 @@ class TestSchemaStability:
         assert selection["graph_generation"] is None
         assert execution["retry_count"] is None
         assert execution["cost"] is None
-        assert execution["cache_hit"] is None
+
+    def test_cache_hit_is_per_call_populatable(self, tmp_path):
+        """The cache_hit seam is populated, not added — passing it sets the
+        field without changing the top-level key set, and omitting it keeps
+        the unattributable ``None`` default."""
+        log = _make_log(tmp_path)
+        for value in (True, False, None):
+            log.log_execution(
+                selection_id="s",
+                trace_id=None,
+                server="srv",
+                selected_tool="test__tool",
+                ok=True,
+                latency_ms=1.0,
+                cache_hit=value,
+            )
+        records = _read_events(log)
+        assert all(set(r) == EXECUTION_KEYS for r in records)
+        assert [r["cache_hit"] for r in records] == [True, False, None]
 
     def test_reject_reasons_are_per_call_populatable(self, tmp_path):
         """#465 wires the hard filter's verdict into the reserved seam: the
@@ -409,7 +427,9 @@ def _make_result(text: str):
     return SimpleNamespace(content=[_text_content(text)], isError=False)
 
 
-def _make_manager(tmp_path: Path, **log_kwargs) -> tuple[ProxyManager, SelectionTelemetryLog]:
+def _make_manager(
+    tmp_path: Path, *, cache=None, **log_kwargs
+) -> tuple[ProxyManager, SelectionTelemetryLog]:
     server_cfg = UpstreamServerConfig(
         prefix="test",
         compression=CompressionStrategy.NONE,
@@ -422,7 +442,7 @@ def _make_manager(tmp_path: Path, **log_kwargs) -> tuple[ProxyManager, Selection
         min_result_retention=0.0,
     )
     log = _make_log(tmp_path, **log_kwargs)
-    mgr = ProxyManager(proxy_cfg, TokenTracker(), selection_log=log)
+    mgr = ProxyManager(proxy_cfg, TokenTracker(), cache=cache, selection_log=log)
 
     session = AsyncMock()
     tool = SimpleNamespace(name="tool", description="a tool", inputSchema={"type": "object"})
@@ -525,6 +545,47 @@ class TestManagerWireIn:
             name="srv", config=server_cfg, session=session, tools=[]
         )
         assert await mgr.call_tool("srv", "tool", {}) == "ok!"
+
+    async def test_cache_hit_field_true_on_hit_false_on_live(self, tmp_path):
+        """The execution event records whether the result came from the
+        response cache: ``True`` on a fast-path hit, ``False`` on a live
+        upstream call. Wires through ``_call_tool_guarded``'s
+        ``(result, cache_hit)`` return (the #467 cache_hit field)."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        cache = ProxyCache(tmp_path / "cache.db")
+        cache.initialize()
+        cache.set("srv", "tool", {"q": "hit"}, "cached!", ttl_seconds=300.0)
+        mgr, log = _make_manager(tmp_path, cache=cache)
+        mgr.get_proxy_tools()
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("live!")
+
+        # Pre-cached args → fast-path hit (no upstream call).
+        assert await mgr.call_tool("srv", "tool", {"q": "hit"}) == "cached!"
+        # Un-cached args → live upstream call.
+        assert await mgr.call_tool("srv", "tool", {"q": "miss"}) == "live!"
+
+        executions = [e for e in _read_events(log) if e["event"] == "execution"]
+        assert len(executions) == 2
+        # Events append in call order: first call (hit) then second (live).
+        assert executions[0]["cache_hit"] is True
+        assert executions[1]["cache_hit"] is False
+
+    async def test_pipeline_error_leaves_cache_hit_null(self, tmp_path):
+        """A raise escaping the guarded call means the hit/miss was never
+        attributed — the execution event stays ``cache_hit=None`` rather
+        than guessing."""
+        mgr, log = _make_manager(tmp_path)
+        mgr.get_proxy_tools()
+        mgr._connections["srv"].session.call_tool.side_effect = RuntimeError("boom")
+
+        with pytest.raises(Exception):
+            await mgr.call_tool("srv", "tool", {})
+
+        executions = [e for e in _read_events(log) if e["event"] == "execution"]
+        assert len(executions) == 1
+        assert executions[0]["ok"] is False
+        assert executions[0]["cache_hit"] is None
 
 
 # ── snapshot (live write-path counters) ──────────────────────────────────
@@ -717,3 +778,26 @@ class TestAggregateSelectionLog:
         assert agg["rotated_backups"] == 2
         # only the active file's one selection is in the aggregate
         assert agg["events"]["selection"] == 1
+
+    def test_cache_hit_miss_unknown_tally_and_hit_rate(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _exec(cache_hit=True),
+                _exec(cache_hit=True),
+                _exec(cache_hit=True),
+                _exec(cache_hit=False),
+                _exec(cache_hit=None),  # in-pipeline raise: unattributable
+                _exec(),  # missing field → unknown
+            ],
+        )
+        agg = aggregate_selection_log(p)
+        # hit_rate denominator excludes the 2 unknowns: 3 / (3 + 1) = 0.75
+        assert agg["cache"] == {"hit": 3, "miss": 1, "unknown": 2, "hit_rate": 0.75}
+
+    def test_cache_zeroed_when_no_executions(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(p, [_sel()])
+        agg = aggregate_selection_log(p)
+        assert agg["cache"] == {"hit": 0, "miss": 0, "unknown": 0, "hit_rate": 0.0}

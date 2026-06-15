@@ -32,8 +32,10 @@ sorted, so a replay harness can stream-parse and diff runs:
     wall time for the full pipeline, what the agent experienced),
     ``error_type`` (exception class name; the *typed* error category
     stays in ``proxy_metrics.db``, joinable via ``trace_id`` — not
-    duplicated here), ``retry_count`` / ``cost`` / ``cache_hit``
-    (reserved ``null`` in v0), ``ts``.
+    duplicated here), ``cache_hit`` (``true`` when the result was served
+    from the proxy response cache, ``false`` on a live upstream call,
+    ``null`` when telemetry can't attribute it — e.g. an in-pipeline
+    raise), ``retry_count`` / ``cost`` (reserved ``null``), ``ts``.
 
 ``feedback``
     ``selection_id`` (+ optional ``trace_id``), ``user_corrected``,
@@ -254,6 +256,7 @@ class SelectionTelemetryLog:
         latency_ms: float,
         error_type: str | None = None,
         ranker_version: str | None = None,
+        cache_hit: bool | None = None,
     ) -> None:
         self._append(
             {
@@ -270,7 +273,7 @@ class SelectionTelemetryLog:
                 "error_type": error_type,
                 "retry_count": None,
                 "cost": None,
-                "cache_hit": None,
+                "cache_hit": cache_hit,
             }
         )
 
@@ -424,6 +427,7 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
         "reject_reasons": [],
         "reject_reasons_distinct": 0,
         "latency_ms": {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0},
+        "cache": {"hit": 0, "miss": 0, "unknown": 0, "hit_rate": 0.0},
     }
     if not result["exists"]:
         return result
@@ -434,6 +438,7 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
     error_types: Counter[str] = Counter()
     reject_reasons: Counter[str] = Counter()
     ok = err = 0
+    cache_hit = cache_miss = cache_unknown = 0
     latencies: list[float] = []
 
     try:
@@ -471,6 +476,13 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
                     etype = rec.get("error_type")
                     if etype is not None:
                         error_types[str(etype)] += 1
+                    ch = rec.get("cache_hit")
+                    if ch is True:
+                        cache_hit += 1
+                    elif ch is False:
+                        cache_miss += 1
+                    else:
+                        cache_unknown += 1
                     lat = rec.get("latency_ms")
                     if isinstance(lat, (int, float)) and not isinstance(lat, bool):
                         latencies.append(float(lat))
@@ -505,4 +517,14 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
             "p95": round(_percentile(latencies, 95), 2),
             "p99": round(_percentile(latencies, 99), 2),
         }
+    # hit_rate is over attributable executions only (hit + miss); unknowns
+    # (in-pipeline raises before the field is set) are excluded from the
+    # denominator so a burst of errors can't deflate the cache hit rate.
+    attributable = cache_hit + cache_miss
+    result["cache"] = {
+        "hit": cache_hit,
+        "miss": cache_miss,
+        "unknown": cache_unknown,
+        "hit_rate": round(cache_hit / attributable, 4) if attributable else 0.0,
+    }
     return result

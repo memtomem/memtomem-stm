@@ -1141,6 +1141,7 @@ class TestSelectionStats:
             selected_tool="gh__a",
             ok=True,
             latency_ms=12.0,
+            cache_hit=True,
         )
         ctx = _ctx_with_selection(tmp_path, log=log)
         result = await stm_selection_stats(ctx=ctx)
@@ -1153,6 +1154,7 @@ class TestSelectionStats:
         assert "Selections by server:" in result
         assert "Execution outcomes:" in result
         assert "ok: 1" in result
+        assert "cache hit/miss: 1 / 0" in result
         assert "Reject reasons (#465 hard filter):" in result
         assert "config_hidden: 1" in result
 
