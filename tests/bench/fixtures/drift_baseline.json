@@ -1,0 +1,288 @@
+{
+  "run_seed": 0,
+  "scenarios": [
+    {
+      "metrics": {
+        "cleaned_chars": 1132,
+        "compressed_chars": 849,
+        "compression_ratio": 0.75,
+        "compression_strategy": "truncate\u2192hybrid_fallback",
+        "original_chars": 4536,
+        "ratio_violation": 1,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 0,
+        "ratio": 1.0,
+        "total": 0
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s01",
+      "tier": "truncate\u2192hybrid_fallback",
+      "trace_id": "bench-006fdf0f7456627d",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 2520,
+        "compressed_chars": 1993,
+        "compression_ratio": 0.7909,
+        "compression_strategy": "extract_fields",
+        "original_chars": 2521,
+        "ratio_violation": 0,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 2,
+        "ratio": 0.6667,
+        "total": 3
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s02",
+      "tier": "extract_fields",
+      "trace_id": "bench-d837cdb9d88dbd9c",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 1671,
+        "compressed_chars": 1379,
+        "compression_ratio": 0.8253,
+        "compression_strategy": "truncate",
+        "original_chars": 1672,
+        "ratio_violation": 0,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 2,
+        "ratio": 0.6667,
+        "total": 3
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s03",
+      "tier": "truncate",
+      "trace_id": "bench-bde1a603f1f9a674",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 3244,
+        "compressed_chars": 2513,
+        "compression_ratio": 0.7747,
+        "compression_strategy": "truncate",
+        "original_chars": 3245,
+        "ratio_violation": 0,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 2,
+        "ratio": 0.6667,
+        "total": 3
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s04",
+      "tier": "truncate",
+      "trace_id": "bench-bffc5f0f1765615b",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 11827,
+        "compressed_chars": 3231,
+        "compression_ratio": 0.2732,
+        "compression_strategy": "skeleton",
+        "original_chars": 11828,
+        "ratio_violation": 0,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 3,
+        "ratio": 1.0,
+        "total": 3
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s05",
+      "tier": "skeleton",
+      "trace_id": "bench-da0b6833c009f2a0",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 10859,
+        "compressed_chars": 4143,
+        "compression_ratio": 0.3815,
+        "compression_strategy": "truncate\u2192progressive_fallback",
+        "original_chars": 10860,
+        "ratio_violation": 1,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "progressive": {
+        "chunks": 3,
+        "round_trip_equal": true,
+        "total_chars": 10859
+      },
+      "qa": {
+        "answerable": 0,
+        "ratio": 1.0,
+        "total": 0
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s06",
+      "tier": "truncate\u2192progressive_fallback",
+      "trace_id": "bench-89b457e498ab3f2e",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 12513,
+        "compressed_chars": 8118,
+        "compression_ratio": 0.6488,
+        "compression_strategy": "selective",
+        "original_chars": 12513,
+        "ratio_violation": 1,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 5,
+        "ratio": 0.8333,
+        "total": 6
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s07",
+      "tier": "selective",
+      "trace_id": "bench-63270e3f4c379fdb",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 1434,
+        "compressed_chars": 992,
+        "compression_ratio": 0.6918,
+        "compression_strategy": "truncate\u2192truncate_fallback",
+        "original_chars": 7180,
+        "ratio_violation": 1,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 0,
+        "ratio": 1.0,
+        "total": 0
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s08",
+      "tier": "truncate\u2192truncate_fallback",
+      "trace_id": "bench-de8eaa257436c85e",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 2513,
+        "compressed_chars": 2513,
+        "compression_ratio": 1.0,
+        "compression_strategy": "none",
+        "original_chars": 2514,
+        "ratio_violation": 0,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 3,
+        "ratio": 1.0,
+        "total": 3
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s09",
+      "tier": "none",
+      "trace_id": "bench-32813a76d14037fd",
+      "verdict": "pass"
+    },
+    {
+      "metrics": {
+        "cleaned_chars": 5114,
+        "compressed_chars": 5114,
+        "compression_ratio": 1.0,
+        "compression_strategy": "none",
+        "original_chars": 5115,
+        "ratio_violation": 0,
+        "surface_error": null,
+        "surfacing_on_progressive_ok": null
+      },
+      "qa": {
+        "answerable": 2,
+        "ratio": 1.0,
+        "total": 2
+      },
+      "rule_judge": {
+        "missing_keywords": [],
+        "score": 0.0
+      },
+      "scenario_id": "s10",
+      "surfacing": {
+        "expected_ids": [
+          "6b358287b37ef447",
+          "4eee90bb62974036"
+        ],
+        "recall_at_k": 1.0,
+        "returned_ids": [
+          "6b358287b37ef447",
+          "4eee90bb62974036"
+        ]
+      },
+      "tier": "none",
+      "trace_id": "bench-2f21951e09186984",
+      "verdict": "pass"
+    }
+  ],
+  "schema_version": 1,
+  "tier_histogram": {
+    "extract_fields": 1,
+    "none": 2,
+    "selective": 1,
+    "skeleton": 1,
+    "truncate": 2,
+    "truncate\u2192hybrid_fallback": 1,
+    "truncate\u2192progressive_fallback": 1,
+    "truncate\u2192truncate_fallback": 1
+  },
+  "totals": {
+    "failing": 0.0,
+    "passing": 10.0,
+    "scenarios": 10.0,
+    "tokens_saved_approx": 5495.0
+  }
+}

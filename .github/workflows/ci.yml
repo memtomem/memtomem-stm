@@ -57,7 +57,7 @@ jobs:
         with:
           version: "latest"
       - run: uv sync --frozen
-      - run: uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep" --tb=short -q
+      - run: uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift" --tb=short -q
 
   notebooks:
     runs-on: ubuntu-latest
@@ -150,3 +150,34 @@ jobs:
             gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@body.md >/dev/null
             echo "created sticky bench_qa comment"
           fi
+
+  bench_qa_drift:
+    # ADVISORY cross-version drift gate (post-gate roadmap item 8). Pins the
+    # whole canonical report.json to tests/bench/fixtures/drift_baseline.json so
+    # a metric sliding the wrong way across PRs — even while still above its
+    # per-scenario floor — must pass through a reviewed baseline diff. The
+    # per-PR `bench_qa` gate only enforces absolute floors and cannot see a slow
+    # slide between them. Self-contained: the test rebuilds the report in-process
+    # from fixtures (no dependency on the bench-qa-report artifact). continue-on-
+    # error keeps it non-blocking; promote to required (flip to false + add to
+    # branch-protection) after an observation window, mirroring #482.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - run: uv sync --frozen
+      - name: Run bench_qa drift gate
+        env:
+          BENCH_QA_REPORT_DIR: ${{ github.workspace }}/bench-qa-drift-report
+        run: uv run pytest -m "bench_qa_drift" --tb=short -q
+      - name: Upload drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-qa-drift-report
+          path: bench-qa-drift-report/
+          if-no-files-found: ignore
+          retention-days: 14

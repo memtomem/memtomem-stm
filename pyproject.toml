@@ -84,6 +84,7 @@ markers = [
     "bench_qa_meta: self-test probes for bench_qa — intentional failures, NOT CI-safe",
     "bench_qa_llm_judge: LLM-as-judge advisory scoring — requires OPENAI_API_KEY or ANTHROPIC_API_KEY, off in default CI",
     "bench_qa_sweep: measurement runs that emit curve artifacts; off in default and advisory CI, invoked manually",
+    "bench_qa_drift: cross-version snapshot drift gate vs committed drift_baseline.json; advisory until promoted (regen with tests/bench/bench_qa/regen_drift_baseline.py)",
 ]
 
 [tool.mypy]
