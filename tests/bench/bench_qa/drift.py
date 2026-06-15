@@ -84,11 +84,17 @@ SCENARIO_EXCLUDED: dict[str, str] = {
 
 # Top-level BenchReport totals direction.
 TOTALS_DIRECTION: dict[str, str] = {
-    "totals.scenarios": NEUTRAL,  # roster size; a drop is caught by the roster lockstep test
+    "totals.scenarios": NEUTRAL,  # roster size; a one-sided drop trips the roster lockstep test
     "totals.passing": DOWN_BAD,
     "totals.failing": UP_BAD,
     "totals.tokens_saved_approx": DOWN_BAD,  # coarse //4 suite-sum; advisory trend
 }
+
+# Nested metric dicts inside a ScenarioReport (vs scalar scenario-level fields).
+_SCENARIO_SECTIONS = ("metrics", "rule_judge", "qa", "progressive", "surfacing")
+# Top-level BenchReport keys diffed structurally elsewhere in classify_drift;
+# every other top-level key (schema_version, run_seed, …) is walked as a scalar.
+_REPORT_AGGREGATES = ("scenarios", "totals", "tier_histogram")
 
 
 @dataclass(frozen=True)
@@ -168,22 +174,30 @@ def _diff_section(
 
 
 def _diff_scenario(sid: str, old: dict[str, Any], new: dict[str, Any]) -> list[FieldDrift]:
+    """Diff one scenario, walking EVERY key so a new field can never be silently
+    dropped from the summary — unknown scalars surface as NEUTRAL "unclassified
+    field", mirroring :func:`_diff_section`. The coverage test still forces a
+    deliberate direction for known fields; this generic walk is the runtime net
+    that keeps the classifier complete vs the gate's whole-dict deep-equal."""
     drifts: list[FieldDrift] = []
-    nested = ("metrics", "rule_judge", "qa", "progressive", "surfacing")
-    scalars = ("trace_id", "tier", "verdict")
-    for section in nested:
-        ov, nv = old.get(section, {}) or {}, new.get(section, {}) or {}
-        for d in _diff_section(section, ov, nv, SCENARIO_DIRECTION):
-            if d.scope in SCENARIO_EXCLUDED:
-                continue
-            drifts.append(FieldDrift(f"{sid}.{d.scope}", d.old, d.new, d.label, d.note))
-    for field in scalars:
-        ov, nv = old.get(field), new.get(field)
+    for key in sorted(set(old) | set(new)):
+        if key == "scenario_id":  # the row key, not a metric
+            continue
+        ov, nv = old.get(key), new.get(key)
         if ov == nv:
             continue
-        policy = SCENARIO_DIRECTION.get(field, NEUTRAL)
-        label, note = _direction_label(policy, ov, nv)
-        drifts.append(FieldDrift(f"{sid}.{field}", ov, nv, label, note))
+        if key in _SCENARIO_SECTIONS:
+            for d in _diff_section(key, ov or {}, nv or {}, SCENARIO_DIRECTION):
+                if d.scope in SCENARIO_EXCLUDED:
+                    continue
+                drifts.append(FieldDrift(f"{sid}.{d.scope}", d.old, d.new, d.label, d.note))
+        else:
+            policy = SCENARIO_DIRECTION.get(key)
+            if policy is None:
+                drifts.append(FieldDrift(f"{sid}.{key}", ov, nv, "NEUTRAL", "unclassified field"))
+            else:
+                label, note = _direction_label(policy, ov, nv)
+                drifts.append(FieldDrift(f"{sid}.{key}", ov, nv, label, note))
     return drifts
 
 
@@ -220,6 +234,17 @@ def classify_drift(old_report: dict[str, Any], new_report: dict[str, Any]) -> li
                 "strategy routing distribution changed",
             )
         )
+
+    # Top-level report scalars (schema_version, run_seed, any future key). The
+    # gate compares the whole dict, so the classifier must walk every top-level
+    # key too — otherwise a scalar-only diff fails the gate while the summary
+    # reads "No drift". Aggregates above are already covered.
+    for key in sorted(set(old_report) | set(new_report)):
+        if key in _REPORT_AGGREGATES:
+            continue
+        ov, nv = old_report.get(key), new_report.get(key)
+        if ov != nv:
+            drifts.append(FieldDrift(key, ov, nv, "NEUTRAL", "top-level report field changed"))
     return drifts
 
 

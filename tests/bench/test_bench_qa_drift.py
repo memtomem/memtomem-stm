@@ -84,7 +84,15 @@ async def test_live_report_matches_committed_baseline(tmp_path):
 
     if live != baseline:
         drifts = classify_drift(baseline, live)
-        summary = format_drift_md(drifts)
+        # classify_drift walks the whole report, so this fallback should be
+        # unreachable — it guards against ever printing "No drift" inside a red
+        # failure if a future field escapes the walk.
+        summary = (
+            format_drift_md(drifts)
+            if drifts
+            else "Reports differ but no field-level drift was classified — "
+            "inspect the report.json deep-equal directly."
+        )
         # Persist the directional summary as a CI artifact when a report dir
         # is configured (the advisory job sets BENCH_QA_REPORT_DIR).
         report_dir = os.environ.get("BENCH_QA_REPORT_DIR")
@@ -142,6 +150,15 @@ def test_drift_baseline_matches_suite_roster():
         f"a fixture was added/removed without regenerating; run {_REGEN_CMD}"
     )
     assert baseline["schema_version"] == 1
+    # Coverage floor: a snapshot scheme can't fully prevent a self-blessing
+    # same-PR roster shrink (delete fixture + drop from SUITE_SCENARIOS +
+    # regen), but pinning a minimum forces that reduction to be a deliberate,
+    # reviewable edit to this number rather than a silent one.
+    assert len(SUITE_SCENARIOS) >= 10, (
+        f"SUITE_SCENARIOS shrank to {len(SUITE_SCENARIOS)} below the canonical 10 "
+        "(s01–s10) — lowering coverage must be intentional; drop this floor "
+        "explicitly with reviewer sign-off."
+    )
 
 
 def test_drift_baseline_has_no_nonreproducible_fields():
@@ -170,23 +187,29 @@ def test_direction_table_covers_every_schema_field():
         ProgressiveResult,
         QAResult,
         RuleJudgeResult,
+        ScenarioReport,
         SurfacingResult,
     )
 
+    sections = {
+        "metrics": MetricSummary,
+        "qa": QAResult,
+        "surfacing": SurfacingResult,
+        "progressive": ProgressiveResult,
+        "rule_judge": RuleJudgeResult,
+    }
     expected: set[str] = set()
-    for section, td in [
-        ("metrics", MetricSummary),
-        ("qa", QAResult),
-        ("surfacing", SurfacingResult),
-        ("progressive", ProgressiveResult),
-        ("rule_judge", RuleJudgeResult),
-    ]:
+    for section, td in sections.items():
         for field in td.__annotations__:
             expected.add(f"{section}.{field}")
     # Stage timings are stripped by canonicalize_report — never seen by the classifier.
     expected -= {f"metrics.{f}" for f in _STAGE_TIMING_FIELDS}
-    # Scenario-level scalars the classifier handles directly.
-    expected |= {"trace_id", "tier", "verdict"}
+    # Scenario-level scalars — derived from the schema (not hard-coded) so a NEW
+    # top-level ScenarioReport field (e.g. a cache_hit mirroring #485) trips this
+    # until it is given a deliberate direction. llm_judge is stripped by
+    # canonicalize_report; scenario_id is the row key.
+    top_scalars = set(ScenarioReport.__annotations__) - set(sections) - {"scenario_id", "llm_judge"}
+    expected |= top_scalars
 
     classified = set(SCENARIO_DIRECTION) | set(SCENARIO_EXCLUDED)
     missing = expected - classified
@@ -319,6 +342,31 @@ def test_classify_dropped_scenario_is_regression():
 def test_classify_equal_reports_no_drift():
     old = _report(_scenario_row())
     assert classify_drift(old, copy.deepcopy(old)) == []
+
+
+def test_classify_surfaces_top_level_scalar_drift():
+    """A run_seed-only diff (or any top-level scalar) must surface — otherwise
+    the gate would red while the summary said 'No drift'."""
+    old = _report(_scenario_row())
+    new = copy.deepcopy(old)
+    new["run_seed"] = 1
+    drifts = classify_drift(old, new)
+    seed = _find(drifts, "run_seed")
+    assert seed is not None and seed.label == "NEUTRAL"
+    assert not format_drift_md(drifts).startswith("No drift")
+
+
+def test_classify_surfaces_unknown_scenario_field():
+    """A NEW top-level ScenarioReport field (not in the direction table) must
+    be surfaced as NEUTRAL 'unclassified', never silently dropped — guards the
+    classifier's invariant that it stays complete vs the gate's deep-equal."""
+    old = _report(_scenario_row())
+    new = copy.deepcopy(old)
+    new["scenarios"][0]["cache_hit"] = True  # hypothetical future field
+    drifts = classify_drift(old, new)
+    unknown = _find(drifts, "s03.cache_hit")
+    assert unknown is not None and unknown.label == "NEUTRAL"
+    assert "unclassified" in unknown.note
 
 
 def test_format_drift_md_groups_by_label():
