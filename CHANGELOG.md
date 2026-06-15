@@ -9,6 +9,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 - **`stm_selection_stats` observability tool — read-side surface for selection telemetry** (#484, issue #467) — surfaces the JSONL selection/execution log (added in #471) through a new opt-in observability MCP tool: live write-path counters plus a persisted aggregate (event counts, selections by ranker version, by server and tool, execution ok/error rate and latency p50/p95/p99, and the hard-filter reject-reason tally from #465). Makes accumulated telemetry inspectable ahead of offline replay/eval (#468). Advertised only when `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`; reads the active log file (rotated backups are noted but not parsed).
 
+### Changed
+
+- **Selection-telemetry `execution.cache_hit` is now populated** (#485, issue #467) — the reserved field is set `true`/`false` per call (served from the proxy response cache vs a live upstream call; `null` when a raise escaped before it was attributable), and `stm_selection_stats` reports the cache hit/miss rate. **Behavior change**: when `selection_telemetry.enabled`, execution records now carry a real `cache_hit` value instead of `null` — additive, the schema key set is unchanged.
+
 ## [0.1.28] — 2026-06-11
 
 A security-hardening, correctness, and tool-selection release. A targeted audit across four issue classes — SQLite file permissions, sensitive-value caching, secret-content persistence, and extraction-call privacy — produced six security fixes. Thirteen correctness fixes address critical paths found in the implementation review (PROGRESSIVE metrics assignment, network LTM reconnects, shutdown ExceptionGroup handling) and the remaining medium and low backlog items across daemon, surfacing, compression, config, and CLI layers. Two new opt-in features instrument the tool-selection path (JSONL telemetry sink and BM25 relevance scoring), and a third hardens what the proxy advertises to MCP clients via an STM-native eligibility filter at exposure time.

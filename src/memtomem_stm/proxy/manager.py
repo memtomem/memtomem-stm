@@ -1328,7 +1328,9 @@ class ProxyManager:
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
         ):
             try:
-                result = await self._call_tool_guarded(server, tool, arguments, trace_id=trace_id)
+                result, cache_hit = await self._call_tool_guarded(
+                    server, tool, arguments, trace_id=trace_id
+                )
             except Exception as exc:
                 # Upstream/transport/timeout/protocol errors are already
                 # recorded inside _call_tool_inner via record_error(); a raise
@@ -1388,6 +1390,7 @@ class ProxyManager:
                 started,
                 ok=True,
                 ranker_version=ranker_version,
+                cache_hit=cache_hit,
             )
             return result
 
@@ -1478,6 +1481,7 @@ class ProxyManager:
         ok: bool,
         error_type: str | None = None,
         ranker_version: str | None = None,
+        cache_hit: bool | None = None,
     ) -> None:
         """Emit the execution-outcome event paired to ``selection_id``.
 
@@ -1485,7 +1489,10 @@ class ProxyManager:
         category and message live in ``proxy_metrics.db``, joinable via
         ``trace_id`` — telemetry never duplicates (or leaks) error text.
         ``ranker_version`` mirrors the paired selection so replay groups
-        both halves under the same cohort.
+        both halves under the same cohort. ``cache_hit`` is ``True``/``False``
+        on a completed call (served from the response cache vs a live
+        upstream call) and left ``None`` when a raise escaped before the
+        hit/miss was attributable.
         """
         if self._selection_log is None or selection_id is None:
             return
@@ -1499,6 +1506,7 @@ class ProxyManager:
                 latency_ms=(_time.perf_counter() - started) * 1000.0,
                 error_type=error_type,
                 ranker_version=ranker_version,
+                cache_hit=cache_hit,
             )
         except Exception:
             logger.debug("Execution telemetry write failed", exc_info=True)
@@ -1510,7 +1518,7 @@ class ProxyManager:
         arguments: dict[str, Any],
         *,
         trace_id: str,
-    ) -> str | list:
+    ) -> tuple[str | list, bool]:
         """Cache stampede guard: serialize identical concurrent ``call_tool``
         invocations on a per-key lock so a cold cache + duplicate requests
         trigger one upstream call rather than N.
@@ -1522,7 +1530,12 @@ class ProxyManager:
         ``finally`` while the lock is still held so any waiter already
         queued on the same lock sees the cached result on its own
         double-check, and a new arrival after pop likewise finds the set
-        value (stampede window closed)."""
+        value (stampede window closed).
+
+        Returns ``(result, cache_hit)`` so ``call_tool`` can stamp the
+        selection-telemetry execution event (#467): ``True`` on either
+        cache-hit return path, ``False`` on a live ``_call_tool_inner``
+        call (including the no-cache configuration)."""
         upstream_args = (
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
@@ -1531,11 +1544,11 @@ class ProxyManager:
         if self._cache is not None:
             cached = self._cache.get(server, tool, upstream_args)
             if cached is not None:
-                return await self._on_cache_hit(cached, server, tool, arguments, trace_id)
+                return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
 
         # No cache configured — stampede protection N/A, go straight through.
         if self._cache is None:
-            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
 
         cache_key = _cache_key(server, tool, upstream_args)
         lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
@@ -1545,8 +1558,10 @@ class ProxyManager:
                 # lock ahead of us may have populated the cache already.
                 cached = self._cache.get(server, tool, upstream_args)
                 if cached is not None:
-                    return await self._on_cache_hit(cached, server, tool, arguments, trace_id)
-                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+                    return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
+                return await self._call_tool_inner(
+                    server, tool, arguments, trace_id=trace_id
+                ), False
             finally:
                 self._key_locks.pop(cache_key, None)
 
