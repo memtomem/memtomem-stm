@@ -6,12 +6,23 @@ timings. This is the load-bearing assumption that makes ``report.json``
 diffs meaningful as a regression signal: without it, every PR's bench
 artifact differs for reasons unrelated to the code under test.
 
-Scope: one scenario (s09, the smallest budget-fit fixture) exercised
-twice in fresh ``tmp_path`` dirs — enough to prove the property per
-scenario without pulling every bench_qa case into a single test. If a
-future change desynchronises a specific compressor, the scenario-local
-determinism check for that scenario can be added alongside the regular
-gate assertions.
+Scope: the full recorded suite. Every fixture that the live bench_qa run
+records as a ``ScenarioReport`` row is replayed twice in fresh
+``tmp_path`` dirs via :func:`bench.bench_qa.run_scenario_once`, which
+drives the same pipeline the gate tests use (happy path / fallback ladder
+/ surfacing) and records the same fields — so a desynchronised compressor,
+fallback ladder, or surfacing path shows up here as a report diff. The
+``s09``-only predecessor only proved the property for one AUTO scenario;
+this gate covers the compaction strategies (AUTO/SELECTIVE/SKELETON), the
+three fallback tiers, and the surfacing recall path.
+
+Cross-process note: the recorded fields are all hash-seed-independent
+(byte counts, categorical strategy, ``sha256`` chunk IDs, recall floats,
+``sha256``-derived trace_id), verified by replaying every scenario under
+several ``PYTHONHASHSEED`` values. The two runs below therefore share a
+process safely — drift would only appear cross-process if a recorded
+field became hash-ordering-dependent, which the roster tripwire and a
+varied-seed manual run would catch.
 """
 
 from __future__ import annotations
@@ -19,55 +30,47 @@ from __future__ import annotations
 import pytest
 
 from bench.bench_qa import (
-    BenchReportCollector,
     canonicalize_report,
     deterministic_trace_id,
-    latest_metrics_row,
-    load_fixture,
-    make_proxy_manager,
+    fixtures_dir,
+    run_scenario_once,
 )
-from bench.bench_qa.runner import make_tool_result
 
+# Every fixture that records a ``ScenarioReport`` row into ``report.json``.
+# Explicit (not globbed) so adding a fixture forces a conscious include /
+# exclude decision via ``test_determinism_roster_covers_every_fixture``.
+DETERMINISM_SCENARIOS = [
+    "s01",  # Tier-2 hybrid_fallback
+    "s02",  # AUTO → extract_fields
+    "s03",  # AUTO → truncate
+    "s04",  # AUTO → truncate
+    "s05",  # SKELETON (chat transcript)
+    "s06",  # Tier-1 progressive_fallback (round-trip)
+    "s07",  # SELECTIVE TOC
+    "s08",  # Tier-3 truncate_fallback
+    "s09",  # AUTO → none (fits budget)
+    "s10",  # surfacing recall@k
+]
 
-async def _run_s09_once(tmp_path) -> dict:
-    """Drive s09 through the full bench pipeline once, return the
-    single-scenario ``BenchReport`` dict."""
-    fixture = load_fixture("s09")
-    mgr, store, session = make_proxy_manager(
-        tmp_path,
-        compression=fixture["expected_compressor"],
-        max_result_chars=fixture["max_result_chars"],
-    )
-    session.call_tool.return_value = make_tool_result(fixture["payload"])
-    trace_id = deterministic_trace_id("s09")
-
-    try:
-        await mgr.call_tool("fake", "tool_s09", {}, trace_id=trace_id)
-        row = latest_metrics_row(store)
-    finally:
-        store.close()
-
-    collector = BenchReportCollector()
-    collector.record_scenario(
-        scenario_id="s09",
-        trace_id=row["trace_id"],
-        row=row,
-        qa_answerable=0,
-        qa_total=0,
-        original_chars=len(fixture["payload"]),
-        verdict="pass",
-    )
-    return dict(collector.build_report(run_seed=0))
+# Fixtures intentionally outside the determinism gate, each with its reason.
+_EXCLUDED_FIXTURES = {
+    "s11": (
+        "F2 min_score sweep — a bench_qa_sweep measurement run emitting a "
+        "curve sidecar, not a ScenarioReport row "
+        "(test_bench_qa_scenarios.test_s11_min_score_sweep)."
+    ),
+}
 
 
 @pytest.mark.bench_qa
 @pytest.mark.asyncio
-async def test_two_runs_same_seed_produce_canonically_equal_reports(tmp_path_factory):
-    tmp_a = tmp_path_factory.mktemp("bench_det_a")
-    tmp_b = tmp_path_factory.mktemp("bench_det_b")
+@pytest.mark.parametrize("scenario_id", DETERMINISM_SCENARIOS)
+async def test_two_runs_same_seed_produce_canonically_equal_reports(scenario_id, tmp_path_factory):
+    tmp_a = tmp_path_factory.mktemp(f"bench_det_{scenario_id}_a")
+    tmp_b = tmp_path_factory.mktemp(f"bench_det_{scenario_id}_b")
 
-    report_a = await _run_s09_once(tmp_a)
-    report_b = await _run_s09_once(tmp_b)
+    report_a = await run_scenario_once(scenario_id, tmp_a)
+    report_b = await run_scenario_once(scenario_id, tmp_b)
 
     canon_a = canonicalize_report(report_a)
     canon_b = canonicalize_report(report_b)
@@ -75,13 +78,33 @@ async def test_two_runs_same_seed_produce_canonically_equal_reports(tmp_path_fac
     # trace_id must survive canonicalization — it's deterministic and
     # differences there indicate an injection bug, not wall-clock noise.
     scenario_a = canon_a["scenarios"][0]
-    assert scenario_a["trace_id"] == deterministic_trace_id("s09")
+    assert scenario_a["trace_id"] == deterministic_trace_id(scenario_id), (
+        f"{scenario_id}: trace_id is not the deterministic value — injection bug"
+    )
 
     assert canon_a == canon_b, (
-        "bench_qa determinism broken — two runs of s09 at run_seed=0 "
-        "diverged after canonicalization. Inspect: "
-        f"A={canon_a!r} B={canon_b!r}"
+        f"bench_qa determinism broken — two runs of {scenario_id} at run_seed=0 "
+        f"diverged after canonicalization. Inspect:\nA={canon_a!r}\nB={canon_b!r}"
     )
+
+
+@pytest.mark.bench_qa
+def test_determinism_roster_covers_every_fixture():
+    """Tripwire against silent under-coverage: every ``s*.json`` fixture must
+    be either in :data:`DETERMINISM_SCENARIOS` or :data:`_EXCLUDED_FIXTURES`
+    (with a documented reason). A new fixture trips this until it's classified.
+    """
+    on_disk = {p.stem for p in fixtures_dir().glob("s*.json")}
+    covered = set(DETERMINISM_SCENARIOS) | set(_EXCLUDED_FIXTURES)
+
+    unclassified = on_disk - covered
+    assert not unclassified, (
+        f"new fixture(s) {sorted(unclassified)} are neither in DETERMINISM_SCENARIOS "
+        f"nor _EXCLUDED_FIXTURES — add each to the determinism gate or document why "
+        f"it is excluded."
+    )
+    stale = set(DETERMINISM_SCENARIOS) - on_disk
+    assert not stale, f"DETERMINISM_SCENARIOS references missing fixture(s): {sorted(stale)}"
 
 
 @pytest.mark.bench_qa
