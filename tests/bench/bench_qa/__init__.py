@@ -7,6 +7,7 @@ See ``/Users/pdstudio/.claude/plans/mcp-snug-river.md`` for the design
 
 from .judge import qa_answerable_ratio, surfacing_recall_at_k
 from .loader import fixtures_dir, load_fixture
+from .replay import run_scenario_once
 from .report import BenchReportCollector, canonicalize_report
 from .runner import (
     deterministic_trace_id,
@@ -35,5 +36,6 @@ __all__ = [
     "load_fixture",
     "make_proxy_manager",
     "qa_answerable_ratio",
+    "run_scenario_once",
     "surfacing_recall_at_k",
 ]
