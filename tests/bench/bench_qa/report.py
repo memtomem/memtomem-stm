@@ -23,6 +23,7 @@ from typing import Any
 from .schema import (
     REPORT_SCHEMA_VERSION,
     BenchReport,
+    LLMJudgeAgreementReport,
     LLMJudgeResultReport,
     MetricSummary,
     ProgressiveResult,
@@ -52,12 +53,14 @@ def canonicalize_report(report: BenchReport) -> dict[str, Any]:
 
     * ``scenarios[*].metrics.clean_ms`` / ``compress_ms`` / ``surface_ms``
       — stage latencies differ run-to-run by definition.
-    * ``scenarios[*].llm_judge`` — the whole block. Even at ``temperature=0``
-      the LLM judge is non-reproducible across provider-side model updates,
-      plus ``cached`` / token counts flip between runs. Stripping the block
-      wholesale keeps the determinism diff silent when the marker is off
-      (key absent on both sides) and when it is on (key absent on both
-      sides after stripping).
+    * ``scenarios[*].llm_judge`` / ``llm_judge_b`` / ``llm_judge_agreement``
+      — the whole LLM-judge surface (model A, model B, and the two-model
+      agreement). Even at ``temperature=0`` LLM scores are non-reproducible
+      across provider-side model updates, plus ``cached`` / token counts flip
+      between runs; the agreement diffs are derived from those same scores, so
+      they drift too. Stripping all three wholesale keeps the determinism diff
+      silent when the marker is off (keys absent on both sides) and when it is
+      on (keys absent on both sides after stripping).
 
     Preserved:
 
@@ -74,6 +77,8 @@ def canonicalize_report(report: BenchReport) -> dict[str, Any]:
         for field in _STAGE_TIMING_FIELDS:
             metrics.pop(field, None)
         scenario.pop("llm_judge", None)
+        scenario.pop("llm_judge_b", None)
+        scenario.pop("llm_judge_agreement", None)
     return canon
 
 
@@ -191,6 +196,36 @@ class BenchReportCollector:
         logger.warning(
             "record_llm_judge: no scenario row for %r — run with "
             "-m 'bench_qa or bench_qa_llm_judge' to capture the score in report.json",
+            scenario_id,
+        )
+
+    def record_llm_judge_agreement(
+        self,
+        *,
+        scenario_id: str,
+        llm_judge_b: LLMJudgeResultReport,
+        agreement: LLMJudgeAgreementReport,
+    ) -> None:
+        """Attach the second judge's block + the two-model agreement (item 9).
+
+        Mirrors :meth:`record_llm_judge` — enriches an existing row when the
+        multi-model agreement test runs in the same session as the main
+        ``bench_qa`` suite. Model A's block continues to come through
+        :meth:`record_llm_judge` (``llm_judge``); this records ``llm_judge_b``
+        and ``llm_judge_agreement``. Same no-row warning: without a prior
+        ``record_scenario`` the agreement is still visible via the test's
+        ``logger.info`` but does not reach ``report.json``, since the row would
+        be missing ``metrics`` / ``qa`` / ``verdict`` that the report builder
+        and summary formatter read unconditionally.
+        """
+        for entry in self._rows:
+            if entry.get("scenario_id") == scenario_id:
+                entry["llm_judge_b"] = llm_judge_b
+                entry["llm_judge_agreement"] = agreement
+                return
+        logger.warning(
+            "record_llm_judge_agreement: no scenario row for %r — run with "
+            "-m 'bench_qa or bench_qa_llm_judge' to capture the agreement in report.json",
             scenario_id,
         )
 

@@ -25,7 +25,12 @@ from pathlib import Path
 
 from ..harness import BenchTask, QAPair
 from ..llm_judge import JudgeDimension, LLMJudge, LLMJudgeResult
-from .schema import LLMJudgeProbeResult, LLMJudgeResultReport, QAProbe
+from .schema import (
+    LLMJudgeAgreementReport,
+    LLMJudgeProbeResult,
+    LLMJudgeResultReport,
+    QAProbe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,3 +202,57 @@ def to_report_dict(result: LLMJudgeResult) -> LLMJudgeResultReport:
     if result.error:
         report["error"] = str(result.error)
     return report
+
+
+def compute_agreement(
+    report_a: LLMJudgeResultReport,
+    report_b: LLMJudgeResultReport,
+) -> LLMJudgeAgreementReport:
+    """Two-judge cross-provider agreement for one scenario (item 9).
+
+    ``report_a`` / ``report_b`` are :func:`to_report_dict` outputs — already
+    normalised to 0.0–1.0 — from two different judges. Returns an
+    :class:`LLMJudgeAgreementReport` with per-dimension absolute differences
+    and a scalar ``agreement_score = 1 - mean(|a - b|)`` over ``overall`` and
+    the three dimensions (``overall`` weighted equally with each component, so
+    the headline judgment counts the same as one dimension).
+    ``agreement_score == 1.0`` is perfect inter-judge agreement; ``0.0`` is
+    maximal disagreement — same polarity and scale as the underlying scores,
+    so it slots into logs and any future ratchet without rescaling.
+
+    If *either* report carries an ``error`` (transport / parse failure), the
+    numeric fields are omitted and only ``model_a`` / ``model_b`` / ``error``
+    are returned: a failed judge's ``overall=0.0`` would otherwise fabricate a
+    large diff that poisons the cross-scenario correlation. The headline test
+    excludes any scenario whose agreement block carries an ``error``.
+    """
+    agreement: LLMJudgeAgreementReport = {
+        "model_a": str(report_a.get("model", "")),
+        "model_b": str(report_b.get("model", "")),
+    }
+    err_a = report_a.get("error")
+    err_b = report_b.get("error")
+    if err_a or err_b:
+        agreement["error"] = f"a={err_a or None} b={err_b or None}"
+        return agreement
+
+    overall_a = report_a.get("overall", 0.0)
+    overall_b = report_b.get("overall", 0.0)
+    diff_overall = abs(overall_a - overall_b)
+    diff_fc = abs(
+        report_a.get("factual_completeness", 0.0) - report_b.get("factual_completeness", 0.0)
+    )
+    diff_sc = abs(
+        report_a.get("structural_coherence", 0.0) - report_b.get("structural_coherence", 0.0)
+    )
+    diff_as = abs(report_a.get("answer_sufficiency", 0.0) - report_b.get("answer_sufficiency", 0.0))
+    mean_abs_diff = (diff_overall + diff_fc + diff_sc + diff_as) / 4.0
+
+    agreement["overall_a"] = overall_a
+    agreement["overall_b"] = overall_b
+    agreement["diff_overall"] = round(diff_overall, 4)
+    agreement["diff_factual_completeness"] = round(diff_fc, 4)
+    agreement["diff_structural_coherence"] = round(diff_sc, 4)
+    agreement["diff_answer_sufficiency"] = round(diff_as, 4)
+    agreement["agreement_score"] = round(max(0.0, min(1.0, 1.0 - mean_abs_diff)), 4)
+    return agreement
