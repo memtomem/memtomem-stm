@@ -196,7 +196,7 @@ A second tier of management lets you decide *which MCP servers a given project s
 | [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) | Opt-in JSONL log of tool selection + execution outcomes |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands, host sync, hooks, daemon, and MCP tools |
 
-STM advertises four model-facing MCP tools by default. Eight observability and
+STM advertises four model-facing MCP tools by default. Nine observability and
 admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, `stm_index_stats`, etc.)
 are hidden unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set,
 which keeps eager-loading clients from paying schema tokens for rarely used

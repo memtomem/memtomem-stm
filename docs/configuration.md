@@ -34,10 +34,11 @@ apply changes.
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # opt in
 ```
 
-When unset or `false`, hides STM's eight observability / admin tools
+When unset or `false`, hides STM's nine observability / admin tools
 (`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
-`stm_surfacing_stats`, `stm_index_stats`, `stm_compression_stats`,
-`stm_progressive_stats`, `stm_tuning_recommendations`) from the MCP
+`stm_surfacing_stats`, `stm_index_stats`, `stm_selection_stats`,
+`stm_compression_stats`, `stm_progressive_stats`,
+`stm_tuning_recommendations`) from the MCP
 `tools/list` surface so eager-loading clients (e.g. OpenAI Codex CLI)
 don't pay schema tokens for tools the model rarely calls. Hidden admin
 tools are not registered with the MCP server while the flag is unset or

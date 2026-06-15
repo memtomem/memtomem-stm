@@ -72,9 +72,11 @@ import random
 import threading
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from memtomem_stm.proxy.metrics import _percentile
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 
 logger = logging.getLogger(__name__)
@@ -166,6 +168,23 @@ class SelectionTelemetryLog:
         """No-op — the file is opened per append so rotation never holds a
         stale descriptor. Exists so lifespan teardown can treat every store
         uniformly."""
+
+    def snapshot(self) -> dict[str, int]:
+        """Return this process's live write-path counters.
+
+        These reflect the running instance only (reset at restart), unlike
+        ``aggregate_selection_log`` which reads the persisted history off
+        disk — the same in-memory-vs-store split as ``stm_index_stats`` /
+        ``stm_surfacing_stats``. Read under ``self._lock`` so a concurrent
+        ``_append`` can't tear a counter.
+        """
+        with self._lock:
+            return {
+                "events_written": self.events_written,
+                "events_sampled_out": self.events_sampled_out,
+                "redaction_drops": self.redaction_drops,
+                "write_errors": self.write_errors,
+            }
 
     # ── event emitters ───────────────────────────────────────────────────
 
@@ -357,3 +376,133 @@ class SelectionTelemetryLog:
             if src.exists():
                 src.replace(self._path.with_name(f"{self._path.name}.{i + 1}"))
         self._path.replace(self._path.with_name(f"{self._path.name}.1"))
+
+
+def _top(counter: Counter[str], n: int) -> list[list[Any]]:
+    """Return the ``n`` highest-count entries as ``[[key, count], …]``.
+
+    Sorted by count descending then key ascending so the order is stable
+    across runs with the same data (ties never reshuffle a rendered table).
+    """
+    ordered = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [[k, v] for k, v in ordered[:n]]
+
+
+def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, Any]:
+    """Stream-aggregate a selection-telemetry JSONL log for read-side stats.
+
+    Pure and side-effect-free: opens the *active* log file (rotated backups
+    ``.1``/``.2``/… are counted via ``rotated_backups`` but not parsed — a
+    50 MB default means rotation is rare, and reading the tail of history is
+    a wait-for-signal extension), parses one JSON object per line, and never
+    raises on a malformed line (counted in ``malformed`` and skipped) so a
+    half-written tail or a hand-edited file can't break the stats tool.
+
+    The high-cardinality maps (server / tool / error-type / reject-reason)
+    are returned as ``top_n`` ``[key, count]`` lists plus a ``*_distinct``
+    cardinality so truncation never reads as "that's all there was";
+    ``by_ranker_version`` is returned in full (low cardinality, and the
+    cohort split is the #468 replay signal).
+    """
+    path = Path(path).expanduser()
+    rotated = sum(1 for _ in path.parent.glob(f"{path.name}.*")) if path.parent.exists() else 0
+    result: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "rotated_backups": rotated,
+        "total_lines": 0,
+        "malformed": 0,
+        "events": {"selection": 0, "execution": 0, "feedback": 0},
+        "by_ranker_version": [],
+        "by_server": [],
+        "by_server_distinct": 0,
+        "by_selected_tool": [],
+        "by_selected_tool_distinct": 0,
+        "outcomes": {"ok": 0, "error": 0, "error_rate": 0.0},
+        "by_error_type": [],
+        "by_error_type_distinct": 0,
+        "reject_reasons": [],
+        "reject_reasons_distinct": 0,
+        "latency_ms": {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0},
+    }
+    if not result["exists"]:
+        return result
+
+    rankers: Counter[str] = Counter()
+    servers: Counter[str] = Counter()
+    tools: Counter[str] = Counter()
+    error_types: Counter[str] = Counter()
+    reject_reasons: Counter[str] = Counter()
+    ok = err = 0
+    latencies: list[float] = []
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                result["total_lines"] += 1
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    result["malformed"] += 1
+                    continue
+                if not isinstance(rec, dict):
+                    result["malformed"] += 1
+                    continue
+                event = rec.get("event")
+                if event == "selection":
+                    result["events"]["selection"] += 1
+                    rankers[str(rec.get("ranker_version"))] += 1
+                    if rec.get("server") is not None:
+                        servers[str(rec["server"])] += 1
+                    if rec.get("selected_tool") is not None:
+                        tools[str(rec["selected_tool"])] += 1
+                    rr = rec.get("reject_reasons")
+                    if isinstance(rr, dict):
+                        for reason in rr.values():
+                            reject_reasons[str(reason)] += 1
+                elif event == "execution":
+                    result["events"]["execution"] += 1
+                    if rec.get("ok"):
+                        ok += 1
+                    else:
+                        err += 1
+                    etype = rec.get("error_type")
+                    if etype is not None:
+                        error_types[str(etype)] += 1
+                    lat = rec.get("latency_ms")
+                    if isinstance(lat, (int, float)) and not isinstance(lat, bool):
+                        latencies.append(float(lat))
+                elif event == "feedback":
+                    result["events"]["feedback"] += 1
+                else:
+                    result["malformed"] += 1
+    except OSError:
+        # Treat an unreadable file like an absent one rather than raising
+        # out of an observability path — the tool reports what it could read.
+        return result
+
+    result["by_ranker_version"] = _top(rankers, len(rankers))
+    result["by_server"] = _top(servers, top_n)
+    result["by_server_distinct"] = len(servers)
+    result["by_selected_tool"] = _top(tools, top_n)
+    result["by_selected_tool_distinct"] = len(tools)
+    result["by_error_type"] = _top(error_types, top_n)
+    result["by_error_type_distinct"] = len(error_types)
+    result["reject_reasons"] = _top(reject_reasons, top_n)
+    result["reject_reasons_distinct"] = len(reject_reasons)
+    result["outcomes"] = {
+        "ok": ok,
+        "error": err,
+        "error_rate": round(err / (ok + err), 4) if (ok + err) else 0.0,
+    }
+    if latencies:
+        latencies.sort()
+        result["latency_ms"] = {
+            "count": len(latencies),
+            "p50": round(_percentile(latencies, 50), 2),
+            "p95": round(_percentile(latencies, 95), 2),
+            "p99": round(_percentile(latencies, 99), 2),
+        }
+    return result
