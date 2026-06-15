@@ -180,3 +180,25 @@ never data. Backstop drops are per-record, so an `execution` whose paired
 
 Telemetry failures never propagate to proxied calls: write errors are
 counted (`write_errors`) and logged, and the call proceeds untouched.
+
+## Reading the telemetry
+
+The `stm_selection_stats` MCP tool reads the active log back into a quick
+operator summary, so a health check needs no hand-parsing of JSONL. It is one
+of the opt-in observability tools — advertise it with
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` (see [cli.md](cli.md)) — and
+it reports two views:
+
+- **Live counters** — this process's write-path counters (`events_written` /
+  `events_sampled_out` / `redaction_drops` / `write_errors`), reset at
+  restart. These come straight off the running `SelectionTelemetryLog`, so
+  they reflect activity even when sampling or the redaction backstop kept
+  records off disk.
+- **Persisted aggregate** — read off the active log file: event counts,
+  selections **by ranker version** (the #468 cohort split — confirm each
+  cohort has enough samples before replay), by server and tool, execution
+  ok/error rate and latency p50/p95/p99, and the #465 reject-reason tally.
+
+Rotated backups (`log.1` …) are noted but not parsed — the summary covers the
+active log only. For the full history, or any join against `proxy_metrics.db`,
+stream the JSONL directly (see [Replay joins](#replay-joins)).

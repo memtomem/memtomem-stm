@@ -20,6 +20,7 @@ from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
+from memtomem_stm.proxy.selection_log import aggregate_selection_log
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.observability import (
     FAULT_SKIP_REASONS,
@@ -420,6 +421,7 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_surfacing_feedback",
     "stm_surfacing_stats",
     "stm_index_stats",
+    "stm_selection_stats",
     "stm_compression_feedback",
     "stm_compression_stats",
     "stm_progressive_stats",
@@ -1278,6 +1280,129 @@ def _format_index_observability_sections(snapshot: dict, *, tool_filter: str | N
             lines.append(f"  {tool_name}:")
             for outcome, count in sorted(tool_outcomes.items(), key=lambda kv: (-kv[1], kv[0])):
                 lines.append(f"    {outcome}: {count}")
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_selection_stats
+# ---------------------------------------------------------------------------
+
+
+@_obs_tool
+async def stm_selection_stats(
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Show tool-selection telemetry recorded by the proxy (#467).
+
+    Surfaces the selection/execution log the proxy writes when
+    ``proxy.selection_telemetry.enabled`` is set — the substrate for
+    offline replay/eval (#468). Two views, the same in-memory-vs-store
+    split as ``stm_index_stats``:
+
+    - **Live counters** — this process's write-path counters (events
+      written / sampled out / redaction drops / write errors), reset at
+      restart.
+    - **Persisted aggregate** — read back off the active JSONL log: event
+      counts, selections by ranker version (the #468 cohort split), by
+      server and tool, execution ok/error + latency percentiles, and the
+      #465 hard-filter reject-reason tally.
+
+    Takes no arguments. Rotated backups are noted but not parsed (the
+    active log only).
+    """
+    app = _get_ctx(ctx)
+    pm = app.proxy_manager
+    if pm is None:
+        return "Proxy is not enabled."
+    sink = pm.selection_log
+    if sink is None:
+        return (
+            "Selection telemetry is disabled "
+            "(set proxy.selection_telemetry.enabled = true to record it)."
+        )
+
+    with traced("stm_selection_stats"):
+        agg = aggregate_selection_log(sink.path)
+        live = sink.snapshot()
+        # An empty disk log with no live activity is genuinely "no data".
+        # But if events were written and then rotated/sampled away, the live
+        # counters still explain where they went — render rather than hide.
+        if (not agg["exists"] or agg["total_lines"] == 0) and not any(live.values()):
+            return f"No selection telemetry recorded yet at {agg['path']}."
+        lines = ["Selection Stats", "==============="]
+        lines.extend(_format_selection_stats_sections(agg, live))
+        return "\n".join(lines)
+
+
+def _append_top_section(lines: list[str], title: str, top: list[list[Any]], distinct: int) -> None:
+    """Append a ``title`` section listing ``[key, count]`` rows, if any.
+
+    Notes truncation as ``(top N of M)`` when the aggregate held more
+    distinct keys than the rendered slice, so a capped list never reads as
+    the full set.
+    """
+    if not top:
+        return
+    suffix = f" (top {len(top)} of {distinct})" if distinct > len(top) else ""
+    lines.append(f"\n{title}{suffix}:")
+    for key, count in top:
+        lines.append(f"  {key}: {count}")
+
+
+def _format_selection_stats_sections(agg: dict, live: dict[str, int]) -> list[str]:
+    """Render the sections for ``stm_selection_stats``.
+
+    Returns lines (no leading blank; caller appends to the header). ``agg``
+    is an ``aggregate_selection_log`` result (persisted, off disk); ``live``
+    is ``SelectionTelemetryLog.snapshot`` (this process only).
+    """
+    lines: list[str] = [f"\nLog: {agg['path']}"]
+    if agg["rotated_backups"]:
+        lines.append(f"  ({agg['rotated_backups']} rotated backup(s) present — not included below)")
+
+    lines.append("\nLive counters (this process):")
+    for label in ("events_written", "events_sampled_out", "redaction_drops", "write_errors"):
+        lines.append(f"  {label}: {live[label]}")
+
+    ev = agg["events"]
+    lines.append("\nEvents (persisted):")
+    for label in ("selection", "execution", "feedback"):
+        lines.append(f"  {label}: {ev[label]}")
+    if agg["malformed"]:
+        lines.append(f"  malformed (skipped): {agg['malformed']}")
+
+    if agg["by_ranker_version"]:
+        lines.append("\nSelections by ranker version:")
+        for rv, count in agg["by_ranker_version"]:
+            lines.append(f"  {rv}: {count}")
+
+    _append_top_section(lines, "Selections by server", agg["by_server"], agg["by_server_distinct"])
+    _append_top_section(
+        lines, "Selections by tool", agg["by_selected_tool"], agg["by_selected_tool_distinct"]
+    )
+
+    if ev["execution"]:
+        out = agg["outcomes"]
+        lines.append("\nExecution outcomes:")
+        lines.append(f"  ok: {out['ok']}")
+        lines.append(f"  error: {out['error']}")
+        lines.append(f"  error_rate: {out['error_rate']:.4f}")
+        lat = agg["latency_ms"]
+        if lat["count"]:
+            lines.append(
+                f"  latency_ms p50/p95/p99: {lat['p50']} / {lat['p95']} / {lat['p99']} "
+                f"(n={lat['count']})"
+            )
+    _append_top_section(
+        lines, "Execution error types", agg["by_error_type"], agg["by_error_type_distinct"]
+    )
+    _append_top_section(
+        lines,
+        "Reject reasons (#465 hard filter)",
+        agg["reject_reasons"],
+        agg["reject_reasons_distinct"],
+    )
 
     return lines
 

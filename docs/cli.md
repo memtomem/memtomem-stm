@@ -608,7 +608,7 @@ observation rather than a CI failure signal. `sync` is the ongoing
 reconciliation path: `--plan` previews, `--apply` writes, `--force` adopts
 entries marked changed, and `--yes` bypasses confirmation prompts for scripts.
 
-## MCP Tools (4 default + 8 opt-in + proxied)
+## MCP Tools (4 default + 9 opt-in + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -621,7 +621,7 @@ The four model-facing tools are advertised by default:
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
 | `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
 
-Eight observability/admin tools are hidden unless
+Nine observability/admin tools are hidden unless
 `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before server start:
 
 | Tool | Arguments | Description |
@@ -631,6 +631,7 @@ Eight observability/admin tools are hidden unless
 | `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
 | `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio (since process start) |
 | `stm_index_stats` | `tool?` | INDEX attempt/outcome counts for extraction and auto-index paths |
+| `stm_selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and hard-filter reject reasons |
 | `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
 | `stm_progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
 | `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner |
@@ -672,9 +673,9 @@ See [Configuration → General](configuration.md#general) for details.
 ## Trimming the advertised MCP tool surface
 
 STM advertises four model-facing MCP tools by default (progressive-delivery
-unlocks and feedback channels). Eight additional tools are operator-facing
+unlocks and feedback channels). Nine additional tools are operator-facing
 (observability / admin). On clients that eager-load MCP tool schemas into
-the model context at session start, the eight observability tools would
+the model context at session start, the nine observability tools would
 pay schema tokens for calls the model rarely makes.
 
 Set the following and restart STM to advertise them over MCP:

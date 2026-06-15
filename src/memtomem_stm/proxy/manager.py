@@ -498,6 +498,16 @@ class ProxyManager:
             self._relevance_scorer_cfg = current_cfg
         return self._relevance_scorer_instance
 
+    @property
+    def selection_log(self) -> SelectionTelemetryLog | None:
+        """The selection-telemetry sink, or ``None`` when disabled.
+
+        Public read accessor for ``stm_selection_stats`` — parity with
+        ``index_observability``; ``None`` is the disabled signal the stats
+        tool renders distinctly from "enabled but empty".
+        """
+        return self._selection_log
+
     # Delegates to proxy.tool_metadata module (backward-compatible)
     _truncate_description = staticmethod(truncate_description)
     _distill_schema = staticmethod(distill_schema)

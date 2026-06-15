@@ -19,6 +19,7 @@ from memtomem_stm.server import (
     stm_proxy_read_more,
     stm_proxy_select_chunks,
     stm_proxy_stats,
+    stm_selection_stats,
     stm_surfacing_feedback,
     stm_surfacing_stats,
     stm_tuning_recommendations,
@@ -1082,6 +1083,99 @@ class TestProgressiveStats:
         mock_tracker.get_stats.assert_called_once_with("docfix:get_doc")
 
 
+# ── stm_selection_stats ───────────────────────────────────────────────────
+
+
+def _selection_log(tmp_path):
+    from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
+
+    log = SelectionTelemetryLog(tmp_path / "sel.jsonl")
+    log.initialize()
+    return log
+
+
+def _ctx_with_selection(tmp_path, *, log):
+    cfg = ProxyConfig(config_path=tmp_path / "p.json", upstream_servers={})
+    pm = ProxyManager(cfg, TokenTracker(), selection_log=log)
+    return _make_ctx(proxy_manager=pm)
+
+
+class TestSelectionStats:
+    async def test_proxy_not_enabled(self):
+        app = STMContext(
+            config=STMConfig(),
+            proxy_manager=None,  # type: ignore[arg-type]
+            tracker=TokenTracker(),
+            surfacing_engine=None,
+            feedback_tracker=None,
+            compression_feedback_tracker=None,
+            progressive_reads_tracker=None,
+        )
+        ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+        assert await stm_selection_stats(ctx=ctx) == "Proxy is not enabled."
+
+    async def test_telemetry_disabled(self, tmp_path):
+        ctx = _ctx_with_selection(tmp_path, log=None)
+        result = await stm_selection_stats(ctx=ctx)
+        assert "Selection telemetry is disabled" in result
+
+    async def test_enabled_but_empty(self, tmp_path):
+        ctx = _ctx_with_selection(tmp_path, log=_selection_log(tmp_path))
+        result = await stm_selection_stats(ctx=ctx)
+        assert "No selection telemetry recorded yet" in result
+
+    async def test_populated_renders_all_sections(self, tmp_path):
+        log = _selection_log(tmp_path)
+        sid = log.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a", "gh__b"],
+            arguments={"q": "x"},
+            trace_id=None,
+            reject_reasons={"gh__b": "config_hidden"},
+        )
+        log.log_execution(
+            selection_id=sid,
+            trace_id=None,
+            server="gh",
+            selected_tool="gh__a",
+            ok=True,
+            latency_ms=12.0,
+        )
+        ctx = _ctx_with_selection(tmp_path, log=log)
+        result = await stm_selection_stats(ctx=ctx)
+
+        assert "Selection Stats" in result
+        assert "Live counters (this process):" in result
+        assert "events_written: 2" in result
+        assert "Selections by ranker version:" in result
+        assert "v0-passthrough: 1" in result
+        assert "Selections by server:" in result
+        assert "Execution outcomes:" in result
+        assert "ok: 1" in result
+        assert "Reject reasons (#465 hard filter):" in result
+        assert "config_hidden: 1" in result
+
+    async def test_sampled_out_still_renders_live_counters(self, tmp_path):
+        from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
+
+        # sample_rate 0 → nothing persisted, but the live drop counter is real
+        # signal the operator should still see (not "no data").
+        log = SelectionTelemetryLog(tmp_path / "sel.jsonl", sample_rate=0.0)
+        log.initialize()
+        log.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a"],
+            arguments={},
+            trace_id=None,
+        )
+        ctx = _ctx_with_selection(tmp_path, log=log)
+        result = await stm_selection_stats(ctx=ctx)
+        assert "Selection Stats" in result
+        assert "events_sampled_out: 1" in result
+
+
 # ── stm_tuning_recommendations ────────────────────────────────────────────
 
 
@@ -1447,6 +1541,7 @@ _OBSERVABILITY_TOOLS = {
     "stm_proxy_cache_clear",
     "stm_surfacing_stats",
     "stm_index_stats",
+    "stm_selection_stats",
     "stm_compression_stats",
     "stm_progressive_stats",
     "stm_tuning_recommendations",
@@ -1509,10 +1604,10 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
 
-    def test_flag_true_advertises_all_twelve(self):
+    def test_flag_true_advertises_all_thirteen(self):
         names = set(self._list_registered(env_override="true"))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
-        assert len(names) == 12
+        assert len(names) == 13
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))
@@ -1583,7 +1678,7 @@ class TestAdvertiseOrder:
 
     def test_reorder_skips_missing_stm_tools(self):
         """When ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`` hides
-        the 8 observability tools, ``_tool_manager._tools`` only holds the
+        the 9 observability tools, ``_tool_manager._tools`` only holds the
         4 model-facing STM tools. The reorder helper must not KeyError on
         the absent names — ``.pop(name, None)`` is the contract."""
         from memtomem_stm.server import _move_stm_tools_to_end

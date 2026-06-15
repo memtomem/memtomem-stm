@@ -31,6 +31,7 @@ from memtomem_stm.proxy.selection_log import (
     SCHEMA_VERSION,
     SelectionTelemetryLog,
     _canonical_args,
+    aggregate_selection_log,
 )
 
 _skip_on_windows = pytest.mark.skipif(
@@ -524,3 +525,195 @@ class TestManagerWireIn:
             name="srv", config=server_cfg, session=session, tools=[]
         )
         assert await mgr.call_tool("srv", "tool", {}) == "ok!"
+
+
+# ── snapshot (live write-path counters) ──────────────────────────────────
+
+
+class TestSnapshot:
+    def test_snapshot_keys_and_initial_zeros(self, tmp_path):
+        log = _make_log(tmp_path)
+        snap = log.snapshot()
+        assert snap == {
+            "events_written": 0,
+            "events_sampled_out": 0,
+            "redaction_drops": 0,
+            "write_errors": 0,
+        }
+
+    def test_snapshot_reflects_writes(self, tmp_path):
+        log = _make_log(tmp_path)
+        _log_pair(log)  # one selection + one execution
+        assert log.snapshot()["events_written"] == 2
+
+    def test_snapshot_reflects_sampling(self, tmp_path):
+        log = _make_log(tmp_path, sample_rate=0.0)
+        assert _log_pair(log) is None  # sampled out, no execution
+        snap = log.snapshot()
+        assert snap["events_sampled_out"] == 1
+        assert snap["events_written"] == 0
+
+    def test_snapshot_reflects_redaction_drop(self, tmp_path):
+        log = _make_log(tmp_path)
+        # A credential-looking selected_tool trips the storage backstop.
+        sid = log.log_selection(
+            server="srv",
+            selected_tool="sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd",
+            candidate_tools=["x"],
+            arguments={},
+            trace_id=None,
+        )
+        # Drop still returns an id (documented left-outer), but nothing
+        # reached disk and the counter recorded the drop.
+        assert sid is not None
+        assert log.snapshot()["redaction_drops"] == 1
+        assert log.snapshot()["events_written"] == 0
+
+
+# ── aggregate_selection_log (read-side stats) ────────────────────────────
+
+
+def _write_lines(path: Path, lines: list) -> None:
+    """Write raw JSONL; dict entries are dumped, str entries written verbatim
+    (so malformed/non-object lines can be exercised)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for item in lines:
+            fh.write((item if isinstance(item, str) else json.dumps(item)) + "\n")
+
+
+def _sel(**kw) -> dict:
+    base = {
+        "event": "selection",
+        "ranker_version": RANKER_VERSION,
+        "server": "srv",
+        "selected_tool": "srv__a",
+        "reject_reasons": {},
+    }
+    base.update(kw)
+    return base
+
+
+def _exec(**kw) -> dict:
+    base = {"event": "execution", "ok": True, "latency_ms": 10.0, "error_type": None}
+    base.update(kw)
+    return base
+
+
+class TestAggregateSelectionLog:
+    def test_absent_file_returns_zeroed_shape(self, tmp_path):
+        agg = aggregate_selection_log(tmp_path / "nope.jsonl")
+        assert agg["exists"] is False
+        assert agg["total_lines"] == 0
+        assert agg["events"] == {"selection": 0, "execution": 0, "feedback": 0}
+        assert agg["by_ranker_version"] == []
+        assert agg["outcomes"] == {"ok": 0, "error": 0, "error_rate": 0.0}
+
+    def test_empty_file_exists_but_no_lines(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("", encoding="utf-8")
+        agg = aggregate_selection_log(p)
+        assert agg["exists"] is True
+        assert agg["total_lines"] == 0
+
+    def test_malformed_and_unknown_lines_skipped_and_counted(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _sel(),
+                "{ this is not json",  # bad JSON
+                "[1, 2, 3]",  # valid JSON, not an object
+                {"event": "mystery"},  # unknown event type
+                "",  # blank line ignored, not counted as malformed
+            ],
+        )
+        agg = aggregate_selection_log(p)
+        # blank line skipped before counting; 4 real lines counted
+        assert agg["total_lines"] == 4
+        assert agg["malformed"] == 3
+        assert agg["events"]["selection"] == 1
+
+    def test_event_counts_and_ranker_cohorts(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _sel(ranker_version="v0-passthrough"),
+                _sel(ranker_version="v1-bm25-tool-relevance"),
+                _sel(ranker_version="v1-bm25-tool-relevance"),
+                _exec(),
+                {"event": "feedback", "selection_id": "z"},
+            ],
+        )
+        agg = aggregate_selection_log(p)
+        assert agg["events"] == {"selection": 3, "execution": 1, "feedback": 1}
+        # full, sorted by count desc then key asc
+        assert agg["by_ranker_version"] == [
+            ["v1-bm25-tool-relevance", 2],
+            ["v0-passthrough", 1],
+        ]
+
+    def test_by_server_and_tool_with_topn_truncation(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        rows = [_sel(selected_tool=f"srv__t{i}") for i in range(5)]
+        # make t0 the most frequent
+        rows += [_sel(selected_tool="srv__t0") for _ in range(3)]
+        _write_lines(p, rows)
+        agg = aggregate_selection_log(p, top_n=2)
+        assert agg["by_selected_tool_distinct"] == 5
+        assert len(agg["by_selected_tool"]) == 2
+        assert agg["by_selected_tool"][0] == ["srv__t0", 4]
+        # server is the same for all → single distinct
+        assert agg["by_server_distinct"] == 1
+        assert agg["by_server"] == [["srv", 8]]
+
+    def test_outcomes_error_rate_and_error_types(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _exec(ok=True),
+                _exec(ok=False, error_type="TimeoutError"),
+                _exec(ok=False, error_type="TimeoutError"),
+                _exec(ok=False, error_type="ValueError"),
+            ],
+        )
+        agg = aggregate_selection_log(p)
+        assert agg["outcomes"] == {"ok": 1, "error": 3, "error_rate": 0.75}
+        assert agg["by_error_type"] == [["TimeoutError", 2], ["ValueError", 1]]
+        assert agg["by_error_type_distinct"] == 2
+
+    def test_reject_reasons_tallied_across_selections(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _sel(reject_reasons={"srv__b": "config_hidden", "srv__c": "unhealthy"}),
+                _sel(reject_reasons={"srv__d": "config_hidden"}),
+                _sel(reject_reasons={}),
+            ],
+        )
+        agg = aggregate_selection_log(p)
+        assert agg["reject_reasons"] == [["config_hidden", 2], ["unhealthy", 1]]
+        assert agg["reject_reasons_distinct"] == 2
+
+    def test_latency_percentiles_and_bool_excluded(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        rows = [_exec(latency_ms=float(v)) for v in (10, 20, 30, 40, 50)]
+        # a malformed/bool latency must not poison the percentile pool
+        rows.append(_exec(latency_ms=True))
+        _write_lines(p, rows)
+        agg = aggregate_selection_log(p)
+        assert agg["latency_ms"]["count"] == 5
+        assert agg["latency_ms"]["p50"] == 30.0
+
+    def test_rotated_backups_counted_not_parsed(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(p, [_sel()])
+        (tmp_path / "log.jsonl.1").write_text("ignored\n", encoding="utf-8")
+        (tmp_path / "log.jsonl.2").write_text("ignored\n", encoding="utf-8")
+        agg = aggregate_selection_log(p)
+        assert agg["rotated_backups"] == 2
+        # only the active file's one selection is in the aggregate
+        assert agg["events"]["selection"] == 1
