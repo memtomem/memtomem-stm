@@ -163,14 +163,14 @@ def test_drift_baseline_matches_suite_roster():
 
 def test_drift_baseline_has_no_nonreproducible_fields():
     """The committed baseline must already be canonicalized — no wall-clock
-    stage timings and no llm_judge block (those would never reproduce)."""
+    stage timings and no llm_judge* blocks (model A / model B / agreement,
+    none of which would reproduce)."""
     from bench.bench_qa.report import _STAGE_TIMING_FIELDS
 
     baseline = _load_baseline()
     for scenario in baseline["scenarios"]:
-        assert "llm_judge" not in scenario, (
-            f"{scenario['scenario_id']}: llm_judge leaked into baseline"
-        )
+        for key in ("llm_judge", "llm_judge_b", "llm_judge_agreement"):
+            assert key not in scenario, f"{scenario['scenario_id']}: {key} leaked into baseline"
         for field in _STAGE_TIMING_FIELDS:
             assert field not in scenario["metrics"], (
                 f"{scenario['scenario_id']}: timing field {field} leaked into baseline"
@@ -206,9 +206,15 @@ def test_direction_table_covers_every_schema_field():
     expected -= {f"metrics.{f}" for f in _STAGE_TIMING_FIELDS}
     # Scenario-level scalars — derived from the schema (not hard-coded) so a NEW
     # top-level ScenarioReport field (e.g. a cache_hit mirroring #485) trips this
-    # until it is given a deliberate direction. llm_judge is stripped by
-    # canonicalize_report; scenario_id is the row key.
-    top_scalars = set(ScenarioReport.__annotations__) - set(sections) - {"scenario_id", "llm_judge"}
+    # until it is given a deliberate direction. The llm_judge* blocks (model A,
+    # model B, and the two-model agreement) are all stripped by
+    # canonicalize_report so the classifier never sees them; scenario_id is the
+    # row key.
+    top_scalars = (
+        set(ScenarioReport.__annotations__)
+        - set(sections)
+        - {"scenario_id", "llm_judge", "llm_judge_b", "llm_judge_agreement"}
+    )
     expected |= top_scalars
 
     classified = set(SCENARIO_DIRECTION) | set(SCENARIO_EXCLUDED)

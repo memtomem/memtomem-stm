@@ -144,3 +144,102 @@ def test_canonicalize_strips_only_stage_timings():
     assert result["scenarios"][0]["trace_id"] == "bench-abc"
     # Original must not be mutated.
     assert "clean_ms" in sample["scenarios"][0]["metrics"]
+
+
+@pytest.mark.bench_qa
+def test_canonicalize_strips_llm_judge_agreement():
+    """The item-9 keys ``llm_judge_b`` + ``llm_judge_agreement`` are derived
+    from drift-prone LLM scores, so canonicalization must strip them alongside
+    ``llm_judge`` — otherwise the multi-model agreement marker would break the
+    two-run determinism diff (and the #487 drift snapshot)."""
+    sample = {
+        "schema_version": 1,
+        "run_seed": 0,
+        "scenarios": [
+            {
+                "scenario_id": "s09",
+                "trace_id": "bench-abc",
+                "metrics": {
+                    "original_chars": 100,
+                    "cleaned_chars": 95,
+                    "compressed_chars": 80,
+                    "compression_ratio": 0.84,
+                    "compression_strategy": "none",
+                    "ratio_violation": 0,
+                    "surfacing_on_progressive_ok": None,
+                    "surface_error": None,
+                    "clean_ms": 1.23,
+                    "compress_ms": 4.56,
+                    "surface_ms": 0.0,
+                },
+                "tier": "none",
+                "verdict": "pass",
+                "llm_judge": {"model": "gpt-4.1-nano", "overall": 0.9},
+                "llm_judge_b": {"model": "claude-haiku-4-5-20251001", "overall": 0.7},
+                "llm_judge_agreement": {
+                    "model_a": "gpt-4.1-nano",
+                    "model_b": "claude-haiku-4-5-20251001",
+                    "agreement_score": 0.8,
+                },
+            }
+        ],
+        "tier_histogram": {"none": 1},
+        "totals": {"scenarios": 1.0},
+    }
+    scenario = canonicalize_report(sample)["scenarios"][0]  # type: ignore[arg-type]
+    assert "llm_judge" not in scenario
+    assert "llm_judge_b" not in scenario
+    assert "llm_judge_agreement" not in scenario
+    # Determinism-safe fields still survive the strip.
+    assert scenario["metrics"]["compressed_chars"] == 80
+    assert scenario["trace_id"] == "bench-abc"
+    # Original must not be mutated.
+    assert "llm_judge_agreement" in sample["scenarios"][0]
+
+
+@pytest.mark.bench_qa
+def test_compute_agreement_metric_math():
+    """Pin the item-9 agreement metric: per-dimension absolute diffs, the
+    ``1 - mean(diffs)`` score (rounded 4 dp, clamped to [0, 1]), and the
+    either-error degrade path that omits numerics so a failed judge can't
+    poison the cross-scenario correlation. No API key — runs in default CI."""
+    from bench.bench_qa.llm_judge_adapter import compute_agreement
+
+    report_a = {
+        "model": "gpt-4.1-nano",
+        "overall": 0.80,
+        "factual_completeness": 0.90,
+        "structural_coherence": 0.70,
+        "answer_sufficiency": 1.00,
+    }
+    report_b = {
+        "model": "claude-haiku-4-5-20251001",
+        "overall": 0.60,
+        "factual_completeness": 0.90,
+        "structural_coherence": 0.50,
+        "answer_sufficiency": 0.80,
+    }
+    agreement = compute_agreement(report_a, report_b)  # type: ignore[arg-type]
+    assert agreement["model_a"] == "gpt-4.1-nano"
+    assert agreement["model_b"] == "claude-haiku-4-5-20251001"
+    assert agreement["overall_a"] == 0.80
+    assert agreement["overall_b"] == 0.60
+    assert agreement["diff_overall"] == 0.2
+    assert agreement["diff_factual_completeness"] == 0.0
+    assert agreement["diff_structural_coherence"] == 0.2
+    assert agreement["diff_answer_sufficiency"] == 0.2
+    # 1 - mean(0.2, 0.0, 0.2, 0.2) = 1 - 0.15 = 0.85
+    assert agreement["agreement_score"] == 0.85
+    assert "error" not in agreement
+
+    # Either-error degrade: numeric fields omitted, error carries both sides.
+    degraded = compute_agreement(
+        {"model": "gpt-4.1-nano", "overall": 0.0, "error": "boom"},  # type: ignore[arg-type]
+        report_b,  # type: ignore[arg-type]
+    )
+    assert degraded["model_a"] == "gpt-4.1-nano"
+    assert degraded["model_b"] == "claude-haiku-4-5-20251001"
+    assert "error" in degraded
+    assert "boom" in degraded["error"]
+    assert "agreement_score" not in degraded
+    assert "diff_overall" not in degraded

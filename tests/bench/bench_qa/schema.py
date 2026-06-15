@@ -146,6 +146,35 @@ class LLMJudgeResultReport(TypedDict, total=False):
     error: str
 
 
+class LLMJudgeAgreementReport(TypedDict, total=False):
+    """Two-judge cross-provider agreement for a single scenario (item 9).
+
+    Advisory only — never gates pass/fail. Derived from two LLM judges'
+    normalised scores, so ``canonicalize_report`` strips it wholesale for the
+    same drift reason it strips ``llm_judge``: provider-side model updates
+    shift the scores (and the diffs computed from them) even at
+    ``temperature=0``. All floats are 0.0–1.0 (the per-model reports are
+    already ``/10``-normalised, rounded to 4 dp), so ``agreement_score`` lines
+    up with ``qa.ratio`` / ``rule_judge.score`` without rescaling.
+
+    On a transport/parse failure in *either* judge, only ``model_a`` /
+    ``model_b`` / ``error`` are populated and the numeric fields are omitted —
+    a failed judge's ``overall=0.0`` must not fabricate a large diff that
+    poisons the cross-scenario correlation.
+    """
+
+    model_a: str
+    model_b: str
+    overall_a: float
+    overall_b: float
+    diff_overall: float
+    diff_factual_completeness: float
+    diff_structural_coherence: float
+    diff_answer_sufficiency: float
+    agreement_score: float  # round(max(0, min(1, 1 - mean(4 diffs))), 4)
+    error: str
+
+
 class ScenarioReport(TypedDict, total=False):
     scenario_id: str
     trace_id: str
@@ -155,6 +184,11 @@ class ScenarioReport(TypedDict, total=False):
     progressive: ProgressiveResult
     surfacing: SurfacingResult
     llm_judge: LLMJudgeResultReport
+    # Second judge's full block (model_a stays in ``llm_judge``) + the
+    # two-model agreement summary (item 9). Both stripped by
+    # ``canonicalize_report`` like ``llm_judge``.
+    llm_judge_b: LLMJudgeResultReport
+    llm_judge_agreement: LLMJudgeAgreementReport
     tier: str
     verdict: Literal["pass", "fail", "advisory"]
 
