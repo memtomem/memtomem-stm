@@ -30,6 +30,7 @@ from __future__ import annotations
 import pytest
 
 from bench.bench_qa import (
+    SUITE_SCENARIOS,
     canonicalize_report,
     deterministic_trace_id,
     fixtures_dir,
@@ -37,20 +38,11 @@ from bench.bench_qa import (
 )
 
 # Every fixture that records a ``ScenarioReport`` row into ``report.json``.
-# Explicit (not globbed) so adding a fixture forces a conscious include /
-# exclude decision via ``test_determinism_roster_covers_every_fixture``.
-DETERMINISM_SCENARIOS = [
-    "s01",  # Tier-2 hybrid_fallback
-    "s02",  # AUTO → extract_fields
-    "s03",  # AUTO → truncate
-    "s04",  # AUTO → truncate
-    "s05",  # SKELETON (chat transcript)
-    "s06",  # Tier-1 progressive_fallback (round-trip)
-    "s07",  # SELECTIVE TOC
-    "s08",  # Tier-3 truncate_fallback
-    "s09",  # AUTO → none (fits budget)
-    "s10",  # surfacing recall@k
-]
+# Sourced from the canonical roster in ``bench_qa.replay`` (shared with the
+# cross-version drift gate) so the two gates can never drift apart; the
+# tripwire below still forces a conscious include/exclude decision when a
+# fixture is added. Not globbed — the roster is explicit on purpose.
+DETERMINISM_SCENARIOS = SUITE_SCENARIOS
 
 # Fixtures intentionally outside the determinism gate, each with its reason.
 _EXCLUDED_FIXTURES = {
