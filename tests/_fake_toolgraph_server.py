@@ -21,7 +21,9 @@ Input-driven behaviors (so one fixture covers every adapter path):
 * ``agent == "ghost"`` returns ``agent_found=False`` as a *structured*
   result (NOT an error) — the abort signal the adapter must surface as data.
 * any candidate ending in ``"::blocked"`` comes back as a ``NOT_GRANTED``
-  rejected row; all others are eligible, in input order.
+  rejected row; a candidate whose tool part starts with ``"missing"`` comes
+  back as a ``TOOL_NOT_FOUND`` rejected row (the graph's blind spot); all
+  others are eligible, in input order.
 
 Run with: ``python <path-to-this-file>``.
 """
@@ -59,10 +61,13 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
     eligible: list[str] = []
     rejected: list[dict] = []
     for candidate in candidates:  # input order is part of the upstream contract
+        tool_part = candidate.split("::", 1)[-1]
         if candidate.endswith("::blocked"):
             rejected.append(
                 {"candidate": candidate, "tool_key": candidate, "reason": "NOT_GRANTED"}
             )
+        elif tool_part.startswith("missing"):
+            rejected.append({"candidate": candidate, "tool_key": None, "reason": "TOOL_NOT_FOUND"})
         else:
             eligible.append(candidate)
 

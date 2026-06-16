@@ -56,7 +56,7 @@ stamp).
 | `candidate_tools`, `candidate_count` | what the proxy last advertised (`get_proxy_tools()` snapshot) |
 | `reject_reasons` | prefixed tool → reason code for every tool the #465 filter withheld from that advertisement (see [Hard-filter reject reasons](#hard-filter-reject-reasons-465)); `{}` when nothing was rejected |
 | `candidate_features` | ranking output object when #466 ranking ran (shape below); `null` otherwise |
-| `graph_generation` | reserved `null` until toolgraph#13 integration |
+| `graph_generation` | the external tool-graph generation the advertisement was filtered under (#465), pinning replay to a graph state; `null` when the `toolgraph` provider is disabled, unconsulted, or the consult failed without a usable verdict (unreachable / protocol error). On an agent-not-found degrade the graph still responded, so the generation is recorded |
 | `args_sha256`, `args_chars` | canonical-JSON hash + length of the call arguments |
 | `ts` | unix seconds |
 
@@ -138,6 +138,8 @@ reason code`:
 | `name_overflow` | composed client-side name exceeds the 64-char MCP limit | all |
 | `sensitive_metadata` | credential-pattern match in the tool's description/schema | rejects under `strict`; demotes under `review` |
 | `unhealthy` | upstream-attributable error rate over the recent metrics window crossed the threshold | rejects under `strict`; demotes under `review` |
+| `toolgraph_not_granted`, `toolgraph_deny_violation`, `toolgraph_deny_governed`, `toolgraph_drifted`, `toolgraph_ambiguous`, `toolgraph_unmapped`, `toolgraph_tool_not_found`, `toolgraph_rejected` | per-candidate verdict from the optional external tool-graph provider (the `toolgraph` block — one code per upstream reason, `toolgraph_rejected` is the forward-compatible fallback for an unrecognized reason) | rejects under `strict`; demotes under `review` |
+| `toolgraph_unreachable`, `toolgraph_agent_not_found`, `toolgraph_protocol_error` | whole-call fail-closed: the consult failed under a `closed` knob, so **every** tool is withheld under one code | all (profile-independent) |
 
 Reason codes are the only #465 payload in the log — no tool metadata, no
 error text — so the redaction policy below is untouched. `reject_reasons`

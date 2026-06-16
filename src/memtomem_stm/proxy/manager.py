@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time as _time
 import uuid
+from collections import Counter
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -68,9 +69,19 @@ from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
     REASON_PROFILE_EXCLUDED,
+    REASON_TOOLGRAPH_AGENT_NOT_FOUND,
+    REASON_TOOLGRAPH_PROTOCOL_ERROR,
+    REASON_TOOLGRAPH_UNREACHABLE,
     ExposureCandidate,
     compute_health_flags,
     filter_tools,
+    interpret_verdict,
+)
+from memtomem_stm.proxy.toolgraph_provider import (
+    TRANSPORT_ERRORS as TOOLGRAPH_TRANSPORT_ERRORS,
+    ToolgraphConsultAdapter,
+    ToolgraphProtocolError,
+    ToolgraphUnreachableError,
 )
 from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25,
@@ -106,6 +117,29 @@ from memtomem_stm.observability.tracing import traced
 _NO_RETRY_CODES = {-32600, -32601, -32602, -32603}  # INVALID_REQUEST/METHOD/PARAMS/INTERNAL
 
 logger = logging.getLogger(__name__)
+
+# Errors the tool-graph consult treats as "graph unreachable" → on_unreachable.
+# ``eligible_tools()`` already wraps transport failures into
+# ``ToolgraphUnreachableError``; ``start()`` re-raises them RAW, so the manager
+# catches both. Built here (not inline in the ``except``) so mypy sees a typed
+# exception tuple rather than a star-unpack.
+_TOOLGRAPH_UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
+    ToolgraphUnreachableError,
+    *TOOLGRAPH_TRANSPORT_ERRORS,
+)
+
+
+class ToolgraphStartupError(RuntimeError):
+    """A ``fail_start`` tool-graph failure aborts proxy startup (#465).
+
+    Raised from ``ProxyManager.start()`` when an enabled provider's consult
+    fails (unreachable / agent-not-found / protocol error) and the matching
+    ``on_*`` knob is ``fail_start`` (the default for the contract-class
+    failures). Propagates out of ``start()`` so the lifespan refuses to bring
+    the proxy up — loud and recoverable, never a silent fail-open. The operator
+    sets the knob to ``open`` (degrade) or ``closed`` (withhold all) to choose
+    a different posture.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +226,22 @@ class ProxyManager:
         # registered) and later get_proxy_tools() calls (teardown, tests),
         # or telemetry would lie about the candidate set the client saw.
         self._unhealthy_tools: frozenset[tuple[str, str]] = frozenset()
+        # #465 optional external tool-graph eligibility provider. Consulted
+        # ONCE per start() (beside the health-flag precompute) so the
+        # advertised set stays session-stable; the snapshots below feed every
+        # get_proxy_tools() pass. ``_toolgraph_external_rejects`` are
+        # per-candidate verdicts (profile-gated in filter_tools);
+        # ``_toolgraph_withhold_all`` is the whole-call fail-closed code (a
+        # ``closed`` knob fired); ``_graph_generation`` pins selection
+        # telemetry to the graph state (#468); ``_toolgraph_degraded`` records
+        # that a failure resolved to ``open`` so the external rule family was
+        # SKIPPED — surfaced loudly so a one-time ``open`` cannot silently
+        # become a permanent enforcement blind spot.
+        self._toolgraph_external_rejects: dict[tuple[str, str], str] = {}
+        self._toolgraph_withhold_all: str | None = None
+        self._graph_generation: int | None = None
+        self._toolgraph_degraded: bool = False
+        self._toolgraph_degraded_reason: str | None = None
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
@@ -337,18 +387,189 @@ class ProxyManager:
                 exposure_cfg.profile.value,
             )
 
-        # #465: the optional external tool-graph eligibility provider is
-        # configured but not yet consulted here — the startup consult that
-        # feeds ``filter_tools`` (beside the health-flag precompute above) is a
-        # follow-up. Until it lands, an enabled block does nothing, so warn
-        # (the #288 "config is enabled but inert" pattern) rather than let an
-        # operator believe external eligibility facts are being enforced.
+        # #465: consult the optional external tool-graph eligibility provider
+        # once, beside the health-flag precompute, so its verdict joins the
+        # exposure filter for the rest of the session. A ``fail_start`` knob
+        # raises here — before any tool is advertised — which is the intended
+        # loud failure (a broken/typo'd provider must not silently disable
+        # enforcement).
         if self._config.toolgraph.enabled:
-            logger.warning(
-                "toolgraph.enabled is set but the eligibility provider is not "
-                "wired yet — config is enabled but inert; no external "
-                "eligibility facts will be consulted."
+            await self._consult_toolgraph()
+
+    def _build_toolgraph_candidates(self) -> tuple[dict[str, list[tuple[str, str]]], list[str]]:
+        """Map every discovered upstream tool to its graph candidate ref.
+
+        A ref is ``"<graph-server>::<tool>"`` where ``<graph-server>`` is the
+        tool-graph's CRAWLED server name — an independent string from STM's own
+        connection key, hence the ``server_name_map`` translation (identity
+        when unmapped). Bare names risk ``AMBIGUOUS_TOOL``, so refs are always
+        server-qualified. Refs are deduplicated for the batch consult; the
+        returned map fans one ref's verdict back to EVERY STM
+        ``(server, original_name)`` key that shares it (two upstreams mapped to
+        one graph server with a same-named tool both inherit that verdict).
+        """
+        name_map = self._config.toolgraph.server_name_map
+        ref_to_keys: dict[str, list[tuple[str, str]]] = {}
+        for conn in self._connections.values():
+            graph_server = name_map.get(conn.name, conn.name)
+            for t in conn.tools:
+                ref = f"{graph_server}::{t.name}"
+                ref_to_keys.setdefault(ref, []).append((conn.name, t.name))
+        return ref_to_keys, list(ref_to_keys.keys())
+
+    async def _consult_toolgraph(self) -> None:
+        """Run the one-shot startup consult and cache its verdict (#465).
+
+        Mirrors :func:`compute_health_flags`: consult once, hold the snapshot
+        for the session so the advertised set stays stable. The adapter is
+        started, consulted, and stopped here — there is no per-request lazy
+        start, so nothing holds the stdio child past startup. Failures are
+        classified onto the configured ``on_*`` knobs; ``fail_start`` raises
+        :class:`ToolgraphStartupError` (out of ``start()``) before any tool is
+        advertised.
+        """
+        cfg = self._config.toolgraph
+        # Reset the cached snapshot first: start() is a supported re-entry path
+        # (the double-start guard re-runs discovery + compute_health_flags), so
+        # a recovered graph on a second start must not inherit the previous
+        # session's withhold-all / degraded / reject state.
+        self._toolgraph_external_rejects = {}
+        self._toolgraph_withhold_all = None
+        self._graph_generation = None
+        self._toolgraph_degraded = False
+        self._toolgraph_degraded_reason = None
+
+        ref_to_keys, refs = self._build_toolgraph_candidates()
+        if not refs:
+            logger.info(
+                "Tool-graph provider enabled but no upstream tools were discovered "
+                "— consult skipped"
             )
+            return
+
+        adapter = ToolgraphConsultAdapter(cfg)
+        try:
+            try:
+                # ``start()`` re-raises raw transport errors (caught below as
+                # unreachable); the consult itself is bounded by the adapter's
+                # ``timeout_seconds`` (the realistic hang is a slow Neo4j query,
+                # which happens during the consult, not during initialize()).
+                await adapter.start()
+                verdict = await adapter.eligible_tools(refs)
+                interp = interpret_verdict(verdict)
+            finally:
+                try:
+                    await adapter.stop()
+                except Exception:
+                    logger.debug("Tool-graph adapter stop() failed", exc_info=True)
+        except _TOOLGRAPH_UNREACHABLE_ERRORS as exc:
+            self._tg_whole_call(cfg.on_unreachable, REASON_TOOLGRAPH_UNREACHABLE, str(exc))
+            return
+        except ToolgraphProtocolError as exc:
+            self._tg_whole_call(cfg.on_protocol_error, REASON_TOOLGRAPH_PROTOCOL_ERROR, str(exc))
+            return
+
+        # Reachable + well-formed. Pin the generation even on an abort — the
+        # graph responded, so it is a meaningful telemetry key.
+        self._graph_generation = interp.graph_generation
+
+        if not interp.agent_found:
+            self._tg_whole_call(
+                cfg.on_agent_not_found,
+                REASON_TOOLGRAPH_AGENT_NOT_FOUND,
+                f"agent_id {cfg.agent_id!r} is not registered in the tool-graph",
+            )
+            return
+
+        # Per-candidate verdicts. TOOL_NOT_FOUND (the graph's blind spot) obeys
+        # ``on_tool_not_found``: ``open`` keeps the working tool advertised,
+        # ``closed`` rejects the uncrawled candidate.
+        rejects = dict(interp.rejects)
+        if cfg.on_tool_not_found == "open":
+            for ref in interp.tool_not_found_refs:
+                rejects.pop(ref, None)
+        self._toolgraph_external_rejects = {
+            key: code for ref, code in rejects.items() for key in ref_to_keys.get(ref, ())
+        }
+        if self._toolgraph_external_rejects:
+            logger.info(
+                "Tool-graph consult: %d candidate(s) rejected by the graph (generation %s)",
+                len(self._toolgraph_external_rejects),
+                self._graph_generation,
+            )
+        self._warn_server_name_mismatch(interp.tool_not_found_refs, ref_to_keys)
+
+    def _tg_whole_call(self, knob: str, code: str, detail: str) -> None:
+        """Apply a whole-call tool-graph failure per its ``on_*`` knob.
+
+        ``fail_start`` raises (aborts startup); ``closed`` withholds every tool
+        under ``code`` (profile-independent); ``open`` degrades to STM-native
+        rules and records the skip loudly so the lost enforcement is never
+        silent (a one-time ``open`` must not quietly become a permanent blind
+        spot — see ``stm_proxy_health``).
+        """
+        if knob == "fail_start":
+            raise ToolgraphStartupError(
+                f"tool-graph consult failed ({code}: {detail}); the matching on_* knob "
+                f"is 'fail_start'. Fix the provider, or set the knob to 'open' (degrade "
+                f"to STM-native rules) or 'closed' (withhold all tools)."
+            )
+        if knob == "closed":
+            self._toolgraph_withhold_all = code
+            logger.warning(
+                "Tool-graph consult failed (%s: %s) — knob is 'closed': withholding "
+                "ALL tools this session.",
+                code,
+                detail,
+            )
+            return
+        # "open" — degrade.
+        self._toolgraph_degraded = True
+        self._toolgraph_degraded_reason = code
+        logger.warning(
+            "Tool-graph consult failed (%s: %s) — knob is 'open': DEGRADED. The "
+            "external eligibility rule family is SKIPPED this session; tools are "
+            "advertised per STM-native rules only. Tool-graph enforcement is NOT active.",
+            code,
+            detail,
+        )
+
+    def _warn_server_name_mismatch(
+        self,
+        tool_not_found_refs: frozenset[str],
+        ref_to_keys: dict[str, list[tuple[str, str]]],
+    ) -> None:
+        """Heuristic: warn when an entire upstream's tools are unknown to the graph.
+
+        STM cannot precisely verify its connection key against the graph's
+        crawled server name (they are independent strings and no ``list_servers``
+        MCP tool exists to reconcile them), so it infers a likely
+        ``server_name_map`` gap: if EVERY candidate from one
+        upstream came back ``TOOL_NOT_FOUND`` and that upstream has no map
+        entry, the names probably don't line up. Conservative by design (fires
+        only at a 100% miss for an unmapped server) so a partially-crawled
+        server never trips a false positive.
+        """
+        name_map = self._config.toolgraph.server_name_map
+        sent: Counter[str] = Counter()
+        missed: Counter[str] = Counter()
+        for ref, keys in ref_to_keys.items():
+            for server, _tool in keys:
+                sent[server] += 1
+                if ref in tool_not_found_refs:
+                    missed[server] += 1
+        for server, n in sent.items():
+            if n > 0 and missed[server] == n and server not in name_map:
+                logger.warning(
+                    "All %d tool(s) from upstream '%s' are unknown to the tool-graph. "
+                    "If '%s' is crawled under a different name, add a "
+                    "toolgraph.server_name_map['%s'] entry; otherwise these tools are "
+                    "simply not in the graph.",
+                    n,
+                    server,
+                    server,
+                    server,
+                )
 
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
         match cfg.transport:
@@ -594,7 +815,13 @@ class ProxyManager:
                     )
                 )
 
-        verdict = filter_tools(candidates, self._config.exposure, self._unhealthy_tools)
+        verdict = filter_tools(
+            candidates,
+            self._config.exposure,
+            self._unhealthy_tools,
+            external_rejects=self._toolgraph_external_rejects or None,
+            withhold_all=self._toolgraph_withhold_all,
+        )
         if verdict.reject_reasons != self._advertised_reject_reasons:
             self._log_exposure_rejects(verdict.reject_reasons)
         self._advertised_infos = verdict.eligible
@@ -1274,6 +1501,31 @@ class ProxyManager:
             }
         return health
 
+    def get_toolgraph_status(self) -> dict[str, Any] | None:
+        """External tool-graph eligibility provider status (#465), or ``None``
+        when the block is disabled.
+
+        Surfaces the once-per-startup consult outcome so an operator can
+        confirm whether external enforcement is actually ACTIVE this session.
+        This is load-bearing, not cosmetic: a failure that resolved to ``open``
+        silently skips the rule family, and a one-time ``on_*: open`` must
+        never become an unnoticed permanent enforcement blind spot. ``degraded``
+        means the family was skipped (advertising per STM-native rules only);
+        ``withholding_all`` means a ``closed`` knob withheld every tool;
+        otherwise the consult succeeded and ``external_reject_count`` reflects
+        the per-candidate verdicts in force.
+        """
+        if not self._config.toolgraph.enabled:
+            return None
+        return {
+            "enabled": True,
+            "degraded": self._toolgraph_degraded,
+            "degraded_reason": self._toolgraph_degraded_reason,
+            "withholding_all": self._toolgraph_withhold_all,
+            "graph_generation": self._graph_generation,
+            "external_reject_count": len(self._toolgraph_external_rejects),
+        }
+
     async def _on_cache_hit(
         self,
         cached: str,
@@ -1478,6 +1730,7 @@ class ProxyManager:
                 candidate_features=candidate_features,
                 ranker_version=ranker_version,
                 reject_reasons=self._advertised_reject_reasons,
+                graph_generation=self._graph_generation,
             )
         except Exception:
             logger.debug("Selection telemetry write failed", exc_info=True)

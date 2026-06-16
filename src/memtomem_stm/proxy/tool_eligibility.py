@@ -51,6 +51,22 @@ then the remaining rules apply per tool in this order, first match wins:
     count against the tool) over the recent metrics window crossed the
     configured threshold with enough samples. Signal rule, like
     ``sensitive_metadata``.
+``toolgraph_*``
+    The optional external tool-graph eligibility provider (#465) rejected
+    this candidate — one ``toolgraph_<reason>`` code per upstream verdict
+    (NOT_GRANTED / DENY_VIOLATION / DENY_GOVERNED / DRIFTED / AMBIGUOUS /
+    UNMAPPED / TOOL_NOT_FOUND, plus a generic ``toolgraph_rejected``
+    fallback for any upstream reason STM does not recognize). Passed
+    in pre-resolved via ``external_rejects`` (the manager runs the consult
+    once at startup and maps upstream reasons to codes). Signal rule, ranked
+    above ``unhealthy`` but below ``sensitive_metadata``.
+
+A whole-call ``toolgraph_*`` outcome (``toolgraph_unreachable`` /
+``toolgraph_agent_not_found`` / ``toolgraph_protocol_error``) is a SEPARATE
+mechanism: when the consult itself fails under a ``closed`` knob, the manager
+passes ``withhold_all`` and EVERY candidate is withheld under that one code,
+profile-INDEPENDENTLY (explore included) — the operator's explicit "no graph,
+no tools" posture, distinct from the per-candidate signal rules above.
 
 Profile semantics (``ExposureProfile``): ``strict`` enforces signal rules as
 hard rejects; ``review`` keeps flagged tools advertised but assigns them a
@@ -88,6 +104,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -99,6 +116,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.metrics import ErrorCategory
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
+from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.manager import ProxyToolInfo
@@ -116,6 +134,51 @@ REASON_NAME_OVERFLOW = "name_overflow"
 REASON_DUPLICATE_NAME = "duplicate_name"
 REASON_SENSITIVE_METADATA = "sensitive_metadata"
 REASON_UNHEALTHY = "unhealthy"
+
+# External tool-graph eligibility provider codes (#465). Two families:
+#
+# PER-CANDIDATE — a successful consult's ``rejected`` rows, one STM code per
+# upstream reason. These ride the profile-gated signal block (like
+# ``unhealthy``): strict rejects, review demotes, explore ignores. They are
+# the value side of ``filter_tools(external_rejects=...)`` — the manager has
+# already mapped the upstream reason to one of these before the filter runs.
+REASON_TOOLGRAPH_NOT_GRANTED = "toolgraph_not_granted"
+REASON_TOOLGRAPH_DENY_VIOLATION = "toolgraph_deny_violation"
+REASON_TOOLGRAPH_DENY_GOVERNED = "toolgraph_deny_governed"
+REASON_TOOLGRAPH_DRIFTED = "toolgraph_drifted"
+REASON_TOOLGRAPH_AMBIGUOUS = "toolgraph_ambiguous"
+REASON_TOOLGRAPH_UNMAPPED = "toolgraph_unmapped"
+REASON_TOOLGRAPH_TOOL_NOT_FOUND = "toolgraph_tool_not_found"
+# Forward-compatible fallback: an upstream ``rejected`` reason STM does not
+# recognize still results in a withhold (never a silent advertise of a tool
+# the graph wanted blocked), just under a generic code.
+REASON_TOOLGRAPH_REJECTED = "toolgraph_rejected"
+
+# WHOLE-CALL — the consult itself failed (or aborted) and the operator's
+# ``on_*`` knob resolved to ``closed``. These are profile-INDEPENDENT and
+# withhold EVERY candidate at once (``filter_tools(withhold_all=...)``); they
+# are STM-owned, never derived from an upstream row.
+REASON_TOOLGRAPH_UNREACHABLE = "toolgraph_unreachable"
+REASON_TOOLGRAPH_AGENT_NOT_FOUND = "toolgraph_agent_not_found"
+REASON_TOOLGRAPH_PROTOCOL_ERROR = "toolgraph_protocol_error"
+
+# Upstream ``eligible_tools`` reject reason → STM per-candidate code. The graph
+# owns its own reason vocabulary (selector.py); this is the 1:1 translation at
+# the boundary. ``TOOL_NOT_FOUND`` is intentionally absent here — it is gated
+# by the ``on_tool_not_found`` knob, applied by the caller, not unconditionally
+# mapped. An upstream reason missing from this map maps to the generic
+# ``REASON_TOOLGRAPH_REJECTED`` (forward-compatible withhold).
+_TOOLGRAPH_REASON_MAP: dict[str, str] = {
+    "NOT_GRANTED": REASON_TOOLGRAPH_NOT_GRANTED,
+    "DENY_VIOLATION": REASON_TOOLGRAPH_DENY_VIOLATION,
+    "DENY_GOVERNED": REASON_TOOLGRAPH_DENY_GOVERNED,
+    "DRIFTED": REASON_TOOLGRAPH_DRIFTED,
+    "AMBIGUOUS_TOOL": REASON_TOOLGRAPH_AMBIGUOUS,
+    "UNMAPPED": REASON_TOOLGRAPH_UNMAPPED,
+}
+# The upstream reason string for an uncrawled candidate (the graph's blind
+# spot), gated separately by ``on_tool_not_found``.
+_TOOLGRAPH_TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
 
 # Error categories that count against a TOOL's health. Proxy-side failures
 # (programming, internal_error, lock_timeout) are our bugs, not the
@@ -232,17 +295,133 @@ def _metadata_scan_text(candidate: ExposureCandidate) -> str:
     return "\n".join((candidate.raw_description, candidate.info.description, schema_text))
 
 
+@dataclass(frozen=True, slots=True)
+class InterpretedVerdict:
+    """Structured, policy-free read of one ``eligible_tools`` consult response.
+
+    Pure parse of the upstream wire shape into what the manager needs, with no
+    knowledge of the ``on_*`` knobs (the caller applies those):
+
+    - ``agent_found`` — ``False`` is the upstream's structured *abort* signal
+      (the configured ``agent_id`` is unknown to the graph), distinct from an
+      empty result; the caller maps it onto ``on_agent_not_found``.
+    - ``rejects`` — graph candidate ref → STM per-candidate reason code, for
+      *every* ``rejected`` row INCLUDING ``TOOL_NOT_FOUND`` (mapped to
+      :data:`REASON_TOOLGRAPH_TOOL_NOT_FOUND`). The caller drops the
+      tool-not-found entries when ``on_tool_not_found`` is ``open``.
+    - ``tool_not_found_refs`` — the subset of refs the graph never crawled,
+      surfaced separately so the manager can run the server-name-mismatch
+      heuristic regardless of the ``on_tool_not_found`` posture.
+    - ``graph_generation`` — the replay/cache key (#468); always a real ``int``
+      because the upstream stamps every response (the ``agent_found=False``
+      abort included), so a missing one is contract drift.
+    """
+
+    agent_found: bool
+    rejects: dict[str, str]
+    tool_not_found_refs: frozenset[str]
+    graph_generation: int
+
+
+def interpret_verdict(verdict: Mapping[str, Any]) -> InterpretedVerdict:
+    """Validate the ``eligible_tools`` verdict shape and parse it (no policy).
+
+    Raises :class:`ToolgraphProtocolError` on a malformed payload — a reachable
+    graph returning a shape STM cannot trust is a *contract* failure (the
+    caller maps it onto ``on_protocol_error``), never silently treated as an
+    empty/clean result. ``graph_generation`` must be a real ``int`` on EVERY
+    path (the abort included — the server stamps it unconditionally); ``bool``
+    is rejected as it is an ``int`` subclass but never a valid generation.
+    """
+    agent_found = verdict.get("agent_found")
+    if not isinstance(agent_found, bool):
+        raise ToolgraphProtocolError(
+            f"eligible_tools verdict has a non-boolean 'agent_found': {agent_found!r}"
+        )
+
+    gen = verdict.get("graph_generation")
+    if isinstance(gen, bool) or not isinstance(gen, int):
+        raise ToolgraphProtocolError(
+            f"eligible_tools verdict has a non-integer 'graph_generation': {gen!r}"
+        )
+    graph_generation = gen
+
+    if not agent_found:
+        return InterpretedVerdict(
+            agent_found=False,
+            rejects={},
+            tool_not_found_refs=frozenset(),
+            graph_generation=graph_generation,
+        )
+
+    rows = verdict.get("rejected")
+    if not isinstance(rows, list):
+        raise ToolgraphProtocolError(
+            f"eligible_tools verdict 'rejected' is not a list: {type(rows).__name__}"
+        )
+
+    rejects: dict[str, str] = {}
+    tool_not_found: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ToolgraphProtocolError(f"eligible_tools 'rejected' row is not an object: {row!r}")
+        ref = row.get("candidate")
+        reason = row.get("reason")
+        if not isinstance(ref, str) or not isinstance(reason, str):
+            raise ToolgraphProtocolError(
+                f"eligible_tools 'rejected' row missing string candidate/reason: {row!r}"
+            )
+        if reason == _TOOLGRAPH_TOOL_NOT_FOUND:
+            tool_not_found.add(ref)
+            rejects[ref] = REASON_TOOLGRAPH_TOOL_NOT_FOUND
+        else:
+            # Unknown upstream reasons still withhold (fail-safe) under a
+            # generic code rather than silently advertising a blocked tool.
+            rejects[ref] = _TOOLGRAPH_REASON_MAP.get(reason, REASON_TOOLGRAPH_REJECTED)
+
+    return InterpretedVerdict(
+        agent_found=True,
+        rejects=rejects,
+        tool_not_found_refs=frozenset(tool_not_found),
+        graph_generation=graph_generation,
+    )
+
+
 def filter_tools(
     candidates: list[ExposureCandidate],
     cfg: ExposureConfig,
     unhealthy: frozenset[tuple[str, str]] = frozenset(),
+    *,
+    external_rejects: Mapping[tuple[str, str], str] | None = None,
+    withhold_all: str | None = None,
 ) -> EligibilityResult:
     """Apply the hard-filter rules to one advertisement candidate set.
 
-    Pure and deterministic: same candidates + config + health flags →
-    identical result, independent of call count or wall clock. *unhealthy*
-    is the cached startup snapshot from :func:`compute_health_flags`.
+    Pure and deterministic: same candidates + config + health flags +
+    external verdict → identical result, independent of call count or wall
+    clock. *unhealthy* is the cached startup snapshot from
+    :func:`compute_health_flags`.
+
+    *external_rejects* maps ``(server, original_name)`` → an already-resolved
+    ``toolgraph_*`` code (the optional tool-graph provider's per-candidate
+    verdict, #465). It is a SIGNAL rule: it rides the profile ladder exactly
+    like ``unhealthy`` (strict rejects, review demotes, explore ignores), and
+    ranks above ``unhealthy`` but below ``sensitive_metadata`` — an explicit
+    graph policy verdict outweighs a heuristic error-rate flag, but a
+    credential in tool metadata (upstream compromise) outweighs both.
+
+    *withhold_all*, when set, is the whole-call fail-closed code: the consult
+    failed under a ``closed`` knob, so EVERY candidate is withheld under that
+    one STM-owned code, profile-INDEPENDENTLY (explore included). This is the
+    operator's explicit "no graph, no tools" posture and short-circuits every
+    per-candidate rule below.
     """
+    if withhold_all is not None:
+        return EligibilityResult(
+            eligible=[],
+            reject_reasons={candidate.info.prefixed_name: withhold_all for candidate in candidates},
+            risk_penalties={},
+        )
     # ── ambiguity pre-pass (every profile) ───────────────────────────────
     # A composed name carried by MORE than one candidate is structurally
     # ambiguous and the whole group is withheld: upstream calls route by
@@ -292,8 +471,17 @@ def filter_tools(
         # ── signal rules (profile-dependent) ─────────────────────────────
         if cfg.profile is not ExposureProfile.EXPLORE:
             flagged_reason: str | None = None
+            external_reason = (
+                external_rejects.get((info.server, info.original_name))
+                if external_rejects
+                else None
+            )
+            # Precedence: upstream-compromise (credential in metadata) >
+            # explicit graph policy verdict > heuristic error-rate health.
             if contains_sensitive_content(_metadata_scan_text(candidate), CREDENTIAL_PATTERNS):
                 flagged_reason = REASON_SENSITIVE_METADATA
+            elif external_reason is not None:
+                flagged_reason = external_reason
             elif (info.server, info.original_name) in unhealthy:
                 flagged_reason = REASON_UNHEALTHY
             if flagged_reason is not None:

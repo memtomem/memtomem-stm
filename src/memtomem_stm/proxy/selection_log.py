@@ -201,6 +201,7 @@ class SelectionTelemetryLog:
         candidate_features: dict[str, Any] | None = None,
         ranker_version: str | None = None,
         reject_reasons: dict[str, str] | None = None,
+        graph_generation: int | None = None,
     ) -> str | None:
         """Record a selection event; returns its ``selection_id``.
 
@@ -211,7 +212,10 @@ class SelectionTelemetryLog:
         which ranker produced it (``None`` = the unranked default).
         ``reject_reasons`` is the #465 hard filter's verdict for the
         advertisement this call selected from — reason codes only, no tool
-        metadata (``None`` records the empty map).
+        metadata (``None`` records the empty map). ``graph_generation`` pins
+        the external tool-graph generation the advertisement was filtered
+        under (#465/#468 replay) — ``None`` when the provider is disabled,
+        degraded, or unconsulted.
         """
         if not self._sampled_in():
             with self._lock:
@@ -233,7 +237,7 @@ class SelectionTelemetryLog:
                 "candidate_count": len(candidate_tools),
                 "reject_reasons": dict(reject_reasons) if reject_reasons else {},
                 "candidate_features": candidate_features,
-                "graph_generation": None,
+                "graph_generation": graph_generation,
                 "args_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
                 "args_chars": len(canonical),
             }
