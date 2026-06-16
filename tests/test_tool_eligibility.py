@@ -20,6 +20,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ExposureConfig,
@@ -38,13 +40,20 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_NAME_OVERFLOW,
     REASON_PROFILE_EXCLUDED,
     REASON_SENSITIVE_METADATA,
+    REASON_TOOLGRAPH_NOT_GRANTED,
+    REASON_TOOLGRAPH_REJECTED,
+    REASON_TOOLGRAPH_TOOL_NOT_FOUND,
+    REASON_TOOLGRAPH_UNMAPPED,
+    REASON_TOOLGRAPH_UNREACHABLE,
     REASON_UNHEALTHY,
     UPSTREAM_ERROR_CATEGORIES,
     ExposureCandidate,
     compute_health_flags,
     filter_tools,
+    interpret_verdict,
 )
 from memtomem_stm.proxy.tool_relevance import RANKER_VERSION_BM25_RISK
+from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
 
 
 def _server_cfg(prefix: str = "test", **kwargs: Any) -> UpstreamServerConfig:
@@ -615,3 +624,170 @@ class TestManagerWireIn:
         finally:
             await mgr.stop()
             store.close()
+
+
+# ── interpret_verdict (pure parse of the external consult, #465) ────────────
+
+
+def _verdict(*, agent_found=True, rejected=None, graph_generation=11):
+    v: dict[str, Any] = {
+        "agent": "stm-proxy",
+        "agent_found": agent_found,
+        "profile": "strict",
+        "eligible": [],
+        "rejected": rejected or [],
+    }
+    if graph_generation is not _MISSING:
+        v["graph_generation"] = graph_generation
+    return v
+
+
+_MISSING = object()
+
+
+class TestInterpretVerdict:
+    def test_success_maps_reject_reasons(self):
+        v = _verdict(
+            rejected=[
+                {"candidate": "s::blocked", "reason": "NOT_GRANTED"},
+                {"candidate": "s::dangerous", "reason": "DENY_VIOLATION"},
+            ]
+        )
+        interp = interpret_verdict(v)
+        assert interp.agent_found is True
+        assert interp.graph_generation == 11
+        assert interp.rejects == {
+            "s::blocked": "toolgraph_not_granted",
+            "s::dangerous": "toolgraph_deny_violation",
+        }
+        assert interp.tool_not_found_refs == frozenset()
+
+    def test_unknown_reason_falls_back_to_generic_reject(self):
+        # An upstream reason STM does not recognize still withholds (fail-safe),
+        # never silently advertises a tool the graph rejected.
+        interp = interpret_verdict(
+            _verdict(rejected=[{"candidate": "s::x", "reason": "SOME_NEW_REASON"}])
+        )
+        assert interp.rejects == {"s::x": REASON_TOOLGRAPH_REJECTED}
+
+    def test_unmapped_reason_has_dedicated_code(self):
+        # UNMAPPED is a first-class reject in the graph's strict profile (the
+        # default query_profile), so it gets a 1:1 code, not the generic fallback.
+        interp = interpret_verdict(_verdict(rejected=[{"candidate": "s::u", "reason": "UNMAPPED"}]))
+        assert interp.rejects == {"s::u": REASON_TOOLGRAPH_UNMAPPED}
+
+    def test_tool_not_found_is_mapped_and_tracked(self):
+        interp = interpret_verdict(
+            _verdict(rejected=[{"candidate": "s::missing", "reason": "TOOL_NOT_FOUND"}])
+        )
+        assert interp.rejects == {"s::missing": REASON_TOOLGRAPH_TOOL_NOT_FOUND}
+        assert interp.tool_not_found_refs == frozenset({"s::missing"})
+
+    def test_agent_not_found_aborts_with_generation(self):
+        interp = interpret_verdict(_verdict(agent_found=False))
+        assert interp.agent_found is False
+        assert interp.rejects == {}
+        assert interp.tool_not_found_refs == frozenset()
+        assert interp.graph_generation == 11
+
+    def test_missing_generation_on_abort_is_protocol_error(self):
+        # The server stamps graph_generation on EVERY path via _with_generation
+        # (the abort included), so a missing one is contract drift even when
+        # agent_found is False.
+        with pytest.raises(ToolgraphProtocolError):
+            interpret_verdict(_verdict(agent_found=False, graph_generation=_MISSING))
+
+    def test_non_bool_agent_found_is_protocol_error(self):
+        with pytest.raises(ToolgraphProtocolError):
+            interpret_verdict({"agent_found": "yes", "graph_generation": 1, "rejected": []})
+
+    def test_missing_generation_when_found_is_protocol_error(self):
+        with pytest.raises(ToolgraphProtocolError):
+            interpret_verdict(_verdict(graph_generation=_MISSING))
+
+    def test_bool_generation_is_protocol_error(self):
+        # bool is an int subclass but never a valid generation.
+        with pytest.raises(ToolgraphProtocolError):
+            interpret_verdict(_verdict(graph_generation=True))
+
+    def test_rejected_not_a_list_is_protocol_error(self):
+        with pytest.raises(ToolgraphProtocolError):
+            interpret_verdict({"agent_found": True, "graph_generation": 1, "rejected": {}})
+
+    def test_reject_row_missing_fields_is_protocol_error(self):
+        with pytest.raises(ToolgraphProtocolError):
+            interpret_verdict(_verdict(rejected=[{"candidate": "s::x"}]))
+
+
+# ── filter_tools external_rejects + withhold_all (#465) ─────────────────────
+
+
+class TestExternalRejects:
+    def _ext(self, profile, code="toolgraph_not_granted"):
+        cfg = _server_cfg()
+        return filter_tools(
+            [_cand("a", cfg), _cand("b", cfg)],
+            profile,
+            external_rejects={("srv", "a"): code},
+        )
+
+    def test_strict_rejects_with_the_code(self):
+        result = self._ext(STRICT)
+        assert _names(result) == ["test__b"]
+        assert result.reject_reasons == {"test__a": REASON_TOOLGRAPH_NOT_GRANTED}
+
+    def test_review_demotes_not_rejects(self):
+        result = self._ext(REVIEW)
+        assert _names(result) == ["test__a", "test__b"]
+        assert result.reject_reasons == {}
+        assert result.risk_penalties["test__a"] == REVIEW.review_risk_penalty
+
+    def test_explore_ignores(self):
+        result = self._ext(EXPLORE)
+        assert _names(result) == ["test__a", "test__b"]
+        assert result.reject_reasons == {}
+        assert result.risk_penalties == {}
+
+    def test_external_outranks_unhealthy(self):
+        # A tool flagged by BOTH the graph and the health heuristic records the
+        # explicit graph code, not the heuristic one.
+        cfg = _server_cfg()
+        result = filter_tools(
+            [_cand("a", cfg)],
+            STRICT,
+            unhealthy=frozenset({("srv", "a")}),
+            external_rejects={("srv", "a"): REASON_TOOLGRAPH_NOT_GRANTED},
+        )
+        assert result.reject_reasons == {"test__a": REASON_TOOLGRAPH_NOT_GRANTED}
+
+    def test_sensitive_outranks_external(self):
+        # Credential-in-metadata (upstream compromise) outranks a graph verdict.
+        cfg = _server_cfg()
+        cand = _cand("a", cfg, raw_desc="token: ghp_" + "x" * 36)
+        result = filter_tools(
+            [cand], STRICT, external_rejects={("srv", "a"): REASON_TOOLGRAPH_NOT_GRANTED}
+        )
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+
+class TestWithholdAll:
+    def test_withholds_every_tool_with_one_code(self):
+        cfg = _server_cfg()
+        result = filter_tools(
+            [_cand("a", cfg), _cand("b", cfg)],
+            STRICT,
+            withhold_all=REASON_TOOLGRAPH_UNREACHABLE,
+        )
+        assert result.eligible == []
+        assert result.reject_reasons == {
+            "test__a": REASON_TOOLGRAPH_UNREACHABLE,
+            "test__b": REASON_TOOLGRAPH_UNREACHABLE,
+        }
+        assert result.risk_penalties == {}
+
+    def test_withhold_all_is_profile_independent(self):
+        # Even explore (which skips signal rules) honors a closed-knob withhold.
+        cfg = _server_cfg()
+        result = filter_tools([_cand("a", cfg)], EXPLORE, withhold_all=REASON_TOOLGRAPH_UNREACHABLE)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_TOOLGRAPH_UNREACHABLE}

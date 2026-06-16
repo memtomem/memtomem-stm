@@ -665,8 +665,42 @@ async def stm_proxy_health(
         cb_state = "open (failing)" if cb.is_open else "closed (healthy)"
         lines.append(f"\nSurfacing circuit breaker: {cb_state}")
 
+    lines.extend(_toolgraph_health_lines(pm.get_toolgraph_status()))
+
     lines.extend(bootstrap_lines)
     return "\n".join(lines)
+
+
+def _toolgraph_health_lines(status: dict | None) -> list[str]:
+    """Render the external tool-graph eligibility provider status (#465).
+
+    Empty when the provider is disabled. When enabled, the line makes a
+    DEGRADED or withhold-all posture loud so an operator never mistakes a
+    skipped external rule family for active enforcement.
+    """
+    if status is None:
+        return []
+    lines = ["", "Tool-graph eligibility provider", "=============================="]
+    if status["withholding_all"]:
+        lines.append(
+            f"  WITHHOLDING ALL tools — consult failed ({status['withholding_all']}), "
+            "knob is 'closed'"
+        )
+    elif status["degraded"]:
+        lines.append(
+            f"  DEGRADED — external enforcement NOT active ({status['degraded_reason']}); "
+            "advertising per STM-native rules only"
+        )
+    elif status["graph_generation"] is None:
+        # Enabled, no failure, but no usable generation → the consult was
+        # skipped (no upstream tools discovered). Not "active" enforcement.
+        lines.append("  enabled, not consulted (no upstream tools discovered)")
+    else:
+        lines.append(
+            f"  active (graph generation {status['graph_generation']}, "
+            f"{status['external_reject_count']} tool(s) rejected by the graph)"
+        )
+    return lines
 
 
 def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:

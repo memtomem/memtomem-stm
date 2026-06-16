@@ -8,15 +8,16 @@ separate, non-proxied MCP server" pattern): one ``ClientSession`` over a
 launched stdio child, and **zero** Python-level dependency on the external
 package — all traffic goes over the MCP protocol.
 
-This first step ships the config block + a connectable adapter only: the
-adapter can connect and run the ``eligible_tools`` consult, but nothing wires
-it into the eligibility filter yet. The startup consult (beside
-``compute_health_flags``), the ``filter_tools`` branch, the ``toolgraph_*``
-reject codes, and the ``graph_generation`` telemetry pin are follow-ups.
-Unlike the surfacing adapter the consult runs once per session at proxy
-startup (so the advertised set stays stable), which is why this adapter has
-no per-request lazy-start / reconnect machinery: the caller starts it once
-and maps any failure onto the configured ``on_*`` knobs.
+This module is the transport adapter only: it connects and runs the
+``eligible_tools`` consult, returning the raw structured verdict. The
+``ProxyManager`` drives it once at startup (beside ``compute_health_flags``),
+interprets the verdict (see ``tool_eligibility.interpret_verdict``), feeds it
+into ``filter_tools`` as per-candidate ``toolgraph_*`` rejects or a whole-call
+withhold, and pins ``graph_generation`` into selection telemetry. Unlike the
+surfacing adapter the consult runs once per session at proxy startup (so the
+advertised set stays stable), which is why this adapter has no per-request
+lazy-start / reconnect machinery: the caller starts it once and maps any
+failure onto the configured ``on_*`` knobs.
 """
 
 from __future__ import annotations
@@ -38,6 +39,22 @@ logger = logging.getLogger(__name__)
 # The upstream MCP tool this adapter consults (toolgraph/server/app.py).
 _ELIGIBLE_TOOLS = "eligible_tools"
 
+# Transport failure modes that mean "graph unreachable" rather than a contract
+# mismatch. ``eligible_tools()`` wraps these into ``ToolgraphUnreachableError``;
+# ``start()`` re-raises them RAW (its rollback only cleans up), so the manager
+# catches this tuple directly to classify a failed launch as unreachable.
+# Module-level so the manager need not duplicate it. stdio pipe failures
+# surface as OSError / EOFError / BrokenPipeError; a blocked/slow server
+# surfaces as ``asyncio.TimeoutError`` (per-consult or via the caller's
+# ``wait_for`` around ``start()``).
+TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ConnectionError,
+    EOFError,
+    BrokenPipeError,
+    asyncio.TimeoutError,
+)
+
 
 class ToolgraphConsultError(Exception):
     """Base error for a failed tool-graph consult."""
@@ -52,8 +69,7 @@ class ToolgraphUnreachableError(ToolgraphConsultError):
     "the graph is unavailable": a backend (e.g. Neo4j) outage where the graph
     *server* stays up surfaces as an ``isError`` tool result, not a transport
     error, and is therefore classified ``ToolgraphProtocolError`` (below) —
-    consistent with the RFC treating any server-side error envelope as a
-    contract class.
+    any server-side error envelope is treated as a contract class.
     """
 
 
@@ -79,17 +95,9 @@ class ToolgraphConsultAdapter:
     interpret.
     """
 
-    # Transport failure modes that mean "graph unreachable" rather than a
-    # contract mismatch. stdio pipe failures surface as
-    # OSError / EOFError / BrokenPipeError; a blocked/slow server surfaces as
-    # ``asyncio.TimeoutError`` via the per-consult ``timeout_seconds``.
-    _TRANSPORT_ERRORS = (
-        OSError,
-        ConnectionError,
-        EOFError,
-        BrokenPipeError,
-        asyncio.TimeoutError,
-    )
+    # Module-level :data:`TRANSPORT_ERRORS` aliased here for the
+    # ``eligible_tools()`` ``except`` clause (kept for call-site readability).
+    _TRANSPORT_ERRORS = TRANSPORT_ERRORS
 
     def __init__(self, config: ToolgraphConfig) -> None:
         self._config = config

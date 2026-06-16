@@ -704,12 +704,15 @@ class ToolgraphConfig(BaseModel):
 
     Default-off: when ``enabled`` is ``True`` the consult runs once at
     proxy startup so the advertised tool set stays session-stable, exactly
-    like the health-flag precompute. This first step parses the block and
-    ships the adapter, but the eligibility wiring (consult at ``start()`` +
-    ``filter_tools`` branch + ``toolgraph_*`` reject codes + telemetry) is a
-    follow-up, so an enabled block logs a "config is enabled but inert"
-    startup WARNING (#288 pattern) until then. Neo4j (behind the graph
-    server) is an operational prerequisite of enabling this block.
+    like the health-flag precompute. The verdict feeds
+    ``tool_eligibility.filter_tools`` via per-candidate ``toolgraph_*`` reject
+    codes (profile-gated, like the native signal rules) or a whole-call
+    fail-closed withhold, and pins ``graph_generation`` into selection
+    telemetry. Failures map onto the four ``on_*`` knobs below. Neo4j (behind
+    the graph server) is an operational prerequisite of enabling this block:
+    a backend outage while the graph *server* stays up surfaces as a
+    server-side error and is classified as a contract failure
+    (``on_protocol_error``).
     """
 
     enabled: bool = False
@@ -733,12 +736,12 @@ class ToolgraphConfig(BaseModel):
     """Maps an STM upstream connection key (the operator-chosen key in
     ``upstream_servers``) to the tool-graph server's *crawled* name. The two
     are independent strings, so they coincide only by luck; an empty map
-    assumes identity and relies on a heuristic mismatch warning (a follow-up)."""
+    assumes identity and relies on a heuristic mismatch warning."""
     query_profile: str = "strict"
     """Profile passed to the upstream ``eligible_tools`` consult. Kept a free
     string (not coupled to STM's own ``ExposureProfile``) because the graph's
     profile ladder is the external package's concern; STM applies its own
-    profile semantics on top (RFC Decision 1)."""
+    profile semantics on top."""
     on_unreachable: Literal["open", "closed"] = "open"
     """Transport down / timeout. ``open`` (default) skips the external rule
     family and advertises per STM-native rules (the graph is an enhancement,

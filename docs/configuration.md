@@ -359,6 +359,67 @@ reasons land in each selection event's `reject_reasons` when
 `selection_telemetry` is enabled; see
 [selection-telemetry.md](selection-telemetry.md) for the reason vocabulary.
 
+`toolgraph` (off by default) plugs an **optional external tool-graph
+eligibility provider** into that same hard filter as an additional rule
+source. When `enabled`, STM consults a separate, non-proxied tool-graph MCP
+server once at startup (stdio; default command `toolgraph serve`) for
+cross-server authorization / data-flow eligibility facts, and feeds its
+per-candidate verdicts into `filter_tools` alongside the native rules. The
+graph is *consulted, never proxied* — its tools never reach the client and STM
+holds no Python-level dependency on it. Per-candidate rejects follow the
+exposure profile ladder (strict rejects / review demotes / explore ignores)
+under `toolgraph_*` reason codes; ranking can never resurrect them.
+
+```json
+"toolgraph": {
+  "enabled": true,
+  "command": "toolgraph",
+  "args": ["serve"],
+  "agent_id": "stm-proxy",
+  "server_name_map": { "<stm-upstream-key>": "<graph-crawled-name>" },
+  "query_profile": "strict",
+  "on_unreachable": "open",
+  "on_agent_not_found": "fail_start",
+  "on_protocol_error": "fail_start",
+  "on_tool_not_found": "open",
+  "timeout_seconds": 5.0
+}
+```
+
+Enabling the block makes the graph's backend (e.g. Neo4j) a startup
+prerequisite. The four `on_*` knobs choose the posture when the consult
+cannot produce a usable verdict:
+
+- **`on_unreachable`** (`open` default) — the graph server is down / the
+  consult times out. `open` degrades to STM-native rules; `closed` withholds
+  every tool (high-assurance).
+- **`on_agent_not_found`** (`fail_start` default) — `agent_id` is unknown to
+  the graph, almost always a typo. `fail_start` refuses startup loudly so a
+  typo cannot silently disable enforcement; `open` / `closed` are explicit
+  opt-ins.
+- **`on_protocol_error`** (`fail_start` default) — the graph is reachable but
+  returns an incompatible / error response. **A backend (Neo4j) outage while
+  the graph *server* stays up surfaces here** (a server-side error envelope),
+  not as `on_unreachable` — so the default `fail_start` means a backend outage
+  refuses proxy startup. Set it to `open` to degrade instead (availability
+  over assurance; note this also degrades on genuine contract drift).
+- **`on_tool_not_found`** (`open` default) — a specific candidate was never
+  crawled (the graph's blind spot). `open` keeps the working tool advertised;
+  `closed` rejects uncrawled candidates.
+
+A failure that resolves to `open` SKIPS the external rule family for the
+session — so it is surfaced loudly: a startup WARNING and a `DEGRADED` line in
+`stm_proxy_health`, so a one-time `open` cannot silently become a permanent
+enforcement blind spot. `stm_proxy_health` also reports a `WITHHOLDING ALL`
+posture (a `closed` knob fired) and, on success, the active graph generation +
+the count of graph-rejected tools.
+
+`server_name_map` translates an STM upstream connection key to the
+tool-graph's *crawled* server name (the two are independent strings); an empty
+map assumes identity and relies on a heuristic warning when an entire
+upstream's tools come back unknown to the graph. The provider runs only when
+`enabled` — a disabled block is fully inert.
+
 ### Token-equivalent budgets (CJK / non-Latin workloads)
 
 By default, every result-size budget in STM is expressed in **characters** (`max_result_chars`, `default_max_result_chars`, `head_chars`). For Latin-script content this approximates token spend reasonably — English averages ~4 characters per token in modern BPE tokenizers (GPT-3.5/4 cl100k_base, similar for Claude). For Korean, Chinese, and Japanese content it does not: Korean averages ~1.85 chars/token, so the same character budget caps roughly **half** the token spend the operator probably intended, and char-based compression gates trip on Korean responses that are token-dense but character-light.
