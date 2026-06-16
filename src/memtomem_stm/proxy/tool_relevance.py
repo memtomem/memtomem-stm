@@ -112,7 +112,17 @@ def compose_risk_penalty(native: float, graph: float) -> float:
     *native* is the #465 ``review``-profile demotion (``review_risk_penalty``);
     *graph* is the #493 tool-graph ``risk_score`` scaled by
     ``risk_penalty_scale``.
+
+    The single-source cases short-circuit to the nonzero input *exactly* — the
+    overwhelmingly common path (a tool rarely carries both penalties), and
+    ``1 - (1 - x)`` does not round-trip to ``x`` in float, so the short-circuit
+    keeps a graph-only ``0.2`` recorded as ``0.2`` rather than
+    ``0.19999999999999996``.
     """
+    if native <= 0.0:
+        return graph
+    if graph <= 0.0:
+        return native
     return 1.0 - (1.0 - native) * (1.0 - graph)
 
 

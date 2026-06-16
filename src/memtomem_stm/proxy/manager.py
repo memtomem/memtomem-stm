@@ -76,19 +76,26 @@ from memtomem_stm.proxy.tool_eligibility import (
     compute_health_flags,
     filter_tools,
     interpret_verdict,
+    parse_risk_scores,
 )
 from memtomem_stm.proxy.toolgraph_provider import (
     TRANSPORT_ERRORS as TOOLGRAPH_TRANSPORT_ERRORS,
     ToolgraphConsultAdapter,
+    ToolgraphConsultError,
     ToolgraphProtocolError,
     ToolgraphUnreachableError,
 )
 from memtomem_stm.proxy.tool_relevance import (
+    PENALTY_SOURCE_BOTH,
+    PENALTY_SOURCE_GRAPH,
     RANKER_VERSION_BM25,
+    RANKER_VERSION_BM25_GRAPH_RISK,
     RANKER_VERSION_BM25_RISK,
     ToolRelevanceRanker,
     build_candidate_features,
+    compose_risk_penalty,
     derive_query,
+    penalty_source,
 )
 from memtomem_stm.proxy.tool_metadata import (
     convention_suffix,
@@ -219,7 +226,13 @@ class ProxyManager:
         self._advertised_tools: list[str] = []
         self._advertised_infos: list[ProxyToolInfo] = []
         self._advertised_reject_reasons: dict[str, str] = {}
+        # Composed ranking demotions for the advertised set (#466), keyed by
+        # prefixed name: the #465 review demotion stacked with the #493 graph
+        # risk penalty (``compose_risk_penalty``). ``_sources`` records each
+        # one's provenance for #468 replay attribution. Both sparse (penalized
+        # tools only) and rebuilt every get_proxy_tools() pass.
         self._advertised_risk_penalties: dict[str, float] = {}
+        self._advertised_risk_penalty_sources: dict[str, str] = {}
         # Health flags for the #465 filter, computed ONCE per start() from
         # the persisted metrics store and held for the session — exposure
         # must not drift between the startup advertisement (what the client
@@ -238,6 +251,12 @@ class ProxyManager:
         # SKIPPED — surfaced loudly so a one-time ``open`` cannot silently
         # become a permanent enforcement blind spot.
         self._toolgraph_external_rejects: dict[tuple[str, str], str] = {}
+        # #493 per-candidate graph ``risk_score`` mapped to a relevance
+        # ``risk_penalty`` (scaled by ``risk_penalty_scale``), keyed by
+        # ``(server, original_name)``. A best-effort enrichment of the consult:
+        # ranking telemetry only, never exposure — so a rank_features failure
+        # leaves this empty rather than touching the on_* knobs.
+        self._toolgraph_risk_penalties: dict[tuple[str, str], float] = {}
         self._toolgraph_withhold_all: str | None = None
         self._graph_generation: int | None = None
         self._toolgraph_degraded: bool = False
@@ -434,6 +453,7 @@ class ProxyManager:
         # a recovered graph on a second start must not inherit the previous
         # session's withhold-all / degraded / reject state.
         self._toolgraph_external_rejects = {}
+        self._toolgraph_risk_penalties = {}
         self._toolgraph_withhold_all = None
         self._graph_generation = None
         self._toolgraph_degraded = False
@@ -448,6 +468,7 @@ class ProxyManager:
             return
 
         adapter = ToolgraphConsultAdapter(cfg)
+        risk_scores: dict[str, float] = {}
         try:
             try:
                 # ``start()`` re-raises raw transport errors (caught below as
@@ -457,6 +478,13 @@ class ProxyManager:
                 await adapter.start()
                 verdict = await adapter.eligible_tools(refs)
                 interp = interpret_verdict(verdict)
+                # #493 risk enrichment in the SAME session (one extra batch
+                # round-trip, still session-stable). Best-effort and gated on a
+                # resolved agent + an enabled scale; its own failures degrade to
+                # "no penalties" inside the helper, so they never reach the on_*
+                # knobs below — a flaky enrichment must not fail startup.
+                if interp.agent_found and cfg.risk_penalty_scale > 0.0:
+                    risk_scores = await self._fetch_risk_scores(adapter, refs)
             finally:
                 try:
                     await adapter.stop()
@@ -497,7 +525,47 @@ class ProxyManager:
                 len(self._toolgraph_external_rejects),
                 self._graph_generation,
             )
+
+        # #493 map each positive ``risk_score`` to a relevance ``risk_penalty``,
+        # scaled by ``risk_penalty_scale`` and clamped to the ranker's [0,1]
+        # range, fanned to every STM key sharing the ref. Ranking telemetry
+        # only — never an exposure input, so a rejected-but-risky ref simply
+        # never reaches the ranker (it is outside ``eligible``).
+        scale = cfg.risk_penalty_scale
+        self._toolgraph_risk_penalties = {
+            key: min(score * scale, 1.0)
+            for ref, score in risk_scores.items()
+            for key in ref_to_keys.get(ref, ())
+        }
+        if self._toolgraph_risk_penalties:
+            logger.info(
+                "Tool-graph consult: %d candidate(s) carry a graph risk penalty (generation %s)",
+                len(self._toolgraph_risk_penalties),
+                self._graph_generation,
+            )
         self._warn_server_name_mismatch(interp.tool_not_found_refs, ref_to_keys)
+
+    async def _fetch_risk_scores(
+        self, adapter: ToolgraphConsultAdapter, refs: list[str]
+    ) -> dict[str, float]:
+        """Best-effort ``rank_features`` enrichment (#493): ``{ref: risk_score}``.
+
+        The graph's per-candidate ``risk_score`` is a ranking-telemetry signal
+        only — never exposure, never a startup gate — so unlike the
+        ``eligible_tools`` verdict (whose failures ride the ``on_*`` knobs) any
+        fault here degrades silently to "no penalties", logged once at WARNING.
+        Returns an empty map on any consult error.
+        """
+        try:
+            verdict = await adapter.rank_features(refs)
+        except ToolgraphConsultError as exc:
+            logger.warning(
+                "Tool-graph risk enrichment (rank_features) failed (%s) — ranking "
+                "proceeds without graph risk penalties this session.",
+                exc,
+            )
+            return {}
+        return parse_risk_scores(verdict)
 
     def _tg_whole_call(self, knob: str, code: str, detail: str) -> None:
         """Apply a whole-call tool-graph failure per its ``on_*`` knob.
@@ -827,8 +895,36 @@ class ProxyManager:
         self._advertised_infos = verdict.eligible
         self._advertised_tools = [info.prefixed_name for info in verdict.eligible]
         self._advertised_reject_reasons = verdict.reject_reasons
-        self._advertised_risk_penalties = verdict.risk_penalties
+        self._advertised_risk_penalties, self._advertised_risk_penalty_sources = (
+            self._compose_advertised_penalties(verdict.eligible, verdict.risk_penalties)
+        )
         return verdict.eligible
+
+    def _compose_advertised_penalties(
+        self, eligible: list[ProxyToolInfo], native: dict[str, float]
+    ) -> tuple[dict[str, float], dict[str, str]]:
+        """Merge the two ranking-demotion sources over the advertised set (#493).
+
+        Composes the #465 ``review``-profile demotion (*native*, keyed by
+        prefixed name) with the #493 graph risk penalty
+        (``_toolgraph_risk_penalties``, keyed by ``(server, original_name)``)
+        via :func:`compose_risk_penalty`, returning parallel
+        ``{prefixed_name: penalty}`` / ``{prefixed_name: source}`` maps. Both
+        are sparse (penalized tools only); an absent tool ranks with no penalty
+        and source ``none``. The graph penalty is applied to every advertised
+        tool regardless of profile — it is ranking telemetry, not an exposure
+        signal — whereas *native* is review-profile-only by construction.
+        """
+        penalties: dict[str, float] = {}
+        sources: dict[str, str] = {}
+        for info in eligible:
+            n = native.get(info.prefixed_name, 0.0)
+            g = self._toolgraph_risk_penalties.get((info.server, info.original_name), 0.0)
+            if n <= 0.0 and g <= 0.0:
+                continue
+            penalties[info.prefixed_name] = compose_risk_penalty(n, g)
+            sources[info.prefixed_name] = penalty_source(n, g)
+        return penalties, sources
 
     @staticmethod
     def _log_exposure_rejects(reject_reasons: dict[str, str]) -> None:
@@ -1513,7 +1609,10 @@ class ProxyManager:
         means the family was skipped (advertising per STM-native rules only);
         ``withholding_all`` means a ``closed`` knob withheld every tool;
         otherwise the consult succeeded and ``external_reject_count`` reflects
-        the per-candidate verdicts in force.
+        the per-candidate verdicts in force. ``risk_penalty_count`` is the
+        number of candidates the graph assigned a positive ``risk_score`` that
+        STM mapped to a relevance demotion (#493) — ranking telemetry only,
+        ``0`` when ``risk_penalty_scale`` is ``0`` or the enrichment degraded.
         """
         if not self._config.toolgraph.enabled:
             return None
@@ -1524,6 +1623,7 @@ class ProxyManager:
             "withholding_all": self._toolgraph_withhold_all,
             "graph_generation": self._graph_generation,
             "external_reject_count": len(self._toolgraph_external_rejects),
+            "risk_penalty_count": len(self._toolgraph_risk_penalties),
         }
 
     async def _on_cache_hit(
@@ -1684,19 +1784,25 @@ class ProxyManager:
                 return None, None
             query, source = derived
             penalties = self._advertised_risk_penalties
+            penalty_sources = self._advertised_risk_penalty_sources
             ranked = ToolRelevanceRanker(top_n=trc.top_n).rank(
-                query, self._advertised_infos, penalties
+                query, self._advertised_infos, penalties, penalty_sources
             )
             if not ranked:
                 return None, None
             # The risk-penalty pathway changes the scoring function, so the
             # cohort stamp must change with it — but only when a penalty
-            # actually shaped the scores (an all-zero map is v1 math).
-            version = (
-                RANKER_VERSION_BM25_RISK
-                if any(p > 0.0 for p in penalties.values())
-                else RANKER_VERSION_BM25
-            )
+            # actually shaped the scores (an all-zero map is v1 math). A
+            # graph-derived component (#493) splits a finer cohort than a
+            # native-review-only penalty, since it reaches every profile.
+            if any(
+                s in (PENALTY_SOURCE_GRAPH, PENALTY_SOURCE_BOTH) for s in penalty_sources.values()
+            ):
+                version = RANKER_VERSION_BM25_GRAPH_RISK
+            elif any(p > 0.0 for p in penalties.values()):
+                version = RANKER_VERSION_BM25_RISK
+            else:
+                version = RANKER_VERSION_BM25
             return build_candidate_features(query, source, ranked), version
         except Exception:
             logger.debug("Tool-relevance ranking failed", exc_info=True)

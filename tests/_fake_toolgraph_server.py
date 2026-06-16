@@ -22,15 +22,19 @@ Input-driven behaviors (so one fixture covers every adapter path):
   adapter's per-consult ``asyncio.wait_for`` fires → ``ToolgraphUnreachableError``.
 * ``agent == "ghost"`` returns ``agent_found=False`` as a *structured*
   result (NOT an error) — the abort signal the adapter must surface as data.
-* any candidate ending in ``"::blocked"`` comes back as a ``NOT_GRANTED``
-  rejected row; a candidate whose tool part starts with ``"missing"`` comes
-  back as a ``TOOL_NOT_FOUND`` rejected row (the graph's blind spot); all
-  others are eligible, in input order.
+* any candidate ending in ``"::blocked"`` (or whose tool part starts with
+  ``"riskyblocked"``) comes back as a ``NOT_GRANTED`` rejected row; a candidate
+  whose tool part starts with ``"missing"`` comes back as a ``TOOL_NOT_FOUND``
+  rejected row (the graph's blind spot); all others are eligible, in input
+  order.
 * ``rank_features`` mirrors that resolution and stamps a ``risk_score`` per the
   real fixed table (``selector._risk_score``): a tool part starting with
   ``"risky"`` scores ``0.4`` (eligible-but-risky — the case PR #493 demotes),
   ``"missing*"`` scores ``None`` (unresolved), and everything else — including
   ``"::blocked"`` (NOT_GRANTED is grant-only, data-flow clean) — scores ``0.0``.
+  ``"riskyblocked*"`` therefore lands in BOTH (rejected by ``eligible_tools``
+  AND scored ``0.4``): under ``review`` it earns a native demote stacked with
+  the graph penalty — the ``review+graph`` provenance.
 
 Run with: ``python <path-to-this-file>``.
 """
@@ -69,7 +73,9 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
     rejected: list[dict] = []
     for candidate in candidates:  # input order is part of the upstream contract
         tool_part = candidate.split("::", 1)[-1]
-        if candidate.endswith("::blocked"):
+        # "riskyblocked*" is BOTH rejected here AND scored >0 by rank_features —
+        # the overlap case (under review: native demote + graph penalty = BOTH).
+        if candidate.endswith("::blocked") or tool_part.startswith("riskyblocked"):
             rejected.append(
                 {"candidate": candidate, "tool_key": candidate, "reason": "NOT_GRANTED"}
             )
@@ -94,7 +100,12 @@ async def rank_features(agent: str, candidates: list[str]) -> dict:
 
     Only the fields STM's ``parse_risk_scores`` reads are populated faithfully
     (``candidate`` + ``risk_score``); the rest of the real row is summarized.
+    ``agent == "rankboom"`` raises (``isError``) so the best-effort enrichment
+    degrade path is exercisable while ``eligible_tools`` still succeeds for the
+    same agent.
     """
+    if agent == "rankboom":
+        raise ValueError("rank_features boom")
     if agent == "ghost":
         return {
             "agent": agent,
