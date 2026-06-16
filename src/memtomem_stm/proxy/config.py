@@ -761,9 +761,16 @@ class ToolgraphConfig(BaseModel):
     ``open`` (default) does not hide a working tool; ``closed`` rejects
     uncrawled candidates (high-assurance)."""
     risk_penalty_scale: float = Field(default=1.0, ge=0.0)
-    """Multiplier mapping the upstream ``risk_score`` to a relevance
-    ``risk_penalty`` (consumed by a follow-up); ``0`` disables the risk
-    signal."""
+    """Multiplier mapping the graph's per-candidate ``risk_score`` (the
+    rule-based data-flow/DENY risk, ``[0,1]``) to a relevance ``risk_penalty``
+    for eligible-but-risky tools (#493): ``penalty = min(risk_score * scale,
+    1.0)``, demoting them in tool-relevance ranking telemetry (#466) in EVERY
+    profile — never exposure (ranking can neither resurrect nor hard-reject).
+    When ``> 0`` the consult runs a second, best-effort ``rank_features`` batch
+    query in the same startup session; a failure there degrades to no penalties
+    (logged, never a startup gate). The penalty composes with the native
+    ``review_risk_penalty`` via a complement-product when both apply. ``0``
+    (or a disabled ``toolgraph`` block) skips the enrichment entirely."""
     timeout_seconds: float = Field(default=5.0, gt=0.0)
     """Per-consult timeout for the startup batch query."""
 

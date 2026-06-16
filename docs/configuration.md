@@ -382,6 +382,7 @@ under `toolgraph_*` reason codes; ranking can never resurrect them.
   "on_agent_not_found": "fail_start",
   "on_protocol_error": "fail_start",
   "on_tool_not_found": "open",
+  "risk_penalty_scale": 1.0,
   "timeout_seconds": 5.0
 }
 ```
@@ -411,8 +412,22 @@ A failure that resolves to `open` SKIPS the external rule family for the
 session — so it is surfaced loudly: a startup WARNING and a `DEGRADED` line in
 `stm_proxy_health`, so a one-time `open` cannot silently become a permanent
 enforcement blind spot. `stm_proxy_health` also reports a `WITHHOLDING ALL`
-posture (a `closed` knob fired) and, on success, the active graph generation +
-the count of graph-rejected tools.
+posture (a `closed` knob fired) and, on success, the active graph generation,
+the count of graph-rejected tools, and the count carrying a graph risk penalty.
+
+- **`risk_penalty_scale`** (`1.0` default) — beyond the hard *reject* verdict,
+  the graph assigns each *eligible* candidate a rule-based `risk_score`
+  (`[0,1]`: e.g. an authorized tool whose evidence chain has unbacked edges).
+  STM maps it to a tool-relevance `risk_penalty = min(risk_score * scale, 1.0)`
+  that **demotes** the eligible-but-risky tool in ranking telemetry (#466) — in
+  every profile, since this is a ranking signal, not an exposure one (ranking
+  can neither resurrect nor hard-reject). When `> 0` the consult runs a second,
+  best-effort `rank_features` batch query in the same startup session; if that
+  query fails the proxy advertises normally and ranks without graph penalties
+  (logged, never a startup gate). The penalty composes with the native
+  `review_risk_penalty` (review profile) via a complement-product, and calls
+  it shaped stamp the `v3-bm25-graph-risk-penalty` ranker cohort (see
+  [Selection telemetry](selection-telemetry.md)). `0` disables the signal.
 
 `server_name_map` translates an STM upstream connection key to the
 tool-graph's *crawled* server name (the two are independent strings); an empty

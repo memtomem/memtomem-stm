@@ -42,9 +42,14 @@ marker stamped on both halves of a pair: `"v0-passthrough"` when no ranking
 informed the call (the client model picked from the full advertised set
 unaided — the unranked baseline), `"v1-bm25-tool-relevance"` when the #466
 ranking ran (see [Tool-relevance ranking](#tool-relevance-ranking-466-v0)),
-and `"v2-bm25-risk-penalty"` when at least one nonzero #465 risk penalty
-shaped the scores (an all-zero penalty map is v1 math and keeps the v1
-stamp).
+`"v2-bm25-risk-penalty"` when at least one nonzero penalty came *only* from
+the #465 review-profile demotion, and `"v3-bm25-graph-risk-penalty"` when at
+least one penalty included a component derived from the external tool-graph's
+per-candidate `risk_score` (#493). The scoring math is identical across v1–v3;
+the cohorts split on penalty *provenance* (and reach — a graph risk penalty
+applies in every profile, the native review penalty only under `review`), so
+replay must not pool them. An all-zero penalty map is v1 math and keeps the v1
+stamp.
 
 ### `selection` — one per proxied call
 
@@ -91,7 +96,7 @@ query signal and recorded in `candidate_features`:
   "query_chars": 42,
   "ranked_candidates": [
     {"tool": "gh__create_issue", "rank": 1, "relevance_score": 2.41,
-     "risk_penalty": 0.0, "final_score": 2.41}
+     "risk_penalty": 0.0, "risk_penalty_source": "none", "final_score": 2.41}
   ]
 }
 ```
@@ -111,14 +116,20 @@ query signal and recorded in `candidate_features`:
   call's top-level string argument values (sorted by key, capped); no
   signal → no ranking, and the pair keeps the `v0-passthrough` baseline.
   The raw query never enters the log — `query_source`/sha256/length only.
-- `risk_penalty` is the #465 hard filter's demotion input: under the
-  `review` exposure profile a signal-flagged tool stays advertised but
-  carries the configured penalty, and `final_score = relevance_score *
-  (1 - risk_penalty)` (ordering follows `final_score`). Multiplicative
-  because BM25 scores are unbounded. Penalties are session-stable (health
-  flags are computed once at startup), so records stay deterministic
-  within a session and self-describing across sessions. When any nonzero
-  penalty applied, both pair halves stamp `"v2-bm25-risk-penalty"`.
+- `risk_penalty` demotes a tool without removing it: `final_score =
+  relevance_score * (1 - risk_penalty)` (ordering follows `final_score`),
+  multiplicative because BM25 scores are unbounded. Two sources feed it,
+  composed via a complement-product (`1 - (1 - native)(1 - graph)`): the #465
+  `review`-profile demotion (a signal-flagged-but-advertised tool), and the
+  #493 external tool-graph `risk_score` scaled by `risk_penalty_scale` (an
+  eligible-but-risky tool, demoted in *every* profile). `risk_penalty_source`
+  records which contributed — `none` / `review` / `graph` / `review+graph` —
+  so replay can attribute the demotion (the combined value alone can't). The
+  penalties are session-stable (health flags + the graph consult both run once
+  at startup), so records stay deterministic within a session and
+  self-describing across sessions. A graph-derived penalty stamps the pair
+  `"v3-bm25-graph-risk-penalty"`; a native-review-only penalty stamps
+  `"v2-bm25-risk-penalty"`.
 - `top_n` (default 20) bounds `ranked_candidates`; the full advertised set
   is already in `candidate_tools`.
 
