@@ -26,14 +26,27 @@ from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo, UpstreamConn
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 from memtomem_stm.proxy.tool_relevance import (
+    PENALTY_SOURCE_BOTH,
+    PENALTY_SOURCE_GRAPH,
+    PENALTY_SOURCE_NONE,
+    PENALTY_SOURCE_REVIEW,
     RANKER_VERSION_BM25,
     ToolRelevanceRanker,
     build_candidate_features,
+    compose_risk_penalty,
     derive_query,
+    penalty_source,
 )
 
 FEATURES_KEYS = {"query_source", "query_sha256", "query_chars", "ranked_candidates"}
-RANKED_ENTRY_KEYS = {"tool", "rank", "relevance_score", "risk_penalty", "final_score"}
+RANKED_ENTRY_KEYS = {
+    "tool",
+    "rank",
+    "relevance_score",
+    "risk_penalty",
+    "risk_penalty_source",
+    "final_score",
+}
 
 
 def _info(name: str, description: str, schema: dict | None = None) -> ProxyToolInfo:
@@ -119,6 +132,7 @@ class TestRanker:
         for entry in ranked:
             assert set(entry) == RANKED_ENTRY_KEYS
             assert entry["risk_penalty"] == 0.0
+            assert entry["risk_penalty_source"] == PENALTY_SOURCE_NONE
             assert entry["final_score"] == entry["relevance_score"]
 
     def test_empty_candidates(self):
@@ -151,6 +165,57 @@ class TestRanker:
         b = ToolRelevanceRanker().rank(query, CANDIDATES, risk_penalties={})
         c = ToolRelevanceRanker().rank(query, CANDIDATES, risk_penalties={"test__read_file": 0.0})
         assert json.dumps(a) == json.dumps(b) == json.dumps(c)
+
+    def test_risk_penalty_source_echoed_into_record(self):
+        """The provenance tag rides each record verbatim; absent tools = none."""
+        query = "send a slack message to the channel"
+        ranked = ToolRelevanceRanker().rank(
+            query,
+            CANDIDATES,
+            risk_penalties={"test__send_message": 0.4, "test__read_file": 0.5},
+            risk_penalty_sources={
+                "test__send_message": PENALTY_SOURCE_GRAPH,
+                "test__read_file": PENALTY_SOURCE_BOTH,
+            },
+        )
+        by_tool = {r["tool"]: r for r in ranked}
+        assert by_tool["test__send_message"]["risk_penalty_source"] == PENALTY_SOURCE_GRAPH
+        assert by_tool["test__read_file"]["risk_penalty_source"] == PENALTY_SOURCE_BOTH
+        # A tool with no source entry records "none" even if a stray penalty
+        # would not apply (default-safe).
+        assert by_tool["test__create_issue"]["risk_penalty_source"] == PENALTY_SOURCE_NONE
+
+
+# ── compose_risk_penalty / penalty_source (#493) ──────────────────────────
+
+
+class TestComposeRiskPenalty:
+    def test_complement_product_stacks_two_demotions(self):
+        # 1 - (1-0.5)(1-0.4) = 1 - 0.30 = 0.70
+        assert compose_risk_penalty(0.5, 0.4) == 0.7
+
+    def test_degenerates_to_single_nonzero_input(self):
+        assert compose_risk_penalty(0.0, 0.4) == 0.4
+        assert compose_risk_penalty(0.6, 0.0) == 0.6
+        assert compose_risk_penalty(0.0, 0.0) == 0.0
+
+    def test_commutative(self):
+        assert compose_risk_penalty(0.3, 0.7) == compose_risk_penalty(0.7, 0.3)
+
+    def test_stays_in_unit_interval(self):
+        # Either input at the 1.0 ceiling saturates the combined penalty to 1.0
+        # (the ranker zeroes final_score — max demotion, still advertised).
+        assert compose_risk_penalty(1.0, 0.4) == 1.0
+        assert compose_risk_penalty(0.4, 1.0) == 1.0
+        assert 0.0 <= compose_risk_penalty(0.99, 0.99) <= 1.0
+
+
+class TestPenaltySource:
+    def test_tags_each_combination(self):
+        assert penalty_source(0.0, 0.0) == PENALTY_SOURCE_NONE
+        assert penalty_source(0.5, 0.0) == PENALTY_SOURCE_REVIEW
+        assert penalty_source(0.0, 0.4) == PENALTY_SOURCE_GRAPH
+        assert penalty_source(0.5, 0.4) == PENALTY_SOURCE_BOTH
 
 
 # ── build_candidate_features ─────────────────────────────────────────────

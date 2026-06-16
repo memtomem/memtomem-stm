@@ -18,18 +18,25 @@ The scored document per candidate is what the client actually saw: the
 prefixed tool name (BM25 heading position, 3x weight) plus the advertised —
 post-truncation, post-distill — description and stable-serialized schema.
 
-``risk_penalty`` is the #465 hard filter's demotion input (``review``
-profile flags a tool instead of rejecting it): ``final_score =
+``risk_penalty`` demotes a tool without removing it: ``final_score =
 relevance_score * (1 - risk_penalty)`` and the ordering follows
-``final_score``, so a flagged tool sinks without leaving the record.
+``final_score``, so a penalized tool sinks without leaving the record.
 Multiplicative because BM25 scores are unbounded — an absolute penalty
-would mean nothing across queries. Calls where any nonzero penalty applied
-stamp :data:`RANKER_VERSION_BM25_RISK` so replay can split cohorts; the
-penalties themselves are session-stable (health flags are computed once at
+would mean nothing across queries. Two independent sources feed the penalty,
+composed via :func:`compose_risk_penalty`: the #465 hard filter's
+``review``-profile demotion (a flagged-but-advertised tool), and the #493
+external tool-graph ``risk_score`` mapped onto eligible-but-risky tools in
+*every* profile. Each candidate also carries a ``risk_penalty_source`` tag
+(:func:`penalty_source`) recording which source(s) shaped it, so #468 replay
+can attribute the demotion. Calls stamp :data:`RANKER_VERSION_BM25_GRAPH_RISK`
+when any graph-derived penalty contributed, :data:`RANKER_VERSION_BM25_RISK`
+when only native review demotions did, else :data:`RANKER_VERSION_BM25` — the
+math is identical, but the cohorts must not pool. The penalties themselves
+are session-stable (health flags + the graph consult both run once at
 startup), making records deterministic within a session and self-describing
-across sessions (each candidate carries the penalty that shaped its score).
-A hard-rejected tool never reaches this module at all — ranking runs over
-the filter's output, so it can never resurrect a reject.
+across sessions (each candidate carries the penalty and source that shaped
+its score). A hard-rejected tool never reaches this module at all — ranking
+runs over the filter's output, so it can never resurrect a reject.
 
 Privacy: the derived query is used in memory for scoring only — callers
 persist its sha256/length/source via ``build_candidate_features``, never the
@@ -58,8 +65,27 @@ RANKER_VERSION_BM25 = "v1-bm25-tool-relevance"
 # a nonzero risk penalty — the scoring function then differs from plain v1
 # (final_score = relevance * (1 - penalty)), and replay must not pool the
 # two. With an all-zero penalty map the math degenerates to v1 exactly, so
-# such calls keep the v1 stamp.
+# such calls keep the v1 stamp. v2 is the NATIVE-only cohort: every nonzero
+# penalty came from the #465 ``review``-profile demotion.
 RANKER_VERSION_BM25_RISK = "v2-bm25-risk-penalty"
+
+# Stamped instead of RANKER_VERSION_BM25_RISK when at least one candidate's
+# penalty includes a component derived from the external tool-graph's
+# per-candidate ``risk_score`` (#493). The scoring math is unchanged (still
+# final = relevance * (1 - penalty)), but the penalty PROVENANCE differs — a
+# graph-risk demotion applies to eligible-but-risky tools in EVERY profile,
+# whereas the native v2 demotion is review-profile-only — so #468 replay must
+# split the cohorts. Per-candidate ``risk_penalty_source`` records which
+# source(s) shaped each tool's penalty within the call.
+RANKER_VERSION_BM25_GRAPH_RISK = "v3-bm25-graph-risk-penalty"
+
+# ``risk_penalty_source`` values — the provenance of a candidate's composed
+# penalty, for #468 replay attribution. Every ranked record carries one
+# (``"none"`` when unpenalized), keeping records self-describing.
+PENALTY_SOURCE_NONE = "none"
+PENALTY_SOURCE_REVIEW = "review"  # #465 review-profile demotion only
+PENALTY_SOURCE_GRAPH = "graph"  # #493 tool-graph risk_score only
+PENALTY_SOURCE_BOTH = "review+graph"  # both stacked via compose_risk_penalty
 
 # Bound the schema text folded into each candidate document. Schemas are
 # advertised (possibly distilled) client-facing artifacts, but a pathological
@@ -69,6 +95,42 @@ _MAX_SCHEMA_CHARS = 2000
 
 # Bound the args-derived fallback query the same way.
 _MAX_QUERY_CHARS = 512
+
+
+def compose_risk_penalty(native: float, graph: float) -> float:
+    """Combine two independent demotions into one penalty (complement-product).
+
+    The ranker scores ``final = relevance * (1 - penalty)``. Two independent
+    multiplicative demotions therefore stack: ``relevance * (1 - native) *
+    (1 - graph) = relevance * (1 - combined)`` with ``combined = 1 -
+    (1 - native)(1 - graph)``. This composition is the one consistent with the
+    ranking math itself — commutative, monotone in each input, bounded to
+    ``[0, 1]`` for inputs in ``[0, 1]``, and degenerating to whichever input is
+    nonzero when the other is ``0`` (so an unflagged tool with a graph risk,
+    or a flagged tool the graph scored clean, behaves exactly as before).
+
+    *native* is the #465 ``review``-profile demotion (``review_risk_penalty``);
+    *graph* is the #493 tool-graph ``risk_score`` scaled by
+    ``risk_penalty_scale``.
+    """
+    return 1.0 - (1.0 - native) * (1.0 - graph)
+
+
+def penalty_source(native: float, graph: float) -> str:
+    """Provenance tag for a composed penalty (one of ``PENALTY_SOURCE_*``).
+
+    Lets #468 replay attribute each candidate's demotion to the native review
+    rule, the tool-graph risk signal, or both — the combined ``risk_penalty``
+    value alone cannot distinguish a ``0.5`` that is native-only from one that
+    is graph-derived.
+    """
+    if native > 0.0 and graph > 0.0:
+        return PENALTY_SOURCE_BOTH
+    if graph > 0.0:
+        return PENALTY_SOURCE_GRAPH
+    if native > 0.0:
+        return PENALTY_SOURCE_REVIEW
+    return PENALTY_SOURCE_NONE
 
 
 def derive_query(arguments: dict[str, Any] | None) -> tuple[str, str] | None:
@@ -119,16 +181,22 @@ class ToolRelevanceRanker:
         query: str,
         candidates: list[ProxyToolInfo],
         risk_penalties: Mapping[str, float] | None = None,
+        risk_penalty_sources: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Rank *candidates* against *query*; order follows ``final_score``.
 
-        *risk_penalties* maps prefixed names to the #465 filter's demotion
-        for tools flagged-but-advertised (``review`` profile); absent tools
-        carry ``0.0`` and the math degenerates to plain relevance order.
+        *risk_penalties* maps prefixed names to the already-composed demotion
+        (native #465 ``review`` demotion stacked with the #493 tool-graph risk
+        via :func:`compose_risk_penalty`); absent tools carry ``0.0`` and the
+        math degenerates to plain relevance order. *risk_penalty_sources* maps
+        the same names to the provenance tag (:func:`penalty_source`) echoed
+        into each record for #468 replay attribution; absent tools record
+        :data:`PENALTY_SOURCE_NONE`.
         """
         if not candidates:
             return []
         penalties = risk_penalties or {}
+        sources = risk_penalty_sources or {}
         sections = [_candidate_document(c) for c in candidates]
         scores = self._scorer.score_sections(query, sections)
         finals = [
@@ -145,6 +213,9 @@ class ToolRelevanceRanker:
                 "rank": rank,
                 "relevance_score": round(scores[i], 6),
                 "risk_penalty": round(penalties.get(candidates[i].prefixed_name, 0.0), 6),
+                "risk_penalty_source": sources.get(
+                    candidates[i].prefixed_name, PENALTY_SOURCE_NONE
+                ),
                 "final_score": round(finals[i], 6),
             }
             for rank, i in enumerate(order[: self._top_n], start=1)
