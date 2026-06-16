@@ -696,10 +696,14 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
         # skipped (no upstream tools discovered). Not "active" enforcement.
         lines.append("  enabled, not consulted (no upstream tools discovered)")
     else:
-        lines.append(
+        line = (
             f"  active (graph generation {status['graph_generation']}, "
-            f"{status['external_reject_count']} tool(s) rejected by the graph)"
+            f"{status['external_reject_count']} tool(s) rejected by the graph"
         )
+        risk_count = status.get("risk_penalty_count", 0)
+        if risk_count:
+            line += f"; {risk_count} carry a graph risk penalty"
+        lines.append(line + ")")
     return lines
 
 

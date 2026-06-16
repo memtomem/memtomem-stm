@@ -45,6 +45,11 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_TOOL_NOT_FOUND,
     REASON_TOOLGRAPH_UNREACHABLE,
 )
+from memtomem_stm.proxy.tool_relevance import (
+    PENALTY_SOURCE_BOTH,
+    PENALTY_SOURCE_GRAPH,
+    RANKER_VERSION_BM25_GRAPH_RISK,
+)
 from memtomem_stm.server import _toolgraph_health_lines
 from memtomem_stm.proxy.toolgraph_provider import (
     ToolgraphConsultAdapter,
@@ -199,6 +204,40 @@ class TestToolgraphConsultAdapter:
         with pytest.raises(ToolgraphUnreachableError):
             await adapter.eligible_tools(["s::a"])
 
+    async def test_rank_features_returns_per_candidate_risk_scores(self):
+        adapter = _adapter()
+        await adapter.start()
+        try:
+            verdict = await adapter.rank_features(
+                ["s::a", "s::risky_tool", "s::missing_x"], agent="planner"
+            )
+        finally:
+            await adapter.stop()
+        assert verdict["agent"] == "planner"
+        assert verdict["agent_found"] is True
+        # input order preserved; risk_score per the fixed table
+        assert [f["candidate"] for f in verdict["features"]] == [
+            "s::a",
+            "s::risky_tool",
+            "s::missing_x",
+        ]
+        assert [f["risk_score"] for f in verdict["features"]] == [0.0, 0.4, None]
+        assert verdict["graph_generation"] == 11
+
+    async def test_rank_features_uses_config_agent_default(self):
+        adapter = _adapter(agent_id="default-agent")
+        await adapter.start()
+        try:
+            verdict = await adapter.rank_features(["s::a"])
+        finally:
+            await adapter.stop()
+        assert verdict["agent"] == "default-agent"
+
+    async def test_rank_features_before_start_raises_unreachable(self):
+        adapter = _adapter()
+        with pytest.raises(ToolgraphUnreachableError):
+            await adapter.rank_features(["s::a"])
+
     async def test_timeout_raises_unreachable(self):
         adapter = _adapter(timeout_seconds=0.3)
         await adapter.start()
@@ -244,6 +283,7 @@ class TestToolgraphStartupWiring:
                 "withholding_all": None,
                 "graph_generation": None,
                 "external_reject_count": 0,
+                "risk_penalty_count": 0,
             }
         finally:
             await mgr.stop()
@@ -387,6 +427,85 @@ class TestToolgraphConsultWiring:
         assert mgr._advertised_reject_reasons == {}
         assert mgr._advertised_risk_penalties == {}
 
+    # ── #493 graph risk_score → relevance risk_penalty ──────────────────────
+
+    async def test_risky_tool_earns_graph_risk_penalty(self, tmp_path):
+        # An eligible (not rejected) tool with a positive risk_score is demoted
+        # in ranking telemetry — exposure is unchanged (still advertised).
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": ["read_file", "risky_tool"]})
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.4}
+        advertised = [i.prefixed_name for i in mgr.get_proxy_tools()]
+        assert advertised == ["srv__read_file", "srv__risky_tool"]  # both advertised
+        assert mgr._advertised_reject_reasons == {}
+        # default scale 1.0 → penalty == risk_score, source is graph-only.
+        assert mgr._advertised_risk_penalties == {"srv__risky_tool": 0.4}
+        assert mgr._advertised_risk_penalty_sources == {"srv__risky_tool": PENALTY_SOURCE_GRAPH}
+        assert mgr.get_toolgraph_status()["risk_penalty_count"] == 1
+
+    async def test_risk_penalty_scale_scales_the_score(self, tmp_path):
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": ["risky_tool"]}, risk_penalty_scale=0.5)
+        await mgr._consult_toolgraph()
+        # 0.4 * 0.5 = 0.2
+        assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.2}
+        mgr.get_proxy_tools()
+        assert mgr._advertised_risk_penalties == {"srv__risky_tool": 0.2}
+
+    async def test_risk_penalty_scale_zero_disables_the_signal(self, tmp_path):
+        # scale 0 skips the rank_features consult entirely → no penalties.
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": ["risky_tool"]}, risk_penalty_scale=0.0)
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {}
+        mgr.get_proxy_tools()
+        assert mgr._advertised_risk_penalties == {}
+        assert mgr.get_toolgraph_status()["risk_penalty_count"] == 0
+
+    async def test_review_reject_and_graph_risk_compose_to_both(self, tmp_path):
+        # "riskyblocked" is rejected by eligible_tools (→ native review demote)
+        # AND scored 0.4 by rank_features → under review the two stack via the
+        # complement-product, tagged review+graph.
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["riskyblocked_tool"]},
+            exposure=ExposureConfig(profile=ExposureProfile.REVIEW),
+        )
+        await mgr._consult_toolgraph()
+        advertised = [i.prefixed_name for i in mgr.get_proxy_tools()]
+        assert advertised == ["srv__riskyblocked_tool"]  # advertised under review
+        # 1 - (1 - 0.5)(1 - 0.4) = 0.7  (review_risk_penalty default 0.5)
+        assert mgr._advertised_risk_penalties["srv__riskyblocked_tool"] == 0.7
+        assert mgr._advertised_risk_penalty_sources["srv__riskyblocked_tool"] == PENALTY_SOURCE_BOTH
+
+    async def test_rank_features_failure_degrades_to_no_penalties(self, tmp_path, caplog):
+        # rank_features fails (agent rankboom raises) but eligible_tools for the
+        # same agent succeeds → exposure verdict intact, risk penalties empty,
+        # startup NOT aborted, and the skip is logged loudly.
+        mgr, _ = _tg_manager(
+            tmp_path, servers={"srv": ["read_file", "risky_tool"]}, agent_id="rankboom"
+        )
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {}
+        # eligible_tools verdict is unaffected (read_file + risky_tool eligible).
+        advertised = [i.prefixed_name for i in mgr.get_proxy_tools()]
+        assert advertised == ["srv__read_file", "srv__risky_tool"]
+        assert mgr._advertised_risk_penalties == {}
+        assert any("risk enrichment" in r.message for r in caplog.records)
+
+    async def test_graph_risk_stamps_v3_ranker_version(self, tmp_path):
+        # End-to-end: a graph risk penalty splits the v3 replay cohort.
+        mgr, log = _tg_manager(tmp_path, servers={"srv": ["read_file", "risky_tool"]})
+        await mgr._consult_toolgraph()
+        mgr.get_proxy_tools()
+        await mgr.call_tool("srv", "risky_tool", {"task": "do the risky thing now"})
+        selection, execution = _events(log)
+        assert selection["ranker_version"] == RANKER_VERSION_BM25_GRAPH_RISK
+        assert execution["ranker_version"] == RANKER_VERSION_BM25_GRAPH_RISK
+        ranked = selection["candidate_features"]["ranked_candidates"]
+        risky = next(r for r in ranked if r["tool"] == "srv__risky_tool")
+        assert risky["risk_penalty"] == 0.4
+        assert risky["risk_penalty_source"] == PENALTY_SOURCE_GRAPH
+
     async def test_multi_upstream_fan_out_to_one_graph_ref(self, tmp_path):
         # Two upstreams both crawled under graph server "srv", each exposing a
         # "blocked" tool → one graph ref "srv::blocked" fans its NOT_GRANTED
@@ -511,10 +630,14 @@ class TestToolgraphConsultWiring:
         mgr, _ = _tg_manager(tmp_path, servers={"srv": ["read_file", "missing_x"]})
         await mgr._consult_toolgraph()  # on_tool_not_found default open
         assert mgr._toolgraph_external_rejects == {}
+        # An uncrawled (blind-spot) tool has no graph facts → risk_score None →
+        # no graph risk penalty, even though it stays advertised.
+        assert mgr._toolgraph_risk_penalties == {}
         assert [i.prefixed_name for i in mgr.get_proxy_tools()] == [
             "srv__read_file",
             "srv__missing_x",
         ]
+        assert mgr._advertised_risk_penalties == {}
 
     async def test_tool_not_found_closed_rejects(self, tmp_path):
         mgr, _ = _tg_manager(
@@ -599,12 +722,33 @@ class TestToolgraphHealthRendering:
                 "withholding_all": None,
                 "graph_generation": 11,
                 "external_reject_count": 2,
+                "risk_penalty_count": 0,
             }
         )
         body = "\n".join(lines)
         assert "active" in body
         assert "11" in body
         assert "2 tool(s) rejected" in body
+        # zero risk penalties → no suffix, line closes cleanly.
+        assert "carry a graph risk penalty" not in body
+        assert body.rstrip().endswith(")")
+
+    def test_active_shows_risk_penalty_count(self):
+        lines = _toolgraph_health_lines(
+            {
+                "enabled": True,
+                "degraded": False,
+                "degraded_reason": None,
+                "withholding_all": None,
+                "graph_generation": 11,
+                "external_reject_count": 2,
+                "risk_penalty_count": 3,
+            }
+        )
+        body = "\n".join(lines)
+        assert "2 tool(s) rejected" in body
+        assert "3 carry a graph risk penalty" in body
+        assert body.rstrip().endswith(")")  # suffix sits inside the closing paren
 
     def test_degraded_is_loud(self):
         lines = _toolgraph_health_lines(
