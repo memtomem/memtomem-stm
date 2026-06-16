@@ -3,9 +3,11 @@
 Stands in for the real tool-graph MCP server (``toolgraph serve``) so that
 STM's :class:`~memtomem_stm.proxy.toolgraph_provider.ToolgraphConsultAdapter`
 can be exercised end-to-end over a real stdio child without depending on the
-external package or a running Neo4j. It exposes the one tool the adapter
-calls — ``eligible_tools`` — returning the real structured shape
-(``{agent, agent_found, profile, eligible, rejected, graph_generation}``).
+external package or a running Neo4j. It exposes the two tools the adapter
+calls — ``eligible_tools`` (the hard-filter verdict) and ``rank_features`` (the
+per-candidate ``risk_score`` enrichment, #493) — returning the real structured
+shapes (``{agent, agent_found, profile, eligible, rejected, graph_generation}``
+and ``{agent, agent_found, features, graph_generation}``).
 
 Returning a bare ``-> dict`` means mcp serializes the verdict into a
 ``TextContent`` JSON payload (mcp 1.27.x does not emit ``structuredContent``
@@ -24,6 +26,11 @@ Input-driven behaviors (so one fixture covers every adapter path):
   rejected row; a candidate whose tool part starts with ``"missing"`` comes
   back as a ``TOOL_NOT_FOUND`` rejected row (the graph's blind spot); all
   others are eligible, in input order.
+* ``rank_features`` mirrors that resolution and stamps a ``risk_score`` per the
+  real fixed table (``selector._risk_score``): a tool part starting with
+  ``"risky"`` scores ``0.4`` (eligible-but-risky — the case PR #493 demotes),
+  ``"missing*"`` scores ``None`` (unresolved), and everything else — including
+  ``"::blocked"`` (NOT_GRANTED is grant-only, data-flow clean) — scores ``0.0``.
 
 Run with: ``python <path-to-this-file>``.
 """
@@ -77,6 +84,40 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
         "profile": profile,
         "eligible": eligible,
         "rejected": rejected,
+        "graph_generation": _GRAPH_GENERATION,
+    }
+
+
+@mcp.tool()
+async def rank_features(agent: str, candidates: list[str]) -> dict:
+    """Canned ``rank_features`` consult mirroring the real per-candidate shape.
+
+    Only the fields STM's ``parse_risk_scores`` reads are populated faithfully
+    (``candidate`` + ``risk_score``); the rest of the real row is summarized.
+    """
+    if agent == "ghost":
+        return {
+            "agent": agent,
+            "agent_found": False,
+            "features": [],
+            "graph_generation": _GRAPH_GENERATION,
+        }
+
+    features: list[dict] = []
+    for candidate in candidates:  # input order is part of the upstream contract
+        tool_part = candidate.split("::", 1)[-1]
+        if tool_part.startswith("missing"):
+            score: float | None = None  # unresolved → no facts to score
+        elif tool_part.startswith("risky"):
+            score = 0.4  # eligible-but-risky (e.g. an unbacked-evidence edge)
+        else:
+            score = 0.0  # clean ALLOW / grant-only reject — data-flow clean
+        features.append({"candidate": candidate, "tool_key": candidate, "risk_score": score})
+
+    return {
+        "agent": agent,
+        "agent_found": True,
+        "features": features,
         "graph_generation": _GRAPH_GENERATION,
     }
 

@@ -36,8 +36,12 @@ from memtomem_stm.proxy.config import ToolgraphConfig
 
 logger = logging.getLogger(__name__)
 
-# The upstream MCP tool this adapter consults (toolgraph/server/app.py).
+# The upstream MCP tools this adapter consults (toolgraph/server/app.py).
+# ``eligible_tools`` is the authoritative hard-filter verdict (rejects);
+# ``rank_features`` carries the per-candidate ``risk_score`` STM maps onto the
+# relevance ``risk_penalty`` (#493) — a separate, best-effort enrichment.
 _ELIGIBLE_TOOLS = "eligible_tools"
+_RANK_FEATURES = "rank_features"
 
 # Transport failure modes that mean "graph unreachable" rather than a contract
 # mismatch. ``eligible_tools()`` wraps these into ``ToolgraphUnreachableError``;
@@ -170,18 +174,55 @@ class ToolgraphConsultAdapter:
             ToolgraphProtocolError: ``isError`` result, missing tool, or a
                 missing / non-dict structured payload.
         """
-        if self._session is None:
-            raise ToolgraphUnreachableError("tool-graph adapter not started")
-
         args: dict[str, Any] = {
             "agent": self._config.agent_id if agent is None else agent,
             "candidates": candidates,
             "profile": self._config.query_profile if profile is None else profile,
         }
+        return await self._consult(_ELIGIBLE_TOOLS, args)
+
+    async def rank_features(
+        self,
+        candidates: list[str],
+        *,
+        agent: str | None = None,
+    ) -> dict[str, Any]:
+        """Consult the graph's ``rank_features`` for *candidates* (#493).
+
+        Returns the raw structured response
+        ``{agent, agent_found, features, graph_generation}`` (``features`` in
+        input order, each row carrying a ``candidate`` ref and a ``risk_score``
+        in ``[0,1]`` or ``None``). Unlike :meth:`eligible_tools` this is a
+        *best-effort enrichment*: the caller maps a positive ``risk_score`` onto
+        a relevance ``risk_penalty`` and treats any failure as "no penalty"
+        (ranking telemetry only, never exposure). The upstream tool takes no
+        ``profile`` — features are profile-independent facts.
+
+        Raises:
+            ToolgraphUnreachableError: transport down / timeout / not started.
+            ToolgraphProtocolError: ``isError`` result, missing tool, or a
+                missing / non-dict structured payload.
+        """
+        args: dict[str, Any] = {
+            "agent": self._config.agent_id if agent is None else agent,
+            "candidates": candidates,
+        }
+        return await self._consult(_RANK_FEATURES, args)
+
+    async def _consult(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Call one upstream tool and return its parsed structured verdict.
+
+        Shared transport/error/parse contract for :meth:`eligible_tools` and
+        :meth:`rank_features`: transport faults map to
+        :class:`ToolgraphUnreachableError`; an ``isError`` result, an unknown
+        tool, or an unparseable payload map to :class:`ToolgraphProtocolError`.
+        """
+        if self._session is None:
+            raise ToolgraphUnreachableError("tool-graph adapter not started")
 
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(_ELIGIBLE_TOOLS, args),
+                self._session.call_tool(tool, args),
                 timeout=self._config.timeout_seconds,
             )
         except self._TRANSPORT_ERRORS as exc:
@@ -195,7 +236,7 @@ class ToolgraphConsultAdapter:
 
         if result.isError:
             raise ToolgraphProtocolError(
-                f"eligible_tools returned an error result: {_result_error_text(result)}"
+                f"{tool} returned an error result: {_result_error_text(result)}"
             )
 
         # Prefer ``structuredContent`` if the upstream emits it, but mcp 1.27.x
@@ -209,7 +250,7 @@ class ToolgraphConsultAdapter:
             verdict = _parse_text_verdict(result)
         if not isinstance(verdict, dict):
             raise ToolgraphProtocolError(
-                "eligible_tools response carried no parseable verdict "
+                f"{tool} response carried no parseable verdict "
                 "(neither structuredContent nor a JSON text payload)"
             )
         return verdict

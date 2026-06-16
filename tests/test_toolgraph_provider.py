@@ -199,6 +199,40 @@ class TestToolgraphConsultAdapter:
         with pytest.raises(ToolgraphUnreachableError):
             await adapter.eligible_tools(["s::a"])
 
+    async def test_rank_features_returns_per_candidate_risk_scores(self):
+        adapter = _adapter()
+        await adapter.start()
+        try:
+            verdict = await adapter.rank_features(
+                ["s::a", "s::risky_tool", "s::missing_x"], agent="planner"
+            )
+        finally:
+            await adapter.stop()
+        assert verdict["agent"] == "planner"
+        assert verdict["agent_found"] is True
+        # input order preserved; risk_score per the fixed table
+        assert [f["candidate"] for f in verdict["features"]] == [
+            "s::a",
+            "s::risky_tool",
+            "s::missing_x",
+        ]
+        assert [f["risk_score"] for f in verdict["features"]] == [0.0, 0.4, None]
+        assert verdict["graph_generation"] == 11
+
+    async def test_rank_features_uses_config_agent_default(self):
+        adapter = _adapter(agent_id="default-agent")
+        await adapter.start()
+        try:
+            verdict = await adapter.rank_features(["s::a"])
+        finally:
+            await adapter.stop()
+        assert verdict["agent"] == "default-agent"
+
+    async def test_rank_features_before_start_raises_unreachable(self):
+        adapter = _adapter()
+        with pytest.raises(ToolgraphUnreachableError):
+            await adapter.rank_features(["s::a"])
+
     async def test_timeout_raises_unreachable(self):
         adapter = _adapter(timeout_seconds=0.3)
         await adapter.start()

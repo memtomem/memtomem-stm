@@ -51,6 +51,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     compute_health_flags,
     filter_tools,
     interpret_verdict,
+    parse_risk_scores,
 )
 from memtomem_stm.proxy.tool_relevance import RANKER_VERSION_BM25_RISK
 from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
@@ -717,6 +718,50 @@ class TestInterpretVerdict:
     def test_reject_row_missing_fields_is_protocol_error(self):
         with pytest.raises(ToolgraphProtocolError):
             interpret_verdict(_verdict(rejected=[{"candidate": "s::x"}]))
+
+
+# ── parse_risk_scores (rank_features risk_score enrichment, #493) ───────────
+
+
+class TestParseRiskScores:
+    def test_keeps_positive_scores_skips_zero_and_none(self):
+        v = {
+            "agent": "stm-proxy",
+            "agent_found": True,
+            "features": [
+                {"candidate": "s::clean", "risk_score": 0.0},
+                {"candidate": "s::risky", "risk_score": 0.4},
+                {"candidate": "s::violation", "risk_score": 1.0},
+                {"candidate": "s::unresolved", "risk_score": None},
+            ],
+            "graph_generation": 11,
+        }
+        assert parse_risk_scores(v) == {"s::risky": 0.4, "s::violation": 1.0}
+
+    def test_int_score_coerced_to_float(self):
+        v = {"features": [{"candidate": "s::a", "risk_score": 1}]}
+        scores = parse_risk_scores(v)
+        assert scores == {"s::a": 1.0}
+        assert isinstance(scores["s::a"], float)
+
+    def test_bool_score_rejected(self):
+        # bool is an int subclass but never a valid risk_score.
+        v = {"features": [{"candidate": "s::a", "risk_score": True}]}
+        assert parse_risk_scores(v) == {}
+
+    def test_lenient_on_malformed_payload(self):
+        # Best-effort enrichment: a malformed shape yields an empty map, never
+        # raises (unlike interpret_verdict's contract failures).
+        assert parse_risk_scores({}) == {}
+        assert parse_risk_scores({"features": "nope"}) == {}
+        assert parse_risk_scores({"features": [None, 42, "x"]}) == {}
+        assert parse_risk_scores({"features": [{"candidate": 5, "risk_score": 0.4}]}) == {}
+        assert parse_risk_scores({"features": [{"candidate": "s::a", "risk_score": "hi"}]}) == {}
+        assert parse_risk_scores({"features": [{"risk_score": 0.4}]}) == {}
+
+    def test_agent_not_found_has_no_features(self):
+        v = {"agent_found": False, "features": [], "graph_generation": 11}
+        assert parse_risk_scores(v) == {}
 
 
 # ── filter_tools external_rejects + withhold_all (#465) ─────────────────────

@@ -387,6 +387,41 @@ def interpret_verdict(verdict: Mapping[str, Any]) -> InterpretedVerdict:
     )
 
 
+def parse_risk_scores(verdict: Mapping[str, Any]) -> dict[str, float]:
+    """Extract per-candidate ``risk_score`` from a ``rank_features`` verdict (#493).
+
+    Returns ``{candidate_ref: risk_score}`` for every resolved row carrying a
+    *positive* numeric ``risk_score`` (the graph's rule-based data-flow/DENY
+    risk, ``[0,1]``). Rows with ``risk_score`` ``None`` (unresolved / ambiguous)
+    or ``0.0`` (clean) are omitted so the map stays sparse — a missing ref means
+    "no penalty", which is exactly the ranker's default.
+
+    Unlike :func:`interpret_verdict` this is **lenient and never raises**: the
+    risk signal is a best-effort ranking-telemetry enrichment (#466/#468), never
+    an exposure input, so a malformed payload yields an empty map (the caller
+    degrades to no penalties) rather than a contract failure. ``bool`` is
+    rejected as a score — it is an ``int`` subclass but never a valid risk.
+    """
+    rows = verdict.get("features")
+    if not isinstance(rows, list):
+        return {}
+    scores: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ref = row.get("candidate")
+        score = row.get("risk_score")
+        if (
+            not isinstance(ref, str)
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+        ):
+            continue
+        if score > 0.0:
+            scores[ref] = float(score)
+    return scores
+
+
 def filter_tools(
     candidates: list[ExposureCandidate],
     cfg: ExposureConfig,
