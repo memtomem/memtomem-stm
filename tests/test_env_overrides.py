@@ -42,6 +42,10 @@ class TestCollectProxyEnvOverrides:
             }
         }
 
+    def test_toolgraph_nested_field(self) -> None:
+        env = {"MEMTOMEM_STM_PROXY__TOOLGRAPH__ENABLED": "true"}
+        assert collect_proxy_env_overrides(env) == {"toolgraph": {"enabled": "true"}}
+
     def test_unrelated_env_vars_ignored(self) -> None:
         env = {
             "PATH": "/usr/bin",
@@ -87,6 +91,17 @@ class TestLoadFromFileWithEnvOverrides:
 
         assert cfg is not None
         assert cfg.default_max_result_chars == 16000
+
+    def test_toolgraph_env_wins_over_file(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"toolgraph": {"on_unreachable": "open"}}))
+
+        cfg = ProxyConfig.load_from_file(
+            cfg_file, env_overrides={"toolgraph": {"on_unreachable": "closed"}}
+        )
+
+        assert cfg is not None
+        assert cfg.toolgraph.on_unreachable == "closed"
 
     def test_env_overrides_when_file_missing(self, tmp_path: Path) -> None:
         cfg = ProxyConfig.load_from_file(

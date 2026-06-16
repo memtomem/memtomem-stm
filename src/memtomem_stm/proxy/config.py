@@ -689,6 +689,82 @@ class ExposureConfig(BaseModel):
     ``review``."""
 
 
+class ToolgraphConfig(BaseModel):
+    """Optional external tool-graph eligibility provider (#465).
+
+    Consults a separate, non-proxied tool-graph MCP server for cross-server
+    authorization / data-flow eligibility facts and feeds them into the
+    STM-native exposure filter as an additional rule source (alongside the
+    config / structural / native-signal rules already in
+    ``tool_eligibility.filter_tools``). The graph is *consulted*, never
+    proxied: the client never sees its tools, and STM holds **no
+    Python-level dependency** on the external package — all traffic goes
+    over the MCP protocol via :class:`~memtomem_stm.proxy.toolgraph_provider.ToolgraphConsultAdapter`
+    (stdio transport), mirroring the surfacing LTM-consult pattern.
+
+    Default-off: when ``enabled`` is ``True`` the consult runs once at
+    proxy startup so the advertised tool set stays session-stable, exactly
+    like the health-flag precompute. This first step parses the block and
+    ships the adapter, but the eligibility wiring (consult at ``start()`` +
+    ``filter_tools`` branch + ``toolgraph_*`` reject codes + telemetry) is a
+    follow-up, so an enabled block logs a "config is enabled but inert"
+    startup WARNING (#288 pattern) until then. Neo4j (behind the graph
+    server) is an operational prerequisite of enabling this block.
+    """
+
+    enabled: bool = False
+    command: str = "toolgraph"
+    """Launch command for the stdio tool-graph MCP server. Defaults to the
+    graph server's registered console script (mirroring the surfacing
+    ``memtomem-server`` default); ``serve`` with no flag runs stdio
+    (``serve --http`` is out of scope for v1 — stdio transport only)."""
+    args: list[str] = ["serve"]
+    env: dict[str, str] | None = None
+    """Extra environment for the launched server (e.g. ``NEO4J_URI`` /
+    ``NEO4J_USER`` / ``NEO4J_PASSWORD``). ``None`` inherits only mcp's safe
+    default-environment allowlist (PATH / HOME / SHELL / TERM / USER /
+    LOGNAME); set ``NEO4J_*`` etc. explicitly here — they are merged *over*
+    that default and are not picked up from the proxy's own environment."""
+    agent_id: str = "stm-proxy"
+    """Identity the graph authorizes eligibility against; must be registered
+    in the graph. A typo returns ``agent_found=false`` — see
+    ``on_agent_not_found``."""
+    server_name_map: dict[str, str] = {}
+    """Maps an STM upstream connection key (the operator-chosen key in
+    ``upstream_servers``) to the tool-graph server's *crawled* name. The two
+    are independent strings, so they coincide only by luck; an empty map
+    assumes identity and relies on a heuristic mismatch warning (a follow-up)."""
+    query_profile: str = "strict"
+    """Profile passed to the upstream ``eligible_tools`` consult. Kept a free
+    string (not coupled to STM's own ``ExposureProfile``) because the graph's
+    profile ladder is the external package's concern; STM applies its own
+    profile semantics on top (RFC Decision 1)."""
+    on_unreachable: Literal["open", "closed"] = "open"
+    """Transport down / timeout. ``open`` (default) skips the external rule
+    family and advertises per STM-native rules (the graph is an enhancement,
+    not a hard dependency); ``closed`` withholds every tool the graph did not
+    bless (high-assurance)."""
+    on_agent_not_found: Literal["fail_start", "open", "closed"] = "fail_start"
+    """Graph reachable but ``agent_id`` unknown — almost always a config
+    typo. ``fail_start`` (default) fails startup loudly so a typo cannot
+    silently disable enforcement; ``open`` / ``closed`` are explicit opt-ins."""
+    on_protocol_error: Literal["fail_start", "open", "closed"] = "fail_start"
+    """Graph reachable but incompatible (missing ``eligible_tools``, malformed
+    ``structuredContent``, non-int ``graph_generation``, unknown-profile
+    error). ``fail_start`` (default) treats a contract break as a loud
+    startup failure rather than a silent passthrough."""
+    on_tool_not_found: Literal["open", "closed"] = "open"
+    """A specific candidate was never crawled (the graph's blind spot).
+    ``open`` (default) does not hide a working tool; ``closed`` rejects
+    uncrawled candidates (high-assurance)."""
+    risk_penalty_scale: float = Field(default=1.0, ge=0.0)
+    """Multiplier mapping the upstream ``risk_score`` to a relevance
+    ``risk_penalty`` (consumed by a follow-up); ``0`` disables the risk
+    signal."""
+    timeout_seconds: float = Field(default=5.0, gt=0.0)
+    """Per-consult timeout for the startup batch query."""
+
+
 # Static context window sizes (tokens) for known model families.
 # Used by ProxyConfig.effective_max_result_chars() to scale compression budget.
 # Prefix-matched: "claude-sonnet-4-20250514" matches "claude-sonnet-4".
@@ -824,6 +900,7 @@ class ProxyConfig(BaseModel):
     selection_telemetry: SelectionTelemetryConfig = Field(default_factory=SelectionTelemetryConfig)
     tool_relevance: ToolRelevanceConfig = Field(default_factory=ToolRelevanceConfig)
     exposure: ExposureConfig = Field(default_factory=ExposureConfig)
+    toolgraph: ToolgraphConfig = Field(default_factory=ToolgraphConfig)
 
     @model_validator(mode="after")
     def _check_nonempty_upstream_prefixes(self) -> Self:

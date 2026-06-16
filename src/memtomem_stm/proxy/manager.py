@@ -337,6 +337,19 @@ class ProxyManager:
                 exposure_cfg.profile.value,
             )
 
+        # #465: the optional external tool-graph eligibility provider is
+        # configured but not yet consulted here — the startup consult that
+        # feeds ``filter_tools`` (beside the health-flag precompute above) is a
+        # follow-up. Until it lands, an enabled block does nothing, so warn
+        # (the #288 "config is enabled but inert" pattern) rather than let an
+        # operator believe external eligibility facts are being enforced.
+        if self._config.toolgraph.enabled:
+            logger.warning(
+                "toolgraph.enabled is set but the eligibility provider is not "
+                "wired yet — config is enabled but inert; no external "
+                "eligibility facts will be consulted."
+            )
+
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
         match cfg.transport:
             case TransportType.SSE:
