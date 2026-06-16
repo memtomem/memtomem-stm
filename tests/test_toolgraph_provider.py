@@ -630,10 +630,14 @@ class TestToolgraphConsultWiring:
         mgr, _ = _tg_manager(tmp_path, servers={"srv": ["read_file", "missing_x"]})
         await mgr._consult_toolgraph()  # on_tool_not_found default open
         assert mgr._toolgraph_external_rejects == {}
+        # An uncrawled (blind-spot) tool has no graph facts → risk_score None →
+        # no graph risk penalty, even though it stays advertised.
+        assert mgr._toolgraph_risk_penalties == {}
         assert [i.prefixed_name for i in mgr.get_proxy_tools()] == [
             "srv__read_file",
             "srv__missing_x",
         ]
+        assert mgr._advertised_risk_penalties == {}
 
     async def test_tool_not_found_closed_rejects(self, tmp_path):
         mgr, _ = _tg_manager(
@@ -718,12 +722,33 @@ class TestToolgraphHealthRendering:
                 "withholding_all": None,
                 "graph_generation": 11,
                 "external_reject_count": 2,
+                "risk_penalty_count": 0,
             }
         )
         body = "\n".join(lines)
         assert "active" in body
         assert "11" in body
         assert "2 tool(s) rejected" in body
+        # zero risk penalties → no suffix, line closes cleanly.
+        assert "carry a graph risk penalty" not in body
+        assert body.rstrip().endswith(")")
+
+    def test_active_shows_risk_penalty_count(self):
+        lines = _toolgraph_health_lines(
+            {
+                "enabled": True,
+                "degraded": False,
+                "degraded_reason": None,
+                "withholding_all": None,
+                "graph_generation": 11,
+                "external_reject_count": 2,
+                "risk_penalty_count": 3,
+            }
+        )
+        body = "\n".join(lines)
+        assert "2 tool(s) rejected" in body
+        assert "3 carry a graph risk penalty" in body
+        assert body.rstrip().endswith(")")  # suffix sits inside the closing paren
 
     def test_degraded_is_loud(self):
         lines = _toolgraph_health_lines(

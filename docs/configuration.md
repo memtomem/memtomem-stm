@@ -425,9 +425,9 @@ the count of graph-rejected tools, and the count carrying a graph risk penalty.
   best-effort `rank_features` batch query in the same startup session; if that
   query fails the proxy advertises normally and ranks without graph penalties
   (logged, never a startup gate). The penalty composes with the native
-  `review_risk_penalty` (review profile) via a complement-product, and calls
-  it shaped stamp the `v3-bm25-graph-risk-penalty` ranker cohort (see
-  [Selection telemetry](selection-telemetry.md)). `0` disables the signal.
+  `review_risk_penalty` (review profile) via a complement-product, and a
+  graph-derived penalty stamps the `v3-bm25-graph-risk-penalty` ranker cohort
+  (see [Selection telemetry](selection-telemetry.md)). `0` disables the signal.
 
 `server_name_map` translates an STM upstream connection key to the
 tool-graph's *crawled* server name (the two are independent strings); an empty

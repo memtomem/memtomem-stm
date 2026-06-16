@@ -53,7 +53,11 @@ from memtomem_stm.proxy.tool_eligibility import (
     interpret_verdict,
     parse_risk_scores,
 )
-from memtomem_stm.proxy.tool_relevance import RANKER_VERSION_BM25_RISK
+from memtomem_stm.proxy.tool_relevance import (
+    PENALTY_SOURCE_NONE,
+    PENALTY_SOURCE_REVIEW,
+    RANKER_VERSION_BM25_RISK,
+)
 from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
 
 
@@ -586,6 +590,7 @@ class TestManagerWireIn:
             if r["tool"] == "test__read_file"
         )
         assert entry["risk_penalty"] == 0.5
+        assert entry["risk_penalty_source"] == PENALTY_SOURCE_REVIEW
         assert entry["final_score"] == round(entry["relevance_score"] * 0.5, 6)
         clean = next(
             r
@@ -593,6 +598,7 @@ class TestManagerWireIn:
             if r["tool"] == "test__send_message"
         )
         assert clean["risk_penalty"] == 0.0
+        assert clean["risk_penalty_source"] == PENALTY_SOURCE_NONE
         assert clean["final_score"] == clean["relevance_score"]
 
     async def test_strict_without_flags_keeps_v1_version(self, tmp_path):
