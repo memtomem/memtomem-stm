@@ -51,6 +51,7 @@ from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25_GRAPH_RISK,
 )
 from memtomem_stm.server import _toolgraph_health_lines
+from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
 from memtomem_stm.proxy.toolgraph_provider import (
     ToolgraphConsultAdapter,
     ToolgraphProtocolError,
@@ -88,6 +89,8 @@ class TestToolgraphConfig:
         assert tg.query_profile == "strict"
         assert tg.risk_penalty_scale == 1.0
         assert tg.timeout_seconds == 5.0
+        assert tg.consult_cache_enabled is True  # #494: strictly-fresh, on by default
+        assert tg.consult_cache_path == Path("~/.memtomem/toolgraph_consult.db")
 
     def test_failure_knob_defaults(self):
         tg = ProxyConfig().toolgraph
@@ -282,6 +285,7 @@ class TestToolgraphStartupWiring:
                 "degraded_reason": None,
                 "withholding_all": None,
                 "graph_generation": None,
+                "from_cache": False,
                 "external_reject_count": 0,
                 "risk_penalty_count": 0,
             }
@@ -364,7 +368,14 @@ def _tg_manager(tmp_path, *, servers=None, exposure=None, **tg_overrides):
         )
         for name in servers
     }
-    tg_kwargs: dict = {"command": sys.executable, "args": [str(_FAKE_TOOLGRAPH)]}
+    tg_kwargs: dict = {
+        "command": sys.executable,
+        "args": [str(_FAKE_TOOLGRAPH)],
+        # Isolate the #494 consult cache per-test (the production default points
+        # at the real ~/.memtomem). Callers override for cross-restart / disabled
+        # cache scenarios.
+        "consult_cache_path": tmp_path / "tg_consult.db",
+    }
     tg_kwargs.update(tg_overrides)  # callers may override command/args (unreachable tests)
     proxy_cfg = ProxyConfig(
         config_path=tmp_path / "proxy.json",
@@ -707,6 +718,186 @@ class TestToolgraphConsultWiring:
 
 
 # ── stm_proxy_health rendering of the toolgraph status (loud degrade) ─────────
+
+
+def _read_calls(path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+class TestToolgraphConsultCache:
+    """#494 — disk-cache the startup consult (Model A: cheap generation probe)."""
+
+    async def test_hit_skips_full_consult(self, tmp_path):
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(tmp_path, env={"FAKE_TG_CALL_LOG": str(call_log)})
+        # First consult: cold cache → miss → full consult (populates the cache).
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False
+        first_rejects = dict(mgr._toolgraph_external_rejects)
+        n_after_first = len(_read_calls(call_log))
+
+        # Second consult: same generation → cache HIT → only the [] probe runs.
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is True
+        assert mgr._toolgraph_external_rejects == first_rejects  # identical from cached facts
+        assert mgr._graph_generation == 11
+        second_calls = _read_calls(call_log)[n_after_first:]
+        assert second_calls == [
+            "eligible_tools:0"
+        ]  # only the probe; no full consult / rank_features
+        await mgr.stop()
+
+    async def test_generation_bump_misses(self, tmp_path):
+        gen_file = tmp_path / "gen.txt"
+        gen_file.write_text("11")
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            env={"FAKE_TG_GENERATION_FILE": str(gen_file), "FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._graph_generation == 11
+        n_after_first = len(_read_calls(call_log))
+
+        gen_file.write_text("12")  # the graph mutated → generation bumped
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False
+        assert mgr._graph_generation == 12
+        # The probe read gen 12, missed the gen-11 row, and ran the full consult.
+        assert "eligible_tools:2" in _read_calls(call_log)[n_after_first:]
+        await mgr.stop()
+
+    async def test_degrade_with_populated_cache_stays_loud_and_serves_no_cache(
+        self, tmp_path, caplog
+    ):
+        mgr, _ = _tg_manager(tmp_path)
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_external_rejects  # a real verdict was cached
+        # The graph goes unreachable; the populated cache must NOT mask it.
+        mgr._config.toolgraph.command = "this-binary-does-not-exist-xyz"
+        mgr._config.toolgraph.args = []
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr._consult_toolgraph()
+        assert mgr._toolgraph_degraded is True
+        assert mgr._toolgraph_degraded_reason == REASON_TOOLGRAPH_UNREACHABLE
+        assert mgr._toolgraph_from_cache is False
+        assert mgr._graph_generation is None
+        assert mgr._toolgraph_external_rejects == {}  # cache was not served
+        assert any("DEGRADED" in r.message and "NOT active" in r.message for r in caplog.records)
+        await mgr.stop()
+
+    async def test_agent_not_found_not_cached(self, tmp_path):
+        shared_db = tmp_path / "shared.db"
+        mgr, _ = _tg_manager(
+            tmp_path, agent_id="ghost", on_agent_not_found="open", consult_cache_path=shared_db
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_degraded is True
+        await mgr.stop()
+        # The structured abort wrote no row — a degraded / agent-not-found verdict
+        # is never cached, so it cannot poison a later valid-agent consult.
+        check = GraphConsultCache(shared_db)
+        check.initialize()
+        try:
+            n = check._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0]
+        finally:
+            check.close()
+        assert n == 0
+
+    async def test_probe_protocol_error_routes_to_knob(self, tmp_path):
+        # With the cache enabled, the [] probe is the first call — a protocol
+        # error on it must ride on_protocol_error exactly as the full verdict would.
+        mgr, _ = _tg_manager(tmp_path, query_profile="boom", on_protocol_error="open")
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_degraded is True
+        assert mgr._toolgraph_degraded_reason == REASON_TOOLGRAPH_PROTOCOL_ERROR
+        assert mgr._toolgraph_from_cache is False
+        await mgr.stop()
+
+    async def test_knob_change_remaps_on_hit(self, tmp_path):
+        # Populate under on_tool_not_found=open (missing_x kept), then flip to
+        # closed on a same-generation restart → the hit re-maps the cached RAW
+        # facts under the new knob → missing_x is now rejected.
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": ["read_file", "missing_x"]})
+        await mgr._consult_toolgraph()  # on_tool_not_found default open
+        assert mgr._toolgraph_external_rejects == {}
+        mgr._config.toolgraph.on_tool_not_found = "closed"
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is True
+        assert mgr._toolgraph_external_rejects == {
+            ("srv", "missing_x"): REASON_TOOLGRAPH_TOOL_NOT_FOUND
+        }
+        await mgr.stop()
+
+    async def test_risk_scale_change_rescales_on_hit(self, tmp_path):
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": ["risky_tool"]})  # scale default 1.0
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.4}
+        mgr._config.toolgraph.risk_penalty_scale = 0.5
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is True
+        # Re-scaled locally from the cached raw risk_score (0.4 * 0.5).
+        assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.2}
+        await mgr.stop()
+
+    async def test_transient_enrichment_failure_not_cached_as_success(self, tmp_path):
+        # rank_features fails (agent "rankboom") while eligible_tools succeeds →
+        # had_risk_scores=False → a later want-risk consult MISSES and re-runs the
+        # full consult instead of serving "no penalties" off the cache forever.
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["risky_tool"]},
+            agent_id="rankboom",
+            env={"FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {}  # enrichment failed this session
+        n_after_first = len(_read_calls(call_log))
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False  # had_risk_scores False → miss under want_risk
+        assert "eligible_tools:1" in _read_calls(call_log)[n_after_first:]  # full consult re-ran
+        await mgr.stop()
+
+    async def test_malformed_enrichment_not_cached_as_success(self, tmp_path):
+        # rank_features returns a NON-error but malformed payload (no 'features'
+        # list, agent "rankmalformed") → had_risk_scores=False → a later want-risk
+        # consult MISSES and re-runs the full consult, never pinning "no penalties".
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["risky_tool"]},
+            agent_id="rankmalformed",
+            env={"FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {}  # malformed enrichment → no penalties
+        n_after_first = len(_read_calls(call_log))
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False
+        assert "eligible_tools:1" in _read_calls(call_log)[n_after_first:]  # full consult re-ran
+        await mgr.stop()
+
+    async def test_cache_disabled_single_consult(self, tmp_path):
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path, consult_cache_enabled=False, env={"FAKE_TG_CALL_LOG": str(call_log)}
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False
+        calls = _read_calls(call_log)
+        assert "eligible_tools:0" not in calls  # no probe
+        assert "eligible_tools:2" in calls  # one full consult, today's behavior
+        await mgr.stop()
+
+    async def test_health_shows_from_cache(self, tmp_path):
+        mgr, _ = _tg_manager(tmp_path)
+        await mgr._consult_toolgraph()
+        await mgr._consult_toolgraph()  # 2nd consult = cache hit
+        assert mgr._toolgraph_from_cache is True
+        body = "\n".join(_toolgraph_health_lines(mgr.get_toolgraph_status()))
+        assert "from cache" in body
+        await mgr.stop()
 
 
 class TestToolgraphHealthRendering:

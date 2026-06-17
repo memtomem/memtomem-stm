@@ -21,6 +21,7 @@ from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackSto
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.pending_store import SQLitePendingStore
 from memtomem_stm.proxy.progressive_reads_store import ProgressiveReadsStore
+from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
 from memtomem_stm.surfacing.feedback_store import FeedbackStore
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 
@@ -88,6 +89,7 @@ STORE_FACTORIES = [
     pytest.param(CompressionFeedbackStore, id="compression_feedback_store"),
     pytest.param(ProgressiveReadsStore, id="progressive_reads_store"),
     pytest.param(SQLitePendingStore, id="pending_store"),
+    pytest.param(GraphConsultCache, id="graph_consult_cache"),
 ]
 
 

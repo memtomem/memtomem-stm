@@ -51,6 +51,7 @@ from memtomem_stm.proxy.config import (
     ProxyConfig,
     ProxyConfigLoader,
     SelectiveConfig,
+    ToolgraphConfig,
     TransportType,
     UpstreamServerConfig,
 )
@@ -74,11 +75,13 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_PROTOCOL_ERROR,
     REASON_TOOLGRAPH_UNREACHABLE,
     ExposureCandidate,
+    InterpretedVerdict,
     compute_health_flags,
     filter_tools,
     interpret_verdict,
     parse_risk_scores,
 )
+from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
 from memtomem_stm.proxy.toolgraph_provider import (
     TRANSPORT_ERRORS as TOOLGRAPH_TRANSPORT_ERRORS,
     ToolgraphConsultAdapter,
@@ -262,6 +265,11 @@ class ProxyManager:
         self._graph_generation: int | None = None
         self._toolgraph_degraded: bool = False
         self._toolgraph_degraded_reason: str | None = None
+        # #494 consult disk cache (lazy-opened per session, closed on stop() and
+        # in the double-start guard so a reconfigured path reopens). ``from_cache``
+        # records whether THIS session's verdict was served from a cache hit.
+        self._toolgraph_cache: GraphConsultCache | None = None
+        self._toolgraph_from_cache: bool = False
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
@@ -314,6 +322,19 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            # Close the consult cache too so a re-entry that changed
+            # ``toolgraph.consult_cache_path`` reopens the right DB (#494). Mirror
+            # the stack-close try/except above: always null the handle so a failed
+            # close cannot leave a stale closed connection for the next start.
+            if self._toolgraph_cache is not None:
+                try:
+                    self._toolgraph_cache.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close tool-graph consult cache in double-start guard",
+                        exc_info=True,
+                    )
+                self._toolgraph_cache = None
         self._stack = AsyncExitStack()
 
         servers = self._config.upstream_servers
@@ -459,6 +480,7 @@ class ProxyManager:
         self._graph_generation = None
         self._toolgraph_degraded = False
         self._toolgraph_degraded_reason = None
+        self._toolgraph_from_cache = False
 
         ref_to_keys, refs = self._build_toolgraph_candidates()
         if not refs:
@@ -477,15 +499,12 @@ class ProxyManager:
                 # ``timeout_seconds`` (the realistic hang is a slow Neo4j query,
                 # which happens during the consult, not during initialize()).
                 await adapter.start()
-                verdict = await adapter.eligible_tools(refs)
-                interp = interpret_verdict(verdict)
-                # #493 risk enrichment in the SAME session (one extra batch
-                # round-trip, still session-stable). Best-effort and gated on a
-                # resolved agent + an enabled scale; its own failures degrade to
-                # "no penalties" inside the helper, so they never reach the on_*
-                # knobs below — a flaky enrichment must not fail startup.
-                if interp.agent_found and cfg.risk_penalty_scale > 0.0:
-                    risk_scores = await self._fetch_risk_scores(adapter, refs)
+                # #494: probe-then-hit/miss. The probe + any full consult run
+                # INSIDE this try, so their transport/protocol faults still ride
+                # the on_* knobs below — the disk cache can never mask a degraded
+                # graph. Returns the same ``(interp, risk_scores)`` the rest of
+                # this method already expects.
+                interp, risk_scores = await self._run_consult(adapter, cfg, refs)
             finally:
                 try:
                     await adapter.stop()
@@ -546,16 +565,118 @@ class ProxyManager:
             )
         self._warn_server_name_mismatch(interp.tool_not_found_refs, ref_to_keys)
 
+    def _open_consult_cache(self, cfg: ToolgraphConfig) -> GraphConsultCache | None:
+        """Lazily open the #494 consult disk cache; ``None`` when disabled.
+
+        Best-effort: a cache that cannot be opened (bad path / perms / disk)
+        degrades to no-cache for the session rather than failing startup — the
+        consult itself is unaffected. Re-used across the session; the
+        double-start guard closes it so a reconfigured path reopens.
+        """
+        if not cfg.consult_cache_enabled:
+            return None
+        if self._toolgraph_cache is None:
+            try:
+                cache = GraphConsultCache(cfg.consult_cache_path.expanduser())
+                cache.initialize()
+            except Exception:
+                logger.warning(
+                    "Tool-graph consult cache could not be opened at %s — consulting "
+                    "without the disk cache this session.",
+                    cfg.consult_cache_path,
+                    exc_info=True,
+                )
+                return None
+            self._toolgraph_cache = cache
+        return self._toolgraph_cache
+
+    async def _run_consult(
+        self, adapter: ToolgraphConsultAdapter, cfg: ToolgraphConfig, refs: list[str]
+    ) -> tuple[InterpretedVerdict, dict[str, float]]:
+        """Probe-then-hit/miss consult (#494). Returns ``(interp, risk_scores)``.
+
+        Model A (strictly-fresh): with the cache enabled, a cheap
+        ``eligible_tools([])`` probe reads the live ``graph_generation`` on EVERY
+        start; the expensive ``eligible_tools(refs)`` + ``rank_features(refs)``
+        evaluation is skipped only when the probed generation (plus provider,
+        agent, profile, and candidate set) matches a cached row. Because the
+        probe always contacts the graph, a degraded/unreachable graph is always
+        re-detected (its fault propagates to the caller's ``on_*`` knobs) and
+        never masked by the cache. Sets ``self._toolgraph_from_cache``.
+
+        Only an agent-found full consult is written; a degraded / agent-not-found
+        verdict is never cached. ``had_risk_scores`` records whether enrichment
+        actually succeeded (not merely that it was wanted), so a transient
+        ``rank_features`` failure is not cached as "no penalties".
+        """
+        want_risk = cfg.risk_penalty_scale > 0.0
+        cache = self._open_consult_cache(cfg)
+        if cache is None:
+            # Cache disabled / unavailable — the pre-#494 path, verbatim.
+            interp = interpret_verdict(await adapter.eligible_tools(refs))
+            risk_scores: dict[str, float] = {}
+            if interp.agent_found and want_risk:
+                risk_scores, _ = await self._fetch_risk_scores(adapter, refs)
+            return interp, risk_scores
+
+        probe = interpret_verdict(await adapter.eligible_tools([]))
+        if not probe.agent_found:
+            # Agent unknown — no full consult; the caller maps this onto
+            # ``on_agent_not_found`` exactly as the full-verdict abort would.
+            return probe, {}
+
+        cand_hash = GraphConsultCache.candidate_hash(refs)
+        prov_fp = GraphConsultCache.provider_fingerprint(cfg)
+        row = cache.get(prov_fp, cfg.agent_id, cfg.query_profile, cand_hash, probe.graph_generation)
+        if row is not None and (row["had_risk_scores"] or not want_risk):
+            self._toolgraph_from_cache = True
+            interp = InterpretedVerdict(
+                agent_found=True,
+                rejects=dict(row["rejects"]),
+                tool_not_found_refs=frozenset(row["tool_not_found_refs"]),
+                graph_generation=probe.graph_generation,
+            )
+            risk_scores = (
+                {ref: float(score) for ref, score in row["risk_scores"].items()}
+                if want_risk
+                else {}
+            )
+            return interp, risk_scores
+
+        # Miss — full consult, then cache the raw facts on agent-found success.
+        interp = interpret_verdict(await adapter.eligible_tools(refs))
+        risk_scores, risk_ok = ({}, False)
+        if interp.agent_found and want_risk:
+            risk_scores, risk_ok = await self._fetch_risk_scores(adapter, refs)
+        if interp.agent_found:
+            cache.put(
+                prov_fp,
+                cfg.agent_id,
+                cfg.query_profile,
+                cand_hash,
+                interp.graph_generation,
+                rejects=interp.rejects,
+                tool_not_found_refs=interp.tool_not_found_refs,
+                risk_scores=risk_scores,
+                had_risk_scores=risk_ok,
+            )
+        return interp, risk_scores
+
     async def _fetch_risk_scores(
         self, adapter: ToolgraphConsultAdapter, refs: list[str]
-    ) -> dict[str, float]:
-        """Best-effort ``rank_features`` enrichment (#493): ``{ref: risk_score}``.
+    ) -> tuple[dict[str, float], bool]:
+        """Best-effort ``rank_features`` enrichment (#493): ``({ref: risk_score}, ok)``.
 
         The graph's per-candidate ``risk_score`` is a ranking-telemetry signal
         only — never exposure, never a startup gate — so unlike the
         ``eligible_tools`` verdict (whose failures ride the ``on_*`` knobs) any
         fault here degrades silently to "no penalties", logged once at WARNING.
-        Returns an empty map on any consult error.
+
+        Returns ``(scores, ok)`` where ``ok`` is ``False`` only on a consult
+        error. The flag lets the #494 disk cache distinguish a *successful empty*
+        enrichment (cacheable as "risk facts captured") from a *transient
+        failure* (must not be cached as success, else a later same-generation
+        start would skip enrichment and serve no penalties forever).
         """
         try:
             verdict = await adapter.rank_features(refs)
@@ -565,8 +686,21 @@ class ProxyManager:
                 "proceeds without graph risk penalties this session.",
                 exc,
             )
-            return {}
-        return parse_risk_scores(verdict)
+            return {}, False
+        # A non-error response whose ``features`` is not a list is a *malformed*
+        # enrichment: ``parse_risk_scores`` leniently yields no penalties, but it
+        # must NOT be cached as a successful "no risk facts" capture (#494) — else
+        # a later same-generation start would skip ``rank_features`` and serve no
+        # penalties forever. Report ``ok=False`` so the cache re-tries (the active
+        # session degrades to no penalties either way).
+        if not isinstance(verdict.get("features"), list):
+            logger.warning(
+                "Tool-graph risk enrichment (rank_features) returned a malformed "
+                "payload (no 'features' list) — ranking proceeds without graph risk "
+                "penalties this session."
+            )
+            return {}, False
+        return parse_risk_scores(verdict), True
 
     def _tg_whole_call(self, knob: str, code: str, detail: str) -> None:
         """Apply a whole-call tool-graph failure per its ``on_*`` knob.
@@ -810,6 +944,15 @@ class ProxyManager:
             # None, so a stop->start cycle gets a fresh httpx client instead of
             # the closed instance (whose extract() asserts _client is not None).
             self._extractor = None
+        # Close the #494 consult disk cache (re-opened lazily on the next start).
+        # Always null the handle so a failed close cannot leave a stale closed
+        # connection that the next start() would reuse.
+        if self._toolgraph_cache is not None:
+            try:
+                self._toolgraph_cache.close()
+            except Exception:
+                logger.debug("Failed to close tool-graph consult cache", exc_info=True)
+            self._toolgraph_cache = None
         for conn in self._connections.values():
             if conn.stack is not None:
                 try:
@@ -1656,6 +1799,7 @@ class ProxyManager:
             "degraded_reason": self._toolgraph_degraded_reason,
             "withholding_all": self._toolgraph_withhold_all,
             "graph_generation": self._graph_generation,
+            "from_cache": self._toolgraph_from_cache,
             "external_reject_count": len(self._toolgraph_external_rejects),
             "risk_penalty_count": len(self._toolgraph_risk_penalties),
         }
