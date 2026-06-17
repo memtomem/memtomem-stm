@@ -68,6 +68,7 @@ from memtomem_stm.proxy.memory_ops import (
     format_fact_md,
     index_content_matches_privacy,
 )
+from memtomem_stm.proxy.pipeline_stages import ShapedResponse, ShapePassthrough
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_eligibility import (
@@ -2286,6 +2287,79 @@ class ProxyManager:
         # this is unreachable but satisfies the type checker.
         raise RuntimeError("unreachable: upstream retry loop exited without a result")
 
+    def _shape_response(
+        self,
+        result: "CallToolResult",
+        server: str,
+        tool: str,
+        *,
+        cfg_snap: ProxyConfig,
+    ) -> ShapedResponse:
+        """Stage 3: split upstream content into text vs non-text under the
+        ``max_upstream_chars`` OOM guard.
+
+        ``max_upstream_chars`` is a hard guard against (mis-)behaving upstreams
+        returning huge payloads — without it, a 100 MB ``ls -R /`` response would
+        be loaded fully into memory and walk through the entire compression
+        pipeline before any ``max_chars`` truncation could apply. ``result.content
+        or []`` tolerates spec-noncompliant upstreams that return ``None`` instead
+        of an empty list.
+
+        Records no metrics and performs no early return: when no text remains it
+        returns a ``ShapedResponse`` whose ``passthrough`` tells the caller to
+        record the non-text passthrough metric (and return the non-text list) or
+        return the ``"[empty response]"`` sentinel. The caller stays the single
+        owner of metric writes and return shapes (R8).
+        """
+        max_upstream = cfg_snap.max_upstream_chars
+        text_parts: list[str] = []
+        non_text_content: list = []
+        total_chars = 0
+        oversize = False
+        for content in result.content or []:
+            if content.type == "text":
+                remaining = max_upstream - total_chars
+                if remaining <= 0:
+                    oversize = True
+                    break
+                # ``content.text or ""`` tolerates spec-noncompliant upstreams
+                # that return ``None`` for a TextContent's ``text`` field.
+                # MCP spec requires ``text: str`` but mirrors the same gap
+                # that PR #114 fixed for ``result.content`` itself.
+                text = content.text or ""
+                if len(text) > remaining:
+                    text_parts.append(text[:remaining])
+                    total_chars += remaining
+                    oversize = True
+                    break
+                text_parts.append(text)
+                total_chars += len(text)
+            else:
+                non_text_content.append(content)
+        if oversize:
+            notice = (
+                f"\n\n[response truncated to {max_upstream} chars at "
+                f"max_upstream_chars guard — upstream returned an oversized payload]"
+            )
+            text_parts.append(notice)
+            logger.warning(
+                "Upstream %s/%s exceeded max_upstream_chars=%d — truncating",
+                server,
+                tool,
+                max_upstream,
+            )
+
+        if not text_parts:
+            return ShapedResponse(
+                original_text="",
+                non_text_content=non_text_content,
+                passthrough=ShapePassthrough(has_non_text=bool(non_text_content)),
+            )
+        return ShapedResponse(
+            original_text="\n".join(text_parts),
+            non_text_content=non_text_content,
+        )
+
     async def _call_tool_inner(
         self,
         server: str,
@@ -2343,54 +2417,14 @@ class ProxyManager:
         # owned entirely by the helper — nothing after the fetch reads them.
         result = await self._fetch_upstream(server, tool, upstream_args, trace_id=trace_id)
 
-        # Separate text and non-text content. ``max_upstream_chars`` is a hard
-        # OOM guard against (mis-)behaving upstreams returning huge payloads —
-        # without it, a 100 MB ``ls -R /`` response would be loaded fully into
-        # memory and walk through the entire compression pipeline before any
-        # ``max_chars`` truncation could apply. ``result.content or []`` also
-        # tolerates spec-noncompliant upstreams that return ``None`` instead
-        # of an empty list — those degrade to ``"[empty response]"``.
-        max_upstream = cfg_snap.max_upstream_chars
-        text_parts: list[str] = []
-        non_text_content: list = []
-        total_chars = 0
-        oversize = False
-        for content in result.content or []:
-            if content.type == "text":
-                remaining = max_upstream - total_chars
-                if remaining <= 0:
-                    oversize = True
-                    break
-                # ``content.text or ""`` tolerates spec-noncompliant upstreams
-                # that return ``None`` for a TextContent's ``text`` field.
-                # MCP spec requires ``text: str`` but mirrors the same gap
-                # that PR #114 fixed for ``result.content`` itself.
-                text = content.text or ""
-                if len(text) > remaining:
-                    text_parts.append(text[:remaining])
-                    total_chars += remaining
-                    oversize = True
-                    break
-                text_parts.append(text)
-                total_chars += len(text)
-            else:
-                non_text_content.append(content)
-        if oversize:
-            notice = (
-                f"\n\n[response truncated to {max_upstream} chars at "
-                f"max_upstream_chars guard — upstream returned an oversized payload]"
-            )
-            text_parts.append(notice)
-            logger.warning(
-                "Upstream %s/%s exceeded max_upstream_chars=%d — truncating",
-                server,
-                tool,
-                max_upstream,
-            )
-
-        # Non-text only → pass through without compression but record metrics
-        if not text_parts:
-            if non_text_content:
+        # ── Stage 3: SHAPE (text/non-text split + max_upstream_chars guard) ──
+        # The helper records no metrics and performs no return; when no text
+        # remains it signals the early-exit via ``shaped.passthrough`` and the
+        # orchestrator owns the metric write + return shape (R8).
+        shaped = self._shape_response(result, server, tool, cfg_snap=cfg_snap)
+        non_text_content = shaped.non_text_content
+        if shaped.passthrough is not None:
+            if shaped.passthrough.has_non_text:
                 self.tracker.record(
                     CallMetrics(
                         server=server,
@@ -2402,8 +2436,7 @@ class ProxyManager:
                 )
                 return non_text_content
             return "[empty response]"
-
-        original_text = "\n".join(text_parts)
+        original_text = shaped.original_text
 
         if result.isError:
             self.tracker.record_error(
