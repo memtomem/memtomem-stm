@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from mcp.types import CallToolResult
+
     from memtomem_stm.proxy.cache import ProxyCache
     from memtomem_stm.proxy.pending_store import PendingStore
     from memtomem_stm.proxy.protocols import FileIndexer
@@ -2115,58 +2117,27 @@ class ProxyManager:
             finally:
                 self._key_locks.pop(cache_key, None)
 
-    async def _call_tool_inner(
+    async def _fetch_upstream(
         self,
         server: str,
         tool: str,
-        arguments: dict[str, Any],
+        upstream_args: dict[str, Any],
         *,
-        trace_id: str | None = None,
-    ) -> str | list:
-        # Public entry point ``call_tool`` generates the trace_id and passes
-        # it in so it can match the enclosing Langfuse span. Direct callers
-        # (tests and internal dispatch) that don't care about tracing omit
-        # the argument and we generate one here.
-        if trace_id is None:
-            trace_id = uuid.uuid4().hex[:16]
-        logger.debug("trace_id=%s server=%s tool=%s", trace_id, server, tool)
+        trace_id: str | None,
+    ) -> "CallToolResult":
+        """Stage 1: fetch the upstream tool result with bounded retry + reconnect.
 
-        # Snapshot config once to avoid intra-request inconsistency from
-        # hot-reload changing the config between accesses.
-        cfg_snap = self._config
-
-        # Extract _context_query before forwarding. Coerce non-str values to
-        # None at the single extraction point — the cache-hit path already
-        # sanitizes this way, and without the mirror here the same malformed
-        # argument reaches scorers/compressors raw on a miss but is dropped on
-        # a hit, so whether it raises depends on cache state.
-        raw_context_query = arguments.get("_context_query") if arguments else None
-        context_query = raw_context_query if isinstance(raw_context_query, str) else None
-        upstream_args = (
-            {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
-        )
-
-        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
-        # time we get here the cache has already missed. Just account the
-        # miss and proceed with the upstream fetch.
-        if self._cache is not None:
-            self.tracker.record_cache_miss()
-
+        Owns the connection handle, the per-attempt and overall deadlines, and the
+        failure taxonomy (timeout / transport / protocol / programming). Returns the
+        upstream ``CallToolResult`` on success. On failure it records the error
+        metric, marks the exception via ``_mark_recorded`` (so the outer
+        ``call_tool`` does not double-record), best-effort reconnects, and re-raises.
+        ``upstream_args`` must already carry ``_trace_id`` — the caller injects it
+        before this call so the cache-key snapshot stays trace-free.
+        """
         conn = self._connections[server]
         cfg = conn.config
         delay = cfg.reconnect_delay_seconds
-
-        # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
-        # The cache lookup at L771 used the original args (no ``_trace_id``);
-        # if cache.set uses the mutated args, every stored entry is keyed on
-        # a per-request random hex and is unreachable by any future lookup
-        # (hit rate structurally 0%). Keep upstream args mutated for trace
-        # propagation, but persist under the original key.
-        cache_args = {**upstream_args}
-
-        # Propagate trace context to upstream server for end-to-end correlation.
-        if trace_id is not None:
-            upstream_args["_trace_id"] = trace_id
 
         # Overall-deadline policy: each attempt uses
         # ``min(call_timeout_seconds, remaining_deadline)`` as its effective
@@ -2207,11 +2178,10 @@ class ProxyManager:
                 raise deadline_exc
             per_attempt_timeout = min(cfg.call_timeout_seconds, remaining_deadline)
             try:
-                result = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     conn.session.call_tool(tool, upstream_args),
                     timeout=per_attempt_timeout,
                 )
-                break
             except Exception as exc:
                 err_code = getattr(getattr(exc, "error", None), "code", None)
                 # Only retry transport/connection errors and MCP errors.
@@ -2311,6 +2281,67 @@ class ProxyManager:
                 except Exception as reconnect_exc:
                     logger.error("Reconnect to '%s' failed: %s", server, reconnect_exc)
                     raise
+
+        # The loop always returns on success or raises on every failure path;
+        # this is unreachable but satisfies the type checker.
+        raise RuntimeError("unreachable: upstream retry loop exited without a result")
+
+    async def _call_tool_inner(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        trace_id: str | None = None,
+    ) -> str | list:
+        # Public entry point ``call_tool`` generates the trace_id and passes
+        # it in so it can match the enclosing Langfuse span. Direct callers
+        # (tests and internal dispatch) that don't care about tracing omit
+        # the argument and we generate one here.
+        if trace_id is None:
+            trace_id = uuid.uuid4().hex[:16]
+        logger.debug("trace_id=%s server=%s tool=%s", trace_id, server, tool)
+
+        # Snapshot config once to avoid intra-request inconsistency from
+        # hot-reload changing the config between accesses.
+        cfg_snap = self._config
+
+        # Extract _context_query before forwarding. Coerce non-str values to
+        # None at the single extraction point — the cache-hit path already
+        # sanitizes this way, and without the mirror here the same malformed
+        # argument reaches scorers/compressors raw on a miss but is dropped on
+        # a hit, so whether it raises depends on cache state.
+        raw_context_query = arguments.get("_context_query") if arguments else None
+        context_query = raw_context_query if isinstance(raw_context_query, str) else None
+        upstream_args = (
+            {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
+        )
+
+        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
+        # time we get here the cache has already missed. Just account the
+        # miss and proceed with the upstream fetch.
+        if self._cache is not None:
+            self.tracker.record_cache_miss()
+
+        # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
+        # The cache lookup at L771 used the original args (no ``_trace_id``);
+        # if cache.set uses the mutated args, every stored entry is keyed on
+        # a per-request random hex and is unreachable by any future lookup
+        # (hit rate structurally 0%). Keep upstream args mutated for trace
+        # propagation, but persist under the original key.
+        cache_args = {**upstream_args}
+
+        # Propagate trace context to upstream server for end-to-end correlation.
+        if trace_id is not None:
+            upstream_args["_trace_id"] = trace_id
+
+        # ── Stage 1: UPSTREAM FETCH ──
+        # Bounded retry + reconnect with per-attempt and overall deadlines.
+        # Returns the upstream result or raises after recording the failure
+        # metric (and ``_mark_recorded``-ing the exception so the outer
+        # ``call_tool`` does not double-record). ``conn``/``cfg``/``delay`` are
+        # owned entirely by the helper — nothing after the fetch reads them.
+        result = await self._fetch_upstream(server, tool, upstream_args, trace_id=trace_id)
 
         # Separate text and non-text content. ``max_upstream_chars`` is a hard
         # OOM guard against (mis-)behaving upstreams returning huge payloads —
