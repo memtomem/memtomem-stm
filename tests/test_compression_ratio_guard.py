@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ProgressiveConfig,
@@ -279,6 +280,70 @@ class TestProxyManagerRatioGuard:
         assert row["ratio_violation"] == 0
         # passthrough keeps the full cleaned content (compressed == cleaned)
         assert row["compressed_chars"] == row["cleaned_chars"]
+        store.close()
+
+    async def test_progressive_passthrough_on_error_is_not_cached(self, tmp_path):
+        """A passthrough triggered by a *transient* progressive store failure
+        must NOT be cached. Caching it would pin the degraded (non-chunked)
+        full response for the cache TTL and suppress progressive delivery on
+        identical calls even after the store recovers — so the next identical
+        call must miss the cache, re-run the pipeline, and re-attempt
+        progressive delivery.
+        """
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=500),
+        )
+        mgr._cache = cache
+        large_text = "content paragraph. " * 200  # > chunk_size → would be chunked
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result(large_text)
+
+        # Call 1: the primary progressive store fails → passthrough degradation.
+        mgr._apply_progressive = lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("pending store full")
+        )
+        first = await mgr.call_tool("srv", "tool", {})
+        assert "stm_proxy_read_more" not in first  # passthrough, no footer
+        # The degraded passthrough must not have entered the cache.
+        assert cache.get("srv", "tool", {}) is None
+
+        # Call 2: store recovered (real method restored). It must be a cache
+        # MISS that re-runs upstream + progressive — not a replay of the
+        # cached passthrough.
+        del mgr._apply_progressive  # restore the real bound method
+        second = await mgr.call_tool("srv", "tool", {})
+        assert session.call_tool.call_count == 2  # cache miss → upstream re-called
+        assert "stm_proxy_read_more" in second  # progressive delivery re-attempted
+        cache.close()
+        store.close()
+
+    async def test_single_chunk_progressive_passthrough_is_still_cached(self, tmp_path):
+        """The cache skip must apply ONLY to the error-degraded passthrough. A
+        normal single-chunk passthrough (content fits one chunk) is a complete,
+        key-free response and stays cacheable, so an identical second call is a
+        cache hit that does not re-call upstream.
+        """
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=5000),
+        )
+        mgr._cache = cache
+        small_text = "fits in one chunk. " * 10  # < chunk_size → single-chunk passthrough
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result(small_text)
+
+        first = await mgr.call_tool("srv", "tool", {})
+        assert "stm_proxy_read_more" not in first  # single chunk, no footer
+        await mgr.call_tool("srv", "tool", {})  # identical call → should hit cache
+        assert session.call_tool.call_count == 1  # cache hit → upstream NOT re-called
+        cache.close()
         store.close()
 
     async def test_auto_is_resolved_before_metrics(self, tmp_path):

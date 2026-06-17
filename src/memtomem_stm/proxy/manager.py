@@ -2241,10 +2241,13 @@ class ProxyManager:
         # which skips for offset-invariant reasons).
         surfacing_on_progressive_ok: bool | None = None
         surface_error: str | None = None
+        # Set True when the primary PROGRESSIVE path degrades to a full-content
+        # passthrough after a store failure (below). Read at the cache-store
+        # gate to keep that transient-failure-degraded response out of the cache.
+        progressive_passthrough_on_error = False
         _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
-            progressive_passthrough_on_error = False
             if len(cleaned) <= pcfg.chunk_size:
                 # Content fits in one chunk — passthrough
                 compressed = cleaned
@@ -2747,7 +2750,21 @@ class ProxyManager:
         # startup legacy purge in ``ProxyCache.initialize``); a false positive
         # only costs one un-cached response, never correctness.
         if self._cache is not None and not non_text_content:
-            if response_carries_transient_key(compressed):
+            if progressive_passthrough_on_error:
+                # The primary PROGRESSIVE path degraded to a full-content
+                # passthrough after a transient store failure. Caching it would
+                # pin the degraded (non-chunked) response for the cache TTL and
+                # suppress progressive delivery on identical calls even after the
+                # store recovers. Skip the store so the next identical call
+                # re-runs the pipeline and re-attempts progressive delivery —
+                # same rationale as the transient-key skip below.
+                logger.debug(
+                    "Skipping cache store for %s/%s: progressive passthrough "
+                    "degradation (transient store failure)",
+                    server,
+                    tool,
+                )
+            elif response_carries_transient_key(compressed):
                 logger.debug(
                     "Skipping cache store for %s/%s: response carries a transient "
                     "retrieval key (progressive/selective TOC)",
