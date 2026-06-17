@@ -209,6 +209,42 @@ class TestBackgroundAutoIndex:
         finally:
             await mgr.stop()
 
+    async def test_background_escaped_exception_surfaces_via_callback(self, tmp_path, caplog):
+        """An exception that ESCAPES the inner ``auto_index_response`` handler
+        (e.g. mkdir / atomic-write failure) is surfaced by the background
+        done-callback as a structured WARNING on the manager logger — not left
+        to a non-deterministic gc-time "Task exception was never retrieved".
+        Regression guard for the background-task exception consumer."""
+        mgr, _ = _bg_manager(tmp_path, background=True)
+        # Replace the whole coroutine so the raise bypasses the inner handler
+        # and propagates to the task — the residual-escape path the callback
+        # exists to catch (the inner handler only covers ``index_file`` errors).
+        mgr._auto_index_response = AsyncMock(side_effect=RuntimeError("escaped past inner handler"))
+        try:
+            with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+                result = await mgr.call_tool("srv", "some_tool", {})
+                assert "[Indexing…]" in result
+                assert len(mgr._background_tasks) == 1
+                task = next(iter(mgr._background_tasks))
+                await asyncio.gather(task, return_exceptions=True)
+                # Let the done-callback (scheduled via call_soon) run.
+                await asyncio.sleep(0)
+
+            # The callback dropped the finished task from the tracking set ...
+            assert mgr._background_tasks == set()
+            # ... and surfaced the escaped exception as a structured WARNING
+            # (with traceback) instead of a gc-time un-retrieved warning.
+            matching = [
+                r
+                for r in caplog.records
+                if "Background auto_index task failed for srv/some_tool" in r.getMessage()
+            ]
+            assert matching, "escaped background exception was not logged"
+            assert "escaped past inner handler" in matching[0].getMessage()
+            assert matching[0].exc_info is not None
+        finally:
+            await mgr.stop()
+
 
 class TestBackgroundLatency:
     async def test_background_avoids_indexer_latency(self, tmp_path):
