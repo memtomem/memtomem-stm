@@ -165,11 +165,33 @@ class GraphConsultCache:
 
     @staticmethod
     def _row_shape_ok(verdict: object) -> bool:
-        return (
-            isinstance(verdict, dict)
-            and isinstance(verdict.get("rejects"), dict)
-            and isinstance(verdict.get("tool_not_found_refs"), list)
-            and isinstance(verdict.get("risk_scores"), dict)
+        """True only if ``verdict`` matches exactly what :meth:`put` writes.
+
+        Validates **leaf** value types, not just the containers — the caller's
+        on-hit reconstruction does ``dict(rejects)`` / ``frozenset(refs)`` /
+        ``float(score)`` outside the ``on_*``-knob ``try``, so a row that passed a
+        containers-only check but carried e.g. a non-numeric ``risk_score`` would
+        raise ``ValueError`` and crash startup. Matching ``put``'s shape
+        (``rejects: {str: str}``, ``tool_not_found_refs: [str]``, ``risk_scores:
+        {str: number}``) guarantees the reconstruction can never raise on a hit.
+        """
+        if not isinstance(verdict, dict):
+            return False
+        rejects = verdict.get("rejects")
+        refs = verdict.get("tool_not_found_refs")
+        risk_scores = verdict.get("risk_scores")
+        if not (
+            isinstance(rejects, dict) and isinstance(refs, list) and isinstance(risk_scores, dict)
+        ):
+            return False
+        if not all(isinstance(k, str) and isinstance(v, str) for k, v in rejects.items()):
+            return False
+        if not all(isinstance(ref, str) for ref in refs):
+            return False
+        # ``bool`` is an ``int`` subclass but never a valid risk score.
+        return all(
+            isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
+            for k, v in risk_scores.items()
         )
 
     def _delete_scope(self, scope_key: str) -> None:

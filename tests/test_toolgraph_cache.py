@@ -187,3 +187,31 @@ class TestCorruptRow:
         cache._db.commit()
         assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
         assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    @pytest.mark.parametrize(
+        "verdict_json",
+        [
+            # Right containers, wrong LEAF types — would crash the caller's on-hit
+            # float()/frozenset()/dict() reconstruction if returned (it runs outside
+            # the on_* knob try). Each must be dropped as a miss, not raised.
+            '{"rejects":{},"tool_not_found_refs":[],"risk_scores":{"s::a":"not-a-float"}}',
+            '{"rejects":{},"tool_not_found_refs":[123],"risk_scores":{}}',
+            '{"rejects":{"s::a":7},"tool_not_found_refs":[],"risk_scores":{}}',
+            '{"rejects":{},"tool_not_found_refs":[],"risk_scores":{"s::a":true}}',
+        ],
+        ids=["nonfloat_risk", "nonstr_tnf", "nonstr_reject", "bool_risk"],
+    )
+    def test_wrong_leaf_type_row_is_dropped_as_miss(self, cache, verdict_json):
+        _put(cache)
+        cache._db.execute("UPDATE toolgraph_consult SET verdict_json = ?", (verdict_json,))
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_numeric_risk_scores_remain_a_valid_hit(self, cache):
+        # Guard against over-strict leaf validation: a well-formed numeric row must
+        # still be a HIT (not falsely dropped by the new leaf-type check).
+        _put(cache, rejects={"s::a": "X"}, tnf=["s::b"], risk={"s::c": 1, "s::d": 0.5})
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row is not None
+        assert row["risk_scores"] == {"s::c": 1.0, "s::d": 0.5}

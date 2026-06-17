@@ -323,9 +323,17 @@ class ProxyManager:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
             # Close the consult cache too so a re-entry that changed
-            # ``toolgraph.consult_cache_path`` reopens the right DB (#494).
+            # ``toolgraph.consult_cache_path`` reopens the right DB (#494). Mirror
+            # the stack-close try/except above: always null the handle so a failed
+            # close cannot leave a stale closed connection for the next start.
             if self._toolgraph_cache is not None:
-                self._toolgraph_cache.close()
+                try:
+                    self._toolgraph_cache.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close tool-graph consult cache in double-start guard",
+                        exc_info=True,
+                    )
                 self._toolgraph_cache = None
         self._stack = AsyncExitStack()
 
@@ -937,8 +945,13 @@ class ProxyManager:
             # the closed instance (whose extract() asserts _client is not None).
             self._extractor = None
         # Close the #494 consult disk cache (re-opened lazily on the next start).
+        # Always null the handle so a failed close cannot leave a stale closed
+        # connection that the next start() would reuse.
         if self._toolgraph_cache is not None:
-            self._toolgraph_cache.close()
+            try:
+                self._toolgraph_cache.close()
+            except Exception:
+                logger.debug("Failed to close tool-graph consult cache", exc_info=True)
             self._toolgraph_cache = None
         for conn in self._connections.values():
             if conn.stack is not None:
