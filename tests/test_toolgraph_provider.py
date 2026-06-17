@@ -88,6 +88,8 @@ class TestToolgraphConfig:
         assert tg.query_profile == "strict"
         assert tg.risk_penalty_scale == 1.0
         assert tg.timeout_seconds == 5.0
+        assert tg.consult_cache_enabled is True  # #494: strictly-fresh, on by default
+        assert tg.consult_cache_path == Path("~/.memtomem/toolgraph_consult.db")
 
     def test_failure_knob_defaults(self):
         tg = ProxyConfig().toolgraph

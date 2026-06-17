@@ -773,6 +773,17 @@ class ToolgraphConfig(BaseModel):
     (or a disabled ``toolgraph`` block) skips the enrichment entirely."""
     timeout_seconds: float = Field(default=5.0, gt=0.0)
     """Per-consult timeout for the startup batch query."""
+    consult_cache_enabled: bool = True
+    """Disk-cache a successful consult's verdict keyed by ``graph_generation``
+    (#494). On restart, a cheap generation probe is still made (so a degraded
+    graph is never masked); only the expensive per-candidate ``eligible_tools`` /
+    ``rank_features`` evaluation is skipped when the generation, candidate set,
+    agent, profile, and backend all match a cached row."""
+    consult_cache_path: Path = Path("~/.memtomem/toolgraph_consult.db")
+    """SQLite path for the consult cache (#494). One DB serves all graph
+    backends, disambiguated by a provider fingerprint over ``command`` / ``args``
+    / env *keys*; point distinct backends sharing identical command/args/env-keys
+    but different env *values* at distinct paths."""
 
 
 # Static context window sizes (tokens) for known model families.
