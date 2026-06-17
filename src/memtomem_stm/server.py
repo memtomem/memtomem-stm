@@ -1566,11 +1566,40 @@ async def stm_progressive_stats(
     per cache key so a response with five follow-ups is weighted
     the same as one with none.
 
+    Also surfaces primary-store *degradation*: when the primary
+    ``PROGRESSIVE`` store path fails, the proxy degrades to an
+    uncached full-content passthrough (recorded in the metrics
+    store as ``→passthrough_on_error``). That count is reported
+    here — independently of the reads tracker — so a failing
+    backing store does not go silent.
+
     Args:
         tool: Optional filter by upstream tool name.
     """
     app = _get_ctx(ctx)
+
+    # Primary-store degradation (a failed PROGRESSIVE store path degrading to
+    # an uncached full-content passthrough) is recorded in the metrics store,
+    # independently of the reads tracker. Compute it up front so the fault
+    # stays visible even when reads tracking itself is disabled.
+    degradation = ""
+    metrics_store = app.tracker._metrics_store
+    if metrics_store is not None:
+        deg = metrics_store.get_progressive_degradations(tool=tool)
+        if deg["total"] > 0:
+            deg_lines = [
+                f"\nPrimary-store degradation (last 24h): {deg['total']} passthrough-on-error"
+            ]
+            for entry in deg["by_server_tool"][:10]:
+                deg_lines.append(f"  {entry['server']}/{entry['tool']}: {entry['count']}")
+            degradation = "\n".join(deg_lines)
+
     if app.progressive_reads_tracker is None:
+        if degradation:
+            return (
+                "Progressive Reads Stats\n=======================\n"
+                "(reads tracking disabled)" + degradation
+            )
         return "Progressive reads tracking is not enabled."
 
     stats = app.progressive_reads_tracker.get_stats(tool)
@@ -1595,6 +1624,9 @@ async def stm_progressive_stats(
                 f"  {tool_name}: responses={per_tool['responses']}, "
                 f"follow_up_rate={per_tool['follow_up_rate'] * 100:.1f}%"
             )
+
+    if degradation:
+        lines.append(degradation)
 
     if tool:
         lines.append(f"\n(filtered by tool: {tool})")

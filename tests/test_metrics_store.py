@@ -304,9 +304,7 @@ class TestReadPathConcurrency:
                 for f in futures:
                     f.result(timeout=30)
 
-            final_count = store._db.execute(
-                "SELECT COUNT(*) FROM proxy_metrics"
-            ).fetchone()[0]
+            final_count = store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
             assert final_count == total_writes
         finally:
             store.close()
@@ -323,10 +321,14 @@ class TestReadCompressionSummary:
         store.initialize()
         try:
             store.record(
-                CallMetrics(server="c7", tool="query-docs", original_chars=1000, compressed_chars=400)
+                CallMetrics(
+                    server="c7", tool="query-docs", original_chars=1000, compressed_chars=400
+                )
             )
             store.record(
-                CallMetrics(server="c7", tool="query-docs", original_chars=1000, compressed_chars=600)
+                CallMetrics(
+                    server="c7", tool="query-docs", original_chars=1000, compressed_chars=600
+                )
             )
             store.record(
                 CallMetrics(server="lf", tool="search", original_chars=500, compressed_chars=500)
@@ -435,3 +437,64 @@ class TestReadCompressionSummary:
             return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         finally:
             db.close()
+
+
+class TestProgressiveDegradations:
+    """``get_progressive_degradations`` aggregates the ``→passthrough_on_error``
+    family (a primary PROGRESSIVE store failure degrading to an uncached
+    passthrough) without colliding with the other ``X→Y_fallback`` labels."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        s = MetricsStore(tmp_path / "metrics.db")
+        s.initialize()
+        yield s
+        s.close()
+
+    @staticmethod
+    def _row(store, server, tool, strategy):
+        store.record(
+            CallMetrics(
+                server=server,
+                tool=tool,
+                original_chars=100,
+                compressed_chars=100,
+                cleaned_chars=100,
+                compression_strategy=strategy,
+            )
+        )
+
+    def test_empty(self, store):
+        assert store.get_progressive_degradations() == {"total": 0, "by_server_tool": []}
+
+    def test_counts_and_breakdown_ignores_other_strategies(self, store):
+        self._row(store, "gh", "search", "progressive→passthrough_on_error")
+        self._row(store, "gh", "search", "progressive→passthrough_on_error")
+        self._row(store, "fs", "read", "progressive→passthrough_on_error")
+        # Unrelated rows must not count — including the sibling fallback family
+        # that also uses the ``X→Y_fallback`` arrow convention.
+        self._row(store, "gh", "search", "progressive")
+        self._row(store, "gh", "search", "llm_summary→timeout_fallback")
+
+        deg = store.get_progressive_degradations()
+        assert deg["total"] == 3
+        assert deg["by_server_tool"] == [
+            {"server": "gh", "tool": "search", "count": 2},
+            {"server": "fs", "tool": "read", "count": 1},
+        ]
+
+    def test_tool_filter(self, store):
+        self._row(store, "gh", "search", "progressive→passthrough_on_error")
+        self._row(store, "fs", "read", "progressive→passthrough_on_error")
+        deg = store.get_progressive_degradations(tool="read")
+        assert deg["total"] == 1
+        assert deg["by_server_tool"] == [{"server": "fs", "tool": "read", "count": 1}]
+
+    def test_window_excludes_old_rows(self, store):
+        self._row(store, "gh", "search", "progressive→passthrough_on_error")
+        # Backdate the row well outside a 60s look-back window.
+        store._db.execute("UPDATE proxy_metrics SET created_at = created_at - 3600")
+        store._db.commit()
+        deg = store.get_progressive_degradations(since_seconds=60.0)
+        assert deg["total"] == 0
+        assert deg["by_server_tool"] == []

@@ -389,6 +389,46 @@ class MetricsStore:
                 )
         return profiles
 
+    def get_progressive_degradations(
+        self, since_seconds: float = 86400.0, tool: str | None = None
+    ) -> dict:
+        """Count progressive-delivery primary-store degradations in the window.
+
+        A row whose ``compression_strategy`` ends in ``→passthrough_on_error``
+        records the proxy degrading a failed primary ``PROGRESSIVE`` store to an
+        uncached full-content passthrough (see ``ProxyManager``). The
+        ``passthrough_on_error`` suffix is unique to this family, so a
+        ``LIKE '%passthrough_on_error'`` match never collides with the other
+        ``X→Y_fallback`` strategy labels (e.g. ``timeout_fallback``).
+
+        Returns ``{"total": int, "by_server_tool": [{"server", "tool",
+        "count"}, ...]}`` (breakdown sorted by count desc) so an operator can
+        answer "is progressive delivery frequently degrading because the
+        backing store is failing, and on which server/tool?".
+        """
+        empty: dict = {"total": 0, "by_server_tool": []}
+        if self._db is None:
+            return empty
+        cutoff = time.time() - since_seconds
+        where = "created_at >= ? AND compression_strategy LIKE '%passthrough_on_error'"
+        params: list = [cutoff]
+        if tool is not None:
+            where += " AND tool = ?"
+            params.append(tool)
+        with self._lock:
+            total = self._db.execute(
+                f"SELECT COUNT(*) FROM proxy_metrics WHERE {where}", params
+            ).fetchone()[0]
+            rows = self._db.execute(
+                f"SELECT server, tool, COUNT(*) AS n FROM proxy_metrics WHERE {where} "
+                "GROUP BY server, tool ORDER BY n DESC, server ASC, tool ASC",
+                params,
+            ).fetchall()
+        return {
+            "total": total,
+            "by_server_tool": [{"server": r[0], "tool": r[1], "count": r[2]} for r in rows],
+        }
+
     def get_tool_error_stats(
         self, since_seconds: float, error_categories: tuple[str, ...]
     ) -> dict[tuple[str, str], tuple[int, int]]:

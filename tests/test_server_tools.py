@@ -1082,6 +1082,62 @@ class TestProgressiveStats:
         assert "filtered by tool: docfix:get_doc" in result
         mock_tracker.get_stats.assert_called_once_with("docfix:get_doc")
 
+    @staticmethod
+    def _tracker_with_degradation(tmp_path, server, tool):
+        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        store = MetricsStore(tmp_path / "m.db")
+        store.initialize()
+        store.record(
+            CallMetrics(
+                server=server,
+                tool=tool,
+                original_chars=100,
+                compressed_chars=100,
+                compression_strategy="progressive→passthrough_on_error",
+            )
+        )
+        return TokenTracker(metrics_store=store), store
+
+    async def test_degradation_section_from_metrics_store(self, tmp_path):
+        """Primary-store passthrough-on-error degradations recorded in the
+        metrics store surface in stm_progressive_stats alongside read stats."""
+        tracker, store = self._tracker_with_degradation(tmp_path, "gh", "search")
+        try:
+            mock_tracker = MagicMock()
+            mock_tracker.get_stats.return_value = {
+                "total_reads": 1,
+                "total_responses": 1,
+                "follow_up_rate": 0.0,
+                "avg_chars_served": 9000.0,
+                "avg_total_chars": 9000.0,
+                "avg_coverage": 1.0,
+                "by_tool": {},
+            }
+            ctx = _make_ctx(tracker=tracker, progressive_reads_tracker=mock_tracker)
+            result = await stm_progressive_stats(ctx=ctx)
+
+            assert "Progressive Reads Stats" in result
+            assert "Primary-store degradation (last 24h): 1 passthrough-on-error" in result
+            assert "gh/search: 1" in result
+        finally:
+            store.close()
+
+    async def test_degradation_visible_when_reads_tracking_disabled(self, tmp_path):
+        """A failing primary store must not go silent: the degradation count is
+        reported even when the reads tracker itself is disabled."""
+        tracker, store = self._tracker_with_degradation(tmp_path, "fs", "read")
+        try:
+            ctx = _make_ctx(tracker=tracker, progressive_reads_tracker=None)
+            result = await stm_progressive_stats(ctx=ctx)
+
+            assert "reads tracking disabled" in result
+            assert "Primary-store degradation (last 24h): 1 passthrough-on-error" in result
+            assert "fs/read: 1" in result
+        finally:
+            store.close()
+
 
 # ── stm_selection_stats ───────────────────────────────────────────────────
 
