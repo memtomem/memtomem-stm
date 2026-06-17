@@ -42,19 +42,49 @@ Run with: ``python <path-to-this-file>``.
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("fake-toolgraph")
 
 # Arbitrary fixed monotonic graph generation so tests can assert the field is
-# threaded through verbatim.
+# threaded through verbatim. The #494 consult-cache tests need to vary the
+# generation *between* consults of one running server, so it is read from a file
+# (path in ``FAKE_TG_GENERATION_FILE``) when set — mutating the file content
+# bumps the generation without changing the env *keys* (so the provider
+# fingerprint stays stable). Unset → the fixed default below.
 _GRAPH_GENERATION = 11
+
+
+def _generation() -> int:
+    path = os.environ.get("FAKE_TG_GENERATION_FILE")
+    if path:
+        try:
+            return int(Path(path).read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pass
+    return _GRAPH_GENERATION
+
+
+def _record_call(tool: str, n_candidates: int) -> None:
+    """Append ``<tool>:<n_candidates>`` to ``FAKE_TG_CALL_LOG`` when set.
+
+    Lets the #494 tests assert that a cache hit issued only the cheap
+    ``eligible_tools([])`` probe (``eligible_tools:0``) and skipped the
+    full-candidate ``eligible_tools`` / ``rank_features`` evaluation.
+    """
+    path = os.environ.get("FAKE_TG_CALL_LOG")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{tool}:{n_candidates}\n")
 
 
 @mcp.tool()
 async def eligible_tools(agent: str, candidates: list[str], profile: str = "strict") -> dict:
     """Canned ``eligible_tools`` consult mirroring the real structured shape."""
+    _record_call("eligible_tools", len(candidates))
     if profile == "boom":
         raise ValueError(f"unknown profile {profile!r}")
     if profile == "sleep":
@@ -66,7 +96,7 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
             "profile": profile,
             "eligible": [],
             "rejected": [],
-            "graph_generation": _GRAPH_GENERATION,
+            "graph_generation": _generation(),
         }
 
     eligible: list[str] = []
@@ -90,7 +120,7 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
         "profile": profile,
         "eligible": eligible,
         "rejected": rejected,
-        "graph_generation": _GRAPH_GENERATION,
+        "graph_generation": _generation(),
     }
 
 
@@ -104,6 +134,7 @@ async def rank_features(agent: str, candidates: list[str]) -> dict:
     degrade path is exercisable while ``eligible_tools`` still succeeds for the
     same agent.
     """
+    _record_call("rank_features", len(candidates))
     if agent == "rankboom":
         raise ValueError("rank_features boom")
     if agent == "ghost":
@@ -111,7 +142,7 @@ async def rank_features(agent: str, candidates: list[str]) -> dict:
             "agent": agent,
             "agent_found": False,
             "features": [],
-            "graph_generation": _GRAPH_GENERATION,
+            "graph_generation": _generation(),
         }
 
     features: list[dict] = []
@@ -129,7 +160,7 @@ async def rank_features(agent: str, candidates: list[str]) -> dict:
         "agent": agent,
         "agent_found": True,
         "features": features,
-        "graph_generation": _GRAPH_GENERATION,
+        "graph_generation": _generation(),
     }
 
 
