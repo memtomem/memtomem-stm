@@ -311,8 +311,9 @@ class TestProgressiveTraceIdPropagation:
 
     def test_both_apply_progressive_call_sites_pass_trace_id_kwarg(self):
         # manager.py has two _apply_progressive call sites: the normal
-        # PROGRESSIVE branch and the hybrid-fallback branch. Both must pass
-        # trace_id=trace_id. This test source-inspects _call_tool_inner,
+        # PROGRESSIVE branch and the ratio-guard Tier-1 fallback branch. Both
+        # must pass trace_id=trace_id. Both live in _compress_and_surface since
+        # the A1 PR3 stage extraction. This test source-inspects that helper,
         # pins the count of call sites at 2, and asserts each call contains
         # the trace_id= kwarg — cheap regression insurance against a future
         # refactor that drops the kwarg at one site (functionally tight:
@@ -322,7 +323,7 @@ class TestProgressiveTraceIdPropagation:
 
         from memtomem_stm.proxy import manager as manager_module
 
-        src = inspect.getsource(manager_module.ProxyManager._call_tool_inner)
+        src = inspect.getsource(manager_module.ProxyManager._compress_and_surface)
         calls = re.findall(r"self\._apply_progressive\(\s*.*?\)", src, re.DOTALL)
         assert len(calls) == 2, f"expected 2 _apply_progressive call sites, found {len(calls)}"
         for call in calls:

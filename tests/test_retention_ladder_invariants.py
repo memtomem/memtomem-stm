@@ -172,7 +172,9 @@ class TestContextQueryPropagation:
         assert "context_query=context_query" in window
 
     def test_truncate_fallback_passes_context_query(self) -> None:
-        src = inspect.getsource(ProxyManager._call_tool_inner)
+        # The ratio-guard ladder (incl. the Tier-3 truncate fallback) lives in
+        # ``_compress_and_surface`` since the A1 PR3 stage extraction.
+        src = inspect.getsource(ProxyManager._compress_and_surface)
         idx = src.index("→truncate_fallback")
         window = src[max(0, idx - 400) : idx]
         assert "context_query=context_query" in window
