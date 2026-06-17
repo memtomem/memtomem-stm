@@ -2241,6 +2241,10 @@ class ProxyManager:
         # which skips for offset-invariant reasons).
         surfacing_on_progressive_ok: bool | None = None
         surface_error: str | None = None
+        # Set True when the primary PROGRESSIVE path degrades to a full-content
+        # passthrough after a store failure (below). Read at the cache-store
+        # gate to keep that transient-failure-degraded response out of the cache.
+        progressive_passthrough_on_error = False
         _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
@@ -2248,9 +2252,31 @@ class ProxyManager:
                 # Content fits in one chunk — passthrough
                 compressed = cleaned
             else:
-                compressed = self._apply_progressive(
-                    cleaned, pcfg, server, tool, sel_cfg=tc.selective, trace_id=trace_id
-                )
+                try:
+                    compressed = self._apply_progressive(
+                        cleaned, pcfg, server, tool, sel_cfg=tc.selective, trace_id=trace_id
+                    )
+                except Exception:
+                    # Progressive build/store failed (e.g. a SQLite-backed
+                    # pending/reads store I/O error inside ``_apply_progressive``).
+                    # Degrade to a zero-loss passthrough of the full cleaned
+                    # upstream content instead of letting the exception escape
+                    # ``_call_tool_inner`` — an escape here is recorded as
+                    # INTERNAL_ERROR and DISCARDS an otherwise-successful upstream
+                    # response. The ratio-guard fallback already wraps its Tier-1
+                    # progressive call below; the primary PROGRESSIVE path now
+                    # mirrors that best-effort handling, but stays zero-loss
+                    # (passthrough, not lossy hybrid/truncate) because the
+                    # PROGRESSIVE strategy has no retention floor to satisfy.
+                    logger.warning(
+                        "Progressive delivery failed for %s/%s; returning full "
+                        "cleaned content (passthrough)",
+                        server,
+                        tool,
+                        exc_info=True,
+                    )
+                    compressed = cleaned
+                    progressive_passthrough_on_error = True
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(cleaned)
             # The metrics record at the bottom reads ``metrics_strategy`` on
@@ -2258,6 +2284,10 @@ class ProxyManager:
             # branch (pre-fix this branch left it unbound and every
             # PROGRESSIVE-strategy call died with UnboundLocalError).
             metrics_strategy = effective_compression.value
+            if progressive_passthrough_on_error:
+                # Surface the degradation in telemetry, consistent with the
+                # ``X→Y_fallback`` labels the ratio-guard ladder records below.
+                metrics_strategy = f"{effective_compression.value}→passthrough_on_error"
             # F6: surface on progressive when ``injection_mode`` is append/section.
             # ``prepend`` stays skipped (offset-shift); helper returns ``ok=None``
             # in that case and logs a one-time WARNING.
@@ -2720,7 +2750,21 @@ class ProxyManager:
         # startup legacy purge in ``ProxyCache.initialize``); a false positive
         # only costs one un-cached response, never correctness.
         if self._cache is not None and not non_text_content:
-            if response_carries_transient_key(compressed):
+            if progressive_passthrough_on_error:
+                # The primary PROGRESSIVE path degraded to a full-content
+                # passthrough after a transient store failure. Caching it would
+                # pin the degraded (non-chunked) response for the cache TTL and
+                # suppress progressive delivery on identical calls even after the
+                # store recovers. Skip the store so the next identical call
+                # re-runs the pipeline and re-attempts progressive delivery —
+                # same rationale as the transient-key skip below.
+                logger.debug(
+                    "Skipping cache store for %s/%s: progressive passthrough "
+                    "degradation (transient store failure)",
+                    server,
+                    tool,
+                )
+            elif response_carries_transient_key(compressed):
                 logger.debug(
                     "Skipping cache store for %s/%s: response carries a transient "
                     "retrieval key (progressive/selective TOC)",
