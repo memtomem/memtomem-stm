@@ -70,6 +70,8 @@ from memtomem_stm.proxy.memory_ops import (
 )
 from memtomem_stm.proxy.pipeline_stages import (
     CompressionResult,
+    ExtractResult,
+    IndexResult,
     ShapedResponse,
     ShapePassthrough,
 )
@@ -2723,6 +2725,201 @@ class ProxyManager:
             surface_ms=_surface_ms,
         )
 
+    async def _run_index_stage(
+        self,
+        *,
+        server: str,
+        tool: str,
+        upstream_args: dict[str, Any],
+        tc: ToolConfig,
+        cfg_snap: ProxyConfig,
+        cleaned: str,
+        original_text: str,
+        surfaced: str,
+        compressed_chars_for_metrics: int,
+        context_query: str | None,
+    ) -> IndexResult:
+        """Stage 4: optional auto-indexing (privacy-skip / background-footer /
+        sync / disabled). Returns the response body to continue with plus the
+        tri-state index outcome. The gate reads the ``cfg_snap`` snapshot, but the
+        inner ``_auto_index_response`` keeps reading live ``self._config`` exactly
+        as before — this extraction relocates only the gate, not that behavior.
+        """
+        # Track outcome for CallMetrics below. ``None`` means "stage did not
+        # run for this call" — either disabled, engine missing, or content
+        # below min_chars. ``False`` means "ran and failed"; dashboards must
+        # distinguish the two.
+        index_ok: bool | None = None
+        index_error: str | None = None
+        chunks_indexed = 0
+        ai_cfg = cfg_snap.auto_index
+        if (
+            tc.auto_index_enabled
+            and self._index_engine is not None
+            and len(cleaned) >= ai_cfg.min_chars
+        ):
+            if ai_cfg.background and index_content_matches_privacy(
+                server, tool, upstream_args, cleaned, context_query=context_query
+            ):
+                # #453: the ``[Indexing…] · scheduled`` placeholder below
+                # would promise an indexing run that the task's own privacy
+                # gate is about to decline — pre-check with the SAME
+                # predicate and return the un-footered response instead of
+                # scheduling. Records what the skipped task would have
+                # recorded, and mirrors the sync skip's metrics shape
+                # (ok=True / 0 chunks).
+                logger.info(
+                    "Auto-index skipped for %s/%s: content matches a privacy pattern",
+                    server,
+                    tool,
+                )
+                self.index_observability.record_attempt(tool, "auto_index")
+                self.index_observability.record_outcome(tool, "privacy_skip")
+                final_result = surfaced
+                index_ok = True
+            elif ai_cfg.background:
+                # F4: schedule indexing off the request path. The placeholder
+                # footer ([Indexing…] … · scheduled, namespace dropped) ships
+                # to the agent synchronously while the indexing task runs in
+                # the background. Trade-off: response no longer guarantees
+                # read-your-own-writes for the next tool call — opt-in only
+                # (default ai_cfg.background = False preserves sync contract).
+                ns = ai_cfg.namespace.format(server=server, tool=tool)
+                final_result = compose_index_footer(
+                    server=server,
+                    tool=tool,
+                    original_chars=len(original_text),
+                    compressed_chars=compressed_chars_for_metrics,
+                    text=cleaned,
+                    agent_summary=surfaced,
+                    ns=ns,
+                    chunks=None,
+                )
+                index_task = asyncio.create_task(
+                    self._auto_index_response(
+                        server,
+                        tool,
+                        upstream_args,
+                        cleaned,
+                        agent_summary=surfaced,
+                        compression_strategy=tc.compression.value,
+                        original_chars=len(original_text),
+                        compressed_chars=compressed_chars_for_metrics,
+                        context_query=context_query,
+                    )
+                )
+                self._background_tasks.add(index_task)
+                index_task.add_done_callback(
+                    functools.partial(self._on_background_task_done, "auto_index", server, tool)
+                )
+                # index_ok / index_error / chunks_indexed stay None / None / 0
+                # — tri-state matches background extraction. Dashboards filter
+                # background rows with WHERE index_ok IS NULL.
+            else:
+                with traced(
+                    "proxy_call_index",
+                    metadata={"server": server, "tool": tool},
+                ):
+                    try:
+                        # A1 fix: pre-surfacing ``compressed_chars_for_metrics``
+                        # matches what we record in the metrics row below, so the
+                        # indexed frontmatter and the dashboards agree on what
+                        # "compressed_chars" means for this call. Pre-A1 the
+                        # frontmatter recorded ``len(surfaced)`` (post-surfacing),
+                        # which drifted from the metrics value whenever surfacing
+                        # added content.
+                        outcome = await self._auto_index_response(
+                            server,
+                            tool,
+                            upstream_args,
+                            cleaned,
+                            agent_summary=surfaced,
+                            compression_strategy=tc.compression.value,
+                            original_chars=len(original_text),
+                            compressed_chars=compressed_chars_for_metrics,
+                            context_query=context_query,
+                        )
+                        final_result = outcome.summary
+                        index_ok = outcome.ok
+                        index_error = outcome.error
+                        chunks_indexed = outcome.chunks_indexed
+                    except Exception as exc:
+                        # Reaches here only for failures outside the inner
+                        # ``index_file`` try/except in ``auto_index_response``
+                        # (mkdir / atomic write / unexpected errors). The inner
+                        # indexing failure is already captured in the outcome.
+                        logger.warning(
+                            "Auto-index failed for %s/%s — returning unindexed response",
+                            server,
+                            tool,
+                            exc_info=True,
+                        )
+                        final_result = surfaced
+                        index_ok = False
+                        index_error = f"{type(exc).__name__}: {exc}"
+        else:
+            final_result = surfaced
+
+        return IndexResult(
+            final_result=final_result,
+            index_ok=index_ok,
+            index_error=index_error,
+            chunks_indexed=chunks_indexed,
+        )
+
+    async def _run_extract_stage(
+        self,
+        *,
+        server: str,
+        tool: str,
+        upstream_args: dict[str, Any],
+        tc: ToolConfig,
+        cfg_snap: ProxyConfig,
+        cleaned: str,
+        context_query: str | None,
+    ) -> ExtractResult:
+        """Stage 4b: optional fact extraction (background by default). Sync path
+        populates ``ok`` / ``error``; background path leaves them ``None`` (the
+        outcome arrives after the metrics row is committed; background failures
+        stay visible via ``memory_ops.extract_and_store``'s WARNING log). Like the
+        index stage, the gate reads ``cfg_snap`` but ``_extract_and_store`` keeps
+        reading live ``self._config``.
+        """
+        extract_ok: bool | None = None
+        extract_error: str | None = None
+        ext_cfg = cfg_snap.extraction
+        if (
+            tc.extraction_enabled
+            and self._index_engine is not None
+            and len(cleaned) >= ext_cfg.min_response_chars
+        ):
+            if ext_cfg.background:
+                task = asyncio.create_task(
+                    self._extract_and_store(
+                        server,
+                        tool,
+                        upstream_args,
+                        cleaned,
+                        context_query=context_query,
+                    )
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(
+                    functools.partial(self._on_background_task_done, "extract", server, tool)
+                )
+            else:
+                extract_outcome = await self._extract_and_store(
+                    server,
+                    tool,
+                    upstream_args,
+                    cleaned,
+                    context_query=context_query,
+                )
+                extract_ok = extract_outcome.ok
+                extract_error = extract_outcome.error
+
+        return ExtractResult(ok=extract_ok, error=extract_error)
+
     async def _call_tool_inner(
         self,
         server: str,
@@ -2862,159 +3059,35 @@ class ProxyManager:
         _compress_ms = comp.compress_ms
         _surface_ms = comp.surface_ms
 
-        # ── Stage 4: INDEX (optional) ──
-        # Track outcome for CallMetrics below. ``None`` means "stage did not
-        # run for this call" — either disabled, engine missing, or content
-        # below min_chars. ``False`` means "ran and failed"; dashboards must
-        # distinguish the two.
-        index_ok: bool | None = None
-        index_error: str | None = None
-        chunks_indexed = 0
-        ai_cfg = cfg_snap.auto_index
-        if (
-            tc.auto_index_enabled
-            and self._index_engine is not None
-            and len(cleaned) >= ai_cfg.min_chars
-        ):
-            if ai_cfg.background and index_content_matches_privacy(
-                server, tool, upstream_args, cleaned, context_query=context_query
-            ):
-                # #453: the ``[Indexing…] · scheduled`` placeholder below
-                # would promise an indexing run that the task's own privacy
-                # gate is about to decline — pre-check with the SAME
-                # predicate and return the un-footered response instead of
-                # scheduling. Records what the skipped task would have
-                # recorded, and mirrors the sync skip's metrics shape
-                # (ok=True / 0 chunks).
-                logger.info(
-                    "Auto-index skipped for %s/%s: content matches a privacy pattern",
-                    server,
-                    tool,
-                )
-                self.index_observability.record_attempt(tool, "auto_index")
-                self.index_observability.record_outcome(tool, "privacy_skip")
-                final_result = surfaced
-                index_ok = True
-            elif ai_cfg.background:
-                # F4: schedule indexing off the request path. The placeholder
-                # footer ([Indexing…] … · scheduled, namespace dropped) ships
-                # to the agent synchronously while the indexing task runs in
-                # the background. Trade-off: response no longer guarantees
-                # read-your-own-writes for the next tool call — opt-in only
-                # (default ai_cfg.background = False preserves sync contract).
-                ns = ai_cfg.namespace.format(server=server, tool=tool)
-                final_result = compose_index_footer(
-                    server=server,
-                    tool=tool,
-                    original_chars=len(original_text),
-                    compressed_chars=compressed_chars_for_metrics,
-                    text=cleaned,
-                    agent_summary=surfaced,
-                    ns=ns,
-                    chunks=None,
-                )
-                index_task = asyncio.create_task(
-                    self._auto_index_response(
-                        server,
-                        tool,
-                        upstream_args,
-                        cleaned,
-                        agent_summary=surfaced,
-                        compression_strategy=tc.compression.value,
-                        original_chars=len(original_text),
-                        compressed_chars=compressed_chars_for_metrics,
-                        context_query=context_query,
-                    )
-                )
-                self._background_tasks.add(index_task)
-                index_task.add_done_callback(
-                    functools.partial(self._on_background_task_done, "auto_index", server, tool)
-                )
-                # index_ok / index_error / chunks_indexed stay None / None / 0
-                # — tri-state matches background extraction. Dashboards filter
-                # background rows with WHERE index_ok IS NULL.
-            else:
-                with traced(
-                    "proxy_call_index",
-                    metadata={"server": server, "tool": tool},
-                ):
-                    try:
-                        # A1 fix: pre-surfacing ``compressed_chars_for_metrics``
-                        # matches what we record in the metrics row below, so the
-                        # indexed frontmatter and the dashboards agree on what
-                        # "compressed_chars" means for this call. Pre-A1 the
-                        # frontmatter recorded ``len(surfaced)`` (post-surfacing),
-                        # which drifted from the metrics value whenever surfacing
-                        # added content.
-                        outcome = await self._auto_index_response(
-                            server,
-                            tool,
-                            upstream_args,
-                            cleaned,
-                            agent_summary=surfaced,
-                            compression_strategy=tc.compression.value,
-                            original_chars=len(original_text),
-                            compressed_chars=compressed_chars_for_metrics,
-                            context_query=context_query,
-                        )
-                        final_result = outcome.summary
-                        index_ok = outcome.ok
-                        index_error = outcome.error
-                        chunks_indexed = outcome.chunks_indexed
-                    except Exception as exc:
-                        # Reaches here only for failures outside the inner
-                        # ``index_file`` try/except in ``auto_index_response``
-                        # (mkdir / atomic write / unexpected errors). The inner
-                        # indexing failure is already captured in the outcome.
-                        logger.warning(
-                            "Auto-index failed for %s/%s — returning unindexed response",
-                            server,
-                            tool,
-                            exc_info=True,
-                        )
-                        final_result = surfaced
-                        index_ok = False
-                        index_error = f"{type(exc).__name__}: {exc}"
-        else:
-            final_result = surfaced
+        # ── Stage 4: INDEX (optional) + Stage 4b: EXTRACT (optional) ──
+        idx = await self._run_index_stage(
+            server=server,
+            tool=tool,
+            upstream_args=upstream_args,
+            tc=tc,
+            cfg_snap=cfg_snap,
+            cleaned=cleaned,
+            original_text=original_text,
+            surfaced=surfaced,
+            compressed_chars_for_metrics=compressed_chars_for_metrics,
+            context_query=context_query,
+        )
+        final_result = idx.final_result
+        index_ok = idx.index_ok
+        index_error = idx.index_error
+        chunks_indexed = idx.chunks_indexed
 
-        # ── Stage 4b: EXTRACT (optional, background by default) ──
-        # Sync path populates ``extract_ok`` / ``extract_error``; background
-        # path leaves them ``None`` — the outcome arrives after the metrics
-        # row below is committed. Background failures stay visible via
-        # ``memory_ops.extract_and_store``'s WARNING log.
-        extract_ok: bool | None = None
-        extract_error: str | None = None
-        ext_cfg = cfg_snap.extraction
-        if (
-            tc.extraction_enabled
-            and self._index_engine is not None
-            and len(cleaned) >= ext_cfg.min_response_chars
-        ):
-            if ext_cfg.background:
-                task = asyncio.create_task(
-                    self._extract_and_store(
-                        server,
-                        tool,
-                        upstream_args,
-                        cleaned,
-                        context_query=context_query,
-                    )
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(
-                    functools.partial(self._on_background_task_done, "extract", server, tool)
-                )
-            else:
-                extract_outcome = await self._extract_and_store(
-                    server,
-                    tool,
-                    upstream_args,
-                    cleaned,
-                    context_query=context_query,
-                )
-                extract_ok = extract_outcome.ok
-                extract_error = extract_outcome.error
+        ext = await self._run_extract_stage(
+            server=server,
+            tool=tool,
+            upstream_args=upstream_args,
+            tc=tc,
+            cfg_snap=cfg_snap,
+            cleaned=cleaned,
+            context_query=context_query,
+        )
+        extract_ok = ext.ok
+        extract_error = ext.error
 
         # Record metrics (using pre-surfacing compressed size)
         # Approximate token counts: chars / 3.5 (average for mixed en/code/json).

@@ -76,3 +76,30 @@ class CompressionResult:
     surface_error: str | None
     compress_ms: float
     surface_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class IndexResult:
+    """Stage-4 (INDEX) output. ``final_result`` is the response body the caller
+    returns/continues with — the ``[Indexing…] · scheduled`` footer on the
+    background path, the indexed summary on the sync path, or ``surfaced`` when
+    indexing is skipped/disabled. ``index_ok`` is tri-state: ``None`` = stage did
+    not run (disabled / no engine / below min_chars) or ran in the background
+    with the outcome still pending; ``True`` = ran ok (incl. the privacy pre-skip);
+    ``False`` = ran and failed.
+    """
+
+    final_result: str
+    index_ok: bool | None
+    index_error: str | None
+    chunks_indexed: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractResult:
+    """Stage-4b (EXTRACT) output. ``ok`` / ``error`` are ``None`` on the
+    background path (the outcome arrives after the metrics row is committed) and
+    populated on the sync path."""
+
+    ok: bool | None
+    error: str | None
