@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time as _time
 import uuid
@@ -740,6 +741,39 @@ class ProxyManager:
         conn.stack = conn_stack
         conn.tools = list(result.tools)
         logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
+
+    def _on_background_task_done(
+        self,
+        stage: str,
+        server: str,
+        tool: str,
+        task: asyncio.Task,
+    ) -> None:
+        """Done-callback for background index/extract tasks.
+
+        Drops the finished task from the tracking set and surfaces any
+        exception that escaped the coroutine's own inner handling. The inner
+        ``auto_index_response`` / ``extract_and_store`` handlers already capture
+        expected failures into their outcome (and log them); this guard catches
+        the residual escapes (mkdir / atomic-write / genuinely unexpected
+        errors) that would otherwise show up only as a non-deterministic,
+        unstructured "Task exception was never retrieved" warning at
+        garbage-collection time. Cancellation during ``stop()`` is expected and
+        is not logged.
+        """
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "Background %s task failed for %s/%s: %s",
+                stage,
+                server,
+                tool,
+                exc,
+                exc_info=exc,
+            )
 
     async def stop(self) -> None:
         # Cancel and drain background tasks (extraction, etc.). Loop until
@@ -2614,7 +2648,9 @@ class ProxyManager:
                     )
                 )
                 self._background_tasks.add(index_task)
-                index_task.add_done_callback(self._background_tasks.discard)
+                index_task.add_done_callback(
+                    functools.partial(self._on_background_task_done, "auto_index", server, tool)
+                )
                 # index_ok / index_error / chunks_indexed stay None / None / 0
                 # — tri-state matches background extraction. Dashboards filter
                 # background rows with WHERE index_ok IS NULL.
@@ -2687,7 +2723,9 @@ class ProxyManager:
                     )
                 )
                 self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                task.add_done_callback(
+                    functools.partial(self._on_background_task_done, "extract", server, tool)
+                )
             else:
                 extract_outcome = await self._extract_and_store(
                     server,
