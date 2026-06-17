@@ -14,7 +14,10 @@ carrying a stale value.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from memtomem_stm.proxy.config import CompressionStrategy
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,3 +47,32 @@ class ShapedResponse:
     original_text: str
     non_text_content: list[Any]
     passthrough: ShapePassthrough | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompressionResult:
+    """Stage-2+3 output: the compressed payload, its surfaced form, and the
+    metrics/cache facts the orchestrator consumes.
+
+    Carries BOTH ``compressed`` (pre-surfacing — the cache payload) and
+    ``surfaced`` (post-surfacing — the return/index input) as distinct fields:
+    the cache stores the former while the agent and the index footer see the
+    latter. ``compressed_chars_for_metrics`` is branch-dependent —
+    ``len(compressed)`` on the compress branch but ``len(cleaned)`` on the
+    zero-loss progressive branch. ``metrics_strategy`` is the fully-mutated label
+    (e.g. ``"truncate→progressive_fallback"``). ``progressive_passthrough_on_error``
+    gates the cache store: a transient progressive-store-failure passthrough must
+    not be cached.
+    """
+
+    compressed: str
+    surfaced: str
+    compressed_chars_for_metrics: int
+    metrics_strategy: str
+    ratio_violation: bool
+    effective_compression: CompressionStrategy
+    progressive_passthrough_on_error: bool
+    surfacing_on_progressive_ok: bool | None
+    surface_error: str | None
+    compress_ms: float
+    surface_ms: float

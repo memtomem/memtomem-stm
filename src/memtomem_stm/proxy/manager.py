@@ -68,7 +68,11 @@ from memtomem_stm.proxy.memory_ops import (
     format_fact_md,
     index_content_matches_privacy,
 )
-from memtomem_stm.proxy.pipeline_stages import ShapedResponse, ShapePassthrough
+from memtomem_stm.proxy.pipeline_stages import (
+    CompressionResult,
+    ShapedResponse,
+    ShapePassthrough,
+)
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
 from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from memtomem_stm.proxy.tool_eligibility import (
@@ -2360,118 +2364,33 @@ class ProxyManager:
             non_text_content=non_text_content,
         )
 
-    async def _call_tool_inner(
+    async def _compress_and_surface(
         self,
+        *,
         server: str,
         tool: str,
-        arguments: dict[str, Any],
-        *,
-        trace_id: str | None = None,
-    ) -> str | list:
-        # Public entry point ``call_tool`` generates the trace_id and passes
-        # it in so it can match the enclosing Langfuse span. Direct callers
-        # (tests and internal dispatch) that don't care about tracing omit
-        # the argument and we generate one here.
-        if trace_id is None:
-            trace_id = uuid.uuid4().hex[:16]
-        logger.debug("trace_id=%s server=%s tool=%s", trace_id, server, tool)
+        upstream_args: dict[str, Any],
+        cleaned: str,
+        tc: ToolConfig,
+        cfg_snap: ProxyConfig,
+        context_query: str | None,
+        trace_id: str | None,
+    ) -> CompressionResult:
+        """Stages 2+3: compress (or build a progressive first chunk), then surface.
 
-        # Snapshot config once to avoid intra-request inconsistency from
-        # hot-reload changing the config between accesses.
-        cfg_snap = self._config
+        Kept atomic on purpose (R6): the PROGRESSIVE branch surfaces *before* the
+        compress branch runs, and ``progressive_fallback`` (set only in the
+        compress branch's ratio-guard ladder) selects which surfacing helper runs
+        — splitting compress from surface would re-introduce the implicit flag
+        threading this refactor removes.
 
-        # Extract _context_query before forwarding. Coerce non-str values to
-        # None at the single extraction point — the cache-hit path already
-        # sanitizes this way, and without the mirror here the same malformed
-        # argument reaches scorers/compressors raw on a miss but is dropped on
-        # a hit, so whether it raises depends on cache state.
-        raw_context_query = arguments.get("_context_query") if arguments else None
-        context_query = raw_context_query if isinstance(raw_context_query, str) else None
-        upstream_args = (
-            {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
-        )
-
-        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
-        # time we get here the cache has already missed. Just account the
-        # miss and proceed with the upstream fetch.
-        if self._cache is not None:
-            self.tracker.record_cache_miss()
-
-        # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
-        # The cache lookup at L771 used the original args (no ``_trace_id``);
-        # if cache.set uses the mutated args, every stored entry is keyed on
-        # a per-request random hex and is unreachable by any future lookup
-        # (hit rate structurally 0%). Keep upstream args mutated for trace
-        # propagation, but persist under the original key.
-        cache_args = {**upstream_args}
-
-        # Propagate trace context to upstream server for end-to-end correlation.
-        if trace_id is not None:
-            upstream_args["_trace_id"] = trace_id
-
-        # ── Stage 1: UPSTREAM FETCH ──
-        # Bounded retry + reconnect with per-attempt and overall deadlines.
-        # Returns the upstream result or raises after recording the failure
-        # metric (and ``_mark_recorded``-ing the exception so the outer
-        # ``call_tool`` does not double-record). ``conn``/``cfg``/``delay`` are
-        # owned entirely by the helper — nothing after the fetch reads them.
-        result = await self._fetch_upstream(server, tool, upstream_args, trace_id=trace_id)
-
-        # ── Stage 3: SHAPE (text/non-text split + max_upstream_chars guard) ──
-        # The helper records no metrics and performs no return; when no text
-        # remains it signals the early-exit via ``shaped.passthrough`` and the
-        # orchestrator owns the metric write + return shape (R8).
-        shaped = self._shape_response(result, server, tool, cfg_snap=cfg_snap)
-        non_text_content = shaped.non_text_content
-        if shaped.passthrough is not None:
-            if shaped.passthrough.has_non_text:
-                self.tracker.record(
-                    CallMetrics(
-                        server=server,
-                        tool=tool,
-                        original_chars=0,
-                        compressed_chars=0,
-                        trace_id=trace_id,
-                    )
-                )
-                return non_text_content
-            return "[empty response]"
-        original_text = shaped.original_text
-
-        if result.isError:
-            self.tracker.record_error(
-                CallMetrics(
-                    server=server,
-                    tool=tool,
-                    original_chars=len(original_text),
-                    compressed_chars=len(original_text),
-                    is_error=True,
-                    error_category=ErrorCategory.UPSTREAM_ERROR,
-                    error_message=original_text[:MAX_ERROR_MESSAGE_CHARS],
-                    trace_id=trace_id,
-                )
-            )
-            # Propagate upstream isError so FastMCP sets isError=true on the
-            # proxied response instead of silently converting to a normal result.
-            from mcp.server.fastmcp.exceptions import ToolError
-
-            tool_err = ToolError(original_text)
-            _mark_recorded(tool_err)
-            raise tool_err
-
-        # Resolve effective settings (using config snapshot)
-        tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
-
-        # ── Stage 1: CLEAN ──
-        with traced(
-            "proxy_call_clean",
-            metadata={"server": server, "tool": tool},
-        ):
-            _t0 = _time.monotonic()
-            cleaned = self._clean_content(original_text, tc.cleaning)
-            _clean_ms = (_time.monotonic() - _t0) * 1000
-
-        # ── Stage 2: COMPRESS (or PROGRESSIVE) ──
+        Returns a ``CompressionResult`` carrying both ``compressed`` (pre-surfacing,
+        the cache payload) and ``surfaced`` (post-surfacing, the return/index
+        input), the branch-dependent ``compressed_chars_for_metrics``, the
+        fully-mutated ``metrics_strategy`` label, and the surfacing outcome. The
+        scorer-fallback delta is computed by the caller (it brackets this call plus
+        the later index/extract stages), so it is intentionally not a field here.
+        """
         # ``effective_compression`` is the strategy actually used (with AUTO
         # already resolved). ``ratio_violation`` is set by the post-compression
         # guard below when the compressor cut more than ``min_result_retention``
@@ -2487,7 +2406,6 @@ class ProxyManager:
         # passthrough after a store failure (below). Read at the cache-store
         # gate to keep that transient-failure-degraded response out of the cache.
         progressive_passthrough_on_error = False
-        _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
             if len(cleaned) <= pcfg.chunk_size:
@@ -2790,6 +2708,159 @@ class ProxyManager:
                         context_query=context_query,
                     )
                     _surface_ms = (_time.monotonic() - _t0) * 1000
+
+        return CompressionResult(
+            compressed=compressed,
+            surfaced=surfaced,
+            compressed_chars_for_metrics=compressed_chars_for_metrics,
+            metrics_strategy=metrics_strategy,
+            ratio_violation=ratio_violation,
+            effective_compression=effective_compression,
+            progressive_passthrough_on_error=progressive_passthrough_on_error,
+            surfacing_on_progressive_ok=surfacing_on_progressive_ok,
+            surface_error=surface_error,
+            compress_ms=_compress_ms,
+            surface_ms=_surface_ms,
+        )
+
+    async def _call_tool_inner(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        trace_id: str | None = None,
+    ) -> str | list:
+        # Public entry point ``call_tool`` generates the trace_id and passes
+        # it in so it can match the enclosing Langfuse span. Direct callers
+        # (tests and internal dispatch) that don't care about tracing omit
+        # the argument and we generate one here.
+        if trace_id is None:
+            trace_id = uuid.uuid4().hex[:16]
+        logger.debug("trace_id=%s server=%s tool=%s", trace_id, server, tool)
+
+        # Snapshot config once to avoid intra-request inconsistency from
+        # hot-reload changing the config between accesses.
+        cfg_snap = self._config
+
+        # Extract _context_query before forwarding. Coerce non-str values to
+        # None at the single extraction point — the cache-hit path already
+        # sanitizes this way, and without the mirror here the same malformed
+        # argument reaches scorers/compressors raw on a miss but is dropped on
+        # a hit, so whether it raises depends on cache state.
+        raw_context_query = arguments.get("_context_query") if arguments else None
+        context_query = raw_context_query if isinstance(raw_context_query, str) else None
+        upstream_args = (
+            {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
+        )
+
+        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
+        # time we get here the cache has already missed. Just account the
+        # miss and proceed with the upstream fetch.
+        if self._cache is not None:
+            self.tracker.record_cache_miss()
+
+        # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
+        # The cache lookup at L771 used the original args (no ``_trace_id``);
+        # if cache.set uses the mutated args, every stored entry is keyed on
+        # a per-request random hex and is unreachable by any future lookup
+        # (hit rate structurally 0%). Keep upstream args mutated for trace
+        # propagation, but persist under the original key.
+        cache_args = {**upstream_args}
+
+        # Propagate trace context to upstream server for end-to-end correlation.
+        if trace_id is not None:
+            upstream_args["_trace_id"] = trace_id
+
+        # ── Stage 1: UPSTREAM FETCH ──
+        # Bounded retry + reconnect with per-attempt and overall deadlines.
+        # Returns the upstream result or raises after recording the failure
+        # metric (and ``_mark_recorded``-ing the exception so the outer
+        # ``call_tool`` does not double-record). ``conn``/``cfg``/``delay`` are
+        # owned entirely by the helper — nothing after the fetch reads them.
+        result = await self._fetch_upstream(server, tool, upstream_args, trace_id=trace_id)
+
+        # ── Stage 3: SHAPE (text/non-text split + max_upstream_chars guard) ──
+        # The helper records no metrics and performs no return; when no text
+        # remains it signals the early-exit via ``shaped.passthrough`` and the
+        # orchestrator owns the metric write + return shape (R8).
+        shaped = self._shape_response(result, server, tool, cfg_snap=cfg_snap)
+        non_text_content = shaped.non_text_content
+        if shaped.passthrough is not None:
+            if shaped.passthrough.has_non_text:
+                self.tracker.record(
+                    CallMetrics(
+                        server=server,
+                        tool=tool,
+                        original_chars=0,
+                        compressed_chars=0,
+                        trace_id=trace_id,
+                    )
+                )
+                return non_text_content
+            return "[empty response]"
+        original_text = shaped.original_text
+
+        if result.isError:
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=len(original_text),
+                    compressed_chars=len(original_text),
+                    is_error=True,
+                    error_category=ErrorCategory.UPSTREAM_ERROR,
+                    error_message=original_text[:MAX_ERROR_MESSAGE_CHARS],
+                    trace_id=trace_id,
+                )
+            )
+            # Propagate upstream isError so FastMCP sets isError=true on the
+            # proxied response instead of silently converting to a normal result.
+            from mcp.server.fastmcp.exceptions import ToolError
+
+            tool_err = ToolError(original_text)
+            _mark_recorded(tool_err)
+            raise tool_err
+
+        # Resolve effective settings (using config snapshot)
+        tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
+
+        # ── Stage 1: CLEAN ──
+        with traced(
+            "proxy_call_clean",
+            metadata={"server": server, "tool": tool},
+        ):
+            _t0 = _time.monotonic()
+            cleaned = self._clean_content(original_text, tc.cleaning)
+            _clean_ms = (_time.monotonic() - _t0) * 1000
+
+        # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──
+        # Capture the scorer fallback counter BEFORE compression so the metrics
+        # record below sees a delta covering compression and everything after.
+        _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
+        comp = await self._compress_and_surface(
+            server=server,
+            tool=tool,
+            upstream_args=upstream_args,
+            cleaned=cleaned,
+            tc=tc,
+            cfg_snap=cfg_snap,
+            context_query=context_query,
+            trace_id=trace_id,
+        )
+        # Unpack into the locals the downstream INDEX / metrics / cache stages
+        # still read inline (those stages are extracted in later PRs). Behavior
+        # is identical — the helper computes exactly what the inline block did.
+        compressed = comp.compressed
+        surfaced = comp.surfaced
+        compressed_chars_for_metrics = comp.compressed_chars_for_metrics
+        metrics_strategy = comp.metrics_strategy
+        ratio_violation = comp.ratio_violation
+        surfacing_on_progressive_ok = comp.surfacing_on_progressive_ok
+        surface_error = comp.surface_error
+        progressive_passthrough_on_error = comp.progressive_passthrough_on_error
+        _compress_ms = comp.compress_ms
+        _surface_ms = comp.surface_ms
 
         # ── Stage 4: INDEX (optional) ──
         # Track outcome for CallMetrics below. ``None`` means "stage did not
