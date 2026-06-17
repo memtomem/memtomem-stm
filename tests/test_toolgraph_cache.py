@@ -157,3 +157,33 @@ class TestProviderFingerprint:
         assert GraphConsultCache.provider_fingerprint(
             self._cfg(env=None)
         ) == GraphConsultCache.provider_fingerprint(self._cfg(env={}))
+
+
+class TestCorruptRow:
+    """A malformed/old-schema/corrupt row is a best-effort MISS — it must never
+    raise during startup (the caller subscripts the raw-fact keys) and is dropped
+    so the next consult re-mints a fresh row."""
+
+    def test_malformed_dict_row_is_dropped_as_miss(self, cache):
+        _put(cache)  # valid row at scope (gen 11, hashA)
+        cache._db.execute("UPDATE toolgraph_consult SET verdict_json = ?", ('{"rejects":"oops"}',))
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_missing_keys_row_is_dropped_as_miss(self, cache):
+        _put(cache)
+        # Valid JSON dict but missing the required raw-fact keys (old schema).
+        cache._db.execute(
+            "UPDATE toolgraph_consult SET verdict_json = ?", ('{"graph_generation":11}',)
+        )
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_invalid_json_row_is_dropped_as_miss(self, cache):
+        _put(cache)
+        cache._db.execute("UPDATE toolgraph_consult SET verdict_json = ?", ("{not valid json",))
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0

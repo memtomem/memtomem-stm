@@ -146,14 +146,42 @@ class GraphConsultCache:
         try:
             verdict = json.loads(row[0])
         except (ValueError, TypeError):
+            verdict = None
+        # Best-effort: a row that is not valid JSON, not a dict, or is missing the
+        # expected raw-fact shape (e.g. an old-schema or externally-corrupted row)
+        # is treated as a MISS and dropped — the caller subscripts these keys, so a
+        # malformed row must never raise during startup. The next consult re-mints
+        # a fresh row.
+        if not self._row_shape_ok(verdict):
             logger.warning(
-                "Corrupt tool-graph consult cache row (scope %s) — treating as miss", key[:12]
+                "Tool-graph consult cache row (scope %s) is malformed — treating as "
+                "a miss and dropping it",
+                key[:12],
             )
-            return None
-        if not isinstance(verdict, dict):
+            self._delete_scope(key)
             return None
         verdict["had_risk_scores"] = bool(row[1])
         return verdict
+
+    @staticmethod
+    def _row_shape_ok(verdict: object) -> bool:
+        return (
+            isinstance(verdict, dict)
+            and isinstance(verdict.get("rejects"), dict)
+            and isinstance(verdict.get("tool_not_found_refs"), list)
+            and isinstance(verdict.get("risk_scores"), dict)
+        )
+
+    def _delete_scope(self, scope_key: str) -> None:
+        """Best-effort drop of a single (corrupt) row by ``scope_key``."""
+        if self._db is None:
+            return
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM toolgraph_consult WHERE scope_key = ?", (scope_key,))
+                self._db.commit()
+        except sqlite3.Error:
+            logger.debug("Failed to drop malformed consult cache row", exc_info=True)
 
     def put(
         self,

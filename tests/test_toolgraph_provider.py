@@ -859,6 +859,25 @@ class TestToolgraphConsultCache:
         assert "eligible_tools:1" in _read_calls(call_log)[n_after_first:]  # full consult re-ran
         await mgr.stop()
 
+    async def test_malformed_enrichment_not_cached_as_success(self, tmp_path):
+        # rank_features returns a NON-error but malformed payload (no 'features'
+        # list, agent "rankmalformed") → had_risk_scores=False → a later want-risk
+        # consult MISSES and re-runs the full consult, never pinning "no penalties".
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["risky_tool"]},
+            agent_id="rankmalformed",
+            env={"FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {}  # malformed enrichment → no penalties
+        n_after_first = len(_read_calls(call_log))
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False
+        assert "eligible_tools:1" in _read_calls(call_log)[n_after_first:]  # full consult re-ran
+        await mgr.stop()
+
     async def test_cache_disabled_single_consult(self, tmp_path):
         call_log = tmp_path / "calls.txt"
         mgr, _ = _tg_manager(

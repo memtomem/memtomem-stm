@@ -679,6 +679,19 @@ class ProxyManager:
                 exc,
             )
             return {}, False
+        # A non-error response whose ``features`` is not a list is a *malformed*
+        # enrichment: ``parse_risk_scores`` leniently yields no penalties, but it
+        # must NOT be cached as a successful "no risk facts" capture (#494) — else
+        # a later same-generation start would skip ``rank_features`` and serve no
+        # penalties forever. Report ``ok=False`` so the cache re-tries (the active
+        # session degrades to no penalties either way).
+        if not isinstance(verdict.get("features"), list):
+            logger.warning(
+                "Tool-graph risk enrichment (rank_features) returned a malformed "
+                "payload (no 'features' list) — ranking proceeds without graph risk "
+                "penalties this session."
+            )
+            return {}, False
         return parse_risk_scores(verdict), True
 
     def _tg_whole_call(self, knob: str, code: str, detail: str) -> None:

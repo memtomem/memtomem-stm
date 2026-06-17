@@ -137,6 +137,11 @@ async def rank_features(agent: str, candidates: list[str]) -> dict:
     _record_call("rank_features", len(candidates))
     if agent == "rankboom":
         raise ValueError("rank_features boom")
+    if agent == "rankmalformed":
+        # A non-error response MISSING the 'features' list — the malformed-but-
+        # successful enrichment shape. parse_risk_scores leniently yields no
+        # penalties, but #494 must not cache this as a successful capture.
+        return {"agent": agent, "agent_found": True, "graph_generation": _generation()}
     if agent == "ghost":
         return {
             "agent": agent,
