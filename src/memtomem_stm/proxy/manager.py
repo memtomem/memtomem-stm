@@ -2920,6 +2920,77 @@ class ProxyManager:
 
         return ExtractResult(ok=extract_ok, error=extract_error)
 
+    def _store_cache(
+        self,
+        *,
+        server: str,
+        tool: str,
+        cache_args: dict[str, Any],
+        comp: CompressionResult,
+        non_text_content: list,
+        cfg_snap: ProxyConfig,
+    ) -> None:
+        """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
+        (so memories stay fresh and surfacing re-runs on a hit).
+
+        Cache writes are an optional fast-path: a SQLite lock timeout, disk full,
+        or any other store error must NOT propagate to the agent and discard a
+        successful upstream response — log and continue.
+
+        Two responses are deliberately NOT cached:
+
+        - ``comp.progressive_passthrough_on_error`` — a transient-store-failure
+          passthrough. Caching it would pin the degraded (non-chunked) response
+          for the cache TTL and suppress progressive delivery on identical calls
+          even after the store recovers.
+        - one embedding a TRANSIENT retrieval key (progressive first-chunk,
+          SELECTIVE/HYBRID TOC): ``compressed`` is a pointer into the process-local
+          pending store, whose key dies on restart/eviction or its shorter TTL
+          (progressive 1800s / selective 300s) well before the cache TTL (3600s).
+          A later cache hit would hand back a dead ``stm_proxy_read_more`` /
+          ``stm_proxy_select_chunks`` key.
+
+        Skipping the store makes the next identical call re-run the pipeline and
+        mint a fresh, live key. Detection is marker-based (shared with the startup
+        legacy purge in ``ProxyCache.initialize``); a false positive only costs one
+        un-cached response, never correctness.
+
+        The key uses ``cache_args`` — the pre-``_trace_id`` snapshot — never the
+        trace-mutated upstream args; otherwise every entry is keyed on a per-request
+        hex and is unreachable by any future lookup (hit rate structurally 0%).
+        """
+        if self._cache is not None and not non_text_content:
+            if comp.progressive_passthrough_on_error:
+                logger.debug(
+                    "Skipping cache store for %s/%s: progressive passthrough "
+                    "degradation (transient store failure)",
+                    server,
+                    tool,
+                )
+            elif response_carries_transient_key(comp.compressed):
+                logger.debug(
+                    "Skipping cache store for %s/%s: response carries a transient "
+                    "retrieval key (progressive/selective TOC)",
+                    server,
+                    tool,
+                )
+            else:
+                try:
+                    self._cache.set(
+                        server,
+                        tool,
+                        cache_args,
+                        comp.compressed,
+                        ttl_seconds=cfg_snap.cache.default_ttl_seconds,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Cache store failed for %s/%s — response unaffected",
+                        server,
+                        tool,
+                        exc_info=True,
+                    )
+
     async def _call_tool_inner(
         self,
         server: str,
@@ -3045,17 +3116,15 @@ class ProxyManager:
             context_query=context_query,
             trace_id=trace_id,
         )
-        # Unpack into the locals the downstream INDEX / metrics / cache stages
-        # still read inline (those stages are extracted in later PRs). Behavior
-        # is identical — the helper computes exactly what the inline block did.
-        compressed = comp.compressed
+        # Unpack the fields the metrics record and the INDEX stage read. The
+        # cache store reads ``comp`` directly (compressed + the cache-skip flag),
+        # so those two are not unpacked here.
         surfaced = comp.surfaced
         compressed_chars_for_metrics = comp.compressed_chars_for_metrics
         metrics_strategy = comp.metrics_strategy
         ratio_violation = comp.ratio_violation
         surfacing_on_progressive_ok = comp.surfacing_on_progressive_ok
         surface_error = comp.surface_error
-        progressive_passthrough_on_error = comp.progressive_passthrough_on_error
         _compress_ms = comp.compress_ms
         _surface_ms = comp.surface_ms
 
@@ -3124,59 +3193,15 @@ class ProxyManager:
             )
         )
 
-        # ── Cache store (pre-surfacing content so memories stay fresh on hit) ──
-        # Cache writes are an optional fast-path: a SQLite lock timeout, disk
-        # full, or any other store error must NOT propagate to the agent and
-        # discard a successful upstream response. Log and continue.
-        #
-        # Never cache a response that embeds a TRANSIENT retrieval key
-        # (progressive first-chunk, SELECTIVE/HYBRID TOC): ``compressed`` is a
-        # pointer into the process-local pending store, whose key dies on
-        # restart/eviction or its shorter TTL (progressive 1800s / selective
-        # 300s) well before the cache TTL (3600s). A later cache hit would hand
-        # back a dead ``stm_proxy_read_more`` / ``stm_proxy_select_chunks`` key.
-        # Skipping the store makes the next identical call re-run the pipeline
-        # and mint a fresh, live key. Detection is marker-based (shared with the
-        # startup legacy purge in ``ProxyCache.initialize``); a false positive
-        # only costs one un-cached response, never correctness.
-        if self._cache is not None and not non_text_content:
-            if progressive_passthrough_on_error:
-                # The primary PROGRESSIVE path degraded to a full-content
-                # passthrough after a transient store failure. Caching it would
-                # pin the degraded (non-chunked) response for the cache TTL and
-                # suppress progressive delivery on identical calls even after the
-                # store recovers. Skip the store so the next identical call
-                # re-runs the pipeline and re-attempts progressive delivery —
-                # same rationale as the transient-key skip below.
-                logger.debug(
-                    "Skipping cache store for %s/%s: progressive passthrough "
-                    "degradation (transient store failure)",
-                    server,
-                    tool,
-                )
-            elif response_carries_transient_key(compressed):
-                logger.debug(
-                    "Skipping cache store for %s/%s: response carries a transient "
-                    "retrieval key (progressive/selective TOC)",
-                    server,
-                    tool,
-                )
-            else:
-                try:
-                    self._cache.set(
-                        server,
-                        tool,
-                        cache_args,
-                        compressed,
-                        ttl_seconds=cfg_snap.cache.default_ttl_seconds,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Cache store failed for %s/%s — response unaffected",
-                        server,
-                        tool,
-                        exc_info=True,
-                    )
+        # ── Stage 5: CACHE STORE (pre-surfacing content, keyed on cache_args) ──
+        self._store_cache(
+            server=server,
+            tool=tool,
+            cache_args=cache_args,
+            comp=comp,
+            non_text_content=non_text_content,
+            cfg_snap=cfg_snap,
+        )
 
         # Combine compressed text with preserved non-text content
         if non_text_content:
