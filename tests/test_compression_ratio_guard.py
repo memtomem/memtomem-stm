@@ -240,6 +240,47 @@ class TestProxyManagerRatioGuard:
         assert row["ratio_violation"] == 0
         store.close()
 
+    async def test_primary_progressive_store_failure_falls_back_to_passthrough(self, tmp_path):
+        """When the *primary* PROGRESSIVE strategy fails to build/store its
+        first chunk (e.g. a SQLite pending/reads-store I/O error inside
+        ``_apply_progressive``), the call must degrade to a zero-loss
+        passthrough of the full cleaned upstream content — not let the
+        exception escape ``_call_tool_inner`` and discard an otherwise
+        successful upstream response.
+
+        Pre-fix only the ratio-guard *fallback* progressive call (Tier 1) was
+        wrapped in try/except; the primary PROGRESSIVE branch was unguarded,
+        so a store error there was recorded as INTERNAL_ERROR and the upstream
+        response was thrown away. This regresses that asymmetry.
+        """
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=500),
+        )
+        large_text = "content paragraph. " * 200  # > chunk_size → would be chunked
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
+        # Force the primary progressive build/store to fail.
+        mgr._apply_progressive = lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("pending store full")
+        )
+
+        # Must NOT raise — the successful upstream response is preserved.
+        result = await mgr.call_tool("srv", "tool", {})
+
+        # Zero-loss passthrough: full content returned, and crucially NO
+        # progressive footer (nothing was stored, so there is no key to read).
+        assert "content paragraph." in result
+        assert len(result) > 3000
+        assert "stm_proxy_read_more" not in result
+
+        row = _latest_row(store)
+        assert row["compression_strategy"] == "progressive→passthrough_on_error"
+        assert row["ratio_violation"] == 0
+        # passthrough keeps the full cleaned content (compressed == cleaned)
+        assert row["compressed_chars"] == row["cleaned_chars"]
+        store.close()
+
     async def test_auto_is_resolved_before_metrics(self, tmp_path):
         """AUTO should be resolved to a concrete strategy before recording.
 
