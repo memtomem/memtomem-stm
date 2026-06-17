@@ -13,6 +13,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 - **Selection-telemetry `execution.cache_hit` is now populated** (#485, issue #467) — the reserved field is set `true`/`false` per call (served from the proxy response cache vs a live upstream call; `null` when a raise escaped before it was attributable), and `stm_selection_stats` reports the cache hit/miss rate. **Behavior change**: when `selection_telemetry.enabled`, execution records now carry a real `cache_hit` value instead of `null` — additive, the schema key set is unchanged.
 
+### Fixed
+
+- **Primary progressive store failures degrade to an uncached passthrough** (#496) — when the primary `PROGRESSIVE` path cannot build or store its first chunk, the proxy now returns the full cleaned upstream response instead of discarding an otherwise successful tool result as an internal error. The degraded response is recorded with a `progressive→passthrough_on_error` strategy label and is **not** cached, so a later identical call re-runs the pipeline and can retry progressive delivery once the pending store recovers. Transient progressive-store failures are uncommon, but when they occur the agent now keeps the full result instead of seeing an error.
+
 ## [0.1.28] — 2026-06-11
 
 A security-hardening, correctness, and tool-selection release. A targeted audit across four issue classes — SQLite file permissions, sensitive-value caching, secret-content persistence, and extraction-call privacy — produced six security fixes. Thirteen correctness fixes address critical paths found in the implementation review (PROGRESSIVE metrics assignment, network LTM reconnects, shutdown ExceptionGroup handling) and the remaining medium and low backlog items across daemon, surfacing, compression, config, and CLI layers. Two new opt-in features instrument the tool-selection path (JSONL telemetry sink and BM25 relevance scoring), and a third hardens what the proxy advertises to MCP clients via an STM-native eligibility filter at exposure time.
