@@ -632,6 +632,74 @@ class TestManagerWireIn:
             await mgr.stop()
             store.close()
 
+    async def test_start_derived_health_flows_into_exposure(self, tmp_path):
+        """End-to-end seam: failing metrics history → ``start()`` *derives*
+        ``_unhealthy_tools`` → ``get_proxy_tools()`` drops the unhealthy tool
+        from exposure and records ``REASON_UNHEALTHY`` — with the set never
+        injected.
+
+        The two existing tests cover the halves in isolation:
+        ``test_start_computes_health_flags_from_metrics_store`` proves
+        derivation→set, and ``test_unhealthy_strict_rejected_and_recorded``
+        proves injected-set→exposure. Neither joins them, so a key-format
+        drift between ``compute_health_flags`` (which keys by upstream-server
+        name) and the exposure-filter lookup would pass both yet silently stop
+        filtering. This pins the join: derived ``("srv", "broken")`` must reach
+        the filter that advertises by prefix.
+        """
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        for _ in range(5):
+            _record(store, "broken", error=ErrorCategory.UPSTREAM_ERROR)
+
+        server_cfg = UpstreamServerConfig(
+            prefix="test",
+            compression=CompressionStrategy.NONE,
+            max_retries=0,
+            reconnect_delay_seconds=0.0,
+        )
+        # upstream_servers empty + a non-existent config_path → start() makes no
+        # real connection (and the fresh-manager path skips the double-start
+        # guard), so the injected connection below survives into derivation.
+        cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={},
+            exposure=ExposureConfig(),  # strict default profile
+        )
+        mgr = ProxyManager(cfg, TokenTracker(metrics_store=store))
+
+        session = AsyncMock()
+        session.call_tool.return_value = _make_result("ok!")
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv",
+            config=server_cfg,
+            session=session,
+            tools=[
+                SimpleNamespace(
+                    name="broken",
+                    description="A flaky tool",
+                    inputSchema={"type": "object"},
+                ),
+                SimpleNamespace(
+                    name="send_message",
+                    description="Send a message to a Slack channel",
+                    inputSchema={"type": "object"},
+                ),
+            ],
+        )
+
+        await mgr.start()
+        try:
+            # Derivation ran from the seeded store — the set is NOT injected.
+            assert mgr._unhealthy_tools == frozenset({("srv", "broken")})
+            # ...and that derived key actually reaches the exposure filter.
+            advertised = [i.prefixed_name for i in mgr.get_proxy_tools()]
+            assert advertised == ["test__send_message"]
+            assert mgr._advertised_reject_reasons == {"test__broken": REASON_UNHEALTHY}
+        finally:
+            await mgr.stop()
+            store.close()
+
 
 # ── interpret_verdict (pure parse of the external consult, #465) ────────────
 
