@@ -21,6 +21,37 @@ def _read(relative: str) -> str:
     return (REPO_ROOT / relative).read_text(encoding="utf-8")
 
 
+def _canonical_ci_test_filter() -> str:
+    """The single CI ``test``-job ``pytest -m`` filter (the one with ``not ollama``).
+
+    Shared source of truth for the README + CONTRIBUTING pins below: both
+    quickstarts must quote this verbatim, or a contributor runs straight into
+    the ``bench_qa_*`` jobs CI deliberately splits into separate workflows.
+    """
+    ci = _read(".github/workflows/ci.yml")
+    # Double-quoted ``pytest -m "…"`` is what the workflow uses today. If the
+    # form ever changes (single quotes, ``run: |`` block, matrix variable),
+    # this regex falls through to zero matches and we want a loud failure
+    # pointing operators back here rather than a cryptic IndexError.
+    ci_filters = re.findall(r'pytest -m "([^"]+)"', ci)
+    test_job_filters = [f for f in ci_filters if "not ollama" in f]
+    if not test_job_filters:
+        pytest.fail(
+            "Could not locate CI's pytest filter — expected a double-quoted "
+            '`pytest -m "…not ollama…"` in .github/workflows/ci.yml. '
+            "The workflow was likely refactored; update this helper and the "
+            "docs that quote it (README.md, CONTRIBUTING.md) together."
+        )
+    if len(test_job_filters) > 1:
+        pytest.fail(
+            "Multiple CI jobs now use `not ollama` — this helper picks the "
+            "first match, which may not be the one the docs should mirror. "
+            f"Filters found: {test_job_filters!r}. Parse by job name or pin "
+            "the canonical one explicitly."
+        )
+    return test_job_filters[0]
+
+
 def test_contributing_pytest_command_matches_ci() -> None:
     """CONTRIBUTING.md's ``pytest -m`` filter must match the one in CI.
 
@@ -30,37 +61,30 @@ def test_contributing_pytest_command_matches_ci() -> None:
     in addition to ``ollama``. A shorter filter in CONTRIBUTING leads new
     contributors straight into those expected failures.
     """
-    ci = _read(".github/workflows/ci.yml")
-    contributing = _read("CONTRIBUTING.md")
-
-    # Double-quoted ``pytest -m "…"`` is what the workflow uses today. If the
-    # form ever changes (single quotes, ``run: |`` block, matrix variable),
-    # this regex falls through to zero matches and we want a loud failure
-    # pointing operators back here rather than a cryptic IndexError.
-    ci_filters = re.findall(r'pytest -m "([^"]+)"', ci)
-    test_job_filters = [f for f in ci_filters if "not ollama" in f]
-
-    if not test_job_filters:
-        pytest.fail(
-            "Could not locate CI's pytest filter — expected a double-quoted "
-            '`pytest -m "…not ollama…"` in .github/workflows/ci.yml. '
-            "The workflow was likely refactored; update this test and "
-            "CONTRIBUTING.md together."
-        )
-    if len(test_job_filters) > 1:
-        pytest.fail(
-            "Multiple CI jobs now use `not ollama` — this test picks the "
-            "first match, which may not be the one CONTRIBUTING should "
-            f"mirror. Filters found: {test_job_filters!r}. Parse by job "
-            "name or pin the canonical one explicitly."
-        )
-    canonical = test_job_filters[0]
-
-    contributing_filters = re.findall(r'pytest -m "([^"]+)"', contributing)
+    canonical = _canonical_ci_test_filter()
+    contributing_filters = re.findall(r'pytest -m "([^"]+)"', _read("CONTRIBUTING.md"))
     assert canonical in contributing_filters, (
         f"CONTRIBUTING.md must quote the CI pytest filter verbatim.\n"
         f"  CI uses: {canonical!r}\n"
         f"  CONTRIBUTING has: {contributing_filters!r}"
+    )
+
+
+def test_readme_pytest_command_matches_ci() -> None:
+    """README.md's Development ``pytest -m`` filter must match CI's verbatim.
+
+    README's quickstart carries the same CI filter as CONTRIBUTING, but was
+    previously unpinned — so it silently drifted to a shorter filter (missing
+    ``not bench_qa_drift and not bench_qa_perf``) while CONTRIBUTING.md and
+    ``ci.yml`` stayed in lockstep. Pin README to the same source of truth so a
+    future CI-filter change can't leave the quickstart behind again.
+    """
+    canonical = _canonical_ci_test_filter()
+    readme_filters = re.findall(r'pytest -m "([^"]+)"', _read("README.md"))
+    assert canonical in readme_filters, (
+        f"README.md must quote the CI pytest filter verbatim.\n"
+        f"  CI uses: {canonical!r}\n"
+        f"  README has: {readme_filters!r}"
     )
 
 

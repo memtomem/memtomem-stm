@@ -15,9 +15,9 @@ Please report security issues via [GitHub private vulnerability advisory](https:
 
 memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-facing application:
 
-- **Transport**: Default communication is stdio with the AI client (Claude Code, Cursor, etc.). No network port is opened unless explicitly configured.
+- **Transport**: Default communication is stdio with the AI client (Claude Code, Cursor, etc.); the MCP proxy server itself opens no network port. When the built-in `mms hook` surfacing path is used, an eligible hook call may auto-spawn a local surfacing daemon (`hook.use_daemon`/`hook.auto_spawn` default on) that binds an ephemeral port on `daemon.host` — **`127.0.0.1` (loopback) by default** — and authenticates every connection with a per-start random token rather than network ACLs. Keep `daemon.host` on loopback: overriding `MEMTOMEM_STM_DAEMON__HOST` to a non-loopback address (e.g. `0.0.0.0`) exposes the token-guarded daemon on that interface, and nothing currently validates against it.
 - **Trust boundary**: memtomem-stm trusts the AI client (local process) and the upstream MCP servers it is configured to proxy. Only configure upstream servers you trust.
-- **Data at rest**: Response cache and `PendingStore` default to in-memory. The SQLite shared backend is local-only.
+- **Data at rest**: The optional selective-compression `PendingStore` defaults to in-memory (`pending_store="memory"`). Other persisted stores — the response cache (`proxy_cache.db`, enabled by default), metrics (`proxy_metrics.db`), and feedback — are local-only SQLite files under `~/.memtomem/`. No store is remote or shared across hosts.
 
 ## Security Measures
 
@@ -35,7 +35,7 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
 ### Data security
 
 - **No unsafe deserialization**: No pickle, no unsafe YAML loading
-- **No command injection**: No `subprocess` / `eval` / `exec` with user input
+- **No command injection**: Subprocess spawns (the surfacing daemon, and stdio MCP child servers such as the LTM-consult client and the optional tool-graph eligibility provider) use static or config-derived argv lists — `shell=True` is never set, so no untrusted input is interpolated into a shell. No `eval` / `exec` on input.
 - **SQL injection**: All queries in the optional SQLite `PendingStore` use parameterized statements
 
 ## Best Practices
