@@ -328,7 +328,7 @@ export MEMTOMEM_STM_PROXY__CONSUMER_MODEL=claude-sonnet-4
 
 | Setting | SLM (≤32K) | Medium (32K-200K) | LLM (>200K) |
 |---------|------------|-------------------|--------------|
-| `max_result_chars` | ~5,600 | ~16,000 | ~35,000 |
+| `max_result_chars` | ~5,600 | ~16,000 | ~16,000 (capped at `default_max_result_chars`, default 16,000; raise it for a larger budget) |
 | `max_injection_chars` | 1,500 | 3,000 | 5,000 |
 | `max_results` (surfacing) | 2 | 3 | 5 |
 | `context_window` | 0-1 | 1-2 | 2-5 |

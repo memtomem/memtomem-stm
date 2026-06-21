@@ -26,10 +26,10 @@ uv run mypy src
 ## Project Structure
 
 - `src/memtomem_stm/` — Core: MCP server, proxy pipeline, compression, surfacing, caching, observability
-  - `proxy/` — 4-stage pipeline (CLEAN → COMPRESS → SURFACE → INDEX), privacy scanning
+  - `proxy/` — pipeline `CLEAN → COMPRESS → SURFACE → (INDEX)`, privacy scanning. INDEX (`auto_index` / `extraction`) only runs when `ProxyManager` is constructed with an `index_engine`; the standalone `mms` server wires none by design, so that config is inert there and logs a warning at startup (#288).
   - `surfacing/` — Memory surfacing engine and relevance gating
   - `observability/` — Langfuse tracing and metrics
-  - `cli/` — `mms` / `memtomem-stm-proxy` CLI
+  - `cli/` — `mms` / `memtomem-stm-proxy` / `memtomem-stm` CLI (all three entry points resolve to the same Click group, see #260)
   - `utils/` — Circuit breaker and shared helpers
 - `tests/` — pytest suite
   - `tests/bench/` — `bench_qa` scenario harness (see "Adding a bench_qa scenario" below)
@@ -80,6 +80,7 @@ short version follows. When adding a new scenario:
 5. Run both `uv run pytest -m bench_qa` and `-m bench_qa_meta`; they
    must stay green. If you changed anything the LLM judge touches,
    also run `OPENAI_API_KEY=… uv run pytest -m bench_qa_llm_judge`
+   (or `ANTHROPIC_API_KEY=…` — either provider key enables the judge)
    and sanity-check the correlation log.
 6. Add the scenario id to `SUITE_SCENARIOS` in
    `tests/bench/bench_qa/replay.py` (the shared roster behind both the

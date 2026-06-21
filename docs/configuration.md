@@ -123,7 +123,7 @@ export MEMTOMEM_STM_SURFACING__CONSUMER_MODEL=claude-sonnet-4  # auto-scales max
 export MEMTOMEM_STM_SURFACING__DEDUP_TTL_SECONDS=604800    # 7 days; 0 to disable cross-session dedup
 export MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH=~/.memtomem/stm_feedback.db
 
-# LTM connection (defaults shown)
+# LTM connection (transport/command are defaults; ltm_mcp_args defaults to [] — value below is an illustrative override)
 export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=stdio
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=memtomem-server
 export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--config","/etc/memtomem.json"]'
@@ -383,7 +383,9 @@ under `toolgraph_*` reason codes; ranking can never resurrect them.
   "on_protocol_error": "fail_start",
   "on_tool_not_found": "open",
   "risk_penalty_scale": 1.0,
-  "timeout_seconds": 5.0
+  "timeout_seconds": 5.0,
+  "consult_cache_enabled": true,
+  "consult_cache_path": "~/.memtomem/toolgraph_consult.db"
 }
 ```
 
@@ -414,6 +416,18 @@ session — so it is surfaced loudly: a startup WARNING and a `DEGRADED` line in
 enforcement blind spot. `stm_proxy_health` also reports a `WITHHOLDING ALL`
 posture (a `closed` knob fired) and, on success, the active graph generation,
 the count of graph-rejected tools, and the count carrying a graph risk penalty.
+
+The startup eligibility verdict is disk-cached when `consult_cache_enabled`
+(default `true`) at `consult_cache_path` (default
+`~/.memtomem/toolgraph_consult.db`). A restart reuses the prior session's
+`eligible_tools`/`rank_features` evaluation only when the graph's
+`graph_generation` — plus the candidate ref-set, agent, profile, and backend
+fingerprint — all match a cached row; a ref-set or `server_name_map` change
+invalidates the hit. A cheap `eligible_tools([])` generation probe still runs
+on every start, so a degraded, unreachable, or rolled-back graph is always
+re-detected (the `on_*` knobs and `DEGRADED` health line stay loud) and is
+never masked by a stale cache hit. Only an agent-found full consult is written.
+Set `consult_cache_enabled` to `false` to force a full consult each start.
 
 - **`risk_penalty_scale`** (`1.0` default) — beyond the hard *reject* verdict,
   the graph assigns each *eligible* candidate a rule-based `risk_score`

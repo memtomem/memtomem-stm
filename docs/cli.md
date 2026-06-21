@@ -696,8 +696,9 @@ export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true
   [mcp_servers.memtomem-stm]
   disabled_tools = [
     "stm_proxy_stats", "stm_proxy_health", "stm_proxy_cache_clear",
-    "stm_surfacing_stats", "stm_index_stats", "stm_compression_stats",
-    "stm_progressive_stats", "stm_tuning_recommendations",
+    "stm_surfacing_stats", "stm_index_stats", "stm_selection_stats",
+    "stm_compression_stats", "stm_progressive_stats",
+    "stm_tuning_recommendations",
   ]
   ```
 

@@ -15,9 +15,9 @@ Please report security issues via [GitHub private vulnerability advisory](https:
 
 memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-facing application:
 
-- **Transport**: Default communication is stdio with the AI client (Claude Code, Cursor, etc.). No network port is opened unless explicitly configured.
+- **Transport**: Default communication is stdio with the AI client (Claude Code, Cursor, etc.); the MCP proxy server itself opens no network port. When the built-in `mms hook` surfacing path is used, an eligible hook call may auto-spawn a local surfacing daemon (`hook.use_daemon`/`hook.auto_spawn` default on) that binds an ephemeral **loopback** port on `127.0.0.1`. That port is local-only and authenticated by a per-daemon secret token, so unauthenticated peers are rejected. No port is ever bound to a non-loopback interface unless you explicitly run memtomem-stm behind an HTTP transport.
 - **Trust boundary**: memtomem-stm trusts the AI client (local process) and the upstream MCP servers it is configured to proxy. Only configure upstream servers you trust.
-- **Data at rest**: Response cache and `PendingStore` default to in-memory. The SQLite shared backend is local-only.
+- **Data at rest**: The optional selective-compression `PendingStore` defaults to in-memory (`pending_store="memory"`). Other persisted stores — the response cache (`proxy_cache.db`, enabled by default), metrics (`proxy_metrics.db`), and feedback — are local-only SQLite files under `~/.memtomem/`. No store is remote or shared across hosts.
 
 ## Security Measures
 
@@ -35,7 +35,7 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
 ### Data security
 
 - **No unsafe deserialization**: No pickle, no unsafe YAML loading
-- **No command injection**: No `subprocess` / `eval` / `exec` with user input
+- **No command injection**: Subprocess spawns (the surfacing daemon, and stdio MCP child servers such as the LTM-consult client and the optional tool-graph eligibility provider) use static or config-derived argv lists — `shell=True` is never set, so no untrusted input is interpolated into a shell. No `eval` / `exec` on input.
 - **SQL injection**: All queries in the optional SQLite `PendingStore` use parameterized statements
 
 ## Best Practices
