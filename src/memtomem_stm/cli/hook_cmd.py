@@ -66,6 +66,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TextIO
 
 import click
@@ -101,12 +102,21 @@ _DEFAULT_SURFACE_TOOLS = frozenset({"read", "grep", "glob", "shell"})
 # falsely suppress compression of the whole result.
 _COMPRESS_SENTINEL = "⟦stm-compressed⟧"
 
-# Hard cap on the ``tool_response`` text forwarded to surfacing, independent of
-# the compression budget. Keeps a multi-MB built-in result from overflowing the
-# daemon's ``MAX_MESSAGE_BYTES`` (4 MiB) frame even when compression is disabled
-# or no-ops. Comfortably below 4 MiB after JSON escaping; surfacing only needs
-# enough text to clear its ``min_response_chars`` gate (the query comes from
+# Hard cap on the ``tool_response_text`` forwarded to surfacing, independent of
+# the compression budget. Keeps a multi-MB built-in *result* from overflowing the
+# daemon's ``MAX_MESSAGE_BYTES`` (4 MiB) wire frame even when compression is
+# disabled or no-ops. Comfortably below 4 MiB after JSON escaping; surfacing only
+# needs enough text to clear its ``min_response_chars`` gate (the query comes from
 # ``tool_input``), so capping costs nothing for relevance.
+#
+# Scope: this caps the *response* channel only — the read-like default allowlist
+# (read/grep/glob/shell) has a tiny ``tool_input`` (a path/pattern/command), so
+# the frame stays bounded. If an operator adds ``write``/``edit`` to
+# ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS``, a multi-MB ``tool_input`` (file contents /
+# ``new_string``) is sent uncapped and may exceed the frame — that degrades
+# safely (the daemon's ``readline`` ``limit`` drops the oversized frame, the hook
+# gets ``None`` and returns ``{}``, tool output passes through), it does not
+# disrupt the host.
 _SAFE_DAEMON_BUDGET = 256 * 1024
 
 # Connect + busy timeout for the best-effort native-tool metrics write. The hook
@@ -301,20 +311,20 @@ def maybe_compress_builtin(
         return None
 
 
-def _bounded_surfacing_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return ``payload`` with its ``tool_response`` text capped to
-    :data:`_SAFE_DAEMON_BUDGET`.
+def _bounded_call(call: "CanonicalHookCall") -> "CanonicalHookCall":
+    """Return ``call`` with ``tool_response_text`` capped to :data:`_SAFE_DAEMON_BUDGET`.
 
     Independent of compression: a multi-MB built-in result must never overflow
-    the daemon's 4 MiB frame, even when compression is disabled or no-ops.
-    Pass-through (same object) when the response is already small, so the common
-    case is untouched. The cap keeps the head of the flattened text (stdout, then
-    stderr), which is all surfacing needs to clear its size gate.
+    the daemon's 4 MiB wire frame, even when compression is disabled or no-ops.
+    Pass-through (same object) when the text is already small, so the common case
+    is untouched. The cap keeps the head of the flattened text, which is all
+    surfacing needs to clear its size gate. Applied before both the daemon round
+    trip and the cold in-process path so the two see the same bounded text.
     """
-    text = _tool_response_to_text(payload.get("tool_response"))
+    text = call.tool_response_text
     if len(text) <= _SAFE_DAEMON_BUDGET:
-        return payload
-    return {**payload, "tool_response": text[:_SAFE_DAEMON_BUDGET]}
+        return call
+    return replace(call, tool_response_text=text[:_SAFE_DAEMON_BUDGET])
 
 
 def _extract_surfaced_block(original: str, injected: str, injection_mode: str) -> str | None:
@@ -506,14 +516,15 @@ def _hook_eligible(call: "CanonicalHookCall") -> bool:
 
 
 async def _run_hook(
-    payload: dict[str, Any], *, config: "STMConfig | None" = None
+    call: "CanonicalHookCall", *, config: "STMConfig | None" = None
 ) -> dict[str, Any]:
     """Resolve the *surfacing* hook output, preferring the warm daemon when enabled.
 
-    Takes the raw host ``payload`` (so the daemon round trip ships exactly what
-    the host wrote) and normalizes it once via the host adapter for the
-    eligibility gate and the cold-path core. An unparseable payload (non-dict /
-    ``mcp__`` tool) degrades to ``{}``.
+    Takes the normalized :class:`CanonicalHookCall` and ships its host-agnostic
+    wire form to the daemon (so the daemon needs no host knowledge). The text is
+    capped once via :func:`_bounded_call` so both the daemon round trip and the
+    cold path see the same bounded ``tool_response_text`` (and the wire frame
+    stays under the daemon's 4 MiB cap).
 
     Degradation ladder (every rung still yields a hook-output dict, never
     raises): daemon disabled → cold in-process path. Daemon enabled → one
@@ -525,9 +536,7 @@ async def _run_hook(
     ``config`` is reused from :func:`_orchestrate` when given (saving a redundant
     ``STMConfig()`` load); ``None`` loads on demand.
     """
-    call = get_adapter().parse(payload)
-    if call is None:
-        return {}
+    bounded = _bounded_call(call)
     if _daemon_enabled():
         from memtomem_stm.config import STMConfig
         from memtomem_stm.daemon import client
@@ -538,10 +547,10 @@ async def _run_hook(
         # a non-allowlisted tool) before routing to / spawning the daemon — an
         # off-target hook call must not warm a pointless daemon. The cold path
         # (run_surfacing_hook) re-checks, so this gate is an optimization.
-        if not config.surfacing.enabled or not _hook_eligible(call):
+        if not config.surfacing.enabled or not _hook_eligible(bounded):
             return {}
         try:
-            out = await client.surface(config, payload, timeout=config.hook.daemon_timeout_seconds)
+            out = await client.surface(config, bounded, timeout=config.hook.daemon_timeout_seconds)
         except Exception:
             logger.debug("daemon surface request failed", exc_info=True)
             out = None
@@ -565,7 +574,7 @@ async def _run_hook(
         if config.hook.fallback != "cold":
             return {}
         # fallback=cold → fall through to the in-process surfacing path.
-    return await run_surfacing_hook(call)
+    return await run_surfacing_hook(bounded)
 
 
 def _record_hook_metrics(
@@ -648,20 +657,20 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     surfacing (or the daemon) receives, and it still runs when surfacing is
     disabled or shell is not in the *surface* allowlist.
 
-    The two stages are independent. Daemon-frame protection comes solely from
-    ``_bounded_surfacing_payload`` (:data:`_SAFE_DAEMON_BUDGET`), which caps the
-    payload copy handed to surfacing whether or not compression ran. Surfacing is
-    wrapped so a failure degrades to "no memories" while still returning the
-    compression half (``maybe_compress_builtin`` is itself non-raising). The CLI
-    wrapper backstops the whole call. A non-raising metrics row (``source='hook'``)
-    is recorded afterwards via :func:`_record_hook_metrics`, regardless of whether
-    either stage produced output.
+    The two stages are independent. Surfacing receives the same ``call``;
+    ``_run_hook`` caps its ``tool_response_text`` via :func:`_bounded_call`
+    (:data:`_SAFE_DAEMON_BUDGET`) so the daemon wire frame stays bounded whether
+    or not compression ran. Surfacing is wrapped so a failure degrades to "no
+    memories" while still returning the compression half
+    (``maybe_compress_builtin`` is itself non-raising). The CLI wrapper backstops
+    the whole call. A non-raising metrics row (``source='hook'``) is recorded
+    afterwards via :func:`_record_hook_metrics`, regardless of whether either
+    stage produced output.
 
-    Note (deferred to the wire step): surfacing still ships the *raw* ``payload``
-    over the daemon wire (``_run_hook``); the daemon re-parses it with the Claude
-    adapter server-side. Sending the ``CanonicalHookCall`` itself over the wire
-    (so the daemon needs no host knowledge) is the next step — the daemon already
-    treats the payload opaquely, so a Claude-only ship needs no wire change yet.
+    The daemon receives the *canonical* call over the wire (``_run_hook`` →
+    ``client.surface`` → ``CanonicalHookCall.to_wire``), so it needs no host
+    knowledge; compression still runs here in the hook process (it needs the
+    original ``tool_response`` object, which is not transmitted).
     """
     from memtomem_stm.config import STMConfig
 
@@ -677,7 +686,7 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     )
     surf_out: dict[str, Any] = {}
     try:
-        surf_out = await _run_hook(_bounded_surfacing_payload(payload), config=config)
+        surf_out = await _run_hook(call, config=config)
     except Exception:
         logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)

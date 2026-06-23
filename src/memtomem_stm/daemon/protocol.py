@@ -8,12 +8,12 @@ session state). ``json.dumps`` escapes any newline inside string values as
 
 Request  (hook → daemon)::
 
-    {"v": 1, "token": "<hex>", "op": "surface", "payload": {<PostToolUse JSON>}}
+    {"v": 2, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
 
 Response (daemon → hook)::
 
-    {"v": 1, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
-    {"v": 1, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
+    {"v": 2, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
+    {"v": 2, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
 
 ``op`` is one of :data:`OP_SURFACE`, :data:`OP_PING`, :data:`OP_SHUTDOWN`. The
 token gates *use* of the loopback port (any local process can ``connect`` to
@@ -21,6 +21,19 @@ it); it is validated with :func:`secrets.compare_digest` on every request and
 never logged. Messages are capped at :data:`MAX_MESSAGE_BYTES` so a malformed
 or oversized stdin can't blow up daemon memory — set the same value as the
 stream ``limit`` on both ends so ``readline`` enforces it.
+
+Versioning. ``v`` is :data:`PROTOCOL_VERSION`, checked for an exact match on
+both ends (the server rejects a mismatched request, the client discards a
+mismatched response). The match is belt-and-suspenders: ``PROTOCOL_VERSION`` is
+folded into the daemon's ``config_fingerprint``, so a hook and a daemon built at
+different protocol versions key to different handshake/lock paths and never even
+discover each other — a version bump makes the two coexist (the stale daemon
+idle-times-out) instead of exchanging frames one side can't parse.
+
+**v2 (this version):** the ``surface`` payload is a serialized
+:class:`~memtomem_stm.cli.hook_adapter.CanonicalHookCall` (``to_wire``), so the
+daemon consumes a host-agnostic call and needs no host knowledge. **v1** sent
+the host's raw Claude PostToolUse JSON and the daemon parsed it server-side.
 """
 
 from __future__ import annotations
@@ -30,7 +43,7 @@ import json
 import secrets
 from typing import Any
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
 # built-in tool's output (a large ``Read`` can be hundreds of KB), so this sits

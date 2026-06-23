@@ -114,6 +114,17 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
+def test_config_fingerprint_includes_protocol_version(monkeypatch: pytest.MonkeyPatch):
+    # A wire-protocol bump must move the fingerprint so a hook and a daemon built
+    # at different PROTOCOL_VERSIONs key to distinct handshake/lock paths and
+    # coexist (the stale one idle-times-out) instead of exchanging frames one
+    # side can't parse.
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
+    fp = discovery.config_fingerprint(STMConfig())
+    monkeypatch.setattr("memtomem_stm.daemon.discovery.PROTOCOL_VERSION", 999)
+    assert discovery.config_fingerprint(STMConfig()) != fp
+
+
 def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())

@@ -37,14 +37,14 @@ adapter sets it ``False`` and the orchestrator skips compression for that host.
 *Surfacing* (context injection) is the universal channel and flows through
 ``render`` for every host.
 
-The shared surfacing core now consumes the :class:`CanonicalHookCall` (not the
-raw payload): :meth:`parse` produces it and it drives adapter dispatch, the
-compression gate, the surfacing core, native-tool metrics, and :meth:`render`.
-Still deferred (the daemon-boundary step): the daemon receives the *raw* payload
-over the wire (``PROTOCOL_VERSION`` unchanged) and re-parses it server-side with
-the Claude adapter — it already treats the payload opaquely, so a Claude-only
-ship needs no wire change. Sending the :class:`CanonicalHookCall` itself over the
-wire (so the daemon needs no host knowledge) is the next step.
+The whole pipeline consumes the :class:`CanonicalHookCall` (not the raw
+payload): :meth:`parse` produces it; it drives adapter dispatch, the compression
+gate, the surfacing core, native-tool metrics, and :meth:`render`; and it
+crosses the hook↔daemon wire via :meth:`CanonicalHookCall.to_wire` /
+:meth:`~CanonicalHookCall.from_wire` (``PROTOCOL_VERSION`` 2), so the daemon
+consumes a host-agnostic call and needs no host knowledge. The hook process
+parses once, compresses (it needs the original ``tool_response``), and ships the
+canonical; the daemon rehydrates and surfaces.
 """
 
 from __future__ import annotations
@@ -70,6 +70,12 @@ class CanonicalHookCall:
     host-agnostic name (e.g. ``shell``) from STM's canonical vocabulary that the
     allowlist + compression gates key on; ``""`` for a tool outside that
     vocabulary (never surfaced/compressed).
+
+    :meth:`to_wire` / :meth:`from_wire` serialize this for the hook↔daemon link:
+    the hook parses the raw host payload and sends the *canonical* over the wire,
+    so the daemon needs no host knowledge. ``tool_response`` (the original
+    object) is **not** transmitted — compression already ran in the hook process
+    before the wire, and surfacing needs only ``tool_response_text``.
     """
 
     event_type: str
@@ -79,6 +85,42 @@ class CanonicalHookCall:
     tool_response: Any = None
     tool_response_text: str = ""
     host_tag: str = "claude"
+
+    def to_wire(self) -> dict[str, Any]:
+        """Serialize for the daemon ``surface`` request (drops ``tool_response``).
+
+        Only the fields the daemon-side surfacing core consumes are sent; the
+        original ``tool_response`` object is omitted (compression is already done
+        and it may not be JSON-serializable)."""
+        return {
+            "event_type": self.event_type,
+            "tool_name": self.tool_name,
+            "canonical_tool": self.canonical_tool,
+            "tool_input": self.tool_input,
+            "tool_response_text": self.tool_response_text,
+            "host_tag": self.host_tag,
+        }
+
+    @classmethod
+    def from_wire(cls, data: Any) -> "CanonicalHookCall | None":
+        """Rebuild from a :meth:`to_wire` dict; ``None`` for a non-dict.
+
+        Permissive (mirrors :meth:`HostHookAdapter.parse`): missing/wrong-typed
+        fields coerce to safe defaults. ``tool_response`` is always ``None`` —
+        it is never transmitted — which is fine because the daemon path is
+        surfacing-only and reads ``tool_response_text``."""
+        if not isinstance(data, dict):
+            return None
+        tool_input = data.get("tool_input")
+        return cls(
+            event_type=str(data.get("event_type") or "PostToolUse"),
+            tool_name=str(data.get("tool_name") or ""),
+            canonical_tool=str(data.get("canonical_tool") or ""),
+            tool_input=tool_input if isinstance(tool_input, dict) else {},
+            tool_response=None,
+            tool_response_text=str(data.get("tool_response_text") or ""),
+            host_tag=str(data.get("host_tag") or "claude"),
+        )
 
 
 class HostHookAdapter(ABC):
