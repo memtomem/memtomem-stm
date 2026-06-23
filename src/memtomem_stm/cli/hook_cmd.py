@@ -68,7 +68,10 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 import click
 
+from memtomem_stm.cli.hook_adapter import get_adapter
+
 if TYPE_CHECKING:
+    from memtomem_stm.cli.hook_adapter import CanonicalHookCall
     from memtomem_stm.config import HookCompressionConfig, STMConfig
 
 logger = logging.getLogger(__name__)
@@ -530,7 +533,7 @@ async def _run_hook(
 
 
 def _record_hook_metrics(
-    payload: dict[str, Any],
+    call: "CanonicalHookCall",
     updated: dict[str, Any] | None,
     additional_context: str | None,
     config: "STMConfig",
@@ -538,10 +541,12 @@ def _record_hook_metrics(
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
     Makes native-tool spend — which never reaches the MCP proxy — visible next
-    to proxied calls. Persists **sizes only** (original / compressed / surfaced
-    chars + the tool name): never ``tool_input`` and never the output text,
-    mirroring the hook's no-query-text privacy posture (a ``Bash`` command may
-    carry secrets). Gated on ``config.hook.metrics_enabled`` (independent of
+    to proxied calls. Reads the normalized :class:`CanonicalHookCall` (``tool_name``
+    + the once-flattened ``tool_response_text``), so the raw payload is parsed
+    exactly once. Persists **sizes only** (original / compressed / surfaced chars
+    + the tool name): never ``tool_input`` and never the output text, mirroring
+    the hook's no-query-text privacy posture (a ``Bash`` command may carry
+    secrets). Gated on ``config.hook.metrics_enabled`` (independent of
     ``proxy.metrics.enabled`` so a hook-only deployment still measures), reusing
     the proxy's ``metrics.db_path`` / ``max_history``. A short-lived store is
     opened per call — the hook is a one-shot subprocess, so there is no
@@ -551,10 +556,10 @@ def _record_hook_metrics(
     try:
         if not config.hook.metrics_enabled:
             return
-        tool_name = payload.get("tool_name")
-        if not isinstance(tool_name, str) or not tool_name:
+        tool_name = call.tool_name
+        if not tool_name:
             return
-        original_chars = len(_tool_response_to_text(payload.get("tool_response")))
+        original_chars = len(call.tool_response_text)
         if original_chars == 0:
             return  # nothing observed (empty / malformed result) — skip
         compressed_chars = (
@@ -595,31 +600,51 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one ``hookSpecificOutput``.
 
-    The two stages are independent. Compression is an opt-in, Bash-only
-    ``updatedToolOutput`` stage that clones the payload — it never alters
-    what surfacing (or the daemon) receives, and it still runs when
-    surfacing is disabled or Bash is not in the *surface* allowlist.
-    Daemon-frame protection comes solely from ``_bounded_surfacing_payload``
-    (:data:`_SAFE_DAEMON_BUDGET`), which caps the payload copy handed to
-    surfacing whether or not compression ran. Surfacing is wrapped so a
-    failure degrades to "no memories" while still returning the compression
-    half (``maybe_compress_builtin`` is itself non-raising). The CLI wrapper
-    backstops the whole call. A non-raising metrics row (``source='hook'``) is
-    recorded afterwards via :func:`_record_hook_metrics`, regardless of whether
+    The host-shaped edges go through a :class:`HostHookAdapter` (B1, Claude
+    only): :meth:`parse` normalizes the payload into a :class:`CanonicalHookCall`
+    and :meth:`render` builds the host output. *Compression* is gated on the
+    adapter's ``can_replace_output`` capability — only hosts that honor output
+    replacement (Claude today; see B0) run it; for others it is skipped and only
+    the surfacing half renders. It is otherwise an opt-in, Bash-only
+    ``updatedToolOutput`` stage that clones the payload — it never alters what
+    surfacing (or the daemon) receives, and it still runs when surfacing is
+    disabled or Bash is not in the *surface* allowlist.
+
+    The two stages are independent. Daemon-frame protection comes solely from
+    ``_bounded_surfacing_payload`` (:data:`_SAFE_DAEMON_BUDGET`), which caps the
+    payload copy handed to surfacing whether or not compression ran. Surfacing is
+    wrapped so a failure degrades to "no memories" while still returning the
+    compression half (``maybe_compress_builtin`` is itself non-raising). The CLI
+    wrapper backstops the whole call. A non-raising metrics row (``source='hook'``)
+    is recorded afterwards via :func:`_record_hook_metrics`, regardless of whether
     either stage produced output.
+
+    Note (B1, deferred to B2): surfacing and compression still read the *raw*
+    ``payload``; the ``CanonicalHookCall`` drives adapter dispatch, the
+    compression gate, and metrics today. Having the shared core consume the
+    canonical (and sending it over the daemon wire) is the B2 step — the daemon
+    already treats the payload opaquely, so a Claude-only ship needs no wire change.
     """
     from memtomem_stm.config import STMConfig
 
     config = STMConfig()
-    updated = maybe_compress_builtin(payload, config.hook.compression)
+    adapter = get_adapter()
+    call = adapter.parse(payload)
+    if call is None:  # unusable payload → pass the tool output through untouched
+        return {}
+    updated = (
+        maybe_compress_builtin(payload, config.hook.compression)
+        if adapter.can_replace_output
+        else None
+    )
     surf_out: dict[str, Any] = {}
     try:
         surf_out = await _run_hook(_bounded_surfacing_payload(payload), config=config)
     except Exception:
         logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
-    _record_hook_metrics(payload, updated, additional_context, config)
-    return _build_hook_output(updated, additional_context)
+    _record_hook_metrics(call, updated, additional_context, config)
+    return adapter.render(updated_tool_output=updated, additional_context=additional_context)
 
 
 @click.command(name="hook")
