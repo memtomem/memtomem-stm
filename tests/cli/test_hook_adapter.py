@@ -11,8 +11,11 @@ alongside the wire-in commit.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
+from memtomem_stm.cli import hook_cmd
 from memtomem_stm.cli.hook_adapter import (
     CanonicalHookCall,
     ClaudeHookAdapter,
@@ -123,3 +126,32 @@ def test_get_adapter_returns_claude_and_falls_back():
     assert get_adapter("claude").host_tag == "claude"
     # Unknown host tag falls back to Claude (B1 registers only Claude).
     assert get_adapter("cursor").host_tag == "claude"
+
+
+# ── source pins (shape-identical routing a behavior spy can't see) ────────────
+
+
+def test_render_delegates_to_build_hook_output():
+    # The Claude output envelope (hookSpecificOutput / hookEventName /
+    # updatedToolOutput / additionalContext) must live in exactly ONE place
+    # (_build_hook_output), so render delegating to it — not inlining the keys —
+    # keeps a future B2 host from silently inheriting Claude's shape.
+    src = inspect.getsource(ClaudeHookAdapter.render)
+    assert "_build_hook_output(" in src
+    assert "hookSpecificOutput" not in src  # envelope built only in the helper
+
+
+def test_parse_delegates_flattening_to_shared_helper():
+    src = inspect.getsource(ClaudeHookAdapter.parse)
+    assert "_tool_response_to_text(" in src
+
+
+def test_orchestrate_routes_through_adapter():
+    # Pin the shape-identical routing: _orchestrate must dispatch via
+    # get_adapter() and use the adapter's parse/render, and gate compression on
+    # the capability flag rather than running it unconditionally.
+    src = inspect.getsource(hook_cmd._orchestrate)
+    assert "get_adapter(" in src
+    assert ".parse(" in src
+    assert ".render(" in src
+    assert "can_replace_output" in src
