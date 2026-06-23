@@ -469,7 +469,10 @@ when a config change — or a `PROTOCOL_VERSION` bump, which is folded into the
 key — leaves an old daemon stranded under a now-stale fingerprint (most visibly
 one pinned with `daemon.idle_timeout_seconds=0`, which never self-clears),
 `mms daemon status` reports it and `mms daemon stop --all` SIGTERMs it. `--all`
-is opt-in because a live daemon under another config may be intentional.
+is opt-in because a live daemon under another config may be intentional. Foreign
+daemon detection is POSIX-only for now: a foreign daemon can't be pinged (it may
+speak an older protocol) and Windows has no reliable signal-0 liveness check, so
+on Windows these commands report/act on the current config only.
 
 ## `mms project` — project-scoped MCP management
 

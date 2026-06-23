@@ -106,7 +106,18 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     the same one the current-config SIGTERM fallback already carries. Each entry
     carries only non-sensitive fields (``fingerprint``/``pid``/``host``/``port``)
     — never the auth ``token`` — so callers can render them.
+
+    **POSIX-only.** On Windows :func:`is_pid_alive` returns ``True`` for any
+    positive pid (no signal-0; it defers to a socket ``ping`` that the foreign
+    path can't make across a protocol gap), so it cannot tell a live foreign
+    daemon from a long-dead handshake. Rather than report every stale file as
+    "running", foreign detection is disabled there until a cross-platform
+    connect-probe lands (the follow-up above, which also closes the recycling
+    window).
     """
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
+        return []
+
     from memtomem_stm.daemon.discovery import (
         config_fingerprint,
         is_pid_alive,
@@ -306,21 +317,14 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     target is identified only by its recorded pid, so a crash-orphaned handshake
     naming a since-recycled pid would signal an unrelated process. This is why
     ``--all`` is opt-in; a process-identity cross-check is a tracked follow-up.
+    POSIX-only in practice: :func:`_live_foreign_daemons` yields nothing on
+    Windows (no verifiable foreign liveness there), so the loop never runs.
     """
     from memtomem_stm.daemon.discovery import is_pid_alive
 
     foreign = _live_foreign_daemons(config)
     if not foreign:
         click.echo("no daemons running under a different config")
-        return
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
-        listing = ", ".join(f"pid={d['pid']} fp={d['fingerprint']}" for d in foreign)
-        click.echo(
-            _warn(
-                f"{len(foreign)} daemon(s) under a different config are running "
-                f"({listing}); stop them by pid (no POSIX signal path on Windows)"
-            )
-        )
         return
     for d in foreign:
         pid = d["pid"]

@@ -892,6 +892,21 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         assert "no daemons running under a different config" in result.output
 
+    def test_foreign_detection_is_posix_only(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """On Windows `is_pid_alive` is True for any positive pid (no signal-0,
+        and the foreign path can't ping), so it would report every stale
+        handshake as live. Foreign detection must yield nothing there instead."""
+        from memtomem_stm.cli import daemon_cmd
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        # Even with a maximally-permissive liveness probe + simulated Windows,
+        # the POSIX-only gate returns [] (so no false-positive foreign daemons).
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(daemon_cmd.os, "name", "nt")
+
+        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+
 
 class TestDaemonRestartCli:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
