@@ -34,6 +34,9 @@ assume arbitrary text is injected verbatim).
 
 - `inbound_shell_posttooluse.json` — PostToolUse payload (documented field names; `Shell`
   tool value; illustrative field values).
-- `expected_surfacing_stdout.txt` — the **literal stdout** (+ exit 0) the hook emits to
-  surface the canonical block. NOTE: the channel is plain stdout, not a JSON wrapper — so the
-  expected artifact is `.txt`, byte-for-byte what the process should print.
+- `expected_surfacing_stdout.txt` — the canonical surfaced block as **literal stdout** (the
+  hook prints it and exits 0; the channel is plain stdout, not a JSON key). The file stores the
+  block bytes only — **byte-identical** to the Cursor/Codex `additional_context` values. A live
+  hook additionally emits one trailing newline (stdout framing from `print`/`echo`); that
+  newline is not part of the canonical block, so it is omitted here to keep the three fixtures
+  byte-identical. The Kimi adapter's `render()` is responsible for that stdout framing.

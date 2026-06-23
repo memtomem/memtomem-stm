@@ -14,8 +14,11 @@ These are the golden files for the B1 `HostHookAdapter` `parse()` / `render()` t
 ## Provenance — B0 (verified 2026-06-23)
 
 Field names, event names, output shapes, and config locations here are pinned to current
-official docs and adversarially re-verified. Full report + citations + corrected capability
-matrix: `docs/reports/b0-host-hook-contract-verification-2026-06-23.md`.
+official docs and adversarially re-verified (the B0 doc-verification gate). **Per-field
+citations — source URLs + verbatim quotes — live in each `<host>/README.md`.** (The full B0
+verification report, with the corrected cross-host capability matrix, is kept as a local
+working note under `docs/reports/` and is intentionally not committed — matching this repo's
+convention that `docs/reports/` holds uncommitted working artifacts.)
 
 In each fixture, **field _names_ are doc-verified; field _values_ are illustrative** (test
 data), except where a value is itself documented verbatim (e.g. Cursor's `tool_name: "Shell"`
@@ -28,18 +31,28 @@ example). Per-host caveats and the verified/unverified marks live in each `<host
   Codex `updatedMCPToolOutput` = "parsed but not supported yet" + MCP-only). So no host
   fixture emits an output-replace field — compression stays Claude-Code-only.
 - **Canonical surfaced block (shared across hosts).** All three `expected_surfacing_*`
-  fixtures carry the **same** surfaced-memories text, so a B1 render test can feed one
-  canonical block and assert each host wraps it correctly. The canonical block is:
+  fixtures carry the **byte-identical** surfaced-memories block below, so a B1 render test can
+  feed one canonical block and assert each host wraps it correctly. It mirrors what `mms hook`
+  actually places in Claude Code's `hookSpecificOutput.additionalContext`: the block is
+  **wrapped in `<surfaced-memories>…</surfaced-memories>` delimiters**, and those delimiters are
+  part of the channel content — `_extract_surfaced_block()` in
+  `src/memtomem_stm/cli/hook_cmd.py` returns the block *including* its delimiters (it slices the
+  block out of the full tool response; it does **not** strip the delimiters). The canonical
+  block is:
 
   ```
+  <surfaced-memories>
   Relevant memories (memtomem LTM):
   - Rotate the service token with `mms rotate`; do not edit config.toml by hand.
   - Point integration-test feedback_db_path at /tmp, never ~/.memtomem.
+  </surfaced-memories>
   ```
 
-  (This mirrors the content `mms hook` puts in Claude Code's
-  `hookSpecificOutput.additionalContext` — the `<surfaced-memories>` delimiters are sliced
-  off by `SurfacingFormatter`, so the channel carries just the memories.)
+  The three expected outputs carry this block byte-for-byte — Cursor/Codex as a JSON string
+  value, Kimi as literal stdout. Note: a live Kimi hook prints to stdout and so emits one
+  trailing newline *after* the block; that newline is stdout framing, not part of the block, so
+  the `.txt` fixture stores the block bytes only (no trailing newline) to keep the three
+  byte-identical. The Kimi adapter's `render()` owns that framing.
 
 ## Hosts present / absent
 
