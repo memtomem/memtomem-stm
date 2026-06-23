@@ -117,6 +117,61 @@ def test_canonical_hook_call_is_frozen():
         call.tool_name = "Write"  # type: ignore[misc]
 
 
+# ── wire serialization (hook → daemon) ─────────────────────────────────────────
+
+
+def test_to_wire_drops_tool_response_keeps_text():
+    response = {"stdout": "x" * 500, "stderr": "warn", "exitCode": 0}
+    call = _CLAUDE.parse(
+        {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": response}
+    )
+    assert call is not None
+    wire = call.to_wire()
+    # The original tool_response object is NOT transmitted (compression already
+    # ran in the hook process; it may not even be JSON-serializable).
+    assert "tool_response" not in wire
+    assert wire["tool_name"] == "Bash"
+    assert wire["canonical_tool"] == "shell"
+    assert wire["tool_input"] == {"command": "ls"}
+    assert wire["tool_response_text"] == call.tool_response_text
+    assert wire["event_type"] == "PostToolUse"
+    assert wire["host_tag"] == "claude"
+
+
+def test_from_wire_round_trips_surfacing_fields():
+    call = _CLAUDE.parse(
+        {"tool_name": "Grep", "tool_input": {"pattern": "jwt"}, "tool_response": {"stdout": "hit"}}
+    )
+    assert call is not None
+    rebuilt = CanonicalHookCall.from_wire(call.to_wire())
+    assert rebuilt is not None
+    # Everything the daemon-side core consumes survives; tool_response is None
+    # (never transmitted) but the daemon path reads tool_response_text.
+    assert rebuilt.event_type == call.event_type
+    assert rebuilt.tool_name == call.tool_name
+    assert rebuilt.canonical_tool == call.canonical_tool
+    assert rebuilt.tool_input == call.tool_input
+    assert rebuilt.tool_response_text == call.tool_response_text
+    assert rebuilt.host_tag == call.host_tag
+    assert rebuilt.tool_response is None
+
+
+@pytest.mark.parametrize("bad", [None, "not a dict", [1, 2], 42])
+def test_from_wire_non_dict_is_none(bad):
+    assert CanonicalHookCall.from_wire(bad) is None
+
+
+def test_from_wire_coerces_missing_and_wrong_typed_fields():
+    rebuilt = CanonicalHookCall.from_wire({"tool_input": "oops"})
+    assert rebuilt is not None
+    assert rebuilt.event_type == "PostToolUse"  # missing → default
+    assert rebuilt.tool_name == ""
+    assert rebuilt.canonical_tool == ""
+    assert rebuilt.tool_input == {}  # non-dict → {}
+    assert rebuilt.tool_response_text == ""
+    assert rebuilt.host_tag == "claude"
+
+
 # ── render (delegates to _build_hook_output — must stay byte-identical) ────────
 
 _BLOCK = "<surfaced-memories>\nMEM\n</surfaced-memories>"

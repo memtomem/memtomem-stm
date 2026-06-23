@@ -24,12 +24,14 @@ from memtomem_stm.daemon.protocol import (
     OP_PING,
     OP_SHUTDOWN,
     OP_SURFACE,
+    PROTOCOL_VERSION,
     build_request,
     encode_line,
     read_message,
 )
 
 if TYPE_CHECKING:
+    from memtomem_stm.cli.hook_adapter import CanonicalHookCall
     from memtomem_stm.config import STMConfig
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,19 @@ async def _request(
             reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
             writer.write(encode_line(build_request(token, op, payload)))
             await writer.drain()
-            return await read_message(reader)
+            resp = await read_message(reader)
+        # Protocol-version guard. A wire-incompatible daemon keys to a different
+        # fingerprint and is normally invisible here; this rejects a stray reply
+        # (e.g. a hand-crafted peer, or a future renegotiation path) rather than
+        # acting on a frame shape this client may not understand.
+        if resp.get("v") != PROTOCOL_VERSION:
+            logger.debug(
+                "daemon response protocol mismatch (got v=%s, want %s)",
+                resp.get("v"),
+                PROTOCOL_VERSION,
+            )
+            return None
+        return resp
     except (OSError, asyncio.TimeoutError):
         return None  # unreachable / refused / over-budget — quiet
     except Exception:
@@ -107,14 +121,17 @@ async def ping(config: STMConfig, *, timeout: float = 2.0) -> dict[str, Any] | N
 
 
 async def surface(
-    config: STMConfig, payload: dict[str, Any], *, timeout: float
+    config: STMConfig, call: "CanonicalHookCall", *, timeout: float
 ) -> dict[str, Any] | None:
-    """Round-trip a ``surface`` request. Returns the hook-output dict, or
-    ``None`` if the daemon is unavailable/stale/slow (caller degrades)."""
+    """Round-trip a ``surface`` request for a normalized :class:`CanonicalHookCall`.
+
+    Sends the call's host-agnostic wire form (``to_wire``) so the daemon needs no
+    host knowledge. Returns the hook-output dict, or ``None`` if the daemon is
+    unavailable/stale/slow/version-mismatched (caller degrades)."""
     hs = _live_handshake_candidate(config)
     if hs is None:
         return None
-    resp = await _request(hs, OP_SURFACE, payload, timeout=timeout)
+    resp = await _request(hs, OP_SURFACE, call.to_wire(), timeout=timeout)
     if resp is not None and resp.get("ok") and isinstance(resp.get("output"), dict):
         return resp["output"]
     return None

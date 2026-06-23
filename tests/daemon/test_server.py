@@ -37,8 +37,10 @@ from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_PING,
     OP_SURFACE,
+    PROTOCOL_VERSION,
     build_request,
     encode_line,
+    read_message,
 )
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -77,6 +79,14 @@ _READ_PAYLOAD = {
     "tool_input": {"file_path": "/src/auth/jwt_handler.py"},
     "tool_response": {"content": _LONG},
 }
+
+
+def _canonical(payload: dict):
+    """Parse a raw host payload into the CanonicalHookCall the hook/daemon now
+    pass around (``client.surface`` serializes it onto the wire)."""
+    from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter
+
+    return ClaudeHookAdapter().parse(payload)
 
 
 def _config(tmp_path: Path) -> STMConfig:
@@ -166,7 +176,7 @@ async def test_surface_round_trip_injects_memories(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     _, task = await _start(cfg, engine=_engine_with_result())
     try:
-        out = await client.surface(cfg, _READ_PAYLOAD, timeout=3.0)
+        out = await client.surface(cfg, _canonical(_READ_PAYLOAD), timeout=3.0)
         assert out is not None
         ctx = out["hookSpecificOutput"]["additionalContext"]
         assert "<surfaced-memories>" in ctx
@@ -189,7 +199,7 @@ async def test_noop_surface_for_non_allowlisted_tool_real_wiring(tmp_path: Path)
             "tool_input": {"file_path": "/x"},
             "tool_response": {"content": _LONG},
         }
-        out = await client.surface(cfg, payload, timeout=3.0)
+        out = await client.surface(cfg, _canonical(payload), timeout=3.0)
         assert out == {}
     finally:
         await _stop(cfg, task)
@@ -204,7 +214,11 @@ async def test_bad_token_is_rejected(tmp_path: Path) -> None:
         reader, writer = await asyncio.open_connection(
             hs["host"], hs["port"], limit=MAX_MESSAGE_BYTES
         )
-        writer.write(encode_line(build_request("wrong-token", OP_SURFACE, _READ_PAYLOAD)))
+        writer.write(
+            encode_line(
+                build_request("wrong-token", OP_SURFACE, _canonical(_READ_PAYLOAD).to_wire())
+            )
+        )
         await writer.drain()
         # Server closes the connection without responding to an unauthenticated peer.
         data = await asyncio.wait_for(reader.read(), timeout=3.0)
@@ -214,11 +228,76 @@ async def test_bad_token_is_rejected(tmp_path: Path) -> None:
         await _stop(cfg, task)
 
 
+async def test_server_rejects_mismatched_protocol_version(tmp_path: Path) -> None:
+    # An authenticated request carrying a wrong protocol `v` gets an explicit
+    # error frame, not action on a payload shape this version may not understand.
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        hs = read_handshake(_hs_path(cfg))
+        assert hs is not None
+        reader, writer = await asyncio.open_connection(
+            hs["host"], hs["port"], limit=MAX_MESSAGE_BYTES
+        )
+        # Correct token, wrong version — craft the frame directly (build_request
+        # always stamps the current PROTOCOL_VERSION).
+        frame = {"v": 999, "token": hs["token"], "op": OP_PING}
+        writer.write(encode_line(frame))
+        await writer.drain()
+        resp = await asyncio.wait_for(read_message(reader), timeout=3.0)
+        assert resp["ok"] is False
+        assert "version" in resp["error"]
+        assert resp["v"] == PROTOCOL_VERSION
+        writer.close()
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_client_rejects_mismatched_protocol_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A live v2 daemon answers, but a client built at a different protocol
+    # version must discard the reply (defense beyond the fingerprint split).
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        # Sanity: same-version ping works.
+        assert await client.ping(cfg, timeout=3.0) is not None
+        # Now pretend the client speaks a different protocol version. The daemon
+        # still replies with its own v (== real PROTOCOL_VERSION), which the
+        # client's response guard rejects → None.
+        monkeypatch.setattr("memtomem_stm.daemon.client.PROTOCOL_VERSION", 999)
+        assert await client.ping(cfg, timeout=3.0) is None
+        assert await client.surface(cfg, _canonical(_READ_PAYLOAD), timeout=3.0) is None
+    finally:
+        await _stop(cfg, task)
+
+
 async def test_surface_returns_none_when_daemon_absent(tmp_path: Path) -> None:
     # No daemon → client.surface returns None so the hook degrades to {}.
     cfg = _config(tmp_path)
-    out = await client.surface(cfg, _READ_PAYLOAD, timeout=0.5)
+    out = await client.surface(cfg, _canonical(_READ_PAYLOAD), timeout=0.5)
     assert out is None
+
+
+async def test_oversized_wire_frame_degrades_to_none(tmp_path: Path) -> None:
+    # _bounded_call caps tool_response_text, but to_wire ships tool_input
+    # uncapped. If an operator adds write/edit to the surface allowlist, a
+    # multi-MB tool_input (file contents / new_string) can push the frame past
+    # MAX_MESSAGE_BYTES. The contract (documented in hook_cmd._SAFE_DAEMON_BUDGET)
+    # is that this degrades to None — the server's readline limit drops the
+    # oversized frame and the client gets no parseable reply — and never raises
+    # to the host. A live daemon makes this exercise the server-side drop, not
+    # just the daemon-absent path above.
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        huge = "z" * (MAX_MESSAGE_BYTES + 4096)
+        call = _canonical({**_READ_PAYLOAD, "tool_input": {"file_path": "/x", "content": huge}})
+        out = await client.surface(cfg, call, timeout=3.0)
+        assert out is None  # degraded, no exception raised
+    finally:
+        await _stop(cfg, task)
 
 
 async def test_hook_run_hook_routes_to_live_daemon(
@@ -237,7 +316,7 @@ async def test_hook_run_hook_routes_to_live_daemon(
     cfg = STMConfig()  # reads the env above → data_dir == tmp_path
     _, task = await _start(cfg, engine=_engine_with_result())
     try:
-        out = await _run_hook(_READ_PAYLOAD)
+        out = await _run_hook(_canonical(_READ_PAYLOAD))
         ctx = out["hookSpecificOutput"]["additionalContext"]
         assert "<surfaced-memories>" in ctx
     finally:
@@ -346,7 +425,7 @@ async def test_hook_run_hook_skips_when_daemon_absent(
 
     from memtomem_stm.cli.hook_cmd import _run_hook
 
-    out = await _run_hook(_READ_PAYLOAD)
+    out = await _run_hook(_canonical(_READ_PAYLOAD))
     assert out == {}
     assert calls == [1]  # fire-and-forget spawn requested
 
@@ -373,7 +452,7 @@ async def test_hook_run_hook_autospawn_runs_off_event_loop(
 
     from memtomem_stm.cli.hook_cmd import _run_hook
 
-    out = await _run_hook(_READ_PAYLOAD)
+    out = await _run_hook(_canonical(_READ_PAYLOAD))
     assert out == {}
     assert threads == [True]  # ran in a worker thread, not on the loop thread
 
@@ -393,7 +472,7 @@ async def test_hook_run_hook_no_autospawn_when_disabled(
 
     from memtomem_stm.cli.hook_cmd import _run_hook
 
-    out = await _run_hook(_READ_PAYLOAD)
+    out = await _run_hook(_canonical(_READ_PAYLOAD))
     assert out == {}
     assert calls == []
 
@@ -414,7 +493,7 @@ async def test_hook_run_hook_autospawn_never_raises(
 
     from memtomem_stm.cli.hook_cmd import _run_hook
 
-    out = await _run_hook(_READ_PAYLOAD)
+    out = await _run_hook(_canonical(_READ_PAYLOAD))
     assert out == {}
 
 
@@ -441,7 +520,7 @@ async def test_hook_run_hook_autospawn_with_fallback_cold(
 
     monkeypatch.setattr(hook_cmd, "run_surfacing_hook", _fake_cold)
 
-    out = await hook_cmd._run_hook(_READ_PAYLOAD)
+    out = await hook_cmd._run_hook(_canonical(_READ_PAYLOAD))
     assert spawned == [1]  # spawn kicked off for next call
     # Cold path ran this call with the normalized CanonicalHookCall (Read→read).
     assert len(cold) == 1 and cold[0].tool_name == "Read" and cold[0].canonical_tool == "read"
@@ -467,7 +546,7 @@ async def test_hook_run_hook_no_autospawn_when_daemon_live(
     cfg = STMConfig()
     _, task = await _start(cfg, engine=_engine_with_result())
     try:
-        out = await _run_hook(_READ_PAYLOAD)
+        out = await _run_hook(_canonical(_READ_PAYLOAD))
         assert "<surfaced-memories>" in out["hookSpecificOutput"]["additionalContext"]
         assert calls == []  # live daemon → no duplicate spawn
     finally:
@@ -602,7 +681,7 @@ async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
     before = daemon_server._direct_child_pids()
     _, task = await _start(cfg)  # real _build_engine
     try:
-        out = await client.surface(cfg, _READ_PAYLOAD, timeout=15.0)
+        out = await client.surface(cfg, _canonical(_READ_PAYLOAD), timeout=15.0)
         assert out is not None
         ltm_children = daemon_server._direct_child_pids() - before
         assert ltm_children  # the surface call warmed a real stdio LTM child

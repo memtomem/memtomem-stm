@@ -28,7 +28,7 @@ from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter
 from memtomem_stm.cli.hook_cmd import (
     _COMPRESS_SENTINEL,
     _SAFE_DAEMON_BUDGET,
-    _bounded_surfacing_payload,
+    _bounded_call,
     _build_hook_output,
     _daemon_enabled,
     _extract_surfaced_block,
@@ -348,7 +348,7 @@ def test_daemon_explicitly_disabled_uses_cold_path(monkeypatch: pytest.MonkeyPat
     # client.surface must never be consulted when the daemon is opted out.
     boom = AsyncMock(side_effect=AssertionError("daemon must not be used when disabled"))
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", boom)
-    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
     assert out == sentinel
     boom.assert_not_called()
 
@@ -364,7 +364,7 @@ def test_daemon_used_when_enabled(monkeypatch: pytest.MonkeyPatch):
         "memtomem_stm.cli.hook_cmd.run_surfacing_hook",
         AsyncMock(side_effect=AssertionError("cold path must not run on a daemon hit")),
     )
-    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
     assert out == daemon_out
 
 
@@ -378,7 +378,7 @@ def test_daemon_not_used_for_ineligible_tool(monkeypatch: pytest.MonkeyPatch):
         side_effect=AssertionError("daemon must not be consulted for an ineligible tool")
     )
     monkeypatch.setattr("memtomem_stm.daemon.client.surface", surface)
-    out = asyncio.run(_run_hook({**_READ_PAYLOAD, "tool_name": "Write"}))
+    out = asyncio.run(_run_hook(_canonical({**_READ_PAYLOAD, "tool_name": "Write"})))
     assert out == {}
     assert spawns == []
     surface.assert_not_called()
@@ -392,7 +392,7 @@ def test_daemon_unavailable_skip_returns_empty(monkeypatch: pytest.MonkeyPatch):
         "memtomem_stm.cli.hook_cmd.run_surfacing_hook",
         AsyncMock(side_effect=AssertionError("skip must not fall back to the cold path")),
     )
-    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
     assert out == {}
 
 
@@ -404,7 +404,7 @@ def test_daemon_unavailable_cold_fallback(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=sentinel)
     )
-    out = asyncio.run(_run_hook(_READ_PAYLOAD))
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
     assert out == sentinel
 
 
@@ -651,20 +651,23 @@ def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
     assert read_compression_summary(db, source="hook")["total_calls"] == 0
 
 
-# ── bounded surfacing payload + merge builder ────────────────────────────────
+# ── bounded canonical call + merge builder ───────────────────────────────────
 
 
-def test_bounded_surfacing_payload_passthrough_when_small():
-    payload = _bash_payload({"stdout": "small"})
-    assert _bounded_surfacing_payload(payload) is payload  # same object, no copy
+def test_bounded_call_passthrough_when_small():
+    call = _bash_call({"stdout": "small"})
+    assert _bounded_call(call) is call  # same object, no copy
 
 
-def test_bounded_surfacing_payload_caps_huge_output():
+def test_bounded_call_caps_huge_text():
     huge = "x" * (_SAFE_DAEMON_BUDGET + 5000)
-    payload = _bash_payload({"stdout": huge, "stderr": "y" * 100})
-    bounded = _bounded_surfacing_payload(payload)
-    assert bounded is not payload
-    assert len(bounded["tool_response"]) == _SAFE_DAEMON_BUDGET
+    call = _bash_call({"stdout": huge, "stderr": "y" * 100})
+    bounded = _bounded_call(call)
+    assert bounded is not call
+    assert len(bounded.tool_response_text) == _SAFE_DAEMON_BUDGET
+    # The capped copy is sent over the wire; nothing else changes.
+    assert bounded.tool_name == call.tool_name
+    assert bounded.canonical_tool == "shell"
 
 
 def test_build_hook_output_merges_both_halves():

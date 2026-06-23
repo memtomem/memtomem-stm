@@ -38,7 +38,7 @@ import sys
 import time
 from typing import Any
 
-from memtomem_stm.cli.hook_adapter import get_adapter
+from memtomem_stm.cli.hook_adapter import CanonicalHookCall
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import discovery, locking
@@ -373,6 +373,13 @@ class DaemonServer:
                 pass
 
     async def _dispatch(self, req: dict[str, Any]) -> dict[str, Any] | None:
+        # Protocol-version guard. A wire-incompatible client normally keys to a
+        # different config_fingerprint and never finds this daemon's handshake;
+        # this rejects a stray/mismatched authenticated request rather than
+        # acting on a payload shape this version may not understand.
+        if req.get("v") != PROTOCOL_VERSION:
+            logger.debug("daemon rejected request with protocol v=%s", req.get("v"))
+            return {"v": PROTOCOL_VERSION, "ok": False, "error": "unsupported protocol version"}
         op = req.get("op")
         if op == OP_PING:
             return {"v": PROTOCOL_VERSION, "ok": True, "status": "ready", "ltm": self._ltm_warmth()}
@@ -381,17 +388,13 @@ class DaemonServer:
             self._shutdown_event.set()
             return {"v": PROTOCOL_VERSION, "ok": True, "status": "shutting_down"}
         if op == OP_SURFACE:
-            payload = req.get("payload")
-            if not isinstance(payload, dict):
-                return surface_response({})
-            self._last_request = time.monotonic()
-            # Normalize the raw host payload into a CanonicalHookCall the core
-            # consumes. The wire still carries Claude's raw PostToolUse payload
-            # today (PROTOCOL_VERSION unchanged), so the daemon parses it with the
-            # Claude adapter; sending the canonical over the wire is the next step.
-            call = get_adapter().parse(payload)
+            # The wire carries a host-agnostic CanonicalHookCall (the hook
+            # normalized it before sending), so the daemon needs no host
+            # knowledge — just rehydrate and run the shared core.
+            call = CanonicalHookCall.from_wire(req.get("payload"))
             if call is None:
                 return surface_response({})
+            self._last_request = time.monotonic()
             # Serialize: one LTM RPC at a time over the shared MCP session.
             async with self._surface_lock:
                 output = await run_surfacing_hook(call, engine=self._engine)
