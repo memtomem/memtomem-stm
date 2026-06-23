@@ -1,0 +1,125 @@
+"""Tests for ``cli/hook_adapter.py`` — the host-shaped parse/render seam.
+
+B1 ships only :class:`ClaudeHookAdapter`. These pin that ``parse`` normalizes a
+Claude PostToolUse payload into a :class:`CanonicalHookCall` (and no-ops on a
+bad payload), and that ``render`` is byte-identical to the existing
+``_build_hook_output`` envelope (it delegates to it). The capability flag
+(``can_replace_output``) and the registry dispatch are pinned too. A
+source-inspection test that the wiring routes through the adapter lives
+alongside the wire-in commit.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from memtomem_stm.cli.hook_adapter import (
+    CanonicalHookCall,
+    ClaudeHookAdapter,
+    get_adapter,
+)
+from memtomem_stm.cli.hook_cmd import _build_hook_output, _tool_response_to_text
+
+_CLAUDE = ClaudeHookAdapter()
+
+
+# ── parse ────────────────────────────────────────────────────────────────────
+
+
+def test_adapter_parse_claude_valid_payload():
+    response = {"content": "JWT handler. " * 20}
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/src/auth/jwt.py"},
+        "tool_response": response,
+    }
+    call = _CLAUDE.parse(payload)
+    assert isinstance(call, CanonicalHookCall)
+    assert call.event_type == "PostToolUse"
+    assert call.tool_name == "Read"
+    assert call.tool_input == {"file_path": "/src/auth/jwt.py"}
+    # The ORIGINAL response object is preserved (compression needs the real dict).
+    assert call.tool_response is response
+    # tool_response_text is the flattened text, identical to the shared helper.
+    assert call.tool_response_text == _tool_response_to_text(response)
+    assert call.host_tag == "claude"
+
+
+def test_adapter_parse_defaults_event_to_posttooluse():
+    call = _CLAUDE.parse({"tool_name": "Bash", "tool_response": {"stdout": "ok"}})
+    assert call is not None
+    assert call.event_type == "PostToolUse"
+
+
+@pytest.mark.parametrize("bad", [None, "not a dict", [1, 2, 3], 42])
+def test_adapter_parse_non_dict_is_none(bad):
+    # Mirrors _read_payload's None no-op; never raises.
+    assert _CLAUDE.parse(bad) is None
+
+
+def test_adapter_parse_coerces_missing_and_wrong_typed_fields():
+    # Permissive: missing tool_name -> "", non-dict tool_input -> {}, missing
+    # tool_response -> None/"" — eligibility gating stays in the core, not parse.
+    call = _CLAUDE.parse({"hook_event_name": "PostToolUse", "tool_input": "oops"})
+    assert call is not None
+    assert call.tool_name == ""
+    assert call.tool_input == {}
+    assert call.tool_response is None
+    assert call.tool_response_text == ""
+
+
+def test_canonical_hook_call_is_frozen():
+    call = _CLAUDE.parse({"tool_name": "Read", "tool_response": "x"})
+    assert call is not None
+    with pytest.raises((AttributeError, TypeError)):
+        call.tool_name = "Write"  # type: ignore[misc]
+
+
+# ── render (delegates to _build_hook_output — must stay byte-identical) ────────
+
+_BLOCK = "<surfaced-memories>\nMEM\n</surfaced-memories>"
+
+
+def test_adapter_render_compression_only():
+    updated = {"stdout": "compressed"}
+    out = _CLAUDE.render(updated_tool_output=updated, additional_context=None)
+    assert out == _build_hook_output(updated, None)
+    assert out["hookSpecificOutput"].keys() == {"hookEventName", "updatedToolOutput"}
+
+
+def test_adapter_render_surfacing_only():
+    out = _CLAUDE.render(updated_tool_output=None, additional_context=_BLOCK)
+    assert out == _build_hook_output(None, _BLOCK)
+    assert out["hookSpecificOutput"].keys() == {"hookEventName", "additionalContext"}
+
+
+def test_adapter_render_both_halves():
+    updated = {"stdout": "c"}
+    out = _CLAUDE.render(updated_tool_output=updated, additional_context=_BLOCK)
+    assert out == _build_hook_output(updated, _BLOCK)
+    hso = out["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PostToolUse"
+    assert hso["updatedToolOutput"] == updated
+    assert hso["additionalContext"] == _BLOCK
+
+
+def test_adapter_render_neither_is_empty():
+    assert _CLAUDE.render(updated_tool_output=None, additional_context=None) == {}
+
+
+# ── capability + registry dispatch ────────────────────────────────────────────
+
+
+def test_claude_capability_and_tag():
+    # Claude is the one host that can replace native tool output (B0). Surfacing
+    # is universal; compression is gated on this flag in the orchestrator.
+    assert _CLAUDE.host_tag == "claude"
+    assert _CLAUDE.can_replace_output is True
+
+
+def test_get_adapter_returns_claude_and_falls_back():
+    assert get_adapter().host_tag == "claude"
+    assert get_adapter("claude").host_tag == "claude"
+    # Unknown host tag falls back to Claude (B1 registers only Claude).
+    assert get_adapter("cursor").host_tag == "claude"
