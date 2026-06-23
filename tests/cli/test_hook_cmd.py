@@ -454,6 +454,18 @@ def test_compress_no_false_positive_on_truncate_marker():
     assert out is not None and out["stdout"].startswith(_COMPRESS_SENTINEL)
 
 
+def test_compress_no_false_positive_on_embedded_sentinel():
+    # Self-referential output (``git log`` / ``grep`` / ``cat`` over STM's own
+    # repo, history, or docs) can legitimately contain the sentinel string
+    # mid-text. Idempotency keys on OUR prefix only, so such output must still be
+    # compressed. Regression: a bare ``in`` match left the whole result
+    # uncompressed (observed on ``git log --stat`` whose commit body names the
+    # sentinel).
+    embedded = f"a commit body mentioning the {_COMPRESS_SENTINEL} sentinel\n" + _BIG_STDOUT
+    out = maybe_compress_builtin(_bash_payload({"stdout": embedded}), _CFG)
+    assert out is not None and out["stdout"].startswith(_COMPRESS_SENTINEL)
+
+
 def test_compress_never_raises(monkeypatch: pytest.MonkeyPatch):
     class _Boom:
         def compress(self, *a, **k):
