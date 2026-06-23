@@ -92,6 +92,39 @@ def test_handshake_and_lock_paths_keyed_by_fingerprint(tmp_path: Path):
     assert discovery.handshake_path(tmp_path, "aaaa") == discovery.handshake_path(tmp_path, "aaaa")
 
 
+def _put_handshake(data_dir: Path, fingerprint: str, pid: int) -> None:
+    discovery.write_handshake(
+        discovery.handshake_path(data_dir, fingerprint),
+        pid=pid,
+        host="127.0.0.1",
+        port=1,
+        token="t",
+        config_fingerprint=fingerprint,
+        created_at=0.0,
+    )
+
+
+def test_iter_foreign_handshakes_excludes_current_and_bad(tmp_path: Path):
+    # Three published daemons + one malformed file; the current fingerprint is
+    # excluded, the malformed file is skipped, the rest come back keyed by the
+    # filename fingerprint and sorted.
+    _put_handshake(tmp_path, "cur00000", pid=10)
+    _put_handshake(tmp_path, "bbbb1111", pid=20)
+    _put_handshake(tmp_path, "aaaa0000", pid=30)
+    (tmp_path / "stm-daemon-broken.json").write_text("{not json", encoding="utf-8")
+    # Sibling files that share neither shape must be ignored.
+    (tmp_path / "stm-daemon.log").write_text("noise", encoding="utf-8")
+
+    out = discovery.iter_foreign_handshakes(tmp_path, "cur00000")
+
+    assert [fp for fp, _ in out] == ["aaaa0000", "bbbb1111"]  # sorted, current dropped
+    assert all(hs.get("pid") in (20, 30) for _, hs in out)
+
+
+def test_iter_foreign_handshakes_missing_dir(tmp_path: Path):
+    assert discovery.iter_foreign_handshakes(tmp_path / "nope", "cur") == []
+
+
 def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())
@@ -635,6 +668,125 @@ class TestDaemonStatusCli:
         result = CliRunner().invoke(_cli(), ["daemon", "status"])
         assert result.exit_code == 0, result.output
         assert "stopped" in result.output
+
+
+class TestDaemonForeignOrphans:
+    """`#517` — daemons orphaned under a stale fingerprint (config/protocol drift)
+    must be visible to ``status`` and stoppable via ``stop --all``, even when
+    pinned with ``idle_timeout_seconds=0`` (so they never self-clear)."""
+
+    def _write_foreign(self, tmp_path: Path, fingerprint: str, pid: int) -> None:
+        discovery.write_handshake(
+            discovery.handshake_path(tmp_path, fingerprint),
+            pid=pid,
+            host="127.0.0.1",
+            port=4242,
+            token="secret-token",
+            config_fingerprint=fingerprint,
+            created_at=0.0,
+        )
+
+    def test_status_reports_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        cur = discovery.config_fingerprint(STMConfig())
+        assert cur != "foreignfp000000"
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+
+        # JSON surface: a `foreign` array with non-sensitive fields (never token).
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["foreign"] == [
+            {"fingerprint": "foreignfp000000", "pid": 98765, "host": "127.0.0.1", "port": 4242}
+        ]
+        assert "secret-token" not in result.output
+
+        # Text surface: a warning line + the actionable hint.
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert result.exit_code == 0, result.output
+        assert "pid=98765 fp=foreignfp000000" in result.output
+        assert "stop --all" in result.output
+
+    def test_bare_stop_leaves_foreign_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "no running daemon" in result.output
+        assert killed == []  # default scope never reaches a different-config daemon
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
+    def test_stop_all_sigterms_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import signal as _signal
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 0, result.output
+        assert killed == [(98765, _signal.SIGTERM)]
+        assert "sent SIGTERM to daemon pid=98765 (fp=foreignfp000000)" in result.output
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
+    def test_pinned_fingerprint_change_is_reachable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The acceptance scenario: a real fingerprint change strands a pinned
+        daemon, which ``stop --all`` then reaches by pid."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        # The "old" daemon ran under a different fingerprinted config (min_score),
+        # then the operator changed it — leaving the old handshake stranded.
+        old = STMConfig()
+        old.surfacing.min_score = 0.5
+        old_fp = discovery.config_fingerprint(old)
+        assert old_fp != discovery.config_fingerprint(STMConfig())
+        self._write_foreign(tmp_path, old_fp, pid=4321)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 0, result.output
+        assert [pid for pid, _ in killed] == [4321]
+        assert f"fp={old_fp}" in result.output
+
+    def test_stop_all_no_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 0, result.output
+        assert "no daemons running under a different config" in result.output
 
 
 class TestDaemonRestartCli:

@@ -84,6 +84,43 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
+    """Daemons running under a *different* config fingerprint than the current one.
+
+    These are orphans left when a fingerprinted field — or ``PROTOCOL_VERSION``,
+    which is folded into the fingerprint so *every* protocol bump counts — changes
+    while a daemon is running: the old daemon keeps its handshake under the old
+    fingerprint, where ``stop``/``status`` (keyed to the *current* fingerprint)
+    never look. A daemon with a finite ``idle_timeout_seconds`` clears itself, but
+    a pinned ``idle_timeout_seconds=0`` one lingers — this surfaces it.
+
+    Liveness is the recorded pid (:func:`is_pid_alive`): a foreign daemon may
+    speak an older protocol, so a socket ``ping`` would fail the version gate.
+    Each entry carries only non-sensitive fields (``fingerprint``/``pid``/
+    ``host``/``port``) — never the auth ``token`` — so callers can render them.
+    """
+    from memtomem_stm.daemon.discovery import (
+        config_fingerprint,
+        is_pid_alive,
+        iter_foreign_handshakes,
+    )
+
+    current = config_fingerprint(config)
+    live: list[dict[str, Any]] = []
+    for fingerprint, hs in iter_foreign_handshakes(config.data_dir, current):
+        pid = _as_int(hs.get("pid", -1))
+        if is_pid_alive(pid):
+            live.append(
+                {
+                    "fingerprint": fingerprint,
+                    "pid": pid,
+                    "host": hs.get("host"),
+                    "port": hs.get("port"),
+                }
+            )
+    return live
+
+
 def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     """Route daemon logs to a file under ``data_dir`` when detached (its stdio
     is ``DEVNULL``), otherwise to stderr for foreground debugging."""
@@ -189,8 +226,30 @@ def start_cmd() -> None:
 
 
 @daemon_group.command(name="stop")
-def stop_cmd() -> None:
-    """Ask a running daemon to shut down gracefully."""
+@click.option(
+    "--all",
+    "stop_all",
+    is_flag=True,
+    help="Also stop daemons running under a different config fingerprint "
+    "(orphans left after a config or PROTOCOL_VERSION change). Off by default: a "
+    "live daemon under another config may be intentional.",
+)
+def stop_cmd(stop_all: bool) -> None:
+    """Ask a running daemon to shut down gracefully.
+
+    By default acts only on the daemon for the *current* config. ``--all`` also
+    SIGTERMs daemons left under a different (stale) config fingerprint — e.g. a
+    pinned ``idle_timeout_seconds=0`` daemon orphaned by a config or
+    ``PROTOCOL_VERSION`` change, which is otherwise invisible to ``stop``/``status``.
+    """
+    config = _load_config()
+    _stop_current_config_daemon(config)
+    if stop_all:
+        _stop_foreign_daemons(config)
+
+
+def _stop_current_config_daemon(config: STMConfig) -> None:
+    """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback)."""
     from memtomem_stm.daemon import client
     from memtomem_stm.daemon.discovery import (
         config_fingerprint,
@@ -199,13 +258,12 @@ def stop_cmd() -> None:
         read_handshake,
     )
 
-    config = _load_config()
     if asyncio.run(client.shutdown(config)):
         click.echo(_ok("daemon stopped"))
         return
     # Graceful path declined → no daemon for *this config*. Only ever act on our
     # own config's handshake; a different-config daemon owns a different file and
-    # is none of our business here.
+    # is handled by ``--all`` (``_stop_foreign_daemons``), not here.
     hs_path = handshake_path(config.data_dir, config_fingerprint(config))
     raw = read_handshake(hs_path)
     if raw is None:
@@ -224,6 +282,41 @@ def stop_cmd() -> None:
     except OSError:
         pass
     click.echo(_warn("no responsive daemon; cleaned stale handshake"))
+
+
+def _stop_foreign_daemons(config: STMConfig) -> None:
+    """SIGTERM every live daemon under a *different* config fingerprint (``--all``).
+
+    SIGTERM (not the socket shutdown op) because a foreign daemon may speak an
+    older protocol the graceful path can't negotiate; the daemon's signal handler
+    sets its shutdown event regardless of ``idle_timeout_seconds``, so even a
+    pinned daemon exits. The daemon removes its own handshake on teardown, so we
+    do not unlink it here (that could hide a survivor that ignored the signal).
+    """
+    from memtomem_stm.daemon.discovery import is_pid_alive
+
+    foreign = _live_foreign_daemons(config)
+    if not foreign:
+        click.echo("no daemons running under a different config")
+        return
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
+        listing = ", ".join(f"pid={d['pid']} fp={d['fingerprint']}" for d in foreign)
+        click.echo(
+            _warn(
+                f"{len(foreign)} daemon(s) under a different config are running "
+                f"({listing}); stop them by pid (no POSIX signal path on Windows)"
+            )
+        )
+        return
+    for d in foreign:
+        pid = d["pid"]
+        if not is_pid_alive(pid):
+            continue  # raced to exit between enumeration and now
+        try:
+            os.kill(pid, signal.SIGTERM)
+            click.echo(_ok(f"sent SIGTERM to daemon pid={pid} (fp={d['fingerprint']})"))
+        except OSError:
+            click.echo(_warn(f"could not signal daemon pid={pid} (fp={d['fingerprint']})"))
 
 
 @daemon_group.command(name="status")
@@ -267,7 +360,13 @@ def status_cmd(as_json: bool) -> None:
         else:
             info = {"state": "stopped", "hook_will_use_daemon": use_daemon}
 
+    # Orthogonal to the current-config state: daemons orphaned under a different
+    # fingerprint (config/protocol drift) are invisible to the keyed paths above,
+    # so surface them here regardless of running/stale/stopped.
+    foreign = _live_foreign_daemons(config)
+
     if as_json:
+        info["foreign"] = foreign
         click.echo(json.dumps(info, indent=2))
         return
 
@@ -295,6 +394,16 @@ def status_cmd(as_json: bool) -> None:
     else:
         hint = "no (opted out via MEMTOMEM_STM_HOOK__USE_DAEMON=0)"
     click.echo(f"hook will use daemon: {hint}")
+
+    if foreign:
+        listing = ", ".join(f"pid={d['pid']} fp={d['fingerprint']}" for d in foreign)
+        click.echo(
+            _warn(
+                f"{len(foreign)} daemon(s) under a different config running "
+                f"(orphaned by a config/protocol change): {listing}"
+            )
+        )
+        click.echo("stop them with `mms daemon stop --all`")
 
 
 @daemon_group.command(name="restart")

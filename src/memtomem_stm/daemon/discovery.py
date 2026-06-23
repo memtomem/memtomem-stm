@@ -24,9 +24,10 @@ handshake behind as an orphan. No reader keys to it anymore, so it is harmless
 to *new* callers, and a daemon with a finite ``idle_timeout_seconds`` removes
 its own handshake on graceful teardown / idle timeout. Caveat: a daemon pinned
 with ``idle_timeout_seconds=0`` never idle-shuts-down, so after a fingerprint
-change it lingers and is no longer reachable by ``mms daemon stop`` (which keys
-to the *current* fingerprint) — stop it manually by pid (better handling of
-such orphans is tracked in #517).
+change it lingers and is not reachable by ``mms daemon stop`` (which keys to the
+*current* fingerprint) — ``mms daemon status`` reports such a foreign-fingerprint
+daemon and ``mms daemon stop --all`` terminates it (see
+:func:`iter_foreign_handshakes`).
 
 File shape::
 
@@ -97,9 +98,10 @@ def config_fingerprint(config: STMConfig) -> str:
     :data:`~memtomem_stm.daemon.protocol.PROTOCOL_VERSION` values key to distinct
     handshake/lock paths and coexist instead of exchanging frames one side can't
     parse (the stale one idle-times-out under a finite ``idle_timeout_seconds``;
-    a pinned ``idle_timeout_seconds=0`` daemon must be stopped manually — see the
-    module docstring and #517). This is the structural half of the version guard;
-    the explicit per-frame ``v`` check is the belt-and-suspenders.
+    a pinned ``idle_timeout_seconds=0`` daemon is reported by ``mms daemon
+    status`` and stopped by ``mms daemon stop --all`` — see the module docstring
+    and :func:`iter_foreign_handshakes`). This is the structural half of the
+    version guard; the explicit per-frame ``v`` check is the belt-and-suspenders.
     """
     material = {
         "surfacing": config.surfacing.model_dump(mode="json"),
@@ -148,6 +150,44 @@ def read_handshake(path: Path) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     return data
+
+
+def iter_foreign_handshakes(
+    data_dir: Path, current_fingerprint: str
+) -> list[tuple[str, dict[str, Any]]]:
+    """``(fingerprint, handshake)`` for every published daemon under a config
+    fingerprint *other than* ``current_fingerprint``.
+
+    Globs the per-config handshake files (``stm-daemon-<fp>.json``) under
+    ``data_dir`` and parses each with :func:`read_handshake`, skipping the
+    current config's own file and any that are missing/unreadable/malformed. The
+    fingerprint is taken from the *filename* — the authoritative routing key that
+    ``mms daemon status``/``stop`` derive from the config — so a corrupted
+    in-file ``config_fingerprint`` that disagrees does not change which file a
+    daemon owns.
+
+    Pure enumeration: it does **not** probe liveness (a left-behind file may name
+    a long-dead pid). The caller decides how to confirm a daemon is alive — for a
+    foreign daemon that may speak an older :data:`PROTOCOL_VERSION` a socket
+    ``ping`` would fail the version gate, so :func:`is_pid_alive` is the
+    available signal. Sorted by fingerprint for deterministic output. Returns an
+    empty list if ``data_dir`` is absent or unreadable (ops callers degrade).
+    """
+    base = data_dir.expanduser()
+    try:
+        paths = sorted(base.glob(f"{HANDSHAKE_PREFIX}-*.json"))
+    except OSError:
+        return []
+    out: list[tuple[str, dict[str, Any]]] = []
+    for path in paths:
+        fingerprint = path.stem.removeprefix(f"{HANDSHAKE_PREFIX}-")
+        if fingerprint == current_fingerprint:
+            continue
+        data = read_handshake(path)
+        if data is None:
+            continue
+        out.append((fingerprint, data))
+    return out
 
 
 def remove_handshake_if_owner(path: Path, *, pid: int, token: str) -> None:
