@@ -433,17 +433,18 @@ async def test_hook_run_hook_autospawn_with_fallback_cold(
     spawned: list[int] = []
     monkeypatch.setattr(spawn, "request_spawn", lambda cfg: spawned.append(1))
 
-    cold: list[dict] = []
+    cold: list = []
 
-    async def _fake_cold(payload):
-        cold.append(payload)
+    async def _fake_cold(call):
+        cold.append(call)
         return {"cold": True}
 
     monkeypatch.setattr(hook_cmd, "run_surfacing_hook", _fake_cold)
 
     out = await hook_cmd._run_hook(_READ_PAYLOAD)
     assert spawned == [1]  # spawn kicked off for next call
-    assert cold == [_READ_PAYLOAD]  # cold path ran this call
+    # Cold path ran this call with the normalized CanonicalHookCall (Read→read).
+    assert len(cold) == 1 and cold[0].tool_name == "Read" and cold[0].canonical_tool == "read"
     assert out == {"cold": True}
 
 

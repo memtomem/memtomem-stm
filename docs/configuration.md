@@ -153,8 +153,11 @@ export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating 
 export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=false
 export MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=16000
 
-# Legacy direct-read allowlist knob; comma-separated Claude Code tool names.
-export MEMTOMEM_STM_HOOK_SURFACE_TOOLS=Read,Grep,Glob,Bash
+# Direct-read allowlist knob; comma-separated *canonical* tool names
+# (read,grep,glob,shell,web_fetch,write,edit), not a host's native spelling.
+# Each host adapter maps its native names (Claude Read/Bash) to these, so one
+# allowlist works across hosts.
+export MEMTOMEM_STM_HOOK_SURFACE_TOOLS=read,grep,glob,shell
 ```
 
 `fallback=skip` returns `{}` immediately when the daemon is unavailable.
