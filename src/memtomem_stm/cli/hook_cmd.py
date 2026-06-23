@@ -511,6 +511,67 @@ async def _run_hook(
     return await run_surfacing_hook(payload)
 
 
+def _record_hook_metrics(
+    payload: dict[str, Any],
+    updated: dict[str, Any] | None,
+    additional_context: str | None,
+    config: "STMConfig",
+) -> None:
+    """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
+
+    Makes native-tool spend — which never reaches the MCP proxy — visible next
+    to proxied calls. Persists **sizes only** (original / compressed / surfaced
+    chars + the tool name): never ``tool_input`` and never the output text,
+    mirroring the hook's no-query-text privacy posture (a ``Bash`` command may
+    carry secrets). Gated on ``config.hook.metrics_enabled`` (independent of
+    ``proxy.metrics.enabled`` so a hook-only deployment still measures), reusing
+    the proxy's ``metrics.db_path`` / ``max_history``. A short-lived store is
+    opened per call — the hook is a one-shot subprocess, so there is no
+    long-lived tracker to write through. **Never raises**: any failure degrades
+    to no row, so metrics can't disrupt the host.
+    """
+    try:
+        if not config.hook.metrics_enabled:
+            return
+        tool_name = payload.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name:
+            return
+        original_chars = len(_tool_response_to_text(payload.get("tool_response")))
+        if original_chars == 0:
+            return  # nothing observed (empty / malformed result) — skip
+        compressed_chars = (
+            len(_tool_response_to_text(updated)) if updated is not None else original_chars
+        )
+        surfaced_chars = len(additional_context) if additional_context else 0
+
+        # Lazy import: keep ``mms hook --help`` and the metrics-disabled path off
+        # the metrics / sqlite import cost.
+        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        store = MetricsStore(
+            config.proxy.metrics.db_path.expanduser(),
+            max_history=config.proxy.metrics.max_history,
+        )
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(
+                    server="builtin",
+                    tool=tool_name,
+                    original_chars=original_chars,
+                    compressed_chars=compressed_chars,
+                    surfaced_chars=surfaced_chars,
+                    compression_strategy="truncate" if updated is not None else None,
+                    source="hook",
+                )
+            )
+        finally:
+            store.close()
+    except Exception:
+        logger.debug("hook metrics recording failed — no row written", exc_info=True)
+
+
 async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one ``hookSpecificOutput``.
@@ -524,7 +585,9 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     surfacing whether or not compression ran. Surfacing is wrapped so a
     failure degrades to "no memories" while still returning the compression
     half (``maybe_compress_builtin`` is itself non-raising). The CLI wrapper
-    backstops the whole call.
+    backstops the whole call. A non-raising metrics row (``source='hook'``) is
+    recorded afterwards via :func:`_record_hook_metrics`, regardless of whether
+    either stage produced output.
     """
     from memtomem_stm.config import STMConfig
 
@@ -535,7 +598,9 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
         surf_out = await _run_hook(_bounded_surfacing_payload(payload), config=config)
     except Exception:
         logger.debug("surfacing failed — keeping the compression half", exc_info=True)
-    return _build_hook_output(updated, _extract_surfaced_context(surf_out))
+    additional_context = _extract_surfaced_context(surf_out)
+    _record_hook_metrics(payload, updated, additional_context, config)
+    return _build_hook_output(updated, additional_context)
 
 
 @click.command(name="hook")

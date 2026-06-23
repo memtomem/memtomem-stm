@@ -27,6 +27,7 @@ NEW_COLUMNS = {
     "extract_error",
     "surfacing_on_progressive_ok",
     "surface_error",
+    "source",
 }
 
 
@@ -230,6 +231,24 @@ class TestRecordPersistsNewFields:
         assert failures == 1
         assert unobserved == 1
 
+    def test_source_defaults_to_mcp_and_persists_hook(self, store):
+        # Proxied calls omit ``source`` → stored as 'mcp'; ``mms hook`` passes
+        # 'hook' so native built-in tool spend is separable in the shared store.
+        store.record(CallMetrics(server="lf", tool="search", original_chars=1, compressed_chars=1))
+        store.record(
+            CallMetrics(
+                server="builtin",
+                tool="Bash",
+                original_chars=900,
+                compressed_chars=300,
+                source="hook",
+            )
+        )
+        rows = dict(
+            store._db.execute("SELECT server, source FROM proxy_metrics ORDER BY server").fetchall()
+        )
+        assert rows == {"builtin": "hook", "lf": "mcp"}
+
 
 class TestReadPathConcurrency:
     """Cross-thread reader/writer safety.
@@ -373,6 +392,81 @@ class TestReadCompressionSummary:
 
         assert summary["total_calls"] == 2
         assert {r["tool"] for r in summary["by_tool"]} == {"search"}
+
+    def _seed_mixed_sources(self, db_path):
+        store = MetricsStore(db_path)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(server="lf", tool="search", original_chars=1000, compressed_chars=400)
+            )
+            store.record(
+                CallMetrics(
+                    server="builtin",
+                    tool="Bash",
+                    original_chars=900,
+                    compressed_chars=300,
+                    source="hook",
+                )
+            )
+            store.record(
+                CallMetrics(
+                    server="builtin",
+                    tool="Read",
+                    original_chars=5000,
+                    compressed_chars=5000,
+                    source="hook",
+                )
+            )
+        finally:
+            store.close()
+
+    def test_source_filter(self, tmp_path):
+        db_path = tmp_path / "metrics.db"
+        self._seed_mixed_sources(db_path)
+
+        hook = read_compression_summary(db_path, source="hook")
+        assert hook["total_calls"] == 2
+        assert {r["server"] for r in hook["by_tool"]} == {"builtin"}
+        assert hook["total_original_chars"] == 5900
+
+        mcp = read_compression_summary(db_path, source="mcp")
+        assert mcp["total_calls"] == 1
+        assert {r["tool"] for r in mcp["by_tool"]} == {"search"}
+
+        # tool + source compose
+        bash = read_compression_summary(db_path, tool="Bash", source="hook")
+        assert bash["total_calls"] == 1
+        assert bash["by_tool"][0]["saved_ratio"] == round(1 - 300 / 900, 4)
+
+    def test_source_filter_on_pre_source_db_returns_empty_for_hook(self, tmp_path):
+        # A DB created before the ``source`` column existed has only legacy
+        # ('mcp') rows. ``source='hook'`` must report empty-but-available rather
+        # than over-counting every legacy row (which a dropped guard would do).
+        db_path = tmp_path / "legacy.db"
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, tool TEXT, "
+            "original_chars INTEGER, compressed_chars INTEGER, "
+            "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+        )
+        db.execute(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, created_at) "
+            "VALUES ('s', 't', 100, 40, 0)"
+        )
+        db.commit()
+        db.close()
+
+        hook = read_compression_summary(db_path, source="hook")
+        assert hook["available"] is True
+        assert hook["schema_outdated"] is True
+        assert hook["total_calls"] == 0
+        assert hook["by_tool"] == []
+
+        # 'mcp' on a legacy DB still sees the legacy rows (all implicitly mcp).
+        mcp = read_compression_summary(db_path, source="mcp")
+        assert mcp["total_calls"] == 1
 
     def test_missing_db_is_unavailable_and_not_created(self, tmp_path):
         db_path = tmp_path / "does_not_exist.db"

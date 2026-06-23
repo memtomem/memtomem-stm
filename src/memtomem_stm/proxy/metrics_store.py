@@ -48,7 +48,9 @@ def _saved_ratio(original: int, compressed: int) -> float:
     return round(1.0 - (compressed / original), 4)
 
 
-def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str, object]:
+def read_compression_summary(
+    db_path: Path, tool: str | None = None, source: str | None = None
+) -> dict[str, object]:
     """Aggregate per-``(server, tool)`` compression stats read-only from disk.
 
     Unlike :meth:`MetricsStore.initialize`, this NEVER creates or migrates the
@@ -65,7 +67,11 @@ def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str
     which case ``error_count`` degrades to ``0`` rather than crashing.
 
     The optional ``tool`` filter matches the raw tool name, so it can span
-    multiple servers that expose a same-named tool.
+    multiple servers that expose a same-named tool. The optional ``source``
+    filter selects a provenance (``'mcp'`` proxied calls vs. ``'hook'`` native
+    built-in tools). On a pre-``source`` DB the column is absent: a request for
+    any source other than the legacy ``'mcp'`` default returns an empty (but
+    ``available``) summary, since no row can carry that source.
     """
     resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
@@ -97,14 +103,26 @@ def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str
             # means the file exists but isn't a recognizable metrics DB.
             return summary
         has_is_error = "is_error" in cols
-        summary["schema_outdated"] = not has_is_error
+        has_source = "source" in cols
+        summary["schema_outdated"] = not has_is_error or not has_source
         error_expr = "SUM(is_error)" if has_is_error else "0"
 
+        if source is not None and not has_source and source != "mcp":
+            # Pre-``source`` DB: every row is the legacy ``'mcp'`` default, so a
+            # request for any other provenance matches nothing. Report an empty
+            # but available summary rather than over-counting every legacy row.
+            summary["available"] = True
+            return summary
+
+        conditions: list[str] = []
         params: list[object] = []
-        where = ""
         if tool is not None:
-            where = " WHERE tool = ?"
+            conditions.append("tool = ?")
             params.append(tool)
+        if source is not None and has_source:
+            conditions.append("source = ?")
+            params.append(source)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
         rows = db.execute(
             "SELECT server, tool, COUNT(*), SUM(original_chars), "
             f"SUM(compressed_chars), {error_expr} "
@@ -235,6 +253,10 @@ class MetricsStore:
             "error_message": (
                 "ALTER TABLE proxy_metrics ADD COLUMN error_message TEXT DEFAULT NULL"
             ),
+            # Provenance: pre-existing rows are all proxied MCP calls, so the
+            # backfill default is ``'mcp'``; ``mms hook`` writes ``'hook'`` for
+            # native built-in tools. NOT NULL + DEFAULT keeps old rows readable.
+            "source": "ALTER TABLE proxy_metrics ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp'",
         }
         for col, ddl in migrations.items():
             if col not in existing:
@@ -271,8 +293,8 @@ class MetricsStore:
                 "compression_strategy, ratio_violation, scorer_fallback, "
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
-                "surfacing_on_progressive_ok, surface_error, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "surfacing_on_progressive_ok, surface_error, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -294,6 +316,7 @@ class MetricsStore:
                     metrics.extract_error,
                     _tristate(metrics.surfacing_on_progressive_ok),
                     metrics.surface_error,
+                    metrics.source,
                     now,
                 ),
             )
