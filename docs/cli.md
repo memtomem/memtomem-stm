@@ -458,12 +458,18 @@ Commands:
   start    Spawn the daemon detached if one is not already running.
   status   Report pid/port/uptime/LTM warmth; accepts --json.
   restart  Stop this config's daemon, then start a fresh one.
-  stop     Ask a running daemon to shut down gracefully.
+  stop     Ask a running daemon to shut down gracefully (--all also reaps
+           orphans under a stale fingerprint).
   run      Run the long-lived daemon server loop.
 ```
 
-Daemons are keyed by config, so starting a daemon for one config does not stop a
-daemon serving another config.
+Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
+touch a daemon serving another config. The one escape hatch is `stop --all`:
+when a config change — or a `PROTOCOL_VERSION` bump, which is folded into the
+key — leaves an old daemon stranded under a now-stale fingerprint (most visibly
+one pinned with `daemon.idle_timeout_seconds=0`, which never self-clears),
+`mms daemon status` reports it and `mms daemon stop --all` SIGTERMs it. `--all`
+is opt-in because a live daemon under another config may be intentional.
 
 ## `mms project` — project-scoped MCP management
 

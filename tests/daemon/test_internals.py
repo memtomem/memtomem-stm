@@ -118,7 +118,7 @@ def test_iter_foreign_handshakes_excludes_current_and_bad(tmp_path: Path):
     out = discovery.iter_foreign_handshakes(tmp_path, "cur00000")
 
     assert [fp for fp, _ in out] == ["aaaa0000", "bbbb1111"]  # sorted, current dropped
-    assert all(hs.get("pid") in (20, 30) for _, hs in out)
+    assert {fp: hs.get("pid") for fp, hs in out} == {"aaaa0000": 30, "bbbb1111": 20}
 
 
 def test_iter_foreign_handshakes_missing_dir(tmp_path: Path):
@@ -776,6 +776,110 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         assert [pid for pid, _ in killed] == [4321]
         assert f"fp={old_fp}" in result.output
+
+    def test_dead_pid_foreign_filtered_and_sorted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A left-behind handshake naming a dead pid must be dropped (not
+        reported), and live ones rendered in fingerprint-sorted order — pins the
+        liveness filter that a non-filtering impl would silently skip."""
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001)  # alive
+        self._write_foreign(tmp_path, "bbbb000000000000", pid=2002)  # dead
+        self._write_foreign(tmp_path, "cccc000000000000", pid=3003)  # alive
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: pid != 2002)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert [d["fingerprint"] for d in info["foreign"]] == [
+            "aaaa000000000000",
+            "cccc000000000000",
+        ]
+        assert [d["pid"] for d in info["foreign"]] == [1001, 3003]  # dead 2002 dropped
+        assert "2002" not in result.output
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert result.exit_code == 0, result.output
+        # Sorted listing in the text warning, dead one absent.
+        assert "pid=1001 fp=aaaa000000000000, pid=3003 fp=cccc000000000000" in result.output
+        assert "2002" not in result.output
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
+    def test_stop_all_skips_dead_and_continues_on_oserror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`stop --all` must (a) never signal a dead-pid orphan, (b) keep going
+        when one SIGTERM raises OSError, and (c) still exit 0 (fail-open)."""
+        import signal as _signal
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001)  # alive, kill raises
+        self._write_foreign(tmp_path, "bbbb000000000000", pid=2002)  # dead, never signalled
+        self._write_foreign(tmp_path, "cccc000000000000", pid=3003)  # alive, kill succeeds
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: pid != 2002)
+        killed: list[tuple[int, int]] = []
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if pid == 1001:
+                raise OSError("ESRCH")
+            killed.append((pid, sig))
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 0, result.output
+        assert killed == [(3003, _signal.SIGTERM)]  # 2002 never tried, loop continued past 1001
+        assert "could not signal daemon pid=1001" in result.output
+        assert "sent SIGTERM to daemon pid=3003" in result.output
+
+    def test_status_running_with_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """A live current daemon AND a foreign orphan: the running-branch `info`
+        must still carry `foreign`, and the token must never leak."""
+        import json
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time(),
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "running"
+        assert info["pid"] == 11
+        assert info["foreign"] == [
+            {"fingerprint": "foreignfp000000", "pid": 98765, "host": "127.0.0.1", "port": 4242}
+        ]
+        assert "secret-token" not in result.output
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert result.exit_code == 0, result.output
+        assert "running  pid=11" in result.output  # current daemon line
+        assert "pid=98765 fp=foreignfp000000" in result.output  # foreign warning
+        assert "secret-token" not in result.output
 
     def test_stop_all_no_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner

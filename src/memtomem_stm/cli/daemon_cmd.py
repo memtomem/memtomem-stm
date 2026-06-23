@@ -6,8 +6,10 @@ avoids the ~6s cold start on every built-in tool call. Subcommands:
 - ``run``     — the actual long-lived server loop (foreground, or the target of
   a detached spawn via ``--detached``).
 - ``start``   — spawn the daemon detached if one isn't already running.
-- ``stop``    — ask a running daemon to shut down (SIGTERM by pid as fallback).
-- ``status``  — running/stale/stopped, with pid/port/uptime/LTM warmth.
+- ``stop``    — ask a running daemon to shut down (SIGTERM by pid as fallback);
+  ``--all`` also reaps daemons orphaned under a stale config fingerprint.
+- ``status``  — running/stale/stopped, with pid/port/uptime/LTM warmth; also
+  surfaces live daemons left under a different (stale) config fingerprint.
 - ``restart`` — ``stop`` then ``start``.
 
 Color helpers are defined locally (not imported from ``cli.proxy``) so this
@@ -96,8 +98,14 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
 
     Liveness is the recorded pid (:func:`is_pid_alive`): a foreign daemon may
     speak an older protocol, so a socket ``ping`` would fail the version gate.
-    Each entry carries only non-sensitive fields (``fingerprint``/``pid``/
-    ``host``/``port``) — never the auth ``token`` — so callers can render them.
+    This is a weaker signal than the current-config path's socket ``ping`` — a
+    daemon that crashed (SIGKILL/OOM, not a graceful teardown) leaves its
+    handshake on disk, and the OS may recycle its pid to an unrelated process,
+    which would then look "alive" here. Closing that window (a process-identity
+    cross-check before acting) is tracked as a follow-up; the residual risk is
+    the same one the current-config SIGTERM fallback already carries. Each entry
+    carries only non-sensitive fields (``fingerprint``/``pid``/``host``/``port``)
+    — never the auth ``token`` — so callers can render them.
     """
     from memtomem_stm.daemon.discovery import (
         config_fingerprint,
@@ -232,7 +240,8 @@ def start_cmd() -> None:
     is_flag=True,
     help="Also stop daemons running under a different config fingerprint "
     "(orphans left after a config or PROTOCOL_VERSION change). Off by default: a "
-    "live daemon under another config may be intentional.",
+    "live daemon under another config may be intentional, and a crash-orphaned "
+    "handshake can name a since-recycled pid.",
 )
 def stop_cmd(stop_all: bool) -> None:
     """Ask a running daemon to shut down gracefully.
@@ -292,6 +301,11 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     sets its shutdown event regardless of ``idle_timeout_seconds``, so even a
     pinned daemon exits. The daemon removes its own handshake on teardown, so we
     do not unlink it here (that could hide a survivor that ignored the signal).
+
+    Caveat (see :func:`_live_foreign_daemons`): without a socket handshake the
+    target is identified only by its recorded pid, so a crash-orphaned handshake
+    naming a since-recycled pid would signal an unrelated process. This is why
+    ``--all`` is opt-in; a process-identity cross-check is a tracked follow-up.
     """
     from memtomem_stm.daemon.discovery import is_pid_alive
 

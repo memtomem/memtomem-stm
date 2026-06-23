@@ -16,8 +16,11 @@ matches the path (defense against a corrupted/hand-edited file). Within a
 single fingerprint the write is still last-writer-wins, not a mutual-exclusion
 primitive — preventing a second *same-config* daemon is the (likewise
 fingerprint-keyed) lock's job (see :mod:`~memtomem_stm.daemon.locking`).
-Liveness is proven by a successful ``ping`` over the socket — not by the
-recorded ``pid`` — so a recycled PID can't be mistaken for the daemon.
+Liveness for a *current-config* daemon is proven by a successful ``ping`` over
+the socket — not by the recorded ``pid`` — so a recycled PID can't be mistaken
+for the daemon. The foreign-orphan path (:func:`iter_foreign_handshakes`) is the
+one exception: it can't ``ping`` a daemon at an incompatible ``PROTOCOL_VERSION``,
+so it falls back to the recorded pid and carries the matching recycling caveat.
 
 A config change (or a ``PROTOCOL_VERSION`` bump) leaves the old fingerprint's
 handshake behind as an orphan. No reader keys to it anymore, so it is harmless
