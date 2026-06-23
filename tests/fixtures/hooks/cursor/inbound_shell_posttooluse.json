@@ -1,0 +1,14 @@
+{
+  "hook_event_name": "postToolUse",
+  "tool_name": "Shell",
+  "tool_input": { "command": "npm test" },
+  "tool_output": "{\"exitCode\":0,\"stdout\":\"All tests passed\"}",
+  "tool_use_id": "abc123",
+  "cwd": "/project",
+  "duration": 5432,
+  "conversation_id": "conv_demo",
+  "generation_id": "gen_demo",
+  "model": "demo-model",
+  "cursor_version": "3.7.36",
+  "workspace_roots": ["/project"]
+}

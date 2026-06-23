@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "sess_demo",
+  "transcript_path": "/tmp/codex/transcript.jsonl",
+  "cwd": "/project",
+  "turn_id": "turn_1",
+  "tool_name": "Bash",
+  "tool_use_id": "call_demo",
+  "tool_input": { "command": "pytest -q" },
+  "tool_response": "12 passed in 3.4s",
+  "model": "demo-model",
+  "permission_mode": "default"
+}

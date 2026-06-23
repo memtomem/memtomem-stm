@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "sess_demo",
+  "cwd": "/project",
+  "tool_name": "Shell",
+  "tool_input": { "command": "pytest -q" },
+  "tool_output": "12 passed in 3.4s"
+}
