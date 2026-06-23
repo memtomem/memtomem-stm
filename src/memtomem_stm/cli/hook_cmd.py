@@ -87,9 +87,12 @@ _SURFACED_CLOSE = "</surfaced-memories>"
 _DEFAULT_SURFACE_TOOLS = frozenset({"Read", "Grep", "Glob", "Bash"})
 
 # Unique marker prepended to compressed ``stdout`` so a re-fired hook recognizes
-# its own output and no-ops (idempotency). Matched *exactly* — never via
-# ``TruncateCompressor``'s generic markers (``(truncated`` / ``(original:`` /
-# ``… omitted``), which appear in real logs and would falsely skip compression.
+# its own output and no-ops (idempotency). Detected as a *prefix* only (see
+# :func:`_already_compressed`) — never via ``TruncateCompressor``'s generic
+# markers (``(truncated`` / ``(original:`` / ``… omitted``), and never by a bare
+# substring match: self-referential output (``git log`` / ``grep`` / ``cat`` over
+# STM's own source, history, or docs that mention this sentinel) would otherwise
+# falsely suppress compression of the whole result.
 _COMPRESS_SENTINEL = "⟦stm-compressed⟧"
 
 # Hard cap on the ``tool_response`` text forwarded to surfacing, independent of
@@ -186,8 +189,16 @@ def _bash_stdout(tool_response: Any) -> tuple[str, dict[str, Any]] | None:
 
 
 def _already_compressed(text: str) -> bool:
-    """Whether ``text`` already carries our compression sentinel (idempotency)."""
-    return _COMPRESS_SENTINEL in text
+    """Whether ``text`` is *our own* prior compression output (idempotency).
+
+    The sentinel is always written as a prefix (``prefix + compressed`` in
+    :func:`maybe_compress_builtin`), so the check is anchored to the start of the
+    text. A bare ``in`` substring match false-positives on any tool output that
+    merely *mentions* the sentinel — e.g. ``git log`` / ``grep`` / ``cat`` over
+    STM's own source, history, or docs — silently skipping compression of the
+    whole result.
+    """
+    return text.startswith(_COMPRESS_SENTINEL)
 
 
 def maybe_compress_builtin(
