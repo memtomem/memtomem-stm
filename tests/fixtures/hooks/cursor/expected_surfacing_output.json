@@ -1,0 +1,3 @@
+{
+  "additional_context": "<surfaced-memories>\nRelevant memories (memtomem LTM):\n- Rotate the service token with `mms rotate`; do not edit config.toml by hand.\n- Point integration-test feedback_db_path at /tmp, never ~/.memtomem.\n</surfaced-memories>"
+}

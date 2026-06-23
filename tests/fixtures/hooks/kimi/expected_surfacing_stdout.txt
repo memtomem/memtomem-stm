@@ -1,0 +1,5 @@
+<surfaced-memories>
+Relevant memories (memtomem LTM):
+- Rotate the service token with `mms rotate`; do not edit config.toml by hand.
+- Point integration-test feedback_db_path at /tmp, never ~/.memtomem.
+</surfaced-memories>
