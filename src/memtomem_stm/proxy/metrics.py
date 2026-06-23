@@ -195,6 +195,13 @@ class CallMetrics:
     # progressive surfacing ran successfully or failed.
     surfacing_on_progressive_ok: bool | None = None
     surface_error: str | None = None
+    # Provenance of the row in the shared ``proxy_metrics.db``. ``"mcp"`` (the
+    # default) is a proxied upstream MCP tool call written by ``ProxyManager``;
+    # ``"hook"`` is a native/built-in tool call (Read/Bash/Grep/…) recorded by
+    # ``mms hook``, which never reaches the MCP proxy. The column lets readers
+    # (CLI/stats, the tuner) separate native-tool spend — otherwise invisible —
+    # from proxied spend without splitting the store.
+    source: str = "mcp"
 
 
 class RPSTracker:

@@ -32,6 +32,7 @@ from memtomem_stm.cli.hook_cmd import (
     _daemon_enabled,
     _extract_surfaced_block,
     _orchestrate,
+    _record_hook_metrics,
     _run_hook,
     _tool_response_to_text,
     maybe_compress_builtin,
@@ -473,6 +474,115 @@ def test_compress_never_raises(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr("memtomem_stm.proxy.compression.TruncateCompressor", _Boom)
     assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG) is None
+
+
+# ── native-tool metrics (A1 — proxy_metrics.db row with source='hook') ───────
+
+
+def _metrics_config(tmp_path: Path, *, enabled: bool = True):
+    """Minimal duck-typed STMConfig for ``_record_hook_metrics`` — only the two
+    attributes it reads, so no env/file/frozen-model coupling."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        hook=SimpleNamespace(metrics_enabled=enabled),
+        proxy=SimpleNamespace(
+            metrics=SimpleNamespace(db_path=tmp_path / "metrics.db", max_history=10000)
+        ),
+    )
+
+
+def test_record_hook_metrics_writes_source_hook_row(tmp_path: Path):
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    cfg = _metrics_config(tmp_path)
+    updated = {"stdout": f"{_COMPRESS_SENTINEL}\nshort", "stderr": ""}
+    _record_hook_metrics(_bash_payload({"stdout": _BIG_STDOUT}), updated, _BLOCK, cfg)
+
+    summary = read_compression_summary(tmp_path / "metrics.db", source="hook")
+    assert summary["available"] is True
+    assert summary["total_calls"] == 1
+    row = summary["by_tool"][0]
+    assert (row["server"], row["tool"]) == ("builtin", "Bash")
+    assert row["original_chars"] == len(_BIG_STDOUT)
+    assert row["compressed_chars"] == len(f"{_COMPRESS_SENTINEL}\nshort")
+
+
+def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path: Path):
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    cfg = _metrics_config(tmp_path)
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/x"},
+        "tool_response": {"content": "y" * 4000},
+    }
+    # Both stages no-op (Read is never compressed; no surfaced context).
+    _record_hook_metrics(payload, None, None, cfg)
+
+    row = read_compression_summary(tmp_path / "metrics.db", source="hook")["by_tool"][0]
+    assert row["tool"] == "Read"
+    assert row["original_chars"] == 4000
+    assert row["compressed_chars"] == 4000
+    assert row["saved_ratio"] == 0.0
+
+
+def test_record_hook_metrics_disabled_writes_nothing(tmp_path: Path):
+    cfg = _metrics_config(tmp_path, enabled=False)
+    _record_hook_metrics(_bash_payload({"stdout": _BIG_STDOUT}), None, None, cfg)
+    assert not (tmp_path / "metrics.db").exists()  # store never opened
+
+
+def test_record_hook_metrics_skips_empty_output(tmp_path: Path):
+    # A result that flattens to nothing carries no spend to record.
+    cfg = _metrics_config(tmp_path)
+    _record_hook_metrics({"hook_event_name": "PostToolUse", "tool_name": "Bash"}, None, None, cfg)
+    assert not (tmp_path / "metrics.db").exists()
+
+
+def test_record_hook_metrics_never_raises_on_bad_store(tmp_path: Path):
+    from types import SimpleNamespace
+
+    # db_path is a directory → MetricsStore.initialize() raises; must be swallowed
+    # so metrics can never disrupt the host.
+    bad = SimpleNamespace(
+        hook=SimpleNamespace(metrics_enabled=True),
+        proxy=SimpleNamespace(metrics=SimpleNamespace(db_path=tmp_path, max_history=10000)),
+    )
+    _record_hook_metrics(_bash_payload({"stdout": _BIG_STDOUT}), None, None, bad)
+
+
+def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
+    import sqlite3
+    import time
+
+    from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
+
+    db = tmp_path / "metrics.db"
+    # Create the schema first so the lock contention is purely on the write.
+    seed = MetricsStore(db)
+    seed.initialize()
+    seed.close()
+
+    # Hold an EXCLUSIVE write lock from another connection so the hook's writer
+    # contends. Its 250 ms busy timeout must make it fail fast (no row, no raise,
+    # no multi-second stall up to the shared 3000 ms budget).
+    blocker = sqlite3.connect(str(db), timeout=0.1)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        cfg = _metrics_config(tmp_path)  # db_path == db
+        start = time.monotonic()
+        _record_hook_metrics(_bash_payload({"stdout": _BIG_STDOUT}), None, None, cfg)
+        elapsed = time.monotonic() - start
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    # Fast-fail: comfortably under the shared 3000 ms busy timeout (generous
+    # bound to stay non-flaky in CI) and nothing persisted.
+    assert elapsed < 2.0
+    assert read_compression_summary(db, source="hook")["total_calls"] == 0
 
 
 # ── bounded surfacing payload + merge builder ────────────────────────────────

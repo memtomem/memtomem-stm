@@ -775,8 +775,22 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--tool", "tool_filter", default=None, help="Filter to one upstream tool name.")
+@click.option(
+    "--source",
+    "source_filter",
+    type=click.Choice(["mcp", "hook"]),
+    default=None,
+    help="Filter compression rows by provenance: 'mcp' (proxied upstream tools) "
+    "or 'hook' (native built-in tools recorded by 'mms hook').",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = False) -> None:
+def stats(
+    config_path: str,
+    *,
+    tool_filter: str | None = None,
+    source_filter: str | None = None,
+    as_json: bool = False,
+) -> None:
     """Show proxy compression and surfacing stats from the persistent stores.
 
     Reads ``proxy_metrics.db`` and ``stm_feedback.db`` read-only (it never
@@ -829,7 +843,9 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
         config_status = "invalid"
         proxy_cfg = ProxyConfig()
 
-    compression = read_compression_summary(proxy_cfg.metrics.db_path, tool=tool_filter)
+    compression = read_compression_summary(
+        proxy_cfg.metrics.db_path, tool=tool_filter, source=source_filter
+    )
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
     if as_json:
@@ -841,6 +857,7 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
                     "enabled": proxy_cfg.enabled,
                     "servers": len(proxy_cfg.upstream_servers),
                     "tool_filter": tool_filter,
+                    "source_filter": source_filter,
                     "compression": compression,
                     "surfacing": surfacing,
                 },
@@ -855,6 +872,8 @@ def stats(config_path: str, *, tool_filter: str | None = None, as_json: bool = F
     click.echo(f"Servers: {len(proxy_cfg.upstream_servers)}")
     if tool_filter:
         click.echo(f"Filter : tool={tool_filter}")
+    if source_filter:
+        click.echo(f"Source : {source_filter}")
     click.echo("")
     _render_compression_block(compression)
     click.echo("")

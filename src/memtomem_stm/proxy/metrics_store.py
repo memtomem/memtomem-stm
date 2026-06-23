@@ -48,7 +48,9 @@ def _saved_ratio(original: int, compressed: int) -> float:
     return round(1.0 - (compressed / original), 4)
 
 
-def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str, object]:
+def read_compression_summary(
+    db_path: Path, tool: str | None = None, source: str | None = None
+) -> dict[str, object]:
     """Aggregate per-``(server, tool)`` compression stats read-only from disk.
 
     Unlike :meth:`MetricsStore.initialize`, this NEVER creates or migrates the
@@ -65,7 +67,11 @@ def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str
     which case ``error_count`` degrades to ``0`` rather than crashing.
 
     The optional ``tool`` filter matches the raw tool name, so it can span
-    multiple servers that expose a same-named tool.
+    multiple servers that expose a same-named tool. The optional ``source``
+    filter selects a provenance (``'mcp'`` proxied calls vs. ``'hook'`` native
+    built-in tools). On a pre-``source`` DB the column is absent: a request for
+    any source other than the legacy ``'mcp'`` default returns an empty (but
+    ``available``) summary, since no row can carry that source.
     """
     resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
@@ -97,14 +103,31 @@ def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str
             # means the file exists but isn't a recognizable metrics DB.
             return summary
         has_is_error = "is_error" in cols
+        has_source = "source" in cols
+        # ``schema_outdated`` flags ONLY the missing ``is_error`` column (its
+        # historical meaning: "error counts degraded to 0"). A DB that has
+        # ``is_error`` but predates ``source`` still reports accurate error
+        # counts, so it must not raise this flag — the missing-``source`` case is
+        # handled by the ``source``-filter guard below, not this flag.
         summary["schema_outdated"] = not has_is_error
         error_expr = "SUM(is_error)" if has_is_error else "0"
 
+        if source is not None and not has_source and source != "mcp":
+            # Pre-``source`` DB: every row is the legacy ``'mcp'`` default, so a
+            # request for any other provenance matches nothing. Report an empty
+            # but available summary rather than over-counting every legacy row.
+            summary["available"] = True
+            return summary
+
+        conditions: list[str] = []
         params: list[object] = []
-        where = ""
         if tool is not None:
-            where = " WHERE tool = ?"
+            conditions.append("tool = ?")
             params.append(tool)
+        if source is not None and has_source:
+            conditions.append("source = ?")
+            params.append(source)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
         rows = db.execute(
             "SELECT server, tool, COUNT(*), SUM(original_chars), "
             f"SUM(compressed_chars), {error_expr} "
@@ -154,9 +177,17 @@ def read_compression_summary(db_path: Path, tool: str | None = None) -> dict[str
 class MetricsStore:
     """SQLite-backed persistent metrics for proxy calls."""
 
-    def __init__(self, db_path: Path, max_history: int = 10000) -> None:
+    def __init__(
+        self, db_path: Path, max_history: int = 10000, *, busy_timeout_ms: int | None = None
+    ) -> None:
         self._db_path = db_path
         self._max_history = max_history
+        # Best-effort writers (the ``mms hook`` native-tool metrics path) pass a
+        # small ``busy_timeout_ms`` so a locked shared ``proxy_metrics.db`` makes
+        # initialize/record fast-fail (degrade to no row) instead of stalling the
+        # host's synchronous tool call up to the shared 3000 ms busy timeout.
+        # ``None`` keeps the long-lived-store default (5 s connect + 3000 ms busy).
+        self._busy_timeout_ms = busy_timeout_ms
         self._db: sqlite3.Connection | None = None
         # Readers and writers share ``self._lock`` defensively. Current
         # callers are all asyncio single-thread, but the connection uses
@@ -169,10 +200,18 @@ class MetricsStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=5.0)
+        connect_timeout = (
+            self._busy_timeout_ms / 1000.0 if self._busy_timeout_ms is not None else 5.0
+        )
+        db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=connect_timeout)
         try:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
+            if self._busy_timeout_ms is not None:
+                # Override tune_connection's shared 3000 ms busy timeout so a
+                # best-effort writer fast-fails on a locked DB. Lower bound only —
+                # the DDL/INSERT below then raise quickly and the caller degrades.
+                db.execute(f"PRAGMA busy_timeout={int(self._busy_timeout_ms)}")
             db.execute(_CREATE)
             db.execute(_INDEX)
             db.commit()
@@ -235,6 +274,10 @@ class MetricsStore:
             "error_message": (
                 "ALTER TABLE proxy_metrics ADD COLUMN error_message TEXT DEFAULT NULL"
             ),
+            # Provenance: pre-existing rows are all proxied MCP calls, so the
+            # backfill default is ``'mcp'``; ``mms hook`` writes ``'hook'`` for
+            # native built-in tools. NOT NULL + DEFAULT keeps old rows readable.
+            "source": "ALTER TABLE proxy_metrics ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp'",
         }
         for col, ddl in migrations.items():
             if col not in existing:
@@ -271,8 +314,8 @@ class MetricsStore:
                 "compression_strategy, ratio_violation, scorer_fallback, "
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
-                "surfacing_on_progressive_ok, surface_error, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "surfacing_on_progressive_ok, surface_error, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -294,6 +337,7 @@ class MetricsStore:
                     metrics.extract_error,
                     _tristate(metrics.surfacing_on_progressive_ok),
                     metrics.surface_error,
+                    metrics.source,
                     now,
                 ),
             )
@@ -322,6 +366,11 @@ class MetricsStore:
         Only non-error rows with ``cleaned_chars > 0`` contribute to
         ``avg_ratio``.  ``p95_original_chars`` is approximated by taking
         the value at the 95th percentile rank within each group.
+
+        Scoped to ``source = 'mcp'``: the tuner adjusts *proxy* compression
+        budgets for upstream MCP tools, so native built-in tool rows written by
+        ``mms hook`` (``source='hook'``) must not be aggregated here — otherwise
+        an unrelated ``builtin/Bash`` row would yield a bogus recommendation.
         """
         if self._db is None:
             return []
@@ -342,7 +391,7 @@ class MetricsStore:
                     )                                                 AS avg_ratio,
                     SUM(is_error)                                     AS error_count
                 FROM proxy_metrics
-                WHERE created_at >= ?
+                WHERE created_at >= ? AND source = 'mcp'
                 GROUP BY server, tool
                 """,
                 (cutoff,),
@@ -354,11 +403,11 @@ class MetricsStore:
                 p95_row = self._db.execute(
                     """
                     SELECT original_chars FROM proxy_metrics
-                    WHERE server = ? AND tool = ? AND created_at >= ?
+                    WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
                     ORDER BY original_chars ASC
                     LIMIT 1 OFFSET MAX(0, CAST(
                         (SELECT COUNT(*) FROM proxy_metrics
-                         WHERE server = ? AND tool = ? AND created_at >= ?)
+                         WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp')
                         * 0.95 AS INTEGER) - 1)
                     """,
                     (server, tool, cutoff, server, tool, cutoff),
@@ -368,7 +417,7 @@ class MetricsStore:
                     """
                     SELECT compression_strategy FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ?
-                        AND compression_strategy IS NOT NULL
+                        AND compression_strategy IS NOT NULL AND source = 'mcp'
                     GROUP BY compression_strategy
                     ORDER BY COUNT(*) DESC
                     LIMIT 1
@@ -410,7 +459,13 @@ class MetricsStore:
         if self._db is None:
             return empty
         cutoff = time.time() - since_seconds
-        where = "created_at >= ? AND compression_strategy LIKE '%passthrough_on_error'"
+        # ``source = 'mcp'``: progressive delivery is a proxy-only path; native
+        # built-in (``source='hook'``) rows never carry this strategy, but scope
+        # explicitly so the count can't drift if that ever changes.
+        where = (
+            "created_at >= ? AND source = 'mcp' "
+            "AND compression_strategy LIKE '%passthrough_on_error'"
+        )
         params: list = [cutoff]
         if tool is not None:
             where += " AND tool = ?"
@@ -447,11 +502,15 @@ class MetricsStore:
         cutoff = time.time() - since_seconds
         placeholders = ",".join("?" for _ in error_categories) or "NULL"
         with self._lock:
+            # ``source = 'mcp'``: the exposure health filter (#465) gauges
+            # upstream tool health; native built-in (``source='hook'``) rows must
+            # not enter the per-(server, tool) call/error counts.
             rows = self._db.execute(
                 "SELECT server, tool, COUNT(*), "
                 "SUM(CASE WHEN is_error = 1 AND error_category IN "
                 f"({placeholders}) THEN 1 ELSE 0 END) "
-                "FROM proxy_metrics WHERE created_at >= ? GROUP BY server, tool",
+                "FROM proxy_metrics WHERE created_at >= ? AND source = 'mcp' "
+                "GROUP BY server, tool",
                 (*error_categories, cutoff),
             ).fetchall()
         return {(r[0], r[1]): (r[2], r[3] or 0) for r in rows}

@@ -118,6 +118,15 @@ class HookConfig(BaseModel):
     compression: HookCompressionConfig = Field(default_factory=HookCompressionConfig)
     """Built-in tool *output compression* (P1a — Bash). Independent of surfacing:
     see :class:`HookCompressionConfig`. Env: ``MEMTOMEM_STM_HOOK__COMPRESSION__*``."""
+    metrics_enabled: bool = True
+    """Record one per-call row (sizes + timings only, never tool input) into the
+    shared ``proxy_metrics.db`` with ``source='hook'`` for every native built-in
+    tool call the hook sees. Default ``True`` makes otherwise-invisible
+    native-tool spend measurable (`mms stats --source hook`). Deliberately
+    independent of ``proxy.metrics.enabled`` so a hook-only deployment (proxy
+    disabled) still gets metrics; it reuses ``proxy.metrics.db_path`` /
+    ``max_history`` for storage. Opt out with
+    ``MEMTOMEM_STM_HOOK__METRICS_ENABLED=0``."""
 
 
 class DaemonConfig(BaseModel):
