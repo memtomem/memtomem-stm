@@ -19,9 +19,14 @@ fingerprint-keyed) lock's job (see :mod:`~memtomem_stm.daemon.locking`).
 Liveness is proven by a successful ``ping`` over the socket — not by the
 recorded ``pid`` — so a recycled PID can't be mistaken for the daemon.
 
-A config change leaves the old fingerprint's handshake behind as an orphan; it
-is harmless (no reader keys to it anymore) and the old daemon removes its own on
-graceful teardown / idle timeout.
+A config change (or a ``PROTOCOL_VERSION`` bump) leaves the old fingerprint's
+handshake behind as an orphan. No reader keys to it anymore, so it is harmless
+to *new* callers, and a daemon with a finite ``idle_timeout_seconds`` removes
+its own handshake on graceful teardown / idle timeout. Caveat: a daemon pinned
+with ``idle_timeout_seconds=0`` never idle-shuts-down, so after a fingerprint
+change it lingers and is no longer reachable by ``mms daemon stop`` (which keys
+to the *current* fingerprint) — stop it manually by pid (better handling of
+such orphans is tracked in #517).
 
 File shape::
 
@@ -90,9 +95,11 @@ def config_fingerprint(config: STMConfig) -> str:
     ``protocol_version`` is also folded in so a wire-incompatible daemon is
     treated as a *different config*: a hook and a daemon built at different
     :data:`~memtomem_stm.daemon.protocol.PROTOCOL_VERSION` values key to distinct
-    handshake/lock paths and coexist (the stale one idle-times-out) instead of
-    exchanging frames one side can't parse. This is the structural half of the
-    version guard; the explicit per-frame ``v`` check is the belt-and-suspenders.
+    handshake/lock paths and coexist instead of exchanging frames one side can't
+    parse (the stale one idle-times-out under a finite ``idle_timeout_seconds``;
+    a pinned ``idle_timeout_seconds=0`` daemon must be stopped manually — see the
+    module docstring and #517). This is the structural half of the version guard;
+    the explicit per-frame ``v`` check is the belt-and-suspenders.
     """
     material = {
         "surfacing": config.surfacing.model_dump(mode="json"),

@@ -280,6 +280,26 @@ async def test_surface_returns_none_when_daemon_absent(tmp_path: Path) -> None:
     assert out is None
 
 
+async def test_oversized_wire_frame_degrades_to_none(tmp_path: Path) -> None:
+    # _bounded_call caps tool_response_text, but to_wire ships tool_input
+    # uncapped. If an operator adds write/edit to the surface allowlist, a
+    # multi-MB tool_input (file contents / new_string) can push the frame past
+    # MAX_MESSAGE_BYTES. The contract (documented in hook_cmd._SAFE_DAEMON_BUDGET)
+    # is that this degrades to None — the server's readline limit drops the
+    # oversized frame and the client gets no parseable reply — and never raises
+    # to the host. A live daemon makes this exercise the server-side drop, not
+    # just the daemon-absent path above.
+    cfg = _config(tmp_path)
+    _, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        huge = "z" * (MAX_MESSAGE_BYTES + 4096)
+        call = _canonical({**_READ_PAYLOAD, "tool_input": {"file_path": "/x", "content": huge}})
+        out = await client.surface(cfg, call, timeout=3.0)
+        assert out is None  # degraded, no exception raised
+    finally:
+        await _stop(cfg, task)
+
+
 async def test_hook_run_hook_routes_to_live_daemon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

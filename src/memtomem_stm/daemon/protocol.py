@@ -27,8 +27,10 @@ both ends (the server rejects a mismatched request, the client discards a
 mismatched response). The match is belt-and-suspenders: ``PROTOCOL_VERSION`` is
 folded into the daemon's ``config_fingerprint``, so a hook and a daemon built at
 different protocol versions key to different handshake/lock paths and never even
-discover each other — a version bump makes the two coexist (the stale daemon
-idle-times-out) instead of exchanging frames one side can't parse.
+discover each other — a version bump makes the two coexist instead of exchanging
+frames one side can't parse (the stale daemon idle-times-out under a finite
+``idle_timeout_seconds``; a pinned ``idle_timeout_seconds=0`` daemon must be
+stopped manually — see #517).
 
 **v2 (this version):** the ``surface`` payload is a serialized
 :class:`~memtomem_stm.cli.hook_adapter.CanonicalHookCall` (``to_wire``), so the
