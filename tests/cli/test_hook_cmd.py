@@ -113,6 +113,12 @@ _READ_PAYLOAD = {
 }
 
 
+def _canonical(payload: dict):
+    """Parse a raw host payload into the CanonicalHookCall the hook core +
+    compression + metrics consume (mirrors what ``_orchestrate`` does once)."""
+    return ClaudeHookAdapter().parse(payload)
+
+
 # ── _tool_response_to_text ───────────────────────────────────────────────────
 
 
@@ -159,7 +165,7 @@ def test_extract_block_defensive_fallback_on_wrong_mode():
 
 async def test_run_hook_surfaces_into_additional_context():
     engine = _engine_with_results([_FakeResult(_FakeChunk(content="Use RS256 for JWT"), 0.5)])
-    out = await run_surfacing_hook(_READ_PAYLOAD, engine=engine)
+    out = await run_surfacing_hook(_canonical(_READ_PAYLOAD), engine=engine)
     hso = out["hookSpecificOutput"]
     assert hso["hookEventName"] == "PostToolUse"
     ctx = hso["additionalContext"]
@@ -174,26 +180,28 @@ async def test_run_hook_surfaces_into_additional_context():
 
 async def test_run_hook_empty_results_is_noop():
     engine = _engine_with_results([])
-    assert await run_surfacing_hook(_READ_PAYLOAD, engine=engine) == {}
+    assert await run_surfacing_hook(_canonical(_READ_PAYLOAD), engine=engine) == {}
 
 
 async def test_run_hook_ignores_non_posttooluse():
     engine = _engine_with_results([_FakeResult(_FakeChunk(), 0.9)])
     payload = {**_READ_PAYLOAD, "hook_event_name": "PreToolUse"}
-    assert await run_surfacing_hook(payload, engine=engine) == {}
+    assert await run_surfacing_hook(_canonical(payload), engine=engine) == {}
 
 
 async def test_run_hook_requires_tool_name():
+    # No tool_name → canonical_tool "" → not in the allowlist → no-op.
     engine = _engine_with_results([_FakeResult(_FakeChunk(), 0.9)])
     payload = {"hook_event_name": "PostToolUse", "tool_input": {"file_path": "x"}}
-    assert await run_surfacing_hook(payload, engine=engine) == {}
+    assert await run_surfacing_hook(_canonical(payload), engine=engine) == {}
 
 
 @pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit", "Task"])
 async def test_run_hook_rejects_non_readlike_tools(tool: str):
     # Write/Edit/etc. must never surface — even with a matching engine and a
-    # broad host matcher — so their inputs don't become queries (the gate's
-    # write-tool block is case-sensitive and misses PascalCase names).
+    # broad host matcher — so their inputs don't become queries. Their canonical
+    # names (write/edit, or "" for tools outside the vocabulary) aren't in the
+    # surface allowlist {read,grep,glob,shell}.
     engine = _engine_with_results([_FakeResult(_FakeChunk(content="secret"), 0.9)])
     payload = {
         "hook_event_name": "PostToolUse",
@@ -201,17 +209,67 @@ async def test_run_hook_rejects_non_readlike_tools(tool: str):
         "tool_input": {"file_path": "/a/b.py", "old_string": "x", "new_string": "y"},
         "tool_response": {"content": _LONG},
     }
-    assert await run_surfacing_hook(payload, engine=engine) == {}
+    assert await run_surfacing_hook(_canonical(payload), engine=engine) == {}
 
 
 async def test_run_hook_allowlist_env_override(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "CustomRead")
+    # The override lists *canonical* names. Set it to grep-only: the default
+    # read (Read) is now rejected, and grep (Grep) is accepted.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "grep")
     engine = _engine_with_results([_FakeResult(_FakeChunk(content="hit"), 0.9)])
-    # A default-allowlisted tool is now rejected...
-    assert await run_surfacing_hook(_READ_PAYLOAD, engine=engine) == {}
-    # ...and the override tool is accepted.
-    out = await run_surfacing_hook({**_READ_PAYLOAD, "tool_name": "CustomRead"}, engine=engine)
+    assert await run_surfacing_hook(_canonical(_READ_PAYLOAD), engine=engine) == {}
+    grep_payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "jwt_auth_handler_token"},
+        "tool_response": {"content": _LONG},
+    }
+    out = await run_surfacing_hook(_canonical(grep_payload), engine=engine)
     assert "hit" in out["hookSpecificOutput"]["additionalContext"]
+
+
+async def test_run_hook_allowlist_env_accepts_legacy_native_names(monkeypatch: pytest.MonkeyPatch):
+    # Back-compat: the env historically listed Claude's native names. A legacy
+    # value still resolves (Bash → shell) so surfacing keeps firing — the
+    # canonical rename is not a silent breaking change.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Bash")
+    engine = _engine_with_results([_FakeResult(_FakeChunk(content="hit"), 0.9)])
+    # Read (canonical read) is not in the Bash-only allowlist → rejected.
+    assert await run_surfacing_hook(_canonical(_READ_PAYLOAD), engine=engine) == {}
+    # Bash (legacy native → canonical shell) is accepted.
+    out = await run_surfacing_hook(_canonical(_bash_payload({"stdout": _LONG})), engine=engine)
+    assert "hit" in out["hookSpecificOutput"]["additionalContext"]
+
+
+async def test_run_hook_passes_host_native_tool_name_to_engine():
+    # Behavior-preservation lever: the surfacing engine receives the HOST-NATIVE
+    # tool name (Bash), not the canonical (shell), so query extraction — which
+    # can fall back to the tool name as a query token — is unchanged for Claude.
+    spy = AsyncMock()
+    spy.surface = AsyncMock(return_value="orig")
+    spy.injection_mode = "append"
+    await run_surfacing_hook(_canonical(_bash_payload({"stdout": _LONG})), engine=spy)
+    args = spy.surface.await_args.args
+    assert args[0] == "builtin"
+    assert args[1] == "Bash"  # NOT "shell"
+
+
+def test_surface_tools_resolves_canonical_native_and_unknown(monkeypatch: pytest.MonkeyPatch):
+    from memtomem_stm.cli.hook_cmd import _surface_tools
+
+    # Mixed: a canonical name kept, a legacy native name translated, an unknown
+    # token dropped (logged). The two valid tokens resolve; the bogus one does not.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "read, Bash, Bogus")
+    assert _surface_tools() == frozenset({"read", "shell"})
+
+    # An explicit list that resolves to nothing → empty allowlist (NOT the
+    # default — the operator restricted, even if every token was a typo).
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Bogus,Nope")
+    assert _surface_tools() == frozenset()
+
+    # All-blank is unset-equivalent → default.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", " , ")
+    assert _surface_tools() == frozenset({"read", "grep", "glob", "shell"})
 
 
 async def test_run_hook_never_raises_on_engine_error():
@@ -220,7 +278,7 @@ async def test_run_hook_never_raises_on_engine_error():
     boom = AsyncMock()
     boom.surface = AsyncMock(side_effect=RuntimeError("LTM exploded"))
     boom.injection_mode = "append"
-    assert await run_surfacing_hook(_READ_PAYLOAD, engine=boom) == {}
+    assert await run_surfacing_hook(_canonical(_READ_PAYLOAD), engine=boom) == {}
 
 
 # ── CLI degradation (must always print {} and exit 0) ────────────────────────
@@ -365,9 +423,14 @@ def _bash_payload(tool_response, *, tool="Bash", event="PostToolUse"):
     }
 
 
+def _bash_call(tool_response, *, tool="Bash", event="PostToolUse"):
+    """The CanonicalHookCall ``maybe_compress_builtin`` now consumes."""
+    return _canonical(_bash_payload(tool_response, tool=tool, event=event))
+
+
 def test_compress_dict_preserves_metadata_and_shrinks_stdout():
     resp = {"stdout": _BIG_STDOUT, "stderr": "a warning", "interrupted": False, "isImage": False}
-    out = maybe_compress_builtin(_bash_payload(resp), _CFG)
+    out = maybe_compress_builtin(_bash_call(resp), _CFG)
     assert isinstance(out, dict)
     # Only stdout is replaced; it is shrunk and carries the sentinel.
     assert out["stdout"].startswith(_COMPRESS_SENTINEL)
@@ -397,7 +460,7 @@ def test_compress_reserves_sentinel_from_budget(monkeypatch: pytest.MonkeyPatch)
             return "BODY"
 
     monkeypatch.setattr("memtomem_stm.proxy.compression.TruncateCompressor", _Spy)
-    out = maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG)
+    out = maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), _CFG)
     prefix_len = len(_COMPRESS_SENTINEL) + 1  # sentinel + "\n"
     assert seen["budget"] == _CFG.max_chars - prefix_len
     assert out["stdout"] == f"{_COMPRESS_SENTINEL}\nBODY"
@@ -409,41 +472,41 @@ def test_compress_skipped_when_budget_below_sentinel():
     # the configured cap many-fold (max_chars=1 → ~18 chars) — the stage
     # must skip instead of "compressing" past its own budget.
     cfg = HookCompressionConfig(enabled=True, max_chars=len(_COMPRESS_SENTINEL))
-    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), cfg) is None
+    assert maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), cfg) is None
 
 
 def test_compress_noop_for_plain_string_response():
     # For the built-in Bash tool, updatedToolOutput must be a structured object;
     # a bare string would be ignored by the host, so an unstructured response is
     # left untouched rather than replaced (Codex Major).
-    assert maybe_compress_builtin(_bash_payload(_BIG_STDOUT), _CFG) is None
+    assert maybe_compress_builtin(_bash_call(_BIG_STDOUT), _CFG) is None
 
 
 def test_compress_noop_when_small():
-    assert maybe_compress_builtin(_bash_payload({"stdout": "tiny"}), _CFG) is None
+    assert maybe_compress_builtin(_bash_call({"stdout": "tiny"}), _CFG) is None
 
 
 def test_compress_noop_when_disabled():
     cfg = HookCompressionConfig(enabled=False, max_chars=2000)
-    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), cfg) is None
+    assert maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), cfg) is None
 
 
 def test_compress_noop_for_non_bash_tool():
     # Read output must never be replaced (a later Edit needs it verbatim).
-    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}, tool="Read"), _CFG) is None
+    assert maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}, tool="Read"), _CFG) is None
 
 
 def test_compress_noop_for_non_posttooluse():
     assert (
-        maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}, event="PreToolUse"), _CFG)
+        maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}, event="PreToolUse"), _CFG)
         is None
     )
 
 
 def test_compress_is_idempotent_on_sentinel():
-    out = maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG)
+    out = maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), _CFG)
     # Feeding the already-compressed stdout back must not re-compress.
-    assert maybe_compress_builtin(_bash_payload({"stdout": out["stdout"]}), _CFG) is None
+    assert maybe_compress_builtin(_bash_call({"stdout": out["stdout"]}), _CFG) is None
 
 
 def test_compress_no_false_positive_on_truncate_marker():
@@ -452,7 +515,7 @@ def test_compress_no_false_positive_on_truncate_marker():
     poisoned = (
         _BIG_STDOUT + "\n... (truncated, original: 5 chars)\n... (12 similar lines omitted)\n"
     )
-    out = maybe_compress_builtin(_bash_payload({"stdout": poisoned}), _CFG)
+    out = maybe_compress_builtin(_bash_call({"stdout": poisoned}), _CFG)
     assert out is not None and out["stdout"].startswith(_COMPRESS_SENTINEL)
 
 
@@ -464,7 +527,7 @@ def test_compress_no_false_positive_on_embedded_sentinel():
     # uncompressed (observed on ``git log --stat`` whose commit body names the
     # sentinel).
     embedded = f"a commit body mentioning the {_COMPRESS_SENTINEL} sentinel\n" + _BIG_STDOUT
-    out = maybe_compress_builtin(_bash_payload({"stdout": embedded}), _CFG)
+    out = maybe_compress_builtin(_bash_call({"stdout": embedded}), _CFG)
     assert out is not None and out["stdout"].startswith(_COMPRESS_SENTINEL)
 
 
@@ -474,7 +537,7 @@ def test_compress_never_raises(monkeypatch: pytest.MonkeyPatch):
             raise RuntimeError("compressor exploded")
 
     monkeypatch.setattr("memtomem_stm.proxy.compression.TruncateCompressor", _Boom)
-    assert maybe_compress_builtin(_bash_payload({"stdout": _BIG_STDOUT}), _CFG) is None
+    assert maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), _CFG) is None
 
 
 # ── native-tool metrics (A1 — proxy_metrics.db row with source='hook') ───────
@@ -493,17 +556,12 @@ def _metrics_config(tmp_path: Path, *, enabled: bool = True):
     )
 
 
-def _hook_call(payload: dict):
-    """Parse a raw payload into the CanonicalHookCall ``_record_hook_metrics`` now consumes."""
-    return ClaudeHookAdapter().parse(payload)
-
-
 def test_record_hook_metrics_writes_source_hook_row(tmp_path: Path):
     from memtomem_stm.proxy.metrics_store import read_compression_summary
 
     cfg = _metrics_config(tmp_path)
     updated = {"stdout": f"{_COMPRESS_SENTINEL}\nshort", "stderr": ""}
-    _record_hook_metrics(_hook_call(_bash_payload({"stdout": _BIG_STDOUT})), updated, _BLOCK, cfg)
+    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), updated, _BLOCK, cfg)
 
     summary = read_compression_summary(tmp_path / "metrics.db", source="hook")
     assert summary["available"] is True
@@ -525,7 +583,7 @@ def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path:
         "tool_response": {"content": "y" * 4000},
     }
     # Both stages no-op (Read is never compressed; no surfaced context).
-    _record_hook_metrics(_hook_call(payload), None, None, cfg)
+    _record_hook_metrics(_canonical(payload), None, None, cfg)
 
     row = read_compression_summary(tmp_path / "metrics.db", source="hook")["by_tool"][0]
     assert row["tool"] == "Read"
@@ -536,7 +594,7 @@ def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path:
 
 def test_record_hook_metrics_disabled_writes_nothing(tmp_path: Path):
     cfg = _metrics_config(tmp_path, enabled=False)
-    _record_hook_metrics(_hook_call(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
+    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
     assert not (tmp_path / "metrics.db").exists()  # store never opened
 
 
@@ -544,7 +602,7 @@ def test_record_hook_metrics_skips_empty_output(tmp_path: Path):
     # A result that flattens to nothing carries no spend to record.
     cfg = _metrics_config(tmp_path)
     _record_hook_metrics(
-        _hook_call({"hook_event_name": "PostToolUse", "tool_name": "Bash"}), None, None, cfg
+        _canonical({"hook_event_name": "PostToolUse", "tool_name": "Bash"}), None, None, cfg
     )
     assert not (tmp_path / "metrics.db").exists()
 
@@ -558,7 +616,7 @@ def test_record_hook_metrics_never_raises_on_bad_store(tmp_path: Path):
         hook=SimpleNamespace(metrics_enabled=True),
         proxy=SimpleNamespace(metrics=SimpleNamespace(db_path=tmp_path, max_history=10000)),
     )
-    _record_hook_metrics(_hook_call(_bash_payload({"stdout": _BIG_STDOUT})), None, None, bad)
+    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, bad)
 
 
 def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
@@ -581,7 +639,7 @@ def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
     try:
         cfg = _metrics_config(tmp_path)  # db_path == db
         start = time.monotonic()
-        _record_hook_metrics(_hook_call(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
+        _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
         elapsed = time.monotonic() - start
     finally:
         blocker.rollback()

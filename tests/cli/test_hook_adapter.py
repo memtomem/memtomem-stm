@@ -41,12 +41,50 @@ def test_adapter_parse_claude_valid_payload():
     assert isinstance(call, CanonicalHookCall)
     assert call.event_type == "PostToolUse"
     assert call.tool_name == "Read"
+    # Read normalizes to the canonical 'read' (the allowlist/compression gates
+    # key on this, not the host-native PascalCase name).
+    assert call.canonical_tool == "read"
     assert call.tool_input == {"file_path": "/src/auth/jwt.py"}
     # The ORIGINAL response object is preserved (compression needs the real dict).
     assert call.tool_response is response
     # tool_response_text is the flattened text, identical to the shared helper.
     assert call.tool_response_text == _tool_response_to_text(response)
     assert call.host_tag == "claude"
+
+
+@pytest.mark.parametrize(
+    ("native", "canonical"),
+    [
+        ("Read", "read"),
+        ("Grep", "grep"),
+        ("Glob", "glob"),
+        ("Bash", "shell"),
+        ("WebFetch", "web_fetch"),
+        ("Write", "write"),
+        ("Edit", "edit"),
+        ("MultiEdit", "edit"),
+        ("Task", ""),  # outside the canonical vocabulary
+        ("TodoWrite", ""),
+    ],
+)
+def test_adapter_parse_canonicalizes_tool_name(native: str, canonical: str):
+    call = _CLAUDE.parse({"tool_name": native, "tool_response": "x"})
+    assert call is not None
+    assert call.tool_name == native  # host-native preserved (engine query input)
+    assert call.canonical_tool == canonical
+
+
+@pytest.mark.parametrize("mcp_tool", ["mcp__memtomem__mem_search", "mcp__github__create_issue"])
+def test_adapter_parse_rejects_mcp_tools(mcp_tool: str):
+    # mcp__-prefixed tools already flow through the MCP proxy pipeline — the
+    # native-tool hook must not double-handle them, so parse no-ops to None.
+    assert _CLAUDE.parse({"tool_name": mcp_tool, "tool_response": "x"}) is None
+
+
+def test_adapter_parse_unmapped_tool_canonicalizes_to_empty():
+    call = _CLAUDE.parse({"tool_name": "SomeFutureTool", "tool_response": "x"})
+    assert call is not None
+    assert call.canonical_tool == ""
 
 
 def test_adapter_parse_defaults_event_to_posttooluse():

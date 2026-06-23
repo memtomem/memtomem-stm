@@ -15,6 +15,19 @@ parse/render delegate to the existing helpers in :mod:`hook_cmd` (imported
 lazily to avoid an import cycle, since ``hook_cmd`` imports this module), so
 behavior is byte-identical to the pre-adapter code.
 
+Tool-name normalization (B2). Every host names the same built-in differently
+(``Bash`` / ``Shell``; ``Read`` / ``ReadFile``), so :meth:`parse` maps each
+host's native name through :attr:`HostHookAdapter.native_tool_map` into STM's
+**canonical vocabulary** ``{read, grep, glob, shell, web_fetch, write, edit}``
+and records it on :attr:`CanonicalHookCall.canonical_tool`. The shared core then
+gates on the canonical name — one surface allowlist (``{read, grep, glob,
+shell}``) and one compression gate (``shell``) work for every host, instead of
+each host's PascalCase spelling. A native name absent from the map canonicalizes
+to ``""`` (never surfaced/compressed — it isn't one of the read-like built-ins
+STM bridges). The surfacing *engine* still receives the host-native
+:attr:`CanonicalHookCall.tool_name` for query extraction (so behavior is
+unchanged), so the canonical name is purely a host-agnostic gating key.
+
 Capability flag — ``can_replace_output``. Per the B0 host-contract
 verification, output *replacement* (the compression channel,
 ``updatedToolOutput``) ports to **no** non-Claude host (Cursor's field is
@@ -24,13 +37,14 @@ adapter sets it ``False`` and the orchestrator skips compression for that host.
 *Surfacing* (context injection) is the universal channel and flows through
 ``render`` for every host.
 
-Scope B1 does NOT cover (deferred to B2, per the daemon-boundary decision): the
-shared surfacing core still reads the raw payload, and the daemon still receives
-the raw payload over the wire (``PROTOCOL_VERSION`` unchanged) — it already
-treats that payload opaquely, so a Claude-only ship needs no wire change. The
-:class:`CanonicalHookCall` is the normalized contract a B2 wire change will send
-and have the core consume; in B1 it is produced by :meth:`parse` and drives
-adapter dispatch, the compression gate, native-tool metrics, and :meth:`render`.
+The shared surfacing core now consumes the :class:`CanonicalHookCall` (not the
+raw payload): :meth:`parse` produces it and it drives adapter dispatch, the
+compression gate, the surfacing core, native-tool metrics, and :meth:`render`.
+Still deferred (the daemon-boundary step): the daemon receives the *raw* payload
+over the wire (``PROTOCOL_VERSION`` unchanged) and re-parses it server-side with
+the Claude adapter — it already treats the payload opaquely, so a Claude-only
+ship needs no wire change. Sending the :class:`CanonicalHookCall` itself over the
+wire (so the daemon needs no host knowledge) is the next step.
 """
 
 from __future__ import annotations
@@ -50,10 +64,17 @@ class CanonicalHookCall:
     the *original* object, so a Bash result's ``stdout`` can be replaced while
     ``stderr`` / exit / ``interrupted`` survive verbatim) need, so a consumer
     never has to re-touch the raw payload.
+
+    ``tool_name`` is the host's *native* tool name (e.g. ``Bash``), passed to the
+    surfacing engine for query extraction. ``canonical_tool`` is the
+    host-agnostic name (e.g. ``shell``) from STM's canonical vocabulary that the
+    allowlist + compression gates key on; ``""`` for a tool outside that
+    vocabulary (never surfaced/compressed).
     """
 
     event_type: str
     tool_name: str
+    canonical_tool: str = ""
     tool_input: dict[str, Any] = field(default_factory=dict)
     tool_response: Any = None
     tool_response_text: str = ""
@@ -66,20 +87,25 @@ class HostHookAdapter(ABC):
     Subclasses are the *only* place that knows a host's payload keys and output
     shape. ``host_tag`` identifies the host (dispatch + provenance);
     ``can_replace_output`` declares whether the host honors output replacement
-    (compression) — see the module docstring.
+    (compression) — see the module docstring. ``native_tool_map`` maps the
+    host's native PostToolUse tool names to STM's canonical vocabulary (see the
+    module docstring); a native name absent from it canonicalizes to ``""``.
     """
 
     host_tag: ClassVar[str]
     can_replace_output: ClassVar[bool]
+    native_tool_map: ClassVar[dict[str, str]]
 
     @abstractmethod
     def parse(self, payload: dict[str, Any]) -> CanonicalHookCall | None:
         """Normalize the host's stdin payload into a :class:`CanonicalHookCall`.
 
-        Returns ``None`` for an unusable payload (e.g. not a dict) — the caller
-        treats that as a clean no-op, mirroring ``_read_payload``. **Never
-        raises.** Permissive by design: eligibility gating (PostToolUse, the
-        surface allowlist) stays in the shared core, not here.
+        Returns ``None`` for an unusable payload (e.g. not a dict) or an
+        ``mcp__``-prefixed tool (those already flow through the MCP proxy, never
+        the native-tool hook) — the caller treats that as a clean no-op,
+        mirroring ``_read_payload``. **Never raises.** Permissive by design:
+        eligibility gating (PostToolUse, the surface allowlist) stays in the
+        shared core, not here.
         """
 
     @abstractmethod
@@ -106,20 +132,37 @@ class ClaudeHookAdapter(HostHookAdapter):
 
     host_tag: ClassVar[str] = "claude"
     can_replace_output: ClassVar[bool] = True
+    # Claude Code's PascalCase built-in tool names → STM's canonical vocabulary.
+    # MultiEdit/Edit both map to ``edit``; tools outside this map (Task,
+    # TodoWrite, …) canonicalize to ``""`` and never surface/compress.
+    native_tool_map: ClassVar[dict[str, str]] = {
+        "Read": "read",
+        "Grep": "grep",
+        "Glob": "glob",
+        "Bash": "shell",
+        "WebFetch": "web_fetch",
+        "Write": "write",
+        "Edit": "edit",
+        "MultiEdit": "edit",
+    }
 
     def parse(self, payload: dict[str, Any]) -> CanonicalHookCall | None:
         if not isinstance(payload, dict):
             return None
+        raw_name = payload.get("tool_name")
+        tool_name = raw_name if isinstance(raw_name, str) else ""
+        if tool_name.startswith("mcp__"):
+            return None  # proxied MCP tool — already runs through the pipeline
         # Lazy import: avoid a cycle (hook_cmd imports this module at top level)
         # and keep ``mms hook --help`` off the surfacing import cost.
         from memtomem_stm.cli.hook_cmd import _tool_response_to_text
 
-        tool_name = payload.get("tool_name")
         tool_input = payload.get("tool_input")
         tool_response = payload.get("tool_response")
         return CanonicalHookCall(
             event_type=payload.get("hook_event_name") or "PostToolUse",
-            tool_name=tool_name if isinstance(tool_name, str) else "",
+            tool_name=tool_name,
+            canonical_tool=self.native_tool_map.get(tool_name, ""),
             tool_input=tool_input if isinstance(tool_input, dict) else {},
             tool_response=tool_response,
             tool_response_text=_tool_response_to_text(tool_response),
@@ -134,13 +177,39 @@ class ClaudeHookAdapter(HostHookAdapter):
         return _build_hook_output(updated_tool_output, additional_context)
 
 
-# Single-entry registry in B1; B2 adds Cursor/Kimi/Codex keyed by host_tag.
+# Single-entry registry today; B2 adds Cursor/Kimi/Codex keyed by host_tag.
 _ADAPTERS: dict[str, HostHookAdapter] = {ClaudeHookAdapter.host_tag: ClaudeHookAdapter()}
+
+# STM's canonical built-in tool vocabulary — the codomain of every adapter's
+# ``native_tool_map``. The surface allowlist + compression gate are expressed in
+# these names so one gate works across hosts.
+CANONICAL_TOOLS: frozenset[str] = frozenset(
+    {"read", "grep", "glob", "shell", "web_fetch", "write", "edit"}
+)
 
 
 def get_adapter(host_tag: str = "claude") -> HostHookAdapter:
     """Return the adapter for ``host_tag`` (falls back to Claude).
 
-    B1 only registers Claude; the indirection is the B2 dispatch seam.
+    Only Claude is registered today; the indirection is the B2 dispatch seam.
     """
     return _ADAPTERS.get(host_tag) or _ADAPTERS["claude"]
+
+
+def canonicalize_tool_token(token: str) -> str | None:
+    """Resolve a surface-allowlist token to a canonical tool name, or ``None``.
+
+    Accepts a canonical name verbatim, or a known host-native name (back-compat
+    for the pre-canonical ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` spelling — e.g.
+    Claude's ``Read`` / ``Bash`` → ``read`` / ``shell`` — and any registered
+    host's native names). Returns ``None`` for an unrecognized token so the
+    caller can warn + drop it instead of silently building an allowlist that
+    matches nothing. Case-sensitive: native names are PascalCase, canonical are
+    lowercase, so there is no ambiguity."""
+    if token in CANONICAL_TOOLS:
+        return token
+    for adapter in _ADAPTERS.values():
+        mapped = adapter.native_tool_map.get(token)
+        if mapped:
+            return mapped
+    return None

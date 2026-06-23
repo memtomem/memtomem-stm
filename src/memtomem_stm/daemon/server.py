@@ -38,6 +38,7 @@ import sys
 import time
 from typing import Any
 
+from memtomem_stm.cli.hook_adapter import get_adapter
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import discovery, locking
@@ -384,9 +385,16 @@ class DaemonServer:
             if not isinstance(payload, dict):
                 return surface_response({})
             self._last_request = time.monotonic()
+            # Normalize the raw host payload into a CanonicalHookCall the core
+            # consumes. The wire still carries Claude's raw PostToolUse payload
+            # today (PROTOCOL_VERSION unchanged), so the daemon parses it with the
+            # Claude adapter; sending the canonical over the wire is the next step.
+            call = get_adapter().parse(payload)
+            if call is None:
+                return surface_response({})
             # Serialize: one LTM RPC at a time over the shared MCP session.
             async with self._surface_lock:
-                output = await run_surfacing_hook(payload, engine=self._engine)
+                output = await run_surfacing_hook(call, engine=self._engine)
             return surface_response(output)
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
 
