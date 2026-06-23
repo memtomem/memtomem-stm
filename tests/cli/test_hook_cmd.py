@@ -541,6 +541,38 @@ def test_record_hook_metrics_never_raises_on_bad_store(tmp_path: Path):
     _record_hook_metrics(_bash_payload({"stdout": _BIG_STDOUT}), None, None, bad)
 
 
+def test_record_hook_metrics_degrades_quickly_when_db_locked(tmp_path: Path):
+    import sqlite3
+    import time
+
+    from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
+
+    db = tmp_path / "metrics.db"
+    # Create the schema first so the lock contention is purely on the write.
+    seed = MetricsStore(db)
+    seed.initialize()
+    seed.close()
+
+    # Hold an EXCLUSIVE write lock from another connection so the hook's writer
+    # contends. Its 250 ms busy timeout must make it fail fast (no row, no raise,
+    # no multi-second stall up to the shared 3000 ms budget).
+    blocker = sqlite3.connect(str(db), timeout=0.1)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        cfg = _metrics_config(tmp_path)  # db_path == db
+        start = time.monotonic()
+        _record_hook_metrics(_bash_payload({"stdout": _BIG_STDOUT}), None, None, cfg)
+        elapsed = time.monotonic() - start
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    # Fast-fail: comfortably under the shared 3000 ms busy timeout (generous
+    # bound to stay non-flaky in CI) and nothing persisted.
+    assert elapsed < 2.0
+    assert read_compression_summary(db, source="hook")["total_calls"] == 0
+
+
 # ── bounded surfacing payload + merge builder ────────────────────────────────
 
 

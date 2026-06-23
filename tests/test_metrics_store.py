@@ -249,6 +249,75 @@ class TestRecordPersistsNewFields:
         )
         assert rows == {"builtin": "hook", "lf": "mcp"}
 
+    def test_get_tool_profiles_excludes_hook_source(self, store):
+        # The tuner adjusts proxy compression budgets for upstream tools; a
+        # native-tool hook row (source='hook') must never surface as a profile,
+        # else the tuner emits a bogus 'builtin/Bash compression=truncate' rec.
+        store.record(
+            CallMetrics(
+                server="lf",
+                tool="search",
+                original_chars=1000,
+                compressed_chars=400,
+                cleaned_chars=900,
+                compression_strategy="truncate",
+            )
+        )
+        store.record(
+            CallMetrics(
+                server="builtin",
+                tool="Bash",
+                original_chars=900,
+                compressed_chars=300,
+                cleaned_chars=900,
+                compression_strategy="truncate",
+                source="hook",
+            )
+        )
+        profiles = store.get_tool_profiles(since_seconds=3600.0)
+        keys = {(p["server"], p["tool"]) for p in profiles}
+        assert ("lf", "search") in keys
+        assert ("builtin", "Bash") not in keys
+
+    def test_error_stats_exclude_hook_source(self, store):
+        # The exposure health filter (#465) is proxy analytics; hook rows must
+        # not enter its per-(server, tool) call/error counts.
+        store.record(CallMetrics(server="gh", tool="search", original_chars=10, compressed_chars=5))
+        store.record(
+            CallMetrics(
+                server="builtin",
+                tool="Bash",
+                original_chars=10,
+                compressed_chars=5,
+                source="hook",
+            )
+        )
+        err = store.get_tool_error_stats(since_seconds=3600.0, error_categories=("upstream_error",))
+        assert ("builtin", "Bash") not in err
+        assert ("gh", "search") in err
+
+
+class TestBusyTimeout:
+    """The hook passes a small ``busy_timeout_ms`` so a locked shared DB
+    fast-fails instead of stalling the host's tool call."""
+
+    def test_override_is_applied(self, tmp_path):
+        store = MetricsStore(tmp_path / "m.db", busy_timeout_ms=250)
+        store.initialize()
+        try:
+            assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 250
+        finally:
+            store.close()
+
+    def test_default_keeps_shared_timeout(self, tmp_path):
+        store = MetricsStore(tmp_path / "m.db")
+        store.initialize()
+        try:
+            # tune_connection's shared BUSY_TIMEOUT_MS (3000) is untouched.
+            assert store._db.execute("PRAGMA busy_timeout").fetchone()[0] == 3000
+        finally:
+            store.close()
+
 
 class TestReadPathConcurrency:
     """Cross-thread reader/writer safety.
@@ -467,6 +536,35 @@ class TestReadCompressionSummary:
         # 'mcp' on a legacy DB still sees the legacy rows (all implicitly mcp).
         mcp = read_compression_summary(db_path, source="mcp")
         assert mcp["total_calls"] == 1
+
+    def test_schema_outdated_false_when_only_source_missing(self, tmp_path):
+        # A DB that has ``is_error`` but predates ``source``: error counts are
+        # available, so ``schema_outdated`` (which flags is_error only) must be
+        # False — otherwise the CLI shows a misleading "error counts" warning.
+        db_path = tmp_path / "post_is_error_pre_source.db"
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, tool TEXT, "
+            "original_chars INTEGER, compressed_chars INTEGER, "
+            "cleaned_chars INTEGER DEFAULT 0, created_at REAL, "
+            "is_error INTEGER NOT NULL DEFAULT 0)"
+        )
+        db.execute(
+            "INSERT INTO proxy_metrics "
+            "(server, tool, original_chars, compressed_chars, created_at, is_error) "
+            "VALUES ('s', 't', 100, 40, 0, 0)"
+        )
+        db.commit()
+        db.close()
+
+        summary = read_compression_summary(db_path)
+        assert summary["available"] is True
+        assert summary["schema_outdated"] is False  # is_error present → up to date
+        assert summary["total_calls"] == 1
+        # source filter still degrades correctly without the column:
+        assert read_compression_summary(db_path, source="hook")["total_calls"] == 0
+        assert read_compression_summary(db_path, source="mcp")["total_calls"] == 1
 
     def test_missing_db_is_unavailable_and_not_created(self, tmp_path):
         db_path = tmp_path / "does_not_exist.db"

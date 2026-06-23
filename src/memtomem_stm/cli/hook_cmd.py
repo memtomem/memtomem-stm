@@ -100,6 +100,13 @@ _COMPRESS_SENTINEL = "⟦stm-compressed⟧"
 # ``tool_input``), so capping costs nothing for relevance.
 _SAFE_DAEMON_BUDGET = 256 * 1024
 
+# Connect + busy timeout for the best-effort native-tool metrics write. The hook
+# runs synchronously inside the host's PostToolUse, so a locked shared
+# ``proxy_metrics.db`` (e.g. the live ``mms`` server writing) must fast-fail and
+# degrade to "no row" rather than stall the tool call up to the store's shared
+# 3000 ms busy timeout. Generous vs. a sub-ms WAL write, tiny vs. host latency.
+_METRICS_BUSY_TIMEOUT_MS = 250
+
 
 def _surface_tools() -> frozenset[str]:
     """Allowlist of tool names to surface for, overridable via env.
@@ -552,6 +559,7 @@ def _record_hook_metrics(
         store = MetricsStore(
             config.proxy.metrics.db_path.expanduser(),
             max_history=config.proxy.metrics.max_history,
+            busy_timeout_ms=_METRICS_BUSY_TIMEOUT_MS,
         )
         store.initialize()
         try:
