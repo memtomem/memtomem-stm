@@ -673,7 +673,13 @@ class TestDaemonStatusCli:
 class TestDaemonForeignOrphans:
     """`#517` — daemons orphaned under a stale fingerprint (config/protocol drift)
     must be visible to ``status`` and stoppable via ``stop --all``, even when
-    pinned with ``idle_timeout_seconds=0`` (so they never self-clear)."""
+    pinned with ``idle_timeout_seconds=0`` (so they never self-clear).
+
+    The tests that assert live-foreign *reporting* are POSIX-only: on Windows
+    ``daemon_cmd._live_foreign_daemons`` short-circuits to ``[]`` (``is_pid_alive``
+    can't distinguish a live foreign daemon from a dead handshake there — no
+    signal-0), so they carry a per-method ``skipif`` (#519). The tests that pin the
+    Windows-disabled behavior / empty cases still run on every platform."""
 
     def _write_foreign(self, tmp_path: Path, fingerprint: str, pid: int) -> None:
         discovery.write_handshake(
@@ -686,6 +692,10 @@ class TestDaemonForeignOrphans:
             created_at=0.0,
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="live foreign-orphan reporting is POSIX-only (#519)",
+    )
     def test_status_reports_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         import json
 
@@ -777,6 +787,10 @@ class TestDaemonForeignOrphans:
         assert [pid for pid, _ in killed] == [4321]
         assert f"fp={old_fp}" in result.output
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="live foreign-orphan reporting is POSIX-only (#519)",
+    )
     def test_dead_pid_foreign_filtered_and_sorted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -842,6 +856,10 @@ class TestDaemonForeignOrphans:
         assert "could not signal daemon pid=1001" in result.output
         assert "sent SIGTERM to daemon pid=3003" in result.output
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="live foreign-orphan reporting is POSIX-only (#519)",
+    )
     def test_status_running_with_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """A live current daemon AND a foreign orphan: the running-branch `info`
         must still carry `foreign`, and the token must never leak."""
