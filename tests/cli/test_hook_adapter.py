@@ -777,3 +777,18 @@ def test_detect_host_cursor_event_wins_over_tool_output():
     # to Cursor (checked first), so a Cursor payload never mis-detects as Kimi.
     payload = {"hook_event_name": "postToolUse", "tool_name": "Shell", "tool_output": "x"}
     assert detect_host(payload) == "cursor"
+
+
+def test_detect_host_both_output_keys_resolves_to_claude():
+    # A payload carrying BOTH ``tool_output`` AND ``tool_response`` is ambiguous; the
+    # Kimi branch requires ``tool_response`` ABSENT, so it resolves to claude (the
+    # safe default — its adapter reads ``tool_response``). Intended behavior, pinned
+    # here (#526 secondary) so a future adapter/detect change can't silently flip
+    # ambiguous Kimi/Cursor/Claude routing.
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Shell",
+        "tool_output": "x",
+        "tool_response": "y",
+    }
+    assert detect_host(payload) == "claude"
