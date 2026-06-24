@@ -144,3 +144,55 @@ async def shutdown(config: STMConfig, *, timeout: float = 5.0) -> bool:
         return False
     resp = await _request(hs, OP_SHUTDOWN, None, timeout=timeout)
     return resp is not None and bool(resp.get("ok"))
+
+
+# Bare connect-probe — the cross-platform liveness discriminator for the
+# foreign-orphan and same-config SIGTERM paths (see #519). Unlike ``ping``, it
+# sends no protocol frame and needs no token, so it tells a *listening* daemon
+# (any ``PROTOCOL_VERSION``) apart from a stale handshake naming a dead or
+# OS-recycled pid: the former still accepts a connect, the latter's port is not
+# bound. It proves only that *something* accepts on ``host:port`` — not that it
+# is the recorded pid (an ephemeral port could be reassigned) — so callers pair
+# it with ``is_pid_alive`` for a two-factor check, materially stronger than pid
+# alone yet still a heuristic, not identity proof.
+PROBE_TIMEOUT_SECONDS = 1.0
+
+
+async def _can_connect(host: object, port: object, *, timeout: float) -> bool:
+    """Open then immediately close a TCP connection to ``host:port``.
+
+    ``True`` iff the connect succeeds within ``timeout``. No bytes are sent, so a
+    foreign daemon at an incompatible protocol still answers. Any failure
+    (refused, unreachable, malformed endpoint, over-budget) is a quiet ``False``;
+    on loopback a closed port is refused instantly, so the timeout only bites a
+    genuinely wedged peer.
+    """
+    if not isinstance(host, str) or not isinstance(port, int) or port <= 0:
+        return False
+    writer: asyncio.StreamWriter | None = None
+    try:
+        async with asyncio.timeout(timeout):
+            _reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+    except Exception:
+        logger.debug("connect probe failed (%s:%s)", host, port, exc_info=True)
+        return False
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except Exception:
+                pass
+
+
+def probe_listening(host: object, port: object, *, timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
+    """Sync wrapper over :func:`_can_connect` for the CLI ops paths.
+
+    ``True`` iff a TCP connect to ``host:port`` succeeds — i.e. a daemon (of any
+    protocol version) is still accepting there. Used by ``mms daemon status`` /
+    ``stop`` to gate action on a recorded pid behind proof its endpoint is live.
+    """
+    return asyncio.run(_can_connect(host, port, timeout=timeout))

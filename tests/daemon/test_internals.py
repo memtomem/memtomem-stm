@@ -452,6 +452,32 @@ def test_is_pid_alive():
         assert discovery.is_pid_alive(10**1000) is False
 
 
+def test_probe_listening():
+    """The cross-platform connect-probe (#519): True iff something accepts on
+    host:port, False for a closed port or a malformed endpoint."""
+    import socket
+
+    from memtomem_stm.daemon import client
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    host, port = srv.getsockname()
+    try:
+        # A listening socket — connect succeeds even though we never speak the
+        # protocol (mirrors a foreign daemon at an incompatible PROTOCOL_VERSION).
+        assert client.probe_listening(host, port) is True
+    finally:
+        srv.close()
+    # Same port, now closed (the daemon's process is gone) — connect refused.
+    assert client.probe_listening(host, port, timeout=0.5) is False
+    # Malformed endpoints from a corrupted/partial handshake → quiet False.
+    assert client.probe_listening(None, port) is False
+    assert client.probe_listening(host, None) is False
+    assert client.probe_listening(host, 0) is False
+    assert client.probe_listening(host, -1) is False
+
+
 # ── locking ─────────────────────────────────────────────────────────────────
 
 
@@ -572,16 +598,20 @@ class TestDaemonStopCli:
         assert not hs.exists()
         assert killed == []
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
     def test_stale_handshake_alive_pid_gets_sigterm(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        """Graceful shutdown declined but the endpoint still accepts a connect →
+        the daemon is there-but-unresponsive, so SIGTERM its recorded pid."""
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         _no_daemon(monkeypatch)
-        _write_handshake({"pid": 12345, "port": 1, "token": "t"})
+        _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
+        )
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
@@ -592,6 +622,31 @@ class TestDaemonStopCli:
         import signal as _signal
 
         assert killed == [(12345, _signal.SIGTERM)]
+
+    def test_stale_handshake_recycled_pid_not_sigtermed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#519 same-config hardening: graceful declined, the handshake's pid is
+        alive (recycled to an unrelated process) but its endpoint no longer
+        accepts → do NOT SIGTERM; clean the stale handshake instead."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        hs = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: False
+        )
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "cleaned stale handshake" in result.output
+        assert killed == []  # recycled pid never signalled
+        assert not hs.exists()
 
 
 class TestDaemonStatusCli:
@@ -670,32 +725,40 @@ class TestDaemonStatusCli:
         assert "stopped" in result.output
 
 
+def _probe_all(monkeypatch: pytest.MonkeyPatch, listening: bool = True) -> None:
+    """Pin the connect-probe so the two-factor liveness check (#519) is decided
+    by ``is_pid_alive`` alone — ``listening=True`` simulates a daemon still
+    accepting on its endpoint, ``False`` a stale handshake whose port is gone."""
+    monkeypatch.setattr(
+        "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: listening
+    )
+
+
 class TestDaemonForeignOrphans:
     """`#517` — daemons orphaned under a stale fingerprint (config/protocol drift)
     must be visible to ``status`` and stoppable via ``stop --all``, even when
     pinned with ``idle_timeout_seconds=0`` (so they never self-clear).
 
-    The tests that assert live-foreign *reporting* are POSIX-only: on Windows
-    ``daemon_cmd._live_foreign_daemons`` short-circuits to ``[]`` (``is_pid_alive``
-    can't distinguish a live foreign daemon from a dead handshake there — no
-    signal-0), so they carry a per-method ``skipif`` (#519). The tests that pin the
-    Windows-disabled behavior / empty cases still run on every platform."""
+    Liveness is two-factor (#519): the recorded pid must be alive *and* its
+    endpoint must accept a connect. These tests mock both factors
+    (``is_pid_alive`` + ``client.probe_listening``), so they are platform-agnostic
+    — the connect-probe is what re-enabled Windows, where ``is_pid_alive`` alone
+    is uninformative. ``test_foreign_detection_cross_platform`` pins that, and
+    ``test_recycled_pid_skipped_by_connect_probe`` pins the recycled-pid gate."""
 
-    def _write_foreign(self, tmp_path: Path, fingerprint: str, pid: int) -> None:
+    def _write_foreign(
+        self, tmp_path: Path, fingerprint: str, pid: int, *, port: int = 4242
+    ) -> None:
         discovery.write_handshake(
             discovery.handshake_path(tmp_path, fingerprint),
             pid=pid,
             host="127.0.0.1",
-            port=4242,
+            port=port,
             token="secret-token",
             config_fingerprint=fingerprint,
             created_at=0.0,
         )
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="live foreign-orphan reporting is POSIX-only (#519)",
-    )
     def test_status_reports_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         import json
 
@@ -707,6 +770,7 @@ class TestDaemonForeignOrphans:
         self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
         _no_daemon(monkeypatch)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
 
         # JSON surface: a `foreign` array with non-sensitive fields (never token).
         result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
@@ -741,7 +805,6 @@ class TestDaemonForeignOrphans:
         assert "no running daemon" in result.output
         assert killed == []  # default scope never reaches a different-config daemon
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
     def test_stop_all_sigterms_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         import signal as _signal
 
@@ -751,6 +814,7 @@ class TestDaemonForeignOrphans:
         self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
         _no_daemon(monkeypatch)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
@@ -760,7 +824,6 @@ class TestDaemonForeignOrphans:
         assert killed == [(98765, _signal.SIGTERM)]
         assert "sent SIGTERM to daemon pid=98765 (fp=foreignfp000000)" in result.output
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
     def test_pinned_fingerprint_change_is_reachable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -778,6 +841,7 @@ class TestDaemonForeignOrphans:
         self._write_foreign(tmp_path, old_fp, pid=4321)
         _no_daemon(monkeypatch)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
@@ -787,10 +851,6 @@ class TestDaemonForeignOrphans:
         assert [pid for pid, _ in killed] == [4321]
         assert f"fp={old_fp}" in result.output
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="live foreign-orphan reporting is POSIX-only (#519)",
-    )
     def test_dead_pid_foreign_filtered_and_sorted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -807,6 +867,7 @@ class TestDaemonForeignOrphans:
         self._write_foreign(tmp_path, "cccc000000000000", pid=3003)  # alive
         _no_daemon(monkeypatch)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: pid != 2002)
+        _probe_all(monkeypatch)
 
         result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
         assert result.exit_code == 0, result.output
@@ -824,7 +885,6 @@ class TestDaemonForeignOrphans:
         assert "pid=1001 fp=aaaa000000000000, pid=3003 fp=cccc000000000000" in result.output
         assert "2002" not in result.output
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM path is POSIX-only")
     def test_stop_all_skips_dead_and_continues_on_oserror(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -840,6 +900,7 @@ class TestDaemonForeignOrphans:
         self._write_foreign(tmp_path, "cccc000000000000", pid=3003)  # alive, kill succeeds
         _no_daemon(monkeypatch)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: pid != 2002)
+        _probe_all(monkeypatch)
         killed: list[tuple[int, int]] = []
 
         def fake_kill(pid: int, sig: int) -> None:
@@ -856,10 +917,6 @@ class TestDaemonForeignOrphans:
         assert "could not signal daemon pid=1001" in result.output
         assert "sent SIGTERM to daemon pid=3003" in result.output
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="live foreign-orphan reporting is POSIX-only (#519)",
-    )
     def test_status_running_with_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """A live current daemon AND a foreign orphan: the running-branch `info`
         must still carry `foreign`, and the token must never leak."""
@@ -882,6 +939,7 @@ class TestDaemonForeignOrphans:
         monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
         self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
 
         result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
         assert result.exit_code == 0, result.output
@@ -910,19 +968,85 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         assert "no daemons running under a different config" in result.output
 
-    def test_foreign_detection_is_posix_only(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """On Windows `is_pid_alive` is True for any positive pid (no signal-0,
-        and the foreign path can't ping), so it would report every stale
-        handshake as live. Foreign detection must yield nothing there instead."""
+    def test_foreign_detection_cross_platform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The connect-probe re-enables Windows (#519): `_live_foreign_daemons` no
+        longer branches on the platform, so with Windows' `is_pid_alive` (always
+        True for a positive pid) the *connect* carries the whole signal — a
+        listening endpoint is detected, a dead one is not."""
         from memtomem_stm.cli import daemon_cmd
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
-        # Even with a maximally-permissive liveness probe + simulated Windows,
-        # the POSIX-only gate returns [] (so no false-positive foreign daemons).
+        # Windows-like: is_pid_alive can't discriminate (always True for a positive
+        # pid). No `os.name` patch — that would poison pathlib (WindowsPath); the
+        # point is precisely that the code path is now platform-independent.
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
-        monkeypatch.setattr(daemon_cmd.os, "name", "nt")
 
+        # Endpoint accepting → reported (previously [] on Windows).
+        _probe_all(monkeypatch, listening=True)
+        assert daemon_cmd._live_foreign_daemons(STMConfig()) == [
+            {"fingerprint": "foreignfp000000", "pid": 98765, "host": "127.0.0.1", "port": 4242}
+        ]
+        # Endpoint gone → still nothing (no false positive from the always-True pid).
+        _probe_all(monkeypatch, listening=False)
+        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+
+    def test_recycled_pid_skipped_by_connect_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The #519 gate: an alive pid (recycled to an unrelated process) whose
+        recorded endpoint no longer accepts must NOT be reported as running, and
+        ``stop --all`` must not SIGTERM it."""
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import daemon_cmd
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)  # alive
+        _probe_all(monkeypatch, listening=False)  # but nothing accepts on its port
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        assert result.exit_code == 0, result.output
+        assert killed == []  # recycled pid never signalled
+        assert "no daemons running under a different config" in result.output
+
+    def test_listening_foreign_detected_end_to_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """No mocks on the probe: a real listening socket + this process's own
+        (alive) pid is detected via the actual TCP connect, and a since-closed
+        port is not — pins the probe wired through ``_live_foreign_daemons``."""
+        import socket
+
+        from memtomem_stm.cli import daemon_cmd
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        _host, port = srv.getsockname()
+        # A genuine foreign daemon: alive pid (ours) + a real accepting endpoint.
+        self._write_foreign(tmp_path, "foreignfp000000", pid=os.getpid(), port=port)
+        try:
+            assert daemon_cmd._live_foreign_daemons(STMConfig()) == [
+                {
+                    "fingerprint": "foreignfp000000",
+                    "pid": os.getpid(),
+                    "host": "127.0.0.1",
+                    "port": port,
+                }
+            ]
+        finally:
+            srv.close()
+        # Endpoint now closed → the alive pid alone is not enough to report it.
         assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
 
 
