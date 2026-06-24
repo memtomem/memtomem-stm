@@ -24,7 +24,7 @@ from uuid import uuid4
 import pytest
 from click.testing import CliRunner
 
-from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter
+from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter, CodexHookAdapter
 from memtomem_stm.cli.hook_cmd import (
     _COMPRESS_SENTINEL,
     _SAFE_DAEMON_BUDGET,
@@ -706,7 +706,7 @@ def test_orchestrate_merges_compression_and_surfacing(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         "memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value=surfaced)
     )
-    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT}), ClaudeHookAdapter()))
     hso = out["hookSpecificOutput"]
     assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
     assert hso["additionalContext"] == "<surfaced-memories>m</surfaced-memories>"
@@ -721,10 +721,26 @@ def test_orchestrate_compression_runs_when_surfacing_yields_nothing(
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
-    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT}), ClaudeHookAdapter()))
     hso = out["hookSpecificOutput"]
     assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
     assert "additionalContext" not in hso
+
+
+def test_orchestrate_honors_supplied_adapter_capability(monkeypatch: pytest.MonkeyPatch):
+    # _orchestrate must use the SUPPLIED adapter, not re-resolve Claude internally:
+    # a can_replace_output=False adapter (Codex) skips compression even with the
+    # same compressible Bash payload + compression env that Claude DOES compress
+    # (test_orchestrate_merges_*). Pins this PR's seam against re-internalizing
+    # get_adapter() — a mutation re-adding it would compress here and fail.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
+    # Codex maps Bash→shell (so it reaches the compression gate) but
+    # can_replace_output is False → compression is skipped, output passes through.
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT}), CodexHookAdapter()))
+    assert out == {}  # no updatedToolOutput — the supplied adapter's capability won
 
 
 def test_orchestrate_keeps_compression_when_surfacing_raises(monkeypatch: pytest.MonkeyPatch):
@@ -737,7 +753,7 @@ def test_orchestrate_keeps_compression_when_surfacing_raises(monkeypatch: pytest
         "memtomem_stm.cli.hook_cmd.run_surfacing_hook",
         AsyncMock(side_effect=RuntimeError("surfacing exploded")),
     )
-    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT})))
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT}), ClaudeHookAdapter()))
     hso = out["hookSpecificOutput"]
     assert hso["updatedToolOutput"]["stdout"].startswith(_COMPRESS_SENTINEL)
     assert "additionalContext" not in hso

@@ -74,7 +74,7 @@ import click
 from memtomem_stm.cli.hook_adapter import CANONICAL_TOOLS, canonicalize_tool_token, get_adapter
 
 if TYPE_CHECKING:
-    from memtomem_stm.cli.hook_adapter import CanonicalHookCall
+    from memtomem_stm.cli.hook_adapter import CanonicalHookCall, HostHookAdapter
     from memtomem_stm.config import HookCompressionConfig, STMConfig
 
 logger = logging.getLogger(__name__)
@@ -641,13 +641,14 @@ def _record_hook_metrics(
         logger.debug("hook metrics recording failed — no row written", exc_info=True)
 
 
-async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
+async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
-    LTM *surfacing*, as one ``hookSpecificOutput``.
+    LTM *surfacing*, as one host-shaped output.
 
-    The host-shaped edges go through a :class:`HostHookAdapter` (Claude only
-    today): :meth:`parse` normalizes the payload into a :class:`CanonicalHookCall`
-    and :meth:`render` builds the host output. The normalized ``call`` drives the
+    The host-shaped edges go through the caller-supplied :class:`HostHookAdapter`
+    (resolved in :func:`hook_command`; Claude is the only one reachable today):
+    :meth:`parse` normalizes the payload into a :class:`CanonicalHookCall` and
+    :meth:`render` builds the host output. The normalized ``call`` drives the
     whole pipeline — the compression gate, the surfacing core, and metrics all
     consume it, so the raw payload is parsed exactly once. *Compression* is gated
     on the adapter's ``can_replace_output`` capability — only hosts that honor
@@ -675,7 +676,6 @@ async def _orchestrate(payload: dict[str, Any]) -> dict[str, Any]:
     from memtomem_stm.config import STMConfig
 
     config = STMConfig()
-    adapter = get_adapter()
     call = adapter.parse(payload)
     if call is None:  # unusable payload → pass the tool output through untouched
         return {}
@@ -706,15 +706,21 @@ def hook_command() -> None:
     use; set ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` for the legacy cold in-process
     path. Always exits 0; on any problem the tool output passes through unchanged
     (prints ``{}``).
+
+    The host adapter resolved here owns both the output *shape* (``render``) and
+    its *stdout serialization* (``serialize`` — JSON for Claude/Codex/Cursor, raw
+    stdout for Kimi). Today ``get_adapter()`` always returns Claude; host selection
+    (``--host`` / payload auto-detect) plugs in here in a later step.
     """
     payload = _read_payload(sys.stdin)
+    adapter = get_adapter()
     output: dict[str, Any] = {}
     if payload is not None:
         try:
             output = asyncio.run(
-                asyncio.wait_for(_orchestrate(payload), timeout=_hook_budget_seconds())
+                asyncio.wait_for(_orchestrate(payload, adapter), timeout=_hook_budget_seconds())
             )
         except Exception:
             logger.warning("hook processing failed — passing tool output through", exc_info=True)
             output = {}
-    click.echo(json.dumps(output, ensure_ascii=False))
+    click.echo(adapter.serialize(output))
