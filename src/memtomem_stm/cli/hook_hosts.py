@@ -52,7 +52,8 @@ Design choices (all surfaced to the operator before any write):
   preserved across a re-install (see :func:`_nested_install`).
 * **Dry-run default + backup.** The CLI previews by default; an ``--apply`` write
   copies the prior file to a non-clobbering backup first (``<path>.bak``, else
-  ``.bak.1``, ``.bak.2``, …; :func:`_backup_path`) so a second apply never
+  ``.bak.1``, ``.bak.2``, …; :func:`_write_backup`, which claims each slot with
+  ``O_EXCL`` so concurrent applies can't race) so a second apply never
   overwrites the original. A config that exists but does not parse is *refused*,
   never clobbered.
 * **TOML rewrite caveat.** TOML hosts are parsed and re-serialized (``tomli_w``),
@@ -66,6 +67,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shlex
 import tomllib
 from collections.abc import Callable
@@ -181,30 +183,43 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
         block["matcher"] = matcher
     handler = {"type": "command", "command": command}
     block["hooks"] = [handler]
-    for i, entry in enumerate(entries):
+
+    # Scan *all* PostToolUse entries (symmetric with ``_nested_uninstall``):
+    # install/refresh exactly one STM handler at the first STM group and strip
+    # STM from any later ones, so a config that somehow holds two STM groups
+    # (a hand-edit, or an old install) converges to a single handler — honoring
+    # the "never duplicated" contract — without ever losing a non-STM sibling a
+    # user co-located in an STM group.
+    out: list[Any] = []
+    installed = False
+    for entry in entries:
         if not _entry_has_stm_handler(entry):
+            out.append(entry)
             continue
-        # Symmetric with ``_nested_uninstall``: never lose a sibling handler a
-        # user co-located in STM's matcher group. If the group holds *only* STM
-        # handler(s), refresh the whole block (so a stale matcher is updated);
-        # otherwise keep the user's matcher + siblings and swap only STM's
-        # handler in place (the first one, dropping any duplicates).
         siblings = [h for h in entry["hooks"] if not _is_stm_command_handler(h)]
-        if not siblings:
-            entries[i] = block
-            return data
-        new_inner: list[Any] = []
-        replaced = False
-        for h in entry["hooks"]:
-            if _is_stm_command_handler(h):
-                if not replaced:
-                    new_inner.append(handler)
-                    replaced = True
+        if not installed:
+            installed = True
+            if not siblings:
+                out.append(block)  # STM-only group → refresh matcher + command
             else:
-                new_inner.append(h)
-        entry["hooks"] = new_inner
-        return data
-    entries.append(block)
+                # Shared group: keep the user's matcher + siblings, swap STM's
+                # handler in place (the first one, dropping any duplicates).
+                new_inner: list[Any] = []
+                replaced = False
+                for h in entry["hooks"]:
+                    if _is_stm_command_handler(h):
+                        if not replaced:
+                            new_inner.append(handler)
+                            replaced = True
+                    else:
+                        new_inner.append(h)
+                out.append({**entry, "hooks": new_inner})
+        elif siblings:
+            out.append({**entry, "hooks": siblings})  # later shared group: drop STM, keep siblings
+        # else: a later STM-only group is a duplicate → drop it entirely
+    if not installed:
+        out.append(block)
+    entries[:] = out  # mutate in place so ``data["hooks"]["PostToolUse"]`` stays wired
     return data
 
 
@@ -561,26 +576,46 @@ def plan_uninstall(host_tag: str) -> HookChange:
     )
 
 
-def _backup_path(path: Path) -> Path:
-    """First free non-clobbering backup slot beside the config.
+def _write_backup(path: Path, content: str, mode: int) -> Path:
+    """Write ``content`` to the first free non-clobbering backup slot, atomically.
 
-    ``<name>.bak`` when free (so ``settings.json`` → ``settings.json.bak``,
-    keeping both suffixes), else ``<name>.bak.1``, ``<name>.bak.2``, … — the first
-    free one. A fixed single ``.bak`` would let a *second* ``--apply`` (an
-    uninstall, or a re-install) overwrite the backup from the *first* apply; for a
-    TOML host that first ``.bak`` is the only comment-preserving copy of the
-    original (re-serialization drops comments — see the module docstring), so
-    overwriting it destroys exactly the safety net. Numbered slots preserve every
-    prior state, with the original always at ``.bak``."""
-    base = path.parent / (path.name + ".bak")
-    if not base.exists():
-        return base
-    i = 1
+    Tries ``<name>.bak`` first (so ``settings.json`` → ``settings.json.bak``,
+    keeping both suffixes), then ``<name>.bak.1``, ``<name>.bak.2``, …. A fixed
+    single ``.bak`` would let a *second* ``--apply`` (an uninstall, or a
+    re-install) overwrite the backup from the *first* apply; for a TOML host that
+    first ``.bak`` is the only comment-preserving copy of the original
+    (re-serialization drops comments — see the module docstring), so overwriting
+    it destroys exactly the safety net. Numbered slots preserve every prior
+    state, with the original always at ``.bak``.
+
+    Each slot is claimed with ``O_CREAT | O_EXCL`` — slot selection *and* the
+    write are one atomic step, so two concurrent ``--apply`` runs can't pick the
+    same slot and clobber each other's backup (the bare ``exists()``-then-write
+    that this replaces had that TOCTOU race). On a collision we advance to the
+    next slot and retry. A backup is always a fresh file, never an overwrite, so
+    no atomic-replace is needed; a partial write (mid-write crash) is unlinked
+    and re-raised, leaving the next slot free."""
+    i = 0
     while True:
-        candidate = path.parent / (path.name + f".bak.{i}")
-        if not candidate.exists():
-            return candidate
-        i += 1
+        candidate = path.parent / (path.name + (".bak" if i == 0 else f".bak.{i}"))
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            i += 1
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            # O_EXCL honors umask, so the mode above may be narrowed; force it
+            # (the prior file's bits, host configs can carry secrets).
+            try:
+                candidate.chmod(mode)
+            except OSError:
+                pass
+        except Exception:
+            candidate.unlink(missing_ok=True)
+            raise
+        return candidate
 
 
 def apply_change(change: HookChange) -> Path | None:
@@ -588,7 +623,7 @@ def apply_change(change: HookChange) -> Path | None:
 
     No-op (returns ``None``) when ``change.changed`` is False. When a prior file
     exists, its verbatim contents are written to a non-clobbering backup slot
-    (:func:`_backup_path`) *before* the new config is atomically written; returns
+    (:func:`_write_backup`) *before* the new config is atomically written; returns
     the backup path (``None`` when there was nothing to back up). The new file
     inherits the prior file's permission bits, or ``0o600`` for a freshly-created
     one (host configs can carry secrets)."""
@@ -601,7 +636,6 @@ def apply_change(change: HookChange) -> Path | None:
         mode = 0o600
     backup: Path | None = None
     if change.current_text is not None:
-        backup = _backup_path(path)
-        atomic_write_text(backup, change.current_text, mode=mode)
+        backup = _write_backup(path, change.current_text, mode)
     atomic_write_text(path, change.new_text, mode=mode)
     return backup

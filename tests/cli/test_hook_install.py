@@ -230,6 +230,45 @@ def test_plan_install_preserves_cohandler_in_stm_matcher_group(redirect) -> None
     assert "memtomem-stm hook --host claude" in commands  # refreshed to the new spelling
 
 
+def test_plan_install_dedups_multiple_stm_groups(redirect) -> None:
+    # A config that somehow holds *two* STM groups (a hand-edit, or an old
+    # install) must converge to a single STM handler on re-install, honoring the
+    # "never duplicated" contract — and never lose a co-located sibling (#529,
+    # codex follow-up). Install scans all PostToolUse entries, like uninstall.
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [
+                                {"type": "command", "command": "mms hook --host claude"},
+                                {"type": "command", "command": "my-guard.sh"},
+                            ],
+                        },
+                        {
+                            "matcher": "Read|Grep|Glob|Bash",
+                            "hooks": [{"type": "command", "command": "mms hook --host claude"}],
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    apply_change(plan_install("claude", "memtomem-stm hook --host claude"))
+    entries = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    commands = [h["command"] for e in entries for h in e["hooks"]]
+    assert sum(_is_stm_hook_command(c) for c in commands) == 1  # one STM handler total
+    assert "my-guard.sh" in commands  # co-located sibling kept
+    # Idempotent now — the lingering duplicate doesn't make re-install a no-op
+    # while STM still fires twice.
+    assert plan_install("claude", "memtomem-stm hook --host claude").status == "already"
+
+
 # ── plan_uninstall: symmetric, sibling-preserving, cleans empties ────────────
 
 
@@ -337,6 +376,27 @@ def test_apply_change_second_apply_does_not_clobber_first_backup(redirect) -> No
     # The original comment-preserving backup is untouched by the second apply.
     assert first.read_text(encoding="utf-8") == original
     assert "# keep this comment" not in second.read_text(encoding="utf-8")  # re-serialized copy
+
+
+def test_write_backup_advances_past_existing_slots(tmp_path: Path) -> None:
+    # _write_backup claims the first free slot with O_EXCL and never touches an
+    # occupied one, so pre-existing backups are preserved and the new one lands
+    # in the next slot (#529). This is the per-slot proof behind the two-apply
+    # test above; it also exercises the collision-advance loop directly.
+    from memtomem_stm.cli.hook_hosts import _write_backup
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("current\n", encoding="utf-8")
+    (tmp_path / "config.toml.bak").write_text("original\n", encoding="utf-8")
+    (tmp_path / "config.toml.bak.1").write_text("second\n", encoding="utf-8")
+
+    dest = _write_backup(cfg, "third\n", 0o600)
+
+    assert dest == tmp_path / "config.toml.bak.2"
+    assert dest.read_text(encoding="utf-8") == "third\n"
+    # The two occupied slots are untouched.
+    assert (tmp_path / "config.toml.bak").read_text(encoding="utf-8") == "original\n"
+    assert (tmp_path / "config.toml.bak.1").read_text(encoding="utf-8") == "second\n"
 
 
 def test_apply_change_no_backup_when_creating(redirect) -> None:
