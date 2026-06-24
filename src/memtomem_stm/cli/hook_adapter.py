@@ -296,12 +296,96 @@ class CodexHookAdapter(HostHookAdapter):
         return _build_hook_output(updated_tool_output, additional_context)
 
 
+class CursorHookAdapter(HostHookAdapter):
+    """Cursor PostToolUse adapter — surfacing-only (B0: no native output replace).
+
+    Unlike Codex, Cursor's contract diverges from Claude's in two ways that this
+    adapter absorbs so the shared core stays host-agnostic:
+
+    * **Event name is camelCase ``postToolUse``.** The core gates on the canonical
+      ``"PostToolUse"`` (:func:`_run_surfacing_hook_inner` etc.), so :meth:`parse`
+      normalizes it; a missing event defaults to ``"PostToolUse"`` (as for Claude),
+      and any other event passes through unchanged so the core rejects it.
+    * **Output is a *flat* top-level ``additional_context`` string** (snake_case),
+      not the nested ``hookSpecificOutput`` envelope. So :meth:`render` builds its
+      own shape rather than delegating to ``_build_hook_output``: ``{}`` when
+      nothing surfaced, else ``{"additional_context": <block>}``.
+
+    Other B0 facts: the tool output arrives under ``tool_output`` (a
+    JSON-stringified string), not ``tool_response``; ``can_replace_output`` is
+    ``False`` because Cursor's only output-replace field, ``updated_mcp_tool_output``,
+    is **MCP-tools-only** (no native equivalent), so compression is skipped and
+    ``render`` never emits a replace field. Verified native tool names are
+    ``Shell`` / ``Read`` / ``Write`` (the docs don't enumerate the rest), so
+    ``native_tool_map`` maps those; unknown names canonicalize to ``""``.
+
+    Rollout caveat (for the host-selection step, not an adapter-shape issue):
+    ``additional_context`` is documented but a **runtime no-op on Cursor today**
+    (staff-confirmed bug), so a runtime check should confirm injection works
+    before enabling Cursor surfacing by default.
+    """
+
+    host_tag: ClassVar[str] = "cursor"
+    can_replace_output: ClassVar[bool] = False
+    # Cursor's verified native built-in tool names (capitalized values) → canonical
+    # vocabulary. Only Shell/Read are in the read-like surface allowlist; the docs
+    # don't enumerate Grep/Glob/WebFetch/Edit equivalents, so they're absent and
+    # canonicalize to ``""``.
+    native_tool_map: ClassVar[dict[str, str]] = {
+        "Shell": "shell",
+        "Read": "read",
+        "Write": "write",
+    }
+
+    def parse(self, payload: dict[str, Any]) -> CanonicalHookCall | None:
+        if not isinstance(payload, dict):
+            return None
+        raw_name = payload.get("tool_name")
+        tool_name = raw_name if isinstance(raw_name, str) else ""
+        if tool_name.startswith("mcp__"):
+            return None  # proxied MCP tool — already runs through the pipeline
+        from memtomem_stm.cli.hook_cmd import _tool_response_to_text
+
+        # Normalize Cursor's camelCase event to the canonical "PostToolUse" the
+        # core gates on; missing → default; any other event passes through (and is
+        # then rejected by the core, which is correct — we only bridge post-tool).
+        raw_event = payload.get("hook_event_name")
+        event_type = "PostToolUse" if raw_event == "postToolUse" else (raw_event or "PostToolUse")
+        tool_input = payload.get("tool_input")
+        # Cursor carries the tool output under ``tool_output`` (a JSON-stringified
+        # string), not ``tool_response``. For surfacing-only we just need its text
+        # for the size gate, so flatten it through the shared helper verbatim.
+        tool_output = payload.get("tool_output")
+        return CanonicalHookCall(
+            event_type=event_type,
+            tool_name=tool_name,
+            canonical_tool=self.native_tool_map.get(tool_name, ""),
+            tool_input=tool_input if isinstance(tool_input, dict) else {},
+            tool_response=tool_output,
+            tool_response_text=_tool_response_to_text(tool_output),
+            host_tag=self.host_tag,
+        )
+
+    def render(
+        self, *, updated_tool_output: Any | None, additional_context: str | None
+    ) -> dict[str, Any]:
+        # Cursor's surfacing channel is a FLAT top-level ``additional_context``
+        # string (a different shape than Claude/Codex), so build it here directly.
+        # ``updated_tool_output`` is ignored: Cursor has no native output-replace
+        # field (can_replace_output=False), and emitting a guessed one could
+        # disrupt the host — omit it.
+        if not additional_context:
+            return {}
+        return {"additional_context": additional_context}
+
+
 # Registry keyed by host_tag. B1 shipped Claude; B2 step3 adds the non-Claude
-# adapters one host at a time (Codex first). Cursor/Kimi follow; Antigravity is
+# adapters one host at a time (Codex, then Cursor). Kimi follows; Antigravity is
 # deferred (unfixturable — see tests/fixtures/hooks/README.md).
 _ADAPTERS: dict[str, HostHookAdapter] = {
     ClaudeHookAdapter.host_tag: ClaudeHookAdapter(),
     CodexHookAdapter.host_tag: CodexHookAdapter(),
+    CursorHookAdapter.host_tag: CursorHookAdapter(),
 }
 
 # STM's canonical built-in tool vocabulary — the codomain of every adapter's
@@ -315,9 +399,9 @@ CANONICAL_TOOLS: frozenset[str] = frozenset(
 def get_adapter(host_tag: str = "claude") -> HostHookAdapter:
     """Return the adapter for ``host_tag`` (falls back to Claude).
 
-    Claude and Codex are registered (B2 step3 adds the rest); an unknown
-    ``host_tag`` falls back to Claude. Host selection (which tag the live hook
-    passes) is wired in a later step — today every caller uses the default.
+    Claude, Codex, and Cursor are registered (B2 step3 adds the rest); an
+    unknown ``host_tag`` falls back to Claude. Host selection (which tag the live
+    hook passes) is wired in a later step — today every caller uses the default.
     """
     return _ADAPTERS.get(host_tag) or _ADAPTERS["claude"]
 
