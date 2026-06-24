@@ -151,13 +151,17 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 - **Cursor / Windsurf / Claude Desktop built-ins** — same principle: anything the client provides natively bypasses the MCP layer.
 - **Sub-agent built-in calls** — the parent's MCP wiring is inherited, but built-in tool calls inside an `Agent` / `Task` invocation stay client-internal.
 
-For Claude Code, `mms hook` is an optional PostToolUse bridge for that
-client-internal path. It can append LTM surfacing context for read-like
-built-ins (`Read`, `Grep`, `Glob`, `Bash`) and, when explicitly enabled with
-`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, compress built-in `Bash` stdout
-through `updatedToolOutput`. This is separate from the MCP proxy: `Write`,
-`Edit`, and other mutation tools stay out of the surfacing path, and the hook
-always fails open to the original tool output.
+`mms hook` is an optional PostToolUse bridge for that client-internal path,
+available for Claude Code, Codex CLI, Cursor, and Kimi Code. It appends LTM
+surfacing context for read-like built-ins (`Read`, `Grep`, `Glob`, `Bash`, and
+each host's equivalents) and, on Claude Code only, can compress built-in `Bash`
+stdout through `updatedToolOutput` when explicitly enabled with
+`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1` (native output replacement ports to
+no other host). Register it per host with `mms hook install --host <name>`
+(dry-run by default; `--apply` to write, backing up any prior config). This is
+separate from the MCP proxy: `Write`, `Edit`, and other mutation tools stay out
+of the surfacing path, and the hook always fails open to the original tool
+output.
 
 **STM does NOT write back to LTM at runtime.** The bundled `mms` server constructs the proxy without a `FileIndexer` engine by design, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are library-mode only — callers embedding STM as a library can pass `index_engine=` to `ProxyManager` themselves ([#288](https://github.com/memtomem/memtomem-stm/issues/288) has the history).
 

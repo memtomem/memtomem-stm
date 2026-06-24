@@ -485,6 +485,15 @@ CANONICAL_TOOLS: frozenset[str] = frozenset(
     {"read", "grep", "glob", "shell", "web_fetch", "write", "edit"}
 )
 
+# The read-like subset of :data:`CANONICAL_TOOLS` STM surfaces against by default
+# (``hook_cmd._DEFAULT_SURFACE_TOOLS`` is this set). Lives here, beside the
+# vocabulary it draws from, so two consumers share one definition: the live hook's
+# surface allowlist *and* ``hook_hosts``'s per-host registration matcher (the
+# native tool names a ``mms hook install`` block fires on are exactly the host's
+# native names that map into this set — see :func:`hook_hosts.matcher_for`). One
+# source keeps the installed matcher from drifting from what the hook surfaces for.
+READLIKE_SURFACE_TOOLS: frozenset[str] = frozenset({"read", "grep", "glob", "shell"})
+
 
 def get_adapter(host_tag: str = "claude") -> HostHookAdapter:
     """Return the adapter for ``host_tag`` (falls back to Claude).

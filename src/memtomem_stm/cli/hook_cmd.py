@@ -65,6 +65,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TextIO
@@ -73,6 +74,7 @@ import click
 
 from memtomem_stm.cli.hook_adapter import (
     CANONICAL_TOOLS,
+    READLIKE_SURFACE_TOOLS,
     canonicalize_tool_token,
     detect_host,
     get_adapter,
@@ -96,8 +98,10 @@ _SURFACED_CLOSE = "</surfaced-memories>"
 # every host: Claude ``Read`` and a future host's ``ReadFile`` both canonicalize
 # to ``read``. ``web_fetch`` / ``write`` / ``edit`` are deliberately excluded —
 # surfacing on a write is semantically wrong and a write's inputs must never
-# become a search query (see module docstring).
-_DEFAULT_SURFACE_TOOLS = frozenset({"read", "grep", "glob", "shell"})
+# become a search query (see module docstring). Defined in ``hook_adapter`` (beside
+# the canonical vocabulary) so ``hook_hosts``'s per-host install matcher and this
+# allowlist share one source — see :data:`READLIKE_SURFACE_TOOLS`.
+_DEFAULT_SURFACE_TOOLS = READLIKE_SURFACE_TOOLS
 
 # Unique marker prepended to compressed ``stdout`` so a re-fired hook recognizes
 # its own output and no-ops (idempotency). Detected as a *prefix* only (see
@@ -700,7 +704,7 @@ async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> d
     return adapter.render(updated_tool_output=updated, additional_context=additional_context)
 
 
-@click.command(name="hook")
+@click.group(name="hook", invoke_without_command=True)
 @click.option(
     "--host",
     "host",
@@ -714,11 +718,13 @@ async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> d
         "for Codex."
     ),
 )
-def hook_command(host: str) -> None:
-    """Compress and/or surface for a host's built-in tool call (PostToolUse hook).
+@click.pass_context
+def hook_command(ctx: click.Context, host: str) -> None:
+    """Bridge a host's built-in tool calls into STM (PostToolUse hook).
 
-    Reads the hook JSON payload on stdin and prints a hook response that may
-    carry ``updatedToolOutput`` (compressed Bash output — opt-in via
+    Bare ``mms hook`` (no subcommand) is the *runtime* bridge: it reads the hook
+    JSON payload on stdin and prints a hook response that may carry
+    ``updatedToolOutput`` (compressed Bash output — opt-in via
     ``MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1``) and/or ``additionalContext``
     (relevant LTM memories, for read-like tools). Surfacing runs in the warm
     ``mms daemon`` by default (no per-call cold start), auto-spawned on first
@@ -734,7 +740,17 @@ def hook_command(host: str) -> None:
     registration. An explicit ``--host`` is authoritative; per-host registration
     writes it so raw-stdout (Kimi) and Codex routing are unambiguous (``auto``
     cannot tell Codex from Claude, nor identify Kimi from a malformed payload).
+
+    The ``install`` / ``uninstall`` subcommands are the *registration UX*: they
+    write (or remove) STM's PostToolUse hook block in a host's own config file
+    (``mms hook install --host <name>``), so the host actually fires this hook.
     """
+    # A subcommand (install/uninstall) was invoked — don't run the runtime bridge
+    # (and never read stdin). The bare ``mms hook`` invocation, where
+    # ``invoked_subcommand`` is None, falls through to the payload path below,
+    # byte-identical to the pre-group command.
+    if ctx.invoked_subcommand is not None:
+        return
     payload = _read_payload(sys.stdin)
     host_tag = detect_host(payload) if host == "auto" else host
     adapter = get_adapter(host_tag)
@@ -756,3 +772,142 @@ def hook_command(host: str) -> None:
     # a non-empty string ("{}" or more), so their trailing newline (and the
     # pre-seam byte-identity) is unchanged.
     click.echo(serialized, nl=bool(serialized))
+
+
+def _hook_install_command_argv(host: str) -> list[str]:
+    """The argv a host should fire on PostToolUse: ``<entrypoint> hook --host <host>``.
+
+    Reuses the MCP-registration entry-point detection (``_detect_install_type``):
+    a source/editable checkout registers ``uv run --directory <root>
+    memtomem-stm hook --host <host>`` and a global install the bare
+    ``memtomem-stm hook --host <host>`` console script. ``--host`` is always
+    written explicitly so raw-stdout (Kimi) and Codex routing are unambiguous (a
+    bare ``mms hook`` would auto-detect, which cannot tell Codex from Claude)."""
+    # Lazy import: ``cli.proxy`` imports this module at top level, so importing it
+    # here (only on the install path) avoids the cycle and keeps it off the
+    # latency-sensitive bare-hook path.
+    from memtomem_stm.cli.proxy import _detect_install_type
+
+    server_cmd, server_args = _detect_install_type()
+    return [server_cmd, *server_args, "hook", "--host", host]
+
+
+def _emit_hook_change(change: Any, *, apply_: bool, backup: Any) -> None:
+    """Render a planned (or applied) install/uninstall to the terminal.
+
+    Pure output: the caller has already applied the change when ``apply_`` and
+    passes the resulting ``backup`` path (or ``None``). Dry-run (the default)
+    shows what *would* happen and how to apply it."""
+    from memtomem_stm.cli.proxy import _hdr, _ok, _warn
+
+    click.echo(f"{_hdr(change.label + ' hook')} — {change.path}")
+
+    if not change.changed:
+        no_change = {
+            "already": "already installed (no change).",
+            "not_installed": "not installed (no memtomem-stm hook found).",
+            "absent": "config not found (nothing to remove).",
+        }.get(change.status, "no change.")
+        click.echo(f"  {_ok(no_change) if change.status == 'already' else no_change}")
+        return
+
+    if change.action == "install":
+        if apply_:
+            if backup is not None:
+                click.echo(f"  {_ok('Backed up')} {backup}")
+            click.echo(f"  {_ok('Installed')} memtomem-stm's PostToolUse hook.")
+        else:
+            verb = "create the config and add" if change.status == "create" else "add"
+            click.echo(f"  Would {verb} memtomem-stm's PostToolUse hook:")
+            click.echo("")
+            for line in change.rendered_block.splitlines():
+                # Indent non-blank lines only — TOML array-of-tables separators are
+                # blank, and prefixing them would emit trailing-whitespace lines.
+                click.echo(f"    {line}" if line else "")
+            click.echo("")
+    else:  # uninstall (only reached when changed → status == "remove")
+        if apply_:
+            if backup is not None:
+                click.echo(f"  {_ok('Backed up')} {backup}")
+            click.echo(f"  {_ok('Removed')} memtomem-stm's PostToolUse hook.")
+        else:
+            click.echo("  Would remove memtomem-stm's PostToolUse hook.")
+
+    if not apply_ and change.fmt == "toml":
+        click.echo(
+            f"  {_warn('Note:')} applying rewrites {change.path.name} — TOML "
+            "comments/formatting are not preserved (a .bak backup is kept)."
+        )
+
+    for note in change.notes:
+        click.echo(f"  {_warn('•')} {note}")
+
+    if not apply_:
+        click.echo("")
+        click.echo(
+            f"  To apply: {_hdr(f'mms hook {change.action} --host {change.host_tag} --apply')}"
+        )
+
+
+@hook_command.command(name="install")
+@click.option(
+    "--host",
+    "host",
+    required=True,
+    type=click.Choice(known_hosts()),
+    help="Host whose hook config to register STM's PostToolUse hook in.",
+)
+@click.option(
+    "--apply",
+    "apply_",
+    is_flag=True,
+    help="Write the change (default: dry-run preview). Backs up any prior file to <path>.bak.",
+)
+def hook_install_command(host: str, apply_: bool) -> None:
+    """Register STM's PostToolUse hook in a host's config (idempotent).
+
+    Read-modify-writes the host's hook-config file (``~/.claude/settings.json``,
+    ``~/.cursor/hooks.json``, ``~/.kimi/config.toml``, or ``~/.codex/config.toml``)
+    so the host fires ``mms hook --host <name>`` after each built-in tool call.
+    Re-running updates STM's existing block in place rather than duplicating it.
+    Default is a dry-run preview; ``--apply`` writes (backing up any prior file)."""
+    from memtomem_stm.cli import hook_hosts
+
+    command = shlex.join(_hook_install_command_argv(host))
+    try:
+        change = hook_hosts.plan_install(host, command)
+    except hook_hosts.HookInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
+    backup = hook_hosts.apply_change(change) if apply_ else None
+    _emit_hook_change(change, apply_=apply_, backup=backup)
+
+
+@hook_command.command(name="uninstall")
+@click.option(
+    "--host",
+    "host",
+    required=True,
+    type=click.Choice(known_hosts()),
+    help="Host whose hook config to remove STM's PostToolUse hook from.",
+)
+@click.option(
+    "--apply",
+    "apply_",
+    is_flag=True,
+    help="Write the change (default: dry-run preview). Backs up any prior file to <path>.bak.",
+)
+def hook_uninstall_command(host: str, apply_: bool) -> None:
+    """Remove STM's PostToolUse hook from a host's config (symmetric to install).
+
+    Removes exactly the block ``install`` would add (recognized by command
+    shape), leaving any hand-written hooks untouched. A no-op when the config is
+    absent or holds no STM block. Default is a dry-run preview; ``--apply`` writes
+    (backing up the prior file)."""
+    from memtomem_stm.cli import hook_hosts
+
+    try:
+        change = hook_hosts.plan_uninstall(host)
+    except hook_hosts.HookInstallError as exc:
+        raise click.ClickException(str(exc)) from exc
+    backup = hook_hosts.apply_change(change) if apply_ else None
+    _emit_hook_change(change, apply_=apply_, backup=backup)
