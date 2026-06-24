@@ -96,28 +96,26 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     never look. A daemon with a finite ``idle_timeout_seconds`` clears itself, but
     a pinned ``idle_timeout_seconds=0`` one lingers — this surfaces it.
 
-    Liveness is the recorded pid (:func:`is_pid_alive`): a foreign daemon may
-    speak an older protocol, so a socket ``ping`` would fail the version gate.
-    This is a weaker signal than the current-config path's socket ``ping`` — a
-    daemon that crashed (SIGKILL/OOM, not a graceful teardown) leaves its
-    handshake on disk, and the OS may recycle its pid to an unrelated process,
-    which would then look "alive" here. Closing that window (a process-identity
-    cross-check before acting) is tracked as a follow-up; the residual risk is
-    the same one the current-config SIGTERM fallback already carries. Each entry
-    carries only non-sensitive fields (``fingerprint``/``pid``/``host``/``port``)
-    — never the auth ``token`` — so callers can render them.
+    Liveness is **two-factor**: the recorded pid must exist
+    (:func:`is_pid_alive`) *and* a bare TCP connect to its endpoint must succeed
+    (:func:`~memtomem_stm.daemon.client.probe_listening`). A foreign daemon may
+    speak an older protocol, so a token ``ping`` would fail the version gate —
+    but it is still *accepting*, so a connect-probe reaches it without sending a
+    frame. The pid alone is too weak: a daemon that crashed (SIGKILL/OOM, not a
+    graceful teardown) leaves its handshake on disk, and the OS may recycle its
+    pid to an unrelated process that would then look "alive". Requiring the
+    endpoint to also accept rejects that recycled-pid case (its port is not
+    bound) — a strictly stronger check than pid alone (the residual is a double
+    coincidence: the pid recycled *and* its ephemeral port reassigned to another
+    listener). Each entry carries only non-sensitive fields
+    (``fingerprint``/``pid``/``host``/``port``) — never the auth ``token`` — so
+    callers can render them.
 
-    **POSIX-only.** On Windows :func:`is_pid_alive` returns ``True`` for any
-    positive pid (no signal-0; it defers to a socket ``ping`` that the foreign
-    path can't make across a protocol gap), so it cannot tell a live foreign
-    daemon from a long-dead handshake. Rather than report every stale file as
-    "running", foreign detection is disabled there until a cross-platform
-    connect-probe lands (the follow-up above, which also closes the recycling
-    window).
+    Cross-platform: the connect-probe is what makes Windows viable too, where
+    :func:`is_pid_alive` is uninformative (returns ``True`` for any positive pid,
+    no signal-0) — there the connect carries the whole signal (#519).
     """
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
-        return []
-
+    from memtomem_stm.daemon.client import probe_listening
     from memtomem_stm.daemon.discovery import (
         config_fingerprint,
         is_pid_alive,
@@ -128,13 +126,18 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     live: list[dict[str, Any]] = []
     for fingerprint, hs in iter_foreign_handshakes(config.data_dir, current):
         pid = _as_int(hs.get("pid", -1))
-        if is_pid_alive(pid):
+        host = hs.get("host")
+        port = hs.get("port")
+        # Cheap pid filter first (drops dead/garbage pids and, on POSIX, the
+        # bulk of stale handshakes without a connect); the probe then confirms
+        # something still accepts on the recorded endpoint.
+        if is_pid_alive(pid) and probe_listening(host, port):
             live.append(
                 {
                     "fingerprint": fingerprint,
                     "pid": pid,
-                    "host": hs.get("host"),
-                    "port": hs.get("port"),
+                    "host": host,
+                    "port": port,
                 }
             )
     return live
@@ -251,8 +254,8 @@ def start_cmd() -> None:
     is_flag=True,
     help="Also stop daemons running under a different config fingerprint "
     "(orphans left after a config or PROTOCOL_VERSION change). Off by default: a "
-    "live daemon under another config may be intentional, and a crash-orphaned "
-    "handshake can name a since-recycled pid.",
+    "live daemon under another config may be intentional. Targets are gated by a "
+    "connect-probe so a stale handshake naming a recycled pid is not signalled.",
 )
 def stop_cmd(stop_all: bool) -> None:
     """Ask a running daemon to shut down gracefully.
@@ -290,7 +293,13 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
         click.echo("no running daemon")
         return
     pid = _as_int(raw.get("pid", -1))
-    if os.name != "nt" and is_pid_alive(pid):
+    # Graceful shutdown declined, but a handshake remains. Only SIGTERM when the
+    # endpoint still accepts a connect — a bare probe (no token) tells "daemon
+    # there but unresponsive to OP_SHUTDOWN" from "stale handshake naming a dead
+    # or OS-recycled pid", so we don't signal an unrelated process. Replaces the
+    # old POSIX-only ``is_pid_alive`` gate, which over-reported on Windows; the
+    # probe makes the fallback safe cross-platform (#519).
+    if is_pid_alive(pid) and client.probe_listening(raw.get("host"), raw.get("port")):
         try:
             os.kill(pid, signal.SIGTERM)
             click.echo(_ok(f"sent SIGTERM to daemon pid={pid}"))
@@ -313,13 +322,14 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     pinned daemon exits. The daemon removes its own handshake on teardown, so we
     do not unlink it here (that could hide a survivor that ignored the signal).
 
-    Caveat (see :func:`_live_foreign_daemons`): without a socket handshake the
-    target is identified only by its recorded pid, so a crash-orphaned handshake
-    naming a since-recycled pid would signal an unrelated process. This is why
-    ``--all`` is opt-in; a process-identity cross-check is a tracked follow-up.
-    POSIX-only in practice: :func:`_live_foreign_daemons` yields nothing on
-    Windows (no verifiable foreign liveness there), so the loop never runs.
+    Targets come from :func:`_live_foreign_daemons`, whose two-factor check
+    (recorded pid alive *and* its endpoint accepting a connect) already rejects a
+    crash-orphaned handshake naming a since-recycled pid — so ``--all`` does not
+    signal an unrelated process in the common case. The residual is a double
+    coincidence (pid recycled *and* its ephemeral port reassigned to another
+    listener); ``--all`` stays opt-in for that narrow window.
     """
+    from memtomem_stm.daemon import client
     from memtomem_stm.daemon.discovery import is_pid_alive
 
     foreign = _live_foreign_daemons(config)
@@ -328,8 +338,13 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
         return
     for d in foreign:
         pid = d["pid"]
-        if not is_pid_alive(pid):
-            continue  # raced to exit between enumeration and now
+        # Re-confirm the *same* two-factor gate at action time, not just
+        # `is_pid_alive`: the daemon may have exited since enumeration and the OS
+        # recycled its pid onto an unrelated process. A pid-only recheck is too
+        # weak for that race (and a no-op on Windows, where is_pid_alive is always
+        # True), so re-run the connect-probe — a recycled pid's endpoint is gone.
+        if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
+            continue  # raced to exit / pid recycled between enumeration and now
         try:
             os.kill(pid, signal.SIGTERM)
             click.echo(_ok(f"sent SIGTERM to daemon pid={pid} (fp={d['fingerprint']})"))
