@@ -321,6 +321,72 @@ def test_cli_kimi_empty_surfacing_emits_truly_empty_stdout(monkeypatch: pytest.M
     assert result.output == ""
 
 
+# ── Host selection (--host / auto-detect, B4) ────────────────────────────────
+
+_KIMI_SHELL_PAYLOAD = {
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Shell",  # Kimi's native shell name → canonical "shell"
+    "tool_input": {"command": "pytest -q"},
+    "tool_output": "12 passed in 3.4s",  # Kimi/Cursor carry output under tool_output
+}
+_SURF_BLOCK = "<surfaced-memories>\nMEM\n</surfaced-memories>"
+_SURF_DICT = {
+    "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": _SURF_BLOCK}
+}
+
+
+def test_cli_host_kimi_routes_to_raw_stdout(monkeypatch: pytest.MonkeyPatch):
+    # --host kimi resolves the Kimi adapter end-to-end (NO get_adapter monkeypatch),
+    # so a surfaced block is emitted as RAW stdout, not a JSON envelope. Only the
+    # surfacing core is mocked; the real parse → render → serialize chain runs.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")  # no sqlite write
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value=_SURF_DICT))
+    result = CliRunner().invoke(
+        cli, ["hook", "--host", "kimi"], input=json.dumps(_KIMI_SHELL_PAYLOAD)
+    )
+    assert result.exit_code == 0
+    assert result.output == _SURF_BLOCK + "\n"  # raw block + click.echo newline
+    assert not result.output.startswith("{")  # not the JSON hookSpecificOutput envelope
+
+
+def test_cli_host_auto_detects_kimi_from_payload(monkeypatch: pytest.MonkeyPatch):
+    # Default (--host auto) infers the host from the payload shape: a Kimi-shaped
+    # payload (tool_output + PascalCase event) routes through the Kimi raw-stdout
+    # adapter without an explicit flag.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value=_SURF_DICT))
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_KIMI_SHELL_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == _SURF_BLOCK + "\n"
+
+
+def test_cli_host_claude_emits_json_envelope(monkeypatch: pytest.MonkeyPatch):
+    # The Claude/Codex/Cursor JSON hosts emit the nested hookSpecificOutput
+    # envelope — the same surfaced block, but JSON, not raw stdout.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value=_SURF_DICT))
+    result = CliRunner().invoke(cli, ["hook", "--host", "claude"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert json.loads(result.output) == _SURF_DICT
+
+
+@pytest.mark.parametrize("host", ["claude", "codex", "cursor", "kimi", "auto"])
+def test_cli_host_choice_accepts_every_registered_host(host: str):
+    # Every registered host (+ auto) is an accepted --host value; a malformed
+    # payload still degrades cleanly (exit 0). Pins the click.Choice ↔ registry tie.
+    result = CliRunner().invoke(cli, ["hook", "--host", host], input="not json")
+    assert result.exit_code == 0
+
+
+def test_cli_invalid_host_is_usage_error():
+    # An unregistered --host is a click usage error (exit 2) — a config typo caught
+    # at the human's terminal, not silently coerced. Registration writes only valid
+    # values, so the live hook never hits this.
+    result = CliRunner().invoke(cli, ["hook", "--host", "bogus"], input="not json")
+    assert result.exit_code == 2
+    assert "bogus" in result.output
+
+
 # ── Daemon routing + degradation ladder ──────────────────────────────────────
 
 

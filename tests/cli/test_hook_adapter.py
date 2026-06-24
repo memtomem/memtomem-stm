@@ -24,7 +24,9 @@ from memtomem_stm.cli.hook_adapter import (
     CodexHookAdapter,
     CursorHookAdapter,
     KimiHookAdapter,
+    detect_host,
     get_adapter,
+    known_hosts,
 )
 from memtomem_stm.cli.hook_cmd import _build_hook_output, _tool_response_to_text
 
@@ -476,7 +478,9 @@ def test_cursor_parse_non_dict_is_none(bad):
     assert _CURSOR.parse(bad) is None
 
 
-@pytest.mark.parametrize("payload", [{}, {"tool_name": 123}, {"tool_name": None}, {"tool_name": []}])
+@pytest.mark.parametrize(
+    "payload", [{}, {"tool_name": 123}, {"tool_name": None}, {"tool_name": []}]
+)
 def test_cursor_parse_coerces_missing_or_non_str_tool_name(payload):
     # Permissive + never-raises contract: a missing/non-str tool_name must coerce
     # to "" before the `tool_name.startswith("mcp__")` guard (which would raise on
@@ -672,7 +676,9 @@ def test_kimi_parse_non_dict_is_none(bad):
     assert _KIMI.parse(bad) is None
 
 
-@pytest.mark.parametrize("payload", [{}, {"tool_name": 123}, {"tool_name": None}, {"tool_name": []}])
+@pytest.mark.parametrize(
+    "payload", [{}, {"tool_name": 123}, {"tool_name": None}, {"tool_name": []}]
+)
 def test_kimi_parse_coerces_missing_or_non_str_tool_name(payload):
     # Never-raises contract: a missing/non-str tool_name coerces to "" before the
     # mcp__ startswith guard.
@@ -719,3 +725,55 @@ def test_kimi_serialize_emits_raw_not_json():
 def test_kimi_parse_delegates_flattening_to_shared_helper():
     src = inspect.getsource(KimiHookAdapter.parse)
     assert "_tool_response_to_text(" in src
+
+
+# ── host selection (--host / auto-detect, B4) ──────────────────────────────────
+
+
+def test_known_hosts_matches_registry():
+    # The values ``--host`` accepts are derived from the registry, so the CLI
+    # choice and the registered adapters never drift apart.
+    assert known_hosts() == ("claude", "codex", "cursor", "kimi")
+    for tag in known_hosts():
+        assert get_adapter(tag).host_tag == tag
+
+
+def test_detect_host_cursor_by_camelcase_event():
+    # Cursor's only unique signature is the camelCase ``postToolUse`` event.
+    payload = json.loads((_HOOK_FIXTURES / "cursor" / "inbound_shell_posttooluse.json").read_text())
+    assert detect_host(payload) == "cursor"
+
+
+def test_detect_host_kimi_by_tool_output_pascalcase():
+    # Kimi: ``tool_output`` (no ``tool_response``) + PascalCase ``PostToolUse``.
+    payload = json.loads((_HOOK_FIXTURES / "kimi" / "inbound_shell_posttooluse.json").read_text())
+    assert detect_host(payload) == "kimi"
+
+
+def test_detect_host_claude_by_tool_response():
+    payload = {"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": "x"}
+    assert detect_host(payload) == "claude"
+
+
+def test_detect_host_codex_payload_resolves_to_claude():
+    # Codex's payload is shape-identical to Claude's (snake_case, tool_response,
+    # PascalCase PostToolUse) — auto-detect CANNOT distinguish them and must
+    # resolve to claude (safe: identical parse + surfacing envelope). Codex users
+    # pass --host codex explicitly. This pins the documented ambiguity.
+    payload = json.loads((_HOOK_FIXTURES / "codex" / "inbound_bash_posttooluse.json").read_text())
+    assert detect_host(payload) == "claude"
+    assert detect_host(payload) != "codex"
+
+
+@pytest.mark.parametrize("bad", [None, "not a dict", [1, 2, 3], 42, {}])
+def test_detect_host_falls_back_to_claude(bad):
+    # Non-dict / empty / unrecognized payloads fall back to claude (the adapter
+    # then no-ops on the unusable payload, as today).
+    assert detect_host(bad) == "claude"
+
+
+def test_detect_host_cursor_event_wins_over_tool_output():
+    # Both Cursor and Kimi carry ``tool_output``; the camelCase event disambiguates
+    # to Cursor (checked first), so a Cursor payload never mis-detects as Kimi.
+    payload = {"hook_event_name": "postToolUse", "tool_name": "Shell", "tool_output": "x"}
+    assert detect_host(payload) == "cursor"

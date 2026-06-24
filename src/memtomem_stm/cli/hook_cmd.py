@@ -71,7 +71,13 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 import click
 
-from memtomem_stm.cli.hook_adapter import CANONICAL_TOOLS, canonicalize_tool_token, get_adapter
+from memtomem_stm.cli.hook_adapter import (
+    CANONICAL_TOOLS,
+    canonicalize_tool_token,
+    detect_host,
+    get_adapter,
+    known_hosts,
+)
 
 if TYPE_CHECKING:
     from memtomem_stm.cli.hook_adapter import CanonicalHookCall, HostHookAdapter
@@ -695,7 +701,20 @@ async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> d
 
 
 @click.command(name="hook")
-def hook_command() -> None:
+@click.option(
+    "--host",
+    "host",
+    type=click.Choice(["auto", *known_hosts()]),
+    default="auto",
+    show_default=True,
+    help=(
+        "Host whose PostToolUse payload/output shape to use. 'auto' infers it from "
+        "the payload shape (falls back to Claude). 'auto' cannot tell Codex from "
+        "Claude — their payloads are identical — so pass --host codex explicitly "
+        "for Codex."
+    ),
+)
+def hook_command(host: str) -> None:
     """Compress and/or surface for a host's built-in tool call (PostToolUse hook).
 
     Reads the hook JSON payload on stdin and prints a hook response that may
@@ -707,13 +726,18 @@ def hook_command() -> None:
     path. Always exits 0; on any problem the tool output passes through unchanged
     (prints ``{}``).
 
-    The host adapter resolved here owns both the output *shape* (``render``) and
-    its *stdout serialization* (``serialize`` — JSON for Claude/Codex/Cursor, raw
-    stdout for Kimi). Today ``get_adapter()`` always returns Claude; host selection
-    (``--host`` / payload auto-detect) plugs in here in a later step.
+    ``--host`` selects the adapter, which owns both the output *shape*
+    (``render``) and its *stdout serialization* (``serialize`` — JSON for
+    Claude/Codex/Cursor, raw stdout for Kimi). It defaults to ``auto``, which
+    infers the host from the payload shape (``detect_host``), falling back to
+    Claude — backward-compatible with the original ``mms hook`` Claude
+    registration. An explicit ``--host`` is authoritative; per-host registration
+    writes it so raw-stdout (Kimi) and Codex routing are unambiguous (``auto``
+    cannot tell Codex from Claude, nor identify Kimi from a malformed payload).
     """
     payload = _read_payload(sys.stdin)
-    adapter = get_adapter()
+    host_tag = detect_host(payload) if host == "auto" else host
+    adapter = get_adapter(host_tag)
     output: dict[str, Any] = {}
     if payload is not None:
         try:
