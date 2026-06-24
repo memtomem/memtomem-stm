@@ -723,4 +723,12 @@ def hook_command() -> None:
         except Exception:
             logger.warning("hook processing failed — passing tool output through", exc_info=True)
             output = {}
-    click.echo(adapter.serialize(output))
+    serialized = adapter.serialize(output)
+    # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
+    # channel with nothing surfaced). An unconditional ``click.echo`` would still
+    # append a newline, making stdout "\n" — non-empty, which Kimi injects into
+    # the model context — so the "empty stdout" pass-through contract requires
+    # suppressing the newline on an empty payload. JSON hosts always serialize to
+    # a non-empty string ("{}" or more), so their trailing newline (and the
+    # pre-seam byte-identity) is unchanged.
+    click.echo(serialized, nl=bool(serialized))

@@ -24,7 +24,7 @@ from uuid import uuid4
 import pytest
 from click.testing import CliRunner
 
-from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter, CodexHookAdapter
+from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter, CodexHookAdapter, KimiHookAdapter
 from memtomem_stm.cli.hook_cmd import (
     _COMPRESS_SENTINEL,
     _SAFE_DAEMON_BUDGET,
@@ -305,6 +305,20 @@ def test_cli_surfacing_disabled_is_noop(monkeypatch: pytest.MonkeyPatch):
     assert result.exit_code == 0
     assert json.loads(result.output) == {}
     assert spawns == []  # surfacing disabled → no daemon spawn
+
+
+def test_cli_kimi_empty_surfacing_emits_truly_empty_stdout(monkeypatch: pytest.MonkeyPatch):
+    # Kimi's surfacing channel is RAW stdout: a non-empty stdout is injected into
+    # the model context, so "nothing surfaced" must emit a *truly* empty stdout —
+    # not the "\n" an unconditional ``click.echo`` appends to an empty payload.
+    # ``KimiHookAdapter.serialize({}) == ""``, so this pins the CLI emit (not just
+    # serialize's return) once host selection can route to Kimi. A regression to
+    # ``click.echo(serialize(output))`` makes ``result.output == "\n"`` and fails.
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: KimiHookAdapter())
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value={}))
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
 
 
 # ── Daemon routing + degradation ladder ──────────────────────────────────────
