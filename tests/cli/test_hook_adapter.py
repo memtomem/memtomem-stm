@@ -12,6 +12,8 @@ alongside the wire-in commit.
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 
 import pytest
 
@@ -19,11 +21,16 @@ from memtomem_stm.cli import hook_cmd
 from memtomem_stm.cli.hook_adapter import (
     CanonicalHookCall,
     ClaudeHookAdapter,
+    CodexHookAdapter,
     get_adapter,
 )
 from memtomem_stm.cli.hook_cmd import _build_hook_output, _tool_response_to_text
 
 _CLAUDE = ClaudeHookAdapter()
+_CODEX = CodexHookAdapter()
+
+# Golden host-contract fixtures (B0): tests/fixtures/hooks/<host>/.
+_HOOK_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "hooks"
 
 
 # ── parse ────────────────────────────────────────────────────────────────────
@@ -214,11 +221,12 @@ def test_claude_capability_and_tag():
     assert _CLAUDE.can_replace_output is True
 
 
-def test_get_adapter_returns_claude_and_falls_back():
-    assert get_adapter().host_tag == "claude"
+def test_get_adapter_returns_registered_and_falls_back():
+    assert get_adapter().host_tag == "claude"  # default
     assert get_adapter("claude").host_tag == "claude"
-    # Unknown host tag falls back to Claude (B1 registers only Claude).
-    assert get_adapter("cursor").host_tag == "claude"
+    assert get_adapter("codex").host_tag == "codex"  # B2 step3
+    # An unregistered host tag falls back to Claude.
+    assert get_adapter("nonexistent-host").host_tag == "claude"
 
 
 # ── source pins (shape-identical routing a behavior spy can't see) ────────────
@@ -248,3 +256,124 @@ def test_orchestrate_routes_through_adapter():
     assert ".parse(" in src
     assert ".render(" in src
     assert "can_replace_output" in src
+
+
+# ── Codex adapter (B2 step3 — surfacing-only) ──────────────────────────────────
+
+_CODEX_DIR = _HOOK_FIXTURES / "codex"
+
+
+def test_codex_parse_golden_inbound():
+    # Golden: the host's documented inbound PostToolUse payload → CanonicalHookCall.
+    payload = json.loads((_CODEX_DIR / "inbound_bash_posttooluse.json").read_text())
+    call = _CODEX.parse(payload)
+    assert isinstance(call, CanonicalHookCall)
+    assert call.event_type == "PostToolUse"
+    assert call.tool_name == "Bash"  # host-native preserved (engine query input)
+    assert call.canonical_tool == "shell"  # Bash → canonical shell (allowlisted)
+    assert call.tool_input == {"command": "pytest -q"}
+    # Codex puts the tool output under ``tool_response`` (same key as Claude).
+    assert call.tool_response == "12 passed in 3.4s"
+    assert call.tool_response_text == "12 passed in 3.4s"
+    assert call.host_tag == "codex"
+
+
+def test_codex_render_golden_surfacing():
+    # Golden: feed the canonical surfaced block from the fixture and assert render
+    # reproduces the committed Codex surfacing emission exactly — the same
+    # ``hookSpecificOutput.additionalContext`` envelope as Claude.
+    expected = json.loads((_CODEX_DIR / "expected_surfacing_output.json").read_text())
+    block = expected["hookSpecificOutput"]["additionalContext"]
+    out = _CODEX.render(updated_tool_output=None, additional_context=block)
+    assert out == expected
+
+
+@pytest.mark.parametrize(
+    ("native", "canonical"),
+    [
+        ("Bash", "shell"),
+        ("apply_patch", "edit"),
+        ("Read", ""),  # Codex shells out — no native Read/Grep/Glob/WebFetch
+        ("WebSearch", ""),  # not intercepted by Codex's PostToolUse hook
+        ("SomeFutureTool", ""),
+    ],
+)
+def test_codex_parse_canonicalizes_tool_name(native: str, canonical: str):
+    call = _CODEX.parse({"tool_name": native, "tool_response": "x"})
+    assert call is not None
+    assert call.tool_name == native  # host-native preserved
+    assert call.canonical_tool == canonical
+
+
+@pytest.mark.parametrize("mcp_tool", ["mcp__memtomem__mem_search", "mcp__github__create_issue"])
+def test_codex_parse_rejects_mcp_tools(mcp_tool: str):
+    # mcp__-prefixed tools already flow through the MCP proxy — the native-tool
+    # hook must not double-handle them.
+    assert _CODEX.parse({"tool_name": mcp_tool, "tool_response": "x"}) is None
+
+
+@pytest.mark.parametrize("bad", [None, "not a dict", [1, 2, 3], 42])
+def test_codex_parse_non_dict_is_none(bad):
+    assert _CODEX.parse(bad) is None
+
+
+def test_codex_parse_defaults_event_to_posttooluse():
+    call = _CODEX.parse({"tool_name": "Bash", "tool_response": {"stdout": "ok"}})
+    assert call is not None
+    assert call.event_type == "PostToolUse"
+
+
+def test_codex_parse_flattens_dict_response_via_shared_helper():
+    # The common Bash-result shape is a dict, not a string. The golden fixture
+    # uses a string ``tool_response`` (for which the flatten is identity), so pin
+    # the dict path explicitly: parse must flatten through the shared helper —
+    # identical to Claude — so surfacing's ``min_response_chars`` gate sees real
+    # text and the ORIGINAL object is preserved (mirrors the Claude coverage).
+    response = {"stdout": "ok", "stderr": "", "exitCode": 0}
+    call = _CODEX.parse({"tool_name": "Bash", "tool_response": response})
+    assert call is not None
+    assert call.tool_response_text == _tool_response_to_text(response)
+    assert call.tool_response_text == "ok"
+    assert call.tool_response is response
+
+
+@pytest.mark.parametrize("bad_input", [["x"], "weird", 42, 0, False])
+def test_codex_parse_coerces_non_dict_tool_input(bad_input):
+    # A non-dict ``tool_input`` must coerce to ``{}`` (not leak through): it flows
+    # to the surfacing query extractor, which calls ``.items()`` on it, so a
+    # leaked non-dict would raise at runtime. Permissive parse, gating in the core.
+    call = _CODEX.parse({"tool_name": "Bash", "tool_input": bad_input, "tool_response": "x"})
+    assert call is not None
+    assert call.tool_input == {}
+
+
+def test_codex_to_wire_carries_host_tag():
+    # Provenance survives the hook→daemon wire so the daemon attributes the call
+    # to Codex without any host knowledge.
+    call = _CODEX.parse(
+        {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": "ok"}
+    )
+    assert call is not None
+    assert call.to_wire()["host_tag"] == "codex"
+
+
+def test_codex_capability_and_tag():
+    # B0: compression (output replacement) does NOT port to Codex
+    # (``updatedMCPToolOutput`` is parsed-but-unsupported + MCP-only), so Codex is
+    # surfacing-only — the orchestrator skips compression on this flag.
+    assert _CODEX.host_tag == "codex"
+    assert _CODEX.can_replace_output is False
+
+
+def test_codex_render_delegates_to_build_hook_output():
+    # The Codex surfacing envelope is identical to Claude's — it must delegate to
+    # the single shared helper, not re-spell ``hookSpecificOutput`` (which would
+    # let the two shapes drift apart silently).
+    src = inspect.getsource(CodexHookAdapter.render)
+    assert "_build_hook_output(" in src
+    assert "hookSpecificOutput" not in src
+
+
+def test_codex_parse_delegates_flattening_to_shared_helper():
+    src = inspect.getsource(CodexHookAdapter.parse)
+    assert "_tool_response_to_text(" in src
