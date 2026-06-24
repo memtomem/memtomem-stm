@@ -1018,6 +1018,34 @@ class TestDaemonForeignOrphans:
         assert killed == []  # recycled pid never signalled
         assert "no daemons running under a different config" in result.output
 
+    def test_stop_all_reprobes_before_kill(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """TOCTOU between enumeration and `os.kill` (#519): a foreign daemon passes
+        the enumeration probe, then exits and its pid is recycled before the kill.
+        The action-time re-probe (not just `is_pid_alive`, a no-op on Windows) must
+        catch it so `stop --all` does not SIGTERM the recycled pid."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        # True at enumeration, False at the action-time re-check (endpoint vanished).
+        calls = {"n": 0}
+
+        def flaky_probe(host, port, **kw):
+            calls["n"] += 1
+            return calls["n"] == 1
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.probe_listening", flaky_probe)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 0, result.output
+        assert killed == []  # re-probe failed → recycled pid not signalled
+        assert calls["n"] == 2  # probed at enumeration AND again before the kill
+
     def test_listening_foreign_detected_end_to_end(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

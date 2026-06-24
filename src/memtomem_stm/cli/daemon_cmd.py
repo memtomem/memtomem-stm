@@ -329,6 +329,7 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     coincidence (pid recycled *and* its ephemeral port reassigned to another
     listener); ``--all`` stays opt-in for that narrow window.
     """
+    from memtomem_stm.daemon import client
     from memtomem_stm.daemon.discovery import is_pid_alive
 
     foreign = _live_foreign_daemons(config)
@@ -337,8 +338,13 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
         return
     for d in foreign:
         pid = d["pid"]
-        if not is_pid_alive(pid):
-            continue  # raced to exit between enumeration and now
+        # Re-confirm the *same* two-factor gate at action time, not just
+        # `is_pid_alive`: the daemon may have exited since enumeration and the OS
+        # recycled its pid onto an unrelated process. A pid-only recheck is too
+        # weak for that race (and a no-op on Windows, where is_pid_alive is always
+        # True), so re-run the connect-probe — a recycled pid's endpoint is gone.
+        if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
+            continue  # raced to exit / pid recycled between enumeration and now
         try:
             os.kill(pid, signal.SIGTERM)
             click.echo(_ok(f"sent SIGTERM to daemon pid={pid} (fp={d['fingerprint']})"))
