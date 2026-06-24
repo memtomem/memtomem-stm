@@ -1,0 +1,6 @@
+# Hook golden fixtures are byte-exact (compared via read_bytes); pin LF so a
+# Windows checkout (core.autocrlf=true) can't CRLF-convert them and break the
+# byte-identity assertion (test_kimi_render_then_serialize_golden_raw_stdout).
+# The raw-stdout goldens are *.txt; the JSON goldens are parsed structurally so
+# are EOL-agnostic, but pinning the whole tree keeps future B2 host fixtures safe.
+tests/fixtures/hooks/** text eol=lf

@@ -23,6 +23,7 @@ from memtomem_stm.cli.hook_adapter import (
     ClaudeHookAdapter,
     CodexHookAdapter,
     CursorHookAdapter,
+    KimiHookAdapter,
     get_adapter,
 )
 from memtomem_stm.cli.hook_cmd import _build_hook_output, _tool_response_to_text
@@ -30,6 +31,7 @@ from memtomem_stm.cli.hook_cmd import _build_hook_output, _tool_response_to_text
 _CLAUDE = ClaudeHookAdapter()
 _CODEX = CodexHookAdapter()
 _CURSOR = CursorHookAdapter()
+_KIMI = KimiHookAdapter()
 
 # Golden host-contract fixtures (B0): tests/fixtures/hooks/<host>/.
 _HOOK_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "hooks"
@@ -228,6 +230,7 @@ def test_get_adapter_returns_registered_and_falls_back():
     assert get_adapter("claude").host_tag == "claude"
     assert get_adapter("codex").host_tag == "codex"  # B2 step3
     assert get_adapter("cursor").host_tag == "cursor"  # B2 step3
+    assert get_adapter("kimi").host_tag == "kimi"  # B2 step3
     # An unregistered host tag falls back to Claude.
     assert get_adapter("nonexistent-host").host_tag == "claude"
 
@@ -251,14 +254,29 @@ def test_parse_delegates_flattening_to_shared_helper():
 
 
 def test_orchestrate_routes_through_adapter():
-    # Pin the shape-identical routing: _orchestrate must dispatch via
-    # get_adapter() and use the adapter's parse/render, and gate compression on
-    # the capability flag rather than running it unconditionally.
+    # Pin the shape-identical routing: _orchestrate consumes the supplied adapter's
+    # parse/render and gates compression on the capability flag rather than running
+    # it unconditionally. (Adapter resolution + serialization live in hook_command.)
     src = inspect.getsource(hook_cmd._orchestrate)
-    assert "get_adapter(" in src
-    assert ".parse(" in src
-    assert ".render(" in src
+    assert "adapter.parse(" in src
+    assert "adapter.render(" in src
     assert "can_replace_output" in src
+    # And it must NOT re-resolve its own adapter (that resolution is hook_command's
+    # job — the host-selection plug-in point). Re-internalizing get_adapter() here
+    # would silently ignore the supplied adapter; pin against it.
+    assert "get_adapter(" not in src
+
+
+def test_hook_command_resolves_adapter_and_serializes():
+    # hook_command owns adapter selection (get_adapter() — the host-selection
+    # plug-in point) and per-host stdout serialization (adapter.serialize), so the
+    # raw-stdout (Kimi) vs JSON (Claude/Codex/Cursor) decision is the adapter's,
+    # not a hardcoded json.dumps in the CLI. (hook_command is a click Command —
+    # inspect its underlying callback.)
+    src = inspect.getsource(hook_cmd.hook_command.callback)
+    assert "get_adapter(" in src
+    assert "adapter.serialize(" in src
+    assert "json.dumps(" not in src  # serialization delegated to the adapter
 
 
 # ── Codex adapter (B2 step3 — surfacing-only) ──────────────────────────────────
@@ -539,4 +557,165 @@ def test_cursor_render_builds_flat_shape_not_envelope():
 
 def test_cursor_parse_delegates_flattening_to_shared_helper():
     src = inspect.getsource(CursorHookAdapter.parse)
+    assert "_tool_response_to_text(" in src
+
+
+# ── serialize seam (per-host stdout: JSON for Claude/Codex/Cursor, raw for Kimi) ─
+
+
+@pytest.mark.parametrize("adapter", [_CLAUDE, _CODEX, _CURSOR])
+def test_json_hosts_serialize_is_json_dumps_byte_identical(adapter):
+    # The default serialize() must stay byte-identical to the pre-seam emit
+    # (`json.dumps(output, ensure_ascii=False)`) for every JSON host — both the
+    # nested Claude/Codex envelope and Cursor's flat keys. The non-ASCII payload
+    # pins the ``ensure_ascii=False`` half: with only-ASCII inputs a regression to
+    # ``ensure_ascii=True`` is invisible, yet it would `\uXXXX`-escape the Korean
+    # LTM blocks this project routinely surfaces.
+    for rendered in (
+        {},
+        {"additional_context": "<surfaced-memories>\nMEM\n</surfaced-memories>"},
+        {"additional_context": "<surfaced-memories>\n한국어 메모\n</surfaced-memories>"},
+        {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "x"}},
+    ):
+        assert adapter.serialize(rendered) == json.dumps(rendered, ensure_ascii=False)
+        # Guard the escape directly: a non-ASCII block must NOT be \uXXXX-escaped.
+        if "한국어" in str(rendered):
+            assert "한국어" in adapter.serialize(rendered)
+            assert "\\ud55c" not in adapter.serialize(rendered)
+
+
+# ── Kimi adapter (B2 step3 — raw-stdout surfacing channel) ─────────────────────
+
+_KIMI_DIR = _HOOK_FIXTURES / "kimi"
+
+
+def test_kimi_parse_golden_inbound():
+    payload = json.loads((_KIMI_DIR / "inbound_shell_posttooluse.json").read_text())
+    call = _KIMI.parse(payload)
+    assert isinstance(call, CanonicalHookCall)
+    # Kimi's event is PascalCase PostToolUse already — no normalization needed.
+    assert call.event_type == "PostToolUse"
+    assert call.tool_name == "Shell"
+    assert call.canonical_tool == "shell"
+    assert call.tool_input == {"command": "pytest -q"}
+    # Output is under ``tool_output`` (like Cursor), not ``tool_response``.
+    assert call.tool_response == "12 passed in 3.4s"
+    assert call.tool_response_text == "12 passed in 3.4s"
+    assert call.host_tag == "kimi"
+
+
+def test_kimi_render_then_serialize_golden_raw_stdout():
+    # The golden: render → serialize must reproduce the committed RAW stdout
+    # fixture exactly (the surfaced block, NOT JSON). Byte-identical to the .txt
+    # (which stores the block with no trailing newline — the live newline is the
+    # caller's click.echo).
+    raw_path = _KIMI_DIR / "expected_surfacing_stdout.txt"
+    block = raw_path.read_text()
+    rendered = _KIMI.render(updated_tool_output=None, additional_context=block)
+    out = _KIMI.serialize(rendered)
+    assert out == block
+    assert out.encode("utf-8") == raw_path.read_bytes()  # byte-identical, no framing
+    # It is RAW text, not a JSON envelope — none of the JSON-host markers.
+    assert not out.startswith("{")
+    assert "additionalContext" not in out
+    assert "hookSpecificOutput" not in out
+
+
+def test_kimi_serialize_is_raw_not_json_vs_claude():
+    block = "<surfaced-memories>\nMEM\n</surfaced-memories>"
+    rendered = {"additional_context": block}
+    # Kimi emits the block verbatim; the JSON hosts emit json.dumps of the dict.
+    assert _KIMI.serialize(rendered) == block
+    assert _CLAUDE.serialize(rendered) == json.dumps(rendered, ensure_ascii=False)
+    assert _CLAUDE.serialize(rendered).startswith("{")
+
+
+def test_kimi_serialize_empty_is_empty_stdout():
+    # Nothing surfaced → empty stdout (Kimi adds only non-empty stdout to context).
+    assert _KIMI.serialize({}) == ""
+    assert _KIMI.serialize(_KIMI.render(updated_tool_output=None, additional_context=None)) == ""
+
+
+def test_kimi_serialize_ignores_updated_output_no_replace_field():
+    # Kimi has no output-replace channel: an updated output never appears in stdout;
+    # only the surfaced block (raw) is emitted.
+    block = "<surfaced-memories>\nMEM\n</surfaced-memories>"
+    rendered = _KIMI.render(updated_tool_output={"stdout": "compressed"}, additional_context=block)
+    assert _KIMI.serialize(rendered) == block
+
+
+@pytest.mark.parametrize(
+    ("native", "canonical"),
+    [
+        ("Shell", "shell"),
+        ("ReadFile", "read"),
+        ("WriteFile", "write"),
+        ("StrReplaceFile", "edit"),
+        ("Bash", ""),  # Claude's name, not Kimi's → unmapped
+        ("SomeFutureTool", ""),
+    ],
+)
+def test_kimi_parse_canonicalizes_tool_name(native: str, canonical: str):
+    call = _KIMI.parse({"tool_name": native, "tool_output": "x"})
+    assert call is not None
+    assert call.tool_name == native
+    assert call.canonical_tool == canonical
+
+
+@pytest.mark.parametrize("mcp_tool", ["mcp__memtomem__mem_search", "mcp__github__create_issue"])
+def test_kimi_parse_rejects_mcp_tools(mcp_tool: str):
+    assert _KIMI.parse({"tool_name": mcp_tool, "tool_output": "x"}) is None
+
+
+@pytest.mark.parametrize("bad", [None, "not a dict", [1, 2, 3], 42])
+def test_kimi_parse_non_dict_is_none(bad):
+    assert _KIMI.parse(bad) is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"tool_name": 123}, {"tool_name": None}, {"tool_name": []}])
+def test_kimi_parse_coerces_missing_or_non_str_tool_name(payload):
+    # Never-raises contract: a missing/non-str tool_name coerces to "" before the
+    # mcp__ startswith guard.
+    call = _KIMI.parse({**payload, "tool_output": "x"})
+    assert call is not None
+    assert call.tool_name == ""
+    assert call.canonical_tool == ""
+
+
+@pytest.mark.parametrize("bad_input", [["x"], "weird", 42, 0, False])
+def test_kimi_parse_coerces_non_dict_tool_input(bad_input):
+    call = _KIMI.parse({"tool_name": "Shell", "tool_input": bad_input, "tool_output": "x"})
+    assert call is not None
+    assert call.tool_input == {}
+
+
+def test_kimi_parse_flattens_dict_output_via_shared_helper():
+    response = {"stdout": "ok", "stderr": ""}
+    call = _KIMI.parse({"tool_name": "Shell", "tool_output": response})
+    assert call is not None
+    assert call.tool_response_text == _tool_response_to_text(response)
+    assert call.tool_response_text == "ok"
+
+
+def test_kimi_to_wire_carries_host_tag():
+    call = _KIMI.parse({"tool_name": "Shell", "tool_input": {"command": "ls"}, "tool_output": "ok"})
+    assert call is not None
+    assert call.to_wire()["host_tag"] == "kimi"
+
+
+def test_kimi_capability_and_tag():
+    # B0: Kimi has no output-replace field at all → surfacing-only.
+    assert _KIMI.host_tag == "kimi"
+    assert _KIMI.can_replace_output is False
+
+
+def test_kimi_serialize_emits_raw_not_json():
+    # The seam pin: Kimi's serialize must NOT json.dumps — it emits the block text.
+    src = inspect.getsource(KimiHookAdapter.serialize)
+    assert "json.dumps" not in src
+    assert "additional_context" in src
+
+
+def test_kimi_parse_delegates_flattening_to_shared_helper():
+    src = inspect.getsource(KimiHookAdapter.parse)
     assert "_tool_response_to_text(" in src
