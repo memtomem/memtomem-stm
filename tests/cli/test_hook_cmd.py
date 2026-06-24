@@ -391,6 +391,25 @@ def test_cli_runtime_invalid_host_fails_open():
     assert result.output.strip() == "{}"
 
 
+def test_cli_runtime_bare_host_flag_fails_open():
+    # A bare `--host` with the value OMITTED (a plausible hand-edit) must NOT trip
+    # Click's "requires an argument" exit 2 before the fail-open body runs. The
+    # option's flag_value="auto" resolves it to auto-detect, so it exits 0 and
+    # passes through — closing the missing-value half of the contract (#526; the
+    # invalid-value half is test_cli_runtime_invalid_host_fails_open).
+    result = CliRunner().invoke(cli, ["hook", "--host"], input="not json")
+    assert result.exit_code == 0
+    assert result.output.strip() == "{}"
+
+
+def test_cli_install_missing_host_value_is_usage_error():
+    # Symmetric guard: the operator `install` command's --host is NOT optional —
+    # a bare `--host` there is still a usage error (exit 2). Pins that the runtime
+    # flag_value leniency did not leak into install/uninstall.
+    result = CliRunner().invoke(cli, ["hook", "install", "--host"])
+    assert result.exit_code == 2
+
+
 def test_cli_runtime_invalid_host_falls_back_to_autodetect(monkeypatch: pytest.MonkeyPatch):
     # The fallback is auto-detect (detect_host on the payload), NOT a hard-coded
     # Claude: a Kimi-shaped payload under a bogus --host still routes through Kimi's

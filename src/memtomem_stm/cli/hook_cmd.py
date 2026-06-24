@@ -739,14 +739,25 @@ def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
     "host",
     default="auto",
     show_default=True,
+    # Optional value (is_flag=False + flag_value): a bare ``--host`` with the value
+    # omitted resolves to ``auto`` (→ detect_host) instead of Click's
+    # "requires an argument" exit 2. Together with the plain-string type (no
+    # click.Choice), this closes *every* ``--host`` argv shape — missing value AND
+    # unrecognized value — into the fail-open body rather than a non-zero parse
+    # exit, honoring the runtime bridge's always-exit-0 contract for any
+    # hand-edited registration (#526). install/uninstall keep the strict
+    # click.Choice (operator commands; an exit-2 usage error on a typo is correct).
+    is_flag=False,
+    flag_value="auto",
     help=(
         "Host whose PostToolUse payload/output shape to use. 'auto' infers it from "
         "the payload shape (falls back to Claude). 'auto' cannot tell Codex from "
         "Claude — their payloads are identical — so pass --host codex explicitly "
-        "for Codex. A plain string (not a click.Choice): an unrecognized value is "
-        "NOT a usage error here — the host fires this non-interactively and treats "
-        "a non-zero exit as a block — so it logs a warning and falls back to "
-        "auto-detect. (install/uninstall keep the strict click.Choice.)"
+        "for Codex. A plain string with an optional value: an unrecognized value is "
+        "NOT a usage error here, and a bare --host (no value) resolves to 'auto' — "
+        "the host fires this non-interactively and treats a non-zero exit as a "
+        "block, so a bad/missing value logs a warning and falls back to auto-detect "
+        "rather than exiting 2. (install/uninstall keep the strict click.Choice.)"
     ),
 )
 @click.pass_context
