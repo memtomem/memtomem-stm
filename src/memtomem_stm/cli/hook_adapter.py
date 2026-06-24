@@ -219,8 +219,90 @@ class ClaudeHookAdapter(HostHookAdapter):
         return _build_hook_output(updated_tool_output, additional_context)
 
 
-# Single-entry registry today; B2 adds Cursor/Kimi/Codex keyed by host_tag.
-_ADAPTERS: dict[str, HostHookAdapter] = {ClaudeHookAdapter.host_tag: ClaudeHookAdapter()}
+class CodexHookAdapter(HostHookAdapter):
+    """Codex CLI PostToolUse adapter — surfacing-only (B0: no output replace).
+
+    Codex's hook payload shares Claude's shape: snake_case keys with the tool
+    output under ``tool_response`` and ``hook_event_name`` = ``PostToolUse``. Its
+    surfacing channel is the *same* ``hookSpecificOutput.additionalContext``
+    envelope as Claude (doc-verified, B0), so :meth:`render` delegates to the one
+    shared ``_build_hook_output`` helper rather than re-spelling the envelope —
+    the Claude shape then lives in exactly one place.
+
+    Two host facts (B0) shape it:
+
+    * **Compression does not port.** Codex's ``updatedMCPToolOutput`` is "parsed
+      but not supported yet" *and* MCP-only — native Bash/apply_patch has no
+      rewrite field — so ``can_replace_output`` is ``False`` and the orchestrator
+      skips compression for Codex (surfacing still flows through ``render``).
+    * **Only Bash + apply_patch fire a native PostToolUse hook.** Codex has no
+      separate Read/Grep/Glob/WebFetch built-ins (it shells out; WebSearch is not
+      intercepted), so ``native_tool_map`` maps just those two; every other name
+      canonicalizes to ``""`` (never surfaced/compressed). In practice only
+      ``Bash`` (→ ``shell``) lands in the read-like surface allowlist.
+
+    Rollout caveat (not an adapter-shape concern): the *standalone* exit-0
+    ``additionalContext`` shape — without ``decision:"block"`` — is undocumented
+    (every official example nests it under a block), so a runtime check should
+    confirm Codex honors it before the host-selection step enables Codex
+    surfacing by default. The adapter still emits the documented field.
+    """
+
+    host_tag: ClassVar[str] = "codex"
+    can_replace_output: ClassVar[bool] = False
+    # Codex's only native (non-MCP) tools that fire PostToolUse. ``apply_patch``
+    # is a diff/patch apply → canonical ``edit``; ``Bash`` → ``shell``. No native
+    # Read/Grep/Glob/WebFetch (Codex shells out), so they are absent here and
+    # canonicalize to ``""``.
+    native_tool_map: ClassVar[dict[str, str]] = {
+        "Bash": "shell",
+        "apply_patch": "edit",
+    }
+
+    def parse(self, payload: dict[str, Any]) -> CanonicalHookCall | None:
+        if not isinstance(payload, dict):
+            return None
+        raw_name = payload.get("tool_name")
+        tool_name = raw_name if isinstance(raw_name, str) else ""
+        if tool_name.startswith("mcp__"):
+            return None  # proxied MCP tool — already runs through the pipeline
+        # Lazy import (as in ClaudeHookAdapter): avoid the hook_cmd import cycle
+        # and keep ``mms hook --help`` off the surfacing import cost. Codex shares
+        # Claude's snake_case / ``tool_response`` payload shape — only the
+        # native_tool_map and host_tag differ — so this mirrors Claude's parse.
+        from memtomem_stm.cli.hook_cmd import _tool_response_to_text
+
+        tool_input = payload.get("tool_input")
+        tool_response = payload.get("tool_response")
+        return CanonicalHookCall(
+            event_type=payload.get("hook_event_name") or "PostToolUse",
+            tool_name=tool_name,
+            canonical_tool=self.native_tool_map.get(tool_name, ""),
+            tool_input=tool_input if isinstance(tool_input, dict) else {},
+            tool_response=tool_response,
+            tool_response_text=_tool_response_to_text(tool_response),
+            host_tag=self.host_tag,
+        )
+
+    def render(
+        self, *, updated_tool_output: Any | None, additional_context: str | None
+    ) -> dict[str, Any]:
+        # Codex's surfacing envelope is identical to Claude's — delegate to the
+        # single shared helper so the output shape lives in exactly one place.
+        # ``updated_tool_output`` is always ``None`` for Codex
+        # (can_replace_output=False) but is honored generically.
+        from memtomem_stm.cli.hook_cmd import _build_hook_output
+
+        return _build_hook_output(updated_tool_output, additional_context)
+
+
+# Registry keyed by host_tag. B1 shipped Claude; B2 step3 adds the non-Claude
+# adapters one host at a time (Codex first). Cursor/Kimi follow; Antigravity is
+# deferred (unfixturable — see tests/fixtures/hooks/README.md).
+_ADAPTERS: dict[str, HostHookAdapter] = {
+    ClaudeHookAdapter.host_tag: ClaudeHookAdapter(),
+    CodexHookAdapter.host_tag: CodexHookAdapter(),
+}
 
 # STM's canonical built-in tool vocabulary — the codomain of every adapter's
 # ``native_tool_map``. The surface allowlist + compression gate are expressed in
@@ -233,7 +315,9 @@ CANONICAL_TOOLS: frozenset[str] = frozenset(
 def get_adapter(host_tag: str = "claude") -> HostHookAdapter:
     """Return the adapter for ``host_tag`` (falls back to Claude).
 
-    Only Claude is registered today; the indirection is the B2 dispatch seam.
+    Claude and Codex are registered (B2 step3 adds the rest); an unknown
+    ``host_tag`` falls back to Claude. Host selection (which tag the live hook
+    passes) is wired in a later step — today every caller uses the default.
     """
     return _ADAPTERS.get(host_tag) or _ADAPTERS["claude"]
 
