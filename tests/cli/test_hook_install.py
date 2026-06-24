@@ -80,6 +80,11 @@ def test_is_stm_hook_command_recognizes_our_invocations(command: str) -> None:
         "echo hook",  # 'hook' token but no STM executable
         "ruff check hooks.py",  # 'hooks.py' is not the 'hook' token (substring guard)
         "my-linter --run hook-stage",  # neither an STM exe nor a bare 'hook' token
+        # Compound command: a bare 'hook' token AND an STM exe, but the exe's
+        # subcommand is 'status', not 'hook' — adjacency (exe→hook) is required,
+        # so install/uninstall must leave this user command alone (#529).
+        "echo hook && memtomem-stm status",
+        "memtomem-stm",  # bare exe, no trailing subcommand at all (no IndexError)
         "",
     ],
 )
@@ -189,6 +194,81 @@ def test_plan_install_preserves_sibling_content(redirect) -> None:
     assert _config_has_stm_command(parsed, "claude")
 
 
+def test_plan_install_preserves_cohandler_in_stm_matcher_group(redirect) -> None:
+    # A user who manually co-located their own handler inside STM's matcher-group
+    # entry must not lose it on re-install (#529). The STM handler is swapped in
+    # place (command refreshed), siblings + the shared matcher are preserved —
+    # symmetric with uninstall, which already filters rather than replaces.
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read",  # user's own matcher, not STM's derived one
+                            "hooks": [
+                                {"type": "command", "command": "mms hook --host claude"},
+                                {"type": "command", "command": "my-guard.sh"},
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    change = plan_install("claude", "memtomem-stm hook --host claude")
+    entries = json.loads(change.new_text)["hooks"]["PostToolUse"]
+    assert len(entries) == 1  # still a single matcher group — STM swapped in place
+    entry = entries[0]
+    assert entry["matcher"] == "Read"  # shared matcher kept (changing it would move guard.sh)
+    commands = [h["command"] for h in entry["hooks"]]
+    assert "my-guard.sh" in commands  # the co-located sibling survives
+    assert sum(_is_stm_hook_command(c) for c in commands) == 1  # exactly one STM handler
+    assert "memtomem-stm hook --host claude" in commands  # refreshed to the new spelling
+
+
+def test_plan_install_dedups_multiple_stm_groups(redirect) -> None:
+    # A config that somehow holds *two* STM groups (a hand-edit, or an old
+    # install) must converge to a single STM handler on re-install, honoring the
+    # "never duplicated" contract — and never lose a co-located sibling (#529,
+    # codex follow-up). Install scans all PostToolUse entries, like uninstall.
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [
+                                {"type": "command", "command": "mms hook --host claude"},
+                                {"type": "command", "command": "my-guard.sh"},
+                            ],
+                        },
+                        {
+                            "matcher": "Read|Grep|Glob|Bash",
+                            "hooks": [{"type": "command", "command": "mms hook --host claude"}],
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    apply_change(plan_install("claude", "memtomem-stm hook --host claude"))
+    entries = json.loads(path.read_text())["hooks"]["PostToolUse"]
+    commands = [h["command"] for e in entries for h in e["hooks"]]
+    assert sum(_is_stm_hook_command(c) for c in commands) == 1  # one STM handler total
+    assert "my-guard.sh" in commands  # co-located sibling kept
+    # Idempotent now — the lingering duplicate doesn't make re-install a no-op
+    # while STM still fires twice.
+    assert plan_install("claude", "memtomem-stm hook --host claude").status == "already"
+
+
 # ── plan_uninstall: symmetric, sibling-preserving, cleans empties ────────────
 
 
@@ -274,6 +354,49 @@ def test_apply_change_backs_up_prior_file_verbatim(redirect) -> None:
     commands = [e["command"] for e in parsed["hooks"]["postToolUse"]]
     assert "other.sh" in commands
     assert any(_is_stm_hook_command(c) for c in commands)
+
+
+def test_apply_change_second_apply_does_not_clobber_first_backup(redirect) -> None:
+    # A second --apply (uninstall here) must not overwrite the backup the first
+    # apply made (#529). For a TOML host that first .bak is the only
+    # comment-preserving copy of the original — re-serialization drops comments —
+    # so clobbering it would destroy exactly the safety net. The second backup
+    # goes to .bak.1 instead; the original stays at .bak.
+    path = redirect("codex")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = 'model = "gpt-5"  # keep this comment\n'
+    path.write_text(original, encoding="utf-8")
+
+    first = apply_change(plan_install("codex", "memtomem-stm hook --host codex"))
+    assert first == path.parent / (path.name + ".bak")
+    assert first.read_text(encoding="utf-8") == original  # verbatim original, comment intact
+
+    second = apply_change(plan_uninstall("codex"))
+    assert second == path.parent / (path.name + ".bak.1")  # numbered slot, not .bak
+    # The original comment-preserving backup is untouched by the second apply.
+    assert first.read_text(encoding="utf-8") == original
+    assert "# keep this comment" not in second.read_text(encoding="utf-8")  # re-serialized copy
+
+
+def test_write_backup_advances_past_existing_slots(tmp_path: Path) -> None:
+    # _write_backup claims the first free slot with O_EXCL and never touches an
+    # occupied one, so pre-existing backups are preserved and the new one lands
+    # in the next slot (#529). This is the per-slot proof behind the two-apply
+    # test above; it also exercises the collision-advance loop directly.
+    from memtomem_stm.cli.hook_hosts import _write_backup
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("current\n", encoding="utf-8")
+    (tmp_path / "config.toml.bak").write_text("original\n", encoding="utf-8")
+    (tmp_path / "config.toml.bak.1").write_text("second\n", encoding="utf-8")
+
+    dest = _write_backup(cfg, "third\n", 0o600)
+
+    assert dest == tmp_path / "config.toml.bak.2"
+    assert dest.read_text(encoding="utf-8") == "third\n"
+    # The two occupied slots are untouched.
+    assert (tmp_path / "config.toml.bak").read_text(encoding="utf-8") == "original\n"
+    assert (tmp_path / "config.toml.bak.1").read_text(encoding="utf-8") == "second\n"
 
 
 def test_apply_change_no_backup_when_creating(redirect) -> None:
