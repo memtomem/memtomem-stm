@@ -34,6 +34,7 @@ from memtomem_stm.cli.hook_cmd import (
     _extract_surfaced_block,
     _orchestrate,
     _record_hook_metrics,
+    _resolve_host_tag,
     _run_hook,
     _tool_response_to_text,
     maybe_compress_builtin,
@@ -371,20 +372,85 @@ def test_cli_host_claude_emits_json_envelope(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize("host", ["claude", "codex", "cursor", "kimi", "auto"])
-def test_cli_host_choice_accepts_every_registered_host(host: str):
+def test_cli_host_accepts_every_registered_host(host: str):
     # Every registered host (+ auto) is an accepted --host value; a malformed
-    # payload still degrades cleanly (exit 0). Pins the click.Choice ↔ registry tie.
+    # payload still degrades cleanly (exit 0). Pins the runtime --host ↔ registry tie
+    # (the runtime option is now a plain string, validated fail-open in the body —
+    # see test_cli_runtime_invalid_host_fails_open).
     result = CliRunner().invoke(cli, ["hook", "--host", host], input="not json")
     assert result.exit_code == 0
 
 
-def test_cli_invalid_host_is_usage_error():
-    # An unregistered --host is a click usage error (exit 2) — a config typo caught
-    # at the human's terminal, not silently coerced. Registration writes only valid
-    # values, so the live hook never hits this.
+def test_cli_runtime_invalid_host_fails_open():
+    # The runtime bridge is fired NON-interactively by the host, which treats a
+    # non-zero exit as a block/deny — so an unrecognized --host must NOT exit 2 the
+    # way #524 shipped. #526 reverses that: it warns and falls back to auto-detect,
+    # passing the tool output through (exit 0, {} for the JSON Claude fallback).
     result = CliRunner().invoke(cli, ["hook", "--host", "bogus"], input="not json")
+    assert result.exit_code == 0
+    assert result.output.strip() == "{}"
+
+
+def test_cli_runtime_bare_host_flag_fails_open():
+    # A bare `--host` with the value OMITTED (a plausible hand-edit) must NOT trip
+    # Click's "requires an argument" exit 2 before the fail-open body runs. The
+    # option's flag_value="auto" resolves it to auto-detect, so it exits 0 and
+    # passes through — closing the missing-value half of the contract (#526; the
+    # invalid-value half is test_cli_runtime_invalid_host_fails_open).
+    result = CliRunner().invoke(cli, ["hook", "--host"], input="not json")
+    assert result.exit_code == 0
+    assert result.output.strip() == "{}"
+
+
+def test_cli_install_missing_host_value_is_usage_error():
+    # Symmetric guard: the operator `install` command's --host is NOT optional —
+    # a bare `--host` there is still a usage error (exit 2). Pins that the runtime
+    # flag_value leniency did not leak into install/uninstall.
+    result = CliRunner().invoke(cli, ["hook", "install", "--host"])
     assert result.exit_code == 2
-    assert "bogus" in result.output
+
+
+def test_cli_runtime_invalid_host_falls_back_to_autodetect(monkeypatch: pytest.MonkeyPatch):
+    # The fallback is auto-detect (detect_host on the payload), NOT a hard-coded
+    # Claude: a Kimi-shaped payload under a bogus --host still routes through Kimi's
+    # raw-stdout adapter. Pins that _resolve_host_tag falls back via detect_host,
+    # not merely get_adapter's claude default.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value=_SURF_DICT))
+    result = CliRunner().invoke(
+        cli, ["hook", "--host", "bogus"], input=json.dumps(_KIMI_SHELL_PAYLOAD)
+    )
+    assert result.exit_code == 0
+    assert result.output == _SURF_BLOCK + "\n"  # raw stdout = Kimi adapter via auto-detect
+
+
+def test_resolve_host_tag_known_host_is_authoritative():
+    # A known --host wins over the payload shape: a Claude-shaped payload still
+    # routes through Kimi when --host kimi is explicit.
+    claude_shaped = {"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": "x"}
+    assert _resolve_host_tag("kimi", claude_shaped) == "kimi"
+
+
+def test_resolve_host_tag_auto_infers_from_payload():
+    kimi_shaped = {"hook_event_name": "PostToolUse", "tool_name": "Shell", "tool_output": "x"}
+    assert _resolve_host_tag("auto", kimi_shaped) == "kimi"
+    assert _resolve_host_tag("auto", None) == "claude"  # detect_host's default
+
+
+@pytest.mark.parametrize("bogus", ["bogus", "", "  ", "CLAUDE"])
+def test_resolve_host_tag_unknown_falls_back_to_autodetect(bogus: str):
+    # Unknown values (typo / blank / wrong case — click.Choice is case-sensitive,
+    # mirrored here) never raise: they fall back to detect_host on the payload, so a
+    # Kimi-shaped payload still resolves to kimi rather than a hard-coded claude.
+    kimi_shaped = {"hook_event_name": "PostToolUse", "tool_name": "Shell", "tool_output": "x"}
+    assert _resolve_host_tag(bogus, kimi_shaped) == "kimi"
+    assert _resolve_host_tag(bogus, None) == "claude"  # detect_host's default
+
+
+def test_resolve_host_tag_strips_whitespace():
+    # A hand-edited config with a padded value (" kimi ") still resolves to the host
+    # rather than tripping the unknown-host fallback.
+    assert _resolve_host_tag(" kimi ", None) == "kimi"
 
 
 # ── Daemon routing + degradation ladder ──────────────────────────────────────

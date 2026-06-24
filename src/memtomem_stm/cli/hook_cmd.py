@@ -704,18 +704,60 @@ async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> d
     return adapter.render(updated_tool_output=updated, additional_context=additional_context)
 
 
+def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
+    """Resolve the runtime ``--host`` value to a concrete host tag — *fail-open*.
+
+    ``auto`` (the default) infers the host from the payload shape via
+    :func:`~memtomem_stm.cli.hook_adapter.detect_host`; a known host tag is
+    authoritative. An **unknown** value never errors: the runtime bridge is fired
+    *non-interactively by the host*, every supported host treats a non-zero hook
+    exit as a block/deny/correction (see the module docstring's "Hard rule"), so a
+    typo'd or stale ``--host`` must fall open rather than surface as a usage error
+    to a person who isn't there. We log a warning and fall back to
+    :func:`detect_host` (which itself defaults to Claude), so the worst case is the
+    same safe pass-through any unusable payload already yields. This is the runtime
+    counterpart of ``install`` / ``uninstall``'s ``click.Choice``, where an exit-2
+    usage error on a typo *is* correct — those run at an operator's terminal (#526,
+    reversing #524's deliberate runtime exit-2 contract)."""
+    host = host.strip()
+    if host == "auto":
+        return detect_host(payload)
+    if host in known_hosts():
+        return host
+    logger.warning(
+        "mms hook: unrecognized --host %r — falling back to auto-detect "
+        "(fail-open; known hosts: %s)",
+        host,
+        ", ".join(known_hosts()),
+    )
+    return detect_host(payload)
+
+
 @click.group(name="hook", invoke_without_command=True)
 @click.option(
     "--host",
     "host",
-    type=click.Choice(["auto", *known_hosts()]),
     default="auto",
     show_default=True,
+    # Optional value (is_flag=False + flag_value): a bare ``--host`` with the value
+    # omitted resolves to ``auto`` (→ detect_host) instead of Click's
+    # "requires an argument" exit 2. Together with the plain-string type (no
+    # click.Choice), this closes *every* ``--host`` argv shape — missing value AND
+    # unrecognized value — into the fail-open body rather than a non-zero parse
+    # exit, honoring the runtime bridge's always-exit-0 contract for any
+    # hand-edited registration (#526). install/uninstall keep the strict
+    # click.Choice (operator commands; an exit-2 usage error on a typo is correct).
+    is_flag=False,
+    flag_value="auto",
     help=(
         "Host whose PostToolUse payload/output shape to use. 'auto' infers it from "
         "the payload shape (falls back to Claude). 'auto' cannot tell Codex from "
         "Claude — their payloads are identical — so pass --host codex explicitly "
-        "for Codex."
+        "for Codex. A plain string with an optional value: an unrecognized value is "
+        "NOT a usage error here, and a bare --host (no value) resolves to 'auto' — "
+        "the host fires this non-interactively and treats a non-zero exit as a "
+        "block, so a bad/missing value logs a warning and falls back to auto-detect "
+        "rather than exiting 2. (install/uninstall keep the strict click.Choice.)"
     ),
 )
 @click.pass_context
@@ -739,7 +781,11 @@ def hook_command(ctx: click.Context, host: str) -> None:
     Claude — backward-compatible with the original ``mms hook`` Claude
     registration. An explicit ``--host`` is authoritative; per-host registration
     writes it so raw-stdout (Kimi) and Codex routing are unambiguous (``auto``
-    cannot tell Codex from Claude, nor identify Kimi from a malformed payload).
+    cannot tell Codex from Claude, nor identify Kimi from a malformed payload). An
+    *unrecognized* ``--host`` is not a usage error on this path — a host fires it
+    non-interactively and reads a non-zero exit as a block — so it warns and falls
+    back to auto-detect (:func:`_resolve_host_tag`, #526); only ``install`` /
+    ``uninstall`` reject a bad ``--host`` (operator commands, run at a terminal).
 
     The ``install`` / ``uninstall`` subcommands are the *registration UX*: they
     write (or remove) STM's PostToolUse hook block in a host's own config file
@@ -752,7 +798,7 @@ def hook_command(ctx: click.Context, host: str) -> None:
     if ctx.invoked_subcommand is not None:
         return
     payload = _read_payload(sys.stdin)
-    host_tag = detect_host(payload) if host == "auto" else host
+    host_tag = _resolve_host_tag(host, payload)
     adapter = get_adapter(host_tag)
     output: dict[str, Any] = {}
     if payload is not None:
