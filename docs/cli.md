@@ -39,7 +39,7 @@ Commands:
   daemon     Manage the local surfacing daemon (warm LTM connection for...
   eject      Restore imported upstream(s) to their host MCP client, then...
   health     Check upstream server connectivity.
-  hook       Compress and/or surface for a host's built-in tool call...
+  hook       Bridge a host's built-in tool calls into STM (PostToolUse...
   host       Host-config inspection and sync (RFC §7.3).
   import     Import MCP definitions from host configs into the mms registry.
   init       Guided first-time setup for memtomem-stm.
@@ -413,38 +413,71 @@ Shows proxy compression and surfacing statistics from the persistent databases (
 
 It reads these files read-only (without creating or migrating them) and reports all-time totals. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
 
-## `mms hook` — Claude Code built-in tool bridge
+## `mms hook` — built-in tool bridge + per-host registration
 
 ```
-Usage: mms hook [OPTIONS]
+Usage: mms hook [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  install    Register STM's PostToolUse hook in a host's config.
+  uninstall  Remove STM's PostToolUse hook from a host's config.
 ```
 
-Reads a Claude Code-compatible `PostToolUse` hook payload from stdin and prints
-a hook response. It can add LTM surfacing through `additionalContext` for
-read-like built-ins (`Read`, `Grep`, `Glob`, `Bash`). Bash stdout compression is
-separate and opt-in via `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning
-`updatedToolOutput` while preserving stderr, exit status, interruption state,
-and image markers.
+Bare `mms hook` (no subcommand) is the **runtime bridge**: it reads a host's
+`PostToolUse` hook payload from stdin and prints a hook response. It adds LTM
+surfacing through `additionalContext` (or, on Kimi, raw stdout) for read-like
+built-ins (`Read`/`Grep`/`Glob`/`Bash` and their per-host equivalents). Bash
+stdout compression is separate, Claude-only, and opt-in via
+`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
+preserving stderr, exit status, interruption state, and image markers.
 
-Register it in Claude Code settings with a PostToolUse matcher:
+`--host [auto|claude|codex|cursor|kimi]` selects the adapter; `auto` (the
+default) infers it from the payload shape and falls back to Claude — but cannot
+tell Codex from Claude (identical payloads), so per-host registration writes an
+explicit `--host`. The hook always exits `0` and emits `{}` (or empty stdout) on
+malformed input, timeout, disabled surfacing, or internal errors so the host
+keeps the original tool output. By default it uses the local daemon path; set
+`MEMTOMEM_STM_HOOK__USE_DAEMON=0` for the legacy cold in-process path.
 
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Read|Grep|Glob|Bash",
-        "hooks": [{ "type": "command", "command": "mms hook" }]
-      }
-    ]
-  }
-}
+### `install` / `uninstall` — per-host registration
+
+`mms hook install --host <name>` writes STM's `PostToolUse` hook block into the
+host's own config so the host fires `mms hook --host <name>` after each built-in
+tool call. `uninstall` removes it.
+
+| host     | config file               | format |
+| -------- | ------------------------- | ------ |
+| `claude` | `~/.claude/settings.json` | JSON   |
+| `cursor` | `~/.cursor/hooks.json`    | JSON   |
+| `kimi`   | `~/.kimi/config.toml`     | TOML   |
+| `codex`  | `~/.codex/config.toml`    | TOML   |
+
+```
+Usage: mms hook install [OPTIONS]
+
+Options:
+  --host [claude|codex|cursor|kimi]
+                                  Host whose hook config to register STM's
+                                  PostToolUse hook in.  [required]
+  --apply                         Write the change (default: dry-run preview).
+                                  Backs up any prior file to <path>.bak.
 ```
 
-The hook always exits `0` and emits `{}` on malformed input, timeout, disabled
-surfacing, or internal errors so the host keeps the original tool output. By
-default it uses the local daemon path; set `MEMTOMEM_STM_HOOK__USE_DAEMON=0`
-for the legacy cold in-process path.
+The merge is idempotent — an existing STM block (recognized by command shape,
+so a global or `uv run …` registration with any `--host` is matched) is updated
+in place, never duplicated — and `uninstall` is symmetric: it removes exactly
+what `install` adds, prunes the emptied containers, and leaves hand-written
+hooks untouched. Both **default to a dry-run preview**; pass `--apply` to write,
+which first backs up any existing file to `<path>.bak`. A config that exists but
+does not parse is refused, never overwritten. TOML hosts (`codex`, `kimi`) are
+re-serialized, so comments/formatting in `config.toml` are not preserved (JSON
+has no comments) — the `.bak` backup is the safety net.
+
+Surfacing is the only capability that ports to non-Claude hosts (native output
+replacement/compression is Claude-only). The command prints each host's runtime
+caveat after planning: Codex requires approving the hook via its `/hooks`
+command; Cursor's `additional_context` is documented but a runtime no-op today;
+Kimi's exit-0 stdout inject is unverified.
 
 ## `mms daemon` — warm surfacing process
 
