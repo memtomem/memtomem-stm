@@ -22,12 +22,14 @@ from memtomem_stm.cli.hook_adapter import (
     CanonicalHookCall,
     ClaudeHookAdapter,
     CodexHookAdapter,
+    CursorHookAdapter,
     get_adapter,
 )
 from memtomem_stm.cli.hook_cmd import _build_hook_output, _tool_response_to_text
 
 _CLAUDE = ClaudeHookAdapter()
 _CODEX = CodexHookAdapter()
+_CURSOR = CursorHookAdapter()
 
 # Golden host-contract fixtures (B0): tests/fixtures/hooks/<host>/.
 _HOOK_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "hooks"
@@ -225,6 +227,7 @@ def test_get_adapter_returns_registered_and_falls_back():
     assert get_adapter().host_tag == "claude"  # default
     assert get_adapter("claude").host_tag == "claude"
     assert get_adapter("codex").host_tag == "codex"  # B2 step3
+    assert get_adapter("cursor").host_tag == "cursor"  # B2 step3
     # An unregistered host tag falls back to Claude.
     assert get_adapter("nonexistent-host").host_tag == "claude"
 
@@ -376,4 +379,164 @@ def test_codex_render_delegates_to_build_hook_output():
 
 def test_codex_parse_delegates_flattening_to_shared_helper():
     src = inspect.getsource(CodexHookAdapter.parse)
+    assert "_tool_response_to_text(" in src
+
+
+# ── Cursor adapter (B2 step3 — surfacing-only; camelCase event + flat render) ──
+
+_CURSOR_DIR = _HOOK_FIXTURES / "cursor"
+
+
+def test_cursor_parse_golden_inbound():
+    # Golden: documented inbound payload → CanonicalHookCall. Exercises the two
+    # Cursor-specific edges: the camelCase event normalizes, and the output is
+    # read from ``tool_output`` (a JSON-stringified string), not ``tool_response``.
+    payload = json.loads((_CURSOR_DIR / "inbound_shell_posttooluse.json").read_text())
+    call = _CURSOR.parse(payload)
+    assert isinstance(call, CanonicalHookCall)
+    assert call.event_type == "PostToolUse"  # normalized from "postToolUse"
+    assert call.tool_name == "Shell"  # host-native preserved
+    assert call.canonical_tool == "shell"  # Shell → canonical shell (allowlisted)
+    assert call.tool_input == {"command": "npm test"}
+    # tool_output is a JSON-stringified string; flattened verbatim for the gate.
+    assert call.tool_response == '{"exitCode":0,"stdout":"All tests passed"}'
+    assert call.tool_response_text == '{"exitCode":0,"stdout":"All tests passed"}'
+    assert call.host_tag == "cursor"
+
+
+def test_cursor_render_golden_surfacing():
+    # Golden: feed the canonical surfaced block and assert render reproduces the
+    # committed Cursor emission exactly — a FLAT top-level ``additional_context``
+    # string (not the ``hookSpecificOutput`` envelope).
+    expected = json.loads((_CURSOR_DIR / "expected_surfacing_output.json").read_text())
+    block = expected["additional_context"]
+    out = _CURSOR.render(updated_tool_output=None, additional_context=block)
+    assert out == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_event", "expected"),
+    [
+        ("postToolUse", "PostToolUse"),  # camelCase normalized to canonical
+        (None, "PostToolUse"),  # missing → default (as for Claude/Codex)
+        ("preToolUse", "preToolUse"),  # other event passes through (core rejects it)
+    ],
+)
+def test_cursor_parse_normalizes_event(raw_event, expected: str):
+    payload = {"tool_name": "Shell", "tool_output": "x"}
+    if raw_event is not None:
+        payload["hook_event_name"] = raw_event
+    call = _CURSOR.parse(payload)
+    assert call is not None
+    assert call.event_type == expected
+
+
+@pytest.mark.parametrize(
+    ("native", "canonical"),
+    [
+        ("Shell", "shell"),
+        ("Read", "read"),
+        ("Write", "write"),
+        ("Grep", ""),  # not in Cursor's verified native names
+        ("SomeFutureTool", ""),
+    ],
+)
+def test_cursor_parse_canonicalizes_tool_name(native: str, canonical: str):
+    call = _CURSOR.parse({"tool_name": native, "tool_output": "x"})
+    assert call is not None
+    assert call.tool_name == native  # host-native preserved
+    assert call.canonical_tool == canonical
+
+
+@pytest.mark.parametrize("mcp_tool", ["mcp__memtomem__mem_search", "mcp__github__create_issue"])
+def test_cursor_parse_rejects_mcp_tools(mcp_tool: str):
+    assert _CURSOR.parse({"tool_name": mcp_tool, "tool_output": "x"}) is None
+
+
+@pytest.mark.parametrize("bad", [None, "not a dict", [1, 2, 3], 42])
+def test_cursor_parse_non_dict_is_none(bad):
+    assert _CURSOR.parse(bad) is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"tool_name": 123}, {"tool_name": None}, {"tool_name": []}])
+def test_cursor_parse_coerces_missing_or_non_str_tool_name(payload):
+    # Permissive + never-raises contract: a missing/non-str tool_name must coerce
+    # to "" before the `tool_name.startswith("mcp__")` guard (which would raise on
+    # a non-str). Pins the load-bearing coercion the sibling Claude suite already
+    # pins — without this, a dropped guard passes every test yet crashes on real
+    # host stdin.
+    call = _CURSOR.parse({**payload, "tool_output": "x"})
+    assert call is not None
+    assert call.tool_name == ""
+    assert call.canonical_tool == ""
+
+
+def test_cursor_parse_flattens_dict_output_via_shared_helper():
+    # tool_output is usually Cursor's JSON-stringified string, but stay permissive:
+    # a dict shape must flatten through the shared helper (the size-gate input).
+    response = {"stdout": "ok", "stderr": ""}
+    call = _CURSOR.parse({"tool_name": "Shell", "tool_output": response})
+    assert call is not None
+    assert call.tool_response_text == _tool_response_to_text(response)
+    assert call.tool_response_text == "ok"
+    assert call.tool_response is response
+
+
+@pytest.mark.parametrize("bad_input", [["x"], "weird", 42, 0, False])
+def test_cursor_parse_coerces_non_dict_tool_input(bad_input):
+    call = _CURSOR.parse({"tool_name": "Shell", "tool_input": bad_input, "tool_output": "x"})
+    assert call is not None
+    assert call.tool_input == {}
+
+
+def test_cursor_to_wire_carries_host_tag():
+    call = _CURSOR.parse(
+        {"tool_name": "Shell", "tool_input": {"command": "ls"}, "tool_output": "ok"}
+    )
+    assert call is not None
+    assert call.to_wire()["host_tag"] == "cursor"
+
+
+def test_cursor_render_surfacing_only_flat_shape():
+    block = "<surfaced-memories>\nMEM\n</surfaced-memories>"
+    out = _CURSOR.render(updated_tool_output=None, additional_context=block)
+    # Flat top-level, snake_case — NOT nested under hookSpecificOutput.
+    assert out == {"additional_context": block}
+
+
+def test_cursor_render_neither_is_empty():
+    assert _CURSOR.render(updated_tool_output=None, additional_context=None) == {}
+
+
+def test_cursor_render_ignores_updated_tool_output():
+    # Cursor has no native output-replace field (can_replace_output=False); render
+    # must NEVER emit one (a guessed field could disrupt the host), even if handed
+    # an updated output — only the surfacing half renders.
+    block = "<surfaced-memories>\nMEM\n</surfaced-memories>"
+    out = _CURSOR.render(updated_tool_output={"stdout": "compressed"}, additional_context=block)
+    assert out == {"additional_context": block}
+    assert "updated_mcp_tool_output" not in out
+    # And with no surfaced block, an updated output alone yields a pass-through {}.
+    assert _CURSOR.render(updated_tool_output={"stdout": "x"}, additional_context=None) == {}
+
+
+def test_cursor_capability_and_tag():
+    # B0: Cursor's only output-replace field (updated_mcp_tool_output) is MCP-only,
+    # so native compression does not port — surfacing-only.
+    assert _CURSOR.host_tag == "cursor"
+    assert _CURSOR.can_replace_output is False
+
+
+def test_cursor_render_builds_flat_shape_not_envelope():
+    # Cursor's render owns a DIFFERENT shape than Claude/Codex: it must NOT delegate
+    # to _build_hook_output nor emit hookSpecificOutput, and must use the flat
+    # snake_case additional_context key.
+    src = inspect.getsource(CursorHookAdapter.render)
+    assert "hookSpecificOutput" not in src
+    assert "_build_hook_output" not in src
+    assert "additional_context" in src
+
+
+def test_cursor_parse_delegates_flattening_to_shared_helper():
+    src = inspect.getsource(CursorHookAdapter.parse)
     assert "_tool_response_to_text(" in src
