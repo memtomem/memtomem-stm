@@ -490,10 +490,55 @@ def get_adapter(host_tag: str = "claude") -> HostHookAdapter:
     """Return the adapter for ``host_tag`` (falls back to Claude).
 
     Claude, Codex, Cursor, and Kimi are registered (Antigravity is deferred); an
-    unknown ``host_tag`` falls back to Claude. Host selection (which tag the live
-    hook passes) is wired in a later step — today every caller uses the default.
+    unknown ``host_tag`` falls back to Claude. The live hook resolves the tag via
+    ``mms hook --host <name>`` (authoritative) or :func:`detect_host` (the
+    ``--host auto`` fallback) — see :func:`memtomem_stm.cli.hook_cmd.hook_command`.
     """
     return _ADAPTERS.get(host_tag) or _ADAPTERS["claude"]
+
+
+def known_hosts() -> tuple[str, ...]:
+    """Registered host tags, registry order (``claude, codex, cursor, kimi``).
+
+    The set of values ``mms hook --host`` accepts (plus ``auto``); derived from
+    the registry so the CLI choice and the adapters never drift apart."""
+    return tuple(_ADAPTERS)
+
+
+def detect_host(payload: Any) -> str:
+    """Best-effort host inference from a PostToolUse payload's *shape*.
+
+    The fallback for ``mms hook`` run without an explicit ``--host`` (the
+    authoritative path; per-host registration always writes ``--host``).
+    Distinguishes by the few payload features that differ across hosts:
+
+    * **Cursor** uniquely uses the camelCase event ``postToolUse``.
+    * **Kimi** carries the tool output under ``tool_output`` (so does Cursor, but
+      its camelCase event is matched first) with a PascalCase ``PostToolUse``.
+    * Everything else — including a payload carrying ``tool_response`` — resolves
+      to **Claude**.
+
+    Claude and Codex payloads are **shape-identical** (snake_case keys,
+    ``tool_response``, ``PostToolUse``), so this can never return ``"codex"``;
+    Codex users must pass ``--host codex`` explicitly. Resolving an ambiguous
+    payload to Claude is safe: the Claude adapter parses a Codex payload
+    identically and its surfacing envelope is the same; only compression differs,
+    and Codex harmlessly ignores the ``updatedToolOutput`` field it does not
+    support. A non-dict / unrecognized payload also falls back to ``"claude"`` (the
+    adapter then no-ops on the unusable payload, as today).
+
+    Caveat for raw-stdout hosts: with a *malformed* payload ``auto`` cannot see
+    it is Kimi and resolves to Claude, which serializes ``{}`` — non-empty stdout
+    that Kimi would inject. ``--host kimi`` (what registration writes) avoids this
+    by routing every output, including the empty one, through Kimi's serializer.
+    """
+    if not isinstance(payload, dict):
+        return "claude"
+    if payload.get("hook_event_name") == "postToolUse":
+        return "cursor"
+    if "tool_output" in payload and "tool_response" not in payload:
+        return "kimi"
+    return "claude"
 
 
 def canonicalize_tool_token(token: str) -> str | None:
