@@ -41,15 +41,20 @@ co-locates "how to register host X" with "how to parse/render host X".
 Design choices (all surfaced to the operator before any write):
 
 * **Idempotent.** :func:`plan_install` recognizes STM's own block by command
-  shape (:func:`_is_stm_hook_command`: a ``hook`` token + an ``mms`` /
-  ``memtomem-stm`` executable), so re-running updates that block in place rather
-  than appending a duplicate, regardless of whether it was registered global
-  (``memtomem-stm hook …``) or source (``uv run … memtomem-stm hook …``).
+  shape (:func:`_is_stm_hook_command`: an ``mms`` / ``memtomem-stm`` executable
+  immediately followed by a ``hook`` token), so re-running updates that block in
+  place rather than appending a duplicate, regardless of whether it was
+  registered global (``memtomem-stm hook …``) or source
+  (``uv run … memtomem-stm hook …``).
 * **Symmetric uninstall.** :func:`plan_uninstall` removes exactly the blocks
-  :func:`plan_install` would add — never a hand-written hook.
+  :func:`plan_install` would add — never a hand-written hook. Install is equally
+  careful: a non-STM handler a user co-located in STM's matcher group is
+  preserved across a re-install (see :func:`_nested_install`).
 * **Dry-run default + backup.** The CLI previews by default; an ``--apply`` write
-  copies the prior file to ``<path>.bak`` first (:func:`apply_change`). A config
-  that exists but does not parse is *refused*, never clobbered.
+  copies the prior file to a non-clobbering backup first (``<path>.bak``, else
+  ``.bak.1``, ``.bak.2``, …; :func:`_backup_path`) so a second apply never
+  overwrites the original. A config that exists but does not parse is *refused*,
+  never clobbered.
 * **TOML rewrite caveat.** TOML hosts are parsed and re-serialized (``tomli_w``),
   so comments / key ordering in ``config.toml`` are **not preserved**. JSON has
   no comments, so JSON hosts are unaffected. The preview states this and the
@@ -97,21 +102,25 @@ class HookInstallError(Exception):
 def _is_stm_hook_command(command: str) -> bool:
     """Whether ``command`` is an STM ``mms hook`` invocation (any entry point).
 
-    Token-based, not substring: a command is ours when it has a bare ``hook``
-    token *and* one of its tokens' basenames is an STM executable. Catches both
-    the global (``memtomem-stm hook --host X``) and source
+    Token-based, not substring: a command is ours when an STM executable token is
+    *immediately followed by* a ``hook`` token (the ``hook`` subcommand). Catches
+    both the global (``memtomem-stm hook --host X``) and source
     (``uv run --directory … memtomem-stm hook --host X``) shapes, and any
     ``--host`` value, so install updates and uninstall removes regardless of how
-    it was first registered. A user's unrelated hook (which neither runs an STM
-    executable nor — vanishingly unlikely — pairs one with a ``hook`` token) is
-    left untouched."""
+    it was first registered.
+
+    Adjacency (exe→``hook``) — not "a ``hook`` token anywhere *and* an STM exe
+    token anywhere" — is what keeps a compound user command like
+    ``echo hook && memtomem-stm status`` from matching: ``status`` is not ``hook``,
+    so install/uninstall leave it alone."""
     try:
         tokens = shlex.split(command)
     except ValueError:
         tokens = command.split()
-    if "hook" not in tokens:
-        return False
-    return any(Path(tok).name in _STM_EXECUTABLES for tok in tokens)
+    return any(
+        Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
+        for i, tok in enumerate(tokens)
+    )
 
 
 def _is_stm_command_handler(handler: Any) -> bool:
@@ -170,11 +179,31 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
     block: dict[str, Any] = {}
     if matcher is not None:
         block["matcher"] = matcher
-    block["hooks"] = [{"type": "command", "command": command}]
+    handler = {"type": "command", "command": command}
+    block["hooks"] = [handler]
     for i, entry in enumerate(entries):
-        if _entry_has_stm_handler(entry):
+        if not _entry_has_stm_handler(entry):
+            continue
+        # Symmetric with ``_nested_uninstall``: never lose a sibling handler a
+        # user co-located in STM's matcher group. If the group holds *only* STM
+        # handler(s), refresh the whole block (so a stale matcher is updated);
+        # otherwise keep the user's matcher + siblings and swap only STM's
+        # handler in place (the first one, dropping any duplicates).
+        siblings = [h for h in entry["hooks"] if not _is_stm_command_handler(h)]
+        if not siblings:
             entries[i] = block
             return data
+        new_inner: list[Any] = []
+        replaced = False
+        for h in entry["hooks"]:
+            if _is_stm_command_handler(h):
+                if not replaced:
+                    new_inner.append(handler)
+                    replaced = True
+            else:
+                new_inner.append(h)
+        entry["hooks"] = new_inner
+        return data
     entries.append(block)
     return data
 
@@ -533,18 +562,36 @@ def plan_uninstall(host_tag: str) -> HookChange:
 
 
 def _backup_path(path: Path) -> Path:
-    """``<name>.bak`` beside the config (keep both suffixes: ``settings.json.bak``)."""
-    return path.parent / (path.name + ".bak")
+    """First free non-clobbering backup slot beside the config.
+
+    ``<name>.bak`` when free (so ``settings.json`` → ``settings.json.bak``,
+    keeping both suffixes), else ``<name>.bak.1``, ``<name>.bak.2``, … — the first
+    free one. A fixed single ``.bak`` would let a *second* ``--apply`` (an
+    uninstall, or a re-install) overwrite the backup from the *first* apply; for a
+    TOML host that first ``.bak`` is the only comment-preserving copy of the
+    original (re-serialization drops comments — see the module docstring), so
+    overwriting it destroys exactly the safety net. Numbered slots preserve every
+    prior state, with the original always at ``.bak``."""
+    base = path.parent / (path.name + ".bak")
+    if not base.exists():
+        return base
+    i = 1
+    while True:
+        candidate = path.parent / (path.name + f".bak.{i}")
+        if not candidate.exists():
+            return candidate
+        i += 1
 
 
 def apply_change(change: HookChange) -> Path | None:
     """Write ``change.new_text`` to disk, backing up any prior file first.
 
     No-op (returns ``None``) when ``change.changed`` is False. When a prior file
-    exists, its verbatim contents are written to ``<path>.bak`` *before* the new
-    config is atomically written; returns the backup path (``None`` when there was
-    nothing to back up). The new file inherits the prior file's permission bits,
-    or ``0o600`` for a freshly-created one (host configs can carry secrets)."""
+    exists, its verbatim contents are written to a non-clobbering backup slot
+    (:func:`_backup_path`) *before* the new config is atomically written; returns
+    the backup path (``None`` when there was nothing to back up). The new file
+    inherits the prior file's permission bits, or ``0o600`` for a freshly-created
+    one (host configs can carry secrets)."""
     if not change.changed:
         return None
     path = change.path

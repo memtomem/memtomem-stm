@@ -460,7 +460,8 @@ Options:
                                   Host whose hook config to register STM's
                                   PostToolUse hook in.  [required]
   --apply                         Write the change (default: dry-run preview).
-                                  Backs up any prior file to <path>.bak.
+                                  Backs up any prior file to <path>.bak
+                                  (.bak.1, … if one already exists).
 ```
 
 The merge is idempotent — an existing STM block (recognized by command shape,
@@ -468,10 +469,12 @@ so a global or `uv run …` registration with any `--host` is matched) is update
 in place, never duplicated — and `uninstall` is symmetric: it removes exactly
 what `install` adds, prunes the emptied containers, and leaves hand-written
 hooks untouched. Both **default to a dry-run preview**; pass `--apply` to write,
-which first backs up any existing file to `<path>.bak`. A config that exists but
-does not parse is refused, never overwritten. TOML hosts (`codex`, `kimi`) are
-re-serialized, so comments/formatting in `config.toml` are not preserved (JSON
-has no comments) — the `.bak` backup is the safety net.
+which first backs up any existing file to `<path>.bak` (or `<path>.bak.1`, `.bak.2`,
+… if one already exists, so a second apply never clobbers the first backup). A
+config that exists but does not parse is refused, never overwritten. TOML hosts
+(`codex`, `kimi`) are re-serialized, so comments/formatting in `config.toml` are
+not preserved (JSON has no comments) — the original-preserving `.bak` backup is
+the safety net.
 
 Surfacing is the only capability that ports to non-Claude hosts (native output
 replacement/compression is Claude-only). The command prints each host's runtime

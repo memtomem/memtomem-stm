@@ -882,7 +882,8 @@ def _emit_hook_change(change: Any, *, apply_: bool, backup: Any) -> None:
     if not apply_ and change.fmt == "toml":
         click.echo(
             f"  {_warn('Note:')} applying rewrites {change.path.name} — TOML "
-            "comments/formatting are not preserved (a .bak backup is kept)."
+            "comments/formatting are not preserved (a non-clobbering .bak backup "
+            "is kept)."
         )
 
     for note in change.notes:
@@ -907,7 +908,8 @@ def _emit_hook_change(change: Any, *, apply_: bool, backup: Any) -> None:
     "--apply",
     "apply_",
     is_flag=True,
-    help="Write the change (default: dry-run preview). Backs up any prior file to <path>.bak.",
+    help="Write the change (default: dry-run preview). Backs up any prior file "
+    "to <path>.bak (.bak.1, … if one already exists).",
 )
 def hook_install_command(host: str, apply_: bool) -> None:
     """Register STM's PostToolUse hook in a host's config (idempotent).
@@ -940,7 +942,8 @@ def hook_install_command(host: str, apply_: bool) -> None:
     "--apply",
     "apply_",
     is_flag=True,
-    help="Write the change (default: dry-run preview). Backs up any prior file to <path>.bak.",
+    help="Write the change (default: dry-run preview). Backs up any prior file "
+    "to <path>.bak (.bak.1, … if one already exists).",
 )
 def hook_uninstall_command(host: str, apply_: bool) -> None:
     """Remove STM's PostToolUse hook from a host's config (symmetric to install).
