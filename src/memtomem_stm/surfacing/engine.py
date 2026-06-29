@@ -807,15 +807,24 @@ class SurfacingEngine:
                 tool,
                 len(demoted_ids),
             )
+        # ``seen`` dedups WITHIN this single result set. ``_surfaced_ids`` only
+        # excludes IDs claimed by *prior* surfacings — it is populated by
+        # ``_claim_surfaced_ids`` AFTER this loop, so it cannot catch a duplicate
+        # appearing twice in the same ``scored`` list. Under
+        # ``result_format='compact'`` a chunk's id is ``sha256(content)[:16]``
+        # (``mcp_client``), so two results with byte-identical content collide on
+        # one id and would otherwise render as two identical bullets to the agent
+        # (they also share a ``memory_id``, so feedback already treats them as one).
         relevant = []
+        seen: set[str] = set()
         for r in scored:
             mid = str(r.chunk.id)
-            if mid in demoted_ids:
+            if mid in demoted_ids or mid in self._surfaced_ids or mid in seen:
                 continue
-            if mid not in self._surfaced_ids:
-                relevant.append(r)
-                if len(relevant) >= max_results:
-                    break
+            relevant.append(r)
+            seen.add(mid)
+            if len(relevant) >= max_results:
+                break
 
         # Cache result (even empty, to avoid repeated searches)
         self._cache.set(cache_key, relevant)
