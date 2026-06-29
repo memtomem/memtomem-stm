@@ -418,7 +418,12 @@ class TestPerToolTtlOverrideBehavior:
     async def test_per_tool_ttl_zero_disables_only_that_tool(self, build):
         """A per-tool ``cache_ttl_seconds`` of 0 bypasses the lookup and skips the
         store for THAT tool (both calls hit upstream, nothing cached), while a
-        sibling tool on the SAME server still caches under the global TTL."""
+        sibling tool on the SAME server still caches under the global TTL.
+
+        Covers the text-response path, where the store-side ``set(ttl<=0)``
+        invalidates any prior live row. The lookup bypass (never-served) holds for
+        every response shape; the on-disk invalidation of a non-text response under
+        ttl<=0 is a pre-existing #536 gap tracked as a separate follow-up."""
         mgr, _, cache = build(
             tools=[_tool("vol"), _tool("plain")],
             tool_overrides={"vol": ToolOverrideConfig(cache_ttl_seconds=0)},

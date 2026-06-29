@@ -429,9 +429,12 @@ class ToolOverrideConfig(BaseModel):
     """Per-tool override for the response-cache TTL (seconds). ``None`` (default)
     defers to the server-level ``cache_ttl_seconds``, then to the global
     ``CacheConfig.default_ttl_seconds``. A positive value caches this tool's
-    responses for that many seconds; ``0`` disables caching for this tool — the
-    lookup is bypassed and any live row invalidated, mirroring the global
-    ``default_ttl_seconds <= 0`` behavior. Independent of the ``cache`` on/off
+    responses for that many seconds; ``0`` disables caching for this tool: while
+    the resolved TTL is ``<= 0`` the lookup is bypassed, so a stale row is never
+    served (mirroring the global ``default_ttl_seconds <= 0`` behavior); any
+    existing on-disk row is cleaned up opportunistically (invalidated when an
+    identical call next stores a text response) and otherwise expires under its
+    original frozen TTL. Independent of the ``cache`` on/off
     gate: ``cache: false`` always wins (never cached); ``cache: true`` with
     ``cache_ttl_seconds: 0`` is eligible but TTL-disabled, i.e. effectively off.
     Unlike the global field, ``None`` here means *inherit*, not *never expires*."""
