@@ -586,7 +586,10 @@ class ProxyManager:
             return None
         if self._toolgraph_cache is None:
             try:
-                cache = GraphConsultCache(cfg.consult_cache_path.expanduser())
+                cache = GraphConsultCache(
+                    cfg.consult_cache_path.expanduser(),
+                    max_scopes=cfg.consult_cache_max_scopes,
+                )
                 cache.initialize()
             except Exception:
                 logger.warning(
