@@ -136,11 +136,27 @@ class GraphConsultCache:
         if self._db is None:
             return None
         key = _scope_key(provider_fp, agent_id, profile, candidate_hash, generation)
-        with self._lock:
-            row = self._db.execute(
-                "SELECT verdict_json, had_risk_scores FROM toolgraph_consult WHERE scope_key = ?",
-                (key,),
-            ).fetchone()
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT verdict_json, had_risk_scores FROM toolgraph_consult WHERE scope_key = ?",
+                    (key,),
+                ).fetchone()
+        except sqlite3.Error:
+            # Best-effort: a runtime sqlite fault on the lookup (database locked,
+            # disk I/O error, page-level corruption) must degrade to a plain MISS,
+            # never raise. get()/put() run inside ``_consult_toolgraph`` — the last
+            # statement of ``ProxyManager.start()`` — whose callers do NOT catch
+            # sqlite3.Error, so an escaping fault would crash proxy startup and take
+            # every proxied tool down for a non-fatal cache problem. A miss instead
+            # re-runs the live full consult (strictly-fresh preserved). Mirrors the
+            # _delete_scope guard below and the initialize()-time best-effort contract.
+            logger.warning(
+                "Tool-graph consult cache read failed (scope %s) — treating as a miss",
+                key[:12],
+                exc_info=True,
+            )
+            return None
         if row is None:
             return None
         try:
@@ -232,40 +248,59 @@ class GraphConsultCache:
             separators=(",", ":"),
         )
         now = time.time()
-        with self._lock:
-            # Scope-replace: a newer generation for the same (provider, agent,
-            # profile, candidate-set) supersedes prior generations — one row per
-            # scope keeps growth bounded.
-            self._db.execute(
-                "DELETE FROM toolgraph_consult WHERE provider_fingerprint = ? AND agent_id = ? "
-                "AND query_profile = ? AND candidate_hash = ? AND graph_generation != ?",
-                (provider_fp, agent_id, profile, candidate_hash, generation),
+        try:
+            with self._lock:
+                # Scope-replace: a newer generation for the same (provider, agent,
+                # profile, candidate-set) supersedes prior generations — one row per
+                # scope keeps growth bounded.
+                self._db.execute(
+                    "DELETE FROM toolgraph_consult WHERE provider_fingerprint = ? AND agent_id = ? "
+                    "AND query_profile = ? AND candidate_hash = ? AND graph_generation != ?",
+                    (provider_fp, agent_id, profile, candidate_hash, generation),
+                )
+                self._db.execute(
+                    """
+                    INSERT INTO toolgraph_consult
+                        (scope_key, provider_fingerprint, agent_id, query_profile,
+                         candidate_hash, graph_generation, had_risk_scores, verdict_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scope_key) DO UPDATE SET
+                        had_risk_scores = excluded.had_risk_scores,
+                        verdict_json    = excluded.verdict_json,
+                        created_at      = excluded.created_at
+                    """,
+                    (
+                        key,
+                        provider_fp,
+                        agent_id,
+                        profile,
+                        candidate_hash,
+                        generation,
+                        1 if had_risk_scores else 0,
+                        verdict_json,
+                        now,
+                    ),
+                )
+                self._db.commit()
+                self._trim()
+        except sqlite3.Error:
+            # Best-effort write (covers the DELETE/INSERT/commit and the _trim sweep
+            # it calls under the same lock): a runtime sqlite fault must no-op, never
+            # raise. See the get() guard above for why an escaping fault is fatal to
+            # startup. A skipped write just means the next consult re-mints the row.
+            # A fault mid-transaction (e.g. the DELETE commits implicitly-open work,
+            # then INSERT/commit/_trim raises) can leave a transaction holding the
+            # write lock; roll it back so the connection stays cleanly reusable.
+            try:
+                self._db.rollback()
+            except sqlite3.Error:
+                logger.debug("Tool-graph consult cache rollback failed", exc_info=True)
+            logger.warning(
+                "Tool-graph consult cache write failed (scope %s) — consult not cached",
+                key[:12],
+                exc_info=True,
             )
-            self._db.execute(
-                """
-                INSERT INTO toolgraph_consult
-                    (scope_key, provider_fingerprint, agent_id, query_profile,
-                     candidate_hash, graph_generation, had_risk_scores, verdict_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(scope_key) DO UPDATE SET
-                    had_risk_scores = excluded.had_risk_scores,
-                    verdict_json    = excluded.verdict_json,
-                    created_at      = excluded.created_at
-                """,
-                (
-                    key,
-                    provider_fp,
-                    agent_id,
-                    profile,
-                    candidate_hash,
-                    generation,
-                    1 if had_risk_scores else 0,
-                    verdict_json,
-                    now,
-                ),
-            )
-            self._db.commit()
-            self._trim()
+            return
 
     def _trim(self) -> None:
         if self._db is None:

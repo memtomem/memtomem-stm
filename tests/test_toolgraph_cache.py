@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -215,3 +216,53 @@ class TestCorruptRow:
         row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
         assert row is not None
         assert row["risk_scores"] == {"s::c": 1.0, "s::d": 0.5}
+
+
+class _RaisingConn:
+    """Stand-in connection whose ``execute`` always raises a sqlite fault.
+
+    ``sqlite3.Connection.execute`` is a read-only C attribute and cannot be
+    monkeypatched, so we swap the whole handle to simulate a runtime fault
+    (database locked / disk I/O error / page-level corruption) during a live op.
+    """
+
+    def __init__(self, exc: sqlite3.Error) -> None:
+        self._exc = exc
+        self.rolled_back = False
+
+    def execute(self, *_a, **_k):
+        raise self._exc
+
+    def commit(self, *_a, **_k):  # pragma: no cover - never reached past execute
+        raise self._exc
+
+    def rollback(self) -> None:
+        # The put() guard rolls back a possibly-open transaction; model a clean
+        # rollback so the no-op write path completes without raising.
+        self.rolled_back = True
+
+    def close(self) -> None:
+        pass
+
+
+class TestSqliteFaultIsBestEffort:
+    """A runtime sqlite fault on get()/put() must degrade to a miss / no-op, never
+    raise — these run inside ``_consult_toolgraph`` (the last statement of
+    ``ProxyManager.start()``), whose callers don't catch ``sqlite3.Error``, so an
+    escaping fault would crash proxy startup. Distinct from the corrupt-ROW tests
+    above: those cover a successful read of malformed data; these cover ``execute``
+    itself raising (database locked / disk I/O error / page-level corruption)."""
+
+    def test_get_returns_miss_when_execute_raises(self, cache):
+        _put(cache)  # real DB write while the handle is still live
+        cache._db = _RaisingConn(sqlite3.OperationalError("database is locked"))
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+
+    def test_put_no_ops_when_execute_raises(self, cache):
+        conn = _RaisingConn(sqlite3.OperationalError("disk I/O error"))
+        cache._db = conn
+        # Must not raise; the consult simply goes uncached.
+        _put(cache)
+        # A fault mid-write must roll back any possibly-open transaction so the
+        # connection does not retain the write lock.
+        assert conn.rolled_back is True
