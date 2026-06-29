@@ -56,7 +56,7 @@ Key details:
 - **Privacy exclusion** — responses that look like secrets are never persisted to the cache; see [SECURITY.md](../SECURITY.md). This guard always applies on top of the policy/override above.
 - **Transient-key exclusion** — to prevent serving expired progressive/selective keys on a cache hit (which would drop the response tail), the cache automatically skips storing any response carrying a transient-key marker (like a `PROGRESSIVE_FOOTER_TOKEN` or a `selection_key` JSON field). The next identical call re-runs the pipeline to generate live keys.
 - Expired entries are purged on startup; oldest entries evicted when `max_entries` is exceeded
-- Clear cache via MCP tool: `stm_proxy_cache_clear(server="gh", tool="search_code")`
+- Clear cache via MCP tool: `stm_proxy_cache_clear(server="gh", tool="search_code")` clears matching response-cache entries; an unfiltered `stm_proxy_cache_clear()` flushes the entire response cache **and** the in-memory surfacing result cache
 - TTL is global (`cache.default_ttl_seconds`); `tool_overrides` tune compression, sizing, indexing, and cache eligibility (`cache: true|false`) — but not per-tool cache TTL
 
 ## Auto-Indexing
