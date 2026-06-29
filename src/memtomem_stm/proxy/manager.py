@@ -2094,20 +2094,29 @@ class ProxyManager:
         Returns ``(result, cache_hit)`` so ``call_tool`` can stamp the
         selection-telemetry execution event (#467): ``True`` on either
         cache-hit return path, ``False`` on a live ``_call_tool_inner``
-        call (including the no-cache configuration)."""
+        call (including the no-cache configuration and cache-ineligible tools)."""
         upstream_args = (
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
 
-        # Fast-path: cache hit without lock contention.
-        if self._cache is not None:
-            cached = self._cache.get(server, tool, upstream_args)
-            if cached is not None:
-                return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
-
         # No cache configured — stampede protection N/A, go straight through.
         if self._cache is None:
             return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
+
+        # Cache-eligibility gate (MCP annotations / per-tool|server ``cache``
+        # override): a tool the policy deems non-cacheable — e.g. a self-declared
+        # writer under the default conservative policy — is never served from nor
+        # stored in the cache. Behave as if no cache exists: straight through with
+        # NO stampede lock, so every call re-runs and its side effect re-executes.
+        # Gating the lookup (not just the store in ``_store_cache``) also refuses
+        # to serve any row cached before this gate existed.
+        if not self._tool_cache_eligible(server, tool, cfg_snap=self._config):
+            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
+
+        # Fast-path: cache hit without lock contention.
+        cached = self._cache.get(server, tool, upstream_args)
+        if cached is not None:
+            return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
 
         cache_key = _cache_key(server, tool, upstream_args)
         lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
@@ -2920,6 +2929,63 @@ class ProxyManager:
 
         return ExtractResult(ok=extract_ok, error=extract_error)
 
+    @staticmethod
+    def _tool_annotations(conn: UpstreamConnection, tool: str) -> Any:
+        """Raw MCP ``ToolAnnotations`` for ``tool`` on ``conn`` (``None`` if the
+        tool is unknown or carries no annotations). The objects in ``conn.tools``
+        are the upstream ``Tool`` records from ``session.list_tools()``, each
+        retaining ``.name`` and ``.annotations`` (populated at connect/reconnect)."""
+        for t in conn.tools:
+            if getattr(t, "name", None) == tool:
+                return getattr(t, "annotations", None)
+        return None
+
+    def _tool_cache_eligible(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> bool:
+        """Whether a ``(server, tool)`` response may enter / be served from the
+        response cache.
+
+        Orthogonal to the privacy and transient-key store guards, which always
+        apply in ``_store_cache`` regardless of this verdict. Resolution order:
+
+          1. explicit per-tool ``cache`` override (``ToolOverrideConfig.cache``),
+          2. explicit per-server ``cache`` override (``UpstreamServerConfig.cache``),
+          3. the global ``CacheConfig.tool_annotation_policy`` applied to the
+             upstream tool's ``readOnlyHint`` / ``destructiveHint``.
+
+        An unknown server (direct dispatch / tests with no registered connection)
+        is treated as eligible, preserving the pre-gate behavior on that path."""
+        conn = self._connections.get(server)
+        if conn is None:
+            return True
+        # Per-tool / per-server ``cache`` overrides are read from ``conn.config``
+        # (the connection's connect-time snapshot), mirroring ``_resolve_tool_config``
+        # which resolves every other per-server/tool field (``compression``,
+        # ``tool_overrides.*``, ...) from the same source. Like those, an override
+        # edited AFTER startup is picked up on the next reconnect/restart, not via
+        # mtime hot-reload — connections hold their connect-time config. The
+        # annotation POLICY below, by contrast, is read from the hot-reloaded
+        # ``cfg_snap``, so the safety-critical writer gate tracks config edits even
+        # though the manual override escape-hatch follows the existing per-server
+        # reload semantics.
+        override = conn.config.tool_overrides.get(tool)
+        if override is not None and override.cache is not None:
+            return override.cache
+        if conn.config.cache is not None:
+            return conn.config.cache
+
+        policy = cfg_snap.cache.tool_annotation_policy
+        if policy == "ignore":
+            return True
+        ann = self._tool_annotations(conn, tool)
+        read_only = getattr(ann, "readOnlyHint", None)
+        destructive = getattr(ann, "destructiveHint", None)
+        if policy == "strict":
+            # Only an explicit read-only declaration qualifies; a missing
+            # readOnlyHint defaults to may-mutate per the MCP spec.
+            return read_only is True
+        # conservative: cache unless the tool self-declares as a writer.
+        return not (read_only is False or destructive is True)
+
     def _store_cache(
         self,
         *,
@@ -2937,7 +3003,12 @@ class ProxyManager:
         or any other store error must NOT propagate to the agent and discard a
         successful upstream response — log and continue.
 
-        Two responses are deliberately NOT cached:
+        A response from a tool the cache-eligibility gate rejects
+        (``_tool_cache_eligible``: a self-declared writer under the conservative/
+        strict annotation policy, or an explicit ``cache: false`` override) is
+        skipped too — the lookup path in ``_call_tool_guarded`` mirrors this so the
+        tool is neither stored nor served. Beyond that, two responses are
+        deliberately NOT cached even for an eligible tool:
 
         - ``comp.progressive_passthrough_on_error`` — a transient-store-failure
           passthrough. Caching it would pin the degraded (non-chunked) response
@@ -2960,7 +3031,14 @@ class ProxyManager:
         hex and is unreachable by any future lookup (hit rate structurally 0%).
         """
         if self._cache is not None and not non_text_content:
-            if comp.progressive_passthrough_on_error:
+            if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
+                logger.debug(
+                    "Skipping cache store for %s/%s: tool is not cache-eligible "
+                    "(mutating tool under the annotation policy, or cache override=false)",
+                    server,
+                    tool,
+                )
+            elif comp.progressive_passthrough_on_error:
                 logger.debug(
                     "Skipping cache store for %s/%s: progressive passthrough "
                     "degradation (transient store failure)",

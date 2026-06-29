@@ -38,7 +38,8 @@ The key insight: **the cache stores pre-surfacing content**. Surfacing runs on e
     "enabled": true,
     "db_path": "~/.memtomem/proxy_cache.db",
     "default_ttl_seconds": 3600,
-    "max_entries": 10000
+    "max_entries": 10000,
+    "tool_annotation_policy": "conservative"
   }
 }
 ```
@@ -47,10 +48,16 @@ Key details:
 
 - Cache key = SHA-256 of `server:tool:args` (argument order independent)
 - **Pre-surfacing content is cached** — surfacing is re-applied on cache hit, so memories stay fresh
+- **Mutating tools are not cached** — the cache is on by default for *every* tool of *every* upstream, so without a gate a write tool (`create_*` / `send_*` / `write_*` / `delete_*`) called twice with identical args within the TTL would be served the first call's cached success *without re-executing the side effect*. The `tool_annotation_policy` gates eligibility on the upstream tool's MCP annotations (`readOnlyHint` / `destructiveHint`):
+  - `conservative` (default) — cache everything except tools that self-declare as writers (`readOnlyHint: false` or `destructiveHint: true`). Keeps caching for read-only and un-annotated tools.
+  - `strict` — cache only tools that explicitly declare `readOnlyHint: true` (un-annotated tools default to may-mutate per the MCP spec).
+  - `ignore` — pre-gate behavior; cache every tool regardless of annotations.
+- **Per-tool / per-server cache override** — set `cache: true|false` on a `tool_overrides` entry or on an `UpstreamServerConfig` to force a tool/server in or out of the cache, overriding the annotation policy (precedence: tool > server > policy). Use `cache: false` for a volatile read tool or a writer on an upstream that omits annotations; `cache: true` to re-enable caching for a tool an upstream mis-annotates.
+- **Privacy exclusion** — responses that look like secrets are never persisted to the cache; see [SECURITY.md](../SECURITY.md). This guard always applies on top of the policy/override above.
 - **Transient-key exclusion** — to prevent serving expired progressive/selective keys on a cache hit (which would drop the response tail), the cache automatically skips storing any response carrying a transient-key marker (like a `PROGRESSIVE_FOOTER_TOKEN` or a `selection_key` JSON field). The next identical call re-runs the pipeline to generate live keys.
 - Expired entries are purged on startup; oldest entries evicted when `max_entries` is exceeded
 - Clear cache via MCP tool: `stm_proxy_cache_clear(server="gh", tool="search_code")`
-- TTL is global (`cache.default_ttl_seconds`); `tool_overrides` only tune compression, sizing, and indexing — not cache TTL
+- TTL is global (`cache.default_ttl_seconds`); `tool_overrides` tune compression, sizing, indexing, and cache eligibility (`cache: true|false`) — but not per-tool cache TTL
 
 ## Auto-Indexing
 
