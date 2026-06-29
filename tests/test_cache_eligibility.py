@@ -255,3 +255,54 @@ class TestCallToolHonoursEligibility:
 
         assert session.call_tool.await_count == 2
         assert cache.get("srv", "vol", {}) is None
+
+
+@pytest.mark.asyncio
+class TestMissAccountingHonoursEligibility:
+    """A cache MISS is recorded only after an ELIGIBLE lookup actually misses.
+    An ineligible (force-forwarded) tool attempts no lookup, so it must not be
+    counted as a miss — otherwise it skews the hit-rate diagnostic."""
+
+    async def test_ineligible_writer_records_no_miss(self, build):
+        mgr, _, _ = build(tools=[_tool("writer", _ann(read_only=False))])
+        mgr._connections["srv"].session.call_tool.return_value = _text_result("done")
+
+        await mgr.call_tool("srv", "writer", {"x": 1})
+        await mgr.call_tool("srv", "writer", {"x": 1})
+
+        assert mgr.tracker.get_summary()["cache_misses"] == 0
+
+    async def test_eligible_miss_records_one_miss_then_hit(self, build):
+        mgr, _, _ = build(tools=[_tool("reader", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # eligible miss → 1
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # served from cache → no miss
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 1
+        assert summary["cache_hits"] == 1
+
+
+@pytest.mark.asyncio
+class TestTtlZeroDisablesServing:
+    """Lowering cache.default_ttl_seconds to 0 must stop serving rows cached under
+    a prior positive TTL — per-row TTL is frozen at write time, so the lookup path
+    itself must bypass the cache when the configured TTL is non-positive."""
+
+    async def test_ttl_lowered_to_zero_stops_serving_and_invalidates(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # cached under default TTL
+        assert session.call_tool.await_count == 1
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        # Operator lowers the cache TTL to 0 (hot-reload). The previously-cached
+        # live row must no longer be served, and the next call must hit upstream.
+        mgr._config.cache.default_ttl_seconds = 0
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 2  # not served from the stale row
+        assert cache.get("srv", "reader", {"q": "a"}) is None  # old row invalidated

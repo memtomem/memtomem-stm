@@ -137,6 +137,40 @@ class TestProxyStats:
         result = await stm_proxy_stats(ctx=ctx)
         assert "LTM hints:" not in result
 
+    async def test_hit_rate_line(self):
+        """Derived hit-rate % is shown alongside the raw hit/miss counts."""
+        tracker = TokenTracker()
+        for _ in range(3):
+            tracker.record_cache_hit()
+        tracker.record_cache_miss()  # 3 hits / 4 lookups → 75.0%
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hit rate:  75.0%" in result
+
+    async def test_cache_entries_line_when_cache_wired(self, tmp_path):
+        """When the response cache is wired, occupancy/eviction is surfaced."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        pm = _make_proxy_manager(tmp_path)
+        cache = ProxyCache(tmp_path / "c.db", max_entries=100)
+        cache.initialize()
+        try:
+            cache.set("s", "t", {"a": 1}, "r", ttl_seconds=60.0)
+            pm._cache = cache
+            ctx = _make_ctx(proxy_manager=pm)
+            result = await stm_proxy_stats(ctx=ctx)
+            assert "Cache entries:   1" in result
+            assert "evicted 0" in result
+        finally:
+            cache.close()
+
+    async def test_cache_entries_line_absent_without_cache(self):
+        """No response cache wired → no occupancy line (hit-rate still shown)."""
+        ctx = _make_ctx()
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache entries:" not in result
+        assert "Cache hit rate:" in result
+
 
 # ── stm_proxy_select_chunks ──────────────────────────────────────────────
 

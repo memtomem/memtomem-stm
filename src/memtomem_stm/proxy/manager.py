@@ -2099,8 +2099,16 @@ class ProxyManager:
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
 
-        # No cache configured — stampede protection N/A, go straight through.
-        if self._cache is None:
+        # No cache configured, OR a non-positive configured TTL disables it: go
+        # straight through (no lookup, no store, no stampede lock). The TTL check
+        # is on the LOOKUP path on purpose — a row cached earlier under a positive
+        # TTL is still "live" on disk after the TTL is lowered to 0 (per-row TTL is
+        # frozen at write time), so without bypassing the lookup that stale row
+        # would keep serving. Skipping the lookup makes ttl<=0 behave like
+        # ``cache.enabled=false``; the store-side ``ProxyCache.set`` short-circuit
+        # additionally deletes such a row when the forced upstream call re-stores.
+        cache_ttl = self._config.cache.default_ttl_seconds
+        if self._cache is None or (cache_ttl is not None and cache_ttl <= 0):
             return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
 
         # Cache-eligibility gate (MCP annotations / per-tool|server ``cache``
@@ -2127,6 +2135,13 @@ class ProxyManager:
                 cached = self._cache.get(server, tool, upstream_args)
                 if cached is not None:
                     return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
+                # Eligible cache lookup confirmed missing (the lock-free fast-path
+                # AND this in-lock double-check). This is the SINGLE eligible-miss
+                # exit, so account the miss here. The ineligible and no-cache paths
+                # above deliberately record NOTHING — no lookup was attempted, and
+                # counting a forced-forward writer (or a ``cache: false`` tool) as a
+                # miss would skew the hit-rate diagnostics.
+                self.tracker.record_cache_miss()
                 return await self._call_tool_inner(
                     server, tool, arguments, trace_id=trace_id
                 ), False
@@ -3100,11 +3115,13 @@ class ProxyManager:
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
 
-        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
-        # time we get here the cache has already missed. Just account the
-        # miss and proceed with the upstream fetch.
-        if self._cache is not None:
-            self.tracker.record_cache_miss()
+        # Cache lookup, hit path, and miss accounting are all owned by
+        # ``_call_tool_guarded``: a hit returns there, an ELIGIBLE miss is
+        # recorded there, and the ineligible / no-cache paths intentionally
+        # record nothing. By the time we reach here the call is already past that
+        # gate, so we just proceed with the upstream fetch. Direct callers (tests)
+        # that invoke ``_call_tool_inner`` bypass the lookup and therefore the
+        # miss counter too, matching the no-lookup semantics.
 
         # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
         # The cache lookup at L771 used the original args (no ``_trace_id``);
