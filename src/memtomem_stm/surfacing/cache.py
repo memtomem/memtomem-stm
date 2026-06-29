@@ -49,4 +49,11 @@ class SurfacingCache:
 
     @staticmethod
     def _hash(query: str) -> str:
-        return hashlib.md5(query.encode()).hexdigest()
+        # ``usedforsecurity=False`` is required: this is a non-cryptographic
+        # cache key, and on a FIPS-enforced OpenSSL build bare ``md5()`` raises
+        # ValueError at construction. Without the flag, every ``get``/``set``
+        # would raise, the surfacing engine's broad ``except`` would swallow it
+        # as ``error_other``, and proactive surfacing would be silently disabled
+        # for 100% of calls on FIPS systems. The digest value is unchanged on
+        # non-FIPS builds, so this is behavior-preserving there.
+        return hashlib.md5(query.encode(), usedforsecurity=False).hexdigest()
