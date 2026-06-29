@@ -93,3 +93,20 @@ class TestSurfacingCacheHashDeterminism:
 
     def test_different_query_different_hash(self):
         assert SurfacingCache._hash("hello") != SurfacingCache._hash("world")
+
+    def test_hash_passes_usedforsecurity_false(self):
+        # FIPS-safety pin: CI cannot run under a FIPS-enforced OpenSSL build (where
+        # bare md5() raises and silently disables surfacing), so assert the md5
+        # CALL itself carries usedforsecurity=False. A source/comment grep would be
+        # too weak — the kwarg could be dropped while a mentioning comment stays.
+        import hashlib
+        from unittest.mock import patch
+
+        with patch("memtomem_stm.surfacing.cache.hashlib.md5", wraps=hashlib.md5) as md5_spy:
+            SurfacingCache._hash("hello")
+        md5_spy.assert_called_once_with(b"hello", usedforsecurity=False)
+
+    def test_hash_matches_canonical_md5_vector(self):
+        # Behavior preservation: the digest value is unchanged on non-FIPS builds,
+        # so existing cache keys keep mapping to the same entries.
+        assert SurfacingCache._hash("hello") == "5d41402abc4b2a76b9719d911017c592"
