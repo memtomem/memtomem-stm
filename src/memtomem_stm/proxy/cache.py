@@ -103,6 +103,10 @@ class ProxyCache:
         self._max_entries = max_entries
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        # Process-lifetime count of rows dropped by ``_trim`` (max_entries
+        # overflow). Surfaced via ``stats()`` so an operator can see the cache
+        # thrashing instead of it evicting silently. Resets on restart.
+        self._evictions = 0
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -221,6 +225,24 @@ class ProxyCache:
     ) -> None:
         if self._db is None:
             return
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            # A non-positive TTL makes every row born-expired (``is_expired`` is
+            # ``now >= created_at + 0`` → always true), so storing one only burns
+            # write+trim I/O for a guaranteed miss — a "cache enabled, 0% hits"
+            # footgun. Treat it as do-not-store: set ``cache.enabled=False`` to turn
+            # caching off, or a positive TTL to cache. (``None`` is the distinct
+            # "never expires" sentinel and still stores.)
+            #
+            # Still INVALIDATE any existing row for this key: an earlier call may
+            # have cached it under a positive TTL (e.g. before the TTL was lowered
+            # to 0 via hot-reload), and leaving that live row would keep serving
+            # stale content. This mirrors the pre-short-circuit behavior, which
+            # overwrote the key with a born-expired row.
+            key = _make_key(server, tool, args)
+            with self._lock:
+                self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+                self._db.commit()
+            return
         if contains_sensitive_content(result):
             # SECURITY.md: responses that look like secrets are never
             # persisted to the response cache. Enforced at the store
@@ -255,12 +277,13 @@ class ProxyCache:
         count = self._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
         if count > self._max_entries:
             excess = count - self._max_entries
-            self._db.execute(
+            cur = self._db.execute(
                 "DELETE FROM proxy_cache WHERE cache_key IN "
                 "(SELECT cache_key FROM proxy_cache ORDER BY created_at ASC LIMIT ?)",
                 (excess,),
             )
             self._db.commit()
+            self._evictions += cur.rowcount
 
     def clear(self, *, server: str | None = None, tool: str | None = None) -> int:
         if self._db is None:
@@ -293,7 +316,7 @@ class ProxyCache:
 
     def stats(self) -> dict[str, int]:
         if self._db is None:
-            return {"total_entries": 0, "expired_entries": 0}
+            return {"total_entries": 0, "expired_entries": 0, "evictions": self._evictions}
         now = time.time()
         with self._lock:
             total = self._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
@@ -301,4 +324,4 @@ class ProxyCache:
                 "SELECT COUNT(*) FROM proxy_cache WHERE ttl_seconds IS NOT NULL AND created_at + ttl_seconds <= ?",
                 (now,),
             ).fetchone()[0]
-        return {"total_entries": total, "expired_entries": expired}
+        return {"total_entries": total, "expired_entries": expired, "evictions": self._evictions}

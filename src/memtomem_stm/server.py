@@ -481,6 +481,11 @@ async def stm_proxy_stats(
     app = _get_ctx(ctx)
     summary = app.tracker.get_summary()
 
+    cache_hits = summary["cache_hits"]
+    cache_misses = summary["cache_misses"]
+    cache_lookups = cache_hits + cache_misses
+    cache_hit_rate = (cache_hits / cache_lookups * 100) if cache_lookups else 0.0
+
     lines = [
         "STM Proxy Stats",
         "===============",
@@ -489,10 +494,24 @@ async def stm_proxy_stats(
         f"Compressed:      {summary['total_compressed_chars']}",
         f"Savings:         {summary['total_savings_pct']:.1f}%",
         f"Token savings:   {summary.get('total_token_savings_pct', 0):.1f}%",
-        f"Cache hits:      {summary['cache_hits']}",
-        f"Cache misses:    {summary['cache_misses']}",
+        f"Cache hits:      {cache_hits}",
+        f"Cache misses:    {cache_misses}",
+        f"Cache hit rate:  {cache_hit_rate:.1f}%",
         f"Reconnects:      {summary.get('reconnects', 0)}",
     ]
+
+    # Cache occupancy / eviction visibility (size vs max_entries, expired backlog,
+    # lifetime evictions) — distinct from the per-call hit/miss counters above and
+    # only available when the response cache is wired. Read inside this
+    # operator-invoked tool, so the synchronous sqlite COUNT stays off the hot path.
+    pm = getattr(app, "proxy_manager", None)
+    response_cache = getattr(pm, "_cache", None) if pm is not None else None
+    if response_cache is not None:
+        cstats = response_cache.stats()
+        lines.append(
+            f"Cache entries:   {cstats['total_entries']} "
+            f"(expired {cstats['expired_entries']}, evicted {cstats['evictions']})"
+        )
 
     # Error summary
     total_errors = summary.get("total_errors", 0)

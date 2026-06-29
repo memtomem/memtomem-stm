@@ -53,6 +53,28 @@ class TestProxyCacheTTL:
         proxy_cache.set("s", "t", {"a": 1}, "result", ttl_seconds=None)
         assert proxy_cache.get("s", "t", {"a": 1}) == "result"
 
+    def test_zero_ttl_does_not_store(self, proxy_cache: ProxyCache):
+        # A ttl of 0 would make every row born-expired; the store short-circuits
+        # so it does not burn write+trim I/O for a guaranteed miss.
+        proxy_cache.set("s", "t", {"a": 1}, "result", ttl_seconds=0)
+        assert proxy_cache.get("s", "t", {"a": 1}) is None
+        assert proxy_cache.stats()["total_entries"] == 0
+
+    def test_negative_ttl_does_not_store(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {"a": 1}, "result", ttl_seconds=-5.0)
+        assert proxy_cache.get("s", "t", {"a": 1}) is None
+        assert proxy_cache.stats()["total_entries"] == 0
+
+    def test_zero_ttl_invalidates_existing_live_row(self, proxy_cache: ProxyCache):
+        # A later ttl<=0 store must not leave a previously-cached LIVE row serving
+        # stale content — it invalidates the key, matching the old behavior of
+        # overwriting it with a born-expired row.
+        proxy_cache.set("s", "t", {"a": 1}, "old", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {"a": 1}) == "old"
+        proxy_cache.set("s", "t", {"a": 1}, "new", ttl_seconds=0)
+        assert proxy_cache.get("s", "t", {"a": 1}) is None
+        assert proxy_cache.stats()["total_entries"] == 0
+
 
 class TestProxyCacheClear:
     def test_clear_all(self, proxy_cache: ProxyCache):
@@ -99,6 +121,17 @@ class TestProxyCacheEviction:
         finally:
             cache.close()
 
+    def test_eviction_counter_tracks_trim(self, tmp_path):
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=3)
+        cache.initialize()
+        try:
+            for i in range(5):
+                cache.set("s", "t", {"i": i}, f"r{i}", ttl_seconds=60.0)
+            # 5 inserts past a cap of 3 → 2 rows evicted, surfaced in stats.
+            assert cache.stats()["evictions"] == 2
+        finally:
+            cache.close()
+
 
 class TestProxyCacheStats:
     def test_stats_counts(self, proxy_cache: ProxyCache):
@@ -106,6 +139,7 @@ class TestProxyCacheStats:
         stats = proxy_cache.stats()
         assert stats["total_entries"] == 1
         assert stats["expired_entries"] == 0
+        assert stats["evictions"] == 0
 
 
 class TestTransientKeyDetector:
