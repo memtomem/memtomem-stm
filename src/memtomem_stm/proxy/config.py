@@ -425,6 +425,19 @@ class ToolOverrideConfig(BaseModel):
     upstream mis-annotates as a writer); ``False`` never caches it (e.g. a
     volatile read tool, or a writer on an upstream that omits annotations). The
     privacy / transient-key store guards still apply when ``True``."""
+    cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
+    """Per-tool override for the response-cache TTL (seconds). ``None`` (default)
+    defers to the server-level ``cache_ttl_seconds``, then to the global
+    ``CacheConfig.default_ttl_seconds``. A positive value caches this tool's
+    responses for that many seconds; ``0`` disables caching for this tool: while
+    the resolved TTL is ``<= 0`` the lookup is bypassed, so a stale row is never
+    served (mirroring the global ``default_ttl_seconds <= 0`` behavior); any
+    existing on-disk row is cleaned up opportunistically (invalidated when an
+    identical call next stores a text response) and otherwise expires under its
+    original frozen TTL. Independent of the ``cache`` on/off
+    gate: ``cache: false`` always wins (never cached); ``cache: true`` with
+    ``cache_ttl_seconds: 0`` is eligible but TTL-disabled, i.e. effectively off.
+    Unlike the global field, ``None`` here means *inherit*, not *never expires*."""
     hidden: bool = False
     description_override: str | None = None
     expose_in_profiles: list[ExposureProfile] | None = None
@@ -511,6 +524,12 @@ class UpstreamServerConfig(BaseModel):
     ``None`` (default) defers to the global ``CacheConfig.tool_annotation_policy``;
     ``True``/``False`` force every tool on this upstream in/out of the cache. A
     per-tool ``cache`` override wins over this."""
+    cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
+    """Per-server response-cache TTL override (see
+    ``ToolOverrideConfig.cache_ttl_seconds``). ``None`` (default) defers to the
+    global ``CacheConfig.default_ttl_seconds``; a positive value sets the TTL for
+    every tool on this upstream; ``0`` disables caching for the whole upstream. A
+    per-tool ``cache_ttl_seconds`` wins over this."""
     expose_in_profiles: list[ExposureProfile] | None = None
     """Exposure profiles in which this upstream's tools are advertised
     (#465). ``None`` (default) means every profile. Per-tool

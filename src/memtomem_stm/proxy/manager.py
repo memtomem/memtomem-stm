@@ -2110,7 +2110,10 @@ class ProxyManager:
         # would keep serving. Skipping the lookup makes ttl<=0 behave like
         # ``cache.enabled=false``; the store-side ``ProxyCache.set`` short-circuit
         # additionally deletes such a row when the forced upstream call re-stores.
-        cache_ttl = self._config.cache.default_ttl_seconds
+        # The resolved TTL honors any per-tool/server ``cache_ttl_seconds``
+        # override, so a tool whose override is 0 bypasses the lookup for THAT
+        # tool exactly as the global ttl<=0 does (per-row TTL is frozen at write).
+        cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=self._config)
         if self._cache is None or (cache_ttl is not None and cache_ttl <= 0):
             return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
 
@@ -2958,6 +2961,34 @@ class ProxyManager:
                 return getattr(t, "annotations", None)
         return None
 
+    def _resolve_cache_ttl(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> float | None:
+        """Effective response-cache TTL (seconds) for a ``(server, tool)`` call.
+
+        Precedence mirrors ``_tool_cache_eligible``'s ``cache`` on/off override:
+
+          1. explicit per-tool ``cache_ttl_seconds`` (``ToolOverrideConfig``),
+          2. explicit per-server ``cache_ttl_seconds`` (``UpstreamServerConfig``),
+          3. the global ``CacheConfig.default_ttl_seconds``.
+
+        At levels 1-2, ``None`` means *inherit the next level* (NOT never-expires);
+        only the global default's ``None`` means never-expires. Per-tool/server
+        overrides are read from ``conn.config`` (the connect-time snapshot), so —
+        like the ``cache`` bool — an override edited after startup is picked up on
+        the next reconnect/restart, not via mtime hot-reload; the global fallback
+        is the hot-reloaded ``cfg_snap``. An unknown server (direct dispatch /
+        tests with no registered connection) falls back to the global, mirroring
+        ``_tool_cache_eligible`` returning ``True`` on that path."""
+        global_ttl = cfg_snap.cache.default_ttl_seconds
+        conn = self._connections.get(server)
+        if conn is None:
+            return global_ttl
+        override = conn.config.tool_overrides.get(tool)
+        if override is not None and override.cache_ttl_seconds is not None:
+            return override.cache_ttl_seconds
+        if conn.config.cache_ttl_seconds is not None:
+            return conn.config.cache_ttl_seconds
+        return global_ttl
+
     def _tool_cache_eligible(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> bool:
         """Whether a ``(server, tool)`` response may enter / be served from the
         response cache.
@@ -3077,7 +3108,7 @@ class ProxyManager:
                         tool,
                         cache_args,
                         comp.compressed,
-                        ttl_seconds=cfg_snap.cache.default_ttl_seconds,
+                        ttl_seconds=self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap),
                     )
                 except Exception:
                     logger.warning(
