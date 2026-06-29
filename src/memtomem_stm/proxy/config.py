@@ -417,6 +417,14 @@ class ToolOverrideConfig(BaseModel):
     cleaning: CleaningConfig | None = None
     auto_index: bool | None = None
     extraction: bool | None = None
+    cache: bool | None = None
+    """Per-tool response-cache opt-in/out. ``None`` (default) defers to the
+    server-level ``cache``, then to the global
+    ``CacheConfig.tool_annotation_policy``. ``True`` force-caches this tool
+    (overriding the annotation policy — e.g. to re-enable caching for a tool an
+    upstream mis-annotates as a writer); ``False`` never caches it (e.g. a
+    volatile read tool, or a writer on an upstream that omits annotations). The
+    privacy / transient-key store guards still apply when ``True``."""
     hidden: bool = False
     description_override: str | None = None
     expose_in_profiles: list[ExposureProfile] | None = None
@@ -498,6 +506,11 @@ class UpstreamServerConfig(BaseModel):
     tool_overrides: dict[str, ToolOverrideConfig] = {}
     auto_index: bool | None = None
     extraction: bool | None = None
+    cache: bool | None = None
+    """Per-server response-cache opt-in/out (see ``ToolOverrideConfig.cache``).
+    ``None`` (default) defers to the global ``CacheConfig.tool_annotation_policy``;
+    ``True``/``False`` force every tool on this upstream in/out of the cache. A
+    per-tool ``cache`` override wins over this."""
     expose_in_profiles: list[ExposureProfile] | None = None
     """Exposure profiles in which this upstream's tools are advertised
     (#465). ``None`` (default) means every profile. Per-tool
@@ -572,6 +585,29 @@ class CacheConfig(BaseModel):
     db_path: Path = Path("~/.memtomem/proxy_cache.db")
     default_ttl_seconds: float | None = Field(default=3600.0, ge=0.0)
     max_entries: int = Field(default=10000, gt=0)
+    tool_annotation_policy: Literal["conservative", "strict", "ignore"] = "conservative"
+    """Which proxied tool responses are eligible for the response cache, based on
+    the upstream tool's MCP annotations (``readOnlyHint`` / ``destructiveHint``).
+
+    The proxy sits transparently in front of every upstream tool, so without a
+    gate a mutating tool (``create_*`` / ``send_*`` / ``write_*`` / ``delete_*``)
+    called twice with identical args within the TTL is served the first call's
+    cached success WITHOUT re-executing the side effect — the agent is told it
+    mutated when it did not.
+
+    - ``conservative`` (default): cache every tool EXCEPT those that explicitly
+      self-declare as writers (``readOnlyHint is False`` or
+      ``destructiveHint is True``). Keeps caching for the un-annotated majority
+      and for declared read-only tools, while refusing to memoize a side effect
+      the upstream itself flags as mutating.
+    - ``strict``: cache ONLY tools that explicitly declare ``readOnlyHint=True``.
+      Safest (the MCP spec treats a missing ``readOnlyHint`` as may-mutate), but
+      drops caching for every upstream that omits annotations.
+    - ``ignore``: pre-gate behavior — cache every tool regardless of annotations.
+
+    A per-tool / per-server ``cache`` override (``ToolOverrideConfig.cache`` /
+    ``UpstreamServerConfig.cache``) takes precedence over this policy. The privacy
+    and transient-key store guards always apply on top, regardless of this knob."""
 
 
 class MetricsConfig(BaseModel):
