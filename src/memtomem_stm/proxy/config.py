@@ -820,6 +820,13 @@ class ToolgraphConfig(BaseModel):
     backends, disambiguated by a provider fingerprint over ``command`` / ``args``
     / env *keys*; point distinct backends sharing identical command/args/env-keys
     but different env *values* at distinct paths."""
+    consult_cache_max_scopes: int = Field(default=64, gt=0)
+    """Maximum number of cached consult rows kept in the #494 disk cache before
+    the oldest (by ``created_at``) are trimmed on each write. Bounds growth of
+    the user-wide ``toolgraph_consult.db``; one row per ``(provider, agent,
+    profile, candidate-set, generation)`` scope, so this caps total rows across
+    all scopes, not per scope. Must be ``>= 1`` (``0`` would trim every row on
+    every write, defeating the cache)."""
 
 
 # Static context window sizes (tokens) for known model families.

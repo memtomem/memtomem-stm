@@ -101,6 +101,25 @@ class TestScopeReplace:
         assert cache.get(_PROV, _AGENT, _PROFILE, "hashB", 11) is not None
 
 
+class TestMaxScopesTrim:
+    def test_default_max_scopes(self, tmp_path):
+        c = GraphConsultCache(tmp_path / "tg.db")
+        assert c._max_scopes == 64  # ctor default; preserves pre-config behavior
+
+    def test_trim_caps_row_count_at_configured_max(self, tmp_path):
+        # Each put with a distinct candidate set is a distinct scope row; once the
+        # count exceeds max_scopes, _trim deletes the oldest down to the cap.
+        c = GraphConsultCache(tmp_path / "tg.db", max_scopes=3)
+        c.initialize()
+        try:
+            for i in range(6):
+                _put(c, cand=f"hash{i}")
+            count = c._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0]
+            assert count == 3
+        finally:
+            c.close()
+
+
 class TestUninitialized:
     def test_get_put_no_op_when_uninitialized(self, tmp_path):
         c = GraphConsultCache(tmp_path / "tg.db")  # no initialize()

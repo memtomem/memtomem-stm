@@ -91,6 +91,16 @@ class TestToolgraphConfig:
         assert tg.timeout_seconds == 5.0
         assert tg.consult_cache_enabled is True  # #494: strictly-fresh, on by default
         assert tg.consult_cache_path == Path("~/.memtomem/toolgraph_consult.db")
+        assert tg.consult_cache_max_scopes == 64  # matches GraphConsultCache ctor default
+
+    def test_consult_cache_max_scopes_must_be_positive(self):
+        # 0 would make _trim delete every row on each write (count > 0 always
+        # true with the just-inserted row), defeating the cache.
+        with pytest.raises(ValidationError):
+            ToolgraphConfig(consult_cache_max_scopes=0)
+        with pytest.raises(ValidationError):
+            ToolgraphConfig(consult_cache_max_scopes=-1)
+        ToolgraphConfig(consult_cache_max_scopes=1)  # minimum valid
 
     def test_failure_knob_defaults(self):
         tg = ProxyConfig().toolgraph
@@ -399,6 +409,22 @@ def _tg_manager(tmp_path, *, servers=None, exposure=None, **tg_overrides):
 
 def _events(log: SelectionTelemetryLog) -> list[dict]:
     return [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines() if line]
+
+
+class TestConsultCacheMaxScopesWiring:
+    def test_open_consult_cache_threads_config_max_scopes(self, tmp_path):
+        # Proves manager.py:_open_consult_cache passes the config value into the
+        # GraphConsultCache ctor rather than relying on the ctor's = 64 default.
+        mgr, _ = _tg_manager(tmp_path, consult_cache_max_scopes=7)
+        cache = mgr._open_consult_cache(mgr._config.toolgraph)
+        assert cache is not None
+        assert cache._max_scopes == 7
+
+    def test_open_consult_cache_default_max_scopes(self, tmp_path):
+        mgr, _ = _tg_manager(tmp_path)
+        cache = mgr._open_consult_cache(mgr._config.toolgraph)
+        assert cache is not None
+        assert cache._max_scopes == 64
 
 
 class TestToolgraphConsultWiring:
