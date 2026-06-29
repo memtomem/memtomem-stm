@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
@@ -48,6 +49,8 @@ def _build(
     *,
     policy: str = "conservative",
     server_cache: bool | None = None,
+    server_cache_ttl: float | None = None,
+    global_ttl: float | None = 3600.0,
     tool_overrides: dict | None = None,
     tools=(),
     with_cache: bool = True,
@@ -59,12 +62,13 @@ def _build(
         max_retries=0,
         reconnect_delay_seconds=0.0,
         cache=server_cache,
+        cache_ttl_seconds=server_cache_ttl,
         tool_overrides=tool_overrides or {},
     )
     proxy_cfg = ProxyConfig(
         config_path=tmp_path / "proxy.json",
         upstream_servers={"srv": server_cfg},
-        cache=CacheConfig(tool_annotation_policy=policy),
+        cache=CacheConfig(tool_annotation_policy=policy, default_ttl_seconds=global_ttl),
     )
     mgr = ProxyManager(proxy_cfg, TokenTracker(metrics_store=store))
     mgr._connections["srv"] = UpstreamConnection(
@@ -102,6 +106,10 @@ def build(tmp_path):
 
 def _eligible(mgr, tool):
     return mgr._tool_cache_eligible("srv", tool, cfg_snap=mgr._config)
+
+
+def _resolve_ttl(mgr, tool):
+    return mgr._resolve_cache_ttl("srv", tool, cfg_snap=mgr._config)
 
 
 # ── Unit: annotation policy ──────────────────────────────────────────────
@@ -306,3 +314,127 @@ class TestTtlZeroDisablesServing:
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.await_count == 2  # not served from the stale row
         assert cache.get("srv", "reader", {"q": "a"}) is None  # old row invalidated
+
+
+# ── Unit: per-tool / per-server TTL override resolution ──────────────────
+
+
+class TestTtlOverridePrecedence:
+    """``_resolve_cache_ttl`` mirrors ``_tool_cache_eligible``'s precedence:
+    per-tool > per-server > global. ``None`` at the tool/server level means
+    *inherit the next level*, NOT *never expires* (only the global default's
+    ``None`` means never-expires)."""
+
+    def test_global_default_when_no_override(self, build):
+        mgr, _, _ = build(global_ttl=1800.0, tools=[_tool("t")])
+        assert _resolve_ttl(mgr, "t") == 1800.0
+
+    def test_server_override_beats_global(self, build):
+        mgr, _, _ = build(global_ttl=1800.0, server_cache_ttl=600.0, tools=[_tool("t")])
+        assert _resolve_ttl(mgr, "t") == 600.0
+
+    def test_tool_override_beats_server_and_global(self, build):
+        mgr, _, _ = build(
+            global_ttl=1800.0,
+            server_cache_ttl=600.0,
+            tools=[_tool("t")],
+            tool_overrides={"t": ToolOverrideConfig(cache_ttl_seconds=42.0)},
+        )
+        assert _resolve_ttl(mgr, "t") == 42.0
+
+    def test_none_at_tool_level_inherits_server(self, build):
+        mgr, _, _ = build(
+            global_ttl=1800.0,
+            server_cache_ttl=600.0,
+            tools=[_tool("t")],
+            tool_overrides={"t": ToolOverrideConfig(cache_ttl_seconds=None)},
+        )
+        assert _resolve_ttl(mgr, "t") == 600.0  # None = inherit, not never-expires
+
+    def test_none_at_both_levels_inherits_global(self, build):
+        mgr, _, _ = build(global_ttl=1800.0, tools=[_tool("t")])
+        assert _resolve_ttl(mgr, "t") == 1800.0
+
+    def test_unknown_server_returns_global(self, build):
+        mgr, _, _ = build(global_ttl=1800.0)
+        assert mgr._resolve_cache_ttl("nope", "t", cfg_snap=mgr._config) == 1800.0
+
+    def test_zero_override_is_a_real_value_not_inherit(self, build):
+        # 0 (disable) must be distinct from None (inherit): a tool override of 0
+        # must NOT fall through to the 1800s server/global value.
+        mgr, _, _ = build(
+            global_ttl=1800.0,
+            server_cache_ttl=600.0,
+            tools=[_tool("t")],
+            tool_overrides={"t": ToolOverrideConfig(cache_ttl_seconds=0)},
+        )
+        assert _resolve_ttl(mgr, "t") == 0
+
+    def test_global_none_never_expires_passes_through(self, build):
+        # The global never-expires sentinel survives resolution when nothing
+        # overrides it.
+        mgr, _, _ = build(global_ttl=None, tools=[_tool("t")])
+        assert _resolve_ttl(mgr, "t") is None
+
+
+class TestCacheTtlConfigConstraint:
+    def test_negative_tool_ttl_rejected(self):
+        with pytest.raises(ValidationError):
+            ToolOverrideConfig(cache_ttl_seconds=-1)
+
+    def test_negative_server_ttl_rejected(self):
+        # prefix is supplied so the ONLY validation error is the negative ttl.
+        with pytest.raises(ValidationError):
+            UpstreamServerConfig(prefix="t", cache_ttl_seconds=-1)
+
+    def test_zero_and_none_allowed(self):
+        assert ToolOverrideConfig(cache_ttl_seconds=0).cache_ttl_seconds == 0
+        assert UpstreamServerConfig(prefix="t", cache_ttl_seconds=0).cache_ttl_seconds == 0
+        assert ToolOverrideConfig().cache_ttl_seconds is None  # default = inherit
+        assert UpstreamServerConfig(prefix="t").cache_ttl_seconds is None
+
+
+# ── Integration: resolved TTL threads into store + gates serving ─────────
+
+
+@pytest.mark.asyncio
+class TestPerToolTtlOverrideBehavior:
+    async def test_positive_per_tool_ttl_threaded_into_store(self, build):
+        """A positive per-tool ``cache_ttl_seconds`` is the ttl the entry is stored
+        with — proves ``_store_cache`` uses the resolved value, not the global."""
+        mgr, _, cache = build(
+            tools=[_tool("reader", _ann(read_only=True))],
+            tool_overrides={"reader": ToolOverrideConfig(cache_ttl_seconds=120.0)},
+        )
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        with patch.object(cache, "set", wraps=cache.set) as set_spy:
+            await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        set_spy.assert_called_once()
+        assert set_spy.call_args.kwargs["ttl_seconds"] == 120.0
+
+    async def test_per_tool_ttl_zero_disables_only_that_tool(self, build):
+        """A per-tool ``cache_ttl_seconds`` of 0 bypasses the lookup and skips the
+        store for THAT tool (both calls hit upstream, nothing cached), while a
+        sibling tool on the SAME server still caches under the global TTL."""
+        mgr, _, cache = build(
+            tools=[_tool("vol"), _tool("plain")],
+            tool_overrides={"vol": ToolOverrideConfig(cache_ttl_seconds=0)},
+        )
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        # vol: ttl=0 → never served, never stored.
+        await mgr.call_tool("srv", "vol", {})
+        await mgr.call_tool("srv", "vol", {})
+        assert session.call_tool.await_count == 2
+        assert cache.get("srv", "vol", {}) is None
+
+        # plain on the same server: default global TTL → second call served.
+        await mgr.call_tool("srv", "plain", {"q": 1})
+        assert session.call_tool.await_count == 3  # first plain hits upstream
+        await mgr.call_tool("srv", "plain", {"q": 1})
+        assert session.call_tool.await_count == 3  # second served from cache
+        assert cache.get("srv", "plain", {"q": 1}) is not None
