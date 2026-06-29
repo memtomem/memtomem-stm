@@ -2400,7 +2400,12 @@ class HybridCompressor:
     """
 
     _SEPARATOR_TEMPLATE = "\n---\nRemaining content ({remaining} chars) — Table of Contents:\n\n"
-    _SEPARATOR_TRUNC_TEMPLATE = "\n---\nRemaining content ({remaining} chars, truncated):\n\n"
+    # The truncate separator is deliberately terse: the tail is run through
+    # TruncateCompressor, whose suffix already reports ``... (truncated, original:
+    # N chars)`` (where N == this remaining count). Repeating ``{remaining} chars,
+    # truncated`` here only duplicated both the count and the word "truncated" in
+    # the wire payload, so this marker just signals the head/tail boundary.
+    _SEPARATOR_TRUNC_TEMPLATE = "\n---\nRemaining content:\n\n"
 
     def __init__(
         self,
@@ -2452,7 +2457,7 @@ class HybridCompressor:
         if self._tail_mode == TailMode.TOC:
             separator = self._SEPARATOR_TEMPLATE.format(remaining=remaining)
         else:
-            separator = self._SEPARATOR_TRUNC_TEMPLATE.format(remaining=remaining)
+            separator = self._SEPARATOR_TRUNC_TEMPLATE
 
         toc_budget = max_chars - len(head) - len(separator)
         if toc_budget < _MIN_TAIL:
