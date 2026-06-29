@@ -629,25 +629,49 @@ async def stm_proxy_cache_clear(
     tool: str | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
-    """Clear the proxy response cache.
+    """Clear the proxy caches.
+
+    An unfiltered call flushes BOTH the SQLite response cache and the in-memory
+    surfacing result cache. A filtered call (``server`` and/or ``tool``) targets
+    only the response cache — the surfacing cache is keyed by query hash and has
+    no server/tool axis, so it cannot be selectively cleared. The startup-only
+    tool-graph consult disk cache is not touched (it only affects the next
+    restart).
 
     Args:
-        server: If given, only clear entries for this upstream server name (the name used in mms add, not the prefix).
-        tool: If given, only clear entries for this tool (across all servers, or scoped to server if both provided).
+        server: If given, only clear response-cache entries for this upstream server name (the name used in mms add, not the prefix).
+        tool: If given, only clear response-cache entries for this tool (across all servers, or scoped to server if both provided).
     """
     app = _get_ctx(ctx)
     pm = app.proxy_manager
-    if not hasattr(pm, "_cache") or pm._cache is None:
-        return "Cache not enabled. Set proxy.cache.enabled = true in stm_proxy.json."
+    proxy_cache = getattr(pm, "_cache", None)
+    engine = app.surfacing_engine
 
-    removed = pm._cache.clear(server=server, tool=tool)
-    if server and tool:
-        return f"Cleared {removed} cache entries for {server}/{tool}."
-    elif server:
-        return f"Cleared {removed} cache entries for server '{server}'."
-    elif tool:
-        return f"Cleared {removed} cache entries for tool '{tool}'."
-    return f"Cleared all {removed} cache entries."
+    # Filtered: response cache only (surfacing has no server/tool dimension).
+    # Preserve the original proxy-only behavior and messages exactly.
+    if server or tool:
+        if proxy_cache is None:
+            return "Cache not enabled. Set proxy.cache.enabled = true in stm_proxy.json."
+        removed = proxy_cache.clear(server=server, tool=tool)
+        if server and tool:
+            return f"Cleared {removed} cache entries for {server}/{tool}."
+        elif server:
+            return f"Cleared {removed} cache entries for server '{server}'."
+        else:
+            return f"Cleared {removed} cache entries for tool '{tool}'."
+
+    # Unfiltered "clear all": flush each enabled cache independently.
+    parts: list[str] = []
+    if proxy_cache is not None:
+        parts.append(f"{proxy_cache.clear()} response-cache")
+    if engine is not None:
+        parts.append(f"{engine.clear_cache()} surfacing-cache")
+    if not parts:
+        return (
+            "No caches enabled (response cache and surfacing are both not enabled). "
+            "Set proxy.cache.enabled = true and/or surfacing.enabled = true in stm_proxy.json."
+        )
+    return "Cleared all caches: " + ", ".join(parts) + " entries."
 
 
 # ---------------------------------------------------------------------------

@@ -245,6 +245,56 @@ class TestCacheClear:
         assert "srv/t" in result
         mock_cache.clear.assert_called_once_with(server="srv", tool="t")
 
+    async def test_unfiltered_flushes_both_caches(self):
+        """An unfiltered call flushes the response cache AND the surfacing cache."""
+        pm = _make_proxy_manager()
+        mock_cache = MagicMock()
+        mock_cache.clear.return_value = 7
+        pm._cache = mock_cache
+        engine = MagicMock()
+        engine.clear_cache.return_value = 3
+
+        ctx = _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+        result = await stm_proxy_cache_clear(ctx=ctx)
+
+        mock_cache.clear.assert_called_once_with()  # no server/tool filter
+        engine.clear_cache.assert_called_once_with()
+        assert "7" in result and "3" in result
+        assert "response-cache" in result and "surfacing-cache" in result
+
+    async def test_filtered_does_not_touch_surfacing(self):
+        """A server/tool-filtered call targets only the response cache.
+
+        The surfacing cache is keyed by query hash with no server/tool axis, so
+        a filtered clear must leave it untouched (and keep the old wording)."""
+        pm = _make_proxy_manager()
+        mock_cache = MagicMock()
+        mock_cache.clear.return_value = 2
+        pm._cache = mock_cache
+        engine = MagicMock()
+
+        ctx = _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+        result = await stm_proxy_cache_clear(server="srv", ctx=ctx)
+
+        engine.clear_cache.assert_not_called()
+        mock_cache.clear.assert_called_once_with(server="srv", tool=None)
+        assert "server 'srv'" in result
+
+    async def test_unfiltered_flushes_surfacing_when_proxy_cache_disabled(self):
+        """Proxy cache off but surfacing on: the unfiltered call still flushes
+        surfacing (the old handler returned early and could never reach it)."""
+        pm = _make_proxy_manager()
+        pm._cache = None
+        engine = MagicMock()
+        engine.clear_cache.return_value = 4
+
+        ctx = _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+        result = await stm_proxy_cache_clear(ctx=ctx)
+
+        engine.clear_cache.assert_called_once_with()
+        assert "4" in result and "surfacing-cache" in result
+        assert "response-cache" not in result  # proxy cache absent, not reported
+
 
 # ── stm_proxy_health ─────────────────────────────────────────────────────
 

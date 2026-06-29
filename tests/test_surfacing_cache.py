@@ -78,13 +78,14 @@ class TestSurfacingCacheEviction:
 
 
 class TestSurfacingCacheClear:
-    def test_clear_removes_all(self):
+    def test_clear_removes_all_and_returns_count(self):
         cache = SurfacingCache(ttl=60.0)
         cache.set("q1", ["r1"])
         cache.set("q2", ["r2"])
-        cache.clear()
+        assert cache.clear() == 2  # reports how many entries were dropped
         assert cache.get("q1") is None
         assert cache.get("q2") is None
+        assert cache.clear() == 0  # empty cache clears nothing
 
 
 class TestSurfacingCacheHashDeterminism:

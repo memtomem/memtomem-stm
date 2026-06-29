@@ -151,6 +151,18 @@ class SurfacingEngine:
         for unconditional recording is not exposed here."""
         return self._observability_public
 
+    def clear_cache(self) -> int:
+        """Flush the in-memory surfacing result cache (operator flush, reached
+        from ``server.py::stm_proxy_cache_clear``). Returns the number of cached
+        query entries dropped.
+
+        Scoped to the result cache ONLY. The cross-session ``_surfaced_ids``
+        dedup set and the ``_invalidated_ids`` feedback set are left intact:
+        clearing the former would resurface memories already shown this session,
+        and the latter is a strict subset of surfacings that is inert once the
+        result cache is empty (it only filters cache hits)."""
+        return self._cache.clear()
+
     def _persistable_query(self, query: str) -> str:
         """Return the form of ``query`` that gets written to
         ``surfacing_events.query`` (#352 part 3).

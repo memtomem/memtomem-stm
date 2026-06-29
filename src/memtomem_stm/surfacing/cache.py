@@ -44,8 +44,11 @@ class SurfacingCache:
             del self._cache[oldest_key]
         self._cache[key] = (time.monotonic(), results)
 
-    def clear(self) -> None:
+    def clear(self) -> int:
+        """Drop every cached entry; returns the number of entries removed."""
+        n = len(self._cache)
         self._cache.clear()
+        return n
 
     @staticmethod
     def _hash(query: str) -> str:
