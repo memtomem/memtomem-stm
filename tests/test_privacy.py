@@ -159,6 +159,19 @@ class TestDefaultPatternCoverage:
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
             "-----BEGIN PGP PRIVATE KEY-----",
+            # --- #1488 LTM-origin mirror (all examples are FAKE; assembled at
+            #     runtime so no contiguous realistic token literal trips GitHub
+            #     push protection) -----------------------------------------
+            # Modern OpenAI key: legacy ``sk-`` rule misses it (hyphen after
+            # "proj" halts the run) — hits via the T3BlbkFJ marker rule.
+            "sk-proj-FAKE0aaaa1111bbbb2222cccc3333T3Blbk" + "FJEXAMPLE0dddd4444eeee5555ffff6666",
+            "sk-ant-api03-" + ("FAKEfake0123456789" * 6)[:93] + "AA",  # Anthropic
+            "ghs_" + "FAKEfake0123456789FAKEfake0123456789",  # GitHub server-to-server
+            "AIza" + "Sy0_-BcdSy0_-BcdSy0_-BcdSy0_-BcdSy0",  # Google API key (AIza + 35)
+            "glpat-" + ("FAKEfake0123456789" * 2)[:20],  # GitLab PAT (exact 20)
+            "hf" + "_FAKEfake0123456789FAKEfake01234567",  # Hugging Face (hf_ + 34)
+            "pypi-Ag"
+            + "EIcHlwaS5vcmcFAKEfake0123456789FAKEfake0123456789FAKEfake0123456789",  # PyPI
         ],
     )
     def test_default_patterns_match_common_secret_shapes(self, sample: str) -> None:
@@ -176,6 +189,15 @@ class TestDefaultPatternCoverage:
             "AKIAshort",  # missing the 16-char IAM suffix
             "github_pat_",  # just the prefix, no body
             "npm_",  # prefix only
+            # --- #1488 mirror false-positive guards: prose / kebab slugs that
+            #     share a provider prefix but must NOT match -----------------
+            "sk-project-management-tool",  # OpenAI prefix, no T3BlbkFJ marker
+            "sk-ant-api03-release-notes-2026-migration-guide",  # Anthropic kebab slug
+            "ghost_writer_mode_enabled",  # starts "gho" but not a gho_ token
+            "AIzaShortKey",  # AIza prefix but body too short
+            "glpat-form-builder-component-name-2026",  # GitLab kebab slug
+            "hf" + "_abcdefghijklmnopqrstuvwxyzabcdefgh",  # hf_ + 34 letters, no digit
+            "pypi-package-name-here",  # pypi- prefix without the macaroon header
         ],
     )
     def test_default_patterns_do_not_match_benign_strings(self, sample: str) -> None:
@@ -208,6 +230,15 @@ class TestCredentialPiiSplit:
         assert privacy.PII_PATTERNS
         assert not set(privacy.CREDENTIAL_PATTERNS) & set(privacy.PII_PATTERNS)
 
+    def test_credential_set_count_pinned(self):
+        # 9 original secret-class patterns + 7 mirrored from memtomem LTM
+        # (#1488 / reverse sync #1491). Bump deliberately when adding a
+        # pattern so a silent add/drop surfaces here and stays coherent with
+        # LTM's matching pin (memtomem DEFAULT_PATTERNS == 16).
+        assert len(privacy.CREDENTIAL_PATTERNS) == 16
+        assert len(privacy.PII_PATTERNS) == 1
+        assert len(privacy.DEFAULT_PATTERNS) == 17
+
     @pytest.mark.parametrize(
         "sample",
         [
@@ -227,6 +258,15 @@ class TestCredentialPiiSplit:
             "psql password=hunter2",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",
             "-----BEGIN RSA PRIVATE KEY-----",
+            # #1488 mirror: each must classify as a credential (not PII) so the
+            # ACTION gate (external-LLM routing) fires, not just storage.
+            "sk-proj-FAKE0aaaa1111bbbb2222cccc3333T3Blbk" + "FJEXAMPLE0dddd4444eeee5555ffff6666",
+            "sk-ant-api03-" + ("FAKEfake0123456789" * 6)[:93] + "AA",
+            "ghs_" + "FAKEfake0123456789FAKEfake0123456789",
+            "AIza" + "Sy0_-BcdSy0_-BcdSy0_-BcdSy0_-BcdSy0",
+            "glpat-" + ("FAKEfake0123456789" * 2)[:20],
+            "hf" + "_FAKEfake0123456789FAKEfake01234567",
+            "pypi-Ag" + "EIcHlwaS5vcmcFAKEfake0123456789FAKEfake0123456789FAKEfake0123456789",
         ],
     )
     def test_credentials_match_via_credential_set_alone(self, sample: str) -> None:
