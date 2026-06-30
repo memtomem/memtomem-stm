@@ -3113,9 +3113,20 @@ class ProxyManager:
         if non_text_content:
             # A non-text / mixed response is never STORED (only its text twin for
             # the same key could have been). Invalidate that prior row when caching
-            # is disabled (resolved ttl<=0); the store-side ttl<=0 self-heal below
-            # runs only on the text path. The non-text-ONLY response early-returns
+            # is disabled (resolved ttl<=0); the explicit ttl<=0 branch below does
+            # the same for text responses. The non-text-ONLY response early-returns
             # in ``_call_tool_inner`` and invalidates there instead.
+            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            return
+        cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
+        if cache_ttl is not None and cache_ttl <= 0:
+            # Caching is disabled (resolved ttl<=0): a text response is never
+            # stored either — every branch below would either skip the store or
+            # call ``set(ttl<=0)`` (which only deletes). Collapse them here so a
+            # stale prior positive-TTL row is invalidated regardless of the skip
+            # reason (cache-ineligible / progressive passthrough / transient key),
+            # not only on the path that happens to reach ``set`` (#541; surfaced
+            # by the codex review of #550).
             self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             return
         if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
@@ -3146,7 +3157,7 @@ class ProxyManager:
                     tool,
                     cache_args,
                     comp.compressed,
-                    ttl_seconds=self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap),
+                    ttl_seconds=cache_ttl,
                 )
             except Exception:
                 logger.warning(
@@ -3237,6 +3248,9 @@ class ProxyManager:
                 # this key is dropped while caching is disabled (#541).
                 self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
                 return non_text_content
+            # A truly-empty upstream response is never stored either; invalidate a
+            # stale prior text row for this key while caching is disabled (#541).
+            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             return "[empty response]"
         original_text = shaped.original_text
 
@@ -3259,6 +3273,12 @@ class ProxyManager:
 
             tool_err = ToolError(original_text)
             _mark_recorded(tool_err)
+            # The error raises before the Stage-5 store, so a text-bearing error
+            # (text-only or mixed) under a disabled cache (ttl<=0) would otherwise
+            # leave a prior cached text row for this key live. A non-text-ONLY
+            # error has no text and is invalidated by the passthrough branch above
+            # instead; here we cover the text-bearing shapes (#541).
+            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             raise tool_err
 
         # Resolve effective settings (using config snapshot)
