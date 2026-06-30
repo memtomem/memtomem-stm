@@ -41,6 +41,9 @@ coverage.xml
 .dev-trio/
 scripts/
 CLAUDE.local.md
+# Internal review/audit reports — kept local; promoted docs live in the
+# private memtomem-docs repo, never committed to this public repo.
+docs/reports/
 
 # Generated JS dependencies (no root npm project in this repo)
 node_modules/
