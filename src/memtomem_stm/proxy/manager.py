@@ -3237,6 +3237,9 @@ class ProxyManager:
                 # this key is dropped while caching is disabled (#541).
                 self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
                 return non_text_content
+            # A truly-empty upstream response is never stored either; invalidate a
+            # stale prior text row for this key while caching is disabled (#541).
+            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             return "[empty response]"
         original_text = shaped.original_text
 
@@ -3259,6 +3262,12 @@ class ProxyManager:
 
             tool_err = ToolError(original_text)
             _mark_recorded(tool_err)
+            # The error raises before the Stage-5 store, so a text-bearing error
+            # (text-only or mixed) under a disabled cache (ttl<=0) would otherwise
+            # leave a prior cached text row for this key live. A non-text-ONLY
+            # error has no text and is invalidated by the passthrough branch above
+            # instead; here we cover the text-bearing shapes (#541).
+            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             raise tool_err
 
         # Resolve effective settings (using config snapshot)

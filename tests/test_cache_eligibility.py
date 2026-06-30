@@ -61,6 +61,21 @@ def _mixed_result(text="payload"):
     )
 
 
+def _error_result(text="boom"):
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=True)
+
+
+def _mixed_error_result(text="boom"):
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=text), _image_content()],
+        isError=True,
+    )
+
+
+def _empty_result():
+    return SimpleNamespace(content=[], isError=False)
+
+
 def _build(
     tmp_path: Path,
     *,
@@ -572,3 +587,63 @@ class TestTtlZeroNonTextInvalidation:
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.await_count == 3  # not served from the stale row
         assert cache.get("srv", "reader", {"q": "a"}) is not None  # fresh row cached
+
+
+@pytest.mark.asyncio
+class TestTtlZeroErrorAndEmptyInvalidation:
+    """#541 follow-through (codex review of PR #548): the error-raise and the
+    truly-empty early returns in ``_call_tool_inner`` also happen BEFORE the
+    Stage-5 store, so a text-bearing error (text-only or mixed) or an empty
+    response under a disabled (``ttl<=0``) cache must invalidate a prior cached
+    text row too — otherwise it resurfaces once the TTL is raised back within the
+    row's frozen window. (A non-text-ONLY error has no text and is handled by the
+    passthrough branch, covered in ``TestTtlZeroNonTextInvalidation``.)"""
+
+    async def test_mixed_error_invalidates_prior_text_row(self, build):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _mixed_error_result("boom")
+        with pytest.raises(ToolError):
+            await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+
+    async def test_text_only_error_invalidates_prior_text_row(self, build):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _error_result("boom")
+        with pytest.raises(ToolError):
+            await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert cache.get("srv", "reader", {"q": "a"}) is None
+
+    async def test_empty_response_invalidates_prior_text_row(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _empty_result()
+        result = await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert result == "[empty response]"
+        assert cache.get("srv", "reader", {"q": "a"}) is None
