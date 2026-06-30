@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 from typing import Literal
@@ -129,6 +130,23 @@ class HookConfig(BaseModel):
     ``MEMTOMEM_STM_HOOK__METRICS_ENABLED=0``."""
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True if ``host`` is a loopback bind target.
+
+    Accepts the literal hostname ``localhost`` plus any loopback IP — the whole
+    ``127.0.0.0/8`` range and IPv6 ``::1`` (incl. expanded / IPv4-mapped forms)
+    — via :mod:`ipaddress`. Everything else (``0.0.0.0``, ``""`` which binds all
+    interfaces, arbitrary hostnames) is non-loopback. Keyed on the address, not
+    a fixed string allowlist, so legitimate loopback forms aren't false-rejected.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class DaemonConfig(BaseModel):
     """Local surfacing daemon (``mms daemon``) settings — Stage 2.
 
@@ -137,11 +155,29 @@ class DaemonConfig(BaseModel):
     host: str = "127.0.0.1"
     """Loopback bind address. The daemon is local-only and authenticated by a
     per-start random token, not by network ACLs — never bind a non-loopback
-    address."""
+    address. A non-loopback ``host`` (including ``0.0.0.0`` and ``""``, which
+    bind every interface) is rejected unless ``allow_non_loopback`` is set."""
+    allow_non_loopback: bool = False
+    """Escape hatch for a deliberate non-loopback bind. Off by default so a
+    stray ``MEMTOMEM_STM_DAEMON__HOST=0.0.0.0`` fails fast at config load
+    instead of silently exposing the token-guarded daemon on a network
+    interface. Set ``MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK=true`` to override."""
     idle_timeout_seconds: float = Field(default=900.0, ge=0.0)
     """Shut the daemon (and its warm LTM child) down after this many seconds
     with no requests, so an abandoned coding session doesn't leak a
     multi-GB process forever. ``0`` disables idle shutdown (pin the process)."""
+
+    @model_validator(mode="after")
+    def _reject_non_loopback_host(self) -> "DaemonConfig":
+        if not self.allow_non_loopback and not _is_loopback_host(self.host):
+            raise ValueError(
+                f"DaemonConfig.host={self.host!r} is not a loopback address. The "
+                "surfacing daemon is local-only and authenticated by a per-start "
+                "token, not network ACLs, so a non-loopback bind exposes it on "
+                "that interface. Set MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK=true "
+                "to override intentionally."
+            )
+        return self
 
 
 class STMConfig(BaseSettings):

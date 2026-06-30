@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from memtomem_stm.config import LangfuseConfig, STMConfig
+from memtomem_stm.config import DaemonConfig, LangfuseConfig, STMConfig
 from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     ExtractionConfig,
@@ -540,3 +540,37 @@ class TestLogLevel:
         monkeypatch.setenv("MEMTOMEM_STM_LOG_LEVEL", "DEBUG")
         cfg = STMConfig()
         assert cfg.log_level == "DEBUG"
+
+
+class TestDaemonHostConstraint:
+    """The surfacing daemon is token-authenticated and local-only; a
+    non-loopback ``host`` is rejected unless explicitly opted into."""
+
+    def test_default_is_loopback(self) -> None:
+        assert DaemonConfig().host == "127.0.0.1"
+
+    @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.0.0.2", "::1"])
+    def test_loopback_forms_accepted(self, host: str) -> None:
+        # Whole 127.0.0.0/8 + ::1 + the literal localhost — not a 3-string allowlist.
+        assert DaemonConfig(host=host).host == host
+
+    @pytest.mark.parametrize("host", ["0.0.0.0", "", "10.0.0.5", "::", "evil.example.com"])
+    def test_non_loopback_rejected_without_optin(self, host: str) -> None:
+        # ``""`` and ``0.0.0.0`` both bind every interface; arbitrary hostnames
+        # and routable IPs are non-loopback. All fail closed.
+        with pytest.raises(ValidationError):
+            DaemonConfig(host=host)
+
+    def test_non_loopback_allowed_with_optin(self) -> None:
+        cfg = DaemonConfig(host="0.0.0.0", allow_non_loopback=True)
+        assert cfg.host == "0.0.0.0"
+
+    def test_rejected_via_stmconfig_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_DAEMON__HOST", "0.0.0.0")
+        with pytest.raises(ValidationError):
+            STMConfig()
+
+    def test_allowed_via_stmconfig_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_DAEMON__HOST", "0.0.0.0")
+        monkeypatch.setenv("MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK", "true")
+        assert STMConfig().daemon.host == "0.0.0.0"
