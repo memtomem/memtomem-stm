@@ -647,3 +647,33 @@ class TestTtlZeroErrorAndEmptyInvalidation:
 
         assert result == "[empty response]"
         assert cache.get("srv", "reader", {"q": "a"}) is None
+
+
+@pytest.mark.asyncio
+class TestTtlZeroTextStoreSkipInvalidation:
+    """#541 follow-through (codex review of PR #550): the text store-skip branches
+    in ``_store_cache`` (cache-ineligible, progressive-passthrough-on-error,
+    transient-key) bypass ``ProxyCache.set`` and so never reach its ``ttl<=0``
+    self-heal. Under a disabled cache a TEXT response that takes one of those
+    branches must still invalidate a stale prior row — guaranteed by hoisting the
+    ``ttl<=0`` invalidation above the whole skip chain (it short-circuits before
+    any skip reason is evaluated)."""
+
+    async def test_ineligible_text_response_invalidates_prior_row_under_ttl_zero(self, build):
+        # Cache a row while the tool is eligible and the TTL is positive.
+        mgr, _, cache = build(tools=[_tool("t")])  # unannotated → eligible
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "t", {"q": "a"})
+        assert cache.get("srv", "t", {"q": "a"}) is not None
+
+        # Disable caching globally AND make the tool cache-ineligible (cache=False).
+        # Without the hoisted ttl<=0 invalidation, _store_cache would take the
+        # "not cache-eligible" skip branch (before reaching set()) and leave the
+        # stale row live, to resurface once the TTL is raised back.
+        mgr._config.cache.default_ttl_seconds = 0
+        mgr._connections["srv"].config.tool_overrides["t"] = ToolOverrideConfig(cache=False)
+        session.call_tool.return_value = _text_result("new-payload")
+        await mgr.call_tool("srv", "t", {"q": "a"})
+
+        assert cache.get("srv", "t", {"q": "a"}) is None  # stale row invalidated
