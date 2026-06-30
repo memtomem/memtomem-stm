@@ -3035,6 +3035,35 @@ class ProxyManager:
         # conservative: cache unless the tool self-declares as a writer.
         return not (read_only is False or destructive is True)
 
+    def _invalidate_disabled_cache(
+        self, server: str, tool: str, cache_args: dict[str, Any], *, cfg_snap: ProxyConfig
+    ) -> None:
+        """Best-effort delete of any cached row for ``(server, tool, cache_args)``
+        when the resolved TTL is ``<= 0`` (caching disabled), for a non-text /
+        mixed response.
+
+        The store-side ``ttl<=0`` self-heal in ``ProxyCache.set`` only runs on the
+        TEXT store path (the store is gated text-only). A non-text / mixed response
+        never reaches it, so a row left behind by an EARLIER text response for the
+        same key survives — and once the TTL is raised back within that row's frozen
+        window the lookup serves the stale text (#541). Resolving the TTL is a
+        config read (no I/O); the DELETE runs only on the ``ttl<=0`` path, bounded
+        to the non-text calls that actually occur — preserving #536's zero-I/O
+        posture for the steady-state text / no-row disabled-cache path."""
+        if self._cache is None:
+            return
+        ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
+        if ttl is not None and ttl <= 0:
+            try:
+                self._cache.invalidate(server, tool, cache_args)
+            except Exception:
+                logger.warning(
+                    "Cache invalidation failed for %s/%s — response unaffected",
+                    server,
+                    tool,
+                    exc_info=True,
+                )
+
     def _store_cache(
         self,
         *,
@@ -3079,44 +3108,53 @@ class ProxyManager:
         trace-mutated upstream args; otherwise every entry is keyed on a per-request
         hex and is unreachable by any future lookup (hit rate structurally 0%).
         """
-        if self._cache is not None and not non_text_content:
-            if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
-                logger.debug(
-                    "Skipping cache store for %s/%s: tool is not cache-eligible "
-                    "(mutating tool under the annotation policy, or cache override=false)",
+        if self._cache is None:
+            return
+        if non_text_content:
+            # A non-text / mixed response is never STORED (only its text twin for
+            # the same key could have been). Invalidate that prior row when caching
+            # is disabled (resolved ttl<=0); the store-side ttl<=0 self-heal below
+            # runs only on the text path. The non-text-ONLY response early-returns
+            # in ``_call_tool_inner`` and invalidates there instead.
+            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            return
+        if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
+            logger.debug(
+                "Skipping cache store for %s/%s: tool is not cache-eligible "
+                "(mutating tool under the annotation policy, or cache override=false)",
+                server,
+                tool,
+            )
+        elif comp.progressive_passthrough_on_error:
+            logger.debug(
+                "Skipping cache store for %s/%s: progressive passthrough "
+                "degradation (transient store failure)",
+                server,
+                tool,
+            )
+        elif response_carries_transient_key(comp.compressed):
+            logger.debug(
+                "Skipping cache store for %s/%s: response carries a transient "
+                "retrieval key (progressive/selective TOC)",
+                server,
+                tool,
+            )
+        else:
+            try:
+                self._cache.set(
                     server,
                     tool,
+                    cache_args,
+                    comp.compressed,
+                    ttl_seconds=self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap),
                 )
-            elif comp.progressive_passthrough_on_error:
-                logger.debug(
-                    "Skipping cache store for %s/%s: progressive passthrough "
-                    "degradation (transient store failure)",
+            except Exception:
+                logger.warning(
+                    "Cache store failed for %s/%s — response unaffected",
                     server,
                     tool,
+                    exc_info=True,
                 )
-            elif response_carries_transient_key(comp.compressed):
-                logger.debug(
-                    "Skipping cache store for %s/%s: response carries a transient "
-                    "retrieval key (progressive/selective TOC)",
-                    server,
-                    tool,
-                )
-            else:
-                try:
-                    self._cache.set(
-                        server,
-                        tool,
-                        cache_args,
-                        comp.compressed,
-                        ttl_seconds=self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap),
-                    )
-                except Exception:
-                    logger.warning(
-                        "Cache store failed for %s/%s — response unaffected",
-                        server,
-                        tool,
-                        exc_info=True,
-                    )
 
     async def _call_tool_inner(
         self,
@@ -3194,6 +3232,10 @@ class ProxyManager:
                         trace_id=trace_id,
                     )
                 )
+                # Non-text-only response is never stored; mirror the mixed-branch
+                # invalidation in ``_store_cache`` so a stale prior text row for
+                # this key is dropped while caching is disabled (#541).
+                self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
                 return non_text_content
             return "[empty response]"
         original_text = shaped.original_text
