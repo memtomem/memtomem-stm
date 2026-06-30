@@ -66,6 +66,7 @@ from memtomem_stm.mms.import_hosts import (
     ALL_HOSTS,
     ImportCandidate,
     discover,
+    project_local_gate_message,
 )
 from memtomem_stm.mms.secrets import redact_for_plan
 from memtomem_stm.mms.state import RegistryServer
@@ -167,8 +168,17 @@ def _classify_against_registry(
     is_flag=True,
     help="In --plan mode, reveal secret values instead of redacting.",
 )
+@click.option(
+    "--allow-project-configs",
+    is_flag=True,
+    help="Acknowledge and register MCP entries discovered in project-local "
+    "config files (.mcp.json / .cursor/mcp.json) under the current directory. "
+    "Without this flag, --apply refuses to register them.",
+)
 @with_write_lock
-def import_command(from_host: str, is_plan: bool, show_imported: bool) -> None:
+def import_command(
+    from_host: str, is_plan: bool, show_imported: bool, allow_project_configs: bool
+) -> None:
     """Import MCP definitions from host configs into the mms registry."""
     cwd = Path.cwd().resolve()
     candidates = discover(from_host, cwd)
@@ -181,6 +191,11 @@ def import_command(from_host: str, is_plan: bool, show_imported: bool) -> None:
 
     registry = state.load_registry()
     new, conflicts, idempotent = _classify_against_registry(candidates, registry)
+
+    # ADD candidates that came from project-local files under cwd — an
+    # untrusted repo checkout can ship these, so registering them is gated
+    # behind --allow-project-configs (see import_hosts.ImportCandidate).
+    repo_local_new = [cand for cand in new if cand.is_repo_local]
 
     # Render the plan. The same render runs in both --plan and --apply
     # modes — --apply just additionally writes the registry afterward.
@@ -214,10 +229,24 @@ def import_command(from_host: str, is_plan: bool, show_imported: bool) -> None:
                 )
                 click.echo(f"  mms import --from {from_host} --plan --show-imported")
                 click.echo("")
+        if repo_local_new and not allow_project_configs:
+            n = len(repo_local_new)
+            click.echo(
+                f"  {n} new entr{'y' if n == 1 else 'ies'} from project-local config under "
+                "cwd; --apply will require --allow-project-configs."
+            )
+            click.echo("")
         click.echo(f"To apply: mms import --from {from_host} --apply")
         return
 
     # --apply
+    # Fail closed before any write when the ADD set includes project-local
+    # candidates (an untrusted repo checkout can ship .mcp.json /
+    # .cursor/mcp.json) and the user hasn't acknowledged them.
+    if repo_local_new and not allow_project_configs:
+        click.echo(project_local_gate_message([cand.name for cand in repo_local_new]), err=True)
+        raise SystemExit(2)
+
     # Load existing sidecar up front — needed to decide whether any
     # idempotent entries require backfill (sidecar row missing for an
     # entry that is already in the registry).

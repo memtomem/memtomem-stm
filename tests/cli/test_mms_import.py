@@ -38,6 +38,11 @@ def _seed_claude_code(sandbox, mcps: dict) -> None:
     (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
 
 
+def _seed_dot_mcp_json(sandbox, mcps: dict) -> None:
+    """Write ``<cwd>/.mcp.json`` — a project-local (repo-shippable) source."""
+    (sandbox["cwd"] / ".mcp.json").write_text(json.dumps({"mcpServers": mcps}), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # --plan default
 # ---------------------------------------------------------------------------
@@ -474,6 +479,60 @@ class TestCrossHostConflict:
 
 
 # ---------------------------------------------------------------------------
+# --allow-project-configs gate
+# ---------------------------------------------------------------------------
+
+
+class TestProjectConfigGate:
+    """``--apply`` must not silently register MCP entries from project-local
+    config (``<cwd>/.mcp.json`` / ``<cwd>/.cursor/mcp.json``) that an untrusted
+    repo checkout can ship — they require explicit ``--allow-project-configs``."""
+
+    def test_apply_aborts_on_project_local_without_flag(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"evil": {"command": "x"}})
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res.exit_code == 2, res.output
+        assert "--allow-project-configs" in res.output
+        assert "evil" in res.output
+        # Fail closed: nothing written.
+        assert not state.registry_path().exists()
+
+    def test_apply_succeeds_with_flag(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"local-tool": {"command": "echo"}})
+        res = runner.invoke(
+            import_command,
+            ["--from", "claude-code", "--apply", "--allow-project-configs"],
+        )
+        assert res.exit_code == 0, res.output
+        assert "local-tool" in state.load_registry().servers
+
+    def test_apply_user_config_not_gated(self, runner, sandbox):
+        # A user-scope (~/.claude.json) entry is trusted — applies without the flag.
+        _seed_claude_code(sandbox, {"trusted": {"command": "echo"}})
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res.exit_code == 0, res.output
+        assert "trusted" in state.load_registry().servers
+
+    def test_home_stored_project_scope_not_gated(self, runner, sandbox):
+        # ``.projects.<cwd>`` lives in the user's home ~/.claude.json — a repo
+        # checkout cannot ship it, so it is NOT gated.
+        cwd = sandbox["cwd"].resolve()
+        cfg = {"projects": {str(cwd): {"mcpServers": {"homeproj": {"command": "echo"}}}}}
+        (sandbox["home"] / ".claude.json").write_text(json.dumps(cfg), encoding="utf-8")
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        assert res.exit_code == 0, res.output
+        assert "homeproj" in state.load_registry().servers
+
+    def test_plan_notes_project_local_requirement(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"local-tool": {"command": "echo"}})
+        res = runner.invoke(import_command, ["--from", "claude-code"])  # --plan default
+        assert res.exit_code == 0, res.output
+        assert "--allow-project-configs" in res.output
+        # Plan never mutates.
+        assert not state.registry_path().exists()
+
+
+# ---------------------------------------------------------------------------
 # Wire-in smoke
 # ---------------------------------------------------------------------------
 
@@ -487,3 +546,4 @@ def test_import_wired_into_top_level_cli(runner):
     assert "--plan" in res.output
     assert "--apply" in res.output
     assert "--show-imported" in res.output
+    assert "--allow-project-configs" in res.output

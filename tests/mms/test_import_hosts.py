@@ -184,6 +184,7 @@ class TestScanClaudeCode:
         assert names == {"filesystem", "github"}
         for c in candidates:
             assert c.source_label == "Claude Code (user)"
+            assert c.is_repo_local is False
 
         gh = next(c for c in candidates if c.name == "github")
         assert gh.env_classification["GITHUB_TOKEN"].is_secret is True
@@ -205,6 +206,9 @@ class TestScanClaudeCode:
         candidates = ih.scan_claude_code(cwd)
         assert len(candidates) == 1
         assert candidates[0].source_label == "Claude Code (project)"
+        # Home-stored (~/.claude.json .projects.<cwd>) — NOT repo-local, so a
+        # repo checkout can't ship it; must not be gated.
+        assert candidates[0].is_repo_local is False
 
     def test_dot_mcp_json(self, sandbox_home, tmp_path):
         cfg = {"mcpServers": {"local-tool": {"command": "echo"}}}
@@ -213,6 +217,8 @@ class TestScanClaudeCode:
         assert len(candidates) == 1
         assert candidates[0].source_label == ".mcp.json (project)"
         assert candidates[0].name == "local-tool"
+        # <cwd>/.mcp.json — a repo checkout can ship this, so it is repo-local.
+        assert candidates[0].is_repo_local is True
 
     def test_self_reference_filtered(self, sandbox_home, tmp_path):
         cfg = {
@@ -258,6 +264,7 @@ class TestScanCursor:
         candidates = ih.scan_cursor(cwd)
         assert len(candidates) == 1
         assert candidates[0].source_label == "Cursor (user)"
+        assert candidates[0].is_repo_local is False
 
     def test_project_scope(self, sandbox_home, tmp_path):
         cwd = tmp_path / "proj"
@@ -269,11 +276,25 @@ class TestScanCursor:
         candidates = ih.scan_cursor(cwd)
         assert len(candidates) == 1
         assert candidates[0].source_label == "Cursor (project)"
+        # <cwd>/.cursor/mcp.json — repo-local, gated.
+        assert candidates[0].is_repo_local is True
 
     def test_missing_returns_empty(self, sandbox_home, tmp_path):
         cwd = tmp_path / "proj"
         cwd.mkdir()
         assert ih.scan_cursor(cwd) == []
+
+
+class TestProjectLocalGateMessage:
+    def test_names_sorted_count_and_flag(self):
+        msg = ih.project_local_gate_message(["beta", "alpha"])
+        assert "2 MCP entries" in msg
+        assert "alpha, beta" in msg  # sorted
+        assert "--allow-project-configs" in msg
+        assert ".mcp.json" in msg
+
+    def test_singular(self):
+        assert "1 MCP entry" in ih.project_local_gate_message(["solo"])
 
 
 class TestScanCodex:

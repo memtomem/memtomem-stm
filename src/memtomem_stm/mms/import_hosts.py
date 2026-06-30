@@ -139,12 +139,22 @@ class ImportCandidate:
     ``--plan`` to decide which env values to redact in output.
     ``source_label`` is what ``mms import --plan`` prints next to the
     name — e.g. ``"Claude Code (user)"``.
+
+    ``is_repo_local`` marks candidates that came from a config file *under
+    the current working directory* (``<cwd>/.mcp.json`` or
+    ``<cwd>/.cursor/mcp.json``) — files an untrusted repository checkout can
+    contain. It gates registration in ``mms import``/``mms host sync``
+    (``--allow-project-configs``). It is keyed on the source *file location*,
+    not the ``source_label``: ``"Claude Code (project)"`` candidates live in
+    the user's home ``~/.claude.json`` (``.projects.<cwd>``) and are NOT
+    repo-local.
     """
 
     name: str
     server: RegistryServer
     env_classification: dict[str, Classification]
     source_label: str
+    is_repo_local: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +221,9 @@ def _to_registry_server(name: str, raw: dict[str, Any]) -> RegistryServer | None
     return RegistryServer(command=command, args=args, env=env, prefix=_derive_prefix(name))
 
 
-def _wrap(name: str, raw: dict[str, Any], source_label: str) -> ImportCandidate | None:
+def _wrap(
+    name: str, raw: dict[str, Any], source_label: str, *, is_repo_local: bool = False
+) -> ImportCandidate | None:
     server = _to_registry_server(name, raw)
     if server is None:
         return None
@@ -221,6 +233,23 @@ def _wrap(name: str, raw: dict[str, Any], source_label: str) -> ImportCandidate 
         server=server,
         env_classification=classification,
         source_label=source_label,
+        is_repo_local=is_repo_local,
+    )
+
+
+def project_local_gate_message(names: list[str]) -> str:
+    """Abort message when project-local candidates are registered without
+    acknowledgement. Shared by ``mms import`` and ``mms host sync`` so both
+    gates speak with one voice."""
+    joined = ", ".join(sorted(names))
+    n = len(names)
+    plural = "y" if n == 1 else "ies"
+    return (
+        f"Refusing to register {n} MCP entr{plural} from project-local config "
+        f"under the current directory: {joined}. These come from files a "
+        "repository checkout can contain (.mcp.json / .cursor/mcp.json) and could "
+        "register an untrusted command that later runs with your privileges. Pass "
+        "--allow-project-configs to acknowledge and proceed."
     )
 
 
@@ -267,7 +296,7 @@ def scan_claude_code(cwd: Path) -> list[ImportCandidate]:
         for name, raw in _mcp_servers(project_mcp).items():
             if not isinstance(raw, dict):
                 continue
-            cand = _wrap(name, raw, ".mcp.json (project)")
+            cand = _wrap(name, raw, ".mcp.json (project)", is_repo_local=True)
             if cand:
                 candidates.append(cand)
 
@@ -278,9 +307,9 @@ def scan_cursor(cwd: Path) -> list[ImportCandidate]:
     """Scan ``~/.cursor/mcp.json`` (user) and ``<cwd>/.cursor/mcp.json`` (project)."""
     candidates: list[ImportCandidate] = []
 
-    for path, label in [
-        (Path("~/.cursor/mcp.json").expanduser(), "Cursor (user)"),
-        (cwd / ".cursor" / "mcp.json", "Cursor (project)"),
+    for path, label, repo_local in [
+        (Path("~/.cursor/mcp.json").expanduser(), "Cursor (user)", False),
+        (cwd / ".cursor" / "mcp.json", "Cursor (project)", True),
     ]:
         config = _read_json_safely(path)
         if not config:
@@ -288,7 +317,7 @@ def scan_cursor(cwd: Path) -> list[ImportCandidate]:
         for name, raw in _mcp_servers(config).items():
             if not isinstance(raw, dict):
                 continue
-            cand = _wrap(name, raw, label)
+            cand = _wrap(name, raw, label, is_repo_local=repo_local)
             if cand:
                 candidates.append(cand)
 

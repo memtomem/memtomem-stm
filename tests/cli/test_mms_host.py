@@ -49,6 +49,11 @@ def _seed_cursor_user(sandbox, mcps: dict) -> None:
     (cursor_dir / "mcp.json").write_text(json.dumps({"mcpServers": mcps}), encoding="utf-8")
 
 
+def _seed_dot_mcp_json(sandbox, mcps: dict) -> None:
+    """Write ``<cwd>/.mcp.json`` — a project-local (repo-shippable) source."""
+    (sandbox["cwd"] / ".mcp.json").write_text(json.dumps({"mcpServers": mcps}), encoding="utf-8")
+
+
 def _apply_claude_code(runner) -> None:
     res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
     assert res.exit_code == 0, res.output
@@ -822,6 +827,74 @@ def _force_tty(monkeypatch) -> None:
     from memtomem_stm.cli import mms_host
 
     monkeypatch.setattr(mms_host, "_is_interactive", lambda: True)
+
+
+class TestSyncProjectConfigGate:
+    """``mms host sync --apply`` writes the ADD bucket without `--yes`/prompt,
+    so it needs its own gate: ADD candidates from project-local config under
+    cwd require `--allow-project-configs`. The REMOVE/RESTAMP confirmation gate
+    does not cover ADD."""
+
+    def test_apply_aborts_on_project_local_without_flag(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"evil": {"command": "x"}})
+        res = _sync(runner, "--apply")
+        assert res.exit_code == 2, res.output
+        assert "--allow-project-configs" in res.output
+        assert "evil" in res.output
+        # Fail closed: the ADD never reached the registry.
+        assert not state.registry_path().exists()
+
+    def test_apply_succeeds_with_flag(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"local-tool": {"command": "echo"}})
+        res = _sync(runner, "--apply", "--allow-project-configs")
+        assert res.exit_code == 0, res.output
+        assert "local-tool" in state.load_registry().servers
+
+    def test_json_abort_payload_on_project_local(self, runner, sandbox):
+        _seed_dot_mcp_json(sandbox, {"evil": {"command": "x"}})
+        res = _sync(runner, "--apply", "--json")
+        assert res.exit_code == 2, res.output
+        # Output is the stderr gate message followed by the aborted JSON.
+        text = res.output
+        payload = json.loads(text[text.find("{") : text.rfind("}") + 1])
+        assert payload["aborted"] is True
+        assert payload["mode"] == "apply"
+        assert not state.registry_path().exists()
+
+    def test_user_scope_add_not_gated(self, runner, sandbox):
+        # ADD from a user-scope (~/.claude.json) host config is trusted —
+        # sync applies it without the flag (no project-local source involved).
+        _seed_claude_code(sandbox, {"trusted": {"command": "npx"}})
+        res = _sync(runner, "--apply")
+        assert res.exit_code == 0, res.output
+        assert "trusted" in state.load_registry().servers
+
+    def test_force_restamp_of_project_local_is_gated(self, runner, sandbox):
+        """RESTAMP also writes the registry, adopting the host's shape. A
+        project-local baseline must not be re-stamped from `<cwd>/.mcp.json`
+        via `--force --yes` without the flag — else a checkout could mutate a
+        registered command past the ADD-only gate."""
+        # Establish a project-local baseline (acknowledged with the flag).
+        _seed_dot_mcp_json(sandbox, {"foo": {"command": "npx", "args": ["v1"]}})
+        res = runner.invoke(
+            import_command, ["--from", "claude-code", "--apply", "--allow-project-configs"]
+        )
+        assert res.exit_code == 0, res.output
+        assert list(state.load_registry().servers["foo"].args) == ["v1"]
+
+        # Mutate the project-local file → entry surfaces as `changed` (RESTAMP).
+        _seed_dot_mcp_json(sandbox, {"foo": {"command": "npx", "args": ["v2"]}})
+
+        # --force --yes WITHOUT the flag must fail closed before any write.
+        res = _sync(runner, "--apply", "--force", "--yes")
+        assert res.exit_code == 2, res.output
+        assert "--allow-project-configs" in res.output
+        assert list(state.load_registry().servers["foo"].args) == ["v1"]  # unchanged
+
+        # With the flag, RESTAMP proceeds.
+        res = _sync(runner, "--apply", "--force", "--yes", "--allow-project-configs")
+        assert res.exit_code == 0, res.output
+        assert list(state.load_registry().servers["foo"].args) == ["v2"]
 
 
 class TestSyncPlan:

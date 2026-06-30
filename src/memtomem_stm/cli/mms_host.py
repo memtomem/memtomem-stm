@@ -64,7 +64,12 @@ from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
-from memtomem_stm.mms.import_hosts import ALL_HOSTS, ImportCandidate, discover
+from memtomem_stm.mms.import_hosts import (
+    ALL_HOSTS,
+    ImportCandidate,
+    discover,
+    project_local_gate_message,
+)
 
 # ---------------------------------------------------------------------------
 # Pinned UX strings — kept as module constants so tests assert against the
@@ -894,8 +899,17 @@ def _render_orphan_no_baseline_footer(n: int) -> None:
         "prompt)."
     ),
 )
+@click.option(
+    "--allow-project-configs",
+    is_flag=True,
+    help="Acknowledge and register ADD-bucket MCP entries discovered in "
+    "project-local config files (.mcp.json / .cursor/mcp.json) under the "
+    "current directory. Without this flag, --apply refuses to register them.",
+)
 @with_write_lock
-def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
+def sync_cmd(
+    is_plan: bool, json_output: bool, yes: bool, force: bool, allow_project_configs: bool
+) -> None:
     """Reconcile registry + sidecar with the union of host scans.
 
     vs ``mms import``:
@@ -1099,6 +1113,28 @@ def sync_cmd(is_plan: bool, json_output: bool, yes: bool, force: bool) -> None:
     # (Lock-down 3). The cross-host slice (Lock-down 6) is excluded —
     # surfaced in the CHANGED footer for manual review only.
     restamp_rows = restamp_eligible_rows if force else []
+
+    # Project-config gate. Both registry-writing buckets — ADD (``new``) and,
+    # under --force, RESTAMP — can adopt candidates read from project-local
+    # files under cwd (.mcp.json / .cursor/mcp.json) that an untrusted
+    # repository checkout can contain. The REMOVE/RESTAMP confirmation below
+    # does not distinguish provenance, so gate both trust-establishing writes
+    # here: fail closed before any write unless --allow-project-configs is set.
+    # (Sidecar BACKFILL is intentionally not gated — it records a drift hash,
+    # not a registry command, and RESTAMP is itself gated regardless of how the
+    # baseline was established.)
+    repo_local_writes = [cand for cand in new if cand.is_repo_local]
+    repo_local_writes += [
+        cand_by_name[row["name"]] for row in restamp_rows if cand_by_name[row["name"]].is_repo_local
+    ]
+    if repo_local_writes and not allow_project_configs:
+        click.echo(
+            project_local_gate_message(sorted({cand.name for cand in repo_local_writes})),
+            err=True,
+        )
+        if json_output:
+            _render_sync_json("apply", _empty_sync_payload(), _empty_sync_summary(), aborted=True)
+        sys.exit(2)
 
     # Confirmation gate (REMOVE or RESTAMP non-empty).
     # ``--json`` + any destructive bucket forces ``--yes``: a TTY prompt
