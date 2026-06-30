@@ -215,6 +215,21 @@ class ProxyCache:
             return None
         return entry.result
 
+    def invalidate(self, server: str, tool: str, args: dict[str, Any]) -> None:
+        """Delete any cached row for ``(server, tool, args)`` — a single
+        best-effort DELETE, keyed exactly as ``set``/``get`` (``_make_key``).
+
+        Two callers: the ``set(ttl<=0)`` do-not-store short-circuit below, and
+        the manager's non-text / mixed disabled-cache path, which never reaches
+        ``set`` and so otherwise leaves a stale row from an earlier text response
+        for the same key (#541)."""
+        if self._db is None:
+            return
+        key = _make_key(server, tool, args)
+        with self._lock:
+            self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+            self._db.commit()
+
     def set(
         self,
         server: str,
@@ -238,10 +253,7 @@ class ProxyCache:
             # to 0 via hot-reload), and leaving that live row would keep serving
             # stale content. This mirrors the pre-short-circuit behavior, which
             # overwrote the key with a born-expired row.
-            key = _make_key(server, tool, args)
-            with self._lock:
-                self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
-                self._db.commit()
+            self.invalidate(server, tool, args)
             return
         if contains_sensitive_content(result):
             # SECURITY.md: responses that look like secrets are never

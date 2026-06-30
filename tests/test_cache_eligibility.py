@@ -44,6 +44,23 @@ def _text_result(text="ok"):
     return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
 
 
+def _image_content():
+    # MCP ImageContent stand-in: ``_shape_response`` treats any content whose
+    # ``type`` is not "text" as non-text.
+    return SimpleNamespace(type="image", data="aGk=", mimeType="image/png")
+
+
+def _nontext_result():
+    return SimpleNamespace(content=[_image_content()], isError=False)
+
+
+def _mixed_result(text="payload"):
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=text), _image_content()],
+        isError=False,
+    )
+
+
 def _build(
     tmp_path: Path,
     *,
@@ -423,7 +440,7 @@ class TestPerToolTtlOverrideBehavior:
         Covers the text-response path, where the store-side ``set(ttl<=0)``
         invalidates any prior live row. The lookup bypass (never-served) holds for
         every response shape; the on-disk invalidation of a non-text response under
-        ttl<=0 is a pre-existing #536 gap tracked as a separate follow-up."""
+        ttl<=0 is covered by ``TestTtlZeroNonTextInvalidation`` (#541)."""
         mgr, _, cache = build(
             tools=[_tool("vol"), _tool("plain")],
             tool_overrides={"vol": ToolOverrideConfig(cache_ttl_seconds=0)},
@@ -443,3 +460,115 @@ class TestPerToolTtlOverrideBehavior:
         await mgr.call_tool("srv", "plain", {"q": 1})
         assert session.call_tool.await_count == 3  # second served from cache
         assert cache.get("srv", "plain", {"q": 1}) is not None
+
+
+# ── Integration: ttl<=0 invalidation of non-text / mixed responses (#541) ─
+
+
+@pytest.mark.asyncio
+class TestTtlZeroNonTextInvalidation:
+    """#541: a non-text / mixed response under a disabled (``ttl<=0``) cache must
+    invalidate a row left behind by an EARLIER text response for the same key.
+
+    The store-side ``ttl<=0`` self-heal in ``ProxyCache.set`` only runs on the
+    TEXT store path (the store is gated text-only), so a tool whose response shape
+    flips text→non-text across a TTL down-then-up window would otherwise resurface
+    the stale text row once the TTL is raised back within its frozen window."""
+
+    async def test_invalidate_helper_noop_under_positive_ttl(self, build):
+        # Direct helper unit: a positive resolved TTL must leave the row intact
+        # (invalidation is gated on ttl<=0, so no spurious deletes).
+        mgr, _, cache = build(global_ttl=3600.0, tools=[_tool("reader", _ann(read_only=True))])
+        cache.set("srv", "reader", {"q": "a"}, "payload", ttl_seconds=3600.0)
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._invalidate_disabled_cache("srv", "reader", {"q": "a"}, cfg_snap=mgr._config)
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+    async def test_invalidate_helper_deletes_under_zero_ttl(self, build):
+        mgr, _, cache = build(global_ttl=3600.0, tools=[_tool("reader", _ann(read_only=True))])
+        cache.set("srv", "reader", {"q": "a"}, "payload", ttl_seconds=3600.0)
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        mgr._invalidate_disabled_cache("srv", "reader", {"q": "a"}, cfg_snap=mgr._config)
+        assert cache.get("srv", "reader", {"q": "a"}) is None
+
+    async def test_nontext_only_response_invalidates_prior_text_row(self, build):
+        # Site A: the non-text-ONLY early return in ``_call_tool_inner``.
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # text cached under default TTL
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        # Caching disabled, and the SAME key now returns a non-text response.
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _nontext_result()
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+
+    async def test_mixed_response_invalidates_prior_text_row(self, build):
+        # Site B: the mixed (text+non-text) branch in ``_store_cache``.
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _mixed_result("payload")
+        result = await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+        # mixed response still returns text + the preserved non-text content.
+        assert isinstance(result, list)
+
+    async def test_per_tool_ttl_zero_nontext_invalidates(self, build):
+        # The per-tool ``cache_ttl_seconds: 0`` path (#540) — the headline
+        # disable-caching-for-a-volatile-tool use case — with a text→non-text flip.
+        mgr, _, cache = build(tools=[_tool("vol", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        # Cache a text row under the global positive TTL (no override yet).
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "vol", {})
+        assert cache.get("srv", "vol", {}) is not None
+
+        # Disable caching for THIS tool only, then flip to a non-text response.
+        mgr._connections["srv"].config.tool_overrides["vol"] = ToolOverrideConfig(
+            cache_ttl_seconds=0
+        )
+        session.call_tool.return_value = _nontext_result()
+        await mgr.call_tool("srv", "vol", {})
+        assert cache.get("srv", "vol", {}) is None
+
+    async def test_lower_to_zero_then_raise_does_not_resurface_stale_row(self, build):
+        # Full #541 sequence: cache under positive TTL → lower to 0 → a non-text
+        # call invalidates → raise the TTL back WITHIN the original window. The
+        # stale text row must not be served (await_count keeps climbing).
+        mgr, _, cache = build(global_ttl=3600.0, tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("stale-text")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 1
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        # Lower to 0; identical call now returns non-text → invalidates the row.
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _nontext_result()
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 2
+
+        # Raise the TTL back within the original 3600s window; the tool returns
+        # text again. Without the fix the stale row would serve (await_count
+        # stays 2); with it the row is gone → upstream is hit and re-cached.
+        mgr._config.cache.default_ttl_seconds = 3600.0
+        session.call_tool.return_value = _text_result("fresh-text")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 3  # not served from the stale row
+        assert cache.get("srv", "reader", {"q": "a"}) is not None  # fresh row cached

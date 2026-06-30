@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ttl<=0` now invalidates a stale cached row when a non-text / mixed response is served** (#548, issue #541) — the store-side `ttl<=0` self-heal in `ProxyCache.set` only ran on the TEXT store path, so a row left behind by an earlier text response for a `(server, tool, args)` key was never invalidated once caching was disabled and the same key returned a non-text response (a non-text-only response early-returns before the Stage-5 store; a mixed text+non-text response is skipped by `_store_cache`'s text-only gate). While `ttl<=0` the lookup is bypassed so the stale row is never *served* during the disabled window, but raising the TTL back within the row's frozen window (per-row TTL is frozen at write time) made the now-eligible lookup serve the stale text — most likely on the `cache_ttl_seconds: 0` headline case (disabling caching for a volatile/binary tool whose response shape flips text→non-text). The delete-by-key is now factored into `ProxyCache.invalidate` and issued from both non-text sites (the non-text-only early return and the mixed branch of `_store_cache`) only when the resolved TTL is `<=0`. This preserves #536's zero-I/O posture for the steady-state text / no-row disabled-cache path; the only added I/O is one `DELETE` per non-text call under a disabled cache, bounded to calls that actually occur.
+
 ## [0.1.30] — 2026-06-30
 
 A security-hardening release. Three coordinated fixes close an ungated
