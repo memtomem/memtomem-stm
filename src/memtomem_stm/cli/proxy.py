@@ -33,6 +33,7 @@ from memtomem_stm.mms.import_hosts import (
     _is_self_reference,
     _read_json_safely,
 )
+from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from memtomem_stm.mms.state import utc_now_iso
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -527,25 +528,60 @@ def version() -> None:
     click.echo(f"memtomem-stm {pkg_version('memtomem-stm')}")
 
 
-def _redacted_servers_json(servers: dict[str, Any]) -> dict[str, Any]:
-    """Server map for ``--json`` output with ``origin.original`` stripped (#475).
+def _mask_mapping_values(mapping: dict[str, Any]) -> dict[str, Any]:
+    """Mask every value in an ``env`` / ``headers`` mapping (keys preserved).
 
-    ``origin.original`` is the verbatim host entry an import captured and may
-    carry secrets (``env`` / ``headers``), so the machine-readable outputs
-    must not dump it. The summary keys (``source`` kinds, ``pruned`` flags,
-    ``imported_at``) stay, plus ``has_original`` so scripts can tell a
-    redacted block from one that never captured an original. Human output is
-    unaffected — it only prints selected fields. (Entries' own ``env`` is
-    exposed here as before — pre-existing surface, out of scope per #475.)
+    Machine-readable ``--json`` output is routinely piped to scripts, CI logs,
+    issue comments, and agent transcripts, so it must not carry secret-bearing
+    ``env`` / ``headers`` values verbatim. We redact *all* values rather than
+    only classifier-flagged ones: a key/value classifier misses ``Cookie``-style
+    headers and short or punctuated secrets, and machine output has no reliable
+    way to tell a secret value from a benign one. Keys stay visible so scripts
+    can still see *which* variables / headers a server defines.
+    """
+    return {key: REDACTED_DISPLAY for key in mapping}
+
+
+def _redacted_servers_json(servers: dict[str, Any]) -> dict[str, Any]:
+    """Server map for ``--json`` output, scrubbed of secret-bearing values.
+
+    Two passes:
+
+    * ``origin.original`` — the verbatim host entry an import captured — is
+      dropped (#475). The summary keys (``source`` kinds, ``pruned`` flags,
+      ``imported_at``) stay, plus ``has_original`` so scripts can tell a
+      redacted block from one that never captured an original.
+    * An entry's own active ``env`` and ``headers`` values are masked, since
+      they reach ``--json`` verbatim and are routinely piped to logs. Keys are
+      kept; only values become ``<REDACTED>``. Use the human-readable output
+      (which never prints ``env`` / ``headers``) or read the on-disk config
+      directly when a value is genuinely needed.
+
+    Redaction is output-only: this returns shallow copies and never mutates the
+    loaded config.
     """
     redacted: dict[str, Any] = {}
     for name, cfg in servers.items():
-        if isinstance(cfg, dict) and isinstance(cfg.get("origin"), dict):
-            origin = dict(cfg["origin"])
-            origin["has_original"] = isinstance(origin.pop("original", None), dict)
-            redacted[name] = {**cfg, "origin": origin}
-        else:
+        if not isinstance(cfg, dict):
             redacted[name] = cfg
+            continue
+        entry = dict(cfg)
+        if isinstance(entry.get("origin"), dict):
+            origin = dict(entry["origin"])
+            origin["has_original"] = isinstance(origin.pop("original", None), dict)
+            entry["origin"] = origin
+        for field in ("env", "headers"):
+            value = entry.get(field)
+            if isinstance(value, dict):
+                entry[field] = _mask_mapping_values(value)
+            elif value is not None:
+                # ``--json`` reads the raw config, not a validated
+                # ``UpstreamServerConfig``, so a hand-edited / corrupted entry
+                # can carry a non-dict ``env`` / ``headers`` (e.g. the string
+                # ``"TOKEN=abc"``). Anything present-but-not-None here is still
+                # potentially secret-bearing — never emit it verbatim.
+                entry[field] = REDACTED_DISPLAY
+        redacted[name] = entry
     return redacted
 
 

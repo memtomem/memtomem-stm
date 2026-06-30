@@ -25,6 +25,7 @@ import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.proxy import cli
+from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from helpers import set_home
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
@@ -88,6 +89,34 @@ def _config_with_origin() -> dict:
                 },
             },
             "plain": {"prefix": "pl", "command": "uvx"},
+        },
+    }
+
+
+def _config_with_active_secrets() -> dict:
+    """Config whose *active* (non-origin) ``env`` / ``headers`` carry secrets —
+    shared by the ``status``/``list --json`` value-redaction tests. Includes a
+    benign value (``NODE_ENV`` / ``X-Trace``) to pin that *all* values are
+    masked, and a ``Cookie`` header a key/value secret classifier would miss."""
+    return {
+        "enabled": True,
+        "upstream_servers": {
+            "gh": {
+                "prefix": "gh",
+                "transport": "stdio",
+                "command": "npx",
+                "env": {"GITHUB_TOKEN": "ghp_active_secret", "NODE_ENV": "production"},
+            },
+            "remote": {
+                "prefix": "rm",
+                "transport": "sse",
+                "url": "https://example.test/mcp",
+                "headers": {
+                    "Authorization": "Bearer aaa.bbb.ccc",
+                    "Cookie": "sessionid=xyz; csrftoken=qq",
+                    "X-Trace": "ok",
+                },
+            },
         },
     }
 
@@ -448,6 +477,66 @@ class TestStatus:
             "GITHUB_TOKEN": "ghp_supersecret"
         }
 
+    def test_json_redacts_active_env_and_headers(self, runner, config):
+        """Active ``env`` / ``headers`` reach ``--json`` verbatim and get piped
+        to logs, so their values must be masked (keys preserved). Redaction
+        covers *all* values, including ones a secret classifier would miss
+        (``Cookie``)."""
+        config.write_text(json.dumps(_config_with_active_secrets()), encoding="utf-8")
+        result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        servers = json.loads(result.output)["servers"]
+        # env: keys kept, every value masked (secret and benign alike).
+        assert servers["gh"]["env"] == {
+            "GITHUB_TOKEN": REDACTED_DISPLAY,
+            "NODE_ENV": REDACTED_DISPLAY,
+        }
+        # headers: keys kept, every value masked (incl. the Cookie a classifier misses).
+        assert servers["remote"]["headers"] == {
+            "Authorization": REDACTED_DISPLAY,
+            "Cookie": REDACTED_DISPLAY,
+            "X-Trace": REDACTED_DISPLAY,
+        }
+        # No secret material survives anywhere in the output stream.
+        for secret in ("ghp_active_secret", "aaa.bbb.ccc", "sessionid=xyz"):
+            assert secret not in result.output
+        # Output-only: the config file keeps the real values.
+        on_disk = json.loads(config.read_text(encoding="utf-8"))
+        assert on_disk["upstream_servers"]["gh"]["env"]["GITHUB_TOKEN"] == "ghp_active_secret"
+        assert (
+            on_disk["upstream_servers"]["remote"]["headers"]["Authorization"]
+            == "Bearer aaa.bbb.ccc"
+        )
+
+    def test_json_redacts_malformed_non_dict_env_headers(self, runner, config):
+        """``--json`` reads raw config, not a validated model, so a hand-edited
+        / corrupted entry can carry a non-dict ``env`` / ``headers`` (string,
+        list, …). Those are still potentially secret-bearing and must not be
+        emitted verbatim — they are replaced wholesale with the sentinel."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bd",
+                            "command": "x",
+                            "env": "GITHUB_TOKEN=ghp_strsecret",
+                            "headers": ["Authorization: Bearer leaked"],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        servers = json.loads(result.output)["servers"]
+        assert servers["bad"]["env"] == REDACTED_DISPLAY
+        assert servers["bad"]["headers"] == REDACTED_DISPLAY
+        for secret in ("ghp_strsecret", "Bearer leaked"):
+            assert secret not in result.output
+
     def test_shows_server_details(self, runner, config):
         config.write_text(
             json.dumps(
@@ -703,6 +792,24 @@ class TestListServers:
         assert "ghp_supersecret" not in result.output
         assert servers["plain"] == {"prefix": "pl", "command": "uvx"}
         assert "origin" not in servers["plain"]
+
+    def test_json_redacts_active_env_and_headers(self, runner, config):
+        """Same active-``env``/``headers`` value masking as ``status --json``."""
+        config.write_text(json.dumps(_config_with_active_secrets()), encoding="utf-8")
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        servers = json.loads(result.output)["servers"]
+        assert servers["gh"]["env"] == {
+            "GITHUB_TOKEN": REDACTED_DISPLAY,
+            "NODE_ENV": REDACTED_DISPLAY,
+        }
+        assert servers["remote"]["headers"] == {
+            "Authorization": REDACTED_DISPLAY,
+            "Cookie": REDACTED_DISPLAY,
+            "X-Trace": REDACTED_DISPLAY,
+        }
+        for secret in ("ghp_active_secret", "aaa.bbb.ccc", "sessionid=xyz"):
+            assert secret not in result.output
 
 
 # ── add command — validation paths ───────────────────────────────────────
