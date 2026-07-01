@@ -136,9 +136,12 @@ export MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS='{"Authorization":"Bearer ..."}'
 
 See [Surfacing → Surfacing Controls](surfacing.md#surfacing-controls) for the complete table of fields and defaults.
 
-### Claude Code Hook
+### PostToolUse Hook
 
-`mms hook` bridges Claude Code built-in `PostToolUse` events into STM surfacing.
+`mms hook` bridges built-in `PostToolUse` events into STM surfacing, available
+for Claude Code, Codex CLI, Cursor, and Kimi Code (`mms hook --host <name>`
+at runtime, or `mms hook install --host <name>` to register it with a host —
+see [docs/cli.md](cli.md#mms-hook--built-in-tool-bridge--per-host-registration)).
 It is independent of the MCP proxy path and is configured with
 `MEMTOMEM_STM_HOOK__*`.
 
@@ -149,7 +152,8 @@ export MEMTOMEM_STM_HOOK__FALLBACK=skip                # skip | cold
 export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
 export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating prompt by default
 
-# Built-in Bash stdout compression is opt-in and separate from surfacing.
+# Built-in Bash stdout compression is opt-in, separate from surfacing, and
+# Claude Code only — native output replacement ports to no other host.
 export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=false
 export MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=16000
 
@@ -162,8 +166,13 @@ export MEMTOMEM_STM_HOOK_SURFACE_TOOLS=read,grep,glob,shell
 
 `fallback=skip` returns `{}` immediately when the daemon is unavailable.
 `fallback=cold` runs the older in-process path, which can pay LTM startup cost
-inside the hook call. Hook compression only targets Bash stdout so later
-`Edit` operations are not broken by replacing file reads.
+inside the hook call. Surfacing (LTM context injection for read-like
+built-ins) is the only capability that ports to non-Claude hosts, and each
+host carries its own runtime caveat — see
+[docs/cli.md → `mms hook install`](cli.md#install--uninstall--per-host-registration)
+for the current per-host status. Hook compression only targets Claude Code's
+Bash stdout so later `Edit` operations are not broken by replacing file
+reads.
 
 ### Surfacing Daemon
 
@@ -172,10 +181,14 @@ inside the hook call. Hook compression only targets Bash stdout so later
 ```bash
 export MEMTOMEM_STM_DAEMON__HOST=127.0.0.1
 export MEMTOMEM_STM_DAEMON__IDLE_TIMEOUT_SECONDS=900
+export MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK=false     # escape hatch, see below
 ```
 
-The daemon binds loopback and authenticates requests with a per-start token.
-`idle_timeout_seconds=0` pins it until explicitly stopped.
+The daemon binds loopback and authenticates requests with a per-start token,
+not network ACLs. A non-loopback `host` (including `0.0.0.0` and `""`, which
+bind every interface) is rejected at config load unless
+`allow_non_loopback=true` is set — see [SECURITY.md](../SECURITY.md) for the
+rationale. `idle_timeout_seconds=0` pins the daemon until explicitly stopped.
 
 ### Langfuse Tracing (optional)
 

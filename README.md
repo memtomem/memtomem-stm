@@ -91,7 +91,8 @@ If you've already configured MCP servers in Claude Desktop, Claude Code, or a pr
 
 ```bash
 mms list      # show what you've added
-mms status    # show full config + connectivity
+mms status    # show full config
+mms health    # check connectivity + surfacing readiness
 ```
 
 ### 2. Connect your AI client to STM
@@ -136,7 +137,8 @@ Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
 Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, etc.). The CLEAN / COMPRESS / SURFACE stages run automatically — responses are cleaned, compressed, cached, and (when an LTM server is configured) enriched with relevant memories. The INDEX stage (auto_index / extraction) is currently inactive in the standalone server; see [#288](https://github.com/memtomem/memtomem-stm/issues/288).
 
 To check connectivity and surfacing readiness from your shell, run
-`mms status` or `mms health`. If you want the agent to call operator-facing MCP
+`mms health` (`mms status` shows the static config only — it doesn't probe
+connectivity). If you want the agent to call operator-facing MCP
 tools such as `stm_proxy_stats`, start STM with
 `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`.
 
@@ -171,7 +173,7 @@ To bring file or shell operations under STM, register an MCP server that exposes
 
 A second tier of management lets you decide *which MCP servers a given project sees*, separately from the STM proxy gateway config. State lives in a new dotdir, `~/.mms/`:
 
-- `mms import --from claude-code` — pull existing MCP definitions out of `~/.claude.json`, `~/.cursor/mcp.json`, `~/.codex/config.toml`, or Claude Desktop's config into `~/.mms/registry.toml` (secrets redacted in `--plan`, written verbatim under `--apply`).
+- `mms import --from <host>` — pull existing MCP definitions out of one host's config (`claude-code` → `~/.claude.json` / `<cwd>/.mcp.json`, `cursor` → `~/.cursor/mcp.json`, `codex` → `~/.codex/config.toml`, `claude-desktop` → its config) into `~/.mms/registry.toml` (secrets redacted in `--plan`, written verbatim under `--apply`). `--from all`, the default, scans every host.
 - `mms project init` — create a `<project>/.mms/project.toml` marker (commit-recommended).
 - `mms project enable filesystem github` — declare which MCPs that project wants visible.
 - `mms project list` / `mms project show` — inspect the index and the current project.

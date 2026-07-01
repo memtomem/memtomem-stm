@@ -197,7 +197,7 @@ Options:
 
 Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, origin, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
 
-The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets.
+The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
 ### `remove`
 
@@ -396,7 +396,7 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Shows the current proxy gateway configuration file path, enabled flag, and the list of configured upstream servers with their prefix, transport, command or URL, compression strategy, character budget, and surfacing toggle.
+Shows the current proxy gateway configuration file path, enabled flag, and the list of configured upstream servers with their prefix, transport, command or URL, compression strategy, character budget, and surfacing toggle. In `--json` output, every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human-readable table never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
 ### `stats`
 
@@ -586,7 +586,7 @@ Options:
 
 ## `mms import` — populate the registry from host configs
 
-`mms import` reads MCP definitions out of your existing host configs (Claude Code, Cursor, Codex CLI, Claude Desktop) and writes them to `~/.mms/registry.toml`. This is the **only** W1 path that mutates the registry — `mms add` writes to `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap), not the mms registry.
+`mms import` reads MCP definitions out of your existing host configs (Claude Code, Cursor, Codex CLI, Claude Desktop) and writes them to `~/.mms/registry.toml`. `mms add` writes to `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) instead — the mms registry and the STM proxy config are separate files. `mms host sync --apply` (below) also mutates the registry, reconciling it against host config drift.
 
 ```
 Usage: mms import [OPTIONS]
@@ -597,7 +597,14 @@ Options:
   --plan / --apply        --plan (default) prints what would be imported with
                           secrets REDACTED. --apply writes ~/.mms/registry.toml.
   --show-imported         In --plan mode, reveal secret values instead of redacting.
+  --allow-project-configs
+                          Acknowledge and register MCP entries discovered in
+                          project-local config files (.mcp.json /
+                          .cursor/mcp.json) under the current directory.
+                          Without this flag, --apply refuses to register them.
 ```
+
+`--apply` refuses to register candidates discovered in `<cwd>/.mcp.json` or `<cwd>/.cursor/mcp.json` unless `--allow-project-configs` is passed — a repository checkout can ship those files, so adopting them without acknowledgement would let a checkout register a command that later runs with your privileges. `~/.claude.json`-sourced entries (including the `Claude Code (project)` label) are unaffected, since they live in your home directory, not the checkout. The gate only enforces on `--apply`; `--plan` just prints a footer warning that `--apply` will require the flag.
 
 Where each host config lives:
 
@@ -626,7 +633,7 @@ When the same name shows up in two places (two hosts in `--from all`, or already
 * If the entry is **identical** (same `command`, `args`, `env`), it's an idempotent no-op and `--apply` reports `Already up to date.`
 * If the entry **differs**, **first-import-wins** — the existing registry entry is kept, the new one is reported as a conflict and skipped. The scanner order for `--from all` is `claude-code → cursor → codex → claude-desktop`.
 
-A future `--force` flag for refresh-on-rerun is W2/W3.
+`mms import` itself has no refresh-on-rerun flag; for an acknowledged restamp of a changed entry, use `mms host sync --force` (below).
 
 ### Dangerous env keys
 
@@ -652,6 +659,12 @@ Commands:
 observation rather than a CI failure signal. `sync` is the ongoing
 reconciliation path: `--plan` previews, `--apply` writes, `--force` adopts
 entries marked changed, and `--yes` bypasses confirmation prompts for scripts.
+
+`sync --apply` shares the same project-local config gate as `mms import`: new
+(ADD-bucket) entries, and — only under `--force` — RESTAMP-bucket entries,
+discovered in project-local config files under the current directory are
+refused unless `--allow-project-configs` is passed. REMOVE and sidecar
+BACKFILL are not gated, since neither adopts a new registry command.
 
 ## MCP Tools (4 default + 9 opt-in + proxied)
 
