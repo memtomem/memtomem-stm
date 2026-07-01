@@ -16,7 +16,7 @@ Please report security issues via [GitHub private vulnerability advisory](https:
 memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-facing application:
 
 - **Transport**: Default communication is stdio with the AI client (Claude Code, Cursor, etc.); the MCP proxy server itself opens no network port. When the built-in `mms hook` surfacing path is used, an eligible hook call may auto-spawn a local surfacing daemon (`hook.use_daemon`/`hook.auto_spawn` default on) that binds an ephemeral port on `daemon.host` — **`127.0.0.1` (loopback) by default** — and authenticates every connection with a per-start random token rather than network ACLs. Keep `daemon.host` on loopback: a non-loopback `daemon.host` (e.g. `0.0.0.0`, or the empty string — both bind every interface) is rejected at config load unless you explicitly opt in with `MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK=true`, which deliberately exposes the token-guarded daemon on that interface.
-- **Trust boundary**: memtomem-stm trusts the AI client (local process) and the upstream MCP servers it is configured to proxy. Only configure upstream servers you trust.
+- **Trust boundary**: memtomem-stm trusts the AI client (local process) and the upstream MCP servers it is configured to proxy. Only configure upstream servers you trust. `mms import --apply` and `mms host sync --apply` additionally gate on the *source* of a candidate: entries discovered in project-local config files (`.mcp.json`, `.cursor/mcp.json`) under the current directory — files an untrusted repository checkout can ship — are refused unless `--allow-project-configs` is passed, so a checkout cannot silently register a command that later runs with your privileges.
 - **Data at rest**: The optional selective-compression `PendingStore` defaults to in-memory (`pending_store="memory"`). Other persisted stores — the response cache (`proxy_cache.db`, enabled by default), metrics (`proxy_metrics.db`), and feedback — are local-only SQLite files under `~/.memtomem/`. No store is remote or shared across hosts.
 
 ## Security Measures
@@ -25,6 +25,7 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
 
 - **Sensitive content auto-detection**: Responses containing patterns that look like secrets (API keys, tokens, private keys) are detected and excluded from the response cache and from being indexed into LTM.
 - **Write-tool skip**: Memory surfacing is automatically disabled for upstream tools that mutate state, reducing the risk of injecting stale context into destructive operations.
+- **CLI output redaction**: `mms status --json` and `mms list --json` mask every `env` and `headers` value (`<REDACTED>`, keys preserved) since that machine-readable output is routinely piped to scripts, CI logs, or issue comments. The human-readable `status`/`list` tables never print `env`/`headers` at all; read the on-disk config directly when a value is genuinely needed.
 
 ### Resilience
 

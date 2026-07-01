@@ -30,10 +30,12 @@ uv run mypy src
   - `surfacing/` — Memory surfacing engine and relevance gating
   - `observability/` — Langfuse tracing and metrics
   - `cli/` — `mms` / `memtomem-stm-proxy` / `memtomem-stm` CLI (all three entry points resolve to the same Click group, see #260)
+  - `daemon/` — Warm surfacing daemon (`mms daemon`): client, discovery, locking, protocol, spawn
+  - `mms/` — `mms import` / `mms host` / `mms project` registry state (`~/.mms/`), drift detection, secret classification
   - `utils/` — Circuit breaker and shared helpers
 - `tests/` — pytest suite
   - `tests/bench/` — `bench_qa` scenario harness (see "Adding a bench_qa scenario" below)
-- `docs/` — User-facing guides (surfacing, compression, caching, configuration, cli)
+- `docs/` — User-facing guides (surfacing, compression, caching, configuration, cli, selection-telemetry)
 
 The LTM core lives in a separate repository: [memtomem/memtomem](https://github.com/memtomem/memtomem). Communication between STM and LTM happens entirely through the MCP protocol — there is no Python-level dependency.
 
