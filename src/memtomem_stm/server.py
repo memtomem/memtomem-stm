@@ -486,17 +486,57 @@ async def stm_proxy_stats(
     cache_lookups = cache_hits + cache_misses
     cache_hit_rate = (cache_hits / cache_lookups * 100) if cache_lookups else 0.0
 
+    # Every rendered number reconciles (#558): ``Total calls`` counts
+    # successful live pipeline calls only (the denominator of the savings/
+    # latency figures) — cache hits and failed calls never enter it — and the
+    # ``Total calls`` line states the sum explicitly so "live + failed +
+    # cache-served = invocations" needs no operator arithmetic. The failed
+    # component is rendered only when non-zero, matching the Errors section.
+    total_errors = summary.get("total_errors", 0)
+    total_invocations = summary.get(
+        "total_invocations", summary["total_calls"] + cache_hits + total_errors
+    )
+    failed_component = f" + {total_errors} failed" if total_errors else ""
+    hits_suffix = (
+        f"  ({summary.get('cache_hit_chars', 0):,} chars served from cache, no upstream I/O)"
+        if cache_hits
+        else ""
+    )
+
     lines = [
         "STM Proxy Stats",
         "===============",
-        f"Total calls:     {summary['total_calls']}",
+        f"Total calls:     {summary['total_calls']} live{failed_component}"
+        f" + {cache_hits} cache-served = {total_invocations} invocations",
         f"Original chars:  {summary['total_original_chars']}",
         f"Compressed:      {summary['total_compressed_chars']}",
-        f"Savings:         {summary['total_savings_pct']:.1f}%",
+        f"Savings:         {summary['total_savings_pct']:.1f}%  (compression of live calls)",
         f"Token savings:   {summary.get('total_token_savings_pct', 0):.1f}%",
-        f"Cache hits:      {cache_hits}",
+        f"Cache hits:      {cache_hits}{hits_suffix}",
         f"Cache misses:    {cache_misses}",
-        f"Cache hit rate:  {cache_hit_rate:.1f}%",
+    ]
+
+    # Misses the cache can never convert to hits (mixed/non-text/empty
+    # responses, transient retrieval keys). Quiet when zero so the common
+    # all-text deployment keeps its familiar output. When present, the hit-rate
+    # line also shows the rate over STORABLE lookups — otherwise a workload
+    # heavy in never-cacheable responses reads as a depressed hit rate, which
+    # is exactly the operator confusion the counter exists to resolve (#558).
+    cache_unstorable = summary.get("cache_unstorable", 0)
+    hit_rate_line = f"Cache hit rate:  {cache_hit_rate:.1f}%"
+    if cache_unstorable > 0:
+        lines.append(
+            f"Unstorable:      {cache_unstorable}  (of misses; response shape is never cacheable)"
+        )
+        storable_lookups = cache_hits + max(cache_misses - cache_unstorable, 0)
+        if storable_lookups > 0:
+            effective_rate = cache_hits / storable_lookups * 100
+            hit_rate_line += f"  ({effective_rate:.1f}% of storable lookups)"
+        else:
+            hit_rate_line += "  (no storable lookups)"
+
+    lines += [
+        hit_rate_line,
         f"Reconnects:      {summary.get('reconnects', 0)}",
     ]
 
@@ -513,10 +553,14 @@ async def stm_proxy_stats(
             f"(expired {cstats['expired_entries']}, evicted {cstats['evictions']})"
         )
 
-    # Error summary
-    total_errors = summary.get("total_errors", 0)
+    # Error summary. ``error_rate``'s denominator is live upstream attempts
+    # (successful + failed calls) — cache hits can't error, so folding them in
+    # would only dilute the diagnostic. Label it so the percentage doesn't read
+    # as inconsistent next to the hits-inclusive invocation total (#558).
     if total_errors > 0:
-        lines.append(f"\nErrors: {total_errors} ({summary.get('error_rate', 0):.1f}%)")
+        lines.append(
+            f"\nErrors: {total_errors} ({summary.get('error_rate', 0):.1f}% of live attempts)"
+        )
         errors_by_cat = summary.get("errors_by_category", {})
         for cat, count in sorted(errors_by_cat.items()):
             lines.append(f"  {cat}: {count}")

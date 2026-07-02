@@ -147,6 +147,111 @@ class TestProxyStats:
         result = await stm_proxy_stats(ctx=ctx)
         assert "Cache hit rate:  75.0%" in result
 
+    async def test_total_calls_line_reconciles_invocations(self):
+        """#558: the Total calls line states live + cache-served = invocations
+        explicitly, so hits are no longer invisible in the call count."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=10, compressed_chars=5))
+        tracker.record_cache_hit(chars=5)
+        tracker.record_cache_hit(chars=5)
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Total calls:     1 live + 2 cache-served = 3 invocations" in result
+
+    async def test_total_calls_line_includes_failed_calls(self):
+        """#558 codex round 2: failed calls are a third mutually-exclusive
+        component of the invocation total; the component renders only when
+        non-zero (matching the Errors section)."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=10, compressed_chars=5))
+        tracker.record_cache_hit(chars=5)
+        tracker.record_error(
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True)
+        )
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Total calls:     1 live + 1 failed + 1 cache-served = 3 invocations" in result
+
+    async def test_error_rate_labeled_as_live_attempts(self):
+        """#558 codex round 3: error_rate's denominator is live attempts
+        (successful + failed calls, no cache hits), so the rendered percentage
+        must say so or it reads inconsistent next to the invocation total."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=10, compressed_chars=5))
+        tracker.record_error(
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True)
+        )
+        for _ in range(2):
+            tracker.record_cache_hit(chars=5)
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        # 1 error / (1 live + 1 failed) = 50.0% — NOT 1/4 over the invocations.
+        assert "Errors: 1 (50.0% of live attempts)" in result
+
+    async def test_cache_hits_line_shows_served_chars(self):
+        """#558: the cache's benefit (chars served with zero upstream I/O) is
+        rendered on the hits line; quiet suffix when there are no hits."""
+        tracker = TokenTracker()
+        tracker.record_cache_hit(chars=1234)
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hits:      1  (1,234 chars served from cache, no upstream I/O)" in result
+
+        result_no_hits = await stm_proxy_stats(ctx=_make_ctx(tracker=TokenTracker()))
+        assert "chars served from cache" not in result_no_hits
+
+    async def test_unstorable_line_only_when_nonzero(self):
+        """#558: unstorable misses get their own line so a permanently
+        re-missing tool is diagnosable; hidden in the common all-text case."""
+        tracker = TokenTracker()
+        tracker.record_cache_miss()
+        tracker.record_cache_unstorable()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Unstorable:      1" in result
+
+        result_zero = await stm_proxy_stats(ctx=_make_ctx(tracker=TokenTracker()))
+        assert "Unstorable:" not in result_zero
+
+    async def test_effective_hit_rate_over_storable_lookups(self):
+        """#558 codex round 1: with unstorable misses present, the hit-rate
+        line also shows the rate over storable lookups, so a never-cacheable-
+        heavy workload doesn't read as a depressed hit rate."""
+        tracker = TokenTracker()
+        tracker.record_cache_hit()  # 1 hit
+        for _ in range(3):
+            tracker.record_cache_miss()  # 3 misses, 2 unstorable
+        tracker.record_cache_unstorable()
+        tracker.record_cache_unstorable()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        # raw: 1/4 = 25.0%; storable: 1 hit + (3-2) convertible miss → 1/2
+        assert "Cache hit rate:  25.0%  (50.0% of storable lookups)" in result
+
+    async def test_effective_hit_rate_no_storable_lookups(self):
+        """Every lookup was an unstorable miss → no percentage is fabricated."""
+        tracker = TokenTracker()
+        tracker.record_cache_miss()
+        tracker.record_cache_unstorable()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hit rate:  0.0%  (no storable lookups)" in result
+
+    async def test_hit_rate_line_unchanged_without_unstorable(self):
+        """Zero unstorable → the pinned plain hit-rate line stays as-is."""
+        tracker = TokenTracker()
+        tracker.record_cache_hit()
+        tracker.record_cache_miss()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hit rate:  50.0%\n" in result
+
     async def test_cache_entries_line_when_cache_wired(self, tmp_path):
         """When the response cache is wired, occupancy/eviction is surfaced."""
         from memtomem_stm.proxy.cache import ProxyCache
