@@ -486,11 +486,17 @@ async def stm_proxy_stats(
     cache_lookups = cache_hits + cache_misses
     cache_hit_rate = (cache_hits / cache_lookups * 100) if cache_lookups else 0.0
 
-    # Every rendered number reconciles (#558): ``Total calls`` counts live
-    # pipeline calls only (the denominator of the savings/latency figures),
-    # cache hits never enter it, and the ``Total calls`` line states the sum
-    # explicitly so "calls + hits = invocations" needs no operator arithmetic.
-    total_invocations = summary.get("total_invocations", summary["total_calls"] + cache_hits)
+    # Every rendered number reconciles (#558): ``Total calls`` counts
+    # successful live pipeline calls only (the denominator of the savings/
+    # latency figures) — cache hits and failed calls never enter it — and the
+    # ``Total calls`` line states the sum explicitly so "live + failed +
+    # cache-served = invocations" needs no operator arithmetic. The failed
+    # component is rendered only when non-zero, matching the Errors section.
+    total_errors = summary.get("total_errors", 0)
+    total_invocations = summary.get(
+        "total_invocations", summary["total_calls"] + cache_hits + total_errors
+    )
+    failed_component = f" + {total_errors} failed" if total_errors else ""
     hits_suffix = (
         f"  ({summary.get('cache_hit_chars', 0):,} chars served from cache, no upstream I/O)"
         if cache_hits
@@ -500,7 +506,7 @@ async def stm_proxy_stats(
     lines = [
         "STM Proxy Stats",
         "===============",
-        f"Total calls:     {summary['total_calls']} live"
+        f"Total calls:     {summary['total_calls']} live{failed_component}"
         f" + {cache_hits} cache-served = {total_invocations} invocations",
         f"Original chars:  {summary['total_original_chars']}",
         f"Compressed:      {summary['total_compressed_chars']}",
@@ -548,7 +554,6 @@ async def stm_proxy_stats(
         )
 
     # Error summary
-    total_errors = summary.get("total_errors", 0)
     if total_errors > 0:
         lines.append(f"\nErrors: {total_errors} ({summary.get('error_rate', 0):.1f}%)")
         errors_by_cat = summary.get("errors_by_category", {})

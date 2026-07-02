@@ -160,6 +160,22 @@ class TestProxyStats:
         result = await stm_proxy_stats(ctx=ctx)
         assert "Total calls:     1 live + 2 cache-served = 3 invocations" in result
 
+    async def test_total_calls_line_includes_failed_calls(self):
+        """#558 codex round 2: failed calls are a third mutually-exclusive
+        component of the invocation total; the component renders only when
+        non-zero (matching the Errors section)."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=10, compressed_chars=5))
+        tracker.record_cache_hit(chars=5)
+        tracker.record_error(
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True)
+        )
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Total calls:     1 live + 1 failed + 1 cache-served = 3 invocations" in result
+
     async def test_cache_hits_line_shows_served_chars(self):
         """#558: the cache's benefit (chars served with zero upstream I/O) is
         rendered on the hits line; quiet suffix when there are no hits."""

@@ -422,6 +422,23 @@ class TestTokenTracker:
         assert s["total_invocations"] == 3
         assert s["cache_hit_chars"] == 80
 
+    def test_total_invocations_includes_failed_calls(self, token_tracker: TokenTracker) -> None:
+        """#558 codex round 2: a failed call only reaches ``record_error()``,
+        never ``record()``, so the invocation total must include errors or a
+        failing workload renders "0 live + 0 cache-served = 0 invocations"
+        next to a non-zero error count."""
+        token_tracker.record(
+            CallMetrics(server="s", tool="t", original_chars=100, compressed_chars=50)
+        )
+        token_tracker.record_cache_hit(chars=50)
+        token_tracker.record_error(
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True)
+        )
+        s = token_tracker.get_summary()
+        assert s["total_calls"] == 1
+        assert s["total_errors"] == 1
+        assert s["total_invocations"] == 3
+
     def test_cache_hit_default_chars_zero(self, token_tracker: TokenTracker) -> None:
         token_tracker.record_cache_hit()
         s = token_tracker.get_summary()

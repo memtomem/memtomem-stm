@@ -424,10 +424,13 @@ class TokenTracker:
         n = self._total_calls or 1
         return {
             "total_calls": self._total_calls,
-            # ``total_calls`` counts live pipeline calls only; cache hits never
-            # reach ``record()``. Expose the reconciled total so an operator can
-            # match "Total calls / Cache hits" to actual tool invocations (#558).
-            "total_invocations": self._total_calls + self._cache_hits,
+            # ``total_calls`` counts successful live pipeline calls only: cache
+            # hits never reach ``record()``, and a failed call only reaches
+            # ``record_error()`` (every pre-``record()`` stage failure raises,
+            # and the hit path swallows surfacing errors), so the three counters
+            # are mutually exclusive per call and their sum reconciles with
+            # actual tool invocations (#558).
+            "total_invocations": self._total_calls + self._cache_hits + self._total_errors,
             "total_original_chars": self._total_original,
             "total_compressed_chars": self._total_compressed,
             "total_surfaced_chars": self._total_surfaced,
