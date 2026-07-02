@@ -164,6 +164,9 @@ class TestDefaultPatternCoverage:
             "aws_session_token: FAKEFwoGZXIvYXdzFAKE",  # YAML form (unquoted ':' separator)
             "{'SessionToken': 'FAKEFwoGZXIvYXdzFAKE'}",  # python-dict repr (single quotes)
             '"session-token": "FAKEAQoDYXdzEPTFAKE"',  # kebab quoted key (serialized headers)
+            "TF_VAR_aws_secret_access_key=FAKEwJalrXUtnFEMIFAKE",  # namespaced env (Terraform)
+            "SESSION_TOKEN=FAKEFwoGZXIvYXdzFAKE",  # bare env var, no aws prefix
+            'aws.secret_access_key = "FAKEwJalrXUtnFEMIFAKE"',  # TOML dotted key
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
@@ -208,6 +211,14 @@ class TestDefaultPatternCoverage:
             "we rotated the session tokens yesterday",  # prose, no separator
             '"session_token": {"type": "string"}',  # JSON-Schema property (object value)
             '"aws.get_session_token": "unhealthy"',  # prefixed key (telemetry by tool name)
+            # Left-boundary guards: identifiers that merely EMBED the label
+            # must not fire the unquoted branch (method names, capability
+            # flags, attribute chains — realistic tool metadata / status text).
+            "aws.get_session_token: unhealthy",  # unquoted telemetry-ish status line
+            "get_session_token: unhealthy",  # method name embeds the label
+            "supports_session_token: true",  # capability flag
+            "rotateSecretAccessKey: done",  # camelCase method, label as suffix
+            "boto3.session_token: expired",  # attribute chain, non-aws head
             "github_pat_",  # just the prefix, no body
             "npm_",  # prefix only
             # --- #1488 mirror false-positive guards: prose / kebab slugs that
