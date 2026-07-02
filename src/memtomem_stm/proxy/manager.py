@@ -3447,8 +3447,9 @@ class ProxyManager:
             # Both passthrough shapes are live upstream calls, so both record the
             # 0/0 metric — otherwise an eligible empty response would carry a
             # recorded miss + unstorable count with no matching call, breaking
-            # the ``total_invocations = total_calls + cache_hits`` reconciliation
-            # (#558; deliberately supersedes the R8 "empty records nothing" pin).
+            # the ``total_invocations = total_calls + cache_hits + total_errors``
+            # reconciliation (#558; deliberately supersedes the R8 "empty
+            # records nothing" pin).
             self.tracker.record(
                 CallMetrics(
                     server=server,

@@ -410,7 +410,9 @@ class TestTokenTracker:
 
     def test_total_invocations_reconciles_calls_and_hits(self, token_tracker: TokenTracker) -> None:
         """#558: hits never enter ``total_calls``; the summary exposes the
-        reconciled ``total_invocations = total_calls + cache_hits`` instead."""
+        reconciled ``total_invocations = total_calls + cache_hits +
+        total_errors`` instead (this test is the no-error case; the failed
+        component is pinned by test_total_invocations_includes_failed_calls)."""
         token_tracker.record(
             CallMetrics(server="s", tool="t", original_chars=100, compressed_chars=50)
         )

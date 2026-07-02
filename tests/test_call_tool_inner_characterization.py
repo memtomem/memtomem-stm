@@ -16,8 +16,9 @@ exercise end-to-end:
 - **R8**  a non-text-only response records a ``0/0`` metric and returns the list;
   an empty response records the same ``0/0`` metric and returns the sentinel
   string. (Amended by #558 — through the A1 refactor the empty branch recorded
-  NOTHING; it now records so ``total_invocations = total_calls + cache_hits``
-  reconciles for eligible empty responses whose miss/unstorable were counted.)
+  NOTHING; it now records so ``total_invocations = total_calls + cache_hits +
+  total_errors`` reconciles for eligible empty responses whose miss/unstorable
+  were counted.)
 - **R10** every downstream consumer (upstream, surfacing, auto-index, extract)
   receives the mutated ``upstream_args`` (with ``_trace_id``); only ``cache.set``
   receives the unmutated ``cache_args``.
