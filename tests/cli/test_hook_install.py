@@ -548,6 +548,10 @@ def test_apply_change_refuses_when_file_deleted_after_plan(redirect) -> None:
     assert not path.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
 def test_cli_install_apply_under_held_lock_exits_cleanly(redirect, monkeypatch) -> None:
     # Two concurrent --apply runs must serialize on the hook-host write lock;
     # the loser times out with a clean, attributed error instead of planning
@@ -566,8 +570,14 @@ def test_cli_install_apply_under_held_lock_exits_cleanly(redirect, monkeypatch) 
     assert not path.exists()  # the loser wrote nothing
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
 def test_cli_install_dry_run_ignores_held_lock(redirect, monkeypatch) -> None:
     # Dry-run never writes, so it must not queue behind (or fail on) the lock.
+    # (Vacuous on Windows — the no-op lock can't block anything — so skipped
+    # alongside the held-lock test rather than passing without meaning.)
     from memtomem_stm.cli._write_lock import hook_hosts_lock_path
     from memtomem_stm.mms import state
 
