@@ -232,7 +232,11 @@ class TestReconnectRetrySuccess:
 
     @pytest.mark.asyncio
     async def test_transient_failure_then_retry_returns_results(self):
-        adapter = McpClientSearchAdapter(SurfacingConfig())
+        # The session is injected directly (no start() → no format
+        # negotiation), so pin the legacy compact format to match the
+        # compact fixture text below. Same pattern in the other
+        # injected-session tests in this module that parse results.
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
 
         compact_output = "[1] 0.95 | [default] src/app.py\nThe retry worked.\n"
         good_result = _result_with_text(compact_output)
@@ -352,8 +356,14 @@ class TestNetworkTransportErrorsReconnect:
 
     @staticmethod
     def _network_adapter(transport: str = "sse") -> McpClientSearchAdapter:
+        # result_format pinned to match the compact fixture text (injected
+        # session, no negotiation).
         return McpClientSearchAdapter(
-            SurfacingConfig(ltm_mcp_transport=transport, ltm_mcp_url="http://127.0.0.1:9/mcp")
+            SurfacingConfig(
+                ltm_mcp_transport=transport,
+                ltm_mcp_url="http://127.0.0.1:9/mcp",
+                result_format="compact",
+            )
         )
 
     @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
@@ -620,7 +630,9 @@ class TestTextNoneTolerance:
 
     @pytest.mark.asyncio
     async def test_search_tolerates_none_text(self):
-        adapter = McpClientSearchAdapter(SurfacingConfig())
+        # result_format pinned to match the compact fixture text (injected
+        # session, no negotiation).
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
         mock_session = AsyncMock()
 
         none_content = MagicMock()
@@ -698,7 +710,9 @@ class TestOuterCancellationLazyReconnect:
 
     @pytest.mark.asyncio
     async def test_next_call_lazy_reconnects_after_cancellation(self):
-        adapter = McpClientSearchAdapter(SurfacingConfig())
+        # result_format pinned to match the compact fixture text (injected
+        # session, no negotiation).
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
         adapter._needs_reconnect = True  # simulate prior cancellation
 
         compact_output = "[1] 0.90 | [default] note.md\nhealed result\n"
@@ -797,7 +811,9 @@ class TestLazyStart:
         """No prior ``start()`` — search() must bootstrap the session itself
         and deliver real results, not the silent ``no_session`` of the old
         eager-start contract."""
-        adapter = McpClientSearchAdapter(SurfacingConfig())
+        # result_format pinned to match the compact fixture text (start()
+        # is mocked, so no negotiation runs).
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
 
         compact_output = "[1] 0.9 | [default] src/a.py\nfrom lazy start.\n"
         good_result = _result_with_text(compact_output)

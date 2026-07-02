@@ -4,9 +4,13 @@ Stands in for `memtomem-server` so that STM's McpClientSearchAdapter can be
 exercised end-to-end without depending on a real memtomem installation. It
 exposes the two tools the adapter actually calls — ``mem_search`` and the
 ``mem_do`` meta-tool routing the ``scratch_get`` and ``increment_access``
-actions — both returning canned text in **core's real compact format**
-(``[rank] score | source > hierarchy``) so that integration tests validate
-the same parsing path used in production.
+actions. ``mem_search`` honors the ``output_format`` argument like real
+core: ``"structured"`` returns the JSON format (``{"results": [...]}``,
+the adapter default since #560) and the default returns **core's real
+compact format** (``[rank] score | source > hierarchy``) — so integration
+tests validate the same parsing paths used in production. The ``mem_do``
+``version`` action advertises both formats, matching what the fake
+actually serves.
 
 **Default mode — content must vary per call.** STM's cross-session dedup
 keys on ``sha256(content)[:16]`` (see
@@ -75,33 +79,82 @@ def _emit_seeds(seeds: list[dict]) -> str:
     return "\n".join(blocks).rstrip() + "\n"
 
 
+def _emit_structured(items: list[dict]) -> str:
+    """Format *items* as core's structured ``mem_search`` output.
+
+    Mirrors ``memtomem.server.formatters``' structured JSON shape. No
+    ``chunk_id`` key is emitted unless the seed carries one, so the
+    adapter falls back to its ``sha256(content)[:16]`` surrogate and
+    bench_qa's pre-computed IDs keep lining up across both formats.
+    """
+    results = []
+    for item in items:
+        entry = {
+            "rank": item["rank"],
+            "score": item["score"],
+            "source": item["source"],
+            "hierarchy": item.get("hierarchy", "Memory"),
+            "namespace": item.get("namespace", "default"),
+            "content": str(item["content"]),
+        }
+        if "chunk_id" in item:
+            entry["chunk_id"] = item["chunk_id"]
+        results.append(entry)
+    return json.dumps({"results": results})
+
+
 @mcp.tool()
 async def mem_search(
     query: str,
     top_k: int | None = None,
     namespace: str | list[str] | None = None,
     context_window: int = 0,
+    output_format: str = "compact",
 ) -> str:
     """Return canned search hits, or fixture seeds if ``--seeds`` was given.
 
-    Matches the output of ``memtomem.server.formatters._format_compact_result``
-    so integration tests validate the real parsing path. In the default
+    Honors ``output_format`` the way real core does: ``"structured"``
+    returns the JSON format, anything else the compact text format —
+    both built from the same result set, so integration tests validate
+    whichever real parsing path the adapter negotiated. In the default
     (no-seeds) mode each call embeds a fresh UUID in both the source path
     and the body text so ``sha256(content)`` dedup never collapses repeated
     calls. See the module docstring for the full rationale.
     """
     if _SEEDS is not None:
+        if output_format == "structured":
+            return _emit_structured(_SEEDS)
         return _emit_seeds(_SEEDS)
 
     auth_tag = uuid.uuid4().hex[:8]
     api_tag = uuid.uuid4().hex[:8]
-    return (
-        "Found 2 results:\n\n"
-        f"[1] 0.92 | auth-{auth_tag}.md > Authentication\n"
-        f"JWT authentication uses HS256 with rotating secrets every 24 hours. [run={auth_tag}]\n\n"
-        f"[2] 0.87 | api-{api_tag}.md > Rate Limiting\n"
-        f"All API responses include rate limit headers (X-RateLimit-*). [run={api_tag}]"
-    )
+    hits = [
+        {
+            "rank": 1,
+            "score": 0.92,
+            "source": f"auth-{auth_tag}.md",
+            "hierarchy": "Authentication",
+            "content": (
+                f"JWT authentication uses HS256 with rotating secrets every 24 hours. "
+                f"[run={auth_tag}]"
+            ),
+        },
+        {
+            "rank": 2,
+            "score": 0.87,
+            "source": f"api-{api_tag}.md",
+            "hierarchy": "Rate Limiting",
+            "content": f"All API responses include rate limit headers (X-RateLimit-*). [run={api_tag}]",
+        },
+    ]
+    if output_format == "structured":
+        return _emit_structured(hits)
+    blocks = [f"Found {len(hits)} results:", ""]
+    for hit in hits:
+        blocks.append(f"[{hit['rank']}] {hit['score']} | {hit['source']} > {hit['hierarchy']}")
+        blocks.append(str(hit["content"]))
+        blocks.append("")
+    return "\n".join(blocks).rstrip()
 
 
 @mcp.tool()

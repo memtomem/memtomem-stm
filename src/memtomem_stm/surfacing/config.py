@@ -127,11 +127,22 @@ class SurfacingConfig(BaseModel):
     out raw text on a TTL for operators who keep the default and want
     bounded retention rather than full opt-out."""
     consumer_model: str = ""
-    result_format: Literal["compact", "structured"] = "compact"
-    """Parser format for mem_search output. ``compact`` is the legacy
-    core format (``[rank] score | source``). ``structured`` selects the
-    machine-parseable JSON format (``{"results": [...]}``) with automatic
-    version negotiation — falls back to compact if core is too old.
+    result_format: Literal["compact", "structured"] = "structured"
+    """Parser format for mem_search output. ``structured`` (default)
+    selects the machine-parseable JSON format (``{"results": [...]}``)
+    with automatic version negotiation — the client silently downgrades
+    to ``compact`` when the core doesn't advertise ``structured`` in
+    ``capabilities.search_formats`` (older cores). ``compact`` is the
+    legacy core text format (``[rank] score | source``).
+
+    Score fidelity (#560): the compact format renders scores rounded to
+    two decimals, and RRF fusion scores live in ``(0, ~0.033]`` — so
+    under ``compact`` every score that survives the default ``min_score``
+    filter (0.03) parses back as exactly ``0.03``. The degenerate
+    distribution blinds ``min_score`` calibration and the auto-tuner
+    (both were benchmarked against full-precision scores, #329) and is
+    why ``structured`` is the default. Only pin ``compact`` for cores
+    that predate the structured format.
 
     Per-memory feedback fidelity (EN-2/3): the formatter renders each
     memory's ``chunk.id`` so the agent can rate memories individually via
@@ -142,9 +153,8 @@ class SurfacingConfig(BaseModel):
     the underlying chunk (``increment_access`` no-ops), and two memories
     with identical content collide on one id. STM-side cache invalidation
     (``not_relevant`` / ``already_known``) still works because it keys on
-    the same surrogate within the process. Select ``structured`` when
-    reliable per-memory boost / dedup matters — it carries the real
-    ``chunk_id`` end to end."""
+    the same surrogate within the process. ``structured`` carries the real
+    ``chunk_id`` end to end, so per-memory boost / dedup stay reliable."""
 
     @model_validator(mode="after")
     def _validate_auto_tune_bounds(self) -> SurfacingConfig:
