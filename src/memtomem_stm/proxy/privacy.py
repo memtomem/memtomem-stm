@@ -66,13 +66,48 @@ CREDENTIAL_PATTERNS = [
     #   forms above, so don't "simplify" it that way.
     #
     # The AKIA/ASIA rule below catches the key *IDs*; this one catches the
-    # *material* those IDs unlock. STM-origin: this rule is ahead of LTM's
-    # mirrored set until the forward-sync lands (the inverse of the
-    # #1488→#1491 reverse-sync direction; see the count-pin note in
+    # *material* those IDs unlock. STM-origin; forward-synced into LTM's
+    # mirrored set as memtomem#1533 (the inverse of the #1488→#1491
+    # reverse-sync direction; see the count-pin note in
     # tests/test_privacy.py).
     r"(?i)(?:[\"'](?:secret[_-]?access[_-]?key|session[_-]?token)[\"']\s*:\s*[\"']"
     r"|(?:(?<![A-Za-z0-9_.-])|(?<=aws[._-]))"
     r"(?:secret[_-]?access[_-]?key|session[_-]?token)\s*[:=])",
+    # The label AWS actually puts on the WIRE for that same session-token
+    # material: botocore DEBUG logs emit the ``x-amz-security-token`` request
+    # header verbatim, and every presigned URL generated with temporary
+    # credentials carries the ``X-Amz-Security-Token=…`` query parameter.
+    # No rule above reaches either: ``session[_-]?token`` cannot cross the
+    # ``security-token`` spelling, and the kebab header shape has no ``aws``
+    # separator directly before the label, so the left-boundary form above
+    # misses it too — catching these payloads otherwise relies on an
+    # ``ASIA…`` key ID co-occurring in the same text. Two alternatives,
+    # mirroring the rule above:
+    #
+    # - quoted form — ``"x-amz-security-token": "…"`` (serialized header
+    #   dicts, JSON or python repr). Quote directly on both sides of the
+    #   label and a string-opening value, so an OpenAPI/JSON-Schema header
+    #   *definition* (``"X-Amz-Security-Token": {"type"…`` — object value,
+    #   ubiquitous in AWS API specs) never fires.
+    # - unquoted form — the raw header line (``x-amz-security-token: FwoG…``)
+    #   and the presigned-URL query param (``…&X-Amz-Security-Token=FwoG…``).
+    #   The left boundary rejects only a directly preceding SEPARATOR
+    #   (``[_.-]``), not alphanumerics — a narrower boundary than the rule
+    #   above, on purpose. Kebab/dotted compounds that merely NAME the
+    #   header must not fire — ``forward-x-amz-security-token: true``
+    #   (config knob about the header), ``proxy.headers.x-amz-security-token``
+    #   (flattened telemetry key — dotted heads are negative by design, as
+    #   in the rule above) — but a directly preceding alphanumeric must
+    #   stay a match: a bytes-repr header dump renders the newline before
+    #   the label as a LITERAL ``\r\n``, putting ``n`` right before the
+    #   ``x`` (``send: b'…\r\nx-amz-security-token: FwoG…'`` —
+    #   http.client debuglevel / botocore DEBUG wire dumps). Real left
+    #   neighbors (``?``, ``&``, quotes, line starts) pass either way.
+    #   Prose that merely NAMES the header (``set the x-amz-security-token
+    #   header``, ``header: x-amz-security-token``) stays negative — the
+    #   separator must directly follow the label.
+    r"(?i)(?:[\"']x-amz-security-token[\"']\s*:\s*[\"']"
+    r"|(?<![_.\-])x-amz-security-token\s*[:=])",
     # Provider-prefixed token formats. Anchored by prefix so false positives
     # on arbitrary high-entropy strings are rare.
     r"(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|xox[bps]-[0-9A-Za-z-]+)",

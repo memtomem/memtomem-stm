@@ -167,6 +167,18 @@ class TestDefaultPatternCoverage:
             "TF_VAR_aws_secret_access_key=FAKEwJalrXUtnFEMIFAKE",  # namespaced env (Terraform)
             "SESSION_TOKEN=FAKEFwoGZXIvYXdzFAKE",  # bare env var, no aws prefix
             'aws.secret_access_key = "FAKEwJalrXUtnFEMIFAKE"',  # TOML dotted key
+            # x-amz-security-token — the label AWS puts on the WIRE for the
+            # same session-token material (#561; values are FAKE): the header
+            # line botocore DEBUG logs emit verbatim, the presigned-URL query
+            # param, and serialized header dicts.
+            "x-amz-security-token: FAKEFwoGZXIvYXdzFAKE",  # raw header line
+            "https://b.s3.amazonaws.com/k?X-Amz-Security-Token=FAKEFwoG&X-Amz-Date=20260702",
+            '"x-amz-security-token": "FAKEFwoGZXIvYXdzFAKE"',  # serialized headers (JSON)
+            "{'x-amz-security-token': 'FAKEFwoGZXIvYXdzFAKE'}",  # python-repr headers
+            # bytes-repr wire dump: the newline before the label is a LITERAL
+            # \r\n, so an alphanumeric (``n``) directly precedes the ``x`` —
+            # pins the boundary class ([_.-], NOT [A-Za-z0-9_.-]).
+            r"send: b'GET /k HTTP/1.1\r\nx-amz-security-token: FAKEFwoG\r\n'",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
@@ -219,6 +231,15 @@ class TestDefaultPatternCoverage:
             "supports_session_token: true",  # capability flag
             "rotateSecretAccessKey: done",  # camelCase method, label as suffix
             "boto3.session_token: expired",  # attribute chain, non-aws head
+            # x-amz-security-token false-positive guards (#561): docs/prose
+            # that merely NAME the header carry no value — the separator must
+            # directly follow the label — and a spec's header *definition* has
+            # an object value, not a string.
+            "header: x-amz-security-token",  # docs prose, separator on the wrong side
+            "sign the x-amz-security-token header into the canonical request",  # prose
+            '"X-Amz-Security-Token": {"type": "string"}',  # OpenAPI header definition
+            "forward-x-amz-security-token: true",  # kebab config knob embeds the label
+            "proxy.headers.x-amz-security-token: passthrough",  # dotted telemetry head
             "github_pat_",  # just the prefix, no body
             "npm_",  # prefix only
             # --- #1488 mirror false-positive guards: prose / kebab slugs that
@@ -263,16 +284,17 @@ class TestCredentialPiiSplit:
         assert not set(privacy.CREDENTIAL_PATTERNS) & set(privacy.PII_PATTERNS)
 
     def test_credential_set_count_pinned(self):
-        # 9 original secret-class patterns + 7 mirrored from memtomem LTM
-        # (#1488 / reverse sync #1491) + 1 STM-origin AWS secret-material
-        # label rule awaiting its forward-sync into LTM. Bump deliberately
-        # when adding a pattern so a silent add/drop surfaces here. LTM's
-        # matching pin (memtomem DEFAULT_PATTERNS == 16) stays one behind
-        # until the AWS rule is mirrored forward — at which point both pins
-        # move to 17 together.
-        assert len(privacy.CREDENTIAL_PATTERNS) == 17
+        # 9 original secret-class patterns + 2 STM-origin AWS label rules
+        # (#553 secret-material labels, forward-synced into LTM as
+        # memtomem#1533; #561 x-amz-security-token, awaiting its forward
+        # sync) + 7 mirrored from memtomem LTM (#1488 / reverse sync #1491).
+        # Bump deliberately when adding a pattern so a silent add/drop
+        # surfaces here. LTM's matching pin sits at 17 until the #561 rule
+        # is mirrored forward — at which point both pins move to 18 together
+        # (the #559 content-hash pin tracks the shared subset).
+        assert len(privacy.CREDENTIAL_PATTERNS) == 18
         assert len(privacy.PII_PATTERNS) == 1
-        assert len(privacy.DEFAULT_PATTERNS) == 18
+        assert len(privacy.DEFAULT_PATTERNS) == 19
 
     @pytest.mark.parametrize(
         "sample",
@@ -294,6 +316,7 @@ class TestCredentialPiiSplit:
             "AWS_SECRET_ACCESS_KEY=FAKEwJalrXUtnFEMIFAKE",
             '"SessionToken": "FAKEFwoGZXIvYXdzFAKE"',
             '"SecretAccessKey": "FAKEwJalrXUtnFEMIFAKE"',
+            "x-amz-security-token: FAKEFwoGZXIvYXdzFAKE",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",
             "-----BEGIN RSA PRIVATE KEY-----",
             # #1488 mirror: each must classify as a credential (not PII) so the
