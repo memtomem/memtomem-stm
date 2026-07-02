@@ -34,6 +34,27 @@ logger = logging.getLogger(__name__)
 CREDENTIAL_PATTERNS = [
     r"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]",
     r"(?i)(password|passwd|pwd)\s*[:=]",
+    # Quoted-JSON / dict-repr forms of the generic labels above. The two
+    # label rules end in ``\s*[:=]``, and a quoted key's closing quote sits
+    # between the label and the colon — ``"password": "hunter2"``,
+    # ``"api_key": "sk-…"``, ``"accessToken": "ya29.…"``, ``{'password':
+    # 'hunter2'}`` match none of them — and JSON-serialized credentials are
+    # high-frequency tool output (``docker inspect``, ``kubectl get secret
+    # -o json``, DB connection configs). Same FP-guard shape as the AWS
+    # quoted branch below: the quote must sit DIRECTLY on both sides of the
+    # label and the value must open as a string, so a JSON-Schema property
+    # (``"access_token": {"type"…`` — object value; login/OAuth tool schemas
+    # carry these constantly), an identifier that merely embeds a label
+    # (``"my_api_key_name": …``), and a prefixed key (``"tools.api_key": …``
+    # — telemetry dicts keyed by tool name) never fire. The ``[_-]?``
+    # separator is optional, so camelCase JSON keys (``"apiKey"``,
+    # ``"accessToken"``) match under ``(?i)``. ``pwd`` is deliberately NOT
+    # in this vocabulary (unlike the unquoted rule above): shell/file tools
+    # legitimately return working-directory fields (``"pwd": "/home/user"``).
+    # The AWS spellings are listed so the vocabulary is self-contained,
+    # though the #553 rule below already covers their quoted forms.
+    r"(?i)[\"'](?:api[_-]?key|secret[_-]?(?:access[_-]?)?key"
+    r"|(?:access|session)[_-]?token|password|passwd)[\"']\s*:\s*[\"']",
     # AWS secret material by label. The generic label rule above misses both
     # spellings the AWS toolchain actually emits: ``secret[_-]?key`` needs its
     # two words adjacent (``secret_access_key`` splits them) and
