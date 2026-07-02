@@ -8,11 +8,27 @@ be running.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import pytest
 
 from memtomem_stm.proxy import privacy
+
+# Golden SHA-256 over the newline-joined ``CREDENTIAL_PATTERNS`` strings.
+# The count pin in ``TestCredentialPiiSplit`` catches a silent add/drop;
+# this catches a silent EDIT of a pattern body. The secret-class set is
+# mirrored byte-identical and same-order with memtomem LTM's
+# ``DEFAULT_PATTERNS`` (see the privacy.py module docstring), and the LTM
+# suite pins the SAME constant (same variable name, greppable across both
+# repos), so tightening one side alone fails that side's suite — updating
+# a pattern is a deliberate two-sided bump. A cross-import equality test
+# is off the table by design: STM holds no Python-level dependency on
+# memtomem core (CLAUDE.md invariant; issue #559). During a deliberate
+# divergence window (one side merged ahead of its sync), bump the leading
+# side's constant with a sync-tracking note, then re-align the trailing
+# side's constant when the sync lands.
+_SECRET_CLASS_SET_SHA256 = "237d505d119c08ba85fc4474aa85bd07c603439809d03915331fab6b435a9f65"
 
 
 @pytest.fixture(autouse=True)
@@ -302,17 +318,25 @@ class TestCredentialPiiSplit:
 
     def test_credential_set_count_pinned(self):
         # 9 original secret-class patterns + 3 STM-origin label rules
-        # (#553 AWS secret-material labels, forward-synced into LTM as
-        # memtomem#1533; #561 x-amz-security-token and #562 the general
-        # quoted-label rule, both awaiting their forward sync) + 7 mirrored
-        # from memtomem LTM (#1488 / reverse sync #1491). Bump deliberately
-        # when adding a pattern so a silent add/drop surfaces here. LTM's
-        # matching pin sits at 17 until #561/#562 are mirrored forward — at
-        # which point both pins move to 19 together (the #559 content-hash
-        # pin tracks the shared subset).
+        # (#553 AWS secret-material labels, #562 the general quoted-label
+        # rule, #561 x-amz-security-token — forward-synced into LTM as
+        # memtomem#1533 and memtomem#1541) + 7 mirrored from memtomem LTM
+        # (#1488 / reverse sync #1491). Bump deliberately when adding a
+        # pattern so a silent add/drop surfaces here. LTM's matching pin
+        # also sits at 19; the content-hash pin below guards the pattern
+        # BODIES on both sides (#559).
         assert len(privacy.CREDENTIAL_PATTERNS) == 19
         assert len(privacy.PII_PATTERNS) == 1
         assert len(privacy.DEFAULT_PATTERNS) == 20
+
+    def test_credential_set_content_pinned_for_ltm_sync(self):
+        joined = "\n".join(privacy.CREDENTIAL_PATTERNS).encode("utf-8")
+        assert hashlib.sha256(joined).hexdigest() == _SECRET_CLASS_SET_SHA256, (
+            "CREDENTIAL_PATTERNS content changed — this set is mirrored "
+            "byte-identical and same-order with memtomem LTM's "
+            "DEFAULT_PATTERNS; bump _SECRET_CLASS_SET_SHA256 together with "
+            "the LTM-side pin of the same name (issue #559)"
+        )
 
     @pytest.mark.parametrize(
         "sample",
