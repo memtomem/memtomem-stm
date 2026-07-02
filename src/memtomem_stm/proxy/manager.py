@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from memtomem_stm.surfacing.observability import SkipReason
 
 from mcp import ClientSession
+from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -316,6 +317,12 @@ class ProxyManager:
         self._relevance_scorer_instance = self._create_scorer(config)
         self._relevance_scorer_cfg = config.relevance_scorer
         self._background_tasks: set[asyncio.Task] = set()
+        # #557 ``tools/list_changed`` refresh bookkeeping. ``dirty`` marks
+        # servers whose advertised tool list is known-stale; ``running`` holds
+        # servers with a drain task in flight so notification bursts coalesce
+        # into one refresh chain. See ``_schedule_tools_refresh``.
+        self._tools_refresh_dirty: set[str] = set()
+        self._tools_refresh_running: set[str] = set()
         # Per-key stampede guard — identical concurrent ``call_tool`` invocations
         # serialize on the same lock so a cache miss triggers one upstream
         # call rather than N. Entries are popped when the work completes so
@@ -346,6 +353,12 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            # Reset the #557 refresh bookkeeping alongside the connections it
+            # tracks (same rationale as in ``stop()``): a ``running`` entry
+            # orphaned by a never-started drain task would silently drop every
+            # ``list_changed`` notification for that server this session.
+            self._tools_refresh_dirty.clear()
+            self._tools_refresh_running.clear()
             # Close the consult cache too so a re-entry that changed
             # ``toolgraph.consult_cache_path`` reopens the right DB (#494). Mirror
             # the stack-close try/except above: always null the handle so a failed
@@ -825,7 +838,9 @@ class ProxyManager:
             transport_ctx = self._open_transport(cfg)
             streams = await conn_stack.enter_async_context(transport_ctx)
             read, write = streams[0], streams[1]
-            session = await conn_stack.enter_async_context(ClientSession(read, write))
+            session = await conn_stack.enter_async_context(
+                ClientSession(read, write, message_handler=self._make_message_handler(name))
+            )
             await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
             result = await session.list_tools()
         except BaseException:
@@ -885,7 +900,9 @@ class ProxyManager:
             transport_ctx = self._open_transport(cfg)
             streams = await conn_stack.enter_async_context(transport_ctx)
             read, write = streams[0], streams[1]
-            session = await conn_stack.enter_async_context(ClientSession(read, write))
+            session = await conn_stack.enter_async_context(
+                ClientSession(read, write, message_handler=self._make_message_handler(name))
+            )
             await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
             result = await session.list_tools()
         except BaseException:
@@ -902,6 +919,122 @@ class ProxyManager:
         conn.stack = conn_stack
         conn.tools = list(result.tools)
         logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
+
+    def _make_message_handler(self, name: str) -> Any:
+        """Per-upstream MCP message handler wired into ``ClientSession``.
+
+        The only message acted on is ``notifications/tools/list_changed``. The
+        cache-eligibility gate (``_tool_cache_eligible``) reads tool annotations
+        from the ``conn.tools`` snapshot, which is otherwise populated only at
+        connect/reconnect — so an upstream that re-declares a tool from
+        read-only to may-mutate at runtime would keep replaying the pre-flip
+        cached response until the next error-driven reconnect (#557). Every
+        other message (server->client requests, other notifications, stream
+        exceptions) falls through untouched, matching the SDK's default
+        handler behavior.
+        """
+
+        async def _handler(message: Any) -> None:
+            # ``ServerNotification`` is a RootModel; requests arrive as
+            # ``RequestResponder`` and stream errors as ``Exception``, neither
+            # of which carries a ``root`` attribute.
+            root = getattr(message, "root", None)
+            if isinstance(root, mcp_types.ToolListChangedNotification):
+                self._schedule_tools_refresh(name)
+
+        return _handler
+
+    def _schedule_tools_refresh(self, name: str) -> None:
+        """Coalesce ``tools/list_changed`` notifications into at most one
+        in-flight refresh per server.
+
+        A notification only says "the list changed, re-fetch it", so a burst
+        collapses to a single ``list_tools`` as long as that call starts after
+        the last notification arrived. Single-threaded event loop: the
+        dirty/running bookkeeping here and in ``_drain_tools_refresh`` runs
+        without an intervening ``await``, so the handler and the drain task
+        cannot interleave mid-decision.
+        """
+        self._tools_refresh_dirty.add(name)
+        if name in self._tools_refresh_running:
+            return
+        self._tools_refresh_running.add(name)
+        task = asyncio.create_task(self._drain_tools_refresh(name))
+        self._background_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._on_background_task_done, "tools_refresh", name, "*")
+        )
+
+    async def _drain_tools_refresh(self, name: str) -> None:
+        """Refresh until no notification arrived during the previous pass.
+
+        If a refresh raises (upstream torn down mid-call, transport error) the
+        loop exits and the failure is logged by ``_on_background_task_done``;
+        the server may remain marked dirty, and the next notification — or the
+        error-driven reconnect, which re-lists on the new session — heals it.
+        """
+        try:
+            while name in self._tools_refresh_dirty:
+                self._tools_refresh_dirty.discard(name)
+                await self._refresh_server_tools(name)
+        finally:
+            self._tools_refresh_running.discard(name)
+
+    async def _refresh_server_tools(self, name: str) -> None:
+        """Re-list an upstream's tools and invalidate cache rows the change
+        made unsafe.
+
+        After ``conn.tools`` is reassigned the eligibility gate already refuses
+        lookups for a tool that now self-declares as a writer; the row deletion
+        on top of that is deliberate — a pre-flip row would otherwise outlive
+        the flip and could be served again if the annotations (or a ``cache``
+        override) later move the verdict back to eligible (#557). Rows for
+        tools that disappeared from the list are also dropped: they could only
+        ever serve calls the upstream no longer answers, masking the removal.
+        """
+        conn = self._connections.get(name)
+        if conn is None:
+            return
+        session = conn.session
+        result = await session.list_tools()
+        if self._connections.get(name) is not conn or conn.session is not session:
+            # A reconnect replaced the session mid-refresh. Its ``list_tools``
+            # ran against the new session; applying this (possibly older)
+            # snapshot over it would clobber fresher state.
+            return
+        cfg_snap = self._config
+        old_names = {n for t in conn.tools if (n := getattr(t, "name", None)) is not None}
+        new_tools = list(result.tools)
+        new_names = {t.name for t in new_tools}
+        all_names = old_names | new_names
+        was_eligible = {t: self._tool_cache_eligible(name, t, cfg_snap=cfg_snap) for t in all_names}
+        conn.tools = new_tools
+        stale = [
+            t
+            for t in sorted(all_names)
+            if (was_eligible[t] and not self._tool_cache_eligible(name, t, cfg_snap=cfg_snap))
+            or t not in new_names
+        ]
+        invalidated = 0
+        if self._cache is not None:
+            for t in stale:
+                try:
+                    invalidated += self._cache.clear(server=name, tool=t)
+                except Exception:
+                    logger.warning(
+                        "Cache invalidation failed for %s/%s after tools/list_changed",
+                        name,
+                        t,
+                        exc_info=True,
+                    )
+        logger.info(
+            "Refreshed tools for '%s' after tools/list_changed "
+            "(%d tools advertised, %d cache rows invalidated across %d tools)",
+            name,
+            len(new_tools),
+            invalidated,
+            len(stale),
+        )
 
     def _on_background_task_done(
         self,
@@ -961,6 +1094,14 @@ class ProxyManager:
                 len(self._background_tasks),
             )
         self._background_tasks.clear()
+        # Reset the #557 refresh bookkeeping. A drain task cancelled before its
+        # first step never enters its ``finally`` (the coroutine body never
+        # runs), so ``running`` can retain the server name — and a stop→start
+        # reuse of this manager would then drop every later ``list_changed``
+        # notification for that server ("running" but no task). ``dirty`` is
+        # cleared for symmetry; a stale entry there is merely unconsumed.
+        self._tools_refresh_dirty.clear()
+        self._tools_refresh_running.clear()
         # Close httpx clients
         if self._llm_compressor is not None:
             await self._llm_compressor.close()
