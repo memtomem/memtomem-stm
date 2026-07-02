@@ -249,7 +249,9 @@ class TokenTracker:
         self._total_compress_ms = 0.0
         self._total_surface_ms = 0.0
         self._cache_hits = 0
+        self._cache_hit_chars = 0
         self._cache_misses = 0
+        self._cache_unstorable = 0
         self._reconnects = 0
         self._metrics_store = metrics_store
         self._by_server = _BoundedCounterDict(
@@ -326,11 +328,36 @@ class TokenTracker:
             except Exception:
                 logger.warning("Failed to persist metrics", exc_info=True)
 
-    def record_cache_hit(self) -> None:
+    def record_cache_hit(self, chars: int = 0) -> None:
+        """Record a response served from the cache.
+
+        Cache hits are deliberately NOT folded into ``record()``: ``_total_calls``
+        is the denominator for the per-stage latency averages and the unit of the
+        per-server/per-tool char counters, and a hit runs none of that pipeline.
+        ``chars`` is the size of the served (stored, compressed) text so the
+        cache's benefit is visible next to the compression savings it would
+        otherwise be structurally excluded from (#558); ``get_summary`` exposes
+        the reconciliation as ``total_invocations = total_calls + cache_hits``.
+        """
         self._cache_hits += 1
+        self._cache_hit_chars += chars
 
     def record_cache_miss(self) -> None:
         self._cache_misses += 1
+
+    def record_cache_unstorable(self) -> None:
+        """Record a counted cache miss whose response the cache refused to store.
+
+        Without this, a tool whose responses are never storable (mixed/non-text
+        content, transient retrieval keys, …) re-misses forever: ``cache_misses``
+        grows unbounded while its hit-rate contribution stays 0%, and the
+        diagnostics point at a tool the cache can never help (#558). Callers only
+        invoke this when the lookup path actually recorded a miss, so
+        ``cache_misses - cache_unstorable`` is the demand the cache can convert
+        to hits. Best-effort: store-side failures after an accepted response
+        (sqlite errors, the privacy write gate) are not counted.
+        """
+        self._cache_unstorable += 1
 
     def record_reconnect(self) -> None:
         self._reconnects += 1
@@ -397,6 +424,10 @@ class TokenTracker:
         n = self._total_calls or 1
         return {
             "total_calls": self._total_calls,
+            # ``total_calls`` counts live pipeline calls only; cache hits never
+            # reach ``record()``. Expose the reconciled total so an operator can
+            # match "Total calls / Cache hits" to actual tool invocations (#558).
+            "total_invocations": self._total_calls + self._cache_hits,
             "total_original_chars": self._total_original,
             "total_compressed_chars": self._total_compressed,
             "total_surfaced_chars": self._total_surfaced,
@@ -412,7 +443,9 @@ class TokenTracker:
             "avg_compress_ms": round(self._total_compress_ms / n, 2),
             "avg_surface_ms": round(self._total_surface_ms / n, 2),
             "cache_hits": self._cache_hits,
+            "cache_hit_chars": self._cache_hit_chars,
             "cache_misses": self._cache_misses,
+            "cache_unstorable": self._cache_unstorable,
             "reconnects": self._reconnects,
             "latency_percentiles": {
                 "clean_ms": self._percentiles(self._clean_latencies),

@@ -408,6 +408,32 @@ class TestTokenTracker:
         assert s["cache_hits"] == 2
         assert s["cache_misses"] == 1
 
+    def test_total_invocations_reconciles_calls_and_hits(self, token_tracker: TokenTracker) -> None:
+        """#558: hits never enter ``total_calls``; the summary exposes the
+        reconciled ``total_invocations = total_calls + cache_hits`` instead."""
+        token_tracker.record(
+            CallMetrics(server="s", tool="t", original_chars=100, compressed_chars=50)
+        )
+        token_tracker.record_cache_hit(chars=50)
+        token_tracker.record_cache_hit(chars=30)
+        s = token_tracker.get_summary()
+        assert s["total_calls"] == 1
+        assert s["cache_hits"] == 2
+        assert s["total_invocations"] == 3
+        assert s["cache_hit_chars"] == 80
+
+    def test_cache_hit_default_chars_zero(self, token_tracker: TokenTracker) -> None:
+        token_tracker.record_cache_hit()
+        s = token_tracker.get_summary()
+        assert s["cache_hits"] == 1
+        assert s["cache_hit_chars"] == 0
+
+    def test_cache_unstorable_counter(self, token_tracker: TokenTracker) -> None:
+        s = token_tracker.get_summary()
+        assert s["cache_unstorable"] == 0
+        token_tracker.record_cache_unstorable()
+        assert token_tracker.get_summary()["cache_unstorable"] == 1
+
     def test_reconnect_counter(self, token_tracker: TokenTracker) -> None:
         token_tracker.record_reconnect()
         assert token_tracker.get_summary()["reconnects"] == 1

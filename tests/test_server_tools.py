@@ -147,6 +147,44 @@ class TestProxyStats:
         result = await stm_proxy_stats(ctx=ctx)
         assert "Cache hit rate:  75.0%" in result
 
+    async def test_total_calls_line_reconciles_invocations(self):
+        """#558: the Total calls line states live + cache-served = invocations
+        explicitly, so hits are no longer invisible in the call count."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=10, compressed_chars=5))
+        tracker.record_cache_hit(chars=5)
+        tracker.record_cache_hit(chars=5)
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Total calls:     1 live + 2 cache-served = 3 invocations" in result
+
+    async def test_cache_hits_line_shows_served_chars(self):
+        """#558: the cache's benefit (chars served with zero upstream I/O) is
+        rendered on the hits line; quiet suffix when there are no hits."""
+        tracker = TokenTracker()
+        tracker.record_cache_hit(chars=1234)
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hits:      1  (1,234 chars served from cache, no upstream I/O)" in result
+
+        result_no_hits = await stm_proxy_stats(ctx=_make_ctx(tracker=TokenTracker()))
+        assert "chars served from cache" not in result_no_hits
+
+    async def test_unstorable_line_only_when_nonzero(self):
+        """#558: unstorable misses get their own line so a permanently
+        re-missing tool is diagnosable; hidden in the common all-text case."""
+        tracker = TokenTracker()
+        tracker.record_cache_miss()
+        tracker.record_cache_unstorable()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Unstorable:      1" in result
+
+        result_zero = await stm_proxy_stats(ctx=_make_ctx(tracker=TokenTracker()))
+        assert "Unstorable:" not in result_zero
+
     async def test_cache_entries_line_when_cache_wired(self, tmp_path):
         """When the response cache is wired, occupancy/eviction is surfaced."""
         from memtomem_stm.proxy.cache import ProxyCache

@@ -342,6 +342,101 @@ class TestMissAccountingHonoursEligibility:
 
 
 @pytest.mark.asyncio
+class TestUnstorableAccounting:
+    """#558: a recorded miss whose response the cache refuses to store is counted
+    as ``cache_unstorable``, so a tool that can never register a hit (mixed /
+    non-text / empty responses) is diagnosable instead of presenting as an
+    ever-growing 0%-hit-rate miss pile. The counter mirrors the lookup gate:
+    no recorded miss → no unstorable count."""
+
+    async def test_mixed_response_counts_unstorable_every_call(self, build):
+        mgr, _, cache = build(tools=[_tool("mixed", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _mixed_result()
+
+        await mgr.call_tool("srv", "mixed", {"q": "a"})
+        await mgr.call_tool("srv", "mixed", {"q": "a"})  # never stored → re-miss
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 2
+        assert summary["cache_unstorable"] == 2
+        assert summary["cache_hits"] == 0
+        assert cache.get("srv", "mixed", {"q": "a"}) is None
+
+    async def test_nontext_only_response_counts_unstorable(self, build):
+        mgr, _, _ = build(tools=[_tool("img", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _nontext_result()
+
+        await mgr.call_tool("srv", "img", {})
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 1
+        assert summary["cache_unstorable"] == 1
+
+    async def test_empty_response_counts_unstorable(self, build):
+        mgr, _, _ = build(tools=[_tool("empty", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _empty_result()
+
+        await mgr.call_tool("srv", "empty", {})
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 1
+        assert summary["cache_unstorable"] == 1
+
+    async def test_ineligible_writer_mixed_response_not_counted(self, build):
+        """No lookup was attempted (force-forwarded writer), so neither a miss
+        nor an unstorable count may move — they must stay reconciled."""
+        mgr, _, _ = build(tools=[_tool("writer", _ann(read_only=False))])
+        mgr._connections["srv"].session.call_tool.return_value = _mixed_result()
+
+        await mgr.call_tool("srv", "writer", {})
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 0
+        assert summary["cache_unstorable"] == 0
+
+    async def test_ttl_zero_mixed_response_not_counted(self, build):
+        """Caching disabled (resolved ttl<=0) bypasses the lookup entirely, so
+        the store refusal must not be counted as an unstorable miss."""
+        mgr, _, _ = build(
+            tools=[_tool("mixed", _ann(read_only=True))],
+            tool_overrides={"mixed": ToolOverrideConfig(cache_ttl_seconds=0.0)},
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _mixed_result()
+
+        await mgr.call_tool("srv", "mixed", {})
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 0
+        assert summary["cache_unstorable"] == 0
+
+    async def test_storable_response_not_counted(self, build):
+        mgr, _, _ = build(tools=[_tool("reader", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {})
+
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_misses"] == 1
+        assert summary["cache_unstorable"] == 0
+
+    async def test_hit_records_served_chars(self, build):
+        """A cache hit records the size of the served (stored) text so the
+        cache's benefit is visible next to the compression savings (#558)."""
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        mgr._connections["srv"].session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # miss → stored
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # hit
+
+        stored = cache.get("srv", "reader", {"q": "a"})
+        assert stored is not None
+        summary = mgr.tracker.get_summary()
+        assert summary["cache_hits"] == 1
+        assert summary["cache_hit_chars"] == len(stored)
+        assert summary["total_invocations"] == summary["total_calls"] + 1
+
+
+@pytest.mark.asyncio
 class TestTtlZeroDisablesServing:
     """Lowering cache.default_ttl_seconds to 0 must stop serving rows cached under
     a prior positive TTL — per-row TTL is frozen at write time, so the lookup path

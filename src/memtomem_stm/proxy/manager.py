@@ -1986,7 +1986,7 @@ class ProxyManager:
         post-lock double-check so concurrent duplicate requests return
         through the same hit pipeline as a single call would.
         """
-        self.tracker.record_cache_hit()
+        self.tracker.record_cache_hit(chars=len(cached))
         context_query = arguments.get("_context_query") if arguments else None
         with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
             return await self._apply_surfacing(
@@ -3250,6 +3250,28 @@ class ProxyManager:
                     exc_info=True,
                 )
 
+    def _record_unstorable_response(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> None:
+        """Count a recorded cache miss whose response shape refuses the store.
+
+        The gate mirrors the lookup path in ``_call_tool_guarded`` exactly
+        (cache wired, resolved TTL positive/None, tool cache-eligible): a miss
+        is recorded only behind that gate, so the counter must only move behind
+        the same gate — otherwise force-forwarded (ineligible / ttl<=0 / no-
+        cache) calls would report "unstorable" misses that were never counted
+        as misses in the first place. Direct ``_call_tool_inner`` callers
+        (tests) bypass the lookup AND this accounting stays consistent only
+        through production's guarded path; see the miss-accounting comment in
+        ``_call_tool_inner``.
+        """
+        if self._cache is None:
+            return
+        cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
+        if cache_ttl is not None and cache_ttl <= 0:
+            return
+        if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
+            return
+        self.tracker.record_cache_unstorable()
+
     def _store_cache(
         self,
         *,
@@ -3302,6 +3324,7 @@ class ProxyManager:
             # is disabled (resolved ttl<=0); the explicit ttl<=0 branch below does
             # the same for text responses. The non-text-ONLY response early-returns
             # in ``_call_tool_inner`` and invalidates there instead.
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             return
         cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
@@ -3323,6 +3346,7 @@ class ProxyManager:
                 tool,
             )
         elif comp.progressive_passthrough_on_error:
+            self.tracker.record_cache_unstorable()
             logger.debug(
                 "Skipping cache store for %s/%s: progressive passthrough "
                 "degradation (transient store failure)",
@@ -3330,6 +3354,7 @@ class ProxyManager:
                 tool,
             )
         elif response_carries_transient_key(comp.compressed):
+            self.tracker.record_cache_unstorable()
             logger.debug(
                 "Skipping cache store for %s/%s: response carries a transient "
                 "retrieval key (progressive/selective TOC)",
@@ -3431,11 +3456,15 @@ class ProxyManager:
                 )
                 # Non-text-only response is never stored; mirror the mixed-branch
                 # invalidation in ``_store_cache`` so a stale prior text row for
-                # this key is dropped while caching is disabled (#541).
+                # this key is dropped while caching is disabled (#541), and count
+                # the store refusal against the miss already recorded (#558).
+                self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
                 self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
                 return non_text_content
             # A truly-empty upstream response is never stored either; invalidate a
-            # stale prior text row for this key while caching is disabled (#541).
+            # stale prior text row for this key while caching is disabled (#541)
+            # and count the store refusal against the recorded miss (#558).
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
             return "[empty response]"
         original_text = shaped.original_text

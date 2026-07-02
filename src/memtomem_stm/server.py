@@ -486,16 +486,40 @@ async def stm_proxy_stats(
     cache_lookups = cache_hits + cache_misses
     cache_hit_rate = (cache_hits / cache_lookups * 100) if cache_lookups else 0.0
 
+    # Every rendered number reconciles (#558): ``Total calls`` counts live
+    # pipeline calls only (the denominator of the savings/latency figures),
+    # cache hits never enter it, and the ``Total calls`` line states the sum
+    # explicitly so "calls + hits = invocations" needs no operator arithmetic.
+    total_invocations = summary.get("total_invocations", summary["total_calls"] + cache_hits)
+    hits_suffix = (
+        f"  ({summary.get('cache_hit_chars', 0):,} chars served from cache, no upstream I/O)"
+        if cache_hits
+        else ""
+    )
+
     lines = [
         "STM Proxy Stats",
         "===============",
-        f"Total calls:     {summary['total_calls']}",
+        f"Total calls:     {summary['total_calls']} live"
+        f" + {cache_hits} cache-served = {total_invocations} invocations",
         f"Original chars:  {summary['total_original_chars']}",
         f"Compressed:      {summary['total_compressed_chars']}",
-        f"Savings:         {summary['total_savings_pct']:.1f}%",
+        f"Savings:         {summary['total_savings_pct']:.1f}%  (compression of live calls)",
         f"Token savings:   {summary.get('total_token_savings_pct', 0):.1f}%",
-        f"Cache hits:      {cache_hits}",
+        f"Cache hits:      {cache_hits}{hits_suffix}",
         f"Cache misses:    {cache_misses}",
+    ]
+
+    # Misses the cache can never convert to hits (mixed/non-text/empty
+    # responses, transient retrieval keys). Quiet when zero so the common
+    # all-text deployment keeps its familiar output.
+    cache_unstorable = summary.get("cache_unstorable", 0)
+    if cache_unstorable > 0:
+        lines.append(
+            f"Unstorable:      {cache_unstorable}  (of misses; response shape is never cacheable)"
+        )
+
+    lines += [
         f"Cache hit rate:  {cache_hit_rate:.1f}%",
         f"Reconnects:      {summary.get('reconnects', 0)}",
     ]
