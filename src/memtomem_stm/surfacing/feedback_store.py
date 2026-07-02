@@ -472,6 +472,7 @@ class FeedbackStore:
             "rating_distribution": {},
             "total_feedback": 0,
             "recent": [],
+            "score_distribution": {"count": 0, "min": None, "max": None},
         }
         if self._db is None:
             return empty
@@ -508,11 +509,19 @@ class FeedbackStore:
         # Per-tool: events + average memory_ids length. Average is computed
         # in Python because memory_ids is JSON-encoded and SQLite's JSON1
         # extension isn't universally guaranteed on the shipping wheels.
+        # The same pass aggregates the score distribution (count/min/max)
+        # for the flat-score tripwire (#560): min == max over a large
+        # enough sample means the upstream score channel carries no
+        # ranking information. min/max is O(1) memory and is exactly the
+        # "all scores equal" predicate — no need to hold the value set.
         rows = self._db.execute(
-            f"SELECT tool, memory_ids FROM surfacing_events{where_sql}", event_params
+            f"SELECT tool, memory_ids, scores FROM surfacing_events{where_sql}", event_params
         ).fetchall()
         per_tool: dict[str, dict[str, float]] = {}
-        for tool_name, memory_ids_json in rows:
+        score_count = 0
+        score_min: float | None = None
+        score_max: float | None = None
+        for tool_name, memory_ids_json, scores_json in rows:
             try:
                 ids = json.loads(memory_ids_json)
                 n = len(ids) if isinstance(ids, list) else 0
@@ -521,6 +530,18 @@ class FeedbackStore:
             bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
             bucket["events"] += 1
             bucket["sum_memory_count"] += n
+            try:
+                scores = json.loads(scores_json)
+            except (json.JSONDecodeError, TypeError):
+                scores = []
+            if isinstance(scores, list):
+                for s in scores:
+                    # bool is an int subclass — a corrupt ``true`` in the
+                    # JSON must not masquerade as score 1.0.
+                    if isinstance(s, (int, float)) and not isinstance(s, bool):
+                        score_count += 1
+                        score_min = s if score_min is None else min(score_min, s)
+                        score_max = s if score_max is None else max(score_max, s)
 
         # Per-tool feedback counts (total + negative) within the same
         # event filter. Powers the AutoTuner readiness signal: with these
@@ -630,6 +651,7 @@ class FeedbackStore:
             "rating_distribution": rating_distribution,
             "total_feedback": total_feedback,
             "recent": recent,
+            "score_distribution": {"count": score_count, "min": score_min, "max": score_max},
         }
 
     # ── Cross-session dedup ────────────────────────────────────────────

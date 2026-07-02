@@ -42,6 +42,15 @@ user-typed checksum search) would be 80-char-clipped by the store but
 still carry the literal prefix; matching the full 23-char digest shape
 keeps the legend from misfiring on those rows."""
 
+_FLAT_SCORE_WARNING_MIN_SAMPLES = 10
+"""Minimum recorded scores before ``stm_surfacing_stats`` warns about a
+zero-variance score distribution (#560 step 3). A handful of identical
+scores is expected noise (a single query surfaced twice, a tiny window);
+ten identical values with zero spread is not — the compact-format
+rounding artifact this tripwire exists to catch produced *months* of a
+single constant. Deliberately a constant, not config: the warning is
+advisory text, and a knob would imply operators should tune it."""
+
 
 @dataclass
 class STMContext:
@@ -1011,6 +1020,28 @@ async def stm_surfacing_stats(
             first_iso = datetime.fromtimestamp(dr["first"]).isoformat(timespec="seconds")
             last_iso = datetime.fromtimestamp(dr["last"]).isoformat(timespec="seconds")
             lines.append(f"Date range:      {first_iso} — {last_iso}")
+
+        # #560 step 3: zero-variance tripwire. A flat score distribution
+        # means the upstream score channel carries no ranking information
+        # (e.g. the compact-format 2-decimal rounding artifact) — the
+        # min_score filter degenerates to a step function and the
+        # auto-tuner moves along a gradient that doesn't exist. Rendered
+        # from the same filtered event set as the counts above, so a
+        # ``tool=`` / ``since=`` window warns about exactly the rows it
+        # shows. ``.get`` guards older/mocked stats dicts without the key.
+        sd = stats.get("score_distribution") or {}
+        if (
+            sd.get("count", 0) >= _FLAT_SCORE_WARNING_MIN_SAMPLES
+            and sd.get("min") is not None
+            and sd["min"] == sd["max"]
+        ):
+            lines.append(
+                f"\nWARNING: zero score variance — all {sd['count']} recorded "
+                f"scores in this window equal {sd['min']:.4f}. The upstream "
+                "relevance score carries no ranking information here, so "
+                "min_score filtering and auto-tune have no signal to act on. "
+                "Check the LTM search path / result_format (#560)."
+            )
 
         # Min score block — show the default, whether auto-tune is on, and any
         # per-tool adjustments AutoTuner has made this process. Surfaced before
