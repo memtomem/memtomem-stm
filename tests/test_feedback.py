@@ -127,6 +127,7 @@ class TestFeedbackStore:
         assert stats["rating_distribution"] == {}
         assert stats["total_feedback"] == 0
         assert stats["recent"] == []
+        assert stats["score_distribution"] == {"count": 0, "min": None, "max": None}
 
     def test_get_stats_multi_tool_breakdown(self, feedback_store: FeedbackStore):
         # tool_a: 2 events (2 + 3 memories) → avg 2.5
@@ -169,6 +170,45 @@ class TestFeedbackStore:
         assert stats["total_feedback"] == 3
         assert stats["date_range"]["first"] is not None
         assert stats["date_range"]["last"] is not None
+
+    def test_get_stats_score_distribution_aggregates(self, feedback_store: FeedbackStore):
+        """#560 step 3 — count/min/max span every score of every event in
+        the filter window, and the tool filter narrows the aggregate to
+        that tool's events only."""
+        feedback_store.record_surfacing("s1", "srv", "tool_a", "q1", ["m1", "m2"], [0.03, 0.03])
+        feedback_store.record_surfacing("s2", "srv", "tool_a", "q2", ["m3"], [0.03])
+        feedback_store.record_surfacing("s3", "srv", "tool_b", "q3", ["m4", "m5"], [0.0164, 0.0325])
+
+        stats = feedback_store.get_stats()
+        assert stats["score_distribution"] == {"count": 5, "min": 0.0164, "max": 0.0325}
+
+        # tool_a alone is flat: min == max is the zero-variance predicate.
+        stats_a = feedback_store.get_stats(tool="tool_a")
+        assert stats_a["score_distribution"] == {"count": 3, "min": 0.03, "max": 0.03}
+
+    def test_get_stats_score_distribution_skips_malformed_scores(
+        self, feedback_store: FeedbackStore
+    ):
+        """Corrupt scores JSON (or non-numeric entries) must not crash the
+        aggregate or skew min/max — the row's memory counts still count."""
+        feedback_store.record_surfacing("s1", "srv", "tool_a", "q1", ["m1"], [0.02])
+        feedback_store._db.execute(  # type: ignore[union-attr]
+            "UPDATE surfacing_events SET scores = ? WHERE id = ?",
+            ("not-json", "s1"),
+        )
+        feedback_store._db.commit()  # type: ignore[union-attr]
+        feedback_store.record_surfacing("s2", "srv", "tool_a", "q2", ["m2"], [0.03])
+        # A JSON ``true`` must not sneak in as score 1.0 (bool is an int
+        # subclass in Python).
+        feedback_store._db.execute(  # type: ignore[union-attr]
+            "UPDATE surfacing_events SET scores = ? WHERE id = ?",
+            ("[true, 0.03]", "s2"),
+        )
+        feedback_store._db.commit()  # type: ignore[union-attr]
+
+        stats = feedback_store.get_stats()
+        assert stats["events_total"] == 2
+        assert stats["score_distribution"] == {"count": 1, "min": 0.03, "max": 0.03}
 
     def test_get_stats_since_filter(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s_old", "srv", "tool_a", "q_old", ["m1"], [0.9])

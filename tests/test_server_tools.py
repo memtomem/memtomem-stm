@@ -712,6 +712,63 @@ class TestSurfacingStats:
         assert "Recent:" in result
         assert "hello world" in result
         assert "(filtered by tool: t)" in result
+        # No score_distribution key in this legacy-shaped dict — the
+        # zero-variance tripwire must degrade to silence, not crash.
+        assert "zero score variance" not in result
+
+    @staticmethod
+    def _stats_with_scores(score_distribution: dict) -> dict:
+        """Minimal stats shape for exercising the flat-score tripwire."""
+        return {
+            "events_total": 21,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [],
+            "rating_distribution": {},
+            "total_feedback": 0,
+            "recent": [],
+            "score_distribution": score_distribution,
+        }
+
+    async def test_flat_score_warning_renders_when_zero_variance(self):
+        """#560 step 3: n>=threshold identical scores → explicit warning,
+        with the sample count and the constant value in the text."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 37, "min": 0.03, "max": 0.03}
+        )
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=None)
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "WARNING: zero score variance" in result
+        assert "all 37 recorded scores" in result
+        assert "equal 0.0300" in result
+
+    async def test_flat_score_warning_absent_when_scores_vary(self):
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 37, "min": 0.0164, "max": 0.0325}
+        )
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=None)
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "zero score variance" not in result
+
+    async def test_flat_score_warning_absent_below_sample_threshold(self):
+        """A handful of identical scores is expected noise — the tripwire
+        stays quiet until _FLAT_SCORE_WARNING_MIN_SAMPLES."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 9, "min": 0.03, "max": 0.03}
+        )
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=None)
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "zero score variance" not in result
+
+        # Boundary: exactly at the threshold the warning fires (>=).
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 10, "min": 0.03, "max": 0.03}
+        )
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "WARNING: zero score variance" in result
 
     async def test_min_score_block_when_engine_present(self):
         """With a surfacing engine, output includes the min_score snapshot

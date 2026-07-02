@@ -446,7 +446,15 @@ Cache (since process start): hits 9, misses 14, hit ratio 39.1%
 ```
 
 The first block (totals + ratings + helpfulness) is read from
-`stm_feedback.db` and persists across restarts. The lower
+`stm_feedback.db` and persists across restarts. When every
+recorded score in the reported window is identical (10+ samples),
+this block also emits a `WARNING: zero score variance` line: a
+flat score distribution means the upstream relevance score
+carries no ranking information, so `min_score` degenerates to a
+step function and auto-tune has no gradient to move along —
+check the LTM search path and `result_format` (#560, where
+compact's 2-decimal rounding produced months of a constant
+`0.03`). The lower
 sections — `Healthy skips`, `Fault skips`, `Outcomes`, `Cache` —
 are in-memory counters from `SurfacingObservability` and reset
 whenever the proxy process restarts. They are suppressed
