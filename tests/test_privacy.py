@@ -179,6 +179,15 @@ class TestDefaultPatternCoverage:
             # \r\n, so an alphanumeric (``n``) directly precedes the ``x`` —
             # pins the boundary class ([_.-], NOT [A-Za-z0-9_.-]).
             r"send: b'GET /k HTTP/1.1\r\nx-amz-security-token: FAKEFwoG\r\n'",
+            # Quoted-JSON / dict-repr forms of the generic labels (#562; the
+            # closing quote blocks the unquoted rules' [:=]): docker/kubectl
+            # JSON output, DB connection configs, OAuth token responses.
+            '"password": "hunter2"',  # JSON config / secret dump
+            "{'password': 'hunter2'}",  # python-dict repr
+            '"api_key": "FAKE-abc123"',  # snake_case JSON key
+            '"apiKey": "FAKE-abc123"',  # camelCase (separator is optional)
+            '"accessToken": "ya29.FAKE"',  # OAuth token response
+            '"secret-key": "FAKEvalue"',  # kebab quoted key
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
@@ -240,6 +249,14 @@ class TestDefaultPatternCoverage:
             '"X-Amz-Security-Token": {"type": "string"}',  # OpenAPI header definition
             "forward-x-amz-security-token: true",  # kebab config knob embeds the label
             "proxy.headers.x-amz-security-token: passthrough",  # dotted telemetry head
+            # #562 quoted-label FP guards — same shape as the AWS quoted-
+            # branch guards above: excluded vocabulary, object values,
+            # embedded labels, prefixed keys.
+            '"pwd": "/home/user"',  # working-directory field — pwd is excluded
+            '"password": {"type": "string"}',  # login-form JSON-Schema property
+            '"access_token": {"type": "string"}',  # OAuth tool-schema property
+            '"my_api_key_name": "prod-key-1"',  # key NAME field embeds the label
+            '"tools.api_key": "configured"',  # prefixed key (telemetry-style)
             "github_pat_",  # just the prefix, no body
             "npm_",  # prefix only
             # --- #1488 mirror false-positive guards: prose / kebab slugs that
@@ -284,17 +301,18 @@ class TestCredentialPiiSplit:
         assert not set(privacy.CREDENTIAL_PATTERNS) & set(privacy.PII_PATTERNS)
 
     def test_credential_set_count_pinned(self):
-        # 9 original secret-class patterns + 2 STM-origin AWS label rules
-        # (#553 secret-material labels, forward-synced into LTM as
-        # memtomem#1533; #561 x-amz-security-token, awaiting its forward
-        # sync) + 7 mirrored from memtomem LTM (#1488 / reverse sync #1491).
-        # Bump deliberately when adding a pattern so a silent add/drop
-        # surfaces here. LTM's matching pin sits at 17 until the #561 rule
-        # is mirrored forward — at which point both pins move to 18 together
-        # (the #559 content-hash pin tracks the shared subset).
-        assert len(privacy.CREDENTIAL_PATTERNS) == 18
+        # 9 original secret-class patterns + 3 STM-origin label rules
+        # (#553 AWS secret-material labels, forward-synced into LTM as
+        # memtomem#1533; #561 x-amz-security-token and #562 the general
+        # quoted-label rule, both awaiting their forward sync) + 7 mirrored
+        # from memtomem LTM (#1488 / reverse sync #1491). Bump deliberately
+        # when adding a pattern so a silent add/drop surfaces here. LTM's
+        # matching pin sits at 17 until #561/#562 are mirrored forward — at
+        # which point both pins move to 19 together (the #559 content-hash
+        # pin tracks the shared subset).
+        assert len(privacy.CREDENTIAL_PATTERNS) == 19
         assert len(privacy.PII_PATTERNS) == 1
-        assert len(privacy.DEFAULT_PATTERNS) == 19
+        assert len(privacy.DEFAULT_PATTERNS) == 20
 
     @pytest.mark.parametrize(
         "sample",
@@ -317,6 +335,7 @@ class TestCredentialPiiSplit:
             '"SessionToken": "FAKEFwoGZXIvYXdzFAKE"',
             '"SecretAccessKey": "FAKEwJalrXUtnFEMIFAKE"',
             "x-amz-security-token: FAKEFwoGZXIvYXdzFAKE",
+            '"password": "hunter2"',
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",
             "-----BEGIN RSA PRIVATE KEY-----",
             # #1488 mirror: each must classify as a credential (not PII) so the
