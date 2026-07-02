@@ -337,7 +337,8 @@ class TokenTracker:
         ``chars`` is the size of the served (stored, compressed) text so the
         cache's benefit is visible next to the compression savings it would
         otherwise be structurally excluded from (#558); ``get_summary`` exposes
-        the reconciliation as ``total_invocations = total_calls + cache_hits``.
+        the reconciliation as ``total_invocations = total_calls + cache_hits +
+        total_errors``.
         """
         self._cache_hits += 1
         self._cache_hit_chars += chars

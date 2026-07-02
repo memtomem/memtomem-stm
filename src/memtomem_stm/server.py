@@ -553,9 +553,14 @@ async def stm_proxy_stats(
             f"(expired {cstats['expired_entries']}, evicted {cstats['evictions']})"
         )
 
-    # Error summary
+    # Error summary. ``error_rate``'s denominator is live upstream attempts
+    # (successful + failed calls) — cache hits can't error, so folding them in
+    # would only dilute the diagnostic. Label it so the percentage doesn't read
+    # as inconsistent next to the hits-inclusive invocation total (#558).
     if total_errors > 0:
-        lines.append(f"\nErrors: {total_errors} ({summary.get('error_rate', 0):.1f}%)")
+        lines.append(
+            f"\nErrors: {total_errors} ({summary.get('error_rate', 0):.1f}% of live attempts)"
+        )
         errors_by_cat = summary.get("errors_by_category", {})
         for cat, count in sorted(errors_by_cat.items()):
             lines.append(f"  {cat}: {count}")

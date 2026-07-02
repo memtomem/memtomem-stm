@@ -176,6 +176,24 @@ class TestProxyStats:
         result = await stm_proxy_stats(ctx=ctx)
         assert "Total calls:     1 live + 1 failed + 1 cache-served = 3 invocations" in result
 
+    async def test_error_rate_labeled_as_live_attempts(self):
+        """#558 codex round 3: error_rate's denominator is live attempts
+        (successful + failed calls, no cache hits), so the rendered percentage
+        must say so or it reads inconsistent next to the invocation total."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+
+        tracker = TokenTracker()
+        tracker.record(CallMetrics(server="s", tool="t", original_chars=10, compressed_chars=5))
+        tracker.record_error(
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True)
+        )
+        for _ in range(2):
+            tracker.record_cache_hit(chars=5)
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        # 1 error / (1 live + 1 failed) = 50.0% — NOT 1/4 over the invocations.
+        assert "Errors: 1 (50.0% of live attempts)" in result
+
     async def test_cache_hits_line_shows_served_chars(self):
         """#558: the cache's benefit (chars served with zero upstream I/O) is
         rendered on the hits line; quiet suffix when there are no hits."""
