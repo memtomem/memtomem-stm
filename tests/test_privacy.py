@@ -175,6 +175,10 @@ class TestDefaultPatternCoverage:
             "https://b.s3.amazonaws.com/k?X-Amz-Security-Token=FAKEFwoG&X-Amz-Date=20260702",
             '"x-amz-security-token": "FAKEFwoGZXIvYXdzFAKE"',  # serialized headers (JSON)
             "{'x-amz-security-token': 'FAKEFwoGZXIvYXdzFAKE'}",  # python-repr headers
+            # bytes-repr wire dump: the newline before the label is a LITERAL
+            # \r\n, so an alphanumeric (``n``) directly precedes the ``x`` —
+            # pins the boundary class ([_.-], NOT [A-Za-z0-9_.-]).
+            r"send: b'GET /k HTTP/1.1\r\nx-amz-security-token: FAKEFwoG\r\n'",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
@@ -234,6 +238,8 @@ class TestDefaultPatternCoverage:
             "header: x-amz-security-token",  # docs prose, separator on the wrong side
             "sign the x-amz-security-token header into the canonical request",  # prose
             '"X-Amz-Security-Token": {"type": "string"}',  # OpenAPI header definition
+            "forward-x-amz-security-token: true",  # kebab config knob embeds the label
+            "proxy.headers.x-amz-security-token: passthrough",  # dotted telemetry head
             "github_pat_",  # just the prefix, no body
             "npm_",  # prefix only
             # --- #1488 mirror false-positive guards: prose / kebab slugs that

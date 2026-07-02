@@ -91,14 +91,23 @@ CREDENTIAL_PATTERNS = [
     #   ubiquitous in AWS API specs) never fires.
     # - unquoted form — the raw header line (``x-amz-security-token: FwoG…``)
     #   and the presigned-URL query param (``…&X-Amz-Security-Token=FwoG…``).
-    #   No left boundary, unlike the rule above: the label is kebab-case, so
-    #   snake_case/camelCase identifiers cannot embed it, and its real left
-    #   neighbors (``?``, ``&``, quotes, line starts) are all non-word.
+    #   The left boundary rejects only a directly preceding SEPARATOR
+    #   (``[_.-]``), not alphanumerics — a narrower boundary than the rule
+    #   above, on purpose. Kebab/dotted compounds that merely NAME the
+    #   header must not fire — ``forward-x-amz-security-token: true``
+    #   (config knob about the header), ``proxy.headers.x-amz-security-token``
+    #   (flattened telemetry key — dotted heads are negative by design, as
+    #   in the rule above) — but a directly preceding alphanumeric must
+    #   stay a match: a bytes-repr header dump renders the newline before
+    #   the label as a LITERAL ``\r\n``, putting ``n`` right before the
+    #   ``x`` (``send: b'…\r\nx-amz-security-token: FwoG…'`` —
+    #   http.client debuglevel / botocore DEBUG wire dumps). Real left
+    #   neighbors (``?``, ``&``, quotes, line starts) pass either way.
     #   Prose that merely NAMES the header (``set the x-amz-security-token
     #   header``, ``header: x-amz-security-token``) stays negative — the
     #   separator must directly follow the label.
     r"(?i)(?:[\"']x-amz-security-token[\"']\s*:\s*[\"']"
-    r"|x-amz-security-token\s*[:=])",
+    r"|(?<![_.\-])x-amz-security-token\s*[:=])",
     # Provider-prefixed token formats. Anchored by prefix so false positives
     # on arbitrary high-entropy strings are rare.
     r"(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|xox[bps]-[0-9A-Za-z-]+)",
