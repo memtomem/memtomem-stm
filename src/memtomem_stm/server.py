@@ -512,15 +512,25 @@ async def stm_proxy_stats(
 
     # Misses the cache can never convert to hits (mixed/non-text/empty
     # responses, transient retrieval keys). Quiet when zero so the common
-    # all-text deployment keeps its familiar output.
+    # all-text deployment keeps its familiar output. When present, the hit-rate
+    # line also shows the rate over STORABLE lookups — otherwise a workload
+    # heavy in never-cacheable responses reads as a depressed hit rate, which
+    # is exactly the operator confusion the counter exists to resolve (#558).
     cache_unstorable = summary.get("cache_unstorable", 0)
+    hit_rate_line = f"Cache hit rate:  {cache_hit_rate:.1f}%"
     if cache_unstorable > 0:
         lines.append(
             f"Unstorable:      {cache_unstorable}  (of misses; response shape is never cacheable)"
         )
+        storable_lookups = cache_hits + max(cache_misses - cache_unstorable, 0)
+        if storable_lookups > 0:
+            effective_rate = cache_hits / storable_lookups * 100
+            hit_rate_line += f"  ({effective_rate:.1f}% of storable lookups)"
+        else:
+            hit_rate_line += "  (no storable lookups)"
 
     lines += [
-        f"Cache hit rate:  {cache_hit_rate:.1f}%",
+        hit_rate_line,
         f"Reconnects:      {summary.get('reconnects', 0)}",
     ]
 

@@ -2519,8 +2519,8 @@ class ProxyManager:
 
         Records no metrics and performs no early return: when no text remains it
         returns a ``ShapedResponse`` whose ``passthrough`` tells the caller to
-        record the non-text passthrough metric (and return the non-text list) or
-        return the ``"[empty response]"`` sentinel. The caller stays the single
+        record the 0/0 passthrough metric and return either the non-text list or
+        the ``"[empty response]"`` sentinel (#558). The caller stays the single
         owner of metric writes and return shapes (R8).
         """
         max_upstream = cfg_snap.max_upstream_chars
@@ -3444,28 +3444,28 @@ class ProxyManager:
         shaped = self._shape_response(result, server, tool, cfg_snap=cfg_snap)
         non_text_content = shaped.non_text_content
         if shaped.passthrough is not None:
-            if shaped.passthrough.has_non_text:
-                self.tracker.record(
-                    CallMetrics(
-                        server=server,
-                        tool=tool,
-                        original_chars=0,
-                        compressed_chars=0,
-                        trace_id=trace_id,
-                    )
+            # Both passthrough shapes are live upstream calls, so both record the
+            # 0/0 metric — otherwise an eligible empty response would carry a
+            # recorded miss + unstorable count with no matching call, breaking
+            # the ``total_invocations = total_calls + cache_hits`` reconciliation
+            # (#558; deliberately supersedes the R8 "empty records nothing" pin).
+            self.tracker.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=0,
+                    compressed_chars=0,
+                    trace_id=trace_id,
                 )
-                # Non-text-only response is never stored; mirror the mixed-branch
-                # invalidation in ``_store_cache`` so a stale prior text row for
-                # this key is dropped while caching is disabled (#541), and count
-                # the store refusal against the miss already recorded (#558).
-                self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
-                self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
-                return non_text_content
-            # A truly-empty upstream response is never stored either; invalidate a
-            # stale prior text row for this key while caching is disabled (#541)
-            # and count the store refusal against the recorded miss (#558).
+            )
+            # Neither shape is ever stored; count the store refusal against the
+            # miss already recorded (#558) and mirror the mixed-branch
+            # invalidation in ``_store_cache`` so a stale prior text row for
+            # this key is dropped while caching is disabled (#541).
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            if shaped.passthrough.has_non_text:
+                return non_text_content
             return "[empty response]"
         original_text = shaped.original_text
 

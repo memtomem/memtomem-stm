@@ -185,6 +185,39 @@ class TestProxyStats:
         result_zero = await stm_proxy_stats(ctx=_make_ctx(tracker=TokenTracker()))
         assert "Unstorable:" not in result_zero
 
+    async def test_effective_hit_rate_over_storable_lookups(self):
+        """#558 codex round 1: with unstorable misses present, the hit-rate
+        line also shows the rate over storable lookups, so a never-cacheable-
+        heavy workload doesn't read as a depressed hit rate."""
+        tracker = TokenTracker()
+        tracker.record_cache_hit()  # 1 hit
+        for _ in range(3):
+            tracker.record_cache_miss()  # 3 misses, 2 unstorable
+        tracker.record_cache_unstorable()
+        tracker.record_cache_unstorable()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        # raw: 1/4 = 25.0%; storable: 1 hit + (3-2) convertible miss → 1/2
+        assert "Cache hit rate:  25.0%  (50.0% of storable lookups)" in result
+
+    async def test_effective_hit_rate_no_storable_lookups(self):
+        """Every lookup was an unstorable miss → no percentage is fabricated."""
+        tracker = TokenTracker()
+        tracker.record_cache_miss()
+        tracker.record_cache_unstorable()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hit rate:  0.0%  (no storable lookups)" in result
+
+    async def test_hit_rate_line_unchanged_without_unstorable(self):
+        """Zero unstorable → the pinned plain hit-rate line stays as-is."""
+        tracker = TokenTracker()
+        tracker.record_cache_hit()
+        tracker.record_cache_miss()
+        ctx = _make_ctx(tracker=tracker)
+        result = await stm_proxy_stats(ctx=ctx)
+        assert "Cache hit rate:  50.0%\n" in result
+
     async def test_cache_entries_line_when_cache_wired(self, tmp_path):
         """When the response cache is wired, occupancy/eviction is surfaced."""
         from memtomem_stm.proxy.cache import ProxyCache

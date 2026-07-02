@@ -24,11 +24,13 @@ if TYPE_CHECKING:
 class ShapePassthrough:
     """The stage-3 early-exit verdict — the text/non-text split produced no text.
 
-    ``has_non_text`` True → the caller records the non-text passthrough metric and
-    returns the non-text content list; False → the caller returns the
-    ``"[empty response]"`` sentinel and records nothing. The shaping helper never
-    records metrics or returns itself, so the orchestrator stays the single owner
-    of metric writes and return shapes.
+    ``has_non_text`` True → the caller records the 0/0 passthrough metric and
+    returns the non-text content list; False → the caller records the same 0/0
+    metric (#558 — an empty response is still a live call, so it must appear in
+    ``total_calls`` for the invocation reconciliation) and returns the
+    ``"[empty response]"`` sentinel. The shaping helper never records metrics or
+    returns itself, so the orchestrator stays the single owner of metric writes
+    and return shapes.
     """
 
     has_non_text: bool

@@ -14,7 +14,10 @@ exercise end-to-end:
   non-progressive paths use ``_apply_surfacing`` — and the recorded
   ``surfacing_on_progressive_ok`` / ``surface_error`` match the engine outcome.
 - **R8**  a non-text-only response records a ``0/0`` metric and returns the list;
-  an empty response records NOTHING and returns the sentinel string.
+  an empty response records the same ``0/0`` metric and returns the sentinel
+  string. (Amended by #558 — through the A1 refactor the empty branch recorded
+  NOTHING; it now records so ``total_invocations = total_calls + cache_hits``
+  reconciles for eligible empty responses whose miss/unstorable were counted.)
 - **R10** every downstream consumer (upstream, surfacing, auto-index, extract)
   receives the mutated ``upstream_args`` (with ``_trace_id``); only ``cache.set``
   receives the unmutated ``cache_args``.
@@ -445,14 +448,21 @@ class TestEarlyReturnMetrics:
         assert row["original_chars"] == 0
         assert row["compressed_chars"] == 0
 
-    async def test_empty_response_records_nothing(self, make_mgr):
+    async def test_empty_response_records_zero_metric(self, make_mgr):
+        # Amended by #558 (was: records NOTHING): an empty response is a live
+        # upstream call, so it records the same 0/0 metric as the non-text
+        # branch — otherwise its recorded miss/unstorable would have no
+        # matching call and the invocation reconciliation would be false.
         mgr, store, _ = make_mgr()
         mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
             content=[], isError=False
         )
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
-        assert _row_count(store) == 0
+        assert _row_count(store) == 1
+        row = _latest(store, "original_chars", "compressed_chars")
+        assert row["original_chars"] == 0
+        assert row["compressed_chars"] == 0
 
 
 # ── scorer_fallback recorded around the compression call ─────────────────

@@ -372,7 +372,10 @@ class TestUnstorableAccounting:
         assert summary["cache_misses"] == 1
         assert summary["cache_unstorable"] == 1
 
-    async def test_empty_response_counts_unstorable(self, build):
+    async def test_empty_response_counts_unstorable_and_reconciles(self, build):
+        """An empty response records the 0/0 call metric too (#558 codex round
+        1): without it the recorded miss/unstorable would have no matching call
+        and ``total_invocations`` would understate actual invocations."""
         mgr, _, _ = build(tools=[_tool("empty", _ann(read_only=True))])
         mgr._connections["srv"].session.call_tool.return_value = _empty_result()
 
@@ -381,6 +384,8 @@ class TestUnstorableAccounting:
         summary = mgr.tracker.get_summary()
         assert summary["cache_misses"] == 1
         assert summary["cache_unstorable"] == 1
+        assert summary["total_calls"] == 1
+        assert summary["total_invocations"] == 1
 
     async def test_ineligible_writer_mixed_response_not_counted(self, build):
         """No lookup was attempted (force-forwarded writer), so neither a miss
