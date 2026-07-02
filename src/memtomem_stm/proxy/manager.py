@@ -353,6 +353,12 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            # Reset the #557 refresh bookkeeping alongside the connections it
+            # tracks (same rationale as in ``stop()``): a ``running`` entry
+            # orphaned by a never-started drain task would silently drop every
+            # ``list_changed`` notification for that server this session.
+            self._tools_refresh_dirty.clear()
+            self._tools_refresh_running.clear()
             # Close the consult cache too so a re-entry that changed
             # ``toolgraph.consult_cache_path`` reopens the right DB (#494). Mirror
             # the stack-close try/except above: always null the handle so a failed
@@ -1088,6 +1094,14 @@ class ProxyManager:
                 len(self._background_tasks),
             )
         self._background_tasks.clear()
+        # Reset the #557 refresh bookkeeping. A drain task cancelled before its
+        # first step never enters its ``finally`` (the coroutine body never
+        # runs), so ``running`` can retain the server name — and a stop→start
+        # reuse of this manager would then drop every later ``list_changed``
+        # notification for that server ("running" but no task). ``dirty`` is
+        # cleared for symmetry; a stale entry there is merely unconsumed.
+        self._tools_refresh_dirty.clear()
+        self._tools_refresh_running.clear()
         # Close httpx clients
         if self._llm_compressor is not None:
             await self._llm_compressor.close()

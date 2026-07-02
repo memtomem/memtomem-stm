@@ -308,6 +308,30 @@ class TestHandlerAndScheduling:
         await asyncio.gather(*mgr._background_tasks)
         assert [t.name for t in conn.tools] == ["new"]
 
+    async def test_stop_resets_refresh_bookkeeping(self, build):
+        """A drain task cancelled before its first step never enters its
+        ``finally`` (the coroutine body never runs), so ``running`` would keep
+        the server name — and a stop→start reuse of the manager would then
+        silently drop every later ``list_changed`` notification for that
+        server. ``stop()`` must reset the bookkeeping."""
+        mgr, _, _ = build(tools=[_tool("old")])
+        conn = mgr._connections["srv"]
+        conn.session.list_tools.return_value = _list_result(_tool("new"))
+
+        mgr._schedule_tools_refresh("srv")  # task created, never given a tick
+        await mgr.stop()
+
+        conn.session.list_tools.assert_not_awaited()  # premise: body never ran
+        assert not mgr._tools_refresh_running
+        assert not mgr._tools_refresh_dirty
+
+        # restart-style reuse: a fresh notification must schedule again
+        mgr._connections["srv"] = conn
+        mgr._schedule_tools_refresh("srv")
+        assert len(mgr._background_tasks) == 1
+        await asyncio.gather(*mgr._background_tasks)
+        assert [t.name for t in conn.tools] == ["new"]
+
 
 # ── Wiring pin ────────────────────────────────────────────────────────────
 
