@@ -210,6 +210,21 @@ def _mark_recorded(exc: BaseException) -> None:
         pass
 
 
+def _mark_cache_invalidated(exc: BaseException) -> None:
+    """Tag *exc* as having already run the disabled-cache invalidation.
+
+    The ``isError`` branch in ``_call_tool_inner`` invalidates a stale row
+    (#541) and then raises; the raised-failure backstop in
+    ``_call_tool_guarded`` invalidates on any OTHER raise. This marker keeps
+    the two from issuing a second DELETE for the same call (same idiom as
+    ``_mark_recorded``).
+    """
+    try:
+        exc._stm_cache_invalidated = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
+
 class ProxyManager:
     def __init__(
         self,
@@ -2115,7 +2130,27 @@ class ProxyManager:
         # tool exactly as the global ttl<=0 does (per-row TTL is frozen at write).
         cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=self._config)
         if self._cache is None or (cache_ttl is not None and cache_ttl <= 0):
-            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
+            try:
+                return (
+                    await self._call_tool_inner(server, tool, arguments, trace_id=trace_id),
+                    False,
+                )
+            except Exception as exc:
+                # A raise (upstream fetch failure or a pipeline-stage error)
+                # exits ``_call_tool_inner`` BEFORE any Stage-5 store, so under
+                # a disabled (``ttl<=0``) cache a row frozen at an earlier
+                # positive TTL would survive the call and resurface once the
+                # TTL is raised back within its window — the same hole #548/
+                # #550 closed for every *returned* response shape. Invalidate
+                # (best-effort, gated on ttl<=0 inside the helper) so raised
+                # failures behave like returned ones. The ``isError`` branch
+                # already invalidated and marked its ToolError; skip its
+                # second DELETE.
+                if not getattr(exc, "_stm_cache_invalidated", False):
+                    self._invalidate_disabled_cache(
+                        server, tool, upstream_args, cfg_snap=self._config
+                    )
+                raise
 
         # Cache-eligibility gate (MCP annotations / per-tool|server ``cache``
         # override): a tool the policy deems non-cacheable — e.g. a self-declared
@@ -3277,8 +3312,11 @@ class ProxyManager:
             # (text-only or mixed) under a disabled cache (ttl<=0) would otherwise
             # leave a prior cached text row for this key live. A non-text-ONLY
             # error has no text and is invalidated by the passthrough branch above
-            # instead; here we cover the text-bearing shapes (#541).
+            # instead; here we cover the text-bearing shapes (#541). Mark the
+            # exception so the raised-failure backstop in ``_call_tool_guarded``
+            # does not repeat the DELETE.
             self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            _mark_cache_invalidated(tool_err)
             raise tool_err
 
         # Resolve effective settings (using config snapshot)

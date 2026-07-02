@@ -677,3 +677,118 @@ class TestTtlZeroTextStoreSkipInvalidation:
         await mgr.call_tool("srv", "t", {"q": "a"})
 
         assert cache.get("srv", "t", {"q": "a"}) is None  # stale row invalidated
+
+
+@pytest.mark.asyncio
+class TestTtlZeroRaisedFailureInvalidation:
+    """#541 follow-through (#548/#550 completed every *returned* response shape):
+    an exception RAISED out of ``_call_tool_inner`` — an upstream fetch failure or
+    a pipeline-stage error — also exits before the Stage-5 store, so under a
+    disabled (``ttl<=0``) cache a prior text row frozen at a positive TTL would
+    survive the failed call and resurface once the TTL is raised back within its
+    window. The ``ttl<=0`` dispatch in ``_call_tool_guarded`` now backstops every
+    raise with the same best-effort invalidation."""
+
+    async def test_upstream_raise_invalidates_prior_text_row(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.side_effect = RuntimeError("upstream died")
+        with pytest.raises(RuntimeError, match="upstream died"):
+            await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+
+    async def test_upstream_raise_under_positive_ttl_leaves_row(self, build):
+        # Under an ENABLED cache a failure must NOT delete the live row — the
+        # TTL governs freshness there, and a transient upstream blip serving
+        # the cached copy on the next call is the configured behavior.
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        session.call_tool.side_effect = RuntimeError("blip")
+        # The enabled-cache path serves the live row without hitting upstream,
+        # so drive the raise through a DIFFERENT key (same tool) and then check
+        # the original row survived.
+        with pytest.raises(RuntimeError, match="blip"):
+            await mgr.call_tool("srv", "reader", {"q": "other"})
+
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+    async def test_raise_window_does_not_resurface_stale_row(self, build):
+        # Full #541 sequence with a raised failure in the disabled window:
+        # cache under positive TTL → lower to 0 → the identical call RAISES
+        # (invalidates) → raise the TTL back within the original window. The
+        # stale row must not be served (await_count keeps climbing).
+        mgr, _, cache = build(global_ttl=3600.0, tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("stale-text")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 1
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.side_effect = RuntimeError("net down")
+        with pytest.raises(RuntimeError, match="net down"):
+            await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 2
+
+        mgr._config.cache.default_ttl_seconds = 3600.0
+        session.call_tool.side_effect = None
+        session.call_tool.return_value = _text_result("fresh-text")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.await_count == 3  # not served from the stale row
+        assert cache.get("srv", "reader", {"q": "a"}) is not None  # fresh row cached
+
+    async def test_is_error_raise_invalidates_exactly_once(self, build):
+        # The isError branch invalidates inside ``_call_tool_inner`` and marks
+        # its ToolError (``_mark_cache_invalidated``); the raised-failure
+        # backstop must not issue a second DELETE for the same call.
+        from unittest.mock import patch as mock_patch
+
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert cache.get("srv", "reader", {"q": "a"}) is not None
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.return_value = _error_result("boom")
+        with mock_patch.object(cache, "invalidate", wraps=cache.invalidate) as spy:
+            with pytest.raises(ToolError):
+                await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert spy.call_count == 1  # isError site only; backstop skipped via marker
+        assert cache.get("srv", "reader", {"q": "a"}) is None
+
+    async def test_unmarked_raise_invalidates_via_backstop_once(self, build):
+        # Complement of the exactly-once test: a plain raise carries no marker,
+        # so the backstop is the ONE site that runs — also exactly one DELETE.
+        from unittest.mock import patch as mock_patch
+
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+
+        session.call_tool.return_value = _text_result("payload")
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        mgr._config.cache.default_ttl_seconds = 0
+        session.call_tool.side_effect = RuntimeError("upstream died")
+        with mock_patch.object(cache, "invalidate", wraps=cache.invalidate) as spy:
+            with pytest.raises(RuntimeError):
+                await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        assert spy.call_count == 1
+        assert cache.get("srv", "reader", {"q": "a"}) is None
