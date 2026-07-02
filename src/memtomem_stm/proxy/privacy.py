@@ -34,6 +34,32 @@ logger = logging.getLogger(__name__)
 CREDENTIAL_PATTERNS = [
     r"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token)\s*[:=]",
     r"(?i)(password|passwd|pwd)\s*[:=]",
+    # AWS secret material by label. The generic label rule above misses both
+    # spellings the AWS toolchain actually emits: ``secret[_-]?key`` needs its
+    # two words adjacent (``secret_access_key`` splits them) and
+    # ``access[_-]?token`` needs the literal ``access`` (``session_token`` has
+    # neither). Two alternatives in one rule:
+    #
+    # - quoted form — ``"SessionToken": "…"`` / ``"SecretAccessKey": "…"``
+    #   (STS JSON, python-dict repr). The quote must sit DIRECTLY on both
+    #   sides of the label and the value must open as a string: a JSON-Schema
+    #   property (``"session_token": {"type"…`` — object value) and a
+    #   prefixed key (``"aws.get_session_token": "unhealthy"`` — telemetry
+    #   dicts keyed by tool name) must NOT fire, or the eligibility scanner
+    #   hides benign tools and the selection log drops whole records. The
+    #   pre-existing label rules never fire on bare JSON keys (the closing
+    #   quote blocks their ``[:=]``); this form must not regress that.
+    # - unquoted form — ``AWS_SECRET_ACCESS_KEY=`` / ``aws_session_token =``
+    #   (env output, ~/.aws/credentials INI): same shape and FP profile as
+    #   the generic label rule above.
+    #
+    # The AKIA/ASIA rule below catches the key *IDs*; this one catches the
+    # *material* those IDs unlock. STM-origin: this rule is ahead of LTM's
+    # mirrored set until the forward-sync lands (the inverse of the
+    # #1488→#1491 reverse-sync direction; see the count-pin note in
+    # tests/test_privacy.py).
+    r"(?i)(?:[\"'](?:secret_?access_?key|session_?token)[\"']\s*:\s*[\"']"
+    r"|(?:secret[_-]?access[_-]?key|session[_-]?token)\s*[:=])",
     # Provider-prefixed token formats. Anchored by prefix so false positives
     # on arbitrary high-entropy strings are rare.
     r"(?i)(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36}|xox[bps]-[0-9A-Za-z-]+)",

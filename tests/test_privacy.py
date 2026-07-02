@@ -155,6 +155,12 @@ class TestDefaultPatternCoverage:
             "npm_" + "E" * 32,
             "AKIAIOSFODNN7EXAMPLE",  # AWS IAM user
             "ASIAIOSFODNN7EXAMPLE",  # AWS temporary
+            # AWS secret *material* labels (values are FAKE): the generic
+            # api_key/secret_key/access_token rule misses all these spellings.
+            "AWS_SECRET_ACCESS_KEY=FAKEwJalrXUtnFEMIFAKE",  # env-var form
+            "aws_session_token = FAKEFwoGZXIvYXdzFAKE",  # ~/.aws/credentials form
+            '"SessionToken": "FAKEFwoGZXIvYXdzFAKE"',  # STS JSON form
+            '"SecretAccessKey": "FAKEwJalrXUtnFEMIFAKE"',  # STS JSON form (other branch)
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
@@ -187,6 +193,18 @@ class TestDefaultPatternCoverage:
             "abc.def.ghi",
             # Short alphanumerics that could trip the AWS prefix if unanchored
             "AKIAshort",  # missing the 16-char IAM suffix
+            # AWS-label false-positive guards. The quoted form requires the
+            # quote DIRECTLY on both sides of the label and a string value —
+            # a bare JSON key must never fire (the pre-existing label rules
+            # don't either; their [:=] is blocked by the closing quote):
+            # scanning consumers walk JSON-serialized structures whose keys
+            # are ordinary identifiers (tool schemas in tool_eligibility,
+            # tool-name-keyed dicts in selection_log).
+            "botocore.exceptions.SessionTokenError: expired",  # label runs into "Error"
+            "SecretAccessKeyRotation: done",  # other branch runs into "Rotation"
+            "we rotated the session tokens yesterday",  # prose, no separator
+            '"session_token": {"type": "string"}',  # JSON-Schema property (object value)
+            '"aws.get_session_token": "unhealthy"',  # prefixed key (telemetry by tool name)
             "github_pat_",  # just the prefix, no body
             "npm_",  # prefix only
             # --- #1488 mirror false-positive guards: prose / kebab slugs that
@@ -232,12 +250,15 @@ class TestCredentialPiiSplit:
 
     def test_credential_set_count_pinned(self):
         # 9 original secret-class patterns + 7 mirrored from memtomem LTM
-        # (#1488 / reverse sync #1491). Bump deliberately when adding a
-        # pattern so a silent add/drop surfaces here and stays coherent with
-        # LTM's matching pin (memtomem DEFAULT_PATTERNS == 16).
-        assert len(privacy.CREDENTIAL_PATTERNS) == 16
+        # (#1488 / reverse sync #1491) + 1 STM-origin AWS secret-material
+        # label rule awaiting its forward-sync into LTM. Bump deliberately
+        # when adding a pattern so a silent add/drop surfaces here. LTM's
+        # matching pin (memtomem DEFAULT_PATTERNS == 16) stays one behind
+        # until the AWS rule is mirrored forward — at which point both pins
+        # move to 17 together.
+        assert len(privacy.CREDENTIAL_PATTERNS) == 17
         assert len(privacy.PII_PATTERNS) == 1
-        assert len(privacy.DEFAULT_PATTERNS) == 17
+        assert len(privacy.DEFAULT_PATTERNS) == 18
 
     @pytest.mark.parametrize(
         "sample",
@@ -256,6 +277,9 @@ class TestCredentialPiiSplit:
             "ghp_" + "A" * 36,
             "api_key=sk-" + "a" * 48,
             "psql password=hunter2",
+            "AWS_SECRET_ACCESS_KEY=FAKEwJalrXUtnFEMIFAKE",
+            '"SessionToken": "FAKEFwoGZXIvYXdzFAKE"',
+            '"SecretAccessKey": "FAKEwJalrXUtnFEMIFAKE"',
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",
             "-----BEGIN RSA PRIVATE KEY-----",
             # #1488 mirror: each must classify as a credential (not PII) so the
