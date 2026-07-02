@@ -65,7 +65,7 @@ _surfacing_id: abc123def456_
 
 Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. Exact raw-score distributions remain available through `stm_surfacing_stats`.
 
-Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="compact"` this id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Set `result_format="structured"` to carry the real `chunk_id` end to end.
+Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution to a single value above `min_score` — the reason structured is the default (#560).
 
 The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
 
@@ -95,6 +95,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
+| `result_format` | `structured` | `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Pin `compact` only for cores that predate the structured format (its 2-decimal score rendering collapses the score distribution, #560). |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
 | `ltm_mcp_command` | `memtomem-server` | Command used when `ltm_mcp_transport=stdio` |

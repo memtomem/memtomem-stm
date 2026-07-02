@@ -552,13 +552,25 @@ class TestMcpClientSearchAdapter:
 
     @pytest.mark.asyncio
     async def test_search_calls_mem_search(self) -> None:
+        """Default-config adapter requests the structured format (#560).
+
+        The ``output_format`` arg in the asserted call is the wire-level
+        pin for the structured default — compact's 2-decimal score
+        rendering collapses the RRF score distribution to a single value
+        above ``min_score``, so full-precision scores must be the default
+        request.
+        """
         from memtomem_stm.surfacing.config import SurfacingConfig
 
         adapter = McpClientSearchAdapter(SurfacingConfig())
 
         mock_content = MagicMock()
         mock_content.type = "text"
-        mock_content.text = "Found 1 results:\n\n[1] 0.9 | notes.md\nRelevant memory"
+        mock_content.text = (
+            '{"results": [{"rank": 1, "score": 0.0325, "source": "notes.md",'
+            ' "hierarchy": "Notes", "namespace": "default",'
+            ' "content": "Relevant memory"}]}'
+        )
 
         mock_result = MagicMock()
         mock_result.content = [mock_content]
@@ -569,10 +581,10 @@ class TestMcpClientSearchAdapter:
 
         results, _, outcome = await adapter.search("what is X", top_k=5)
         mock_session.call_tool.assert_awaited_once_with(
-            "mem_search", {"query": "what is X", "top_k": 5}
+            "mem_search", {"query": "what is X", "top_k": 5, "output_format": "structured"}
         )
         assert len(results) == 1
-        assert results[0].score == 0.9
+        assert results[0].score == 0.0325
         assert outcome == "ok"
 
     @pytest.mark.asyncio

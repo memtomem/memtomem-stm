@@ -296,6 +296,14 @@ class TestSurfacingNumericConstraints:
         SurfacingConfig(result_format="compact")
         SurfacingConfig(result_format="structured")
 
+    def test_surfacing_result_format_default_is_structured(self) -> None:
+        """#560: compact's 2-decimal score rendering collapses the RRF
+        score distribution to a single value above ``min_score``, blinding
+        the filter and the auto-tuner. ``structured`` carries full-precision
+        scores (and real chunk ids) and auto-downgrades to compact for
+        cores that don't advertise it."""
+        assert SurfacingConfig().result_format == "structured"
+
 
 class TestLangfuseInterdepValidator:
     def test_enabled_requires_both_keys(self) -> None:
