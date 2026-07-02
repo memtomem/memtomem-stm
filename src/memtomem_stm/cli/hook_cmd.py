@@ -918,16 +918,23 @@ def hook_install_command(host: str, apply_: bool) -> None:
     ``~/.cursor/hooks.json``, ``~/.kimi/config.toml``, or ``~/.codex/config.toml``)
     so the host fires ``mms hook --host <name>`` after each built-in tool call.
     Re-running updates STM's existing block in place rather than duplicating it.
-    Default is a dry-run preview; ``--apply`` writes (backing up any prior file)."""
+    Default is a dry-run preview; ``--apply`` writes (backing up any prior file)
+    under the hook-host write lock, with plan and apply in one locked span so
+    concurrent mms runs cannot interleave (the host app's own concurrent writes
+    are caught by ``apply_change``'s staleness guard instead)."""
+    # Lazy import: the lock machinery pulls in ``mms.state`` (pydantic), and
+    # this module is imported on the per-tool-call hook hot path.
     from memtomem_stm.cli import hook_hosts
+    from memtomem_stm.cli._write_lock import hook_hosts_write_lock
 
     command = shlex.join(_hook_install_command_argv(host))
-    try:
-        change = hook_hosts.plan_install(host, command)
-    except hook_hosts.HookInstallError as exc:
-        raise click.ClickException(str(exc)) from exc
-    backup = hook_hosts.apply_change(change) if apply_ else None
-    _emit_hook_change(change, apply_=apply_, backup=backup)
+    with hook_hosts_write_lock(enabled=apply_):
+        try:
+            change = hook_hosts.plan_install(host, command)
+            backup = hook_hosts.apply_change(change) if apply_ else None
+        except hook_hosts.HookInstallError as exc:
+            raise click.ClickException(str(exc)) from exc
+        _emit_hook_change(change, apply_=apply_, backup=backup)
 
 
 @hook_command.command(name="uninstall")
@@ -951,12 +958,16 @@ def hook_uninstall_command(host: str, apply_: bool) -> None:
     Removes exactly the block ``install`` would add (recognized by command
     shape), leaving any hand-written hooks untouched. A no-op when the config is
     absent or holds no STM block. Default is a dry-run preview; ``--apply`` writes
-    (backing up the prior file)."""
+    (backing up the prior file) under the same locked plan+apply span as
+    ``install``."""
+    # Lazy import: see hook_install_command.
     from memtomem_stm.cli import hook_hosts
+    from memtomem_stm.cli._write_lock import hook_hosts_write_lock
 
-    try:
-        change = hook_hosts.plan_uninstall(host)
-    except hook_hosts.HookInstallError as exc:
-        raise click.ClickException(str(exc)) from exc
-    backup = hook_hosts.apply_change(change) if apply_ else None
-    _emit_hook_change(change, apply_=apply_, backup=backup)
+    with hook_hosts_write_lock(enabled=apply_):
+        try:
+            change = hook_hosts.plan_uninstall(host)
+            backup = hook_hosts.apply_change(change) if apply_ else None
+        except hook_hosts.HookInstallError as exc:
+            raise click.ClickException(str(exc)) from exc
+        _emit_hook_change(change, apply_=apply_, backup=backup)

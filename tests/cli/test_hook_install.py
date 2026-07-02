@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
+from helpers import set_home
 
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, known_hosts
 from memtomem_stm.cli.hook_cmd import _DEFAULT_SURFACE_TOOLS
@@ -54,6 +55,16 @@ def redirect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         return path
 
     return _redirect
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The ``--apply`` span takes the hook-host write lock under
+    ``~/.memtomem/`` (see ``hook_hosts_lock_path``); pin HOME so no test in
+    this module touches the real one."""
+    home = tmp_path / "home"
+    set_home(monkeypatch, home)
+    return home
 
 
 # ── _is_stm_hook_command ─────────────────────────────────────────────────────
@@ -482,6 +493,102 @@ def test_cli_bare_hook_runtime_path_intact() -> None:
     result = CliRunner().invoke(cli, ["hook"], input="not json")
     assert result.exit_code == 0
     assert result.output.strip() == "{}"
+
+
+# ── staleness guard + write lock (lost-update protection) ───────────────────
+
+
+def test_apply_change_refuses_when_file_changed_after_plan(redirect) -> None:
+    # The host application rewriting its own config between plan and apply is
+    # the one writer mms' advisory lock cannot serialize; without the guard the
+    # atomic replace writes the plan-time merge back wholesale and silently
+    # reverts the app's edit (e.g. a permission Claude Code just persisted).
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"hooks": {}}\n', encoding="utf-8")
+
+    change = plan_install("claude", _CMD.format(host="claude"))
+    concurrent = '{"permissions": {"allow": ["Bash(ls:*)"]}}\n'
+    path.write_text(concurrent, encoding="utf-8")  # app writes concurrently
+
+    with pytest.raises(HookInstallError, match="changed after this change was planned"):
+        apply_change(change)
+
+    assert path.read_text(encoding="utf-8") == concurrent  # not clobbered
+    # Aborted BEFORE the backup — a refused apply leaves no side effect.
+    assert not (path.parent / (path.name + ".bak")).exists()
+
+
+def test_apply_change_refuses_when_file_created_after_plan(redirect) -> None:
+    # Planned as "create" (file absent), but something wrote the file since —
+    # blind-applying would overwrite content the plan never saw.
+    path = redirect("claude")
+    change = plan_install("claude", _CMD.format(host="claude"))
+    assert change.status == "create"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(HookInstallError, match="changed after this change was planned"):
+        apply_change(change)
+    assert path.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_apply_change_refuses_when_file_deleted_after_plan(redirect) -> None:
+    # Deleted since plan: applying would resurrect the (merged) old contents.
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"hooks": {}}\n', encoding="utf-8")
+    change = plan_install("claude", _CMD.format(host="claude"))
+
+    path.unlink()
+
+    with pytest.raises(HookInstallError, match="changed after this change was planned"):
+        apply_change(change)
+    assert not path.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
+def test_cli_install_apply_under_held_lock_exits_cleanly(redirect, monkeypatch) -> None:
+    # Two concurrent --apply runs must serialize on the hook-host write lock;
+    # the loser times out with a clean, attributed error instead of planning
+    # from a stale base and clobbering the winner's write (lost update).
+    from memtomem_stm.cli._write_lock import hook_hosts_lock_path
+    from memtomem_stm.mms import state
+
+    path = redirect("claude")
+    monkeypatch.setattr(state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with state.write_lock(lock_path=hook_hosts_lock_path()):
+        result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+
+    assert result.exit_code == 1
+    assert "another `mms hook install/uninstall" in result.output
+    assert not path.exists()  # the loser wrote nothing
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
+def test_cli_install_dry_run_ignores_held_lock(redirect, monkeypatch) -> None:
+    # Dry-run never writes, so it must not queue behind (or fail on) the lock.
+    # (Vacuous on Windows — the no-op lock can't block anything — so skipped
+    # alongside the held-lock test rather than passing without meaning.)
+    from memtomem_stm.cli._write_lock import hook_hosts_lock_path
+    from memtomem_stm.mms import state
+
+    redirect("claude")
+    monkeypatch.setattr(state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with state.write_lock(lock_path=hook_hosts_lock_path()):
+        result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert result.exit_code == 0
+    assert "To apply" in result.output
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
