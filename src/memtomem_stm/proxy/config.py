@@ -618,7 +618,12 @@ class CacheConfig(BaseModel):
       self-declare as writers (``readOnlyHint is False`` or
       ``destructiveHint is True``). Keeps caching for the un-annotated majority
       and for declared read-only tools, while refusing to memoize a side effect
-      the upstream itself flags as mutating.
+      the upstream itself flags as mutating. A tool declaring BOTH
+      ``readOnlyHint=True`` and ``destructiveHint=True`` is contradictory and
+      is deliberately treated as a writer (not the spec-literal reading, which
+      scopes ``destructiveHint`` to ``readOnlyHint=false`` tools) — distrusting
+      a self-contradiction costs one cache slot; trusting it could replay a
+      side effect. Re-enable such a tool via a per-tool ``cache: true``.
     - ``strict``: cache ONLY tools that explicitly declare ``readOnlyHint=True``.
       Safest (the MCP spec treats a missing ``readOnlyHint`` as may-mutate), but
       drops caching for every upstream that omits annotations.

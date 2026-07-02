@@ -172,7 +172,12 @@ class TestConservativePolicy:
         assert _eligible(mgr, "t") is False
 
     def test_destructive_wins_over_read_only_claim(self, build):
-        # Contradictory annotations → treat as a writer (safe default).
+        # Contradictory annotations → treat as a writer (safe default). This is
+        # a DELIBERATE deviation from the spec-literal reading (destructiveHint
+        # is only meaningful when readOnlyHint == false, under which the
+        # read-only claim would win): see the conservative-branch NOTE in
+        # ``_tool_cache_eligible``. Per-tool ``cache: true`` is the escape
+        # hatch, pinned by test_tool_override_true_beats_contradictory_annotations.
         mgr, _, _ = build(tools=[_tool("t", _ann(read_only=True, destructive=True))])
         assert _eligible(mgr, "t") is False
 
@@ -214,6 +219,18 @@ class TestOverridePrecedence:
     def test_tool_override_true_beats_writer_annotation(self, build):
         mgr, _, _ = build(
             tools=[_tool("t", _ann(read_only=False))],
+            tool_overrides={"t": ToolOverrideConfig(cache=True)},
+        )
+        assert _eligible(mgr, "t") is True
+
+    def test_tool_override_true_beats_contradictory_annotations(self, build):
+        # Pins the escape hatch promised for the contradictory pair
+        # (readOnlyHint=True + destructiveHint=True → writer; see the NOTE in
+        # ``_tool_cache_eligible`` and docs/caching.md): a per-tool
+        # ``cache: true`` must stay ahead of the annotation policy even for
+        # this combination, or the documented opt-back-in silently breaks.
+        mgr, _, _ = build(
+            tools=[_tool("t", _ann(read_only=True, destructive=True))],
             tool_overrides={"t": ToolOverrideConfig(cache=True)},
         )
         assert _eligible(mgr, "t") is True
