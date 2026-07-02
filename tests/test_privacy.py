@@ -161,6 +161,9 @@ class TestDefaultPatternCoverage:
             "aws_session_token = FAKEFwoGZXIvYXdzFAKE",  # ~/.aws/credentials form
             '"SessionToken": "FAKEFwoGZXIvYXdzFAKE"',  # STS JSON form
             '"SecretAccessKey": "FAKEwJalrXUtnFEMIFAKE"',  # STS JSON form (other branch)
+            "aws_session_token: FAKEFwoGZXIvYXdzFAKE",  # YAML form (unquoted ':' separator)
+            "{'SessionToken': 'FAKEFwoGZXIvYXdzFAKE'}",  # python-dict repr (single quotes)
+            '"session-token": "FAKEAQoDYXdzEPTFAKE"',  # kebab quoted key (serialized headers)
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcDEF_-12345",  # JWT
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",

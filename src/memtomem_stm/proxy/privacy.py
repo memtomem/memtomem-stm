@@ -41,8 +41,11 @@ CREDENTIAL_PATTERNS = [
     # neither). Two alternatives in one rule:
     #
     # - quoted form — ``"SessionToken": "…"`` / ``"SecretAccessKey": "…"``
-    #   (STS JSON, python-dict repr). The quote must sit DIRECTLY on both
-    #   sides of the label and the value must open as a string: a JSON-Schema
+    #   (STS JSON, python-dict repr) plus kebab-case quoted keys
+    #   (``"session-token": "…"`` — serialized header dicts), so both
+    #   branches share the same ``[_-]?`` separator charset. The quote must
+    #   sit DIRECTLY on both sides of the label and the value must open as
+    #   a string: a JSON-Schema
     #   property (``"session_token": {"type"…`` — object value) and a
     #   prefixed key (``"aws.get_session_token": "unhealthy"`` — telemetry
     #   dicts keyed by tool name) must NOT fire, or the eligibility scanner
@@ -58,7 +61,7 @@ CREDENTIAL_PATTERNS = [
     # mirrored set until the forward-sync lands (the inverse of the
     # #1488→#1491 reverse-sync direction; see the count-pin note in
     # tests/test_privacy.py).
-    r"(?i)(?:[\"'](?:secret_?access_?key|session_?token)[\"']\s*:\s*[\"']"
+    r"(?i)(?:[\"'](?:secret[_-]?access[_-]?key|session[_-]?token)[\"']\s*:\s*[\"']"
     r"|(?:secret[_-]?access[_-]?key|session[_-]?token)\s*[:=])",
     # Provider-prefixed token formats. Anchored by prefix so false positives
     # on arbitrary high-entropy strings are rare.
