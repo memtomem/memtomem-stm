@@ -626,10 +626,32 @@ def apply_change(change: HookChange) -> Path | None:
     (:func:`_write_backup`) *before* the new config is atomically written; returns
     the backup path (``None`` when there was nothing to back up). The new file
     inherits the prior file's permission bits, or ``0o600`` for a freshly-created
-    one (host configs can carry secrets)."""
+    one (host configs can carry secrets).
+
+    Staleness guard: ``change.new_text`` was merged from the config as read at
+    PLAN time, and the atomic replace writes that merge back wholesale — so if
+    the file changed in between (the host application persisting its own
+    settings; mms' advisory lock only serializes mms processes), applying would
+    silently revert the other writer's edit. The guard re-reads the file and
+    raises :class:`HookInstallError` on any divergence from what the plan saw
+    (including created-since-planned and deleted-since-planned), BEFORE the
+    backup, so an aborted apply has no side effect. Re-running re-plans from
+    the fresh contents."""
     if not change.changed:
         return None
     path = change.path
+    try:
+        on_disk = path.read_text(encoding="utf-8") if path.exists() else None
+    except OSError as exc:
+        raise HookInstallError(
+            f"cannot re-read {path} before writing ({exc}); nothing was written."
+        ) from exc
+    if on_disk != change.current_text:
+        raise HookInstallError(
+            f"{path} changed after this change was planned (a concurrent writer, "
+            "possibly the host application itself); nothing was written. Re-run "
+            "the command to re-plan against the current contents."
+        )
     try:
         mode = path.stat().st_mode & 0o777
     except OSError:
