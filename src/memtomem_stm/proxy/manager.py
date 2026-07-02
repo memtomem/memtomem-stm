@@ -3033,6 +3033,16 @@ class ProxyManager:
             # readOnlyHint defaults to may-mutate per the MCP spec.
             return read_only is True
         # conservative: cache unless the tool self-declares as a writer.
+        # NOTE — contradictory annotations (readOnlyHint=True AND
+        # destructiveHint=True) are treated as a writer ON PURPOSE, deviating
+        # from the spec-literal reading (the MCP spec scopes destructiveHint to
+        # readOnlyHint=false tools, under which an explicit read-only claim
+        # would win). A tool contradicting itself is a mis-annotation signal,
+        # and the failure directions are asymmetric: trusting the read-only
+        # claim on a sloppily-annotated writer replays its side effect from
+        # cache, while distrusting it merely costs one tool a cache slot — an
+        # operator who knows better can force it back with a per-tool
+        # ``cache: true``. Pinned by test_destructive_wins_over_read_only_claim.
         return not (read_only is False or destructive is True)
 
     def _invalidate_disabled_cache(
