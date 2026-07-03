@@ -324,6 +324,12 @@ class SurfacingEngine:
                 tool,
                 self._config.timeout_seconds,
             )
+            # A hung LTM must open the breaker like an erroring one (#579): a
+            # timeout is a degraded dependency, and it also cancels the adapter
+            # mid-RPC, forcing a stdio child respawn on the next call (#290/#296).
+            # Without counting it, every eligible call pays the full timeout
+            # indefinitely and the breaker never opens.
+            self._circuit_breaker.record_failure()
             return response_text
         except Exception:
             self._observability.record_outcome(tool, "error_other")
