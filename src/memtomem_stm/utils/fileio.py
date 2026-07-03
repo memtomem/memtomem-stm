@@ -30,6 +30,7 @@ def atomic_write_text(
     mode: int | None = None,
     ensure_parent: bool = True,
     parent_mode: int = 0o700,
+    durable: bool = False,
 ) -> None:
     """Atomically write ``content`` to ``path``.
 
@@ -56,6 +57,15 @@ def atomic_write_text(
         already prepared the parent and does not want its mode rewritten.
     :param parent_mode: Mode for created parent directories. Only used
         when ``ensure_parent`` is True.
+    :param durable: When True, ``fsync`` the temp file before the rename
+        and ``fsync`` the parent directory after it (POSIX), so the write
+        survives power loss / kernel panic — not just a process crash. The
+        default ``os.replace`` guards against process crash already; the
+        rename can otherwise become durable before the data blocks, leaving
+        a truncated file after an unclean shutdown. Costs a disk flush per
+        write, so it is opt-in: pass ``durable=True`` from config/state
+        writers (single sources of truth that ``mms init`` refuses to
+        recreate), leave it off for high-frequency hot-path writers.
     """
     resolved = path.expanduser().resolve()
     if ensure_parent:
@@ -69,15 +79,43 @@ def atomic_write_text(
     try:
         with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
+            if durable:
+                # Flush Python + libc buffers, then force the data blocks to
+                # disk BEFORE the rename, so os.replace can't make the new
+                # name durable ahead of the content it points at.
+                f.flush()
+                os.fsync(f.fileno())
         if mode is not None:
             try:
                 tmp.chmod(mode)
             except OSError:
                 pass
         _replace_with_windows_retry(tmp, resolved)
+        if durable:
+            _fsync_dir(resolved.parent)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of ``directory`` so a rename into it is durable
+    (POSIX). No-op on platforms without directory fds (Windows) or when the
+    open/fsync fails — durability is a best-effort hardening, not a hard
+    guarantee, and a failure here must not fail the write that already
+    landed via ``os.replace``."""
+    if sys.platform == "win32":
+        return
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def _replace_with_windows_retry(src: Path, dst: Path) -> None:

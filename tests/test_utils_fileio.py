@@ -47,6 +47,60 @@ class TestAtomicWriteText:
         # Bottom 9 bits = permission bits.
         assert (target.stat().st_mode & 0o777) == 0o600
 
+    def test_durable_false_does_not_fsync(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """#585 — the default (durable=False) never calls os.fsync (no extra
+        disk flush on the hot path)."""
+        calls: list[int] = []
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.fsync", lambda fd: calls.append(fd))
+        atomic_write_text(tmp_path / "out.txt", "hello")
+        assert calls == []
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="directory fsync is POSIX-only",
+    )
+    def test_durable_true_fsyncs_file_and_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#585 — durable=True fsyncs the temp file (before rename) and the
+        parent directory (after), so the write survives power loss."""
+        fsynced: list[int] = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(
+            "memtomem_stm.utils.fileio.os.fsync",
+            lambda fd: (fsynced.append(fd), real_fsync(fd))[0],
+        )
+        target = tmp_path / "cfg.json"
+        atomic_write_text(target, "{}", durable=True)
+        assert target.read_text() == "{}"
+        # At least two fsyncs: the temp file fd and the parent-dir fd.
+        assert len(fsynced) >= 2
+
+    def test_durable_true_dir_fsync_failure_does_not_break_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A directory fsync failure is best-effort — the write that already
+        landed via os.replace must still succeed."""
+        real_fsync = os.fsync
+
+        def flaky_fsync(fd: int):
+            # Fail only the directory fsync (a dir fd isn't the temp file's).
+            try:
+                os.fstat(fd)
+            except OSError:
+                raise
+            # Distinguish dir from file by checking if it's a directory fd.
+            import stat as _stat
+
+            if _stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("simulated dir fsync failure")
+            return real_fsync(fd)
+
+        monkeypatch.setattr("memtomem_stm.utils.fileio.os.fsync", flaky_fsync)
+        target = tmp_path / "cfg.json"
+        atomic_write_text(target, "payload", durable=True)
+        assert target.read_text() == "payload"
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",

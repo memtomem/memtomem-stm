@@ -659,5 +659,5 @@ def apply_change(change: HookChange) -> Path | None:
     backup: Path | None = None
     if change.current_text is not None:
         backup = _write_backup(path, change.current_text, mode)
-    atomic_write_text(path, change.new_text, mode=mode)
+    atomic_write_text(path, change.new_text, mode=mode, durable=True)
     return backup
