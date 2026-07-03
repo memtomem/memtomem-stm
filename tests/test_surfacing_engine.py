@@ -291,6 +291,56 @@ class TestSurfacingTimeout:
         output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert output == LONG_RESPONSE
 
+    async def test_timeout_records_circuit_breaker_failure(self):
+        # A hung LTM times out (not errors); it must still count as a breaker
+        # failure, otherwise the breaker never opens and every call pays the
+        # full timeout indefinitely (#579).
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = slow_search
+
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+        )
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert engine._circuit_breaker.failure_count == 1
+
+    async def test_circuit_breaker_opens_after_repeated_timeouts(self):
+        # Mirror TestSurfacingCircuitBreaker for a *hung* dependency: repeated
+        # timeouts must open the breaker so surfacing is skipped rather than
+        # taxed forever (#579).
+        call_count = 0
+
+        async def slow_search(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = slow_search
+
+        engine = SurfacingEngine(
+            config=_make_config(
+                circuit_max_failures=2, circuit_reset_seconds=60, timeout_seconds=0.05
+            ),
+            mcp_adapter=adapter,
+        )
+
+        # First 2 timeouts still return original (caught by except) and open the breaker.
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.surface("gh", "read_file", {"path": "y"}, LONG_RESPONSE)
+        assert call_count == 2
+
+        # Circuit now open — the third call skips surfacing without touching the adapter.
+        output = await engine.surface("gh", "read_file", {"path": "z"}, LONG_RESPONSE)
+        assert output == LONG_RESPONSE
+        assert call_count == 2
+
 
 class TestSessionDedup:
     """Verify same memory isn't surfaced twice in one session."""
