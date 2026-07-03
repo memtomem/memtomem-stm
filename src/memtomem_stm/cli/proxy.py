@@ -153,7 +153,7 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     even if the parent directory is shared.
     """
     payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    atomic_write_text(config_path, payload, mode=0o600)
+    atomic_write_text(config_path, payload, mode=0o600, durable=True)
 
 
 # ── MCP client registration helpers ─────────────────────────────────────
@@ -356,7 +356,7 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
         file_mode = mcp_path.stat().st_mode & 0o777
     except OSError:
         file_mode = 0o644
-    atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode)
+    atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode, durable=True)
     return mcp_path
 
 
@@ -1510,7 +1510,7 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
         return (False, f"'{name}' not registered in {path}")
     del servers[name]
     try:
-        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True)
     except OSError as exc:
         return (False, f"write error: {exc}")
     return (True, None)
@@ -1587,7 +1587,9 @@ def _append_pruned_backup(
     # 0600 like ``stm_proxy.json`` (``_save``): ``original`` carries verbatim
     # host env/headers, secrets included.
     try:
-        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600)
+        atomic_write_text(
+            path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600, durable=True
+        )
     except OSError as exc:
         return (False, f"backup log write failed: {exc}")
     return (True, None)
@@ -2979,6 +2981,7 @@ def _json_config_set_entry(
             path,
             json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
             mode=default_mode,
+            durable=True,
         )
     except OSError as exc:
         return (False, f"write error: {exc}")

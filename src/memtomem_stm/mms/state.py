@@ -426,24 +426,26 @@ def load_import_state(path: Path | None = None) -> ImportState:
 def save_registry(config: RegistryConfig, path: Path | None = None) -> None:
     """Atomically write ``registry.toml`` with mode 0o600 (contains secrets)."""
     p = path or registry_path()
-    atomic_write_text(p, tomli_w.dumps(config.model_dump()), mode=_REGISTRY_MODE)
+    atomic_write_text(p, tomli_w.dumps(config.model_dump()), mode=_REGISTRY_MODE, durable=True)
 
 
 def save_projects_index(index: ProjectsIndex, path: Path | None = None) -> None:
     """Atomically write ``projects.toml`` with mode 0o600 (paths are private)."""
     p = path or projects_index_path()
-    atomic_write_text(p, tomli_w.dumps(index.model_dump()), mode=_PROJECTS_INDEX_MODE)
+    atomic_write_text(p, tomli_w.dumps(index.model_dump()), mode=_PROJECTS_INDEX_MODE, durable=True)
 
 
 def save_project_config(config: ProjectConfig, path: Path) -> None:
     """Atomically write a per-project ``project.toml`` (committed file, default mode)."""
-    atomic_write_text(path, tomli_w.dumps(config.model_dump()), mode=_PROJECT_FILE_MODE)
+    atomic_write_text(
+        path, tomli_w.dumps(config.model_dump()), mode=_PROJECT_FILE_MODE, durable=True
+    )
 
 
 def save_import_state(state: ImportState, path: Path | None = None) -> None:
     """Atomically write ``import_state.toml`` with mode 0o600."""
     p = path or import_state_path()
-    atomic_write_text(p, tomli_w.dumps(state.model_dump()), mode=_IMPORT_STATE_MODE)
+    atomic_write_text(p, tomli_w.dumps(state.model_dump()), mode=_IMPORT_STATE_MODE, durable=True)
 
 
 # ---------------------------------------------------------------------------
