@@ -36,8 +36,9 @@ class CompressionFeedbackTracker:
         self,
         db_path: Path,
         metrics_store: MetricsStore | None = None,
+        retention_days: int = 0,
     ) -> None:
-        self._store = CompressionFeedbackStore(db_path.expanduser())
+        self._store = CompressionFeedbackStore(db_path.expanduser(), retention_days=retention_days)
         self._store.initialize()
         self._metrics_store = metrics_store
 

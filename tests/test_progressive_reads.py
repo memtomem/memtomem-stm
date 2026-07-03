@@ -64,6 +64,55 @@ class TestProgressiveReadsStore:
         finally:
             store.close()
 
+    def test_startup_purge_deletes_aged_rows(self, tmp_path: Path):
+        """#584 — a store opened with retention_days>0 purges rows older than
+        the window on initialize(); newer rows and a retention_days=0 store are
+        untouched."""
+        import time
+
+        db_path = tmp_path / "pr.db"
+        store = ProgressiveReadsStore(db_path)
+        store.initialize()
+        store.record("old", "t", "s", "tool_a", 0, 10, 10, 10)
+        store.record("new", "t", "s", "tool_a", 0, 10, 10, 10)
+        assert store._db is not None
+        store._db.execute(
+            "UPDATE progressive_reads SET created_at = ? WHERE key = 'old'",
+            (time.time() - 100 * 86400.0,),
+        )
+        store._db.commit()
+        store.close()
+
+        # Reopen with a 90-day retention → the 100-day-old row is purged.
+        store2 = ProgressiveReadsStore(db_path, retention_days=90)
+        store2.initialize()
+        assert store2._db is not None
+        keys = [r[0] for r in store2._db.execute("SELECT key FROM progressive_reads").fetchall()]
+        assert keys == ["new"]
+        store2.close()
+
+    def test_startup_purge_disabled_by_default(self, tmp_path: Path):
+        """retention_days defaults to 0 → no purge, rows kept indefinitely."""
+        import time
+
+        db_path = tmp_path / "pr.db"
+        store = ProgressiveReadsStore(db_path)
+        store.initialize()
+        store.record("old", "t", "s", "tool_a", 0, 10, 10, 10)
+        assert store._db is not None
+        store._db.execute(
+            "UPDATE progressive_reads SET created_at = ? WHERE key = 'old'",
+            (time.time() - 1000 * 86400.0,),
+        )
+        store._db.commit()
+        store.close()
+
+        store2 = ProgressiveReadsStore(db_path)  # retention_days=0
+        store2.initialize()
+        assert store2._db is not None
+        assert store2._db.execute("SELECT COUNT(*) FROM progressive_reads").fetchone()[0] == 1
+        store2.close()
+
     def test_full_follow_up_rate(self, tmp_path: Path):
         """Initial + 2 follow-ups on the same key → follow_up_rate 1.0."""
         store = ProgressiveReadsStore(tmp_path / "pr.db")

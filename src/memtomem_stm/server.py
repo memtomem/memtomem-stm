@@ -163,6 +163,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                     compression_feedback_tracker = CompressionFeedbackTracker(
                         config.proxy.compression_feedback.db_path,
                         metrics_store=metrics_store,
+                        retention_days=config.proxy.compression_feedback.retention_days,
                     )
                 except Exception:
                     logger.warning(
@@ -179,6 +180,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 try:
                     progressive_reads_tracker = ProgressiveReadsTracker(
                         config.proxy.progressive_reads.db_path,
+                        retention_days=config.proxy.progressive_reads.retention_days,
                     )
                 except Exception:
                     logger.warning(

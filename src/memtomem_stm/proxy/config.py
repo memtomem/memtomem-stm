@@ -652,6 +652,11 @@ class CompressionFeedbackConfig(BaseModel):
 
     enabled: bool = True
     db_path: Path = Path("~/.memtomem/stm_feedback.db")
+    retention_days: int = Field(default=90, ge=0)
+    """#584 — days to keep ``compression_feedback`` rows before a startup
+    purge deletes them. The table is otherwise append-only and unbounded.
+    ``0`` disables the purge (rows kept indefinitely — the pre-#584
+    behavior)."""
 
 
 class ProgressiveReadsConfig(BaseModel):
@@ -669,6 +674,11 @@ class ProgressiveReadsConfig(BaseModel):
 
     enabled: bool = True
     db_path: Path = Path("~/.memtomem/stm_feedback.db")
+    retention_days: int = Field(default=90, ge=0)
+    """#584 — days to keep ``progressive_reads`` rows before a startup purge
+    deletes them. The table is append-only by design and otherwise
+    unbounded. ``0`` disables the purge (rows kept indefinitely — the
+    pre-#584 behavior)."""
 
 
 class SelectionTelemetryConfig(BaseModel):

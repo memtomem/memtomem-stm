@@ -57,8 +57,9 @@ class ProgressiveReadsStore:
     multiple concurrent connections and the tables are disjoint.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, retention_days: int = 0) -> None:
         self._db_path = db_path
+        self._retention_days = retention_days
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
 
@@ -69,6 +70,20 @@ class ProgressiveReadsStore:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
             db.executescript(_SCHEMA)
+            # Startup purge of aged-out rows (#584) — the table is append-only
+            # and otherwise unbounded. Runs once per process start, mirroring
+            # ProxyCache's startup expiry purge. ``retention_days=0`` disables.
+            if self._retention_days > 0:
+                cutoff = time.time() - self._retention_days * 86400.0
+                deleted = db.execute(
+                    "DELETE FROM progressive_reads WHERE created_at < ?", (cutoff,)
+                ).rowcount
+                if deleted:
+                    logger.info(
+                        "Purged %d progressive_reads rows older than %d days (#584)",
+                        deleted,
+                        self._retention_days,
+                    )
             db.commit()
         except Exception:
             db.close()

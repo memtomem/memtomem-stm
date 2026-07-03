@@ -78,6 +78,47 @@ class TestCompressionFeedbackStore:
         finally:
             store.close()
 
+    def test_startup_purge_deletes_aged_rows(self, tmp_path: Path):
+        """#584 — a store opened with retention_days>0 purges rows older than
+        the window on initialize(); a retention_days=0 store keeps everything."""
+        db_path = tmp_path / "cfb.db"
+        store = CompressionFeedbackStore(db_path)
+        store.initialize()
+        store.record("s", "tool_a", "truncated", "x", None)
+        store.record("s", "tool_b", "truncated", "y", None)
+        assert store._db is not None
+        store._db.execute(
+            "UPDATE compression_feedback SET created_at = ? WHERE tool = 'tool_a'",
+            (time.time() - 100 * 86400.0,),
+        )
+        store._db.commit()
+        store.close()
+
+        store2 = CompressionFeedbackStore(db_path, retention_days=90)
+        store2.initialize()
+        assert store2._db is not None
+        tools = [
+            r[0] for r in store2._db.execute("SELECT tool FROM compression_feedback").fetchall()
+        ]
+        assert tools == ["tool_b"]
+        store2.close()
+
+        # retention_days=0 (default) → the still-present row is never purged.
+        store3 = CompressionFeedbackStore(db_path)
+        store3.initialize()
+        assert store3._db is not None
+        store3._db.execute(
+            "UPDATE compression_feedback SET created_at = ? WHERE tool = 'tool_b'",
+            (time.time() - 1000 * 86400.0,),
+        )
+        store3._db.commit()
+        store3.close()
+        store4 = CompressionFeedbackStore(db_path)  # retention_days=0
+        store4.initialize()
+        assert store4._db is not None
+        assert store4._db.execute("SELECT COUNT(*) FROM compression_feedback").fetchone()[0] == 1
+        store4.close()
+
     def test_get_stats_aggregates_by_kind_and_tool(self, tmp_path: Path):
         store = CompressionFeedbackStore(tmp_path / "cfb.db")
         store.initialize()

@@ -114,6 +114,16 @@ class SurfacingConfig(BaseModel):
     so aggregate counts in ``stm_surfacing_stats`` are unaffected. Part 3
     of #352 (``persist_query_text=False`` opt-in hashing) is the
     write-side counterpart to this read-side retention sweep."""
+    stats_retention_days: int = Field(default=90, ge=0)
+    """#584 — days to keep ``surfacing_events`` (and their
+    ``surfacing_feedback``) rows before the opportunistic cleanup DELETES
+    them. Unlike ``query_retention_days`` (which only nulls the query
+    column, keeping the row for aggregates), this bounds the table so
+    ``FeedbackStore.get_stats`` cannot full-scan an ever-growing table on
+    the event loop. ``0`` disables deletion (rows kept indefinitely — the
+    pre-#584 behavior). Aggregates older than the window are rarely
+    actionable for tuning; the default 90 days sits well past the 30-day
+    query-text retention."""
     persist_query_text: bool = True
     """#352 part 3 — when ``True`` (default, backward-compatible),
     ``FeedbackStore`` stores the verbatim extracted query in

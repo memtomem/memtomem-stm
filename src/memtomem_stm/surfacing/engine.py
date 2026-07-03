@@ -984,7 +984,8 @@ class SurfacingEngine:
             return
         dedup_ttl = self._config.dedup_ttl_seconds
         retention_days = self._config.query_retention_days
-        if dedup_ttl <= 0 and retention_days <= 0:
+        stats_retention_days = self._config.stats_retention_days
+        if dedup_ttl <= 0 and retention_days <= 0 and stats_retention_days <= 0:
             return
         now = time.monotonic()
         if now - self._last_cleanup < self._cleanup_interval:
@@ -998,6 +999,20 @@ class SurfacingEngine:
                     logger.info("Cleaned up %d expired seen_memories entries", deleted)
             except Exception:
                 logger.warning("Failed to clean up expired seen_memories", exc_info=True)
+        if stats_retention_days > 0:
+            # Delete aged-out event rows BEFORE nulling queries: a row past the
+            # stats window is gone entirely, so nulling its query first would be
+            # wasted work. Bounds the table get_stats scans (#584).
+            try:
+                deleted = store.delete_events_older_than(stats_retention_days * 86400.0)
+                if deleted:
+                    logger.info(
+                        "Deleted %d surfacing_events rows older than %d days (#584)",
+                        deleted,
+                        stats_retention_days,
+                    )
+            except Exception:
+                logger.warning("Failed to delete expired surfacing_events", exc_info=True)
         if retention_days > 0:
             try:
                 nulled = store.cleanup_expired_queries(retention_days * 86400.0)

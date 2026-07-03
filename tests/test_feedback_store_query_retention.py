@@ -261,3 +261,40 @@ class TestLegacyNotNullMigration:
             )
         finally:
             store.close()
+
+
+class TestDeleteEventsOlderThan:
+    """#584 — row-level retention deletes aged-out events (and their
+    feedback), bounding the table get_stats scans."""
+
+    def test_deletes_old_events_and_cascades_feedback(self, tmp_path: Path) -> None:
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+
+        _record_event(store, "old", age_seconds=10_000)
+        _record_event(store, "new", age_seconds=10)
+        # A feedback row on the old event must go too.
+        assert store.record_feedback("old", "helpful", memory_id="m1")
+        assert store.record_feedback("new", "helpful", memory_id="m1")
+
+        deleted = store.delete_events_older_than(retention_seconds=1_000)
+
+        assert deleted == 1
+        assert store._db is not None
+        events = [r[0] for r in store._db.execute("SELECT id FROM surfacing_events").fetchall()]
+        assert events == ["new"]
+        feedback_ids = [
+            r[0]
+            for r in store._db.execute("SELECT surfacing_id FROM surfacing_feedback").fetchall()
+        ]
+        assert feedback_ids == ["new"]  # the old event's feedback cascaded away
+        store.close()
+
+    def test_zero_retention_is_disabled(self, tmp_path: Path) -> None:
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+        _record_event(store, "old", age_seconds=10_000)
+        assert store.delete_events_older_than(retention_seconds=0) == 0
+        assert store._db is not None
+        assert store._db.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()[0] == 1
+        store.close()

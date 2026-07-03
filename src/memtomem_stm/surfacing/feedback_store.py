@@ -712,6 +712,32 @@ class FeedbackStore:
             self._db.commit()
             return cursor.rowcount
 
+    def delete_events_older_than(self, retention_seconds: float) -> int:
+        """Delete ``surfacing_events`` (and their ``surfacing_feedback``) rows
+        older than the retention window. Returns the number of event rows
+        deleted (#584).
+
+        Unlike :meth:`cleanup_expired_queries`, which only nulls the query
+        column and keeps the row for aggregates, this bounds the table so
+        :meth:`get_stats` cannot full-scan an unbounded history on the event
+        loop. The feedback rows are removed first (they reference events by
+        ``surfacing_id``), then the events, in one transaction. ``<= 0``
+        disables deletion."""
+        if self._db is None or retention_seconds <= 0:
+            return 0
+        cutoff = time.time() - retention_seconds
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM surfacing_feedback WHERE surfacing_id IN "
+                "(SELECT id FROM surfacing_events WHERE created_at < ?)",
+                (cutoff,),
+            )
+            cursor = self._db.execute(
+                "DELETE FROM surfacing_events WHERE created_at < ?", (cutoff,)
+            )
+            self._db.commit()
+            return cursor.rowcount
+
     def _get_tool_rating_ratio(
         self,
         tool: str | None,

@@ -61,6 +61,10 @@ def _make_config(**overrides) -> SurfacingConfig:
         # retention branch only fires when a test opts in. Production
         # default is 30 days (set in SurfacingConfig).
         "query_retention_days": 0,
+        # #584: same convention — default the row-deletion retention off in
+        # tests so it only fires when a test opts in. Production default is
+        # 90 days (set in SurfacingConfig).
+        "stats_retention_days": 0,
     }
     defaults.update(overrides)
     return SurfacingConfig(**defaults)
@@ -1659,6 +1663,7 @@ class TestMaybeCleanupExpired:
         tracker.store.mark_surfaced = MagicMock()
         tracker.store.cleanup_expired = MagicMock(return_value=0)
         tracker.store.cleanup_expired_queries = MagicMock(return_value=0)
+        tracker.store.delete_events_older_than = MagicMock(return_value=0)
         tracker.store.record_surfacing_event = MagicMock()
         return tracker
 
@@ -1823,6 +1828,53 @@ class TestMaybeCleanupExpired:
         out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "mem" in out
         tracker.store.cleanup_expired_queries.assert_called_once()
+
+    # ── #584: row-deletion retention branch ────────────────────────────
+
+    async def test_stats_retention_runs_when_enabled(self):
+        """``stats_retention_days > 0`` triggers ``delete_events_older_than``
+        with the configured window in seconds, independent of dedup."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, stats_retention_days=90),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store.delete_events_older_than.assert_called_once_with(90 * 86400.0)
+
+    async def test_stats_retention_skipped_when_zero(self):
+        """``stats_retention_days=0`` disables the row-deletion branch."""
+        tracker = self._make_tracker()
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=3600, stats_retention_days=0),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store.delete_events_older_than.assert_not_called()
+
+    async def test_stats_retention_exception_is_swallowed(self):
+        """A misbehaving ``delete_events_older_than`` must not break surface()."""
+        tracker = self._make_tracker()
+        tracker.store.delete_events_older_than = MagicMock(side_effect=RuntimeError("locked"))
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, stats_retention_days=90),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        engine._last_cleanup = time.monotonic() - 7200
+
+        out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "mem" in out
+        tracker.store.delete_events_older_than.assert_called_once()
 
 
 class TestSurfacingEngineStop:
