@@ -1122,6 +1122,27 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close tool-graph consult cache", exc_info=True)
             self._toolgraph_cache = None
+        # Close the pending stores (#601). Under ``pending_store: "sqlite"`` the
+        # selective compressor and the progressive store each hold a live sqlite
+        # connection; they were the lone long-lived resources ``stop()`` left
+        # open. Close and null them (with their cfg snapshots) so a stop->start —
+        # or a post-restart config change that rebuilds them — starts from a
+        # fresh store instead of reusing a closed connection, matching the
+        # close-and-null pattern used for the extractor / tool-graph cache above.
+        if self._selective_compressor is not None:
+            try:
+                self._selective_compressor.close()
+            except Exception:
+                logger.debug("Failed to close selective pending store", exc_info=True)
+            self._selective_compressor = None
+            self._selective_compressor_cfg = None
+        if self._progressive_store is not None:
+            try:
+                self._progressive_store.close()
+            except Exception:
+                logger.debug("Failed to close progressive pending store", exc_info=True)
+            self._progressive_store = None
+            self._progressive_store_cfg = None
         for conn in self._connections.values():
             if conn.stack is not None:
                 try:

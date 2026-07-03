@@ -193,6 +193,44 @@ class TestStop:
         mock_stack.aclose.assert_awaited_once()
         assert len(mgr._connections) == 0
 
+    async def test_stop_closes_and_nulls_pending_stores(self):
+        """#601 — stop() closes the selective compressor + progressive store
+        (their sqlite connections) and nulls both handles + cfg snapshots, so a
+        stop→start rebuilds cleanly instead of reusing a closed store."""
+        from unittest.mock import MagicMock
+
+        mgr = _make_manager(servers={})
+
+        selective = MagicMock()
+        progressive = MagicMock()
+        mgr._selective_compressor = selective
+        mgr._selective_compressor_cfg = object()
+        mgr._progressive_store = progressive
+        mgr._progressive_store_cfg = object()
+
+        await mgr.stop()
+
+        selective.close.assert_called_once()
+        progressive.close.assert_called_once()
+        assert mgr._selective_compressor is None
+        assert mgr._selective_compressor_cfg is None
+        assert mgr._progressive_store is None
+        assert mgr._progressive_store_cfg is None
+
+    async def test_stop_pending_store_close_failure_is_swallowed(self):
+        """A close() that raises must not break stop() — the handle is still
+        nulled so a restart rebuilds."""
+        from unittest.mock import MagicMock
+
+        mgr = _make_manager(servers={})
+        selective = MagicMock()
+        selective.close.side_effect = RuntimeError("db locked")
+        mgr._selective_compressor = selective
+
+        await mgr.stop()  # must not raise
+
+        assert mgr._selective_compressor is None
+
 
 # ── connect timeout ─────────────────────────────────────────────────────
 

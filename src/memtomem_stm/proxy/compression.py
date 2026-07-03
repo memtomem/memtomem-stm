@@ -853,6 +853,15 @@ class SelectiveCompressor:
 
             self._store = InMemoryPendingStore()
 
+    def close(self) -> None:
+        """Release the backing pending store (#601). A ``SQLitePendingStore``
+        holds a live sqlite connection; the in-memory store has no ``close``,
+        so this is a no-op there. Idempotent — safe to call from
+        ``ProxyManager.stop()`` and again on a subsequent stop."""
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
+
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         if not text or len(text) <= max_chars:
             return text

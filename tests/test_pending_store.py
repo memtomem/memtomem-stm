@@ -255,6 +255,19 @@ class TestSelectiveCompressorWithStore:
         assert "Data X" in selected
         store.close()
 
+    def test_compressor_close_closes_sqlite_store(self, tmp_path):
+        """#601 — SelectiveCompressor.close() releases the backing sqlite
+        connection; InMemory has no close() so it's a harmless no-op."""
+        store = SQLitePendingStore(tmp_path / "sel.db")
+        store.initialize()
+        comp = SelectiveCompressor(store=store)
+        assert store._db is not None
+        comp.close()
+        assert store._db is None  # connection released
+
+        # InMemory-backed compressor: close() is a no-op, no raise.
+        SelectiveCompressor().close()
+
     def test_multi_instance_shared_sqlite(self, tmp_path):
         """Two compressors sharing one SQLite DB can cross-select."""
         db_path = tmp_path / "shared.db"

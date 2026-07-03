@@ -62,6 +62,14 @@ class ProgressiveStoreAdapter:
     def __init__(self, store: object) -> None:
         self._store = store
 
+    def close(self) -> None:
+        """Release the backing pending store (#601). A ``SQLitePendingStore``
+        holds a live sqlite connection; the in-memory store has no ``close``,
+        so this is a no-op there. Idempotent."""
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
+
     def put(self, key: str, resp: ProgressiveResponse) -> None:
         meta = json.dumps(
             {
