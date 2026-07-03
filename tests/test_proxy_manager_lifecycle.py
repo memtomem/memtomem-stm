@@ -169,6 +169,36 @@ class TestStart:
             assert "alice:s3cr3t-token" not in blob
             assert "***@ltm.example.com" in blob
 
+    async def test_startup_failure_redacts_long_credential_past_cap(self):
+        """#580: redaction runs on the FULL message before the 500-char cap, so
+        a credential long enough that ``@host`` falls past the cap is still
+        scrubbed. Capping first (as format_error_message_from_exc does) would
+        truncate the token mid-string, leaving a partial that redact can no
+        longer match against the configured URL."""
+        from memtomem_stm.proxy.metrics import MAX_ERROR_MESSAGE_CHARS
+
+        token = "t" * (MAX_ERROR_MESSAGE_CHARS + 300)  # pushes @host past the cap
+        url = f"https://user:{token}@ltm.example.com/mcp"
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=url),
+            }
+        )
+
+        async def _leaky_connect(name, cfg):
+            raise ConnectionError(f"All connection attempts failed for {url}")
+
+        with patch.object(mgr, "_connect_server", side_effect=_leaky_connect):
+            await mgr.start()
+
+        recorded = mgr._failed_servers["web"]
+        health_error = mgr.get_upstream_health()["web"]["error"]
+        for blob in (recorded, health_error):
+            # Not even a long partial run of the token may survive the cap.
+            assert token not in blob
+            assert "t" * 100 not in blob
+            assert "***@ltm.example.com" in blob
+
     async def test_url_less_network_upstream_recorded_in_health(self):
         """#580: a non-stdio upstream configured without a url is skipped by
         _connect_server with a warning + early return (no exception), so it

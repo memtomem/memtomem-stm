@@ -478,9 +478,12 @@ class ProxyManager:
                 # included — so a credentialed upstream
                 # (``https://user:token@host/mcp``) would otherwise leak its
                 # token through ``stm_proxy_health`` to the MCP client/model.
-                self._failed_servers[name] = redact_exception_text(
-                    format_error_message_from_exc(exc), cfg.url
-                )
+                # Redact the FULL message, THEN cap: capping first (as
+                # format_error_message_from_exc does) can truncate a long
+                # credential mid-token so redact_exception_text no longer
+                # matches the configured URL, leaving a partial token exposed.
+                redacted = redact_exception_text(f"{type(exc).__name__}: {exc}", cfg.url)
+                self._failed_servers[name] = redacted[:MAX_ERROR_MESSAGE_CHARS]
 
         # #465: evaluate per-tool health once per session, before the first
         # advertisement. get_proxy_tools() applies this cached snapshot so
