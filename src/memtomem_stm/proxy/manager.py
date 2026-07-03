@@ -2338,6 +2338,7 @@ class ProxyManager:
         upstream_args: dict[str, Any],
         *,
         trace_id: str | None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> "CallToolResult":
         """Stage 1: fetch the upstream tool result with bounded retry + reconnect.
 
@@ -2348,6 +2349,10 @@ class ProxyManager:
         ``call_tool`` does not double-record), best-effort reconnects, and re-raises.
         ``upstream_args`` must already carry ``_trace_id`` — the caller injects it
         before this call so the cache-key snapshot stays trace-free.
+
+        ``cfg_snap`` is the caller's per-request config snapshot, used by the
+        timeout-replay guard (#578); ``None`` (direct test callers) falls back
+        to the live config.
         """
         conn = self._connections[server]
         cfg = conn.config
@@ -2450,7 +2455,27 @@ class ProxyManager:
                         logger.debug("Post-protocol-error reconnect failed", exc_info=True)
                     raise
 
-                if attempt >= cfg.max_retries:
+                # Timeout-replay guard (#578): a per-attempt timeout cancels OUR
+                # wait — the request may already have executed upstream, so
+                # re-invoking a non-read-only tool would manufacture duplicate
+                # writes. Connection-level failures (refused / reset / EOF) stay
+                # retryable for every tool: they overwhelmingly mean the request
+                # never completed, and gating them would disable most useful
+                # retries. MCP-error retries (err_code path) also re-execute but
+                # are out of scope here — tracked as a follow-up on #578.
+                replay_unsafe = isinstance(
+                    exc, asyncio.TimeoutError
+                ) and not self._tool_idempotent_for_retry(
+                    server, tool, cfg_snap=cfg_snap if cfg_snap is not None else self._config
+                )
+                if attempt >= cfg.max_retries or replay_unsafe:
+                    if replay_unsafe and attempt < cfg.max_retries:
+                        logger.warning(
+                            "Timeout on non-read-only tool %s/%s — not retrying "
+                            "(replay guard); reconnecting for the next call",
+                            server,
+                            tool,
+                        )
                     cat = (
                         ErrorCategory.TIMEOUT
                         if isinstance(exc, asyncio.TimeoutError)
@@ -3269,6 +3294,55 @@ class ProxyManager:
         # ``cache: true``. Pinned by test_destructive_wins_over_read_only_claim.
         return not (read_only is False or destructive is True)
 
+    def _tool_idempotent_for_retry(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> bool:
+        """Whether a timed-out call to ``(server, tool)`` may be re-invoked (#578).
+
+        A per-attempt timeout cancels OUR wait, not the upstream execution — the
+        request may already have committed its side effect, so re-invoking a
+        non-read-only tool manufactures duplicate writes the client never asked
+        for. This gate is deliberately NOT ``_tool_cache_eligible``:
+
+        - An explicit ``cache: true`` override still counts as the operator's
+          "effectively read-only" assertion (a coherent replay-safety claim),
+          but ``cache: false`` — documented for *volatile read* tools — says
+          nothing about replay safety and falls through to the annotations
+          instead of needlessly killing their timeout-retry.
+        - Under BOTH ``strict`` and ``conservative`` annotation policies only an
+          explicit ``readOnlyHint=True`` (without a contradicting
+          ``destructiveHint=True``) qualifies. ``conservative`` is
+          strict-shaped here on purpose: a conservative *cache* verdict serves
+          a stored response (no re-execution), while a conservative *retry*
+          verdict would RE-EXECUTE an unknown tool's side effect — the failure
+          directions are not symmetric, so unknown means don't replay.
+        - ``policy == "ignore"`` returns True: the operator declared the
+          annotations untrustworthy, and deriving a new safety gate from data
+          they opted out of would silently change behavior on known-bad input.
+          They keep the pre-#578 replay-on-timeout semantics.
+
+        An unknown server (direct dispatch / tests with no registered
+        connection) is treated as idempotent, mirroring ``_tool_cache_eligible``.
+        """
+        conn = self._connections.get(server)
+        if conn is None:
+            return True
+        override = conn.config.tool_overrides.get(tool)
+        if override is not None and override.cache is not None:
+            if override.cache is True:
+                return True
+            # ``cache: false`` set per-tool: fall through to annotations, and
+            # skip the per-server override (the per-tool setting shadows it,
+            # mirroring the cache-eligibility precedence).
+        elif conn.config.cache is True:
+            return True
+
+        policy = cfg_snap.cache.tool_annotation_policy
+        if policy == "ignore":
+            return True
+        ann = self._tool_annotations(conn, tool)
+        read_only = getattr(ann, "readOnlyHint", None)
+        destructive = getattr(ann, "destructiveHint", None)
+        return read_only is True and destructive is not True
+
     def _invalidate_disabled_cache(
         self, server: str, tool: str, cache_args: dict[str, Any], *, cfg_snap: ProxyConfig
     ) -> None:
@@ -3495,7 +3569,9 @@ class ProxyManager:
         # metric (and ``_mark_recorded``-ing the exception so the outer
         # ``call_tool`` does not double-record). ``conn``/``cfg``/``delay`` are
         # owned entirely by the helper — nothing after the fetch reads them.
-        result = await self._fetch_upstream(server, tool, upstream_args, trace_id=trace_id)
+        result = await self._fetch_upstream(
+            server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
+        )
 
         # ── Stage 3: SHAPE (text/non-text split + max_upstream_chars guard) ──
         # The helper records no metrics and performs no return; when no text
