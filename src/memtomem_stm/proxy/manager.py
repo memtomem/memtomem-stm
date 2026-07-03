@@ -133,6 +133,7 @@ from memtomem_stm.proxy.metrics import (
     format_error_message_from_exc,
 )
 from memtomem_stm.observability.tracing import traced
+from memtomem_stm.utils.redact import redact_exception_text
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
 # Retrying these wastes time and can damage the connection.
@@ -370,6 +371,12 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            # Drop stale startup-failure records (#580): a manager reused across
+            # ``start()`` calls (new config, or a server removed) must not keep
+            # reporting a previous session's failed upstream in
+            # ``stm_proxy_health``. The next connect pass repopulates from the
+            # current config.
+            self._failed_servers.clear()
             # Reset the #557 refresh bookkeeping alongside the connections it
             # tracks (same rationale as in ``stop()``): a ``running`` entry
             # orphaned by a never-started drain task would silently drop every
@@ -466,8 +473,14 @@ class ProxyManager:
                 # configured-but-dead server (#580) — otherwise it is absent
                 # from ``stm_proxy_health`` entirely (no ``_connections`` entry
                 # is created on a failed connect) and the degradation is
-                # undiagnosable from inside the session.
-                self._failed_servers[name] = format_error_message_from_exc(exc)
+                # undiagnosable from inside the session. Redact first: httpx
+                # transport exceptions embed the full request URL — userinfo
+                # included — so a credentialed upstream
+                # (``https://user:token@host/mcp``) would otherwise leak its
+                # token through ``stm_proxy_health`` to the MCP client/model.
+                self._failed_servers[name] = redact_exception_text(
+                    format_error_message_from_exc(exc), cfg.url
+                )
 
         # #465: evaluate per-tool health once per session, before the first
         # advertisement. get_proxy_tools() applies this cached snapshot so
@@ -854,6 +867,15 @@ class ProxyManager:
 
         if cfg.transport != TransportType.STDIO and not cfg.url:
             logger.warning("Skipping server '%s': transport=%s requires url", name, cfg.transport)
+            # Record the misconfiguration (#580) instead of returning silently:
+            # this early return raises nothing, so ``start()``'s except never
+            # fires and the configured-but-unconnected server would otherwise
+            # stay invisible in ``stm_proxy_health`` — the exact false-green
+            # this surfacing is meant to close. Static message (no url), so
+            # nothing to redact.
+            self._failed_servers[name] = (
+                f"configuration error: transport={cfg.transport.value} requires a url"
+            )
             return
 
         conn_stack = AsyncExitStack()
@@ -1191,6 +1213,9 @@ class ProxyManager:
                 logger.debug("Failed to close progressive store on stop", exc_info=True)
             self._progressive_store = None
             self._progressive_store_cfg = None
+        # Clear startup-failure records too (#580) so a stopped manager reports
+        # no upstreams — mirrors the double-start reset in ``start()``.
+        self._failed_servers.clear()
 
     @property
     def _config(self) -> ProxyConfig:

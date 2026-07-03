@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from memtomem_stm.proxy.config import (
     ProxyConfig,
+    TransportType,
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
@@ -141,6 +142,67 @@ class TestStart:
         assert health["srv"]["connected"] is True
         assert "error" not in health["srv"]
 
+    async def test_startup_failure_redacts_credentialed_url(self):
+        """#580: a startup connect error whose message embeds a credentialed
+        URL (as httpx exceptions do) must be scrubbed before it lands in
+        _failed_servers / stm_proxy_health — otherwise the token leaks to the
+        MCP client/model through the health tool."""
+        url = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=url),
+            }
+        )
+
+        async def _leaky_connect(name, cfg):
+            # httpx-style message that embeds the full request URL, userinfo
+            # included.
+            raise ConnectionError(f"All connection attempts failed for {url}")
+
+        with patch.object(mgr, "_connect_server", side_effect=_leaky_connect):
+            await mgr.start()
+
+        recorded = mgr._failed_servers["web"]
+        health_error = mgr.get_upstream_health()["web"]["error"]
+        for blob in (recorded, health_error):
+            assert "s3cr3t-token" not in blob
+            assert "alice:s3cr3t-token" not in blob
+            assert "***@ltm.example.com" in blob
+
+    async def test_url_less_network_upstream_recorded_in_health(self):
+        """#580: a non-stdio upstream configured without a url is skipped by
+        _connect_server with a warning + early return (no exception), so it
+        must be recorded in _failed_servers itself — otherwise start()'s except
+        never fires and the misconfigured server stays false-green in health."""
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=""),
+            }
+        )
+
+        await mgr.start()
+
+        assert "web" in mgr._failed_servers
+        assert "configuration error" in mgr._failed_servers["web"]
+        health = mgr.get_upstream_health()
+        assert health["web"]["connected"] is False
+        assert "configuration error" in health["web"]["error"]
+
+    async def test_double_start_clears_stale_failed_servers(self):
+        """#580: a manager reused across start() calls must not keep reporting
+        a previous session's failed upstream — the double-start reset clears
+        _failed_servers alongside _connections."""
+        mgr = _make_manager(servers={})
+        with patch.object(ProxyConfig, "load_from_file", return_value=None):
+            await mgr.start()
+        mgr._failed_servers["gone"] = "stale connect error"
+
+        with patch.object(ProxyConfig, "load_from_file", return_value=None):
+            await mgr.start()
+
+        assert mgr._failed_servers == {}
+        assert "gone" not in mgr.get_upstream_health()
+
     async def test_double_start_closes_previous(self):
         """Calling start() twice closes the previous AsyncExitStack."""
         mgr = _make_manager(servers={})
@@ -209,6 +271,16 @@ class TestStop:
         await mgr.stop()
 
         mock_ext.close.assert_awaited_once()
+
+    async def test_stop_clears_failed_servers(self):
+        """#580: stop() clears startup-failure records so a stopped manager
+        reports no upstreams — mirrors the double-start reset."""
+        mgr = _make_manager(servers={})
+        mgr._failed_servers["bad"] = "connect error"
+
+        await mgr.stop()
+
+        assert mgr._failed_servers == {}
 
     async def test_stop_nulls_extractor_so_restart_rebuilds(self):
         """stop() nulls _extractor (like _llm_compressor) — _get_extractor()
