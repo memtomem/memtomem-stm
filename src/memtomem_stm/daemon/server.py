@@ -453,6 +453,30 @@ class DaemonServer:
 
 
 def run(config: STMConfig | None = None) -> int:
-    """Synchronous entry point used by ``mms daemon run``."""
+    """Synchronous entry point used by ``mms daemon run``.
+
+    Exception barrier (mirrors the MCP server's #209 barrier): a detached
+    daemon runs with ``stderr=DEVNULL``, so an uncaught crash during startup
+    — e.g. ``_build_engine`` (SurfacingEngine ctor) or ``asyncio.start_server``
+    raising inside ``serve()`` — would otherwise leave *no* trace: the
+    traceback goes to the devnulled stderr, never through the file logger, so
+    ``stm-daemon.log`` (which ``mms daemon start`` points the operator at)
+    stays empty. ``_configure_logging`` has already installed the file handler
+    by the time ``run()`` is called (``daemon_cmd.run_cmd``), so logging here
+    lands in that file. Re-raise after logging so the exit code still reflects
+    the failure — this only adds observability.
+    """
     cfg = config if config is not None else STMConfig()
-    return asyncio.run(DaemonServer(cfg).serve())
+    try:
+        return asyncio.run(DaemonServer(cfg).serve())
+    except (RuntimeError, ExceptionGroup) as e:
+        # A clean anyio cancel-scope teardown on shutdown is not a crash — the
+        # main server's barrier ignores the same shape (#410 follow-up).
+        if is_clean_cancel_scope_shutdown(e):
+            logger.warning("daemon shut down with an AnyIO cancel scope warning (ignored): %s", e)
+            return 0
+        logger.exception("daemon terminated with an unhandled exception")
+        raise
+    except Exception:
+        logger.exception("daemon terminated with an unhandled exception")
+        raise

@@ -759,3 +759,46 @@ async def test_lifetime_lock_retry_acquires_after_incumbent_releases(
         await _await_handshake(cfg)  # proves it acquired → built → published
     finally:
         await _stop(cfg, task)
+
+
+# ── run() top-level exception barrier (#581) ─────────────────────────────
+
+
+def test_run_logs_traceback_on_startup_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A crash inside serve() (e.g. _build_engine / start_server) must reach the
+    logger — for a detached daemon its stderr is DEVNULL, so without the barrier
+    the traceback would be lost and stm-daemon.log (the log the start hint points
+    at) would stay empty."""
+    cfg = _config(tmp_path)
+
+    async def _boom(self):
+        raise ValueError("engine build blew up")
+
+    monkeypatch.setattr(DaemonServer, "serve", _boom)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(ValueError, match="engine build blew up"):
+            daemon_server.run(cfg)
+
+    assert "daemon terminated with an unhandled exception" in caplog.text
+    # The original traceback is attached (exc_info), not just the message.
+    assert any(r.exc_info for r in caplog.records if r.levelno >= logging.ERROR)
+
+
+def test_run_ignores_clean_cancel_scope_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean anyio cancel-scope teardown is not a crash: the barrier swallows
+    it, returns 0, and does not re-raise."""
+    cfg = _config(tmp_path)
+
+    async def _clean_teardown(self):
+        raise RuntimeError("Attempted to exit cancel scope in a different task")
+
+    monkeypatch.setattr(DaemonServer, "serve", _clean_teardown)
+    monkeypatch.setattr(daemon_server, "is_clean_cancel_scope_shutdown", lambda _e: True)
+
+    rc = daemon_server.run(cfg)
+    assert rc == 0
