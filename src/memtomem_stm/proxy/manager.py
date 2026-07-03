@@ -2730,6 +2730,19 @@ class ProxyManager:
                         context_query=context_query,
                     )
                 except sqlite3.Error:
+                    # sqlite is reachable in this path ONLY via the
+                    # SELECTIVE/HYBRID chunk-TOC pending-store write
+                    # (``SQLitePendingStore``, opt-in). Scope the degrade to
+                    # those two strategies: a sqlite error surfacing from any
+                    # other path (a future sqlite-touching compressor, a mocked
+                    # store in a test) is not this fault and must not be
+                    # relabeled as a store degradation — re-raise it to the
+                    # INTERNAL_ERROR path, exactly its behavior before this guard.
+                    if effective_compression not in (
+                        CompressionStrategy.SELECTIVE,
+                        CompressionStrategy.HYBRID,
+                    ):
+                        raise
                     # SELECTIVE / HYBRID persist a chunk TOC to the (opt-in)
                     # sqlite pending store; a store fault there — a writer
                     # holding the lock past the busy timeout, disk-full, a
@@ -2738,9 +2751,7 @@ class ProxyManager:
                     # INTERNAL_ERROR. Degrade to a lossy-but-immediate
                     # boundary-aware truncation at the retention budget (the
                     # same terminal tier the ratio-guard ladder falls back to),
-                    # mirroring the PROGRESSIVE passthrough guard above. sqlite
-                    # is the only DB in this path, so the catch is scoped to the
-                    # store fault and can't mask a compressor logic error.
+                    # mirroring the PROGRESSIVE passthrough guard above.
                     logger.warning(
                         "Selective/hybrid pending-store write failed for %s/%s; "
                         "returning boundary-aware truncation (degraded)",
