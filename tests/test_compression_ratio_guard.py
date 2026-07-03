@@ -23,11 +23,13 @@ from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ProgressiveConfig,
     ProxyConfig,
+    SelectiveConfig,
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import CallMetrics, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.pending_store import SQLitePendingStore
 
 
 # ── CallMetrics compression fields ───────────────────────────────────────
@@ -158,6 +160,7 @@ def _make_manager_with_store(
     compression: CompressionStrategy = CompressionStrategy.TRUNCATE,
     max_result_chars: int = 50000,
     progressive: ProgressiveConfig | None = None,
+    selective: SelectiveConfig | None = None,
 ) -> tuple[ProxyManager, MetricsStore]:
     """Build a ProxyManager wired to a real MetricsStore so tests can read
     persisted rows directly — closer to production than summary dicts."""
@@ -170,6 +173,7 @@ def _make_manager_with_store(
         max_retries=0,
         reconnect_delay_seconds=0.0,
         progressive=progressive,
+        selective=selective,
     )
     proxy_cfg = ProxyConfig(
         config_path=tmp_path / "proxy.json",
@@ -344,6 +348,135 @@ class TestProxyManagerRatioGuard:
         await mgr.call_tool("srv", "tool", {})  # identical call → should hit cache
         assert session.call_tool.call_count == 1  # cache hit → upstream NOT re-called
         cache.close()
+        store.close()
+
+    async def test_selective_store_failure_falls_back_to_truncate(self, tmp_path):
+        """A SELECTIVE/HYBRID pending-store write failure — a raw ``sqlite3``
+        error out of ``SQLitePendingStore.put`` (the store has no error
+        handling) — must degrade to a boundary-aware truncation, not escape
+        ``_call_tool_inner`` and discard the successful upstream response as
+        INTERNAL_ERROR (mirrors the PROGRESSIVE passthrough guard).
+        """
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.SELECTIVE,
+            max_result_chars=600,
+        )
+        large_text = "# Doc\n\n" + "\n\n".join(
+            f"## Section {i}\n" + ("word " * 40) for i in range(12)
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
+        # The pending-store write raises a raw sqlite error (lock past busy
+        # timeout / disk-full / corrupt DB) from inside the real SELECTIVE path.
+        mgr._apply_compression = AsyncMock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+
+        result = await mgr.call_tool("srv", "tool", {})  # must NOT raise
+
+        # Degraded to plain truncation — no chunk-TOC selection key.
+        assert '"selection_key"' not in result
+        row = _latest_row(store)
+        assert row["compression_strategy"] == "selective→truncate_on_store_error"
+        store.close()
+
+    async def test_selective_store_error_is_not_cached(self, tmp_path):
+        """The truncate degradation from a *transient* store failure must NOT
+        be cached: caching the lossy truncation would pin it for the TTL and
+        suppress the chunk-TOC protocol on identical calls after the store
+        recovers. The next identical call must miss, re-run upstream, and
+        re-attempt the real SELECTIVE TOC.
+        """
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.SELECTIVE,
+            max_result_chars=600,
+        )
+        mgr._cache = cache
+        large_text = "# Doc\n\n" + "\n\n".join(
+            f"## Section {i}\n" + ("word " * 40) for i in range(12)
+        )
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result(large_text)
+
+        # Call 1: the pending-store write fails → truncate degradation.
+        mgr._apply_compression = AsyncMock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+        first = await mgr.call_tool("srv", "tool", {})
+        assert '"selection_key"' not in first  # truncated, no TOC key
+        assert cache.get("srv", "tool", {}) is None  # degradation not cached
+
+        # Call 2: store recovered (real method restored). Cache MISS that
+        # re-runs upstream + the real SELECTIVE TOC — not a cached truncation.
+        del mgr._apply_compression  # restore the real bound method
+        second = await mgr.call_tool("srv", "tool", {})
+        assert session.call_tool.call_count == 2  # miss → upstream re-called
+        assert '"selection_key"' in second  # real SELECTIVE TOC re-attempted
+        cache.close()
+        store.close()
+
+    async def test_selective_sqlite_store_real_put_failure_degrades(self, tmp_path, monkeypatch):
+        """End-to-end with the REAL sqlite pending backend: a raw sqlite3
+        error out of ``SQLitePendingStore.put`` degrades to truncation.
+
+        Unlike the mocked tests above, this drives the real
+        ``_create_selective`` → ``SelectiveCompressor.compress`` →
+        ``SQLitePendingStore.put`` path, proving the store fault actually
+        surfaces as the ``sqlite3.Error`` the guard catches (the store has no
+        error handling of its own).
+        """
+        sel = SelectiveConfig(
+            pending_store="sqlite",
+            pending_store_path=tmp_path / "pending.db",
+        )
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.SELECTIVE,
+            max_result_chars=600,
+            selective=sel,
+        )
+        large_text = "# Doc\n\n" + "\n\n".join(
+            f"## Section {i}\n" + ("word " * 40) for i in range(12)
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(large_text)
+
+        def _boom(self, key, selection):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(SQLitePendingStore, "put", _boom)
+
+        result = await mgr.call_tool("srv", "tool", {})  # must NOT raise
+
+        assert '"selection_key"' not in result  # degraded to plain truncation
+        row = _latest_row(store)
+        assert row["compression_strategy"] == "selective→truncate_on_store_error"
+        store.close()
+
+    async def test_non_selective_sqlite_error_is_not_converted(self, tmp_path):
+        """The store-fault degrade is scoped to SELECTIVE/HYBRID. A
+        ``sqlite3.Error`` escaping any other strategy's compression must NOT be
+        relabeled as a store degradation — it propagates to the INTERNAL_ERROR
+        path unchanged (``call_tool`` records then re-raises). Guards against
+        the over-broad ``except`` codex flagged.
+        """
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.TRUNCATE,
+            max_result_chars=600,
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("x" * 5000)
+        mgr._apply_compression = AsyncMock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            await mgr.call_tool("srv", "tool", {})
+        # Not degraded: no truncate_on_store_error row was recorded as success.
+        row = _latest_row(store)
+        assert row["compression_strategy"] != "selective→truncate_on_store_error"
         store.close()
 
     async def test_auto_is_resolved_before_metrics(self, tmp_path):

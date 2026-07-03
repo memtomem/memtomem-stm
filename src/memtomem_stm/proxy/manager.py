@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import sqlite3
 import time as _time
 import uuid
 from collections import Counter
@@ -2614,6 +2615,11 @@ class ProxyManager:
         # passthrough after a store failure (below). Read at the cache-store
         # gate to keep that transient-failure-degraded response out of the cache.
         progressive_passthrough_on_error = False
+        # Set True when the SELECTIVE/HYBRID path degrades to a boundary-aware
+        # truncation after a pending-store write failure (below). Defined here
+        # (not only in the else-branch) because the shared CompressionResult
+        # construction at the end reads it on the PROGRESSIVE path too.
+        selective_store_error = False
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
             if len(cleaned) <= pcfg.chunk_size:
@@ -2711,17 +2717,53 @@ class ProxyManager:
                 },
             ):
                 _t0 = _time.monotonic()
-                compressed, llm_fallback = await self._apply_compression(
-                    cleaned,
-                    effective_compression,
-                    effective_max_chars,
-                    tc.selective,
-                    tc.llm,
-                    tc.hybrid,
-                    server,
-                    tool,
-                    context_query=context_query,
-                )
+                try:
+                    compressed, llm_fallback = await self._apply_compression(
+                        cleaned,
+                        effective_compression,
+                        effective_max_chars,
+                        tc.selective,
+                        tc.llm,
+                        tc.hybrid,
+                        server,
+                        tool,
+                        context_query=context_query,
+                    )
+                except sqlite3.Error:
+                    # sqlite is reachable in this path ONLY via the
+                    # SELECTIVE/HYBRID chunk-TOC pending-store write
+                    # (``SQLitePendingStore``, opt-in). Scope the degrade to
+                    # those two strategies: a sqlite error surfacing from any
+                    # other path (a future sqlite-touching compressor, a mocked
+                    # store in a test) is not this fault and must not be
+                    # relabeled as a store degradation — re-raise it to the
+                    # INTERNAL_ERROR path, exactly its behavior before this guard.
+                    if effective_compression not in (
+                        CompressionStrategy.SELECTIVE,
+                        CompressionStrategy.HYBRID,
+                    ):
+                        raise
+                    # SELECTIVE / HYBRID persist a chunk TOC to the (opt-in)
+                    # sqlite pending store; a store fault there — a writer
+                    # holding the lock past the busy timeout, disk-full, a
+                    # corrupt DB — would otherwise escape ``_call_tool_inner``
+                    # and DISCARD this otherwise-successful upstream response as
+                    # INTERNAL_ERROR. Degrade to a lossy-but-immediate
+                    # boundary-aware truncation at the retention budget (the
+                    # same terminal tier the ratio-guard ladder falls back to),
+                    # mirroring the PROGRESSIVE passthrough guard above.
+                    logger.warning(
+                        "Selective/hybrid pending-store write failed for %s/%s; "
+                        "returning boundary-aware truncation (degraded)",
+                        server,
+                        tool,
+                        exc_info=True,
+                    )
+                    compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
+                        cleaned, max_chars=effective_max_chars, context_query=context_query
+                    )
+                    llm_fallback = None
+                    selective_store_error = True
                 _compress_ms = (_time.monotonic() - _t0) * 1000
 
             # ── Compression ratio guard (R4 defense + fallback ladder) ──
@@ -2733,10 +2775,15 @@ class ProxyManager:
             # PROGRESSIVE is excluded above — it is zero-loss by construction.
             cleaned_len = len(cleaned)
             metrics_strategy = effective_compression.value
+            if selective_store_error:
+                # Terminal truncation already applied above — surface the
+                # degradation in telemetry and skip the ratio-guard ladder
+                # (truncate is the ladder's own terminal tier).
+                metrics_strategy = f"{effective_compression.value}→truncate_on_store_error"
             if llm_fallback:
                 metrics_strategy = f"llm_summary→{llm_fallback}_fallback"
             progressive_fallback = False  # set when progressive replaces the response
-            if cleaned_len > 0 and dynamic > 0:
+            if cleaned_len > 0 and dynamic > 0 and not selective_store_error:
                 compressed_ratio = len(compressed) / cleaned_len
                 if compressed_ratio < dynamic:
                     ratio_violation = True
@@ -2929,6 +2976,7 @@ class ProxyManager:
             surface_error=surface_error,
             compress_ms=_compress_ms,
             surface_ms=_surface_ms,
+            selective_store_error=selective_store_error,
         )
 
     async def _run_index_stage(
@@ -3300,6 +3348,10 @@ class ProxyManager:
           passthrough. Caching it would pin the degraded (non-chunked) response
           for the cache TTL and suppress progressive delivery on identical calls
           even after the store recovers.
+        - ``comp.selective_store_error`` — the SELECTIVE/HYBRID analogue: a
+          pending-store write failed and the response degraded to a boundary-aware
+          truncation. Caching the lossy truncation would pin it for the TTL and
+          suppress the chunk-TOC protocol on identical calls after recovery.
         - one embedding a TRANSIENT retrieval key (progressive first-chunk,
           SELECTIVE/HYBRID TOC): ``compressed`` is a pointer into the process-local
           pending store, whose key dies on restart/eviction or its shorter TTL
@@ -3349,6 +3401,14 @@ class ProxyManager:
             self.tracker.record_cache_unstorable()
             logger.debug(
                 "Skipping cache store for %s/%s: progressive passthrough "
+                "degradation (transient store failure)",
+                server,
+                tool,
+            )
+        elif comp.selective_store_error:
+            self.tracker.record_cache_unstorable()
+            logger.debug(
+                "Skipping cache store for %s/%s: selective/hybrid truncate "
                 "degradation (transient store failure)",
                 server,
                 tool,
