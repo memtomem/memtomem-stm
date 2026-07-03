@@ -78,6 +78,11 @@ class CompressionResult:
     surface_error: str | None
     compress_ms: float
     surface_ms: float
+    # A SELECTIVE/HYBRID pending-store write failed and the call degraded to a
+    # boundary-aware truncation. Gates the cache store like
+    # ``progressive_passthrough_on_error`` — the truncation is lossy and
+    # transient, and must not be pinned for the cache TTL.
+    selective_store_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)
