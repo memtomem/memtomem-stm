@@ -11,9 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from memtomem_stm.proxy.config import (
+    CacheConfig,
     CompressionStrategy,
     ProgressiveConfig,
     ProxyConfig,
+    ToolOverrideConfig,
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
@@ -33,6 +35,23 @@ def _make_result(text: str, is_error: bool = False):
     return SimpleNamespace(content=[_text_content(text)], isError=is_error)
 
 
+def _ann(*, read_only=None, destructive=None):
+    """A stand-in for MCP ``ToolAnnotations`` (``getattr``-based consumers, so a
+    SimpleNamespace matches the real model). Mirrors test_cache_eligibility."""
+    return SimpleNamespace(readOnlyHint=read_only, destructiveHint=destructive)
+
+
+def _tool(name, ann=None):
+    return SimpleNamespace(name=name, annotations=ann)
+
+
+def _read_only_tools(name: str = "tool"):
+    """Connection tool snapshot declaring ``name`` read-only, so the #578
+    timeout-replay guard keeps retrying it — for tests that exercise the retry
+    MECHANICS (backoff, deadlines, reconnect ordering) rather than the guard."""
+    return [_tool(name, _ann(read_only=True, destructive=False))]
+
+
 def _make_manager(
     max_retries: int = 3,
     reconnect_delay: float = 0.0,
@@ -43,6 +62,9 @@ def _make_manager(
     call_timeout: float = 90.0,
     overall_deadline: float = 180.0,
     progressive: ProgressiveConfig | None = None,
+    tools: list | None = None,
+    tool_overrides: dict[str, ToolOverrideConfig] | None = None,
+    annotation_policy: str = "conservative",
 ) -> ProxyManager:
     """Create a ProxyManager with a mocked upstream connection."""
     server_cfg = UpstreamServerConfig(
@@ -55,11 +77,13 @@ def _make_manager(
         call_timeout_seconds=call_timeout,
         overall_deadline_seconds=overall_deadline,
         progressive=progressive,
+        tool_overrides=tool_overrides or {},
     )
     config_path = (tmp_path / "proxy.json") if tmp_path else Path("/tmp/proxy.json")
     proxy_cfg = ProxyConfig(
         config_path=config_path,
         upstream_servers={"srv": server_cfg},
+        cache=CacheConfig(tool_annotation_policy=annotation_policy),
     )
     tracker = TokenTracker()
     mgr = ProxyManager(proxy_cfg, tracker)
@@ -70,7 +94,7 @@ def _make_manager(
         name="srv",
         config=server_cfg,
         session=session,
-        tools=[],
+        tools=tools if tools is not None else [],
     )
     mgr._connections["srv"] = conn
     return mgr
@@ -92,7 +116,10 @@ class TestTransportFailureRetry:
         ids=["OSError", "ConnectionError", "TimeoutError", "EOFError"],
     )
     async def test_retryable_error_succeeds_on_second_attempt(self, exc_type):
-        mgr = _make_manager(max_retries=3)
+        # Read-only annotations so the TimeoutError case stays retryable under
+        # the #578 replay guard (the guard itself is covered by
+        # TestTimeoutReplayGuard).
+        mgr = _make_manager(max_retries=3, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = [exc_type("fail"), _make_result("ok")]
 
@@ -884,6 +911,7 @@ class TestCallTimeout:
             max_reconnect_delay=0.0,
             call_timeout=0.05,
             overall_deadline=1.0,
+            tools=_read_only_tools(),
         )
         session = _get_session(mgr)
 
@@ -939,6 +967,7 @@ class TestCallTimeout:
             max_reconnect_delay=0.0,
             call_timeout=0.05,
             overall_deadline=1.0,
+            tools=_read_only_tools(),
         )
         session = _get_session(mgr)
 
@@ -979,6 +1008,7 @@ class TestCallTimeout:
             max_reconnect_delay=0.0,
             call_timeout=0.02,
             overall_deadline=0.05,
+            tools=_read_only_tools(),
         )
         session = _get_session(mgr)
 
@@ -1009,6 +1039,7 @@ class TestCallTimeout:
             max_reconnect_delay=0.0,
             call_timeout=0.1,
             overall_deadline=0.12,
+            tools=_read_only_tools(),
         )
         session = _get_session(mgr)
 
@@ -1044,6 +1075,209 @@ class TestCallTimeout:
             f"second attempt used {captured_timeouts[1]:.4f}s but remaining "
             "deadline was smaller; shrink logic not applied"
         )
+
+
+class TestTimeoutReplayGuard:
+    """#578: a per-attempt timeout cancels our wait, not the upstream execution,
+    so a non-read-only tool must NOT be re-invoked (that would replay its side
+    effect). The connection is still refreshed for the next call, and the
+    original ``TimeoutError`` propagates. Connection-level failures stay
+    retryable for every tool."""
+
+    async def test_writer_timeout_not_retried(self):
+        """A tool annotated ``readOnlyHint=False`` that times out is invoked
+        exactly once, reconnected for the next call, and raises."""
+        mgr = _make_manager(
+            max_retries=3,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=[_tool("tool", _ann(read_only=False))],
+        )
+        session = _get_session(mgr)
+
+        async def hang(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+
+        assert session.call_tool.call_count == 1, "writer tool must not be re-invoked on timeout"
+        mock_reconnect.assert_awaited_once_with("srv")
+
+    async def test_unannotated_timeout_not_retried(self):
+        """The core case: a tool with NO annotations (may-mutate per spec) is
+        treated as a writer under the default ``conservative`` policy."""
+        mgr = _make_manager(
+            max_retries=3,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=[],  # no annotations at all
+        )
+        session = _get_session(mgr)
+
+        async def hang(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+
+        assert session.call_tool.call_count == 1
+        mock_reconnect.assert_awaited_once_with("srv")
+
+    async def test_readonly_timeout_is_retried(self):
+        """A declared read-only tool is replay-safe: timeout still retries."""
+        mgr = _make_manager(
+            max_retries=1,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=_read_only_tools(),
+        )
+        session = _get_session(mgr)
+
+        attempts = 0
+
+        async def hang_once_then_ok(*_a, **_kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await asyncio.sleep(10)
+            return _make_result("ok")
+
+        session.call_tool.side_effect = hang_once_then_ok
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert result == "ok"
+        assert attempts == 2
+
+    async def test_writer_connection_refused_is_retried(self):
+        """A non-timeout connection failure (refused) provably never executed,
+        so it stays retryable even for a writer tool."""
+        mgr = _make_manager(
+            max_retries=3,
+            tools=[_tool("tool", _ann(read_only=False))],
+        )
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [ConnectionRefusedError("refused"), _make_result("ok")]
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert result == "ok"
+        assert session.call_tool.call_count == 2
+        mock_reconnect.assert_awaited_once_with("srv")
+
+    async def test_ignore_policy_keeps_replay(self):
+        """``tool_annotation_policy=ignore`` opts out of annotation trust, so a
+        writer timeout retries as it did pre-#578."""
+        mgr = _make_manager(
+            max_retries=1,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=[_tool("tool", _ann(read_only=False))],
+            annotation_policy="ignore",
+        )
+        session = _get_session(mgr)
+
+        attempts = 0
+
+        async def hang_once_then_ok(*_a, **_kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await asyncio.sleep(10)
+            return _make_result("ok")
+
+        session.call_tool.side_effect = hang_once_then_ok
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert result == "ok"
+        assert attempts == 2
+
+    async def test_per_tool_cache_true_override_keeps_replay(self):
+        """An explicit per-tool ``cache: true`` is the operator's 'effectively
+        read-only' assertion, so timeout-retry is preserved for an otherwise
+        unannotated tool."""
+        mgr = _make_manager(
+            max_retries=1,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=[],
+            tool_overrides={"tool": ToolOverrideConfig(cache=True)},
+        )
+        session = _get_session(mgr)
+
+        attempts = 0
+
+        async def hang_once_then_ok(*_a, **_kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await asyncio.sleep(10)
+            return _make_result("ok")
+
+        session.call_tool.side_effect = hang_once_then_ok
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert result == "ok"
+        assert attempts == 2
+
+    async def test_contradictory_annotation_treated_as_writer(self):
+        """``readOnlyHint=True`` AND ``destructiveHint=True`` is a mis-annotation;
+        the guard treats it as a writer (unknown → don't replay)."""
+        mgr = _make_manager(
+            max_retries=3,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=[_tool("tool", _ann(read_only=True, destructive=True))],
+        )
+        session = _get_session(mgr)
+
+        async def hang(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+
+        assert session.call_tool.call_count == 1
+
+    async def test_gated_path_records_exactly_one_timeout_metric(self):
+        """The replay-gated terminal path records exactly one TIMEOUT error, not
+        one per would-be attempt, and the outer call_tool does not double-record."""
+        mgr = _make_manager(
+            max_retries=3,
+            call_timeout=0.05,
+            overall_deadline=1.0,
+            tools=[_tool("tool", _ann(read_only=False))],
+        )
+        session = _get_session(mgr)
+
+        async def hang(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
+
+        summary = mgr.tracker.get_summary()
+        assert summary["total_errors"] == 1
+        assert summary["errors_by_category"].get("timeout") == 1
 
 
 class TestTransientKeyResponsesNotCached:
