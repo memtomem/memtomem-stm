@@ -315,3 +315,164 @@ class TestSelectiveCompressorWithStore:
         result = comp.compress(text, max_chars=50)
         assert "selection_key" in result
         store.close()
+
+
+# ── Restart reachability of the SQLite pending store (#583) ───────────────
+
+
+def _sqlite_manager(tmp_path, *, override: bool = False):
+    """A ProxyManager configured with a SQLite selective pending store, either
+    at the server level or (``override=True``) only in a per-tool override."""
+    from memtomem_stm.proxy.config import (
+        ProxyConfig,
+        SelectiveConfig,
+        ToolOverrideConfig,
+        UpstreamServerConfig,
+    )
+    from memtomem_stm.proxy.manager import ProxyManager
+    from memtomem_stm.proxy.metrics import TokenTracker
+
+    sel = SelectiveConfig(pending_store="sqlite", pending_store_path=tmp_path / "pending.db")
+    if override:
+        srv = UpstreamServerConfig(
+            prefix="t", tool_overrides={"some_tool": ToolOverrideConfig(selective=sel)}
+        )
+    else:
+        srv = UpstreamServerConfig(prefix="t", selective=sel)
+    cfg = ProxyConfig(config_path=tmp_path / "proxy.json", upstream_servers={"srv": srv})
+    return ProxyManager(cfg, TokenTracker()), sel
+
+
+class TestSelectChunksRestartRecovery:
+    def test_finds_key_persisted_before_restart(self, tmp_path):
+        """A selection written by a prior process is reachable via select_chunks
+        on a fresh manager, before any compress call rebuilds the compressor."""
+        # Pre-restart: seed a selection directly into the SQLite store.
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        store.put("k1", _make_selection({"A": "recovered content"}))
+        store.close()
+
+        # Post-restart: a brand-new manager, no compress call has run.
+        mgr, sel = _sqlite_manager(tmp_path)
+        assert mgr._selective_compressor is None
+        result = mgr.select_chunks("k1", ["A"])
+        assert result == "recovered content"
+        assert mgr._selective_compressor_cfg == sel
+
+    def test_override_only_sqlite_is_found(self, tmp_path):
+        """The fallback scan reaches a SQLite store configured only in a per-tool
+        override (server-level compression is memory/unset)."""
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        store.put("k1", _make_selection({"A": "from override"}))
+        store.close()
+
+        mgr, _sel = _sqlite_manager(tmp_path, override=True)
+        assert mgr.select_chunks("k1", ["A"]) == "from override"
+
+    def test_no_sqlite_configured_returns_sentinel(self, tmp_path):
+        """With no SQLite backend anywhere, the endpoint keeps the sentinel."""
+        from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerConfig
+        from memtomem_stm.proxy.manager import ProxyManager
+        from memtomem_stm.proxy.metrics import TokenTracker
+
+        cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": UpstreamServerConfig(prefix="t")},
+        )
+        mgr = ProxyManager(cfg, TokenTracker())
+        assert "not active" in mgr.select_chunks("k1", ["A"])
+
+    def test_unopenable_path_degrades_without_caching(self, tmp_path):
+        """A store that can't be opened degrades to the sentinel and pins no
+        compressor (a failed open must not cache a bad state)."""
+        from memtomem_stm.proxy.config import (
+            ProxyConfig,
+            SelectiveConfig,
+            UpstreamServerConfig,
+        )
+        from memtomem_stm.proxy.manager import ProxyManager
+        from memtomem_stm.proxy.metrics import TokenTracker
+
+        # Point the DB path at a directory → sqlite open fails.
+        bad_dir = tmp_path / "as_dir"
+        bad_dir.mkdir()
+        sel = SelectiveConfig(pending_store="sqlite", pending_store_path=bad_dir)
+        cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": UpstreamServerConfig(prefix="t", selective=sel)},
+        )
+        mgr = ProxyManager(cfg, TokenTracker())
+        assert "not active" in mgr.select_chunks("k1", ["A"])
+        assert mgr._selective_compressor is None
+
+
+class TestReadMoreRestartRecovery:
+    def test_finds_progressive_key_persisted_before_restart(self, tmp_path):
+        """A progressive response written by a prior process is reachable via
+        read_more on a fresh manager (SQLite backend), rather than reporting
+        'not found' from a fresh in-memory store."""
+        from memtomem_stm.proxy.config import ProgressiveConfig
+
+        # Pre-restart: write a progressive response through mgr1's SQLite store.
+        mgr1, sel = _sqlite_manager(tmp_path)
+        prog_cfg = ProgressiveConfig(chunk_size=40)
+        text = "First chunk content. " * 20
+        first = mgr1._apply_progressive(text, prog_cfg, "srv", "some_tool", sel)
+        # Recover the key from the footer.
+        import re
+
+        m = re.search(r'key="([0-9a-f]{16})"', first)
+        assert m is not None, first
+        key = m.group(1)
+
+        # Post-restart: a fresh manager over the same config finds the key.
+        mgr2, _sel2 = _sqlite_manager(tmp_path)
+        assert mgr2._progressive_store is None
+        out = mgr2.read_more(key, len(text) // 4)
+        assert "not found or expired" not in out
+
+    def test_open_failure_degrades_to_sentinel(self, tmp_path):
+        """A SQLite open failure in read_more recovery degrades to the sentinel
+        and caches no store."""
+        from memtomem_stm.proxy.config import (
+            ProxyConfig,
+            SelectiveConfig,
+            UpstreamServerConfig,
+        )
+        from memtomem_stm.proxy.manager import ProxyManager
+        from memtomem_stm.proxy.metrics import TokenTracker
+
+        bad_dir = tmp_path / "as_dir"
+        bad_dir.mkdir()
+        sel = SelectiveConfig(pending_store="sqlite", pending_store_path=bad_dir)
+        cfg = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": UpstreamServerConfig(prefix="t", selective=sel)},
+        )
+        mgr = ProxyManager(cfg, TokenTracker())
+        assert "not found or expired" in mgr.read_more("k1", 0)
+        assert mgr._progressive_store is None
+
+    def test_no_clobber_of_live_inmemory_store(self, tmp_path):
+        """A key written to a live in-memory store (no sel_cfg) stays readable;
+        read_more must not rebuild the store from the fallback cfg and lose it."""
+        from memtomem_stm.proxy.config import ProgressiveConfig
+
+        mgr, _sel = _sqlite_manager(tmp_path)
+        prog_cfg = ProgressiveConfig(chunk_size=40)
+        text = "In memory chunk. " * 20
+        # Write WITHOUT sel_cfg → builds/caches an in-memory store.
+        first = mgr._apply_progressive(text, prog_cfg, "srv", "some_tool", None)
+        import re
+
+        m = re.search(r'key="([0-9a-f]{16})"', first)
+        assert m is not None, first
+        key = m.group(1)
+
+        store_before = mgr._progressive_store
+        out = mgr.read_more(key, len(text) // 4)
+        assert "not found or expired" not in out
+        # The live in-memory store was not rebuilt from the fallback cfg.
+        assert mgr._progressive_store is store_before
