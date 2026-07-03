@@ -1158,6 +1158,24 @@ class ProxyManager:
             await self._stack.aclose()
             self._stack = None
         self._connections.clear()
+        # Close the lazily-built selective/progressive stores (#583): a restart
+        # recovery or a SELECTIVE/HYBRID/progressive call may have opened a
+        # SQLite-backed store that ``_connections`` cleanup never touches, so
+        # without this the connection leaks across stop()/reuse.
+        if self._selective_compressor is not None:
+            try:
+                self._selective_compressor.close()
+            except Exception:
+                logger.debug("Failed to close selective compressor on stop", exc_info=True)
+            self._selective_compressor = None
+            self._selective_compressor_cfg = None
+        if self._progressive_store is not None:
+            try:
+                self._progressive_store.close()
+            except Exception:
+                logger.debug("Failed to close progressive store on stop", exc_info=True)
+            self._progressive_store = None
+            self._progressive_store_cfg = None
 
     @property
     def _config(self) -> ProxyConfig:
@@ -1340,6 +1358,96 @@ class ProxyManager:
             timeout=sc.embedding_timeout,
         )
 
+    def _distinct_sqlite_selective_cfgs(self) -> list[SelectiveConfig]:
+        """All configured SQLite ``SelectiveConfig`` s, deduped by resolved
+        path, in deterministic order (#583).
+
+        ``SelectiveConfig`` is nested per-server (``UpstreamServerConfig.selective``)
+        and per-tool (``ToolOverrideConfig.selective``); there is no global one.
+        Scans servers (sorted), server-level ``selective`` first then each
+        server's tool overrides (sorted), keeping the first config seen for each
+        distinct on-disk path. The in-memory default contributes nothing — it
+        has no persisted rows to recover.
+        """
+        out: list[SelectiveConfig] = []
+        seen_paths: set[str] = set()
+        for _srv_name, srv_cfg in sorted(self._config.upstream_servers.items()):
+            candidates: list[SelectiveConfig | None] = [srv_cfg.selective]
+            candidates.extend(
+                srv_cfg.tool_overrides[t].selective for t in sorted(srv_cfg.tool_overrides)
+            )
+            for sel in candidates:
+                if sel is not None and sel.pending_store == "sqlite":
+                    path = str(sel.pending_store_path.expanduser())
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        out.append(sel)
+        return out
+
+    def _sqlite_cfg_holding_key(self, key: str) -> SelectiveConfig | None:
+        """The distinct configured SQLite ``SelectiveConfig`` whose store
+        currently holds *key*, or ``None`` if none does (#583).
+
+        ``pending_store_path`` is configurable per server and per tool, so
+        several distinct stores may exist. After a restart the retrieval
+        endpoints (``stm_proxy_select_chunks`` / ``stm_proxy_read_more``) can
+        receive a key whose row still lives in one of them while the lazily
+        built compressor/store points at a different one. Probe each distinct
+        store read-only (a cheap ``get`` that opens then closes its own
+        connection) and return the config whose store holds the key.
+
+        Single-store / no-store configs return ``None`` **without probing** —
+        callers fall back to the sole (or first) configured store, so the common
+        case pays no extra open and only genuinely multi-store configs probe.
+        """
+        cfgs = self._distinct_sqlite_selective_cfgs()
+        if len(cfgs) <= 1:
+            return None
+
+        from memtomem_stm.proxy.pending_store import SQLitePendingStore
+
+        for sel_cfg in cfgs:
+            try:
+                probe = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+                probe.initialize()
+            except Exception:
+                logger.warning(
+                    "Could not open configured SQLite pending store %s while probing "
+                    "for a persisted key",
+                    sel_cfg.pending_store_path,
+                    exc_info=True,
+                )
+                continue
+            try:
+                if probe.get(key) is not None:
+                    return sel_cfg
+            finally:
+                probe.close()
+        return None
+
+    def _rebuild_selective_compressor(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+        """Replace the cached selective compressor, closing the superseded one
+        so a SQLite-backed store from a changed config does not leak its
+        connection (#583). Returns the new compressor. Only called when the cfg
+        changed or nothing is cached; the recovery path in ``select_chunks``
+        builds inline because it needs its own degrade-on-open-failure handling.
+
+        Build the replacement BEFORE closing the old one: if ``_create_selective``
+        fails to open the new SQLite store it raises here, leaving the still-open
+        old compressor cached and usable rather than a closed store behind the
+        cfg-equality fast path.
+        """
+        new = self._create_selective(sel_cfg)
+        old = self._selective_compressor
+        self._selective_compressor = new
+        self._selective_compressor_cfg = sel_cfg
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                logger.debug("Failed to close superseded selective compressor", exc_info=True)
+        return new
+
     def _create_selective(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
         """Create a SelectiveCompressor with the appropriate PendingStore backend."""
         kwargs: dict[str, Any] = {}
@@ -1514,12 +1622,11 @@ class ProxyManager:
                 name="selective_lock",
             ):
                 if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                    self._selective_compressor = self._create_selective(sel_cfg)
-                    self._selective_compressor_cfg = sel_cfg
+                    sel_compressor = self._rebuild_selective_compressor(sel_cfg)
+                else:
+                    sel_compressor = self._selective_compressor
             return (
-                self._selective_compressor.compress(
-                    text, max_chars=max_chars, context_query=context_query
-                ),
+                sel_compressor.compress(text, max_chars=max_chars, context_query=context_query),
                 None,
             )
 
@@ -1734,8 +1841,7 @@ class ProxyManager:
             name="selective_lock",
         ):
             if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                self._selective_compressor = self._create_selective(sel_cfg)
-                self._selective_compressor_cfg = sel_cfg
+                self._rebuild_selective_compressor(sel_cfg)
 
         compressor = HybridCompressor(
             head_chars=cfg.head_chars,
@@ -1812,10 +1918,83 @@ class ProxyManager:
     # Backward-compatible delegate
     _format_fact_md = staticmethod(format_fact_md)
 
+    @staticmethod
+    def _is_recovery_miss(text: str) -> bool:
+        """Whether a select/read_more result is a store MISS (key absent) as
+        opposed to a hit or a section-mismatch. Both endpoints render the miss
+        with this stable suffix; used to decide whether to re-probe other
+        configured SQLite stores for the key (#583)."""
+        return "not found or expired" in text
+
     def select_chunks(self, key: str, sections: list[str]) -> str:
+        cfgs = self._distinct_sqlite_selective_cfgs()
         if self._selective_compressor is None:
-            return "Selective compression not active — no pending TOC selections."
-        return self._selective_compressor.select(key, sections)
+            # Restart recovery (#583): no compress call has run yet this process,
+            # so the compressor (and its store handle) hasn't been built — but a
+            # configured SQLite pending store may hold a selection persisted
+            # before the restart. Build the configured compressor on first use so
+            # the key becomes reachable — from the store that actually holds it
+            # (multi-store) or the first configured store otherwise. A later
+            # SELECTIVE/HYBRID compress with the same cfg reuses it via the
+            # cfg-equality check. If nothing configures SQLite, or the store
+            # can't be opened, degrade to the existing sentinel and cache NOTHING
+            # (a failed open must not pin a bad state). No await runs between the
+            # check and the assignment, and neither do the lock-holding compress
+            # paths, so this can't interleave with them on the event loop — no
+            # _selective_lock needed here.
+            sel_cfg = self._sqlite_cfg_holding_key(key) or (cfgs[0] if cfgs else None)
+            if sel_cfg is None:
+                return "Selective compression not active — no pending TOC selections."
+            try:
+                compressor = self._create_selective(sel_cfg)
+            except Exception:
+                logger.warning(
+                    "Could not open the configured SQLite pending store for select_chunks recovery",
+                    exc_info=True,
+                )
+                return "Selective compression not active — no pending TOC selections."
+            self._selective_compressor = compressor
+            self._selective_compressor_cfg = sel_cfg
+        result = self._selective_compressor.select(key, sections)
+        if len(cfgs) > 1 and self._is_recovery_miss(result):
+            # The cached compressor's store did not hold the key, but with
+            # multiple distinct stores configured an earlier call may have
+            # cached a *different* store (#583). Probe the others; if one holds
+            # the key, serve it from a temporary compressor without disturbing
+            # the cache or this session's in-memory selections.
+            alt = self._sqlite_cfg_holding_key(key)
+            if alt is not None and alt != self._selective_compressor_cfg:
+                try:
+                    tmp = self._create_selective(alt)
+                except Exception:
+                    logger.warning(
+                        "Could not open alternate SQLite pending store for select_chunks recovery",
+                        exc_info=True,
+                    )
+                    return result
+                try:
+                    return tmp.select(key, sections)
+                finally:
+                    tmp.close()
+        return result
+
+    def _open_progressive_adapter(self, sel_cfg: SelectiveConfig | None) -> ProgressiveStoreAdapter:
+        """Build (do NOT cache) a ProgressiveStoreAdapter for *sel_cfg* —
+        SQLite-backed when configured, else in-memory. ``_get_progressive_store``
+        uses it for the cached adapter; ``read_more``'s multi-store recovery uses
+        it for a throwaway adapter it closes after the call (#583)."""
+        store: PendingStore
+        if sel_cfg is not None and sel_cfg.pending_store == "sqlite":
+            from memtomem_stm.proxy.pending_store import SQLitePendingStore
+
+            sqlite_store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+            sqlite_store.initialize()
+            store = sqlite_store
+        else:
+            from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+
+            store = InMemoryPendingStore()
+        return ProgressiveStoreAdapter(store)
 
     def _get_progressive_store(
         self, sel_cfg: SelectiveConfig | None = None
@@ -1823,18 +2002,16 @@ class ProxyManager:
         if self._progressive_store is None or (
             sel_cfg is not None and sel_cfg != self._progressive_store_cfg
         ):
-            store: PendingStore
-            if sel_cfg is not None and sel_cfg.pending_store == "sqlite":
-                from memtomem_stm.proxy.pending_store import SQLitePendingStore
-
-                sqlite_store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
-                sqlite_store.initialize()
-                store = sqlite_store
-            else:
-                from memtomem_stm.proxy.pending_store import InMemoryPendingStore
-
-                store = InMemoryPendingStore()
-            self._progressive_store = ProgressiveStoreAdapter(store)
+            # Build the replacement BEFORE closing the old one (#583): if the new
+            # SQLite store fails to open this raises with the old adapter still
+            # cached and usable rather than a closed store behind the cfg check.
+            new = self._open_progressive_adapter(sel_cfg)
+            if self._progressive_store is not None:
+                try:
+                    self._progressive_store.close()
+                except Exception:
+                    logger.debug("Failed to close superseded progressive store", exc_info=True)
+            self._progressive_store = new
             self._progressive_store_cfg = sel_cfg
         return self._progressive_store
 
@@ -1903,49 +2080,101 @@ class ProxyManager:
         upstream call and otherwise loses its link to the originating
         trace_id.
         """
-        store = self._get_progressive_store()
+        # Restart recovery (#583): if no progressive store has been built yet
+        # this process, a configured SQLite backend may hold the key from before
+        # the restart — but a bare _get_progressive_store() defaults to a fresh
+        # in-memory store and reports "not found". Pass the fallback cfg ONLY
+        # when nothing is cached: passing it once a store exists would trip the
+        # cfg-mismatch rebuild and discard a live in-memory store still holding
+        # keys written since startup. On a SQLite open failure, degrade to the
+        # sentinel; _get_progressive_store caches only after initialize()
+        # succeeds, so nothing bad is pinned and the next call retries.
+        cfgs = self._distinct_sqlite_selective_cfgs()
+        temp_store: ProgressiveStoreAdapter | None = None
+        if self._progressive_store is None:
+            fallback = self._sqlite_cfg_holding_key(key) or (cfgs[0] if cfgs else None)
+            if fallback is not None:
+                try:
+                    store = self._get_progressive_store(fallback)
+                except Exception:
+                    logger.warning(
+                        "Could not open the configured SQLite pending store for read_more recovery",
+                        exc_info=True,
+                    )
+                    return f"Progressive delivery key '{key}' not found or expired."
+            else:
+                store = self._get_progressive_store()
+        else:
+            store = self._get_progressive_store()
         resp = store.get(key)
-        if resp is None:
-            return f"Progressive delivery key '{key}' not found or expired."
-        with traced(
-            "proxy_call_read_more",
-            metadata={
-                "server": resp.server,
-                "tool": resp.tool,
-                "trace_id": resp.trace_id,
-                "key": key,
-            },
-        ):
-            store.touch(key)
-            # Continue with the chunking the first chunk used (persisted on
-            # the ProgressiveResponse) — an explicit ``limit`` from the agent
-            # still wins. Hardcoding ``4000`` here made follow-ups diverge
-            # from a tuned ``progressive.chunk_size`` / hint preference.
-            chunk_size = limit or resp.chunk_size
-            chunker = ProgressiveChunker(
-                chunk_size=chunk_size, include_hint=resp.include_structure_hint
-            )
-            output = chunker.read_chunk(
-                resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
-            )
-            # Skip telemetry when ``read_chunk`` short-circuits with the
-            # ``(no more content)`` sentinel (offset >= len(content)) —
-            # that response carries no footer and no payload, so logging
-            # it would inflate ``follow_up_rate`` with calls that served
-            # zero new bytes and push ``avg_chars_served`` above
-            # ``total_chars``.
-            if self._progressive_reads_tracker is not None and PROGRESSIVE_FOOTER_TOKEN in output:
-                chunk_chars = len(output.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
-                self._progressive_reads_tracker.record_follow_up(
-                    key=key,
-                    trace_id=resp.trace_id,
-                    server=resp.server,
-                    tool=resp.tool,
-                    offset=offset,
-                    chars=chunk_chars,
-                    total_chars=resp.total_chars,
+        if resp is None and len(cfgs) > 1:
+            # The cached store did not hold the key, but with multiple distinct
+            # stores configured an earlier call may have cached a *different*
+            # one (#583). Probe the others and, if one holds the key, serve it
+            # from a temporary adapter (closed below) without disturbing the
+            # cache or this session's in-memory progressive responses.
+            alt = self._sqlite_cfg_holding_key(key)
+            if alt is not None and alt != self._progressive_store_cfg:
+                try:
+                    temp_store = self._open_progressive_adapter(alt)
+                except Exception:
+                    logger.warning(
+                        "Could not open alternate SQLite pending store for read_more recovery",
+                        exc_info=True,
+                    )
+                    temp_store = None
+                if temp_store is not None:
+                    alt_resp = temp_store.get(key)
+                    if alt_resp is not None:
+                        store, resp = temp_store, alt_resp
+        try:
+            if resp is None:
+                return f"Progressive delivery key '{key}' not found or expired."
+            with traced(
+                "proxy_call_read_more",
+                metadata={
+                    "server": resp.server,
+                    "tool": resp.tool,
+                    "trace_id": resp.trace_id,
+                    "key": key,
+                },
+            ):
+                store.touch(key)
+                # Continue with the chunking the first chunk used (persisted on
+                # the ProgressiveResponse) — an explicit ``limit`` from the agent
+                # still wins. Hardcoding ``4000`` here made follow-ups diverge
+                # from a tuned ``progressive.chunk_size`` / hint preference.
+                chunk_size = limit or resp.chunk_size
+                chunker = ProgressiveChunker(
+                    chunk_size=chunk_size, include_hint=resp.include_structure_hint
                 )
-            return output
+                output = chunker.read_chunk(
+                    resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
+                )
+                # Skip telemetry when ``read_chunk`` short-circuits with the
+                # ``(no more content)`` sentinel (offset >= len(content)) —
+                # that response carries no footer and no payload, so logging
+                # it would inflate ``follow_up_rate`` with calls that served
+                # zero new bytes and push ``avg_chars_served`` above
+                # ``total_chars``.
+                if (
+                    self._progressive_reads_tracker is not None
+                    and PROGRESSIVE_FOOTER_TOKEN in output
+                ):
+                    chunk_chars = len(output.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+                    self._progressive_reads_tracker.record_follow_up(
+                        key=key,
+                        trace_id=resp.trace_id,
+                        server=resp.server,
+                        tool=resp.tool,
+                        offset=offset,
+                        chars=chunk_chars,
+                        total_chars=resp.total_chars,
+                    )
+                return output
+        finally:
+            if temp_store is not None:
+                temp_store.close()
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool counts.

@@ -990,6 +990,18 @@ class SelectiveCompressor:
 
         return "\n\n".join(selected_parts)
 
+    def close(self) -> None:
+        """Release the underlying pending store's OS resources.
+
+        The SQLite backend holds a connection; the in-memory backend has
+        nothing to release. Called by ``ProxyManager`` on stop and before it
+        rebuilds a compressor for a changed config (#583), so a cached
+        SQLite-backed compressor does not leak its connection.
+        """
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
+
     def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
         try:
             data = _mm_json_loads(text)

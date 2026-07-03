@@ -127,6 +127,17 @@ class ProgressiveStoreAdapter:
         self._store.evict_expired(ttl)
         self._store.evict_oldest(max_size)
 
+    def close(self) -> None:
+        """Release the underlying store's OS resources (SQLite connection).
+
+        The in-memory backend has nothing to release. ``ProxyManager`` calls
+        this on stop and before rebuilding the adapter for a changed config
+        (#583) so a cached SQLite-backed adapter does not leak its connection.
+        """
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
+
 
 class ProgressiveChunker:
     """Splits content into cursor-based chunks with metadata footers."""
