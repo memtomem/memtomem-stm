@@ -239,8 +239,17 @@ class MetricsStore:
         ``extract_ok``, ``surfacing_on_progressive_ok``) are nullable
         ``INTEGER DEFAULT NULL`` — ``NULL`` means "stage did not run", which
         readers must distinguish from ``0`` (stage ran and failed).
+
+        The ``table_info`` snapshot makes each ALTER conditional, but the
+        check and the ALTER are not one atomic step across processes: two
+        ``mms`` sessions starting right after a column-adding upgrade can
+        both read the pre-migration schema before either ALTERs, and the
+        loser's ALTER then raises ``duplicate column name``. That race is
+        tolerated per-column below (the column exists afterwards either way,
+        which is the desired end state); any other ``OperationalError`` is a
+        real failure and propagates.
         """
-        existing = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
+        existing = self._existing_columns(db)
         migrations = {
             "is_error": "ALTER TABLE proxy_metrics ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0",
             "error_category": "ALTER TABLE proxy_metrics ADD COLUMN error_category TEXT DEFAULT NULL",
@@ -281,8 +290,24 @@ class MetricsStore:
         }
         for col, ddl in migrations.items():
             if col not in existing:
-                db.execute(ddl)
+                try:
+                    db.execute(ddl)
+                except sqlite3.OperationalError as exc:
+                    # A concurrent process won the race and added this column
+                    # between our ``_existing_columns`` read and this ALTER —
+                    # the column now exists, so treat the duplicate as a no-op.
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
         db.commit()
+
+    def _existing_columns(self, db: sqlite3.Connection) -> set[str]:
+        """Current ``proxy_metrics`` column names — the migration snapshot.
+
+        Its own method so the concurrent-migration race (a stale snapshot
+        that misses a column another process just added) can be reproduced
+        deterministically in tests.
+        """
+        return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
 
     def close(self) -> None:
         if self._db:

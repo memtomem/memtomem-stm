@@ -136,11 +136,23 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
         if config.proxy.enabled:
             # Metrics store
             if config.proxy.metrics.enabled:
-                metrics_store = MetricsStore(
-                    config.proxy.metrics.db_path.expanduser().resolve(),
-                    max_history=config.proxy.metrics.max_history,
-                )
-                metrics_store.initialize()
+                try:
+                    metrics_store = MetricsStore(
+                        config.proxy.metrics.db_path.expanduser().resolve(),
+                        max_history=config.proxy.metrics.max_history,
+                    )
+                    metrics_store.initialize()
+                except Exception:
+                    # A corrupt/locked metrics DB (or a lost migration race)
+                    # must not take down every proxied tool — telemetry is
+                    # optional. Degrade to no metrics, like the sibling
+                    # trackers below. ``initialize`` closes its own handle on
+                    # failure, so dropping the object leaks nothing.
+                    logger.warning(
+                        "Metrics store init failed — proxy metrics disabled",
+                        exc_info=True,
+                    )
+                    metrics_store = None
             tracker = TokenTracker(metrics_store=metrics_store)
 
             # Compression feedback tracker — learning loop for agent-reported
@@ -260,11 +272,23 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
 
             # Response cache
             if config.proxy.cache.enabled:
-                proxy_cache = ProxyCache(
-                    config.proxy.cache.db_path.expanduser().resolve(),
-                    max_entries=config.proxy.cache.max_entries,
-                )
-                proxy_cache.initialize()
+                try:
+                    proxy_cache = ProxyCache(
+                        config.proxy.cache.db_path.expanduser().resolve(),
+                        max_entries=config.proxy.cache.max_entries,
+                    )
+                    proxy_cache.initialize()
+                except Exception:
+                    # A corrupt/locked cache DB must not take down every
+                    # proxied call — the cache is an optional optimization.
+                    # Degrade to cache-disabled (ProxyManager already handles
+                    # cache=None). ``initialize`` closes its own handle on
+                    # failure, so dropping the object leaks nothing.
+                    logger.warning(
+                        "Response cache init failed — proxy cache disabled",
+                        exc_info=True,
+                    )
+                    proxy_cache = None
 
             # Langfuse (optional)
             try:
