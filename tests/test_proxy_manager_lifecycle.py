@@ -458,6 +458,46 @@ class TestConnectServerCleanup:
         mock_session.__aexit__.assert_awaited_once()
         mock_transport.__aexit__.assert_awaited_once()
 
+    async def test_cleanup_failure_log_redacts_credential(self, caplog):
+        """#580: if the rollback aclose() ALSO raises for a credentialed network
+        upstream, the DEBUG cleanup log must not leak the token — the message is
+        redacted and no exc_info traceback (whose tail repeats the raw exception
+        string) is emitted."""
+        import pytest as _pt
+
+        url = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+        cfg = UpstreamServerConfig(prefix="bad", transport=TransportType.SSE, url=url)
+        mgr = _make_manager(servers={"bad": cfg})
+
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(side_effect=RuntimeError("catalog failed"))
+
+        mock_transport = AsyncMock()
+        mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        # The rollback close itself raises an httpx-style error embedding the URL.
+        mock_transport.__aexit__ = AsyncMock(
+            side_effect=ConnectionError(f"cleanup failed for {url}")
+        )
+
+        with caplog.at_level("DEBUG"):
+            with (
+                patch.object(mgr, "_open_transport", return_value=mock_transport),
+                patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+            ):
+                with _pt.raises(RuntimeError, match="catalog failed"):
+                    await mgr._connect_server("bad", cfg)
+
+        assert "Error during initial connection cleanup for 'bad'" in caplog.text
+        assert "s3cr3t-token" not in caplog.text
+        assert "alice:s3cr3t-token" not in caplog.text
+        assert "***@ltm.example.com" in caplog.text
+
 
 class TestConcurrentReconnect:
     """#586 — two concurrent _reconnect_server calls for one server must

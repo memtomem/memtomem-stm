@@ -468,20 +468,13 @@ class ProxyManager:
             try:
                 await self._connect_server(name, cfg)
             except Exception as exc:
-                # Redact the full exception text ONCE, then reuse it for both the
+                # Redact the exception text ONCE, then reuse it for both the
                 # operator log and the health record (#580). httpx transport
-                # exceptions embed the credentialed request URL
-                # (``https://user:token@host/mcp``), so an unredacted path would
-                # leak the token — via ``stm_proxy_health`` to the MCP
-                # client/model, or via the log. Do NOT use ``logger.exception``
-                # here: its traceback tail repeats the raw, unredacted exception
-                # string. Redact the FULL message, THEN cap: capping first (as
-                # format_error_message_from_exc does) can truncate a long
-                # credential mid-token so redact_exception_text no longer matches
-                # the configured URL, leaving a partial token exposed.
-                redacted = redact_exception_text(f"{type(exc).__name__}: {exc}", cfg.url)[
-                    :MAX_ERROR_MESSAGE_CHARS
-                ]
+                # exceptions embed the credentialed request URL, so an unredacted
+                # path would leak the token — via ``stm_proxy_health`` to the MCP
+                # client/model, or via the log. Do NOT use ``logger.exception``:
+                # its traceback tail repeats the raw, unredacted exception string.
+                redacted = self._redacted_error(exc, cfg.url)
                 logger.error("Failed to connect to upstream server '%s': %s", name, redacted)
                 # Record the failure so ``get_upstream_health`` can report the
                 # configured-but-dead server — otherwise it is absent from
@@ -869,6 +862,17 @@ class ProxyManager:
                     StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
                 )
 
+    @staticmethod
+    def _redacted_error(exc: BaseException, url: str) -> str:
+        """Exception text with *url* userinfo scrubbed, capped for storage/logs
+        (#580). One choke point for every credential-safe rendering of a
+        connect/cleanup exception: httpx transport errors embed the credentialed
+        request URL, so any log or health field built from them must go through
+        here. Redacts the FULL message BEFORE the cap so a long credential can't
+        be truncated past ``redact_exception_text``'s reach.
+        """
+        return redact_exception_text(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_MESSAGE_CHARS]
+
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
             raise RuntimeError("ProxyManager.start() not called")
@@ -901,9 +905,14 @@ class ProxyManager:
             # visible to stop()/reconnect cleanup.
             try:
                 await conn_stack.aclose()
-            except Exception:
+            except Exception as cleanup_exc:
+                # Redact + no exc_info (#580): a network transport was opened
+                # with the credentialed ``cfg.url``, so a cleanup failure's
+                # traceback tail could otherwise leak the token even at DEBUG.
                 logger.debug(
-                    "Error during initial connection cleanup for '%s'", name, exc_info=True
+                    "Error during initial connection cleanup for '%s': %s",
+                    name,
+                    self._redacted_error(cleanup_exc, cfg.url),
                 )
             raise
 
