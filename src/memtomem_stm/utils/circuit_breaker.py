@@ -12,8 +12,19 @@ class CircuitBreaker:
     """Three-state circuit breaker: closed → open → half-open.
 
     - **closed**: all calls pass through.
-    - **open**: all calls blocked; transitions to half-open after ``reset_timeout``.
-    - **half-open**: one probe call allowed; success closes, failure re-opens.
+    - **open**: all calls blocked; becomes eligible to probe (half-open) after
+      ``reset_timeout``.
+    - **half-open**: the reset window has elapsed; the next call is allowed
+      through as a probe — success closes, failure re-opens.
+
+    The half-open transition is **computed, not committed on read** (#600):
+    ``is_open`` / ``state`` / ``time_until_reset`` are pure — reading them
+    never mutates the breaker, so an observer (e.g. ``stm_proxy_health``)
+    cannot perturb or misreport its state. The commit happens on the probe's
+    outcome via ``record_success`` / ``record_failure``. (Half-open is not
+    single-probe-gated: a failing dependency behind a serialized single MCP
+    client is probed once per elapsed window in practice; concurrent
+    single-probe enforcement is out of scope — see #600.)
     """
 
     def __init__(
@@ -29,22 +40,29 @@ class CircuitBreaker:
         self._state = "closed"
         self._opened_at = 0.0
 
+    def _effective_state(self) -> str:
+        """Effective state without mutating (#600): an open breaker whose
+        ``reset_timeout`` has elapsed reads as ``half-open`` (probe eligible)
+        but ``self._state`` stays ``open`` until ``record_*`` commits the
+        outcome. Only ``record_success`` / ``record_failure`` write state."""
+        if self._state == "open" and time.monotonic() - self._opened_at >= self._reset_timeout:
+            return "half-open"
+        return self._state
+
     @property
     def is_open(self) -> bool:
-        if self._state == "closed":
-            return False
-        if self._state == "open" and time.monotonic() - self._opened_at >= self._reset_timeout:
-            self._state = "half-open"
-            return False  # allow one probe
-        return self._state == "open"
+        """Whether calls should currently be blocked. PURE — reading this never
+        mutates the breaker (#600), so an observer like ``stm_proxy_health`` can
+        read it without perturbing state. Returns ``False`` once the reset
+        window has elapsed (effectively half-open — the next call probes)."""
+        return self._effective_state() == "open"
 
     @property
     def state(self) -> str:
-        """Current state: 'closed', 'open', or 'half-open'."""
-        # Trigger half-open transition if timeout elapsed
-        if self._state == "open" and time.monotonic() - self._opened_at >= self._reset_timeout:
-            self._state = "half-open"
-        return self._state
+        """Current effective state: 'closed', 'open', or 'half-open'. PURE —
+        computes the open→half-open transition from elapsed time without
+        committing it (#600)."""
+        return self._effective_state()
 
     @property
     def failure_count(self) -> int:
@@ -66,12 +84,13 @@ class CircuitBreaker:
         The value is a real ``time.monotonic()`` reading — typically in
         the ~1e5 to 1e9 second range on long-running processes.
         ``time_until_reset`` computes ``reset_timeout - (now - opened_at)``
-        from this; ``(opened_at + 10.0) - opened_at`` loses a few low
-        bits at those magnitudes and the result is ``~1e-14`` rather
-        than bit-exact ``0.0``. Callers subtracting two
-        ``opened_at``-derived values must tolerate a few ULPs of float
-        residue (the test at ``test_time_until_reset_at_boundary``
-        pins an absolute-tolerance check).
+        from this; at those magnitudes ``now - opened_at`` loses a few low
+        bits, so a value just under the reset window can return a tiny
+        positive residue rather than a bit-exact figure. Callers must
+        tolerate a few ULPs of float residue (the test at
+        ``test_time_until_reset_near_boundary`` pins an absolute-tolerance
+        check). At or past the window the breaker reads effectively
+        half-open and ``time_until_reset`` is ``None``.
 
         The backing field uses ``0.0`` as a "never opened" sentinel.
         ``time.monotonic()`` is implementation-defined and could in
@@ -82,8 +101,11 @@ class CircuitBreaker:
 
     @property
     def time_until_reset(self) -> float | None:
-        """Seconds until open breaker transitions to half-open. None if not open."""
-        if self._state != "open":
+        """Seconds until an open breaker becomes probe-eligible (half-open).
+        ``None`` once the window has elapsed (effectively half-open) or closed.
+        PURE — uses the effective state, so a read never commits the transition
+        (#600)."""
+        if self._effective_state() != "open":
             return None
         remaining = self._reset_timeout - (time.monotonic() - self._opened_at)
         return max(0.0, remaining)
@@ -94,9 +116,13 @@ class CircuitBreaker:
 
     def record_failure(self) -> None:
         self._failures += 1
-        if self._state == "half-open" or (
-            self._failures >= self._max_failures and self._state == "closed"
-        ):
+        # Re-open on a failed probe (effectively half-open once the reset window
+        # elapsed) or when a closed breaker crosses the failure threshold. Since
+        # reads no longer commit the half-open transition (#600), the effective
+        # state is recomputed here; a probe that fails in the elapsed window
+        # restarts the window with a fresh ``_opened_at``.
+        eff = self._effective_state()
+        if eff == "half-open" or (self._failures >= self._max_failures and eff == "closed"):
             self._state = "open"
             self._opened_at = time.monotonic()
             logger.warning(

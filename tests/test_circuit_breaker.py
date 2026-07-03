@@ -59,9 +59,12 @@ class TestCircuitBreakerHalfOpen:
         # Simulate time passing beyond reset_timeout
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
             mock_time.monotonic.return_value = cb.opened_at + 11.0
-            # Should transition to half-open and allow one probe
+            # Effectively half-open (probe eligible) — but reading it does NOT
+            # commit the transition (#600): the public state reads half-open
+            # while the raw internal state stays "open" until record_* runs.
             assert not cb.is_open
-            assert cb._state == "half-open"
+            assert cb.state == "half-open"
+            assert cb._state == "open"
 
     def test_half_open_success_closes_circuit(self):
         cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
@@ -79,13 +82,17 @@ class TestCircuitBreakerHalfOpen:
         cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
         cb.record_failure()
 
+        # The probe fails WITHIN the elapsed window (as it does in production:
+        # the gate reads is_open → admits → the call fails → record_failure, all
+        # at roughly the same, post-timeout instant). Since reads no longer
+        # commit the transition (#600), record_failure must see the elapsed
+        # time itself to re-open — so it runs inside the patched clock.
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
             mock_time.monotonic.return_value = cb.opened_at + 11.0
-            assert not cb.is_open  # half-open
-
-        cb.record_failure()
-        assert cb._state == "open"
-        assert cb.is_open
+            assert not cb.is_open  # effectively half-open
+            cb.record_failure()
+            assert cb._state == "open"
+            assert cb.is_open  # re-opened with a fresh window
 
     def test_half_open_failure_resets_timeout(self):
         cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
@@ -94,12 +101,11 @@ class TestCircuitBreakerHalfOpen:
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
             mock_time.monotonic.return_value = first_opened_at + 11.0
-            assert not cb.is_open  # half-open
-
-        cb.record_failure()
-        # opened_at should be refreshed
-        assert cb.opened_at > first_opened_at or cb.opened_at == first_opened_at
-        # If time.monotonic was called normally, opened_at >= first_opened_at
+            assert not cb.is_open  # effectively half-open
+            cb.record_failure()  # fails within the window → re-open
+            # opened_at refreshed to the (mocked) failure time, strictly later.
+            assert cb.opened_at == first_opened_at + 11.0
+            assert cb.opened_at > first_opened_at
 
     def test_repeated_open_close_cycles(self):
         cb = CircuitBreaker(max_failures=2, reset_timeout=5.0)
@@ -121,23 +127,23 @@ class TestCircuitBreakerHalfOpen:
         cb.record_failure()
         assert cb.is_open
 
-    def test_half_open_does_not_allow_multiple_probes(self):
-        """After transitioning to half-open, subsequent is_open calls should not
-        return False again (the probe was already allowed)."""
+    def test_reads_are_pure_and_idempotent(self):
+        """#600 — repeated is_open / state / time_until_reset reads in the
+        elapsed (effectively half-open) window never mutate the breaker: the
+        raw internal state stays "open" no matter how many times an observer
+        reads it. This is what lets stm_proxy_health read the breaker without
+        flipping it."""
         cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
         cb.record_failure()
 
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
             mock_time.monotonic.return_value = cb.opened_at + 11.0
-            # First call: transitions to half-open, returns False
-            assert not cb.is_open
-            assert cb._state == "half-open"
-
-        # Second call without success/failure: state is half-open,
-        # is_open returns False (half-open is not "open").
-        # This is acceptable because the consumer should call
-        # record_success/failure before the next is_open check.
-        # The important thing is the circuit reacts correctly to the result.
+            for _ in range(5):
+                assert not cb.is_open
+                assert cb.state == "half-open"
+                assert cb.time_until_reset is None
+                # The raw state is never committed by a read.
+                assert cb._state == "open"
 
 
 class TestCircuitBreakerProperties:
@@ -162,18 +168,26 @@ class TestCircuitBreakerProperties:
             # assertion inside the patch block — fix for timing concern
             assert cb.time_until_reset is None
 
-    def test_time_until_reset_at_boundary(self):
+    def test_time_until_reset_near_boundary(self):
         cb = CircuitBreaker(max_failures=1, reset_timeout=10.0)
         cb.record_failure()
+        opened = cb.opened_at
 
+        # Just BEFORE the window elapses: still open, a tiny positive remaining
+        # (the float-residue tolerance — see the ``opened_at`` docstring).
         with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
-            mock_time.monotonic.return_value = cb.opened_at + 10.0
+            mock_time.monotonic.return_value = opened + 9.999
             result = cb.time_until_reset
-            # The contract here is "not positive, effectively zero" — pick a
-            # tolerance several orders of magnitude below any observable reset
-            # window. See ``CircuitBreaker.opened_at`` docstring for the
-            # float-precision rationale (paragraph migrated there per #277).
-            assert result is not None and abs(result) < 1e-9
+            assert result is not None and 0.0 <= result < 0.01
+
+        # Past the window: effectively half-open → None (no time until reset,
+        # the reset has completed). Pure read — does not commit the transition.
+        # (Use a value clearly past reset_timeout so the float residue at
+        # ~1e5-1e9 magnitudes can't land it on the wrong side of the boundary.)
+        with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
+            mock_time.monotonic.return_value = opened + 10.001
+            assert cb.time_until_reset is None
+            assert cb._state == "open"
 
     def test_opened_at_lifecycle_preserves_most_recent_open(self):
         """``opened_at`` is None initially, captures the open transition,
