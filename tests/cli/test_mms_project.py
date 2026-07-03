@@ -420,6 +420,10 @@ def test_project_mutator_under_held_lock_exits_cleanly(runner, sandbox, monkeypa
     assert res.exit_code == 1
     # WriteLockTimeout is surfaced as a Click error, not a traceback.
     assert "Error" in res.output
+    # #582 follow-up: the timeout attribution must name the `mms project`
+    # mutators too, not just host sync / import — they share this lock, so an
+    # operator whose project command timed out needs to see it in the hint.
+    assert "mms project" in res.output
 
 
 @pytest.mark.skipif(

@@ -135,13 +135,18 @@ class CorruptedConfig(MmsConfigError):
 
 
 _REGISTRY_LOCK_HOLDER_HINT = (
-    "another `mms host sync --apply` or `mms import --apply` appears to be "
-    "running (possibly waiting at its confirmation prompt)"
+    "another registry-mutating command (`mms host sync --apply`, "
+    "`mms import --apply`, or a `mms project` mutator such as "
+    "`init`/`enable`/`disable`/`list --prune`) appears to be running "
+    "(possibly waiting at its confirmation prompt)"
 )
-"""Default :class:`WriteLockTimeout` attribution — names the registry/sidecar
-mutators that hold the default ``~/.mms/.lock``. Locks over other domains
-(the proxy-config lock, #475 PR2) pass their own hint so the operator is
-pointed at the right family of commands."""
+"""Default :class:`WriteLockTimeout` attribution — names every command that
+holds the default ``~/.mms/.lock``: the registry/sidecar mutators
+(``mms host sync --apply``, ``mms import --apply``) and the ``mms project``
+mutators (``init``/``enable``/``disable`` and ``list --prune``), which share
+the same lock (#582). Locks over other domains (the proxy-config lock, #475
+PR2) pass their own hint so the operator is pointed at the right family of
+commands."""
 
 
 class WriteLockTimeout(MmsConfigError):
