@@ -135,8 +135,8 @@ class CorruptedConfig(MmsConfigError):
 
 
 _REGISTRY_LOCK_HOLDER_HINT = (
-    "another registry-mutating command (`mms host sync --apply`, "
-    "`mms import --apply`, or a `mms project` mutator such as "
+    "another `~/.mms` state-mutating command (`mms host sync --apply`, "
+    "`mms import --apply`, or a `mms project` mutator: "
     "`init`/`enable`/`disable`/`list --prune`) appears to be running "
     "(possibly waiting at its confirmation prompt)"
 )
