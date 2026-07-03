@@ -94,6 +94,52 @@ class TestStart:
             await mgr.start()
 
         assert "Failed to connect to upstream server 'bad'" in caplog.text
+        # #580: the failed server is recorded so it stays visible in health,
+        # instead of vanishing (no _connections entry is created on failure).
+        assert "bad" in mgr._failed_servers
+        assert "unreachable" in mgr._failed_servers["bad"]
+
+    async def test_startup_failed_server_appears_in_health(self):
+        """#580: a configured-but-unconnected server surfaces in
+        get_upstream_health with connected=False and its connect error,
+        making the DISCONNECTED rendering reachable."""
+        mgr = _make_manager(
+            servers={
+                "ok": UpstreamServerConfig(prefix="ok"),
+                "bad": UpstreamServerConfig(prefix="bad"),
+            }
+        )
+
+        async def _conditional_connect(name, cfg):
+            if name == "bad":
+                raise ConnectionError("unreachable")
+            # The 'ok' server: register a live connection so it reports healthy.
+            mgr._connections[name] = UpstreamConnection(
+                name=name, config=cfg, session=AsyncMock(), tools=[]
+            )
+
+        with patch.object(mgr, "_connect_server", side_effect=_conditional_connect):
+            await mgr.start()
+
+        health = mgr.get_upstream_health()
+        assert health["bad"]["connected"] is False
+        assert "unreachable" in health["bad"]["error"]
+        assert health["ok"]["connected"] is True
+        assert "error" not in health["ok"]
+
+    async def test_health_prefers_live_connection_over_stale_failed_entry(self):
+        """If a name is somehow in both maps (a live connection and a stale
+        failed record), get_upstream_health reports it connected — the live
+        connection wins and no error line leaks (#580 guard)."""
+        mgr = _make_manager(servers={"srv": UpstreamServerConfig(prefix="srv")})
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=UpstreamServerConfig(prefix="srv"), session=AsyncMock(), tools=[]
+        )
+        mgr._failed_servers["srv"] = "stale error"
+
+        health = mgr.get_upstream_health()
+        assert health["srv"]["connected"] is True
+        assert "error" not in health["srv"]
 
     async def test_double_start_closes_previous(self):
         """Calling start() twice closes the previous AsyncExitStack."""

@@ -306,6 +306,13 @@ class ProxyManager:
         self._toolgraph_cache: GraphConsultCache | None = None
         self._toolgraph_from_cache: bool = False
         self._connections: dict[str, UpstreamConnection] = {}
+        # Configured servers whose startup connect FAILED (#580). Entries never
+        # land in ``_connections`` (created only on a successful connect), so
+        # without this map a startup-failed upstream is invisible in
+        # ``stm_proxy_health`` — an operator sees only healthy servers and no
+        # anomaly. name → short error summary; an entry is cleared if the
+        # server later connects (e.g. via reconnect).
+        self._failed_servers: dict[str, str] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
         self._selective_compressor_cfg: SelectiveConfig | None = None
@@ -453,8 +460,14 @@ class ProxyManager:
         for name, cfg in servers.items():
             try:
                 await self._connect_server(name, cfg)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to connect to upstream server '%s'", name)
+                # Record the failure so ``get_upstream_health`` can report the
+                # configured-but-dead server (#580) — otherwise it is absent
+                # from ``stm_proxy_health`` entirely (no ``_connections`` entry
+                # is created on a failed connect) and the degradation is
+                # undiagnosable from inside the session.
+                self._failed_servers[name] = format_error_message_from_exc(exc)
 
         # #465: evaluate per-tool health once per session, before the first
         # advertisement. get_proxy_tools() applies this cached snapshot so
@@ -893,6 +906,8 @@ class ProxyManager:
         self._connections[name] = UpstreamConnection(
             name=name, config=cfg, session=session, tools=list(result.tools), stack=conn_stack
         )
+        # A successful connect clears any prior startup-failure record (#580).
+        self._failed_servers.pop(name, None)
         logger.info("Connected to '%s' (%s tools discovered)", name, len(result.tools))
 
     async def _reconnect_server(self, name: str) -> None:
@@ -2186,6 +2201,12 @@ class ProxyManager:
         withheld tool from a missing one. ``advertised_tools`` reflects
         the most recent ``get_proxy_tools()`` pass — in the server it runs
         at startup registration, before any health probe can observe it.
+
+        A configured server that FAILED to connect at startup (#580) has no
+        ``_connections`` entry, so it is reported here from ``_failed_servers``
+        with ``connected: False`` and an ``error`` summary — making the
+        existing ``DISCONNECTED`` rendering reachable instead of the server
+        vanishing from health entirely.
         """
         health: dict[str, dict] = {}
         for name, conn in self._connections.items():
@@ -2195,6 +2216,17 @@ class ProxyManager:
                 "advertised_tools": sum(
                     1 for info in self._advertised_infos if info.server == name
                 ),
+            }
+        for name, error in self._failed_servers.items():
+            # A server can't be both connected and in the failed map (the
+            # success path pops it), but guard against a stale entry anyway.
+            if name in health:
+                continue
+            health[name] = {
+                "connected": False,
+                "tools": 0,
+                "advertised_tools": 0,
+                "error": error,
             }
         return health
 

@@ -780,6 +780,11 @@ async def stm_proxy_health(
             f"  {name}: {status} "
             f"({info['tools']} tools discovered, {info['advertised_tools']} advertised)"
         )
+        # A startup-failed upstream (#580) carries the connect error so the
+        # DISCONNECTED status is actionable, not just visible.
+        error = info.get("error")
+        if error:
+            lines.append(f"      startup connect failed: {error}")
 
     surfacing = app.surfacing_engine
     if surfacing is not None:

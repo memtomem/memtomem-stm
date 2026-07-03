@@ -430,6 +430,23 @@ class TestHealth:
         result = await stm_proxy_health(ctx=ctx)
         assert "srv: connected (2 tools discovered, 0 advertised)" in result
 
+    async def test_startup_failed_server_rendered_disconnected(self):
+        """#580: a server that failed to connect at startup is rendered
+        DISCONNECTED with its connect error, instead of being absent."""
+        pm = _make_proxy_manager()
+        pm._connections["ok"] = UpstreamConnection(
+            name="ok",
+            config=UpstreamServerConfig(prefix="ok"),
+            session=AsyncMock(),
+            tools=[MagicMock()],
+        )
+        pm._failed_servers["bad"] = "ConnectionError: host unreachable"
+        ctx = _make_ctx(proxy_manager=pm)
+        result = await stm_proxy_health(ctx=ctx)
+        assert "ok: connected (1 tools discovered, 0 advertised)" in result
+        assert "bad: DISCONNECTED" in result
+        assert "startup connect failed: ConnectionError: host unreachable" in result
+
     @staticmethod
     def _proxy_enabled_config() -> STMConfig:
         cfg = STMConfig()
