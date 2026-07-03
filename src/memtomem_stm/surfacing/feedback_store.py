@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS auto_tune_adjustments (
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_memory_rating ON surfacing_feedback(memory_id, rating);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
+-- #584: the stats-retention delete and get_stats both filter/order on
+-- created_at; without this index each is a full scan on a large history.
+CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 """
 
@@ -111,6 +114,10 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
         DROP TABLE surfacing_events;
         ALTER TABLE surfacing_events__migrate_352 RENAME TO surfacing_events;
         CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
+        -- Recreate the #584 created_at index too: DROP TABLE above dropped the
+        -- one _SCHEMA created, and initialize() does not re-run _SCHEMA after
+        -- this migration.
+        CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at);
         COMMIT;
         """
     )
@@ -708,6 +715,32 @@ class FeedbackStore:
                 "UPDATE surfacing_events SET query = NULL "
                 "WHERE created_at < ? AND query IS NOT NULL",
                 (cutoff,),
+            )
+            self._db.commit()
+            return cursor.rowcount
+
+    def delete_events_older_than(self, retention_seconds: float) -> int:
+        """Delete ``surfacing_events`` (and their ``surfacing_feedback``) rows
+        older than the retention window. Returns the number of event rows
+        deleted (#584).
+
+        Unlike :meth:`cleanup_expired_queries`, which only nulls the query
+        column and keeps the row for aggregates, this bounds the table so
+        :meth:`get_stats` cannot full-scan an unbounded history on the event
+        loop. The feedback rows are removed first (they reference events by
+        ``surfacing_id``), then the events, in one transaction. ``<= 0``
+        disables deletion."""
+        if self._db is None or retention_seconds <= 0:
+            return 0
+        cutoff = time.time() - retention_seconds
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM surfacing_feedback WHERE surfacing_id IN "
+                "(SELECT id FROM surfacing_events WHERE created_at < ?)",
+                (cutoff,),
+            )
+            cursor = self._db.execute(
+                "DELETE FROM surfacing_events WHERE created_at < ?", (cutoff,)
             )
             self._db.commit()
             return cursor.rowcount
