@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -383,3 +384,56 @@ def test_enable_project_flag_missing_marker_complains(runner, sandbox):
     assert res.exit_code != 0
     assert "marker file is missing" in res.output
     assert "list --prune" in res.output
+
+
+# ---------------------------------------------------------------------------
+# write lock (#582) — the shared ~/.mms registry lock serializes the mutators
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["init"], id="init"),
+        pytest.param(["enable", "filesystem"], id="enable"),
+        pytest.param(["disable", "filesystem"], id="disable"),
+        pytest.param(["list", "--prune"], id="list-prune"),
+    ],
+)
+def test_project_mutator_under_held_lock_exits_cleanly(runner, sandbox, monkeypatch, argv):
+    # Every project mutator must serialize on the shared ~/.mms registry write
+    # lock; a concurrent run that can't acquire it times out with a clean,
+    # attributed error instead of doing an unlocked read-modify-write of the
+    # shared projects.toml and dropping the other run's rows (lost update).
+    if argv[0] in {"enable", "disable"}:
+        runner.invoke(project_group, ["init"])
+        _seed_registry("filesystem")
+    monkeypatch.setattr(state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with state.write_lock():  # hold the default registry lock like a sibling run
+        res = runner.invoke(project_group, argv)
+
+    assert res.exit_code == 1
+    # WriteLockTimeout is surfaced as a Click error, not a traceback.
+    assert "Error" in res.output
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
+)
+def test_list_without_prune_ignores_held_lock(runner, sandbox, monkeypatch):
+    # A plain list is read-only, so it must not queue behind (or fail on) the
+    # write lock — mirroring the --plan skip convention.
+    runner.invoke(project_group, ["init"])
+    monkeypatch.setattr(state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with state.write_lock():
+        res = runner.invoke(project_group, ["list"])
+
+    assert res.exit_code == 0, res.output
+    assert "proj" in res.output

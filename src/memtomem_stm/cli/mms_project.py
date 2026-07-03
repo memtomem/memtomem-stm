@@ -16,6 +16,7 @@ from pathlib import Path
 
 import click
 
+from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.detect import Project, Source, detect_project
 
@@ -142,6 +143,7 @@ def _refresh_index(name: str, root: Path) -> None:
     "--name", "name_opt", default=None, help="Override project name (default: dir basename)."
 )
 @click.option("--force", is_flag=True, help="Overwrite an existing .mms/project.toml.")
+@with_write_lock
 def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
     """Create ``<path>/.mms/project.toml`` (default path = cwd) and add to index."""
     target_root = (path or Path.cwd()).expanduser().resolve()
@@ -247,21 +249,30 @@ def _emit_show(proj: Project, json_output: bool, *, cwd: Path) -> None:
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
 def list_cmd(prune: bool, json_output: bool) -> None:
     """List known projects from the index. Mark current cwd's project with ``*``."""
-    idx = state.load_projects_index()
     cwd = Path.cwd().resolve()
 
+    # ``--prune`` does a read-modify-write of the shared ~/.mms/projects.toml,
+    # so it must hold the same cross-process write lock every other registry
+    # mutator uses (#582) — otherwise two concurrent prunes interleave and the
+    # loser's save drops the winner's kept entries. A plain ``list`` (no prune)
+    # is read-only and stays unlocked, mirroring the ``--plan`` skip convention.
     pruned: list[state.ProjectIndexEntry] = []
-    if prune:
-        kept: list[state.ProjectIndexEntry] = []
-        for entry in idx.projects:
-            if Path(entry.path).is_dir():
-                kept.append(entry)
-            else:
-                pruned.append(entry)
-        if pruned:
-            new_idx = state.ProjectsIndex(schema_version=idx.schema_version, projects=kept)
-            state.save_projects_index(new_idx)
-            idx = new_idx
+    try:
+        with state.write_lock(enabled=prune):
+            idx = state.load_projects_index()
+            if prune:
+                kept: list[state.ProjectIndexEntry] = []
+                for entry in idx.projects:
+                    if Path(entry.path).is_dir():
+                        kept.append(entry)
+                    else:
+                        pruned.append(entry)
+                if pruned:
+                    new_idx = state.ProjectsIndex(schema_version=idx.schema_version, projects=kept)
+                    state.save_projects_index(new_idx)
+                    idx = new_idx
+    except state.WriteLockTimeout as exc:
+        raise click.ClickException(str(exc)) from exc
 
     def _is_current(entry: state.ProjectIndexEntry) -> bool:
         return Path(entry.path).resolve() == cwd
@@ -304,6 +315,7 @@ def list_cmd(prune: bool, json_output: bool) -> None:
 @click.option(
     "--project", "project_name", default=None, help="Target project (default: detect from cwd)."
 )
+@with_write_lock
 def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     """Add MCP names to the project's enabled list (RFC §7.1)."""
     proj = _resolve_project_for_mutation(project_name)
@@ -355,6 +367,7 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
 @click.option(
     "--project", "project_name", default=None, help="Target project (default: detect from cwd)."
 )
+@with_write_lock
 def disable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     """Remove MCP names from the project's enabled list.
 
