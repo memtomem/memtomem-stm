@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1620,6 +1621,88 @@ class TestLifespan:
             async with app_lifespan(mcp) as ctx:
                 assert ctx.feedback_tracker is None
                 assert captured_engine_kwargs.get("feedback_tracker") is None
+
+    async def test_metrics_store_init_failure_degrades_gracefully(self):
+        """A corrupt/locked metrics DB (or a lost migration race) raising at
+        init must log and fall back to no metrics rather than crashing the
+        server — every proxied tool would otherwise go down for an optional
+        telemetry DB. Mirrors the sibling-tracker guard pattern."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            patch(
+                "memtomem_stm.proxy.metrics_store.MetricsStore",
+                side_effect=sqlite3.DatabaseError("file is not a database"),
+            ),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = True
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.metrics.enabled = True
+            mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.progressive_reads.enabled = False
+            mock_cfg.proxy.selection_telemetry.enabled = False
+            mock_cfg.proxy.cache.enabled = False
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = False
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+
+            async with app_lifespan(mcp) as ctx:
+                # Server came up; the tracker just has no backing store.
+                assert ctx.tracker._metrics_store is None
+                mock_pm_instance.start.assert_awaited_once()
+
+    async def test_cache_init_failure_degrades_gracefully(self):
+        """A corrupt/locked cache DB raising at init must degrade to
+        cache-disabled (ProxyManager receives cache=None) instead of failing
+        startup — the response cache is an optional optimization."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        captured_pm_kwargs: dict = {}
+
+        def _capture_pm(*_args, **kwargs):
+            captured_pm_kwargs.update(kwargs)
+            return mock_pm_instance
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", side_effect=_capture_pm),
+            patch(
+                "memtomem_stm.proxy.cache.ProxyCache",
+                side_effect=sqlite3.DatabaseError("file is not a database"),
+            ),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = True
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.metrics.enabled = False
+            mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.progressive_reads.enabled = False
+            mock_cfg.proxy.selection_telemetry.enabled = False
+            mock_cfg.proxy.cache.enabled = True
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = False
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+
+            async with app_lifespan(mcp) as _ctx:
+                assert captured_pm_kwargs.get("cache") is None
+                mock_pm_instance.start.assert_awaited_once()
 
     async def test_init_failure_after_mcp_adapter_runs_cleanup(self):
         """If a post-mcp_adapter init step raises (e.g. proxy_manager.start()),

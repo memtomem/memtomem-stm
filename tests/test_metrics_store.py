@@ -130,6 +130,64 @@ class TestMigrationIdempotency:
         finally:
             store.close()
 
+    def test_migrate_tolerates_lost_race_duplicate_column(self, tmp_path, monkeypatch):
+        """A migration whose ``_existing_columns`` snapshot is stale (another
+        process added the columns after the read) must not raise.
+
+        Reproduces the cross-process race: two ``mms`` sessions start right
+        after a column-adding upgrade, both read the pre-migration schema,
+        and the loser's ALTER hits ``duplicate column name``. The loser must
+        treat that as benign and initialize cleanly instead of crashing
+        startup. Forcing the snapshot to ``set()`` makes EVERY new-column
+        ALTER duplicate, so the tolerance is exercised for all of them.
+        """
+        db_path = tmp_path / "metrics.db"
+        # Winner fully migrates the DB.
+        winner = MetricsStore(db_path)
+        winner.initialize()
+        winner.close()
+
+        # Loser reads a stale (empty) snapshot → every ALTER targets an
+        # already-present column and raises "duplicate column name".
+        monkeypatch.setattr(MetricsStore, "_existing_columns", lambda self, db: set())
+        loser = MetricsStore(db_path)
+        try:
+            loser.initialize()  # must not raise
+            assert NEW_COLUMNS.issubset(_column_names(loser._db))
+        finally:
+            loser.close()
+
+    def test_migrate_reraises_non_duplicate_operational_error(self, tmp_path, monkeypatch):
+        """The duplicate-column tolerance must not swallow real ALTER
+        failures — any other ``OperationalError`` still propagates so a
+        genuinely broken migration is not silently skipped."""
+        db_path = tmp_path / "metrics.db"
+
+        class _AlterFailsConnection:
+            """Wraps a real connection; makes only the ADD COLUMN ALTERs
+            fail with a non-duplicate error, delegating everything else."""
+
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
+                if sql.startswith("ALTER TABLE proxy_metrics ADD COLUMN"):
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name: str):  # noqa: ANN202
+                return getattr(self._real, name)
+
+        real_connect = sqlite3.connect
+        monkeypatch.setattr(
+            "memtomem_stm.proxy.metrics_store.sqlite3.connect",
+            lambda *a, **k: _AlterFailsConnection(real_connect(*a, **k)),
+        )
+
+        store = MetricsStore(db_path)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            store.initialize()
+
 
 class TestRecordPersistsNewFields:
     """``CallMetrics`` → SQLite round-trip for the F2 observability fields."""
