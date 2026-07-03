@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from memtomem_stm.proxy.config import (
     ProxyConfig,
+    TransportType,
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
@@ -94,6 +95,170 @@ class TestStart:
             await mgr.start()
 
         assert "Failed to connect to upstream server 'bad'" in caplog.text
+        # #580: the failed server is recorded so it stays visible in health,
+        # instead of vanishing (no _connections entry is created on failure).
+        assert "bad" in mgr._failed_servers
+        assert "unreachable" in mgr._failed_servers["bad"]
+
+    async def test_startup_failed_server_appears_in_health(self):
+        """#580: a configured-but-unconnected server surfaces in
+        get_upstream_health with connected=False and its connect error,
+        making the DISCONNECTED rendering reachable."""
+        mgr = _make_manager(
+            servers={
+                "ok": UpstreamServerConfig(prefix="ok"),
+                "bad": UpstreamServerConfig(prefix="bad"),
+            }
+        )
+
+        async def _conditional_connect(name, cfg):
+            if name == "bad":
+                raise ConnectionError("unreachable")
+            # The 'ok' server: register a live connection so it reports healthy.
+            mgr._connections[name] = UpstreamConnection(
+                name=name, config=cfg, session=AsyncMock(), tools=[]
+            )
+
+        with patch.object(mgr, "_connect_server", side_effect=_conditional_connect):
+            await mgr.start()
+
+        health = mgr.get_upstream_health()
+        assert health["bad"]["connected"] is False
+        assert "unreachable" in health["bad"]["error"]
+        assert health["ok"]["connected"] is True
+        assert "error" not in health["ok"]
+
+    async def test_health_prefers_live_connection_over_stale_failed_entry(self):
+        """If a name is somehow in both maps (a live connection and a stale
+        failed record), get_upstream_health reports it connected — the live
+        connection wins and no error line leaks (#580 guard)."""
+        mgr = _make_manager(servers={"srv": UpstreamServerConfig(prefix="srv")})
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=UpstreamServerConfig(prefix="srv"), session=AsyncMock(), tools=[]
+        )
+        mgr._failed_servers["srv"] = "stale error"
+
+        health = mgr.get_upstream_health()
+        assert health["srv"]["connected"] is True
+        assert "error" not in health["srv"]
+
+    async def test_startup_failure_redacts_credentialed_url(self):
+        """#580: a startup connect error whose message embeds a credentialed
+        URL (as httpx exceptions do) must be scrubbed before it lands in
+        _failed_servers / stm_proxy_health — otherwise the token leaks to the
+        MCP client/model through the health tool."""
+        url = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=url),
+            }
+        )
+
+        async def _leaky_connect(name, cfg):
+            # httpx-style message that embeds the full request URL, userinfo
+            # included.
+            raise ConnectionError(f"All connection attempts failed for {url}")
+
+        with patch.object(mgr, "_connect_server", side_effect=_leaky_connect):
+            await mgr.start()
+
+        recorded = mgr._failed_servers["web"]
+        health_error = mgr.get_upstream_health()["web"]["error"]
+        for blob in (recorded, health_error):
+            assert "s3cr3t-token" not in blob
+            assert "alice:s3cr3t-token" not in blob
+            assert "***@ltm.example.com" in blob
+
+    async def test_startup_failure_redacts_long_credential_past_cap(self):
+        """#580: redaction runs on the FULL message before the 500-char cap, so
+        a credential long enough that ``@host`` falls past the cap is still
+        scrubbed. Capping first (as format_error_message_from_exc does) would
+        truncate the token mid-string, leaving a partial that redact can no
+        longer match against the configured URL."""
+        from memtomem_stm.proxy.metrics import MAX_ERROR_MESSAGE_CHARS
+
+        token = "t" * (MAX_ERROR_MESSAGE_CHARS + 300)  # pushes @host past the cap
+        url = f"https://user:{token}@ltm.example.com/mcp"
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=url),
+            }
+        )
+
+        async def _leaky_connect(name, cfg):
+            raise ConnectionError(f"All connection attempts failed for {url}")
+
+        with patch.object(mgr, "_connect_server", side_effect=_leaky_connect):
+            await mgr.start()
+
+        recorded = mgr._failed_servers["web"]
+        health_error = mgr.get_upstream_health()["web"]["error"]
+        for blob in (recorded, health_error):
+            # Not even a long partial run of the token may survive the cap.
+            assert token not in blob
+            assert "t" * 100 not in blob
+            assert "***@ltm.example.com" in blob
+
+    async def test_startup_failure_log_line_redacts_credential(self, caplog):
+        """#580: the operator LOG for a failed credentialed connect must also be
+        scrubbed. The failure is logged as a redacted message, not via
+        logger.exception whose traceback tail repeats the raw exception string
+        (URL included)."""
+        url = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=url),
+            }
+        )
+
+        async def _leaky_connect(name, cfg):
+            raise ConnectionError(f"All connection attempts failed for {url}")
+
+        with caplog.at_level("ERROR"):
+            with patch.object(mgr, "_connect_server", side_effect=_leaky_connect):
+                await mgr.start()
+
+        # caplog.text includes any exc_info traceback, so this also fails if the
+        # code regresses to logger.exception.
+        assert "s3cr3t-token" not in caplog.text
+        assert "alice:s3cr3t-token" not in caplog.text
+        # The failure is still logged, redacted.
+        assert "Failed to connect to upstream server 'web'" in caplog.text
+        assert "***@ltm.example.com" in caplog.text
+
+    async def test_url_less_network_upstream_recorded_in_health(self):
+        """#580: a non-stdio upstream configured without a url is skipped by
+        _connect_server with a warning + early return (no exception), so it
+        must be recorded in _failed_servers itself — otherwise start()'s except
+        never fires and the misconfigured server stays false-green in health."""
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=""),
+            }
+        )
+
+        await mgr.start()
+
+        assert "web" in mgr._failed_servers
+        assert "configuration error" in mgr._failed_servers["web"]
+        health = mgr.get_upstream_health()
+        assert health["web"]["connected"] is False
+        assert "configuration error" in health["web"]["error"]
+
+    async def test_double_start_clears_stale_failed_servers(self):
+        """#580: a manager reused across start() calls must not keep reporting
+        a previous session's failed upstream — the double-start reset clears
+        _failed_servers alongside _connections."""
+        mgr = _make_manager(servers={})
+        with patch.object(ProxyConfig, "load_from_file", return_value=None):
+            await mgr.start()
+        mgr._failed_servers["gone"] = "stale connect error"
+
+        with patch.object(ProxyConfig, "load_from_file", return_value=None):
+            await mgr.start()
+
+        assert mgr._failed_servers == {}
+        assert "gone" not in mgr.get_upstream_health()
 
     async def test_double_start_closes_previous(self):
         """Calling start() twice closes the previous AsyncExitStack."""
@@ -163,6 +328,16 @@ class TestStop:
         await mgr.stop()
 
         mock_ext.close.assert_awaited_once()
+
+    async def test_stop_clears_failed_servers(self):
+        """#580: stop() clears startup-failure records so a stopped manager
+        reports no upstreams — mirrors the double-start reset."""
+        mgr = _make_manager(servers={})
+        mgr._failed_servers["bad"] = "connect error"
+
+        await mgr.stop()
+
+        assert mgr._failed_servers == {}
 
     async def test_stop_nulls_extractor_so_restart_rebuilds(self):
         """stop() nulls _extractor (like _llm_compressor) — _get_extractor()
@@ -282,6 +457,46 @@ class TestConnectServerCleanup:
         assert "bad" not in mgr._connections
         mock_session.__aexit__.assert_awaited_once()
         mock_transport.__aexit__.assert_awaited_once()
+
+    async def test_cleanup_failure_log_redacts_credential(self, caplog):
+        """#580: if the rollback aclose() ALSO raises for a credentialed network
+        upstream, the DEBUG cleanup log must not leak the token — the message is
+        redacted and no exc_info traceback (whose tail repeats the raw exception
+        string) is emitted."""
+        import pytest as _pt
+
+        url = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+        cfg = UpstreamServerConfig(prefix="bad", transport=TransportType.SSE, url=url)
+        mgr = _make_manager(servers={"bad": cfg})
+
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(side_effect=RuntimeError("catalog failed"))
+
+        mock_transport = AsyncMock()
+        mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        # The rollback close itself raises an httpx-style error embedding the URL.
+        mock_transport.__aexit__ = AsyncMock(
+            side_effect=ConnectionError(f"cleanup failed for {url}")
+        )
+
+        with caplog.at_level("DEBUG"):
+            with (
+                patch.object(mgr, "_open_transport", return_value=mock_transport),
+                patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+            ):
+                with _pt.raises(RuntimeError, match="catalog failed"):
+                    await mgr._connect_server("bad", cfg)
+
+        assert "Error during initial connection cleanup for 'bad'" in caplog.text
+        assert "s3cr3t-token" not in caplog.text
+        assert "alice:s3cr3t-token" not in caplog.text
+        assert "***@ltm.example.com" in caplog.text
 
 
 class TestConcurrentReconnect:

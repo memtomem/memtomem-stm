@@ -133,6 +133,7 @@ from memtomem_stm.proxy.metrics import (
     format_error_message_from_exc,
 )
 from memtomem_stm.observability.tracing import traced
+from memtomem_stm.utils.redact import redact_exception_text
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
 # Retrying these wastes time and can damage the connection.
@@ -306,6 +307,13 @@ class ProxyManager:
         self._toolgraph_cache: GraphConsultCache | None = None
         self._toolgraph_from_cache: bool = False
         self._connections: dict[str, UpstreamConnection] = {}
+        # Configured servers whose startup connect FAILED (#580). Entries never
+        # land in ``_connections`` (created only on a successful connect), so
+        # without this map a startup-failed upstream is invisible in
+        # ``stm_proxy_health`` — an operator sees only healthy servers and no
+        # anomaly. name → short error summary; an entry is cleared if the
+        # server later connects (e.g. via reconnect).
+        self._failed_servers: dict[str, str] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
         self._selective_compressor_cfg: SelectiveConfig | None = None
@@ -363,6 +371,12 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            # Drop stale startup-failure records (#580): a manager reused across
+            # ``start()`` calls (new config, or a server removed) must not keep
+            # reporting a previous session's failed upstream in
+            # ``stm_proxy_health``. The next connect pass repopulates from the
+            # current config.
+            self._failed_servers.clear()
             # Reset the #557 refresh bookkeeping alongside the connections it
             # tracks (same rationale as in ``stop()``): a ``running`` entry
             # orphaned by a never-started drain task would silently drop every
@@ -453,8 +467,21 @@ class ProxyManager:
         for name, cfg in servers.items():
             try:
                 await self._connect_server(name, cfg)
-            except Exception:
-                logger.exception("Failed to connect to upstream server '%s'", name)
+            except Exception as exc:
+                # Redact the exception text ONCE, then reuse it for both the
+                # operator log and the health record (#580). httpx transport
+                # exceptions embed the credentialed request URL, so an unredacted
+                # path would leak the token — via ``stm_proxy_health`` to the MCP
+                # client/model, or via the log. Do NOT use ``logger.exception``:
+                # its traceback tail repeats the raw, unredacted exception string.
+                redacted = self._redacted_error(exc, cfg.url)
+                logger.error("Failed to connect to upstream server '%s': %s", name, redacted)
+                # Record the failure so ``get_upstream_health`` can report the
+                # configured-but-dead server — otherwise it is absent from
+                # ``stm_proxy_health`` entirely (no ``_connections`` entry is
+                # created on a failed connect) and the degradation is
+                # undiagnosable from inside the session.
+                self._failed_servers[name] = redacted
 
         # #465: evaluate per-tool health once per session, before the first
         # advertisement. get_proxy_tools() applies this cached snapshot so
@@ -835,12 +862,32 @@ class ProxyManager:
                     StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
                 )
 
+    @staticmethod
+    def _redacted_error(exc: BaseException, url: str) -> str:
+        """Exception text with *url* userinfo scrubbed, capped for storage/logs
+        (#580). One choke point for every credential-safe rendering of a
+        connect/cleanup exception: httpx transport errors embed the credentialed
+        request URL, so any log or health field built from them must go through
+        here. Redacts the FULL message BEFORE the cap so a long credential can't
+        be truncated past ``redact_exception_text``'s reach.
+        """
+        return redact_exception_text(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_MESSAGE_CHARS]
+
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
             raise RuntimeError("ProxyManager.start() not called")
 
         if cfg.transport != TransportType.STDIO and not cfg.url:
             logger.warning("Skipping server '%s': transport=%s requires url", name, cfg.transport)
+            # Record the misconfiguration (#580) instead of returning silently:
+            # this early return raises nothing, so ``start()``'s except never
+            # fires and the configured-but-unconnected server would otherwise
+            # stay invisible in ``stm_proxy_health`` — the exact false-green
+            # this surfacing is meant to close. Static message (no url), so
+            # nothing to redact.
+            self._failed_servers[name] = (
+                f"configuration error: transport={cfg.transport.value} requires a url"
+            )
             return
 
         conn_stack = AsyncExitStack()
@@ -858,9 +905,14 @@ class ProxyManager:
             # visible to stop()/reconnect cleanup.
             try:
                 await conn_stack.aclose()
-            except Exception:
+            except Exception as cleanup_exc:
+                # Redact + no exc_info (#580): a network transport was opened
+                # with the credentialed ``cfg.url``, so a cleanup failure's
+                # traceback tail could otherwise leak the token even at DEBUG.
                 logger.debug(
-                    "Error during initial connection cleanup for '%s'", name, exc_info=True
+                    "Error during initial connection cleanup for '%s': %s",
+                    name,
+                    self._redacted_error(cleanup_exc, cfg.url),
                 )
             raise
 
@@ -893,6 +945,8 @@ class ProxyManager:
         self._connections[name] = UpstreamConnection(
             name=name, config=cfg, session=session, tools=list(result.tools), stack=conn_stack
         )
+        # A successful connect clears any prior startup-failure record (#580).
+        self._failed_servers.pop(name, None)
         logger.info("Connected to '%s' (%s tools discovered)", name, len(result.tools))
 
     async def _reconnect_server(self, name: str) -> None:
@@ -1176,6 +1230,9 @@ class ProxyManager:
                 logger.debug("Failed to close progressive store on stop", exc_info=True)
             self._progressive_store = None
             self._progressive_store_cfg = None
+        # Clear startup-failure records too (#580) so a stopped manager reports
+        # no upstreams — mirrors the double-start reset in ``start()``.
+        self._failed_servers.clear()
 
     @property
     def _config(self) -> ProxyConfig:
@@ -2186,6 +2243,12 @@ class ProxyManager:
         withheld tool from a missing one. ``advertised_tools`` reflects
         the most recent ``get_proxy_tools()`` pass — in the server it runs
         at startup registration, before any health probe can observe it.
+
+        A configured server that FAILED to connect at startup (#580) has no
+        ``_connections`` entry, so it is reported here from ``_failed_servers``
+        with ``connected: False`` and an ``error`` summary — making the
+        existing ``DISCONNECTED`` rendering reachable instead of the server
+        vanishing from health entirely.
         """
         health: dict[str, dict] = {}
         for name, conn in self._connections.items():
@@ -2195,6 +2258,17 @@ class ProxyManager:
                 "advertised_tools": sum(
                     1 for info in self._advertised_infos if info.server == name
                 ),
+            }
+        for name, error in self._failed_servers.items():
+            # A server can't be both connected and in the failed map (the
+            # success path pops it), but guard against a stale entry anyway.
+            if name in health:
+                continue
+            health[name] = {
+                "connected": False,
+                "tools": 0,
+                "advertised_tools": 0,
+                "error": error,
             }
         return health
 
