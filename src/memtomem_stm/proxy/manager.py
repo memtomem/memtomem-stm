@@ -361,10 +361,15 @@ class ProxyManager:
                 if conn.stack is not None:
                     try:
                         await conn.stack.aclose()
-                    except Exception:
+                    except Exception as cleanup_exc:
+                        # Redact + no exc_info (#605): this stack wraps a transport
+                        # opened with the credentialed ``conn.config.url``, so a
+                        # close failure's traceback tail could leak the token even
+                        # at DEBUG. Route through the #593 choke point.
                         logger.debug(
-                            "Failed to close connection stack in double-start guard",
-                            exc_info=True,
+                            "Failed to close connection stack for '%s' in double-start guard: %s",
+                            conn.name,
+                            self._redacted_error(cleanup_exc, conn.config.url),
                         )
             try:
                 await self._stack.aclose()
@@ -969,8 +974,15 @@ class ProxyManager:
             if conn.stack is not None:
                 try:
                     await conn.stack.aclose()
-                except Exception:
-                    logger.debug("Failed to close previous stack for '%s'", name, exc_info=True)
+                except Exception as cleanup_exc:
+                    # Redact + no exc_info (#605): the previous stack wraps a
+                    # transport opened with the credentialed ``cfg.url``, so a
+                    # close failure's traceback tail could leak the token at DEBUG.
+                    logger.debug(
+                        "Failed to close previous stack for '%s': %s",
+                        name,
+                        self._redacted_error(cleanup_exc, cfg.url),
+                    )
 
             conn_stack = AsyncExitStack()
             try:
@@ -988,8 +1000,15 @@ class ProxyManager:
                 # and child processes across retry storms.
                 try:
                     await conn_stack.aclose()
-                except Exception:
-                    logger.debug("Error during reconnect cleanup for '%s'", name, exc_info=True)
+                except Exception as cleanup_exc:
+                    # Redact + no exc_info (#605): the rolled-back stack wraps a
+                    # transport just opened with the credentialed ``cfg.url``, so a
+                    # close failure's traceback tail could leak the token at DEBUG.
+                    logger.debug(
+                        "Error during reconnect cleanup for '%s': %s",
+                        name,
+                        self._redacted_error(cleanup_exc, cfg.url),
+                    )
                 raise
 
             conn.session = session
@@ -1206,8 +1225,15 @@ class ProxyManager:
             if conn.stack is not None:
                 try:
                     await conn.stack.aclose()
-                except Exception:
-                    logger.debug("Failed to close connection stack", exc_info=True)
+                except Exception as cleanup_exc:
+                    # Redact + no exc_info (#605): this stack wraps a transport
+                    # opened with the credentialed ``conn.config.url``, so a close
+                    # failure's traceback tail could leak the token at DEBUG.
+                    logger.debug(
+                        "Failed to close connection stack for '%s': %s",
+                        conn.name,
+                        self._redacted_error(cleanup_exc, conn.config.url),
+                    )
         if self._stack:
             await self._stack.aclose()
             self._stack = None
@@ -2721,8 +2747,15 @@ class ProxyManager:
                 _mark_recorded(deadline_exc)
                 try:
                     await self._reconnect_server(server)
-                except Exception:
-                    logger.debug("Post-deadline reconnect failed", exc_info=True)
+                except Exception as reconnect_exc:
+                    # Redact + no exc_info (#605): the reconnect reopens a transport
+                    # with the credentialed ``cfg.url``, so a failure's traceback
+                    # tail could leak the token at DEBUG.
+                    logger.debug(
+                        "Post-deadline reconnect failed for '%s': %s",
+                        server,
+                        self._redacted_error(reconnect_exc, cfg.url),
+                    )
                 raise deadline_exc
             per_attempt_timeout = min(cfg.call_timeout_seconds, remaining_deadline)
             try:
@@ -2776,12 +2809,18 @@ class ProxyManager:
                     _mark_recorded(exc)
                     try:
                         await self._reconnect_server(server)
-                    except Exception:
+                    except Exception as reconnect_exc:
                         # Expected fallback: the primary error is already being
                         # re-raised and carries the actionable trace. The
                         # reconnect attempt here is best-effort for the NEXT
                         # call — a failure is noise for current operators.
-                        logger.debug("Post-protocol-error reconnect failed", exc_info=True)
+                        # Redact + no exc_info (#605): the reconnect reopens a
+                        # transport with the credentialed ``cfg.url``.
+                        logger.debug(
+                            "Post-protocol-error reconnect failed for '%s': %s",
+                            server,
+                            self._redacted_error(reconnect_exc, cfg.url),
+                        )
                     raise
 
                 # Timeout-replay guard (#578): a per-attempt timeout cancels OUR
@@ -2826,11 +2865,17 @@ class ProxyManager:
                     # Reconnect before raising so the NEXT call starts fresh
                     try:
                         await self._reconnect_server(server)
-                    except Exception:
+                    except Exception as reconnect_exc:
                         # Same reasoning as the protocol-error path above:
                         # the primary failure is being re-raised, the
                         # reconnect attempt is just pre-emptive cleanup.
-                        logger.debug("Post-failure reconnect failed", exc_info=True)
+                        # Redact + no exc_info (#605): the reconnect reopens a
+                        # transport with the credentialed ``cfg.url``.
+                        logger.debug(
+                            "Post-failure reconnect failed for '%s': %s",
+                            server,
+                            self._redacted_error(reconnect_exc, cfg.url),
+                        )
                     raise
                 logger.warning(
                     "Tool call %s/%s failed (attempt %d/%d): %s",

@@ -680,3 +680,230 @@ class TestConnectServerOverflowSkip:
         assert mgr._advertised_reject_reasons == {}
         # No overflow guidance in the log — no overflow happened.
         assert "will not be advertised" not in caplog.text
+
+
+class TestCleanupLogCredentialRedaction:
+    """#605 (follow-up to #580/#593): the connection-lifecycle cleanup and
+    reconnect DEBUG logs close or reopen transports opened with the
+    credentialed ``cfg.url``. httpx transport exceptions embed the request
+    URL, so a close/reconnect failure routed through ``logger.debug(...,
+    exc_info=True)`` would repeat the token in the traceback tail. Every such
+    site must instead render the exception through ``_redacted_error`` with no
+    ``exc_info`` — the same guarantee #593 gave the startup connect path.
+
+    One regression per in-scope site: the two ``_reconnect_server`` closes, the
+    ``stop()`` and double-start-guard connection-stack closes, and the three
+    ``_fetch_upstream`` post-error reconnect logs.
+    """
+
+    URL = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+
+    def _assert_redacted(self, caplog, expect_msg: str) -> None:
+        assert expect_msg in caplog.text
+        assert "s3cr3t-token" not in caplog.text
+        assert "alice:s3cr3t-token" not in caplog.text
+        # The redacted rendering still identifies the host for operators.
+        assert "***@ltm.example.com" in caplog.text
+
+    def _cfg(self, **overrides) -> UpstreamServerConfig:
+        return UpstreamServerConfig(
+            prefix="bad", transport=TransportType.SSE, url=self.URL, **overrides
+        )
+
+    async def test_double_start_guard_conn_stack_close_redacts(self, caplog):
+        """start() re-entry closes each live connection's stack; a close failure
+        for a credentialed upstream must not leak the token."""
+        from contextlib import AsyncExitStack
+
+        cfg = self._cfg()
+        mgr = _make_manager(servers={"bad": cfg})
+        failing_stack = AsyncMock()
+        failing_stack.aclose = AsyncMock(
+            side_effect=ConnectionError(f"close failed for {self.URL}")
+        )
+        mgr._connections["bad"] = UpstreamConnection(
+            name="bad", config=cfg, session=AsyncMock(), tools=[], stack=failing_stack
+        )
+        mgr._stack = AsyncExitStack()  # non-None → double-start branch runs
+
+        with caplog.at_level("DEBUG"):
+            with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+                await mgr.start()
+
+        self._assert_redacted(
+            caplog, "Failed to close connection stack for 'bad' in double-start guard"
+        )
+
+    async def test_stop_conn_stack_close_redacts(self, caplog):
+        """stop() closes every connection stack; a close failure for a
+        credentialed upstream must not leak the token."""
+        from contextlib import AsyncExitStack
+
+        cfg = self._cfg()
+        mgr = _make_manager(servers={"bad": cfg})
+        failing_stack = AsyncMock()
+        failing_stack.aclose = AsyncMock(
+            side_effect=ConnectionError(f"close failed for {self.URL}")
+        )
+        mgr._connections["bad"] = UpstreamConnection(
+            name="bad", config=cfg, session=AsyncMock(), tools=[], stack=failing_stack
+        )
+        mgr._stack = AsyncExitStack()
+
+        with caplog.at_level("DEBUG"):
+            await mgr.stop()
+
+        self._assert_redacted(caplog, "Failed to close connection stack for 'bad'")
+
+    async def test_reconnect_previous_stack_close_redacts(self, caplog):
+        """_reconnect_server closes the previous stack before reopening; a close
+        failure must not leak the credentialed URL."""
+        cfg = self._cfg(connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"bad": cfg})
+        failing_stack = AsyncMock()
+        failing_stack.aclose = AsyncMock(
+            side_effect=ConnectionError(f"prev close failed for {self.URL}")
+        )
+        mgr._connections["bad"] = UpstreamConnection(
+            name="bad", config=cfg, session=AsyncMock(), tools=[], stack=failing_stack
+        )
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+        mock_transport = AsyncMock()
+        mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        mock_transport.__aexit__ = AsyncMock(return_value=False)
+
+        with caplog.at_level("DEBUG"):
+            with (
+                patch.object(mgr, "_open_transport", return_value=mock_transport),
+                patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+            ):
+                await mgr._reconnect_server("bad")
+
+        self._assert_redacted(caplog, "Failed to close previous stack for 'bad'")
+
+    async def test_reconnect_rollback_cleanup_redacts(self, caplog):
+        """When a reconnect's list_tools fails, the rollback aclose() of the new
+        stack may itself raise for a credentialed transport; the cleanup log
+        must not leak the token."""
+        import pytest as _pt
+
+        cfg = self._cfg(connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"bad": cfg})
+        mgr._connections["bad"] = UpstreamConnection(
+            name="bad", config=cfg, session=AsyncMock(), tools=[], stack=None
+        )
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(side_effect=RuntimeError("catalog failed"))
+        mock_transport = AsyncMock()
+        mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        mock_transport.__aexit__ = AsyncMock(
+            side_effect=ConnectionError(f"rollback failed for {self.URL}")
+        )
+
+        with caplog.at_level("DEBUG"):
+            with (
+                patch.object(mgr, "_open_transport", return_value=mock_transport),
+                patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+            ):
+                with _pt.raises(RuntimeError, match="catalog failed"):
+                    await mgr._reconnect_server("bad")
+
+        self._assert_redacted(caplog, "Error during reconnect cleanup for 'bad'")
+
+    def _seed_fetch_conn(self, mgr, cfg):
+        """A connection whose session.call_tool is a controllable AsyncMock."""
+        session = AsyncMock()
+        mgr._connections["bad"] = UpstreamConnection(
+            name="bad", config=cfg, session=session, tools=[], stack=AsyncMock()
+        )
+        return session
+
+    async def test_fetch_post_deadline_reconnect_redacts(self, caplog):
+        """_fetch_upstream best-effort reconnect after the overall deadline is
+        blown; a reconnect failure must not leak the credentialed URL."""
+        import pytest as _pt
+
+        cfg = self._cfg(overall_deadline_seconds=1.0, call_timeout_seconds=1.0)
+        mgr = _make_manager(servers={"bad": cfg})
+        self._seed_fetch_conn(mgr, cfg)
+
+        with caplog.at_level("DEBUG"):
+            with (
+                # _call_started_at, then the in-loop deadline check reads a
+                # monotonic far in the future → remaining_deadline <= 0.
+                patch(
+                    "memtomem_stm.proxy.manager._time.monotonic",
+                    side_effect=[100.0, 200.0, 200.0, 200.0],
+                ),
+                patch.object(
+                    mgr,
+                    "_reconnect_server",
+                    new_callable=AsyncMock,
+                    side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
+                ),
+            ):
+                with _pt.raises(asyncio.TimeoutError):
+                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+
+        self._assert_redacted(caplog, "Post-deadline reconnect failed for 'bad'")
+
+    async def test_fetch_post_protocol_error_reconnect_redacts(self, caplog):
+        """_fetch_upstream reconnects after a no-retry protocol error; a
+        reconnect failure must not leak the credentialed URL."""
+        import pytest as _pt
+
+        cfg = self._cfg()
+        mgr = _make_manager(servers={"bad": cfg})
+        session = self._seed_fetch_conn(mgr, cfg)
+
+        class _ProtocolError(Exception):
+            def __init__(self):
+                super().__init__("protocol boom")
+                self.error = SimpleNamespace(code=-32601)  # METHOD_NOT_FOUND
+
+        session.call_tool = AsyncMock(side_effect=_ProtocolError())
+
+        with caplog.at_level("DEBUG"):
+            with patch.object(
+                mgr,
+                "_reconnect_server",
+                new_callable=AsyncMock,
+                side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
+            ):
+                with _pt.raises(_ProtocolError):
+                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+
+        self._assert_redacted(caplog, "Post-protocol-error reconnect failed for 'bad'")
+
+    async def test_fetch_post_failure_reconnect_redacts(self, caplog):
+        """_fetch_upstream reconnects after exhausting retries on a transport
+        error; a reconnect failure must not leak the credentialed URL."""
+        import pytest as _pt
+
+        cfg = self._cfg(max_retries=0)
+        mgr = _make_manager(servers={"bad": cfg})
+        session = self._seed_fetch_conn(mgr, cfg)
+        # URL-free upstream error so the ONLY token-bearing string is the
+        # reconnect failure we assert is redacted.
+        session.call_tool = AsyncMock(side_effect=ConnectionError("upstream boom"))
+
+        with caplog.at_level("DEBUG"):
+            with patch.object(
+                mgr,
+                "_reconnect_server",
+                new_callable=AsyncMock,
+                side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
+            ):
+                with _pt.raises(ConnectionError, match="upstream boom"):
+                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+
+        self._assert_redacted(caplog, "Post-failure reconnect failed for 'bad'")
