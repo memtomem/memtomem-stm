@@ -43,6 +43,33 @@ class TestProxyCacheBasic:
         assert proxy_cache.get("s", "t", {"a": 1}) == "new"
 
 
+class TestProxyCacheDegradation:
+    def test_get_degrades_to_miss_on_sqlite_error(self, tmp_path, caplog):
+        """A lookup fault (disk I/O error, page corruption mid-session, a
+        writer holding the file past the busy timeout) must degrade to a
+        plain MISS instead of raising out of the request path — the cache
+        is optional and must never fail an otherwise-healthy proxied call."""
+        cache = ProxyCache(tmp_path / "c.db", max_entries=10)
+        cache.initialize()
+        cache.set("s", "t", {"a": 1}, "result", ttl_seconds=60.0)
+        assert cache.get("s", "t", {"a": 1}) == "result"  # sanity
+
+        real_db = cache._db
+
+        class _BoomDB:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("disk I/O error")
+
+        cache._db = _BoomDB()
+        try:
+            with caplog.at_level("WARNING", logger="memtomem_stm.proxy.cache"):
+                assert cache.get("s", "t", {"a": 1}) is None
+            assert any("Cache lookup failed" in r.getMessage() for r in caplog.records)
+        finally:
+            cache._db = real_db
+            cache.close()
+
+
 class TestProxyCacheTTL:
     def test_expired_entry_returns_none(self, proxy_cache: ProxyCache):
         proxy_cache.set("s", "t", {"a": 1}, "result", ttl_seconds=0.001)

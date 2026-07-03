@@ -174,11 +174,25 @@ class ProxyCache:
         if self._db is None:
             return None
         key = _make_key(server, tool, args)
-        with self._lock:
-            row = self._db.execute(
-                "SELECT result, created_at, ttl_seconds FROM proxy_cache WHERE cache_key = ?",
-                (key,),
-            ).fetchone()
+        try:
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT result, created_at, ttl_seconds FROM proxy_cache WHERE cache_key = ?",
+                    (key,),
+                ).fetchone()
+        except sqlite3.Error:
+            # A lookup fault (disk I/O error, page-level corruption surfacing
+            # mid-session, an external writer holding the file past the busy
+            # timeout) must degrade to a plain MISS — the cache is an optional
+            # optimization and a read fault must never fail the proxied call.
+            # Mirrors the privacy-eviction guard below and GraphConsultCache.get.
+            logger.warning(
+                "Cache lookup failed for %s/%s — serving a miss",
+                server,
+                tool,
+                exc_info=True,
+            )
+            return None
         if row is None:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
