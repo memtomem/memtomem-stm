@@ -107,7 +107,14 @@ class SurfacingEngine:
                     )
             except Exception:
                 logger.warning("Failed to load cross-session seen IDs", exc_info=True)
-        # In-memory boost guard — at most one mem_do(increment_access) call
+        # Bound surfacing_events once at startup (#584): stm_surfacing_stats
+        # reads get_stats directly and can be called before the first surface()
+        # fires this session, so the opportunistic _maybe_cleanup_expired path
+        # alone would leave that first read scanning an unbounded table after a
+        # restart. Runs after the store is known to be open (seed block above
+        # already read from it).
+        if feedback_tracker is not None:
+            self._run_stats_retention(feedback_tracker.store)
         # per surfacing event, even if the agent fires multiple "helpful"
         # ratings for it. Insertion-ordered dict for FIFO eviction; cap at
         # 10k matches the sibling _surfaced_ids bound.
@@ -970,6 +977,31 @@ class SurfacingEngine:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
 
+    def _run_stats_retention(self, store: Any) -> None:
+        """Delete ``surfacing_events`` rows past the stats-retention window so
+        ``get_stats`` cannot full-scan an unbounded history (#584).
+
+        Called both opportunistically from ``surface()`` (via
+        ``_maybe_cleanup_expired``) and once at startup: ``stm_surfacing_stats``
+        reads ``get_stats`` directly and an operator can call it before the
+        first ``surface()`` fires after a restart, so relying on the surface()
+        path alone would leave that first stats read scanning the whole table.
+        ``stats_retention_days <= 0`` disables it.
+        """
+        stats_retention_days = self._config.stats_retention_days
+        if stats_retention_days <= 0:
+            return
+        try:
+            deleted = store.delete_events_older_than(stats_retention_days * 86400.0)
+            if deleted:
+                logger.info(
+                    "Deleted %d surfacing_events rows older than %d days (#584)",
+                    deleted,
+                    stats_retention_days,
+                )
+        except Exception:
+            logger.warning("Failed to delete expired surfacing_events", exc_info=True)
+
     def _maybe_cleanup_expired(self) -> None:
         """Run periodic store maintenance at most once per cleanup interval.
 
@@ -999,20 +1031,10 @@ class SurfacingEngine:
                     logger.info("Cleaned up %d expired seen_memories entries", deleted)
             except Exception:
                 logger.warning("Failed to clean up expired seen_memories", exc_info=True)
-        if stats_retention_days > 0:
-            # Delete aged-out event rows BEFORE nulling queries: a row past the
-            # stats window is gone entirely, so nulling its query first would be
-            # wasted work. Bounds the table get_stats scans (#584).
-            try:
-                deleted = store.delete_events_older_than(stats_retention_days * 86400.0)
-                if deleted:
-                    logger.info(
-                        "Deleted %d surfacing_events rows older than %d days (#584)",
-                        deleted,
-                        stats_retention_days,
-                    )
-            except Exception:
-                logger.warning("Failed to delete expired surfacing_events", exc_info=True)
+        # Delete aged-out event rows BEFORE nulling queries: a row past the
+        # stats window is gone entirely, so nulling its query first would be
+        # wasted work. Bounds the table get_stats scans (#584).
+        self._run_stats_retention(store)
         if retention_days > 0:
             try:
                 nulled = store.cleanup_expired_queries(retention_days * 86400.0)

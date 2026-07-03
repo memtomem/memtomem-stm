@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS auto_tune_adjustments (
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_memory_rating ON surfacing_feedback(memory_id, rating);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
+-- #584: the stats-retention delete and get_stats both filter/order on
+-- created_at; without this index each is a full scan on a large history.
+CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 """
 
@@ -111,6 +114,10 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
         DROP TABLE surfacing_events;
         ALTER TABLE surfacing_events__migrate_352 RENAME TO surfacing_events;
         CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
+        -- Recreate the #584 created_at index too: DROP TABLE above dropped the
+        -- one _SCHEMA created, and initialize() does not re-run _SCHEMA after
+        -- this migration.
+        CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at);
         COMMIT;
         """
     )

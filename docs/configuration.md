@@ -316,11 +316,13 @@ Full example with all options:
   },
   "compression_feedback": {
     "enabled": true,
-    "db_path": "~/.memtomem/stm_feedback.db"
+    "db_path": "~/.memtomem/stm_feedback.db",
+    "retention_days": 90
   },
   "progressive_reads": {
     "enabled": true,
-    "db_path": "~/.memtomem/stm_feedback.db"
+    "db_path": "~/.memtomem/stm_feedback.db",
+    "retention_days": 90
   },
   "selection_telemetry": {
     "enabled": false,

@@ -1841,6 +1841,9 @@ class TestMaybeCleanupExpired:
             mcp_adapter=_make_mcp_adapter(results),
             feedback_tracker=tracker,
         )
+        # Construction runs a startup retention pass (#584); reset so this test
+        # asserts only the surface()-triggered call.
+        tracker.store.delete_events_older_than.reset_mock()
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
@@ -1870,10 +1873,49 @@ class TestMaybeCleanupExpired:
             mcp_adapter=_make_mcp_adapter(results),
             feedback_tracker=tracker,
         )
+        # The startup retention pass (#584) also hits the raising mock and must
+        # itself be swallowed (construction did not raise); reset so the assert
+        # below counts only the surface()-triggered call.
+        tracker.store.delete_events_older_than.reset_mock()
         engine._last_cleanup = time.monotonic() - 7200
 
         out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "mem" in out
+        tracker.store.delete_events_older_than.assert_called_once()
+
+    def test_stats_retention_runs_at_startup(self):
+        """#584: retention runs once at engine construction, so a
+        ``stm_surfacing_stats`` read before the first ``surface()`` fires after
+        a restart still sees a bounded table."""
+        tracker = self._make_tracker()
+        SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, stats_retention_days=90),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=tracker,
+        )
+        tracker.store.delete_events_older_than.assert_called_once_with(90 * 86400.0)
+
+    def test_no_startup_retention_when_disabled(self):
+        """``stats_retention_days=0`` skips the startup pass as well."""
+        tracker = self._make_tracker()
+        SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, stats_retention_days=0),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=tracker,
+        )
+        tracker.store.delete_events_older_than.assert_not_called()
+
+    def test_startup_retention_failure_does_not_break_construction(self):
+        """A raising ``delete_events_older_than`` at startup is swallowed so the
+        engine still constructs."""
+        tracker = self._make_tracker()
+        tracker.store.delete_events_older_than = MagicMock(side_effect=RuntimeError("locked"))
+        engine = SurfacingEngine(
+            config=_make_config(dedup_ttl_seconds=0, stats_retention_days=90),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=tracker,
+        )
+        assert engine is not None
         tracker.store.delete_events_older_than.assert_called_once()
 
 
