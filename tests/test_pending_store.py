@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 
 from memtomem_stm.proxy.compression import PendingSelection, SelectiveCompressor
 from memtomem_stm.proxy.pending_store import InMemoryPendingStore, SQLitePendingStore
@@ -550,6 +551,51 @@ class TestMultiPathRecovery:
         assert mgr2._progressive_store is None
         assert "not found or expired" not in mgr2.read_more(key, len(text) // 4)
 
+    def test_select_chunks_reprobes_after_caching_other_store(self, tmp_path):
+        """Even once a compressor is cached for the FIRST store (e.g. an earlier
+        absent-key call), a later key that lives in the SECOND store is still
+        reached — select_chunks re-probes on a miss instead of trusting the
+        cached store's not-found."""
+        store_b = SQLitePendingStore(tmp_path / "b.db")
+        store_b.initialize()
+        store_b.put("kB", _make_selection({"A": "in store B"}))
+        store_b.close()
+
+        mgr, sel_a, sel_b = _two_store_manager(tmp_path)
+        # First call is for an absent key → caches the first store (a.db).
+        assert "not found" in mgr.select_chunks("absent", ["A"])
+        assert mgr._selective_compressor_cfg == sel_a
+        # A later key that lives in b.db is still served, via the miss re-probe.
+        assert mgr.select_chunks("kB", ["A"]) == "in store B"
+        # The cache was NOT disturbed — the temp store served it.
+        assert mgr._selective_compressor_cfg == sel_a
+
+    def test_read_more_reprobes_after_caching_other_store(self, tmp_path):
+        """read_more re-probes the other configured stores on a miss even after
+        a progressive store is already cached for a different path."""
+        import re
+
+        from memtomem_stm.proxy.config import ProgressiveConfig
+
+        # Persist a progressive key into b.db via a manager pointed at it.
+        writer, _sa, sel_b = _two_store_manager(tmp_path)
+        text = "Second store progressive. " * 20
+        first = writer._apply_progressive(
+            text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b
+        )
+        key = re.search(r'key="([0-9a-f]{16})"', first).group(1)
+        writer._progressive_store.close()
+
+        mgr, _sa2, _sb2 = _two_store_manager(tmp_path)
+        # Force a cached progressive store for a.db via a miss on an absent key.
+        assert "not found or expired" in mgr.read_more("absent", 0)
+        cached = mgr._progressive_store
+        assert cached is not None
+        # The b.db key is still reachable through the miss re-probe...
+        assert "not found or expired" not in mgr.read_more(key, len(text) // 4)
+        # ...without disturbing the cached a.db adapter.
+        assert mgr._progressive_store is cached
+
 
 class TestStoreLifecycleCleanup:
     async def test_stop_closes_recovered_stores(self, tmp_path):
@@ -613,3 +659,44 @@ class TestStoreLifecycleCleanup:
 
         spy.assert_called_once()
         assert mgr._progressive_store is not first
+
+    def test_rebuild_selective_failure_leaves_old_usable(self, tmp_path):
+        """If building the replacement compressor fails (bad SQLite path), the
+        old compressor stays cached and usable instead of a closed store behind
+        the cfg-equality fast path."""
+        from memtomem_stm.proxy.config import SelectiveConfig
+
+        mgr, sel = _sqlite_manager(tmp_path)
+        mgr._rebuild_selective_compressor(sel)
+        first = mgr._selective_compressor
+        assert first is not None
+
+        bad_dir = tmp_path / "as_dir"
+        bad_dir.mkdir()
+        bad = SelectiveConfig(pending_store="sqlite", pending_store_path=bad_dir)
+        with pytest.raises(Exception):
+            mgr._rebuild_selective_compressor(bad)
+
+        # Old compressor untouched: still cached, same cfg, and NOT closed —
+        # a select on it still works (its store connection is live).
+        assert mgr._selective_compressor is first
+        assert mgr._selective_compressor_cfg == sel
+        assert "not found or expired" in first.select("missing", ["A"])
+
+    def test_progressive_rebuild_failure_leaves_old_usable(self, tmp_path):
+        """A failed progressive-store rebuild leaves the old adapter cached and
+        usable rather than closing it before the replacement is built."""
+        from memtomem_stm.proxy.config import SelectiveConfig
+
+        mgr, sel_a, _sel_b = _two_store_manager(tmp_path)
+        first = mgr._get_progressive_store(sel_a)
+        assert first is not None
+
+        bad_dir = tmp_path / "as_dir"
+        bad_dir.mkdir()
+        bad = SelectiveConfig(pending_store="sqlite", pending_store_path=bad_dir)
+        with pytest.raises(Exception):
+            mgr._get_progressive_store(bad)
+
+        assert mgr._progressive_store is first
+        assert first.get("missing") is None  # still live, not closed
