@@ -493,6 +493,44 @@ class TestHealth:
         result = await stm_proxy_health(ctx=ctx)
         assert "Surfacing Bootstrap" not in result
 
+    async def test_circuit_breaker_reports_three_states(self):
+        """#600: the breaker line renders all three states from the pure
+        cb.state. An elapsed open breaker reads half-open (is_open == False) and
+        must NOT be reported as 'closed (healthy)' before a probe succeeds."""
+        from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+
+        def _ctx_with_breaker(cb):
+            # The breaker line only renders past the "no upstream servers"
+            # early-return, so give health a connected upstream to report.
+            pm = _make_proxy_manager()
+            pm._connections["srv"] = UpstreamConnection(
+                name="srv", config=UpstreamServerConfig(prefix="t"), session=AsyncMock(), tools=[]
+            )
+            engine = MagicMock()
+            engine._circuit_breaker = cb
+            return _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+
+        # closed
+        cb_closed = CircuitBreaker(max_failures=1, reset_timeout=100.0)
+        result = await stm_proxy_health(ctx=_ctx_with_breaker(cb_closed))
+        assert "Surfacing circuit breaker: closed (healthy)" in result
+
+        # open — just tripped, window not elapsed
+        cb_open = CircuitBreaker(max_failures=1, reset_timeout=100.0)
+        cb_open.record_failure()
+        assert cb_open.state == "open"
+        result = await stm_proxy_health(ctx=_ctx_with_breaker(cb_open))
+        assert "Surfacing circuit breaker: open (failing)" in result
+
+        # half-open — reset window elapsed, is_open is False but no probe yet
+        cb_half = CircuitBreaker(max_failures=1, reset_timeout=0.0)
+        cb_half.record_failure()
+        assert cb_half.state == "half-open"
+        assert cb_half.is_open is False
+        result = await stm_proxy_health(ctx=_ctx_with_breaker(cb_half))
+        assert "Surfacing circuit breaker: half-open (probe eligible)" in result
+        assert "circuit breaker: closed (healthy)" not in result
+
 
 # ── stm_surfacing_feedback ───────────────────────────────────────────────
 

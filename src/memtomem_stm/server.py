@@ -782,7 +782,16 @@ async def stm_proxy_health(
     surfacing = app.surfacing_engine
     if surfacing is not None:
         cb = surfacing._circuit_breaker
-        cb_state = "open (failing)" if cb.is_open else "closed (healthy)"
+        # Render all three states from the pure ``cb.state`` (#600), not just
+        # the open/closed split off ``is_open``: once the reset window elapses
+        # an open breaker reads as ``half-open`` with ``is_open == False``, so
+        # an ``is_open``-only check would report ``closed (healthy)`` before any
+        # probe has actually succeeded — hiding a still-degraded dependency.
+        cb_state = {
+            "open": "open (failing)",
+            "half-open": "half-open (probe eligible)",
+            "closed": "closed (healthy)",
+        }.get(cb.state, cb.state)
         lines.append(f"\nSurfacing circuit breaker: {cb_state}")
 
     lines.extend(_toolgraph_health_lines(pm.get_toolgraph_status()))
