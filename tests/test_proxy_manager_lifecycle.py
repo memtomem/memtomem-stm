@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from memtomem_stm.proxy.config import (
@@ -281,6 +282,65 @@ class TestConnectServerCleanup:
         assert "bad" not in mgr._connections
         mock_session.__aexit__.assert_awaited_once()
         mock_transport.__aexit__.assert_awaited_once()
+
+
+class TestConcurrentReconnect:
+    """#586 — two concurrent _reconnect_server calls for one server must
+    collapse into a single transport spawn; the loser skips (generation
+    advanced) instead of building a second AsyncExitStack that gets orphaned."""
+
+    async def test_concurrent_reconnect_spawns_one_transport(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+
+        # Seed a live connection with an existing (closeable) stack.
+        old_stack = AsyncMock()
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv",
+            config=cfg,
+            session=AsyncMock(),
+            tools=[],
+            stack=old_stack,
+        )
+
+        transport_opens = 0
+
+        def _open_transport(_cfg):
+            nonlocal transport_opens
+            transport_opens += 1
+            t = AsyncMock()
+
+            async def _delayed_streams(*_args):
+                # Yield control so the second reconnect reaches the lock while
+                # the first is mid-setup — the interleaving the guard defends.
+                await asyncio.sleep(0.01)
+                return (AsyncMock(), AsyncMock())
+
+            t.__aenter__ = AsyncMock(side_effect=_delayed_streams)
+            t.__aexit__ = AsyncMock(return_value=False)
+            return t
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+        with (
+            patch.object(mgr, "_open_transport", side_effect=_open_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            await asyncio.gather(
+                mgr._reconnect_server("srv"),
+                mgr._reconnect_server("srv"),
+            )
+
+        # Exactly one reconnect actually ran: one transport spawn, one
+        # generation bump, and the old stack closed once (not twice).
+        assert transport_opens == 1
+        assert mgr._connections["srv"].reconnect_generation == 1
+        old_stack.aclose.assert_awaited_once()
+        assert mgr._connections["srv"].session is mock_session
 
 
 # ── tool name overflow (#261 → exposure-time enforcement via #465) ──────

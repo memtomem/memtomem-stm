@@ -10,7 +10,7 @@ import time as _time
 import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -197,6 +197,15 @@ class UpstreamConnection:
     session: ClientSession
     tools: list[Any]
     stack: AsyncExitStack | None = None
+    # Serialize concurrent ``_reconnect_server`` calls for this server (#586).
+    # Four unserialized retry-loop sites can reconnect the same connection at
+    # once; without this, two interleaving reconnects each build a fresh
+    # ``AsyncExitStack`` and the last writer wins — orphaning the loser's stack
+    # (a leaked stdio child + fds per race). The generation counter lets a
+    # waiter that wakes after another reconnect already completed skip its own,
+    # collapsing a reconnect storm into one transport spawn.
+    reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    reconnect_generation: int = 0
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -890,36 +899,53 @@ class ProxyManager:
         conn = self._connections[name]
         cfg = conn.config
 
-        if conn.stack is not None:
-            try:
-                await conn.stack.aclose()
-            except Exception:
-                logger.debug("Failed to close previous stack for '%s'", name, exc_info=True)
+        # Serialize concurrent reconnects for this server (#586). Capture the
+        # generation BEFORE acquiring: if it advanced while we waited, another
+        # caller already reconnected this connection, so we skip — no redundant
+        # transport spawn, and no stack to orphan. The lock lives on ``conn``,
+        # which is mutated in place (never replaced), so its identity is stable.
+        generation_at_entry = conn.reconnect_generation
+        async with conn.reconnect_lock:
+            if conn.reconnect_generation != generation_at_entry:
+                logger.debug(
+                    "Skipping reconnect for '%s' — another reconnect already completed", name
+                )
+                return
 
-        conn_stack = AsyncExitStack()
-        try:
-            transport_ctx = self._open_transport(cfg)
-            streams = await conn_stack.enter_async_context(transport_ctx)
-            read, write = streams[0], streams[1]
-            session = await conn_stack.enter_async_context(
-                ClientSession(read, write, message_handler=self._make_message_handler(name))
-            )
-            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-            result = await session.list_tools()
-        except BaseException:
-            # Roll back any contexts we entered (transport subprocess, session
-            # streams). Without this, a failed reconnect leaks file descriptors
-            # and child processes across retry storms.
-            try:
-                await conn_stack.aclose()
-            except Exception:
-                logger.debug("Error during reconnect cleanup for '%s'", name, exc_info=True)
-            raise
+            if conn.stack is not None:
+                try:
+                    await conn.stack.aclose()
+                except Exception:
+                    logger.debug("Failed to close previous stack for '%s'", name, exc_info=True)
 
-        conn.session = session
-        conn.stack = conn_stack
-        conn.tools = list(result.tools)
-        logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
+            conn_stack = AsyncExitStack()
+            try:
+                transport_ctx = self._open_transport(cfg)
+                streams = await conn_stack.enter_async_context(transport_ctx)
+                read, write = streams[0], streams[1]
+                session = await conn_stack.enter_async_context(
+                    ClientSession(read, write, message_handler=self._make_message_handler(name))
+                )
+                await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
+                result = await session.list_tools()
+            except BaseException:
+                # Roll back any contexts we entered (transport subprocess, session
+                # streams). Without this, a failed reconnect leaks file descriptors
+                # and child processes across retry storms.
+                try:
+                    await conn_stack.aclose()
+                except Exception:
+                    logger.debug("Error during reconnect cleanup for '%s'", name, exc_info=True)
+                raise
+
+            conn.session = session
+            conn.stack = conn_stack
+            conn.tools = list(result.tools)
+            # Bump the generation only on a successful reconnect so a waiter
+            # skips its own; a failed attempt leaves it unchanged so the next
+            # caller retries rather than silently skipping.
+            conn.reconnect_generation += 1
+            logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
 
     def _make_message_handler(self, name: str) -> Any:
         """Per-upstream MCP message handler wired into ``ClientSession``.
