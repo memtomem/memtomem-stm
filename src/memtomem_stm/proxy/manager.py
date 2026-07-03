@@ -1132,6 +1132,24 @@ class ProxyManager:
             await self._stack.aclose()
             self._stack = None
         self._connections.clear()
+        # Close the lazily-built selective/progressive stores (#583): a restart
+        # recovery or a SELECTIVE/HYBRID/progressive call may have opened a
+        # SQLite-backed store that ``_connections`` cleanup never touches, so
+        # without this the connection leaks across stop()/reuse.
+        if self._selective_compressor is not None:
+            try:
+                self._selective_compressor.close()
+            except Exception:
+                logger.debug("Failed to close selective compressor on stop", exc_info=True)
+            self._selective_compressor = None
+            self._selective_compressor_cfg = None
+        if self._progressive_store is not None:
+            try:
+                self._progressive_store.close()
+            except Exception:
+                logger.debug("Failed to close progressive store on stop", exc_info=True)
+            self._progressive_store = None
+            self._progressive_store_cfg = None
 
     @property
     def _config(self) -> ProxyConfig:
@@ -1314,31 +1332,18 @@ class ProxyManager:
             timeout=sc.embedding_timeout,
         )
 
-    def _fallback_selective_cfg(self) -> SelectiveConfig | None:
-        """Resolve a SelectiveConfig to reach a persisted pending store when no
-        compressor/store has been lazily built yet (#583).
+    def _distinct_sqlite_selective_cfgs(self) -> list[SelectiveConfig]:
+        """All configured SQLite ``SelectiveConfig`` s, deduped by resolved
+        path, in deterministic order (#583).
 
         ``SelectiveConfig`` is nested per-server (``UpstreamServerConfig.selective``)
         and per-tool (``ToolOverrideConfig.selective``); there is no global one.
-        After a restart, ``stm_proxy_select_chunks`` / ``stm_proxy_read_more`` can
-        receive a key whose row still lives in a configured SQLite pending store,
-        but the compressor/progressive store that would read it is built lazily
-        (only inside a compress call), so the retrieval endpoint defaults to a
-        fresh in-memory store and reports "not found" while the row persists on
-        disk. This scans the configured servers (sorted for determinism) —
-        server-level ``selective`` first, then that server's tool overrides — and
-        returns the first that opts into the SQLite backend, so the endpoint can
-        build the configured store on first use. Returns ``None`` when nothing
-        configures SQLite (the in-memory default has nothing to recover).
-
-        Common case is a single shared SQLite path (the default
-        ``~/.memtomem/pending_selections.db``). If distinct paths are configured
-        across tools, this returns the first and warns; a key that lives in a
-        different path stays unreachable until that tool's next compression
-        rebuilds its compressor — probing every configured path on a miss is a
-        possible follow-up.
+        Scans servers (sorted), server-level ``selective`` first then each
+        server's tool overrides (sorted), keeping the first config seen for each
+        distinct on-disk path. The in-memory default contributes nothing — it
+        has no persisted rows to recover.
         """
-        chosen: SelectiveConfig | None = None
+        out: list[SelectiveConfig] = []
         seen_paths: set[str] = set()
         for _srv_name, srv_cfg in sorted(self._config.upstream_servers.items()):
             candidates: list[SelectiveConfig | None] = [srv_cfg.selective]
@@ -1347,18 +1352,74 @@ class ProxyManager:
             )
             for sel in candidates:
                 if sel is not None and sel.pending_store == "sqlite":
-                    seen_paths.add(str(sel.pending_store_path.expanduser()))
-                    if chosen is None:
-                        chosen = sel
-        if len(seen_paths) > 1:
-            logger.warning(
-                "Multiple distinct SQLite pending_store paths configured (%s); "
-                "restart-recovery for pending selections uses %s — keys written to "
-                "the others stay unreachable until their tool's next compression",
-                sorted(seen_paths),
-                chosen.pending_store_path.expanduser() if chosen else None,
-            )
-        return chosen
+                    path = str(sel.pending_store_path.expanduser())
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        out.append(sel)
+        return out
+
+    def _recover_cfg_for_key(self, key: str) -> SelectiveConfig | None:
+        """Resolve the configured SelectiveConfig whose SQLite store actually
+        holds *key*, for restart recovery when no compressor/store has been
+        lazily built yet (#583).
+
+        After a restart, ``stm_proxy_select_chunks`` / ``stm_proxy_read_more``
+        can receive a key whose row still lives in a configured SQLite pending
+        store, but the compressor/progressive store that would read it is built
+        lazily (only inside a compress call), so the retrieval endpoint defaults
+        to a fresh in-memory store and reports "not found" while the row
+        persists on disk.
+
+        ``pending_store_path`` is configurable per server and per tool, so
+        several distinct stores may exist. Probe each distinct store read-only
+        (a cheap ``get`` that opens then closes its own connection) and return
+        the config whose store holds the key, so a key in *any* configured path
+        is reachable — not just the first. When no store holds it, fall back to
+        the first configured store so a genuinely-absent key still degrades
+        through the normal not-found path; this also keeps the common
+        single-store case a straight passthrough with no extra open. Returns
+        ``None`` when nothing configures SQLite.
+        """
+        cfgs = self._distinct_sqlite_selective_cfgs()
+        if len(cfgs) <= 1:
+            return cfgs[0] if cfgs else None
+
+        from memtomem_stm.proxy.pending_store import SQLitePendingStore
+
+        for sel_cfg in cfgs:
+            try:
+                probe = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+                probe.initialize()
+            except Exception:
+                logger.warning(
+                    "Could not open configured SQLite pending store %s while probing "
+                    "for a persisted key",
+                    sel_cfg.pending_store_path,
+                    exc_info=True,
+                )
+                continue
+            try:
+                if probe.get(key) is not None:
+                    return sel_cfg
+            finally:
+                probe.close()
+        return cfgs[0]
+
+    def _rebuild_selective_compressor(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+        """Replace the cached selective compressor, closing the superseded one
+        first so a SQLite-backed store from a changed config does not leak its
+        connection (#583). Returns the new compressor. Only called when the cfg
+        changed or nothing is cached; the recovery path in ``select_chunks``
+        builds inline because it needs its own degrade-on-open-failure handling.
+        """
+        if self._selective_compressor is not None:
+            try:
+                self._selective_compressor.close()
+            except Exception:
+                logger.debug("Failed to close superseded selective compressor", exc_info=True)
+        self._selective_compressor = self._create_selective(sel_cfg)
+        self._selective_compressor_cfg = sel_cfg
+        return self._selective_compressor
 
     def _create_selective(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
         """Create a SelectiveCompressor with the appropriate PendingStore backend."""
@@ -1534,12 +1595,11 @@ class ProxyManager:
                 name="selective_lock",
             ):
                 if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                    self._selective_compressor = self._create_selective(sel_cfg)
-                    self._selective_compressor_cfg = sel_cfg
+                    sel_compressor = self._rebuild_selective_compressor(sel_cfg)
+                else:
+                    sel_compressor = self._selective_compressor
             return (
-                self._selective_compressor.compress(
-                    text, max_chars=max_chars, context_query=context_query
-                ),
+                sel_compressor.compress(text, max_chars=max_chars, context_query=context_query),
                 None,
             )
 
@@ -1754,8 +1814,7 @@ class ProxyManager:
             name="selective_lock",
         ):
             if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                self._selective_compressor = self._create_selective(sel_cfg)
-                self._selective_compressor_cfg = sel_cfg
+                self._rebuild_selective_compressor(sel_cfg)
 
         compressor = HybridCompressor(
             head_chars=cfg.head_chars,
@@ -1845,7 +1904,7 @@ class ProxyManager:
             # bad state). No await runs between the check and the assignment, and
             # neither do the lock-holding compress paths, so this can't interleave
             # with them on the event loop — no _selective_lock needed here.
-            sel_cfg = self._fallback_selective_cfg()
+            sel_cfg = self._recover_cfg_for_key(key)
             if sel_cfg is None:
                 return "Selective compression not active — no pending TOC selections."
             try:
@@ -1877,6 +1936,13 @@ class ProxyManager:
                 from memtomem_stm.proxy.pending_store import InMemoryPendingStore
 
                 store = InMemoryPendingStore()
+            # Close the superseded adapter first so a SQLite-backed store from a
+            # changed config does not leak its connection (#583).
+            if self._progressive_store is not None:
+                try:
+                    self._progressive_store.close()
+                except Exception:
+                    logger.debug("Failed to close superseded progressive store", exc_info=True)
             self._progressive_store = ProgressiveStoreAdapter(store)
             self._progressive_store_cfg = sel_cfg
         return self._progressive_store
@@ -1956,7 +2022,7 @@ class ProxyManager:
         # sentinel; _get_progressive_store caches only after initialize()
         # succeeds, so nothing bad is pinned and the next call retries.
         if self._progressive_store is None:
-            fallback = self._fallback_selective_cfg()
+            fallback = self._recover_cfg_for_key(key)
             if fallback is not None:
                 try:
                     store = self._get_progressive_store(fallback)

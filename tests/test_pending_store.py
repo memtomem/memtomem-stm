@@ -476,3 +476,140 @@ class TestReadMoreRestartRecovery:
         assert "not found or expired" not in out
         # The live in-memory store was not rebuilt from the fallback cfg.
         assert mgr._progressive_store is store_before
+
+
+# ── Multi-path recovery + store lifecycle (#583 follow-up) ────────────────
+
+
+def _two_store_manager(tmp_path):
+    """A ProxyManager with two servers, each configured to a DISTINCT SQLite
+    pending store, so restart recovery must probe both to reach a key."""
+    from memtomem_stm.proxy.config import (
+        ProxyConfig,
+        SelectiveConfig,
+        UpstreamServerConfig,
+    )
+    from memtomem_stm.proxy.manager import ProxyManager
+    from memtomem_stm.proxy.metrics import TokenTracker
+
+    sel_a = SelectiveConfig(pending_store="sqlite", pending_store_path=tmp_path / "a.db")
+    sel_b = SelectiveConfig(pending_store="sqlite", pending_store_path=tmp_path / "b.db")
+    cfg = ProxyConfig(
+        config_path=tmp_path / "proxy.json",
+        upstream_servers={
+            "a": UpstreamServerConfig(prefix="a", selective=sel_a),
+            "b": UpstreamServerConfig(prefix="b", selective=sel_b),
+        },
+    )
+    return ProxyManager(cfg, TokenTracker()), sel_a, sel_b
+
+
+class TestMultiPathRecovery:
+    def test_select_chunks_probes_all_stores(self, tmp_path):
+        """A key persisted in the SECOND of two distinct SQLite stores is
+        reachable — recovery probes every configured path, not just the first."""
+        store_b = SQLitePendingStore(tmp_path / "b.db")
+        store_b.initialize()
+        store_b.put("kB", _make_selection({"A": "in store B"}))
+        store_b.close()
+
+        mgr, _sel_a, sel_b = _two_store_manager(tmp_path)
+        assert mgr.select_chunks("kB", ["A"]) == "in store B"
+        # It bound the store that actually held the key, not merely the first.
+        assert mgr._selective_compressor_cfg == sel_b
+
+    def test_select_chunks_absent_key_falls_back_to_first(self, tmp_path):
+        """When no configured store holds the key, recovery falls back to the
+        first store so the key still degrades through the normal not-found
+        path (and the common single-store case stays a straight passthrough)."""
+        for name in ("a.db", "b.db"):
+            s = SQLitePendingStore(tmp_path / name)
+            s.initialize()
+            s.close()
+
+        mgr, sel_a, _sel_b = _two_store_manager(tmp_path)
+        assert "not found" in mgr.select_chunks("missing", ["A"])
+        assert mgr._selective_compressor_cfg == sel_a
+
+    def test_read_more_probes_all_stores(self, tmp_path):
+        """A progressive key persisted in the second store is reachable via
+        read_more on a fresh manager."""
+        import re
+
+        from memtomem_stm.proxy.config import ProgressiveConfig
+
+        mgr1, _sel_a, sel_b = _two_store_manager(tmp_path)
+        text = "Second store chunk. " * 20
+        first = mgr1._apply_progressive(text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b)
+        m = re.search(r'key="([0-9a-f]{16})"', first)
+        assert m is not None, first
+        key = m.group(1)
+        mgr1._progressive_store.close()  # release b.db before reopening
+
+        mgr2, *_ = _two_store_manager(tmp_path)
+        assert mgr2._progressive_store is None
+        assert "not found or expired" not in mgr2.read_more(key, len(text) // 4)
+
+
+class TestStoreLifecycleCleanup:
+    async def test_stop_closes_recovered_stores(self, tmp_path):
+        """stop() closes the lazily-built selective and progressive stores and
+        nulls them, so a recovery-opened SQLite connection does not leak."""
+        from unittest.mock import patch
+
+        from memtomem_stm.proxy.config import ProgressiveConfig
+
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        store.put("k1", _make_selection({"A": "x"}))
+        store.close()
+
+        mgr, sel = _sqlite_manager(tmp_path)
+        mgr.select_chunks("k1", ["A"])  # opens a SQLite-backed selective compressor
+        mgr._apply_progressive("y " * 50, ProgressiveConfig(chunk_size=40), "srv", "t", sel)
+        sel_comp = mgr._selective_compressor
+        prog = mgr._progressive_store
+        assert sel_comp is not None and prog is not None
+
+        with (
+            patch.object(sel_comp, "close", wraps=sel_comp.close) as sel_spy,
+            patch.object(prog, "close", wraps=prog.close) as prog_spy,
+        ):
+            await mgr.stop()
+
+        sel_spy.assert_called_once()
+        prog_spy.assert_called_once()
+        assert mgr._selective_compressor is None
+        assert mgr._selective_compressor_cfg is None
+        assert mgr._progressive_store is None
+        assert mgr._progressive_store_cfg is None
+
+    def test_rebuild_selective_closes_superseded(self, tmp_path):
+        """Rebuilding the selective compressor for a changed config closes the
+        superseded one first, so its SQLite store does not leak."""
+        from unittest.mock import patch
+
+        mgr, sel = _sqlite_manager(tmp_path)
+        mgr._rebuild_selective_compressor(sel)
+        first = mgr._selective_compressor
+        assert first is not None
+
+        with patch.object(first, "close", wraps=first.close) as spy:
+            mgr._rebuild_selective_compressor(sel)
+
+        spy.assert_called_once()
+        assert mgr._selective_compressor is not first
+
+    def test_progressive_rebuild_closes_superseded(self, tmp_path):
+        """A progressive-store rebuild for a changed cfg closes the old adapter."""
+        from unittest.mock import patch
+
+        mgr, sel_a, sel_b = _two_store_manager(tmp_path)
+        first = mgr._get_progressive_store(sel_a)
+        assert first is not None
+
+        with patch.object(first, "close", wraps=first.close) as spy:
+            mgr._get_progressive_store(sel_b)  # different path → rebuild
+
+        spy.assert_called_once()
+        assert mgr._progressive_store is not first
