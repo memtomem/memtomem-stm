@@ -468,22 +468,27 @@ class ProxyManager:
             try:
                 await self._connect_server(name, cfg)
             except Exception as exc:
-                logger.exception("Failed to connect to upstream server '%s'", name)
-                # Record the failure so ``get_upstream_health`` can report the
-                # configured-but-dead server (#580) — otherwise it is absent
-                # from ``stm_proxy_health`` entirely (no ``_connections`` entry
-                # is created on a failed connect) and the degradation is
-                # undiagnosable from inside the session. Redact first: httpx
-                # transport exceptions embed the full request URL — userinfo
-                # included — so a credentialed upstream
-                # (``https://user:token@host/mcp``) would otherwise leak its
-                # token through ``stm_proxy_health`` to the MCP client/model.
-                # Redact the FULL message, THEN cap: capping first (as
+                # Redact the full exception text ONCE, then reuse it for both the
+                # operator log and the health record (#580). httpx transport
+                # exceptions embed the credentialed request URL
+                # (``https://user:token@host/mcp``), so an unredacted path would
+                # leak the token — via ``stm_proxy_health`` to the MCP
+                # client/model, or via the log. Do NOT use ``logger.exception``
+                # here: its traceback tail repeats the raw, unredacted exception
+                # string. Redact the FULL message, THEN cap: capping first (as
                 # format_error_message_from_exc does) can truncate a long
-                # credential mid-token so redact_exception_text no longer
-                # matches the configured URL, leaving a partial token exposed.
-                redacted = redact_exception_text(f"{type(exc).__name__}: {exc}", cfg.url)
-                self._failed_servers[name] = redacted[:MAX_ERROR_MESSAGE_CHARS]
+                # credential mid-token so redact_exception_text no longer matches
+                # the configured URL, leaving a partial token exposed.
+                redacted = redact_exception_text(f"{type(exc).__name__}: {exc}", cfg.url)[
+                    :MAX_ERROR_MESSAGE_CHARS
+                ]
+                logger.error("Failed to connect to upstream server '%s': %s", name, redacted)
+                # Record the failure so ``get_upstream_health`` can report the
+                # configured-but-dead server — otherwise it is absent from
+                # ``stm_proxy_health`` entirely (no ``_connections`` entry is
+                # created on a failed connect) and the degradation is
+                # undiagnosable from inside the session.
+                self._failed_servers[name] = redacted
 
         # #465: evaluate per-tool health once per session, before the first
         # advertisement. get_proxy_tools() applies this cached snapshot so

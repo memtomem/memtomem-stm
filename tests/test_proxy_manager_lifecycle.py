@@ -199,6 +199,33 @@ class TestStart:
             assert "t" * 100 not in blob
             assert "***@ltm.example.com" in blob
 
+    async def test_startup_failure_log_line_redacts_credential(self, caplog):
+        """#580: the operator LOG for a failed credentialed connect must also be
+        scrubbed. The failure is logged as a redacted message, not via
+        logger.exception whose traceback tail repeats the raw exception string
+        (URL included)."""
+        url = "https://alice:s3cr3t-token@ltm.example.com/mcp"
+        mgr = _make_manager(
+            servers={
+                "web": UpstreamServerConfig(prefix="web", transport=TransportType.SSE, url=url),
+            }
+        )
+
+        async def _leaky_connect(name, cfg):
+            raise ConnectionError(f"All connection attempts failed for {url}")
+
+        with caplog.at_level("ERROR"):
+            with patch.object(mgr, "_connect_server", side_effect=_leaky_connect):
+                await mgr.start()
+
+        # caplog.text includes any exc_info traceback, so this also fails if the
+        # code regresses to logger.exception.
+        assert "s3cr3t-token" not in caplog.text
+        assert "alice:s3cr3t-token" not in caplog.text
+        # The failure is still logged, redacted.
+        assert "Failed to connect to upstream server 'web'" in caplog.text
+        assert "***@ltm.example.com" in caplog.text
+
     async def test_url_less_network_upstream_recorded_in_health(self):
         """#580: a non-stdio upstream configured without a url is skipped by
         _connect_server with a warning + early return (no exception), so it
