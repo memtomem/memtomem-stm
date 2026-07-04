@@ -907,3 +907,29 @@ class TestCleanupLogCredentialRedaction:
                     await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
 
         self._assert_redacted(caplog, "Post-failure reconnect failed for 'bad'")
+
+    async def test_fetch_mid_loop_reconnect_failure_redacts(self, caplog):
+        """#622: the mid-loop reconnect on the retry-continue path (a retryable
+        transport error with attempts remaining) re-raises the reconnect error;
+        its ERROR log must not leak the credentialed URL. Sibling to the three
+        #605 post-error reconnect sites, which this sweep originally missed."""
+        import pytest as _pt
+
+        cfg = self._cfg(max_retries=1, reconnect_delay_seconds=0.0, max_reconnect_delay_seconds=0.0)
+        mgr = _make_manager(servers={"bad": cfg})
+        session = self._seed_fetch_conn(mgr, cfg)
+        # URL-free upstream error so the ONLY token-bearing string is the
+        # mid-loop reconnect failure we assert is redacted.
+        session.call_tool = AsyncMock(side_effect=ConnectionError("upstream boom"))
+
+        with caplog.at_level("DEBUG"):
+            with patch.object(
+                mgr,
+                "_reconnect_server",
+                new_callable=AsyncMock,
+                side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
+            ):
+                with _pt.raises(ConnectionError, match="reconnect boom"):
+                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+
+        self._assert_redacted(caplog, "Reconnect to 'bad' failed")
