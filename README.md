@@ -214,10 +214,10 @@ operator tools.
 uv sync                                                    # install dev deps
 uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"   # tests (CI filter)
 uv run ruff check src && uv run ruff format --check src    # lint (required)
-uv run mypy src                                            # typecheck (advisory)
+uv run mypy src                                            # typecheck (required)
 ```
 
-CI runs the same commands on every PR via `.github/workflows/ci.yml`. Lint (`ruff check` + `ruff format --check`) and tests must pass; mypy is advisory.
+CI runs the same commands on every PR via `.github/workflows/ci.yml`. Lint (`ruff check` + `ruff format --check`), mypy, and tests must pass.
 
 ## License
 

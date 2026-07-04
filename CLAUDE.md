@@ -13,11 +13,13 @@ Requires Python 3.12+ and `uv`.
 uv sync                                                    # install deps
 uv run pytest -m "not ollama"                              # tests (CI filter)
 uv run ruff check src && uv run ruff format --check src    # lint (required)
-uv run mypy src                                            # typecheck (advisory)
+uv run mypy src                                            # typecheck (required)
 ```
 
 The `ollama` marker auto-skips when Ollama isn't running; CI always uses
-`-m "not ollama"`. `ruff` and tests must pass to merge; `mypy` is advisory.
+`-m "not ollama"`. `ruff`, `mypy`, and tests must pass to merge. mypy must be
+clean on Windows too — CI typechecks both platforms, so POSIX-only stdlib
+usage (`fcntl`, `os.killpg`, …) needs a `sys.platform` guard mypy can narrow.
 
 ## Invariants when editing
 

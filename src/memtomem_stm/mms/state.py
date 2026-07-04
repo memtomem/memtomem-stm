@@ -23,6 +23,7 @@ sandbox.
 from __future__ import annotations
 
 import os
+import sys
 import time
 import tomllib
 from collections.abc import Iterator
@@ -35,10 +36,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from memtomem_stm.utils.fileio import atomic_write_text
 
-try:
+# sys.platform (not try/ImportError) so mypy's platform narrowing proves the
+# flock calls below unreachable on win32 — Windows builds lack fcntl.
+if sys.platform != "win32":
     import fcntl
-except ImportError:  # pragma: no cover — Windows builds lack fcntl
-    fcntl = None  # type: ignore[assignment]
+else:  # pragma: no cover — exercised on Windows CI only
+    fcntl = None
 
 SCHEMA_VERSION = 1
 """Version constant for the three RFC §5.3 files (registry / projects index /

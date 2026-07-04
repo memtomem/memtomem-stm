@@ -110,6 +110,8 @@ def _signal_pid(pid: int, sig: int) -> None:
     shares the daemon's group (never signal our own group). The stdio LTM
     child is spawned with ``start_new_session=True``, so the group kill also
     reaches grandchildren (e.g. ``uv run memtomem`` wrappers)."""
+    if sys.platform == "win32":  # pragma: no cover — unreachable: no pgrep pids
+        return
     try:
         pgid = os.getpgid(pid)
         if pgid != os.getpgid(0):
@@ -122,6 +124,8 @@ def _signal_pid(pid: int, sig: int) -> None:
 
 async def _terminate_leaked_children(pids: set[int]) -> None:
     """SIGTERM each leaked child's process group, then SIGKILL stragglers."""
+    if sys.platform == "win32":  # pragma: no cover — _direct_child_pids is empty
+        return
     for pid in pids:
         _signal_pid(pid, signal.SIGTERM)
     deadline = asyncio.get_running_loop().time() + _LEAK_KILL_ESCALATE_SECONDS

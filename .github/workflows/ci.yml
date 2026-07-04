@@ -17,9 +17,9 @@ jobs:
   # ubuntu-latest. The matrix was introduced in #304 (P1a) with a
   # `continue-on-error` escape hatch while the #302 Windows-support triage
   # was in flight; with #314–#319 merged the matrix is consistently green
-  # so the escape hatch is gone. The mypy *step* keeps its own
-  # `continue-on-error: true` because typecheck is still advisory project-wide
-  # (CLAUDE.md), independent of the OS matrix.
+  # so the escape hatch is gone. The mypy step was advisory
+  # (`continue-on-error: true`) until the #617 burn-down reached 0 errors
+  # on every platform; it now gates like lint and test.
   lint:
     strategy:
       fail-fast: false
@@ -47,9 +47,8 @@ jobs:
         with:
           version: "latest"
       - run: uv sync --frozen
-      - name: mypy (gradual)
+      - name: mypy
         run: uv run mypy src
-        continue-on-error: true
 
   test:
     strategy:
@@ -82,11 +81,12 @@ jobs:
   audit:
     # ADVISORY dependency vulnerability audit (#609). Exports the locked
     # dependency set (uv.lock, all groups) and runs pip-audit against it.
-    # Step-level continue-on-error mirrors the mypy convention above: the
-    # findings land in the job log without a red check on every PR while
-    # the baseline is being cleaned (50 known vulns in transitive dev deps
-    # at introduction time). Promote to required (drop the flag + branch
-    # protection) once Dependabot has cleaned the baseline.
+    # Step-level continue-on-error (the convention mypy used during its
+    # advisory phase, pre-#617) keeps the findings in the job log without
+    # a red check on every PR while the baseline is being cleaned (50 known
+    # vulns in transitive dev deps at introduction time). Promote to
+    # required (drop the flag + branch protection) once Dependabot has
+    # cleaned the baseline.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
