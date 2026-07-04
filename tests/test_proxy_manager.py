@@ -12,6 +12,9 @@ from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
     ExtractionConfig,
+    ExtractionStrategy,
+    LLMCompressorConfig,
+    LLMProvider,
     ProxyConfig,
     RelevanceScorerConfig,
     SelectiveConfig,
@@ -295,6 +298,171 @@ class TestAutoIndexStartupWarning:
                 # on fires before the connect loop runs.
                 pass
         assert not any("permanently lost" in r.message for r in caplog.records)
+
+
+# ── Privacy-scan-disabled startup warning tests (#610) ──────────────────
+# When an LLM path (compression / extraction) is enabled with
+# ``privacy_scan_enabled=false`` toward an EXTERNAL provider, raw upstream
+# responses leave the machine without credential redaction (#289). Warn loudly
+# at startup — but stay silent for local Ollama (never leaves the machine).
+
+
+class TestPrivacyScanStartupWarning:
+    @pytest.mark.asyncio
+    async def test_warns_llm_compression_scan_off_external(self, caplog):
+        """compression=llm_summary + privacy_scan_enabled=false + OpenAI → warning."""
+        config = ProxyConfig(
+            enabled=True,
+            upstream_servers={
+                "docs": UpstreamServerConfig(
+                    prefix="dc",
+                    command="echo",
+                    compression=CompressionStrategy.LLM_SUMMARY,
+                    llm=LLMCompressorConfig(
+                        provider=LLMProvider.OPENAI,
+                        api_key="sk-test",
+                        privacy_scan_enabled=False,
+                    ),
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except (Exception, asyncio.CancelledError):
+                # "echo" upstream exits before the JSON-RPC handshake; the
+                # warning fires before that connect failure.
+                pass
+        assert any(
+            "LLM compression enabled" in r.message
+            and "server 'docs'" in r.message
+            and "privacy_scan_enabled=false" in r.message
+            and "UNSCANNED" in r.message
+            and "openai" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_warns_llm_extraction_scan_off_external(self, caplog):
+        """extraction (LLM, scan off, external) with an index engine → warning."""
+        config = ProxyConfig(
+            enabled=True,
+            extraction=ExtractionConfig(
+                enabled=True,
+                strategy=ExtractionStrategy.LLM,
+                llm=LLMCompressorConfig(
+                    provider=LLMProvider.ANTHROPIC,
+                    api_key="ant-test",
+                    privacy_scan_enabled=False,
+                ),
+            ),
+        )
+        # Extraction only reaches the provider when an index engine is wired
+        # (Stage-4b gate); a sentinel is enough to exercise the warning path.
+        mgr = ProxyManager(config, TokenTracker(), index_engine=object())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr.start()
+        assert any(
+            "LLM extraction enabled" in r.message
+            and "extraction.enabled" in r.message
+            and "UNSCANNED" in r.message
+            and "anthropic" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_extraction_warning_without_index_engine(self, caplog):
+        """Same scan-off external extraction, but no index engine → no leak, no
+        warning (extraction never runs in the bundled ``mms`` server)."""
+        config = ProxyConfig(
+            enabled=True,
+            extraction=ExtractionConfig(
+                enabled=True,
+                strategy=ExtractionStrategy.LLM,
+                llm=LLMCompressorConfig(
+                    provider=LLMProvider.OPENAI,
+                    api_key="sk-test",
+                    privacy_scan_enabled=False,
+                ),
+            ),
+        )
+        mgr = ProxyManager(config, TokenTracker())  # index_engine=None
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr.start()
+        assert not any("LLM extraction enabled" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_warning_for_local_ollama_scan_off(self, caplog):
+        """Scan off but destination is local Ollama → no warning (never leaves box)."""
+        config = ProxyConfig(
+            enabled=True,
+            extraction=ExtractionConfig(
+                enabled=True,
+                strategy=ExtractionStrategy.LLM,
+                llm=LLMCompressorConfig(
+                    provider=LLMProvider.OLLAMA,
+                    base_url="http://localhost:11434",
+                    privacy_scan_enabled=False,
+                ),
+            ),
+        )
+        mgr = ProxyManager(config, TokenTracker(), index_engine=object())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            await mgr.start()
+        assert not any("UNSCANNED" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_scan_enabled(self, caplog):
+        """privacy_scan_enabled=true (default) + external LLM → no warning."""
+        config = ProxyConfig(
+            enabled=True,
+            upstream_servers={
+                "docs": UpstreamServerConfig(
+                    prefix="dc",
+                    command="echo",
+                    compression=CompressionStrategy.LLM_SUMMARY,
+                    llm=LLMCompressorConfig(
+                        provider=LLMProvider.OPENAI,
+                        api_key="sk-test",
+                        # privacy_scan_enabled defaults to True
+                    ),
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except (Exception, asyncio.CancelledError):
+                pass
+        assert not any("UNSCANNED" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_warning_for_auto_compression(self, caplog):
+        """compression=auto (not explicit llm_summary) → not statically flagged."""
+        config = ProxyConfig(
+            enabled=True,
+            upstream_servers={
+                "docs": UpstreamServerConfig(
+                    prefix="dc",
+                    command="echo",
+                    compression=CompressionStrategy.AUTO,
+                    llm=LLMCompressorConfig(
+                        provider=LLMProvider.OPENAI,
+                        api_key="sk-test",
+                        privacy_scan_enabled=False,
+                    ),
+                ),
+            },
+        )
+        mgr = ProxyManager(config, TokenTracker())
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+            try:
+                await mgr.start()
+            except (Exception, asyncio.CancelledError):
+                pass
+        assert not any("LLM compression enabled" in r.message for r in caplog.records)
 
 
 class TestToolConfigFrozen:
