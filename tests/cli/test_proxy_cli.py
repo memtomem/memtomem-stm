@@ -7324,7 +7324,8 @@ class TestRootCauseMessage:
 
 class TestSurfacingCommand:
     """`mms surfacing <server> [on|off]` toggles per-upstream surfacing in
-    stm_proxy.json; `mms status` renders the effective state."""
+    stm_proxy.json; `mms list` renders the effective state (SURFACING
+    column — #614 moved the per-server view off `mms status`)."""
 
     @staticmethod
     def _seed(config: Path, *, surfacing_enabled: bool | None = None) -> None:
