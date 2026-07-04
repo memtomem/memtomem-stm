@@ -5405,8 +5405,9 @@ class TestConfigWriteLock:
             ["prune", "--all", "--yes"],
             ["init"],
             ["eject", "srv", "--yes"],
+            ["tune", "--apply", "--yes"],
         ],
-        ids=["add", "remove", "surfacing-write", "prune", "init", "eject"],
+        ids=["add", "remove", "surfacing-write", "prune", "init", "eject", "tune-apply"],
     )
     def test_mutators_fail_cleanly_when_lock_held(
         self, runner, config, argv, _hermetic_home
@@ -5427,8 +5428,9 @@ class TestConfigWriteLock:
     def test_read_and_dry_run_paths_skip_lock(
         self, runner, config, monkeypatch, _hermetic_home
     ):
-        """`surfacing NAME` (read) and `prune --dry-run` never write, so a
-        held lock must not block them — mirrors the mms ``--plan`` skip."""
+        """`surfacing NAME` (read), `prune --dry-run`, and `tune` without
+        --apply never write, so a held lock must not block them — mirrors
+        the mms ``--plan`` skip."""
         from memtomem_stm.cli import proxy as proxy_mod
 
         self._seed(config)
@@ -5440,10 +5442,12 @@ class TestConfigWriteLock:
                 cli,
                 ["eject", "srv", "--dry-run", "--to", "claude-user", *_cfg_args(config)],
             )
+            tune_preview = runner.invoke(cli, ["tune", *_cfg_args(config)])
         assert read.exit_code == 0, read.output
         assert "surfacing for 'srv': on" in read.output
         assert dry.exit_code == 0, dry.output
         assert eject_dry.exit_code == 0, eject_dry.output
+        assert tune_preview.exit_code == 0, tune_preview.output
 
     def test_concurrent_prunes_serialize_and_lose_no_backup_rows(
         self, config, monkeypatch, _hermetic_home
@@ -6910,3 +6914,279 @@ class TestSurfacingCommand:
         result = runner.invoke(cli, ["status", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "surfacing=on" in result.output
+
+
+class TestTune:
+    """`mms tune [--apply]` — preview and apply CompressionTuner overrides (#615).
+
+    Seeds a real metrics DB so the CLI exercises the same offline
+    MetricsStore → CompressionTuner path the command wires up; recommendation
+    heuristics themselves are covered in tests/test_tuner.py.
+    """
+
+    @staticmethod
+    def _seed_config(config: Path, metrics_db: Path, **extra) -> None:
+        payload = {
+            "enabled": True,
+            "upstream_servers": {"srv": {"prefix": "s", "command": "npx"}},
+            "metrics": {"db_path": str(metrics_db)},
+            **extra,
+        }
+        config.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def _seed_metrics(metrics_db: Path, *, server: str = "srv", tool: str = "big_tool") -> None:
+        """Six calls, four ratio violations at 30000 chars → deterministic H1:
+        current server-level budget 8000 → recommended max(24000, 10000) = 24000.
+        Call count 6 stays below MEDIUM_CONFIDENCE_CALLS so H3 cannot fire."""
+        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        store = MetricsStore(metrics_db)
+        store.initialize()
+        try:
+            for i in range(6):
+                store.record(
+                    CallMetrics(
+                        server=server,
+                        tool=tool,
+                        original_chars=30000,
+                        compressed_chars=8000,
+                        cleaned_chars=30000,
+                        compression_strategy="truncate",
+                        ratio_violation=i < 4,
+                    )
+                )
+        finally:
+            store.close()
+
+    def test_preview_no_metrics_db_is_noop_and_creates_nothing(
+        self, runner, config, tmp_path
+    ):
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        result = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "nothing to tune" in result.output
+        assert not metrics_db.exists()
+
+    def test_preview_renders_diff_and_does_not_write(self, runner, config, tmp_path):
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+        before = config.read_bytes()
+        result = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "srv/big_tool" in result.output
+        assert "max_result_chars: 8000 -> 24000" in result.output
+        assert "violation rate" in result.output
+        assert "confidence" in result.output
+        assert "--apply" in result.output
+        assert config.read_bytes() == before
+
+    def test_preview_json_shape(self, runner, config, tmp_path):
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+        result = runner.invoke(cli, ["tune", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["since_hours"] == 24.0
+        assert payload["tool_filter"] is None
+        assert payload["skipped"] == []
+        (change,) = payload["changes"]
+        assert change["server"] == "srv"
+        assert change["tool"] == "big_tool"
+        assert change["field"] == "max_result_chars"
+        assert change["current"] == "8000"
+        assert change["recommended"] == "24000"
+        assert change["confidence"] == "low"
+
+    def test_json_with_apply_is_a_usage_error(self, runner, config, tmp_path):
+        self._seed_config(config, tmp_path / "metrics.db")
+        result = runner.invoke(cli, ["tune", "--json", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 2
+        assert "preview format" in result.output
+
+    def test_apply_yes_writes_typed_overrides_and_preserves_unknown_keys(
+        self, runner, config, tmp_path
+    ):
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db, future_top_level={"keep": 1})
+        data = json.loads(config.read_text())
+        data["upstream_servers"]["srv"]["future_server_key"] = "keep me"
+        config.write_text(json.dumps(data), encoding="utf-8")
+        self._seed_metrics(metrics_db)
+
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "Applied 1 override(s) to 1 tool(s)." in result.output
+
+        saved = json.loads(config.read_text())
+        override = saved["upstream_servers"]["srv"]["tool_overrides"]["big_tool"]
+        assert override["max_result_chars"] == 24000
+        assert isinstance(override["max_result_chars"], int)
+        assert saved["future_top_level"] == {"keep": 1}
+        assert saved["upstream_servers"]["srv"]["future_server_key"] == "keep me"
+        assert ProxyConfig.model_validate(saved).upstream_servers["srv"] is not None
+
+    def test_apply_creates_timestamped_backup_with_original_bytes(
+        self, runner, config, tmp_path
+    ):
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+        before = config.read_bytes()
+
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        backups = sorted(config.parent.glob("stm_proxy.json.bak-*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == before
+        assert (backups[0].stat().st_mode & 0o777) == 0o600
+        assert str(backups[0]) in result.output  # restore hint names the backup
+
+    def test_backup_same_second_collision_uses_numbered_slot(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        target = tmp_path / "stm_proxy.json"
+        target.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(proxy_mod, "utc_now_iso", lambda: "2026-07-04T10:15:30Z")
+        first = proxy_mod._backup_config_snapshot(target, "one")
+        second = proxy_mod._backup_config_snapshot(target, "two")
+        assert first.name == "stm_proxy.json.bak-20260704T101530Z"
+        assert second.name == "stm_proxy.json.bak-20260704T101530Z.1"
+        assert first.read_text() == "one"
+        assert second.read_text() == "two"
+
+    def test_apply_non_tty_without_yes_errors(self, runner, config, tmp_path):
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+        before = config.read_bytes()
+        result = runner.invoke(cli, ["tune", "--apply", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "--yes" in result.output
+        assert config.read_bytes() == before
+
+    def test_apply_with_no_recommendations_writes_nothing(self, runner, config, tmp_path):
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        store = MetricsStore(metrics_db)
+        store.initialize()
+        store.close()
+        before = config.read_bytes()
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "No recommendations" in result.output
+        assert config.read_bytes() == before
+        assert list(config.parent.glob("stm_proxy.json.bak-*")) == []
+
+    def test_apply_refuses_schema_invalid_config(self, runner, config, tmp_path):
+        metrics_db = tmp_path / "metrics.db"
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"srv": {"command": "npx", "max_result_chars": -5}},
+                    "metrics": {"db_path": str(metrics_db)},
+                }
+            ),
+            encoding="utf-8",
+        )
+        before = config.read_bytes()
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "config validate" in result.output
+        assert config.read_bytes() == before
+
+
+class TestMergeTuneChanges:
+    """Merge policy for colliding TuningActions — unit-level, hand-built recs."""
+
+    @staticmethod
+    def _rec(server: str, tool: str, actions, confidence: str = "medium"):
+        from memtomem_stm.proxy.tuner import TuningRecommendation
+
+        return TuningRecommendation(
+            server=server, tool=tool, confidence=confidence, actions=list(actions)
+        )
+
+    @staticmethod
+    def _action(field: str, current: str | None, recommended: str, reason: str = "r"):
+        from memtomem_stm.proxy.tuner import TuningAction
+
+        return TuningAction(field=field, current=current, recommended=recommended, reason=reason)
+
+    _SERVERS = {"srv": {"command": "npx"}}
+
+    def test_compression_collision_last_wins_keeps_first_current(self):
+        from memtomem_stm.cli.proxy import _merge_tune_changes
+
+        rec = self._rec(
+            "srv",
+            "t",
+            [
+                self._action("compression", "auto", "skeleton", "pin dominant"),
+                self._action("compression", None, "hybrid", "feedback: truncated"),
+            ],
+        )
+        changes, skipped = _merge_tune_changes([rec], self._SERVERS)
+        assert skipped == []
+        (change,) = changes
+        assert change.value == "hybrid"  # H4 (feedback) beats H3 (latency pin)
+        assert change.current == "auto"  # resolved current survives the None-current winner
+        assert "feedback: truncated" in change.reason
+        assert "(merged 2 recommendations)" in change.reason
+
+    @pytest.mark.parametrize("order", ["asc", "desc"])
+    def test_max_result_chars_collision_takes_numeric_max(self, order):
+        from memtomem_stm.cli.proxy import _merge_tune_changes
+
+        values = ["16000", "24000"] if order == "asc" else ["24000", "16000"]
+        rec = self._rec(
+            "srv",
+            "t",
+            [self._action("max_result_chars", "8000", v) for v in values],
+        )
+        changes, _ = _merge_tune_changes([rec], self._SERVERS)
+        (change,) = changes
+        assert change.value == 24000
+        assert isinstance(change.value, int)
+
+    def test_unknown_server_is_skipped_with_warning(self):
+        from memtomem_stm.cli.proxy import _merge_tune_changes
+
+        rec = self._rec("ghost", "t", [self._action("max_result_chars", None, "16000")])
+        changes, skipped = _merge_tune_changes([rec], self._SERVERS)
+        assert changes == []
+        assert len(skipped) == 1
+        assert "ghost" in skipped[0]
+
+    def test_non_numeric_budget_recommendation_is_skipped_not_fatal(self):
+        from memtomem_stm.cli.proxy import _merge_tune_changes
+
+        rec = self._rec(
+            "srv",
+            "t",
+            [
+                self._action("max_result_chars", None, "lots"),
+                self._action("compression", "auto", "hybrid"),
+            ],
+        )
+        changes, skipped = _merge_tune_changes([rec], self._SERVERS)
+        (change,) = changes
+        assert change.field == "compression"
+        assert any("unusable" in s for s in skipped)
+
+    def test_retention_floor_converted_to_float(self):
+        from memtomem_stm.cli.proxy import _merge_tune_changes
+
+        rec = self._rec("srv", "t", [self._action("retention_floor", None, "0.4")])
+        changes, _ = _merge_tune_changes([rec], self._SERVERS)
+        assert changes[0].value == 0.4
+        assert isinstance(changes[0].value, float)

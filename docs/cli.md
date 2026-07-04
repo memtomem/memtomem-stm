@@ -52,6 +52,7 @@ Commands:
   stats      Show proxy compression and surfacing stats from the...
   status     Show proxy gateway configuration and server list.
   surfacing  Toggle proactive memory surfacing for an upstream server.
+  tune       Preview and apply per-tool compression tuning recommendations.
   version    Show the installed memtomem-stm version.
 ```
 
@@ -435,6 +436,32 @@ Shows proxy compression and surfacing statistics from the persistent databases (
 
 It reads these files read-only (without creating or migrating them) and reports all-time totals. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
 
+### `tune`
+
+```
+Usage: mms tune [OPTIONS]
+
+Options:
+  --config TEXT        [default: ~/.memtomem/stm_proxy.json]
+  --apply              Write the accepted overrides into the config (default: preview only).
+  -y, --yes            Apply all recommendations without prompting (scripts / CI / non-TTY).
+  --since-hours FLOAT  Analysis window over the metrics/feedback stores.  [default: 24.0]
+  --tool TEXT          Filter to one upstream tool name.
+  --json               Preview as JSON for scripting.
+```
+
+Runs the same analysis as the `stm_tuning_recommendations` MCP tool against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool.
+
+Three modes:
+
+- **`mms tune`** — preview only. Shows exactly what `--apply` would write, as `field: current -> recommended` lines per tool. `--json` emits the same data as `{"config_path", "since_hours", "tool_filter", "changes": [...], "skipped": [...]}` (preview only; it cannot be combined with `--apply`).
+- **`mms tune --apply`** — interactive: pick which tools to apply (all pre-selected; set `MMS_NO_TUI=1` for plain per-tool confirm prompts), then write the accepted overrides into `upstream_servers.<server>.tool_overrides.<tool>` under the config write lock. Without a TTY this errors and points at `--yes`.
+- **`mms tune --apply --yes`** — apply everything without prompting.
+
+Before writing, the config is snapshotted to a timestamped backup next to it (`stm_proxy.json.bak-<UTC>`, mode 0600); restore is `cp <backup> <config>`. A running proxy hot-reloads the new overrides without a restart. Recommendations for upstreams that exist only in metrics (env-defined or since-renamed servers) are reported as skipped rather than written.
+
+Unlike `mms stats`, this command opens the stores read-write to run their idempotent schema migrations (the same step the server performs at startup) — but only when the DB files already exist; a preview never creates anything.
+
 ## `mms hook` — built-in tool bridge + per-host registration
 
 ```
@@ -714,7 +741,7 @@ Nine observability/admin tools are hidden unless
 | `stm_selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and hard-filter reject reasons |
 | `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
 | `stm_progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
-| `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner |
+| `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner (apply them with [`mms tune --apply`](#tune)) |
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
 

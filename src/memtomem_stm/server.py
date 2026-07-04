@@ -1896,7 +1896,8 @@ async def stm_tuning_recommendations(
     Analyses proxy metrics (and compression feedback when available) to
     suggest ``max_result_chars``, ``compression`` strategy, and
     ``retention_floor`` adjustments per tool.  Recommendations are
-    read-only — apply them manually to ``stm_proxy.json``.
+    read-only — apply them with ``mms tune --apply`` (or edit
+    ``stm_proxy.json`` manually).
 
     Args:
         since_hours: Analysis window in hours (default 24).

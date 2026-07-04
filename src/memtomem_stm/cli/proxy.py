@@ -17,9 +17,12 @@ from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 import click
+
+if TYPE_CHECKING:
+    from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
@@ -2733,6 +2736,484 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     servers[name]["surfacing_enabled"] = desired
     _save(path, data)
     click.echo(f"{_ok('Surfacing ' + state)} for '{name}'.")
+
+
+# ── tune command (#615) ────────────────────────────────────────────────
+#
+# CLI front-end for the CompressionTuner analysis behind the
+# `stm_tuning_recommendations` MCP tool. The MCP tool renders a report that
+# ends with "apply manually to stm_proxy.json"; this command closes that
+# loop: preview the per-tool overrides the tuner suggests, then `--apply`
+# writes the accepted ones under the config write lock, after a timestamped
+# backup — a running proxy hot-reloads the file, so a bad apply is live
+# immediately and one-command restore matters.
+
+
+@dataclass(frozen=True)
+class _TuneChange:
+    """One ``(server, tool, field)`` override the tuner recommends writing."""
+
+    server: str
+    tool: str
+    field: str  # "max_result_chars" | "compression" | "retention_floor"
+    current: str | None  # effective current value, for display
+    recommended: str  # recommended value, for display
+    value: int | str | float  # typed value written into the config
+    reason: str
+    confidence: str
+
+
+def _tune_typed_value(field: str, recommended: str) -> int | str | float:
+    """Convert a ``TuningAction.recommended`` display string to the config type.
+
+    The tuner emits strings uniformly (its output was designed for a rendered
+    report); ``ToolOverrideConfig`` wants ``int`` for ``max_result_chars`` and
+    ``float`` for ``retention_floor``. Raises ``ValueError`` on a
+    non-numeric string so the caller can skip the action instead of writing
+    a value the server would reject.
+    """
+    if field == "max_result_chars":
+        return int(recommended)
+    if field == "retention_floor":
+        return float(recommended)
+    return recommended
+
+
+def _merge_tune_changes(
+    recs: list[TuningRecommendation], raw_servers: dict[str, Any]
+) -> tuple[list[_TuneChange], list[str]]:
+    """Collapse duplicate ``(server, tool, field)`` actions into one change each.
+
+    A single recommendation can carry colliding actions (see
+    ``CompressionTuner._analyze_profile``): the strategy-pin heuristic and the
+    feedback heuristic both emit ``compression``; a budget heuristic and the
+    feedback heuristic both emit ``max_result_chars``. Policy per field:
+
+    * ``compression`` — last-wins. The feedback-driven action is appended
+      after the latency pin, and an explicit agent-reported deficiency should
+      beat an optimization.
+    * ``max_result_chars`` — numeric max. "Budget too small" signals combine
+      as max; when the budget-savings heuristic collides with feedback asking
+      for more room, feedback wins, which max also yields.
+    * ``retention_floor`` — defensive last-wins (no current heuristic emits it).
+
+    Recommendations for servers absent from the raw config file are split off
+    as human-readable skip warnings: the metrics DB can carry rows for an
+    env-only or since-renamed upstream that has no dict entry to write into.
+    """
+    merged: dict[tuple[str, str, str], _TuneChange] = {}
+    merge_counts: dict[tuple[str, str, str], int] = {}
+    skipped: list[str] = []
+    skipped_servers: set[str] = set()
+
+    for rec in recs:
+        if rec.server not in raw_servers:
+            if rec.server not in skipped_servers:
+                skipped_servers.add(rec.server)
+                skipped.append(
+                    f"{rec.server}/{rec.tool}: server '{rec.server}' is not in the config "
+                    "file (env-defined or renamed upstream) — nothing to write"
+                )
+            continue
+        for action in rec.actions:
+            try:
+                value = _tune_typed_value(action.field, action.recommended)
+            except ValueError:
+                skipped.append(
+                    f"{rec.server}/{rec.tool}: unusable {action.field} recommendation "
+                    f"{action.recommended!r} — skipped"
+                )
+                continue
+            key = (rec.server, rec.tool, action.field)
+            prior = merged.get(key)
+            if prior is not None:
+                merge_counts[key] += 1
+                if (
+                    action.field == "max_result_chars"
+                    and isinstance(value, int)
+                    and isinstance(prior.value, int)
+                    and value <= prior.value
+                ):
+                    continue
+            else:
+                merge_counts[key] = 1
+            merged[key] = _TuneChange(
+                server=rec.server,
+                tool=rec.tool,
+                field=action.field,
+                # The feedback heuristic emits ``current=None``; keep the first
+                # action's resolved current so the diff still shows what the
+                # override replaces.
+                current=action.current if prior is None else (prior.current or action.current),
+                recommended=action.recommended,
+                value=value,
+                reason=action.reason,
+                confidence=rec.confidence,
+            )
+
+    changes: list[_TuneChange] = []
+    for key, change in merged.items():
+        if merge_counts[key] > 1:
+            reason = f"{change.reason} (merged {merge_counts[key]} recommendations)"
+            change = _TuneChange(
+                server=change.server,
+                tool=change.tool,
+                field=change.field,
+                current=change.current,
+                recommended=change.recommended,
+                value=change.value,
+                reason=reason,
+                confidence=change.confidence,
+            )
+        changes.append(change)
+    return changes, skipped
+
+
+def _tune_groups(
+    changes: list[_TuneChange],
+) -> list[tuple[tuple[str, str], list[_TuneChange]]]:
+    """Group changes per ``(server, tool)`` — the selection granularity."""
+    groups: dict[tuple[str, str], list[_TuneChange]] = {}
+    for change in changes:
+        groups.setdefault((change.server, change.tool), []).append(change)
+    return list(groups.items())
+
+
+def _pick_tune_tui(
+    groups: list[tuple[tuple[str, str], list[_TuneChange]]],
+) -> list[int] | None:
+    """Enter-to-toggle select loop over per-tool recommendations.
+
+    Same interaction model as :func:`_pick_imports_tui` (chosen over
+    ``questionary.checkbox`` — see that docstring), but starts with **all**
+    rows selected: the expected flow is "apply what the tuner found, minus
+    exceptions". Returns sorted indices into ``groups``; ``None`` on Cancel
+    (distinct from an empty Confirm, though callers treat both as abort).
+    """
+    import questionary
+
+    picks: set[int] = set(range(len(groups)))
+    cursor: object = 0
+
+    while True:
+        choices: list[Any] = []
+        for i, ((server, tool), items) in enumerate(groups):
+            marker = "[v]" if i in picks else "[ ]"
+            fields = ", ".join(f"{c.field} -> {c.recommended}" for c in items)
+            choices.append(
+                questionary.Choice(title=f"{marker}  {server}/{tool}  {fields}", value=i)
+            )
+        choices.append(questionary.Separator())
+        choices.append(
+            questionary.Choice(
+                title=f"Confirm — apply to {len(picks)} tool(s)",
+                value=_TUI_CONFIRM,
+            )
+        )
+        choices.append(questionary.Choice(title="Cancel", value=_TUI_CANCEL))
+
+        result = questionary.select(
+            "Select tools to tune (↑↓ or j/k to move, Enter toggles, scroll to Confirm):",
+            choices=choices,
+            default=cursor,  # type: ignore[arg-type]
+            style=_tui_style(),
+            use_arrow_keys=True,
+            use_jk_keys=True,
+            use_emacs_keys=True,
+        ).ask()
+
+        if result is None or result == _TUI_CANCEL:
+            return None
+        if result == _TUI_CONFIRM:
+            return sorted(picks)
+        cursor = result
+        if result in picks:
+            picks.remove(result)
+        else:
+            picks.add(result)
+
+
+def _pick_tune_changes(changes: list[_TuneChange]) -> list[_TuneChange] | None:
+    """Interactive per-tool selection. ``None`` means the user cancelled.
+
+    TUI when available; otherwise (``MMS_NO_TUI``, or questionary failing on
+    an incompatible terminal — same recovery as the init-wizard prompts) a
+    sequential ``click.confirm`` per tool, default yes. Callers guarantee a
+    TTY — the non-TTY case errors out before selection.
+    """
+    groups = _tune_groups(changes)
+    if _should_use_tui():
+        try:
+            picks = _pick_tune_tui(groups)
+        except Exception:
+            pass  # degrade to plain confirms below
+        else:
+            if picks is None:
+                return None
+            return [c for i in picks for c in groups[i][1]]
+
+    selected: list[_TuneChange] = []
+    for (server, tool), items in groups:
+        fields = ", ".join(c.field for c in items)
+        if click.confirm(f"Apply to {server}/{tool} ({fields})?", default=True):
+            selected.extend(items)
+    return selected
+
+
+def _render_tune_preview(
+    changes: list[_TuneChange],
+    skipped: list[str],
+    *,
+    since_hours: float,
+    apply_hint: bool,
+) -> None:
+    groups = _tune_groups(changes)
+    click.echo(_hdr(f"Tuning recommendations (last {since_hours:g}h): {len(groups)} tool(s)"))
+    for (server, tool), items in groups:
+        click.echo(f"  {server}/{tool}  [{items[0].confidence} confidence]")
+        for change in items:
+            current = change.current if change.current is not None else "(default)"
+            click.echo(f"    {change.field}: {current} -> {change.recommended}")
+            click.echo(f"        {change.reason}")
+    for entry in skipped:
+        click.echo(f"  {_warn('Skipped:')} {entry}")
+    if apply_hint:
+        click.echo("")
+        click.echo(
+            f"{len(changes)} change(s) across {len(groups)} tool(s). "
+            "Run with --apply to write them."
+        )
+
+
+def _tune_json_payload(
+    changes: list[_TuneChange],
+    skipped: list[str],
+    *,
+    resolved: Path,
+    since_hours: float,
+    tool_filter: str | None,
+) -> dict[str, Any]:
+    return {
+        "config_path": str(resolved),
+        "since_hours": since_hours,
+        "tool_filter": tool_filter,
+        "changes": [
+            {
+                "server": c.server,
+                "tool": c.tool,
+                "field": c.field,
+                "current": c.current,
+                "recommended": c.recommended,
+                "reason": c.reason,
+                "confidence": c.confidence,
+            }
+            for c in changes
+        ],
+        "skipped": skipped,
+    }
+
+
+def _backup_config_snapshot(resolved: Path, original_text: str) -> Path:
+    """Snapshot the pre-apply config to a timestamped, non-clobbering slot.
+
+    ``stm_proxy.json.bak-20260704T101530Z`` (``.1``, ``.2``, … on same-second
+    collision), each slot claimed with ``O_CREAT | O_EXCL`` like
+    ``hook_hosts._write_backup`` so two concurrent applies can't share one.
+    Mode 0o600 — the config can carry upstream env secrets, same rationale
+    as ``_save``. Restore is a plain ``cp`` back over the config; a running
+    proxy hot-reloads it.
+    """
+    stamp = utc_now_iso().replace("-", "").replace(":", "")
+    base = resolved.parent / f"{resolved.name}.bak-{stamp}"
+    i = 0
+    while True:
+        candidate = base if i == 0 else base.with_name(f"{base.name}.{i}")
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            i += 1
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(original_text)
+            # O_EXCL honors umask, so the mode above may be narrowed; force it.
+            try:
+                candidate.chmod(0o600)
+            except OSError:
+                pass
+        except Exception:
+            candidate.unlink(missing_ok=True)
+            raise
+        return candidate
+
+
+def _apply_tune_changes(data: dict[str, Any], selected: list[_TuneChange]) -> None:
+    """Write selected overrides into the raw config dict (unknown keys untouched)."""
+    servers = data.setdefault("upstream_servers", {})
+    for change in selected:
+        overrides = servers[change.server].setdefault("tool_overrides", {})
+        overrides.setdefault(change.tool, {})[change.field] = change.value
+
+
+@cli.command()
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    help="Write the accepted overrides into the config (default: preview only).",
+)
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    help="Apply all recommendations without prompting (scripts / CI / non-TTY).",
+)
+@click.option(
+    "--since-hours",
+    "since_hours",
+    type=float,
+    default=24.0,
+    show_default=True,
+    help="Analysis window over the metrics/feedback stores.",
+)
+@click.option("--tool", "tool_filter", default=None, help="Filter to one upstream tool name.")
+@click.option("--json", "as_json", is_flag=True, help="Preview as JSON for scripting.")
+@with_config_write_lock(skip=lambda kwargs: not kwargs.get("do_apply"))
+def tune(
+    config_path: str,
+    do_apply: bool,
+    assume_yes: bool,
+    since_hours: float,
+    tool_filter: str | None,
+    as_json: bool,
+) -> None:
+    """Preview and apply per-tool compression tuning recommendations.
+
+    \b
+    mms tune                 # preview what --apply would write
+    mms tune --apply         # pick recommendations, write tool_overrides
+    mms tune --apply --yes   # apply all, no prompts
+
+    Runs the same analysis as the ``stm_tuning_recommendations`` MCP tool
+    against the on-disk metrics/feedback stores (no running server needed)
+    and shows the per-tool ``tool_overrides`` diff it suggests. ``--apply``
+    writes the accepted overrides under the config write lock, after
+    snapshotting the config to a timestamped ``.bak-<UTC>`` file next to it;
+    restore is ``cp <backup> <config>``. A running proxy hot-reloads the
+    result without a restart.
+
+    Unlike ``mms stats`` (pure read-only summaries), this opens the stores
+    read-write to run their idempotent schema migrations — the same step the
+    server performs at startup — but only when the DB files already exist;
+    a preview never creates anything.
+    """
+    from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
+    from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
+    from memtomem_stm.proxy.metrics_store import MetricsStore
+    from memtomem_stm.proxy.tuner import CompressionTuner
+
+    if as_json and do_apply:
+        raise click.UsageError("--json is a preview format; it cannot be combined with --apply.")
+
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
+        click.echo("  Run `mms init` first.", err=True)
+        sys.exit(1)
+
+    original_text = resolved.read_text(encoding="utf-8")
+    data = _load(resolved)
+
+    # Typed load with the env overlay: the tuner resolves *effective* current
+    # values (and the DB paths) the way the server does. A file that fails the
+    # typed load is one a running server silently ignores (#611) — refuse to
+    # write overrides into it.
+    typed_cfg = ProxyConfig.load_from_file(
+        path, env_overrides=collect_proxy_env_overrides(), missing_ok=False
+    )
+    if typed_cfg is None:
+        click.echo(
+            f"{_err('Error:')} config fails validation — run `mms config validate` "
+            "and fix it before tuning.",
+            err=True,
+        )
+        sys.exit(1)
+
+    metrics_path = typed_cfg.metrics.db_path.expanduser()
+    if not metrics_path.exists():
+        click.echo(f"No proxy metrics recorded yet at {metrics_path} — nothing to tune.")
+        return
+    feedback_path = typed_cfg.compression_feedback.db_path.expanduser()
+
+    metrics_store = MetricsStore(metrics_path)
+    feedback_store = CompressionFeedbackStore(feedback_path) if feedback_path.exists() else None
+    try:
+        metrics_store.initialize()
+        if feedback_store is not None:
+            feedback_store.initialize()
+        tuner = CompressionTuner(metrics_store, feedback_store, config=typed_cfg)
+        recs = tuner.analyze(since_seconds=since_hours * 3600.0, tool_filter=tool_filter)
+    finally:
+        metrics_store.close()
+        if feedback_store is not None:
+            feedback_store.close()
+
+    raw_servers: dict[str, Any] = data.get("upstream_servers", {})
+    changes, skipped = _merge_tune_changes(recs, raw_servers)
+
+    if as_json:
+        payload = _tune_json_payload(
+            changes, skipped, resolved=resolved, since_hours=since_hours, tool_filter=tool_filter
+        )
+        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    if not changes:
+        for entry in skipped:
+            click.echo(f"{_warn('Skipped:')} {entry}")
+        click.echo("No recommendations — all observed tools are within healthy parameters.")
+        return
+
+    _render_tune_preview(changes, skipped, since_hours=since_hours, apply_hint=not do_apply)
+    if not do_apply:
+        return
+
+    if assume_yes:
+        selected: list[_TuneChange] | None = list(changes)
+    elif _stdin_is_tty():
+        click.echo("")
+        selected = _pick_tune_changes(changes)
+    else:
+        click.echo(
+            f"{_err('Error:')} no TTY; pass --yes to apply all "
+            "(or run without --apply to preview).",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not selected:
+        click.echo("Aborted. No changes made.")
+        return
+
+    _apply_tune_changes(data, selected)
+    config_error = _schema_validation_error(data)
+    if config_error:
+        click.echo(
+            f"{_err('Error:')} applying would produce an invalid config "
+            f"({config_error}); nothing written.",
+            err=True,
+        )
+        sys.exit(1)
+
+    backup = _backup_config_snapshot(resolved, original_text)
+    click.echo(f"Backup: {backup}")
+    _save(resolved, data)
+    tool_count = len({(c.server, c.tool) for c in selected})
+    click.echo(f"{_ok('Applied')} {len(selected)} override(s) to {tool_count} tool(s).")
+    click.echo(f"  A running proxy hot-reloads the config; restore with: cp {backup} {resolved}")
 
 
 # ── prune command ──────────────────────────────────────────────────────
