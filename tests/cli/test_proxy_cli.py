@@ -4373,6 +4373,10 @@ class TestPruneCommand:
         fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
         result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
         assert result.exit_code == 1
+        # json.loads tolerates leading whitespace, so pin byte-level purity
+        # too: the failure-block separator line must not reach stdout
+        # (codex #644 R1 caught exactly that leak).
+        assert result.stdout.startswith("{")
         data = json.loads(result.stdout)  # stderr diagnostics must not corrupt stdout
         assert data["ok"] is False
         assert data["failed"][0]["name"] == "docs-langchain"
@@ -5697,6 +5701,27 @@ class TestConfigWriteLock:
         assert result.exit_code == 1
         assert "timed out" in result.output
         assert "mutating the proxy config" in result.output
+
+    def test_lock_timeout_renders_json_envelope_in_json_mode(
+        self, runner, config, _hermetic_home
+    ):
+        """The lock is acquired before the callback runs, so the commands'
+        own --json error handling can never see a timeout — the decorator
+        must render the envelope itself (#614, codex #644 R1). Exit code
+        stays 1; stdout is exactly one JSON document."""
+        self._seed(config)
+        with self._hold_lock(_hermetic_home):
+            result = runner.invoke(
+                cli, ["remove", "srv", "--yes", "--json", *_cfg_args(config)]
+            )
+        assert result.exit_code == 1
+        assert result.stdout.lstrip().startswith("{")
+        data = json.loads(result.stdout)
+        assert data["action"] == "remove" and data["ok"] is False
+        assert data["error"] == "config_lock_timeout"
+        assert "timed out" in data["message"]
+        # Human diagnostics still land on stderr.
+        assert "timed out" in result.stderr
 
     def test_read_and_dry_run_paths_skip_lock(
         self, runner, config, monkeypatch, _hermetic_home

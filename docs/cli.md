@@ -62,6 +62,8 @@ All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
 
 Output is colorized when writing to a terminal; set `NO_COLOR=1` to disable. JSON output (`--json`) and non-TTY streams (pipes, CI) are never colored.
 
+The `--json` single-document contract covers well-formed invocations: success and operational failures (including a config write-lock timeout) emit exactly one JSON object on stdout. **Usage errors are outside it** — a malformed invocation (unknown flag, missing argument, an incompatible flag combination such as `add --json --from-clients` or `tune --json --apply`) gets Click's standard plain-text usage message on stderr with exit 2 and an empty stdout, same as every read-only `--json` command today.
+
 ### `init`
 
 ```

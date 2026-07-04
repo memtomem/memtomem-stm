@@ -1999,7 +1999,11 @@ def _report_prune_results(
             click.echo(f"  {name} — {src}")
 
     if failed:
-        click.echo("")
+        # Visual separator: stdout in human mode, but it must not precede
+        # the JSON document in --json mode — stdout carries exactly one
+        # JSON object there (json.loads tolerates leading whitespace, so a
+        # naive parse test would not catch this).
+        click.echo("", err=quiet_success)
         click.echo(
             f"{_warn('Warning:')} could not remove {len(failed)} direct registration(s):",
             err=True,

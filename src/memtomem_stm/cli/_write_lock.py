@@ -142,6 +142,16 @@ def with_config_write_lock(
     no state argument) — those run unlocked, mirroring the mms ``--plan``
     skip. A factory rather than a bare decorator because the skip
     predicate differs per command.
+
+    Timeout rendering honors the command's ``--json`` mode: the lock is
+    acquired *before* the callback runs, so the callback's own JSON error
+    handling can never see a :class:`state.WriteLockTimeout`. When the
+    wrapped kwargs carry a truthy ``as_json`` (the flag variable every
+    proxy.py ``--json`` command uses), the timeout is emitted as the same
+    single-JSON-document envelope the commands produce (#614) instead of
+    Click's plain-text error, keeping ``mms <cmd> --json | jq`` parseable
+    on this failure too. Commands with other flag names (``mms host sync``'s
+    ``json_output``) keep the pre-existing text rendering.
     """
 
     def decorate(f: F) -> F:
@@ -156,6 +166,26 @@ def with_config_write_lock(
                 ):
                     return f(*args, **kwargs)
             except state.WriteLockTimeout as exc:
+                if kwargs.get("as_json"):
+                    import json as _json
+                    import sys as _sys
+
+                    ctx = click.get_current_context(silent=True)
+                    action = ctx.command.name if ctx and ctx.command.name else f.__name__
+                    click.echo(f"Error: {exc}", err=True)
+                    click.echo(
+                        _json.dumps(
+                            {
+                                "action": action,
+                                "ok": False,
+                                "error": "config_lock_timeout",
+                                "message": str(exc),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                    _sys.exit(1)
                 raise click.ClickException(str(exc)) from exc
 
         return wrapper  # type: ignore[return-value]
