@@ -5723,6 +5723,23 @@ class TestConfigWriteLock:
         # Human diagnostics still land on stderr.
         assert "timed out" in result.stderr
 
+    def test_lock_timeout_json_envelope_is_opt_in(self, runner, config, _hermetic_home):
+        """`mms tune` also names its flag ``as_json`` but is NOT opted in
+        to the JSON timeout envelope (its --json is a preview-only mode) —
+        pins that the decorator keys on json_envelope, not on flag-name
+        sniffing (codex #644 R2)."""
+        self._seed(config)
+        with self._hold_lock(_hermetic_home):
+            # --json + --apply is a usage error inside the callback, but the
+            # held lock times out first (same precedence as main for every
+            # mutator); a non-opted-in command must keep text rendering.
+            result = runner.invoke(
+                cli, ["tune", "--apply", "--yes", "--json", *_cfg_args(config)]
+            )
+        assert result.exit_code == 1
+        assert result.stdout.strip() == ""
+        assert "timed out" in result.output
+
     def test_read_and_dry_run_paths_skip_lock(
         self, runner, config, monkeypatch, _hermetic_home
     ):

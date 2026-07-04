@@ -124,7 +124,9 @@ def hook_hosts_write_lock(*, enabled: bool) -> Iterator[None]:
 
 
 def with_config_write_lock(
-    *, skip: Callable[[dict[str, Any]], bool] | None = None
+    *,
+    skip: Callable[[dict[str, Any]], bool] | None = None,
+    json_envelope: bool = False,
 ) -> Callable[[F], F]:
     """Run a Click command callback under the proxy-config write lock (#475 PR2).
 
@@ -143,15 +145,19 @@ def with_config_write_lock(
     skip. A factory rather than a bare decorator because the skip
     predicate differs per command.
 
-    Timeout rendering honors the command's ``--json`` mode: the lock is
-    acquired *before* the callback runs, so the callback's own JSON error
-    handling can never see a :class:`state.WriteLockTimeout`. When the
-    wrapped kwargs carry a truthy ``as_json`` (the flag variable every
-    proxy.py ``--json`` command uses), the timeout is emitted as the same
+    Timeout rendering honors the command's ``--json`` mode when the command
+    opts in via ``json_envelope=True``: the lock is acquired *before* the
+    callback runs, so the callback's own JSON error handling can never see
+    a :class:`state.WriteLockTimeout`. For an opted-in command whose kwargs
+    carry a truthy ``as_json``, the timeout is emitted as the same
     single-JSON-document envelope the commands produce (#614) instead of
     Click's plain-text error, keeping ``mms <cmd> --json | jq`` parseable
-    on this failure too. Commands with other flag names (``mms host sync``'s
-    ``json_output``) keep the pre-existing text rendering.
+    on this failure too. Explicit opt-in rather than sniffing ``as_json``
+    alone (codex #644 R2): ``mms tune`` also names its flag ``as_json`` but
+    documents a *preview*-only ``--json`` and keeps text rendering. Error
+    precedence under contention is unchanged from main for every mutator:
+    the lock wraps the whole command, so a held lock surfaces the timeout
+    before any callback-level usage validation runs — in both renderings.
     """
 
     def decorate(f: F) -> F:
@@ -166,7 +172,7 @@ def with_config_write_lock(
                 ):
                     return f(*args, **kwargs)
             except state.WriteLockTimeout as exc:
-                if kwargs.get("as_json"):
+                if json_envelope and kwargs.get("as_json"):
                     import json as _json
                     import sys as _sys
 

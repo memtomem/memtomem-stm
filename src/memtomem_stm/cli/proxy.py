@@ -1108,7 +1108,7 @@ def stats(
     "valid with --from-clients/--import.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-@with_config_write_lock()
+@with_config_write_lock(json_envelope=True)
 def add(
     name: str | None,
     config_path: str,
@@ -2803,7 +2803,7 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
     is_flag=True,
     help="Output as JSON for scripting (requires --yes).",
 )
-@with_config_write_lock()
+@with_config_write_lock(json_envelope=True)
 def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> None:
     """Remove an upstream MCP server from the proxy configuration."""
     path = Path(config_path)
@@ -3461,7 +3461,7 @@ def tune(
     is_flag=True,
     help="Output as JSON for scripting (requires --yes, or --dry-run).",
 )
-@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")))
+@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")), json_envelope=True)
 def prune(
     names: tuple[str, ...],
     config_path: str,
@@ -4170,7 +4170,7 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     is_flag=True,
     help="Output as JSON for scripting (requires --yes, or --dry-run).",
 )
-@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")))
+@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")), json_envelope=True)
 def eject(
     names: tuple[str, ...],
     config_path: str,
