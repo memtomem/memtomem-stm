@@ -53,6 +53,28 @@ The LTM core lives in a separate repository: [memtomem/memtomem](https://github.
 We do not accept third-party automated promotional or badge PRs (for example,
 vendor security-scan badges); these will be closed.
 
+## Changelog and upgrade notes
+
+Every user-visible change gets a `CHANGELOG.md` bullet under `## [Unreleased]`,
+citing the merged PR (`(#N)` — add it once the PR number exists) and, where
+one drove the work, the issue. If the change alters observable behavior — a
+default flip, an output-format change, new exit codes, a removed surface —
+the bullet must carry an inline `**Behavior change**:` clause stating exactly
+what a user sees differently (write `**Behavior change**: none external` when
+a fix looks behavioral but isn't).
+
+The release's `### Upgrade notes` block is the scannable aggregate of those
+clauses: when cutting a release, any release block containing a real
+`**Behavior change**:` clause opens with `### Upgrade notes` (first
+subsection under the release heading) summarizing each one in 1–3 lines with
+its PR reference and, where applicable, the escape hatch that restores the
+old behavior. Releases without behavior changes omit the block. The detailed
+bullets stay where they are — the block points, it doesn't replace.
+
+The user-facing side of this contract (what compatibility a 0.x release
+promises, how deprecations are staged) lives in the README's
+[Compatibility & deprecation policy](README.md#compatibility--deprecation-policy).
+
 ## Adding a bench_qa scenario
 
 `bench_qa` is an end-to-end pytest sub-suite that drives the proxy

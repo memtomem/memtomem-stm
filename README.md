@@ -208,6 +208,19 @@ are hidden unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set,
 which keeps eager-loading clients from paying schema tokens for rarely used
 operator tools.
 
+## Compatibility & deprecation policy
+
+memtomem-stm is alpha (0.x): behavior and defaults may change between minor
+releases while the design settles — defaults have flipped before (e.g.
+`injection_mode` `prepend` → `append` in 0.1.24). Every such change is flagged
+inline in [CHANGELOG.md](https://github.com/memtomem/memtomem-stm/blob/main/CHANGELOG.md)
+with a `**Behavior change**:` marker and, per release, summarized up front in
+that release's **Upgrade notes** block — skim that block before upgrading.
+Machine-readable surfaces (`--json` output shapes, exit codes) only change
+with an Upgrade notes entry; additive keys may appear at any time, so parse by
+key, not by shape equality. Deprecated CLI commands or flags keep working with
+a warning for at least one minor release before removal.
+
 ## Development
 
 ```bash

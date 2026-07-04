@@ -722,3 +722,34 @@ def test_user_facing_surfaces_carry_no_private_docs_paths() -> None:
         "protocol references, public docs links) — readers cannot open "
         "memtomem-docs files."
     )
+
+
+def test_deprecation_policy_and_upgrade_notes_convention_exist() -> None:
+    """The #614 compatibility contract spans three files that reference each
+    other by heading: README's policy section (the anchor CHANGELOG and
+    CONTRIBUTING link to), CONTRIBUTING's changelog-writing guidance, and
+    the CHANGELOG header prose that tells readers where to look. Renaming
+    or dropping any one of them silently orphans the other two."""
+    readme = _read("README.md")
+    contributing = _read("CONTRIBUTING.md")
+    changelog_head = _read("CHANGELOG.md")[:2000]
+
+    assert "## Compatibility & deprecation policy" in readme, (
+        "README lost the '## Compatibility & deprecation policy' section — "
+        "CHANGELOG.md and CONTRIBUTING.md link to its anchor."
+    )
+    assert "## Changelog and upgrade notes" in contributing, (
+        "CONTRIBUTING lost the '## Changelog and upgrade notes' section that "
+        "defines when a release block needs an '### Upgrade notes' summary."
+    )
+    # The inline marker string is the convention's join key: CONTRIBUTING
+    # tells writers to use it and the README tells readers to look for it.
+    for name, text in (("README.md", readme), ("CONTRIBUTING.md", contributing)):
+        assert "**Behavior change**:" in text, (
+            f"{name} no longer names the '**Behavior change**:' marker the "
+            "upgrade-notes convention aggregates."
+        )
+    assert "Upgrade notes" in changelog_head, (
+        "CHANGELOG.md's header prose should tell readers releases with "
+        "behavior changes open with an 'Upgrade notes' block."
+    )
