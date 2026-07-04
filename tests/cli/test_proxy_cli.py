@@ -449,6 +449,12 @@ class TestStatus:
         assert data["enabled"] is True
         assert "fs" in data["servers"]
         assert str(config) in data["config_path"]
+        # #614 additive keys — the full `servers` map above stays (scripted
+        # consumers + the redaction pins depend on it); the counts let
+        # callers match the human summary without re-deriving the pruned
+        # predicate.
+        assert data["server_count"] == 1
+        assert data["pruned_count"] == 0
 
     def test_json_missing_config(self, runner, config):
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
@@ -583,7 +589,10 @@ class TestStatus:
         for secret in ("ghp_strsecret", "Bearer leaked"):
             assert secret not in result.output
 
-    def test_shows_server_details(self, runner, config):
+    def test_human_output_is_summary_without_server_rows(self, runner, config):
+        """#614: status is the config summary; per-server rows moved to
+        ``mms list``. Pins the removal — none of the old per-server
+        fragments may reappear — and the pointer at the new home."""
         config.write_text(
             json.dumps(
                 {
@@ -604,10 +613,71 @@ class TestStatus:
         )
         result = runner.invoke(cli, ["status", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "fs" in result.output
-        assert "prefix=fs" in result.output
-        assert "uvx" in result.output
-        assert "compression=auto" in result.output
+        assert "Servers: 1" in result.output
+        assert "mms list" in result.output
+        assert "prefix=" not in result.output
+        assert "compression=" not in result.output
+        assert "surfacing=" not in result.output
+        assert "uvx" not in result.output
+
+    def test_servers_line_counts_host_pruned(self, runner, config):
+        """The host-pruned suffix uses the same every-source predicate as
+        the ``mms list`` ``*`` marker: fully-pruned entries count, an
+        entry with an un-pruned duplicate does not."""
+
+        def _entry(*, source_pruned: bool, dup_pruned: bool | None = None) -> dict:
+            duplicates = (
+                [] if dup_pruned is None else [{"kind": "claude-desktop", "pruned": dup_pruned}]
+            )
+            return {
+                "prefix": "xx",
+                "transport": "stdio",
+                "command": "npx",
+                "origin": {
+                    "schema_version": 1,
+                    "source": {"kind": "claude-user", "pruned": source_pruned},
+                    "duplicates": duplicates,
+                    "imported_at": "2026-06-11T00:00:00Z",
+                    "original": {"command": "npx"},
+                },
+            }
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "gone": _entry(source_pruned=True),
+                        "partial": _entry(source_pruned=True, dup_pruned=False),
+                        "manual": {"prefix": "mn", "command": "npx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "Servers: 3 (1 host-pruned)" in result.output
+        data = json.loads(runner.invoke(cli, ["status", "--json", *_cfg_args(config)]).output)
+        assert data["server_count"] == 3
+        assert data["pruned_count"] == 1
+
+    def test_no_pruned_suffix_when_nothing_pruned(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {"enabled": True, "upstream_servers": {"fs": {"prefix": "fs", "command": "x"}}}
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert "Servers: 1\n" in result.output
+
+    def test_empty_config_points_at_add(self, runner, config):
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms add" in result.output
+        assert "mms list" not in result.output
 
 
 # ── list command ─────────────────────────────────────────────────────────
@@ -674,9 +744,38 @@ class TestListServers:
         # The COMPRESSION column starts at the same offset on header
         # and row — drift used to put them several chars apart.
         assert header.index("COMPRESSION") == row.index("auto")
+        # Same pin for the SURFACING column added in #614 ("on" is the
+        # default — the flag is absent on this entry).
+        assert row[header.index("SURFACING") :].startswith("on")
         # Same pin for the ORIGIN column added in #475 PR4 ("-" is the
         # no-provenance cell; this entry was added manually).
         assert row[header.index("ORIGIN")] == "-"
+
+    def test_list_surfacing_column_shows_toggle(self, runner, config):
+        """The SURFACING column is the per-server toggle's visible home
+        (#614 — ``mms status`` no longer prints per-server rows): ``off``
+        when ``surfacing_enabled`` is false, ``on`` when absent (default)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "quiet": {"prefix": "q", "command": "npx", "surfacing_enabled": False},
+                        "loud": {"prefix": "l", "command": "npx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        header = next(line for line in lines if "SURFACING" in line)
+        offset = header.index("SURFACING")
+        quiet_row = next(line for line in lines if line.startswith("quiet"))
+        loud_row = next(line for line in lines if line.startswith("loud"))
+        assert quiet_row[offset:].startswith("off")
+        assert loud_row[offset:].startswith("on")
 
     def test_list_origin_column_summarizes_provenance(self, runner, config):
         """The ORIGIN column shows the recorded source kind for imported
@@ -6903,17 +7002,23 @@ class TestSurfacingCommand:
         result = runner.invoke(cli, ["surfacing", "context7", "maybe", *_cfg_args(config)])
         assert result.exit_code != 0
 
-    def test_status_renders_surfacing_off(self, runner, config):
+    def test_list_renders_surfacing_off(self, runner, config):
+        """#614: the per-server surfacing state's visible home is the
+        ``mms list`` SURFACING column (status is a config summary now)."""
         self._seed(config, surfacing_enabled=False)
-        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "surfacing=off" in result.output
+        header = next(line for line in result.output.splitlines() if "SURFACING" in line)
+        row = next(line for line in result.output.splitlines() if line.startswith("context7"))
+        assert row[header.index("SURFACING") :].startswith("off")
 
-    def test_status_renders_surfacing_on_by_default(self, runner, config):
+    def test_list_renders_surfacing_on_by_default(self, runner, config):
         self._seed(config)
-        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "surfacing=on" in result.output
+        header = next(line for line in result.output.splitlines() if "SURFACING" in line)
+        row = next(line for line in result.output.splitlines() if line.startswith("context7"))
+        assert row[header.index("SURFACING") :].startswith("on")
 
 
 class TestTune:

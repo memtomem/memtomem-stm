@@ -139,4 +139,4 @@ Open an issue at https://github.com/memtomem/memtomem-stm/issues with:
 - Steps to reproduce
 - Expected vs actual behavior
 - Environment (OS, Python version, memtomem-stm version, upstream MCP server versions)
-- Relevant config (`stm_proxy.json` or `mms status` output, with secrets redacted)
+- Relevant config (`stm_proxy.json` or `mms list --json` output, with secrets redacted)
