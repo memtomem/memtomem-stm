@@ -442,10 +442,28 @@ class TestCompressionFeedbackTracker:
             tracker.record(server="s", tool="t2", missing="c", kind="truncated")
 
             summary = tracker.store.get_tool_feedback_summary(since_seconds=3600.0)
-            assert set(summary.keys()) == {"t1", "t2"}
-            assert summary["t1"]["total"] == 2
-            assert summary["t1"]["by_kind"] == {"truncated": 1, "missing_example": 1}
-            assert summary["t2"]["total"] == 1
+            assert set(summary.keys()) == {("s", "t1"), ("s", "t2")}
+            assert summary[("s", "t1")]["total"] == 2
+            assert summary[("s", "t1")]["by_kind"] == {"truncated": 1, "missing_example": 1}
+            assert summary[("s", "t2")]["total"] == 1
+        finally:
+            tracker.close()
+
+    def test_get_tool_feedback_summary_splits_same_tool_name_across_servers(
+        self, tmp_path: Path
+    ):
+        """Two upstreams exposing the same tool name must not pool feedback —
+        the tuner keys per-server config recommendations off this aggregate."""
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        try:
+            tracker.record(server="server_a", tool="search", missing="a", kind="truncated")
+            tracker.record(server="server_a", tool="search", missing="b", kind="truncated")
+            tracker.record(server="server_b", tool="search", missing="c", kind="missing_example")
+
+            summary = tracker.store.get_tool_feedback_summary(since_seconds=3600.0)
+            assert summary[("server_a", "search")]["total"] == 2
+            assert summary[("server_b", "search")]["total"] == 1
+            assert summary[("server_b", "search")]["by_kind"] == {"missing_example": 1}
         finally:
             tracker.close()
 

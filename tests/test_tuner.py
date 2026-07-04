@@ -92,6 +92,25 @@ class TestGetProfiles:
         assert profiles[0].feedback_count == 2
         assert profiles[0].feedback_dominant_kind == "truncated"
 
+    def test_feedback_not_pooled_across_servers_sharing_a_tool_name(
+        self, metrics_store: MetricsStore, feedback_store: CompressionFeedbackStore
+    ):
+        """Feedback joins on (server, tool), not tool name alone: with two
+        upstreams exposing `search`, server_a's reports must not surface on
+        server_b's profile — the tuner turns a profile's feedback into a
+        per-server config recommendation (`mms tune --apply` writes it)."""
+        _seed_metrics(metrics_store, "server_a", "search", 5)
+        _seed_metrics(metrics_store, "server_b", "search", 5)
+        for note in ("one", "two", "three"):
+            feedback_store.record("server_a", "search", "truncated", note, None)
+
+        tuner = CompressionTuner(metrics_store, feedback_store)
+        by_server = {p.server: p for p in tuner.get_profiles()}
+        assert by_server["server_a"].feedback_count == 3
+        assert by_server["server_a"].feedback_dominant_kind == "truncated"
+        assert by_server["server_b"].feedback_count == 0
+        assert by_server["server_b"].feedback_dominant_kind is None
+
 
 # ── analyze ─────────────────────────────────────────────────────────────
 
