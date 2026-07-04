@@ -20,6 +20,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -65,8 +66,15 @@ def _make_manager(
     tools: list | None = None,
     tool_overrides: dict[str, ToolOverrideConfig] | None = None,
     annotation_policy: str = "conservative",
+    circuit_max_failures: int = 0,
+    circuit_reset_seconds: float = 60.0,
 ) -> ProxyManager:
-    """Create a ProxyManager with a mocked upstream connection."""
+    """Create a ProxyManager with a mocked upstream connection.
+
+    ``circuit_max_failures`` defaults to 0 (breaker disabled) so the
+    pre-#608 error-path tests keep exercising the raw retry/deadline
+    mechanics without breaker fast-fails intervening.
+    """
     server_cfg = UpstreamServerConfig(
         prefix="test",
         compression=compression,
@@ -78,6 +86,8 @@ def _make_manager(
         overall_deadline_seconds=overall_deadline,
         progressive=progressive,
         tool_overrides=tool_overrides or {},
+        circuit_max_failures=circuit_max_failures,
+        circuit_reset_seconds=circuit_reset_seconds,
     )
     config_path = (tmp_path / "proxy.json") if tmp_path else Path("/tmp/proxy.json")
     proxy_cfg = ProxyConfig(
@@ -88,13 +98,22 @@ def _make_manager(
     tracker = TokenTracker()
     mgr = ProxyManager(proxy_cfg, tracker)
 
-    # Inject a mocked connection
+    # Inject a mocked connection (breaker built exactly as _connect_server does)
     session = AsyncMock()
     conn = UpstreamConnection(
         name="srv",
         config=server_cfg,
         session=session,
         tools=tools if tools is not None else [],
+        breaker=(
+            CircuitBreaker(
+                max_failures=circuit_max_failures,
+                reset_timeout=circuit_reset_seconds,
+                name="upstream-srv",
+            )
+            if circuit_max_failures > 0
+            else None
+        ),
     )
     mgr._connections["srv"] = conn
     return mgr
@@ -1447,3 +1466,242 @@ class TestTransientKeyResponsesNotCached:
             )
         finally:
             cache.close()
+
+
+# ── Per-upstream circuit breaker (#608) ──────────────────────────────────
+
+
+class TestUpstreamCircuitBreaker:
+    """Terminal transport/timeout failures open the per-upstream breaker;
+    an open breaker fast-fails without touching the upstream."""
+
+    async def test_opens_after_terminal_failures_and_fast_fails(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        mgr = _make_manager(max_retries=0, circuit_max_failures=2)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            for _ in range(2):
+                with pytest.raises(ConnectionError):
+                    await mgr.call_tool("srv", "tool", {})
+            assert mgr._connections["srv"].breaker.state == "open"
+
+            with pytest.raises(ToolError, match="circuit breaker open"):
+                await mgr.call_tool("srv", "tool", {})
+
+        # The fast-fail never reached the upstream
+        assert session.call_tool.call_count == 2
+
+    async def test_fast_fail_counters_stay_reconciled(self):
+        """Wire-in counters (#558 invariant): the fast-fail records exactly
+        one ``circuit_open`` error row and nothing else."""
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager(max_retries=0, circuit_max_failures=2)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            for _ in range(2):
+                with pytest.raises(ConnectionError):
+                    await mgr.call_tool("srv", "tool", {})
+            with pytest.raises(ToolError):
+                await mgr.call_tool("srv", "tool", {})
+
+        cats = mgr.tracker._errors_by_category
+        assert cats[ErrorCategory.TRANSPORT.value] == 2
+        assert cats[ErrorCategory.CIRCUIT_OPEN.value] == 1
+        # _mark_recorded honored: the outer wrapper adds no INTERNAL_ERROR row
+        assert cats[ErrorCategory.INTERNAL_ERROR.value] == 0
+        summary = mgr.tracker.get_summary()
+        assert summary["total_invocations"] == 3
+        assert summary["total_errors"] == 3
+
+    async def test_one_breaker_count_per_call_not_per_attempt(self):
+        mgr = _make_manager(max_retries=2, circuit_max_failures=3, tools=_read_only_tools())
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+
+        breaker = mgr._connections["srv"].breaker
+        assert session.call_tool.call_count == 3  # 3 attempts...
+        assert breaker.failure_count == 1  # ...one breaker count
+        assert breaker.state == "closed"
+
+    async def test_success_resets_failure_count(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=3)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [ConnectionError("down"), _make_result("ok")]
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+            breaker = mgr._connections["srv"].breaker
+            assert breaker.failure_count == 1
+            result = await mgr.call_tool("srv", "tool", {})
+
+        assert result == "ok"
+        assert breaker.failure_count == 0
+        assert breaker.state == "closed"
+
+    async def test_is_error_result_counts_as_breaker_success(self):
+        """A tool-level ``isError`` result proves the upstream is alive —
+        it closes the breaker instead of counting against it."""
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager(max_retries=0, circuit_max_failures=2)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [
+            ConnectionError("down"),
+            _make_result("tool blew up", is_error=True),
+        ]
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+            with pytest.raises(ToolError, match="tool blew up"):
+                await mgr.call_tool("srv", "tool", {})
+
+        breaker = mgr._connections["srv"].breaker
+        assert breaker.failure_count == 0
+        assert breaker.state == "closed"
+        assert mgr.tracker._errors_by_category[ErrorCategory.UPSTREAM_ERROR.value] == 1
+
+    async def test_protocol_and_programming_errors_do_not_count(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=1)
+        session = _get_session(mgr)
+        breaker = mgr._connections["srv"].breaker
+
+        protocol_exc = Exception("bad params")
+        protocol_exc.error = SimpleNamespace(code=-32602)
+        session.call_tool.side_effect = protocol_exc
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(Exception, match="bad params"):
+                await mgr.call_tool("srv", "tool", {})
+        assert breaker.failure_count == 0
+
+        session.call_tool.side_effect = TypeError("wrong type")
+        with pytest.raises(TypeError):
+            await mgr.call_tool("srv", "tool", {})
+        assert breaker.failure_count == 0
+        assert breaker.state == "closed"
+
+    async def test_half_open_probe_success_closes(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=1)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [ConnectionError("down"), _make_result("ok")]
+        breaker = mgr._connections["srv"].breaker
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+            assert breaker.state == "open"
+
+            with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
+                mock_time.monotonic.return_value = breaker.opened_at + 61.0
+                result = await mgr.call_tool("srv", "tool", {})
+
+        assert result == "ok"
+        assert breaker.state == "closed"
+        assert session.call_tool.call_count == 2  # the probe reached the session
+
+    async def test_half_open_probe_failure_reopens(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=1)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("still down")
+        breaker = mgr._connections["srv"].breaker
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+            first_opened_at = breaker.opened_at
+
+            with patch("memtomem_stm.utils.circuit_breaker.time") as mock_time:
+                mock_time.monotonic.return_value = first_opened_at + 61.0
+                with pytest.raises(ConnectionError):
+                    await mgr.call_tool("srv", "tool", {})
+
+        assert breaker.state == "open"
+        assert breaker.opened_at != first_opened_at  # fresh window from the probe failure
+
+    async def test_overall_deadline_terminal_records_breaker_failure(self):
+        mgr = _make_manager(
+            max_retries=10,
+            call_timeout=0.01,
+            overall_deadline=0.05,
+            circuit_max_failures=3,
+            tools=_read_only_tools(),
+        )
+        session = _get_session(mgr)
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        session.call_tool.side_effect = hang
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError, match="overall_deadline"):
+                await mgr.call_tool("srv", "tool", {})
+
+        breaker = mgr._connections["srv"].breaker
+        assert breaker.failure_count == 1
+
+    async def test_disabled_breaker_never_fast_fails(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=0)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+
+        assert mgr._connections["srv"].breaker is None
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            for _ in range(5):
+                with pytest.raises(ConnectionError):
+                    await mgr.call_tool("srv", "tool", {})
+
+        # Every call reached the upstream — no fast-fail ever intervened
+        assert session.call_tool.call_count == 5
+
+    async def test_open_breaker_isolates_only_its_upstream(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=1)
+        srv2_cfg = UpstreamServerConfig(prefix="other")
+        srv2_session = AsyncMock()
+        srv2_session.call_tool.return_value = _make_result("srv2 ok")
+        mgr._connections["srv2"] = UpstreamConnection(
+            name="srv2",
+            config=srv2_cfg,
+            session=srv2_session,
+            tools=[],
+            breaker=CircuitBreaker(max_failures=1, reset_timeout=60.0, name="upstream-srv2"),
+        )
+
+        # Open srv's breaker directly (same technique as the surfacing tests)
+        mgr._connections["srv"].breaker.record_failure()
+        assert mgr._connections["srv"].breaker.state == "open"
+
+        result = await mgr.call_tool("srv2", "tool", {})
+        assert result == "srv2 ok"
+        assert mgr._connections["srv2"].breaker.state == "closed"
+
+    async def test_cache_hit_still_serves_while_open(self):
+        mgr = _make_manager(max_retries=0, circuit_max_failures=1)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = AssertionError("should not be called")
+
+        cache = MagicMock()
+        cache.get.return_value = "cached result"
+        mgr._cache = cache
+
+        mgr._connections["srv"].breaker.record_failure()
+        assert mgr._connections["srv"].breaker.state == "open"
+
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result == "cached result"
+        session.call_tool.assert_not_called()

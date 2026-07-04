@@ -548,6 +548,57 @@ class TestHealth:
         assert "Surfacing circuit breaker: half-open (probe eligible)" in result
         assert "circuit breaker: closed (healthy)" not in result
 
+    async def test_upstream_circuit_breaker_reports_three_states(self):
+        """#608: each upstream with an enabled breaker gets its own circuit
+        line, rendered from the same pure-read state labels as the surfacing
+        line; an open breaker also shows the time until probe eligibility."""
+        from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+
+        def _ctx_with_upstream_breaker(cb):
+            pm = _make_proxy_manager()
+            pm._connections["srv"] = UpstreamConnection(
+                name="srv",
+                config=UpstreamServerConfig(prefix="t"),
+                session=AsyncMock(),
+                tools=[],
+                breaker=cb,
+            )
+            return _make_ctx(proxy_manager=pm)
+
+        cb_closed = CircuitBreaker(max_failures=1, reset_timeout=100.0)
+        result = await stm_proxy_health(ctx=_ctx_with_upstream_breaker(cb_closed))
+        assert "      circuit breaker: closed (healthy)" in result
+
+        cb_open = CircuitBreaker(max_failures=1, reset_timeout=100.0)
+        cb_open.record_failure()
+        result = await stm_proxy_health(ctx=_ctx_with_upstream_breaker(cb_open))
+        assert "      circuit breaker: open (failing), retry in ~" in result
+
+        cb_half = CircuitBreaker(max_failures=1, reset_timeout=0.0)
+        cb_half.record_failure()
+        assert cb_half.state == "half-open"
+        result = await stm_proxy_health(ctx=_ctx_with_upstream_breaker(cb_half))
+        assert "      circuit breaker: half-open (probe eligible)" in result
+        assert "retry in ~" not in result  # no countdown once probe-eligible
+
+    async def test_upstream_circuit_line_absent_when_disabled_or_failed(self):
+        """#608: no circuit line for a breaker-disabled upstream
+        (circuit_max_failures=0 → breaker None) or a startup-failed server
+        (no connection, no breaker) — absence must not read as healthy."""
+        pm = _make_proxy_manager()
+        pm._connections["nobreaker"] = UpstreamConnection(
+            name="nobreaker",
+            config=UpstreamServerConfig(prefix="t"),
+            session=AsyncMock(),
+            tools=[],
+        )
+        pm._failed_servers["bad"] = "ConnectionError: host unreachable"
+        ctx = _make_ctx(proxy_manager=pm)
+        result = await stm_proxy_health(ctx=ctx)
+        assert "nobreaker: connected" in result
+        assert "bad: DISCONNECTED" in result
+        assert "circuit breaker:" not in result
+
 
 # ── stm_surfacing_feedback ───────────────────────────────────────────────
 
