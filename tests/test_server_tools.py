@@ -6,7 +6,7 @@ import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerConfig
+from memtomem_stm.proxy.config import ConfigLoadResult, ProxyConfig, UpstreamServerConfig
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.server import (
@@ -43,6 +43,7 @@ def _make_ctx(
     compression_feedback_tracker: object | None = None,
     progressive_reads_tracker: object | None = None,
     config: STMConfig | None = None,
+    proxy_config_error: str | None = None,
 ) -> SimpleNamespace:
     """Build a fake CtxType that _get_ctx() can unwrap.
 
@@ -65,6 +66,7 @@ def _make_ctx(
         feedback_tracker=feedback_tracker,
         compression_feedback_tracker=compression_feedback_tracker,
         progressive_reads_tracker=progressive_reads_tracker,
+        proxy_config_error=proxy_config_error,
     )
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
 
@@ -412,6 +414,36 @@ class TestHealth:
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_health(ctx=ctx)
         assert "No upstream servers configured" in result
+        assert "failed to parse" not in result
+
+    async def test_config_error_shown_without_upstreams(self):
+        """#611: a broken config file typically manifests as zero upstreams —
+        the warning must lead the 'No upstream servers' branch, naming the
+        cause of the symptom."""
+        pm = _make_proxy_manager()
+        ctx = _make_ctx(proxy_manager=pm, proxy_config_error="Expecting value: line 1")
+        result = await stm_proxy_health(ctx=ctx)
+        lines = result.splitlines()
+        assert lines[0] == (
+            "WARNING: proxy config file present but failed to parse — "
+            "running env/default config: Expecting value: line 1"
+        )
+        assert "No upstream servers configured" in result
+
+    async def test_config_error_shown_with_upstreams(self):
+        """The warning also leads the populated branch (env-configured
+        upstreams can coexist with a broken file)."""
+        pm = _make_proxy_manager()
+        pm._connections["srv"] = UpstreamConnection(
+            name="srv",
+            config=UpstreamServerConfig(prefix="test"),
+            session=AsyncMock(),
+            tools=[MagicMock()],
+        )
+        ctx = _make_ctx(proxy_manager=pm, proxy_config_error="boom")
+        result = await stm_proxy_health(ctx=ctx)
+        assert result.splitlines()[0].startswith("WARNING: proxy config file present")
+        assert "srv: connected" in result
 
     async def test_with_servers(self):
         """Reports connection status with discovered vs advertised counts —
@@ -1840,7 +1872,10 @@ class TestLifespan:
             # Prevent the file-load block at the top of app_lifespan from
             # overwriting our mocked ProxyConfig with the real on-disk one
             # (or its defaults when the file is missing).
-            patch("memtomem_stm.server.ProxyConfig.load_from_file", return_value=None),
+            patch(
+                "memtomem_stm.server.ProxyConfig.load_from_file_with_status",
+                return_value=ConfigLoadResult(config=None, error=None),
+            ),
         ):
             mock_cfg = MockConfig.return_value
             mock_cfg.proxy = MagicMock()
@@ -1870,7 +1905,7 @@ class TestLifespan:
         JSON file load entirely — the proxy started enabled but with zero
         upstreams (``upstream_servers`` is a file-only field in practice).
         An existing file must be loaded regardless of the env var; env wins
-        through the ``load_from_file`` overlay instead of a bypass."""
+        through the ``load_from_file_with_status`` overlay instead of a bypass."""
         from memtomem_stm.server import app_lifespan, mcp
 
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "1")
@@ -1885,7 +1920,10 @@ class TestLifespan:
         with (
             patch("memtomem_stm.server.STMConfig") as MockConfig,
             patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
-            patch("memtomem_stm.server.ProxyConfig.load_from_file", return_value=None) as mock_load,
+            patch(
+                "memtomem_stm.server.ProxyConfig.load_from_file_with_status",
+                return_value=ConfigLoadResult(config=None, error=None),
+            ) as mock_load,
         ):
             mock_cfg = MockConfig.return_value
             mock_cfg.proxy = MagicMock()
@@ -2009,6 +2047,37 @@ class TestApplyProxyFileConfig:
 
         assert config.proxy.enabled is True
         assert set(config.proxy.upstream_servers) == {"gh"}
+
+    def test_returns_error_when_file_present_but_broken(self, tmp_path, monkeypatch):
+        """#611: the helper reports "present but broken" so the lifespan can
+        pin it on STMContext instead of the failure living only in stderr."""
+        from memtomem_stm.server import _apply_proxy_file_config
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json", encoding="utf-8")
+        config = self._config(monkeypatch)
+        config.proxy.config_path = cfg_file
+        default_enabled = config.proxy.enabled
+
+        error = _apply_proxy_file_config(config, {})
+
+        assert error is not None
+        assert config.proxy.enabled is default_enabled  # fell back, no swap
+
+    def test_returns_none_for_good_and_missing_files(self, tmp_path, monkeypatch):
+        import json
+
+        from memtomem_stm.server import _apply_proxy_file_config
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+        config = self._config(monkeypatch)
+        config.proxy.config_path = cfg_file
+        assert _apply_proxy_file_config(config, {}) is None
+
+        config2 = self._config(monkeypatch)
+        config2.proxy.config_path = tmp_path / "nonexistent.json"
+        assert _apply_proxy_file_config(config2, {}) is None
 
 
 # ── advertise_observability_tools flag ──────────────────────────────────
