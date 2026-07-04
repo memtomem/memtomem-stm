@@ -2801,10 +2801,10 @@ def _merge_tune_changes(
     as human-readable skip warnings: the metrics DB can carry rows for an
     env-only or since-renamed upstream that has no dict entry to write into.
     The same guard covers a raw entry that isn't writable — a non-dict server
-    value, or a non-dict ``tool_overrides`` — because the *typed* validation
-    the command runs sees the env-overlaid composite, and an env override for
-    ``upstream_servers`` can mask a malformed file entry that
-    ``_apply_tune_changes`` would then crash on.
+    value, a non-dict ``tool_overrides``, or a non-dict per-tool override —
+    because the *typed* validation the command runs sees the env-overlaid
+    composite, and an env override for ``upstream_servers`` can mask a
+    malformed file entry that ``_apply_tune_changes`` would then crash on.
     """
     merged: dict[tuple[str, str, str], _TuneChange] = {}
     merge_counts: dict[tuple[str, str, str], int] = {}
@@ -2823,6 +2823,13 @@ def _merge_tune_changes(
                 skipped.append(
                     f"{rec.server}/{rec.tool}: server '{rec.server}' {detail} — nothing to write"
                 )
+            continue
+        existing_override = entry.get("tool_overrides", {}).get(rec.tool)
+        if existing_override is not None and not isinstance(existing_override, dict):
+            skipped.append(
+                f"{rec.server}/{rec.tool}: existing tool_overrides entry is malformed "
+                "in the config file — nothing to write"
+            )
             continue
         for action in rec.actions:
             try:

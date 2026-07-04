@@ -7169,8 +7169,12 @@ class TestMergeTuneChanges:
 
     @pytest.mark.parametrize(
         "raw_entry",
-        ["not-a-dict", {"command": "npx", "tool_overrides": "not-a-dict"}],
-        ids=["server-entry-not-dict", "tool-overrides-not-dict"],
+        [
+            "not-a-dict",
+            {"command": "npx", "tool_overrides": "not-a-dict"},
+            {"command": "npx", "tool_overrides": {"t": "not-a-dict"}},
+        ],
+        ids=["server-entry-not-dict", "tool-overrides-not-dict", "per-tool-override-not-dict"],
     )
     def test_unwritable_raw_entry_is_skipped_not_crashed(self, raw_entry):
         """An env override for ``upstream_servers`` can mask a malformed file
