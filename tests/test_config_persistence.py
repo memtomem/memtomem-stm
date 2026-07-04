@@ -124,6 +124,96 @@ class TestProxyConfigLoader:
         assert "gh2" not in reloaded.upstream_servers
 
 
+# ── load_from_file_with_status / unknown-key warning (#611) ──────────────
+
+
+class TestLoadFromFileWithStatus:
+    def test_valid_file_no_error(self, tmp_path):
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is not None and result.config.enabled is True
+        assert result.error is None
+        assert result.unknown_keys == ()
+
+    def test_parse_failure_sets_error(self, tmp_path):
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None
+
+    def test_validation_failure_sets_error_and_keeps_unknown_keys(self, tmp_path):
+        # Duplicate prefixes fail the model validator; the typo'd key found
+        # before validation must survive into the result for `mms config
+        # validate` to report both.
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "bogus_key": 1,
+            "upstream_servers": {
+                "a": {"prefix": "dup", "command": "a"},
+                "b": {"prefix": "dup", "command": "b"},
+            },
+        }))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None and "Duplicate upstream prefixes" in result.error
+        assert result.unknown_keys == ("bogus_key",)
+
+    def test_missing_file_is_not_an_error(self, tmp_path):
+        missing = tmp_path / "nonexistent.json"
+        strict = ProxyConfig.load_from_file_with_status(missing, missing_ok=False)
+        assert strict.config is None and strict.error is None
+        lenient = ProxyConfig.load_from_file_with_status(missing)
+        assert lenient.config is not None and lenient.error is None
+
+    def test_unknown_keys_warned_once_aggregated(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "max_result_char": 4000,
+            "cache": {"ttl_secondz": 60},
+        }))
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is not None
+        assert result.unknown_keys == ("cache.ttl_secondz", "max_result_char")
+        warnings = [r for r in caplog.records if "unknown key" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "cache.ttl_secondz" in warnings[0].getMessage()
+        assert "max_result_char" in warnings[0].getMessage()
+
+    def test_env_injected_keys_not_flagged_as_file_typos(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        # An env overlay carrying a key the file doesn't have (even a bogus
+        # one — extra="ignore" accepts it) must not surface as a file typo:
+        # the walk runs on the raw file dict before the merge.
+        overrides = {"default_max_result_chars": "9000", "bogus_env_key": "1"}
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, overrides)
+        assert result.config is not None
+        assert result.config.default_max_result_chars == 9000
+        assert result.unknown_keys == ()
+        assert not [r for r in caplog.records if "unknown key" in r.getMessage()]
+
+    def test_load_from_file_delegate_contract_unchanged(self, tmp_path):
+        good = tmp_path / "good.json"
+        good.write_text(json.dumps({"enabled": True}))
+        broken = tmp_path / "broken.json"
+        broken.write_text("{ nope")
+        missing = tmp_path / "missing.json"
+
+        assert ProxyConfig.load_from_file(good).enabled is True
+        assert ProxyConfig.load_from_file(broken) is None
+        assert ProxyConfig.load_from_file(missing).enabled is False  # defaults
+        assert ProxyConfig.load_from_file(missing, missing_ok=False) is None
+
+
 # ── MetricsStore persistence ─────────────────────────────────────────────
 
 
