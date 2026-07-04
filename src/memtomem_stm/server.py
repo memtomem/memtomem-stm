@@ -15,6 +15,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from memtomem_stm.config import STMConfig
+from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
 from memtomem_stm.proxy.manager import ProxyManager
@@ -1878,11 +1879,18 @@ async def stm_tuning_recommendations(
 
 def main() -> None:
     """Run the STM MCP server."""
-    level = os.environ.get("MEMTOMEM_STM_LOG_LEVEL", "WARNING").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.WARNING),
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    # STMConfig folds MEMTOMEM_STM_LOG_LEVEL and MEMTOMEM_STM_LOG_FILE into
+    # one env surface (#612). A bad env value used to fall back to WARNING
+    # silently here while the lifespan's own STMConfig() raised the same
+    # ValidationError moments later WITHOUT any logging configured — failing
+    # here, after a plain stderr basicConfig, is the readable version.
+    try:
+        startup_config = STMConfig()
+    except Exception:
+        logging.basicConfig(level=logging.WARNING, format=STDERR_FORMAT)
+        logger.exception("Invalid MEMTOMEM_STM_* environment configuration")
+        raise
+    configure_server_logging(startup_config)
     # Exception barrier (#209): without this, an unhandled exception from
     # ``mcp.run()`` (e.g. a background task crashing the event loop) ends the
     # process with only stderr output — operators get no ERROR-level log, and

@@ -125,6 +125,72 @@ def test_iter_foreign_handshakes_missing_dir(tmp_path: Path):
     assert discovery.iter_foreign_handshakes(tmp_path / "nope", "cur") == []
 
 
+# ── daemon logging (#612 convergence) ─────────────────────────────────────
+
+
+_skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX 0o700/0o600 modes are unenforceable on Windows",
+)
+
+
+@pytest.fixture
+def _restore_root_logging():
+    import logging
+
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    yield
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+    for h in saved_handlers:
+        root.addHandler(h)
+    root.setLevel(saved_level)
+
+
+@_skip_on_windows
+def test_configure_logging_detached_hardens_file(tmp_path, _restore_root_logging):
+    """Detached daemon logs to stm-daemon.log, now via the shared #612 handler:
+    0o600 file / 0o700 parent + rotation, closing the pre-existing gap where
+    the plain FileHandler left the crash-trace log world-readable."""
+    import logging
+
+    from memtomem_stm.cli.daemon_cmd import _configure_logging
+    from memtomem_stm.logging_setup import PrivateRotatingFileHandler
+
+    config = STMConfig(data_dir=tmp_path)
+    _configure_logging(config, detached=True)
+    logging.getLogger("daemon.test").warning("crash trace")
+
+    logpath = tmp_path / "stm-daemon.log"
+    assert logpath.exists()
+    assert logpath.stat().st_mode & 0o777 == 0o600
+    assert logpath.parent.stat().st_mode & 0o777 == 0o700
+    handlers = [
+        h for h in logging.getLogger().handlers if isinstance(h, PrivateRotatingFileHandler)
+    ]
+    assert len(handlers) == 1
+
+
+def test_configure_logging_foreground_uses_stderr(tmp_path, _restore_root_logging):
+    import logging
+
+    from memtomem_stm.cli.daemon_cmd import _configure_logging
+    from memtomem_stm.logging_setup import PrivateRotatingFileHandler
+
+    _configure_logging(STMConfig(data_dir=tmp_path), detached=False)
+    handlers = logging.getLogger().handlers
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], logging.StreamHandler)
+    assert not isinstance(handlers[0], PrivateRotatingFileHandler)
+    assert not (tmp_path / "stm-daemon.log").exists()
+
+
 def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())

@@ -748,6 +748,23 @@ Log level is controlled via environment variable (no CLI flag):
 export MEMTOMEM_STM_LOG_LEVEL=DEBUG   # DEBUG | INFO | WARNING | ERROR | CRITICAL
 ```
 
+By default the server logs to **stderr**, which the launching MCP client
+captures (or drops) — hard to find when you're diagnosing why the proxy did
+nothing. Set `MEMTOMEM_STM_LOG_FILE` to also write to a rotating file:
+
+```bash
+export MEMTOMEM_STM_LOG_FILE=~/.memtomem/stm.log
+```
+
+The file is created `0o600` (parent dir `0o700`) and rotates at 2 MiB with 3
+backups. It's opt-in and additive — stderr logging is unchanged. `mms health`
+prints where a newly started server would log (the configured, probed
+destination — it runs in a separate process and can't see a live server's
+handler): `Logging: stderr only …`, or `Logging: stderr + file <path> …` when
+the path is writable, or a `stderr only — configured log file <path> is not
+writable` warning when it isn't. If the file can't be opened at startup
+(read-only path), the server logs a warning to stderr and keeps running.
+
 See [Configuration → General](configuration.md#general) for details.
 
 ## Trimming the advertised MCP tool surface

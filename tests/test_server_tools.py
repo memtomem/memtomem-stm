@@ -6,6 +6,8 @@ import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from memtomem_stm.proxy.config import ConfigLoadResult, ProxyConfig, UpstreamServerConfig
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
@@ -2302,6 +2304,17 @@ class TestMainExceptionBarrier:
     """#209 Part A: unhandled exceptions from ``mcp.run()`` must be logged at
     ERROR level before the process terminates, so operators have a visible
     signal instead of only stderr tail output."""
+
+    @pytest.fixture(autouse=True)
+    def _neutralize_logging_setup(self):
+        """``main()`` now configures root logging via
+        ``configure_server_logging`` (#612), which calls
+        ``basicConfig(force=True)`` — that removes pytest's caplog handler
+        before ``mcp.run()`` raises, so the barrier's ERROR log would never be
+        captured. These tests exercise the barrier, not logging setup, so
+        stub it out (its own behavior is covered in test_logging_setup.py)."""
+        with patch("memtomem_stm.server.configure_server_logging", return_value=None):
+            yield
 
     def test_unhandled_exception_is_logged_then_reraised(self, caplog):
         import logging

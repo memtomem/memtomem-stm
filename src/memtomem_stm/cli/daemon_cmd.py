@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from memtomem_stm.logging_setup import FILE_FORMAT, open_private_log_handler
+
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
 
@@ -145,19 +147,25 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
 
 def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     """Route daemon logs to a file under ``data_dir`` when detached (its stdio
-    is ``DEVNULL``), otherwise to stderr for foreground debugging."""
+    is ``DEVNULL``), otherwise to stderr for foreground debugging.
+
+    The detached file goes through the shared #612 handler: 0o600 file /
+    0o700 parent per the data-at-rest convention, and size rotation so the
+    #581 crash-trace guarantee doesn't eventually drown in an unbounded log.
+    A failure to open it propagates — with stdio devnulled, a daemon that
+    cannot log its crashes must not run. (The server path degrades to
+    stderr instead; see ``configure_server_logging``.)
+    """
     level = getattr(logging, config.log_level, logging.WARNING)
     handler: logging.Handler
     if detached:
-        logpath = (config.data_dir / "stm-daemon.log").expanduser()
-        logpath.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(logpath, encoding="utf-8")
+        handler = open_private_log_handler((config.data_dir / "stm-daemon.log").expanduser())
     else:
         handler = logging.StreamHandler(sys.stderr)
     logging.basicConfig(
         level=level,
         handlers=[handler],
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=FILE_FORMAT,
         force=True,
     )
 

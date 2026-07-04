@@ -170,6 +170,42 @@ _CONFIG_INVALID_WARNING = (
 )
 
 
+def _logging_destination_status() -> dict[str, Any]:
+    """Active log destination for ``mms health`` (#612) — the point of the
+    opt-in file log is diagnosability, so health says where to look.
+    ValidationError-guarded: a bad ``MEMTOMEM_STM_*`` env value must not
+    break a diagnostics command."""
+    from pydantic import ValidationError
+
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.logging_setup import describe_log_destination
+
+    try:
+        return describe_log_destination(STMConfig())
+    except ValidationError as exc:
+        return {"error": f"invalid MEMTOMEM_STM_* environment ({exc.error_count()} error(s))"}
+
+
+def _format_logging_destination(status: dict[str, Any]) -> str:
+    """One ``Logging:`` line — always printed, so users learn the file-log
+    option exists even while running stderr-only. When a configured log file
+    isn't writable, name stderr as the real destination (the server degrades
+    to it) instead of pointing at a file that receives nothing."""
+    if "error" in status:
+        return f"{_warn('Logging:')} {status['error']}"
+    if status["log_file"]:
+        if status.get("writable"):
+            return (
+                f"Logging: stderr + file {status['log_file']} "
+                f"(level {status['log_level']}, rotating)"
+            )
+        return (
+            f"{_warn('Logging:')} stderr only — configured log file {status['log_file']} "
+            "is not writable; the server falls back to stderr"
+        )
+    return "Logging: stderr only (set MEMTOMEM_STM_LOG_FILE for a persistent log)"
+
+
 def _save(config_path: Path, data: dict[str, Any]) -> None:
     """Write the proxy config atomically.
 
@@ -4028,6 +4064,7 @@ def health(
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
     config_error = _schema_validation_error(data)
+    logging_status = _logging_destination_status()
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
     # ensure_ascii=False) so scripts piping the three commands through the
@@ -4041,6 +4078,7 @@ def health(
                         "config_valid": config_error is None,
                         "config_error": config_error,
                         "surfacing": surfacing_status,
+                        "logging": logging_status,
                     },
                     indent=2,
                     ensure_ascii=False,
@@ -4053,6 +4091,7 @@ def health(
             click.echo("")
             for line in _format_surfacing_bootstrap(surfacing_status):
                 click.echo(line)
+            click.echo(_format_logging_destination(logging_status))
         return
 
     results = asyncio.run(_probe_servers(servers, timeout))
@@ -4065,6 +4104,7 @@ def health(
                     "config_valid": config_error is None,
                     "config_error": config_error,
                     "surfacing": surfacing_status,
+                    "logging": logging_status,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -4096,6 +4136,7 @@ def health(
     click.echo("")
     for line in _format_surfacing_bootstrap(surfacing_status):
         click.echo(line)
+    click.echo(_format_logging_destination(logging_status))
 
 
 # `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py

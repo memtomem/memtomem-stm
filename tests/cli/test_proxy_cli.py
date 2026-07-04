@@ -5944,7 +5944,60 @@ class TestHealth:
         assert "fails validation" in result.output
         assert "No upstream servers configured" in result.output
 
-    def test_health_json_no_servers(self, runner, config):
+    def test_health_logging_line_stderr_only(self, runner, config, monkeypatch):
+        """#612: health always prints where logs go, so users learn the
+        file-log option exists even while running stderr-only."""
+        monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "Logging: stderr only" in result.output
+        assert "MEMTOMEM_STM_LOG_FILE" in result.output
+
+    def test_health_logging_line_with_file(self, runner, config, tmp_path, monkeypatch):
+        logf = tmp_path / "stm.log"
+        monkeypatch.setenv("MEMTOMEM_STM_LOG_FILE", str(logf))
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert f"stderr + file {logf}" in result.output
+        assert "rotating" in result.output
+
+    def test_health_json_logging_key(self, runner, config, tmp_path, monkeypatch):
+        logf = tmp_path / "stm.log"
+        monkeypatch.setenv("MEMTOMEM_STM_LOG_FILE", str(logf))
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        logging_status = json.loads(result.output)["logging"]
+        assert logging_status["log_file"] == str(logf)
+        assert logging_status["destination"] == "stderr+file"
+        assert logging_status["writable"] is True
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_health_logging_line_unwritable_file_names_stderr(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """codex review of #612: mms health runs in a separate process and
+        cannot see the server's live handler. When the configured log file
+        can't be opened, the server degrades to stderr — health must say so,
+        not point at a file that receives nothing."""
+        locked = tmp_path / "locked"
+        locked.mkdir(mode=0o500)
+        try:
+            monkeypatch.setenv("MEMTOMEM_STM_LOG_FILE", str(locked / "sub" / "stm.log"))
+            config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+            result = runner.invoke(cli, ["health", *_cfg_args(config)])
+            assert result.exit_code == 0
+            assert "stderr only — configured log file" in result.output
+            assert "not writable" in result.output
+            json_result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+            assert json.loads(json_result.output)["logging"]["writable"] is False
+        finally:
+            locked.chmod(0o700)
+
+    def test_health_json_no_servers(self, runner, config, monkeypatch):
+        monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert result.exit_code == 0
@@ -5952,6 +6005,7 @@ class TestHealth:
         assert data["servers"] == {}
         assert data["config_valid"] is True
         assert data["config_error"] is None
+        assert data["logging"]["destination"] == "stderr"
         assert data["surfacing"]["enabled"] is True
         assert data["surfacing"]["feedback_enabled"] is True
         assert data["surfacing"]["feedback_db"]["exists"] is False
