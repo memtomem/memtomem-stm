@@ -732,7 +732,12 @@ def test_deprecation_policy_and_upgrade_notes_convention_exist() -> None:
     or dropping any one of them silently orphans the other two."""
     readme = _read("README.md")
     contributing = _read("CONTRIBUTING.md")
-    changelog_head = _read("CHANGELOG.md")[:2000]
+    changelog = _read("CHANGELOG.md")
+    # The convention prose lives ABOVE the first release heading; slicing
+    # there means the assertions below cannot be satisfied by the Unreleased
+    # block's own `### Upgrade notes` heading surviving a header deletion.
+    changelog_header = changelog.split("## [Unreleased]", 1)[0]
+    policy_anchor = "README.md#compatibility--deprecation-policy"
 
     assert "## Compatibility & deprecation policy" in readme, (
         "README lost the '## Compatibility & deprecation policy' section — "
@@ -742,14 +747,26 @@ def test_deprecation_policy_and_upgrade_notes_convention_exist() -> None:
         "CONTRIBUTING lost the '## Changelog and upgrade notes' section that "
         "defines when a release block needs an '### Upgrade notes' summary."
     )
+    # Both referrers must carry the exact anchor of the README section —
+    # renaming the heading changes the GitHub anchor and orphans these links.
+    for name, text in (("CHANGELOG.md", changelog_header), ("CONTRIBUTING.md", contributing)):
+        assert policy_anchor in text, (
+            f"{name} no longer links to '{policy_anchor}' — the README policy "
+            "heading and its referrers must move together."
+        )
     # The inline marker string is the convention's join key: CONTRIBUTING
     # tells writers to use it and the README tells readers to look for it.
-    for name, text in (("README.md", readme), ("CONTRIBUTING.md", contributing)):
+    for name, text in (
+        ("README.md", readme),
+        ("CONTRIBUTING.md", contributing),
+        ("CHANGELOG.md header", changelog_header),
+    ):
         assert "**Behavior change**:" in text, (
             f"{name} no longer names the '**Behavior change**:' marker the "
             "upgrade-notes convention aggregates."
         )
-    assert "Upgrade notes" in changelog_head, (
-        "CHANGELOG.md's header prose should tell readers releases with "
-        "behavior changes open with an 'Upgrade notes' block."
+    assert "Upgrade notes" in changelog_header, (
+        "CHANGELOG.md's header prose (before the first release heading) should "
+        "tell readers releases with behavior changes open with an 'Upgrade "
+        "notes' block."
     )
