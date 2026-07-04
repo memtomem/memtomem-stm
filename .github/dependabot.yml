@@ -1,0 +1,21 @@
+# Automated dependency update PRs (#609). Actions are SHA-pinned in the
+# workflows; Dependabot updates the pinned SHA and its trailing version
+# comment together. Minor/patch updates are grouped to limit PR noise;
+# major bumps arrive as individual PRs.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]

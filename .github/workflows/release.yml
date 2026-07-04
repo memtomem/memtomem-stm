@@ -22,6 +22,12 @@ on:
       - "v[0-9]*"        # production
       - "test-v[0-9]*"   # TestPyPI dry-run
 
+# Least-privilege baseline (#609). The publish job declares its own block
+# (job-level permissions fully replace this one) with the OIDC-required
+# id-token: write.
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Build and publish to ${{ startsWith(github.ref_name, 'test-') && 'TestPyPI' || 'PyPI' }}
@@ -32,21 +38,21 @@ jobs:
     permissions:
       id-token: write   # required for OIDC token
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - name: Build distribution
         run: uv build
       - name: Publish to PyPI
         if: ${{ !startsWith(github.ref_name, 'test-') }}
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist
           skip-existing: true
       - name: Publish to TestPyPI
         if: ${{ startsWith(github.ref_name, 'test-') }}
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
