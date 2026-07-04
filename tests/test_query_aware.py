@@ -8,7 +8,7 @@ budget allocation behavior.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -385,6 +385,118 @@ class TestEmbeddingOpenAIResponseParsing:
         with patch("httpx.post", return_value=self._mock_response({"data": []})):
             result = scorer._embed_openai(None, [])
         assert result == []
+
+
+class TestEmbeddingProviderPaths:
+    """Non-network branches of ``EmbeddingScorer`` (#619): the Ollama
+    ``/api/embed`` parsing, provider dispatch, error mapping into the BM25
+    fallback, and the empty-input short-circuit — all with a mocked transport.
+    """
+
+    def _make_scorer(self, provider: str = "ollama"):
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        return EmbeddingScorer(
+            provider=provider, model="test-model", base_url="http://ollama:11434"
+        )
+
+    def _mock_response(self, payload: dict):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=payload)
+        return resp
+
+    def test_ollama_success_path_maps_cosine_scores(self):
+        """A successful /api/embed response scores sections by cosine similarity
+        against the query embedding (first element of the batch)."""
+        scorer = self._make_scorer()
+        # query == section A embedding (cos 1.0), orthogonal to section B (cos 0.0)
+        payload = {"embeddings": [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]}
+        sections = [("## A", "matches the query"), ("## B", "unrelated")]
+
+        with patch("httpx.post", return_value=self._mock_response(payload)) as post:
+            scores = scorer.score_sections("the query", sections)
+
+        assert scores == pytest.approx([1.0, 0.0])
+        assert scorer.fallback_count == 0
+        url = post.call_args.args[0]
+        assert url == "http://ollama:11434/api/embed"
+        body = post.call_args.kwargs["json"]
+        assert body["model"] == "test-model"
+        assert len(body["input"]) == 3  # query + 2 sections
+        assert body["input"][0] == "the query"
+
+    def test_unknown_provider_raises_and_falls_back(self):
+        """_embed_batch rejects unknown providers loudly; score_sections maps
+        that into the BM25 fallback like any other embedding failure."""
+        scorer = self._make_scorer(provider="cohere")
+
+        with pytest.raises(ValueError, match="Unknown embedding provider: cohere"):
+            scorer._embed_batch(["text"])
+
+        scores = scorer.score_sections("query", [("## A", "body")])
+        assert len(scores) == 1
+        assert scorer.fallback_count == 1
+
+    def test_missing_httpx_raises_runtime_error_and_falls_back(self, monkeypatch):
+        """An unavailable httpx maps to RuntimeError in _embed_batch, and
+        score_sections degrades to BM25 instead of propagating."""
+        import sys
+
+        scorer = self._make_scorer()
+        monkeypatch.setitem(sys.modules, "httpx", None)
+
+        with pytest.raises(RuntimeError, match="httpx required"):
+            scorer._embed_batch(["text"])
+
+        scores = scorer.score_sections("query", [("## A", "body")])
+        assert len(scores) == 1
+        assert scorer.fallback_count == 1
+
+    def test_empty_query_and_sections_short_circuit_without_network(self):
+        scorer = self._make_scorer()
+
+        with patch("httpx.post") as post:
+            assert scorer.score_sections("", [("## A", "body")]) == [0.0]
+            assert scorer.score_sections("query", []) == []
+
+        post.assert_not_called()
+        assert scorer.fallback_count == 0
+
+    def test_http_error_falls_back_with_message_only_warning(self, caplog):
+        """raise_for_status failures fall back to BM25, count once, and log a
+        message-only WARNING (no stack trace per hit)."""
+        import httpx
+
+        scorer = self._make_scorer()
+        resp = self._mock_response({})
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "503", request=MagicMock(), response=MagicMock()
+        )
+        sections = [("## Redis", "Cache layer."), ("## Database", "PostgreSQL.")]
+
+        with (
+            patch("httpx.post", return_value=resp),
+            caplog.at_level("WARNING", logger="memtomem_stm.proxy.relevance"),
+        ):
+            scores = scorer.score_sections("Redis", sections)
+
+        assert len(scores) == 2
+        assert scores[0] > scores[1]  # BM25 fallback actually scored
+        assert scorer.fallback_count == 1
+        warning = next(r for r in caplog.records if "falling back to BM25" in r.message)
+        assert warning.levelname == "WARNING"
+        assert warning.exc_info is None  # message-only, no stack
+
+    def test_cosine_similarity_edge_cases(self):
+        from memtomem_stm.proxy.relevance import _cosine_similarity
+
+        assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0  # zero norm
+        assert _cosine_similarity([1.0, 0.0], [0.0, 0.0]) == 0.0
+        assert _cosine_similarity([1.0, 2.0], [1.0, 2.0]) == pytest.approx(1.0)
+        assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0  # orthogonal
 
 
 # ── TruncateCompressor with context_query ─────────────────────────────
