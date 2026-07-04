@@ -193,6 +193,41 @@ class TestLogFileWritable:
         assert not path.exists()
         assert not path.parent.exists()
 
+    def test_existing_directory_is_not_writable_target(self, tmp_path):
+        # os.open(dir, O_WRONLY|O_CREAT) fails — health must not report it usable.
+        d = tmp_path / "logdir"
+        d.mkdir()
+        assert log_file_writable(d) is False
+
+    @_skip_on_windows
+    def test_symlink_to_directory_rejected(self, tmp_path):
+        target = tmp_path / "realdir"
+        target.mkdir()
+        link = tmp_path / "link.log"
+        link.symlink_to(target)
+        assert log_file_writable(link) is False
+
+    @_skip_on_windows
+    def test_broken_symlink_rejected(self, tmp_path):
+        link = tmp_path / "broken.log"
+        link.symlink_to(tmp_path / "does_not_exist")
+        assert log_file_writable(link) is False
+
+    @_skip_on_windows
+    def test_symlink_to_regular_writable_file_accepted(self, tmp_path):
+        target = tmp_path / "real.log"
+        target.touch()
+        target.chmod(0o600)
+        link = tmp_path / "link.log"
+        link.symlink_to(target)
+        assert log_file_writable(link) is True
+
+    def test_non_directory_ancestor_rejected(self, tmp_path):
+        # A file used as if it were a parent dir: mkdir(parents=True) fails.
+        notdir = tmp_path / "afile"
+        notdir.write_text("x")
+        assert log_file_writable(notdir / "sub" / "stm.log") is False
+
 
 class TestDescribeLogDestination:
     def test_unset(self):

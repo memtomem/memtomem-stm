@@ -120,17 +120,34 @@ def log_file_writable(path: Path) -> bool:
 
     ``mms health`` runs in a separate process from the server, so it cannot
     observe the live handler — it can only tell whether the configured path
-    *would* open. Mirrors the handler's needs (create parent dirs, then the
-    file) without any side effect: an existing file must be writable; a
-    missing one needs its nearest existing ancestor writable + traversable.
+    *would* open. This mirrors what the handler actually needs — ``mkdir(
+    parents=True)`` on the parent then ``os.open(file, O_WRONLY|O_CREAT|
+    O_APPEND)`` — without side effects, so it rejects the cases that pass a
+    naive "exists and writable" test but still fail the real open:
+
+    - an existing directory / symlink-to-directory / special file (can't be
+      opened ``O_WRONLY``): the terminal path must resolve to a regular file;
+    - a broken symlink (``O_CREAT`` would chase a missing target);
+    - a non-directory ancestor (``mkdir(parents=True)`` fails on it).
+
+    A symlink to a regular writable file is accepted. Point-in-time: like any
+    probe it races the real open, but for a diagnostic that is acceptable.
     """
     resolved = path.expanduser()
+    # Broken symlink: exists() follows it and returns False, but the server's
+    # O_CREAT open would chase the missing target — not usable.
+    if resolved.is_symlink() and not resolved.exists():
+        return False
     if resolved.exists():
-        return os.access(resolved, os.W_OK)
+        # Must be a regular file (is_file follows symlinks) openable for
+        # append — a directory / special file cannot be O_WRONLY'd.
+        return resolved.is_file() and os.access(resolved, os.W_OK)
+    # Missing file: mkdir(parents=True) needs the nearest existing ancestor to
+    # be a writable, traversable *directory* (it fails on a non-directory).
     ancestor = resolved.parent
     while not ancestor.exists() and ancestor != ancestor.parent:
         ancestor = ancestor.parent
-    return os.access(ancestor, os.W_OK | os.X_OK)
+    return ancestor.is_dir() and os.access(ancestor, os.W_OK | os.X_OK)
 
 
 def describe_log_destination(config: STMConfig) -> dict[str, Any]:
