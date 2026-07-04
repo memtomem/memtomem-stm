@@ -212,7 +212,7 @@ operator tools.
 
 ```bash
 uv sync                                                    # install dev deps
-uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"   # tests (CI filter)
+uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"   # tests (CI filter)
 uv run ruff check src && uv run ruff format --check src    # lint (required)
 uv run mypy src                                            # typecheck (required)
 ```
