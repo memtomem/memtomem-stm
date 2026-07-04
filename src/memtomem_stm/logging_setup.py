@@ -146,6 +146,11 @@ def log_file_writable(path: Path) -> bool:
     # be a writable, traversable *directory* (it fails on a non-directory).
     ancestor = resolved.parent
     while not ancestor.exists() and ancestor != ancestor.parent:
+        # A broken symlink in the parent chain reads as "missing" via exists()
+        # (which follows links), but mkdir(parents=True) raises FileExistsError
+        # on it rather than creating through it — so it's not usable.
+        if ancestor.is_symlink():
+            return False
         ancestor = ancestor.parent
     return ancestor.is_dir() and os.access(ancestor, os.W_OK | os.X_OK)
 

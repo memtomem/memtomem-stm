@@ -214,6 +214,15 @@ class TestLogFileWritable:
         assert log_file_writable(link) is False
 
     @_skip_on_windows
+    def test_broken_symlink_intermediate_ancestor_rejected(self, tmp_path):
+        # A dangling symlink used as an intermediate parent: exists() follows
+        # it and reads "missing", but mkdir(parents=True) raises
+        # FileExistsError on it rather than creating through it.
+        broken_parent = tmp_path / "broken_parent"
+        broken_parent.symlink_to(tmp_path / "missing_target")
+        assert log_file_writable(broken_parent / "sub" / "stm.log") is False
+
+    @_skip_on_windows
     def test_symlink_to_regular_writable_file_accepted(self, tmp_path):
         target = tmp_path / "real.log"
         target.touch()
