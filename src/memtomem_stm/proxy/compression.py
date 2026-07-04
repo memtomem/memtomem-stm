@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 try:
     import httpx
@@ -115,7 +115,7 @@ def _sanitize_nonfinite(obj: object) -> object:
     return obj
 
 
-def _mm_json_loads(s: str, **kwargs: object) -> object:
+def _mm_json_loads(s: str, **kwargs: Any) -> object:
     """``json.loads`` that scrubs non-finite floats from the parsed result.
 
     Python's ``json.loads`` accepts the ``NaN`` / ``Infinity`` / ``-Infinity``
@@ -1599,13 +1599,13 @@ class FieldExtractCompressor:
         else:
             framing = 0 if base_empty else 2
         room = budget - len(dump(base)) - framing
-        cand = self._fit_monotone(boundary_item, room) if room >= 0 else _MISSING
+        boundary_cand = self._fit_monotone(boundary_item, room) if room >= 0 else _MISSING
         if (
-            cand is not _MISSING
-            and not starved(cand, boundary_item)
-            and len(dump(frame(full_k, cand, omitted_after))) <= budget
+            boundary_cand is not _MISSING
+            and not starved(boundary_cand, boundary_item)
+            and len(dump(frame(full_k, boundary_cand, omitted_after))) <= budget
         ):
-            return frame(full_k, cand, omitted_after)
+            return frame(full_k, boundary_cand, omitted_after)
 
         # No room for a content-bearing boundary: keep the full prefix + a marker
         # for every remaining item.

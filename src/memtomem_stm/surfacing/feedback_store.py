@@ -363,7 +363,7 @@ class FeedbackStore:
             return {}
 
         target_ids = list(dict.fromkeys(str(mid) for mid in memory_ids))
-        event_ids_by_memory = {mid: set() for mid in target_ids}
+        event_ids_by_memory: dict[str, set[str]] = {mid: set() for mid in target_ids}
         target_set = set(target_ids)
 
         placeholders = ", ".join("?" for _ in target_ids)

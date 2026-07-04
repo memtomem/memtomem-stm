@@ -2630,7 +2630,11 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
     origin = entry.get("origin")
     if not _origin_fully_pruned(origin):
         return None
+    if not isinstance(origin, dict):  # unreachable — narrows for mypy
+        return None
     source = origin.get("source")
+    if not isinstance(source, dict):  # unreachable — narrows for mypy
+        return None
     kind = source.get("kind")
     spec = _SOURCE_BY_KIND.get(kind) if isinstance(kind, str) else None
     label = spec.label if spec else (kind if isinstance(kind, str) else "its host client")

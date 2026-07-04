@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic_core import ErrorDetails
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,7 @@ def _env_override_hint(
                         _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
                     )
 
-    def _error_key(e: dict[str, Any]) -> tuple[tuple[Any, ...], str, str]:
+    def _error_key(e: ErrorDetails) -> tuple[tuple[Any, ...], str, str]:
         return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
 
     file_error_keys: frozenset[tuple[tuple[Any, ...], str, str]] | None = None
