@@ -479,8 +479,12 @@ def _hidden_obs_tools_hint() -> str | None:
     Returns ``None`` when the tools are advertised. Driven off
     ``_should_advertise_obs_tools()`` — the same signal that actually gates
     registration — so the hint never claims tools are hidden when they aren't
-    (or vice versa). Shared by the ``stm_proxy_health`` MCP tool and the
-    ``mms health`` CLI so both surfaces phrase it identically.
+    (or vice versa).
+
+    Consumed by the ``mms health`` CLI, not by ``stm_proxy_health``: that MCP
+    tool is itself one of the gated tools, so it is unreachable over MCP in the
+    exact state (flag off) where the hint applies. The CLI command is always
+    available regardless of the flag, so it is the reachable operator surface.
     """
     if _should_advertise_obs_tools():
         return None
@@ -833,16 +837,16 @@ async def stm_proxy_health(
             f"running env/default config: {app.proxy_config_error}"
         )
 
-    # Observability-tools discoverability hint (#613) — appended to both
-    # branches so a user who asked for e.g. stm_proxy_stats and found it absent
-    # learns the env flag that exposes it.
-    obs_hint = _hidden_obs_tools_hint()
-    hint_lines = [obs_hint] if obs_hint else []
-
+    # NB: the observability-tools discoverability hint (#613) is intentionally
+    # NOT emitted here. ``stm_proxy_health`` is itself gated by ``@_obs_tool``,
+    # so in the only state where the hint applies (flag off) this tool is not in
+    # ``tools/list`` and an MCP client cannot reach it; with the flag on there
+    # is nothing to hint. The reachable operator surface is ``mms health`` (a
+    # CLI command, always available), which carries the hint instead.
     health = pm.get_upstream_health()
     if not health:
         head = "No upstream servers configured."
-        return "\n".join([*config_warning, head, *bootstrap_lines, *hint_lines])
+        return "\n".join([*config_warning, head, *bootstrap_lines])
 
     lines = [*config_warning, "Upstream Server Health", "====================="]
     for name, info in health.items():
@@ -880,7 +884,6 @@ async def stm_proxy_health(
     lines.extend(_toolgraph_health_lines(pm.get_toolgraph_status()))
 
     lines.extend(bootstrap_lines)
-    lines.extend(hint_lines)
     return "\n".join(lines)
 
 

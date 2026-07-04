@@ -421,33 +421,12 @@ class TestHealth:
         assert "No upstream servers configured" in result
         assert "failed to parse" not in result
 
-    async def test_obs_tools_hint_present_when_hidden_no_servers(self, monkeypatch):
-        """#613: flag off → the no-servers branch surfaces the discoverability
-        hint so a user who couldn't find e.g. stm_proxy_stats learns the flag."""
+    async def test_no_obs_tools_hint_over_mcp(self, monkeypatch):
+        """#613: the hidden-tools hint is NOT emitted over MCP. stm_proxy_health
+        is itself gated, so it is unreachable in the flag-off state where the
+        hint would apply; emitting it here would be dead + misleading. The hint
+        lives on the always-available ``mms health`` CLI instead."""
         monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
-        pm = _make_proxy_manager()
-        ctx = _make_ctx(proxy_manager=pm)
-        result = await stm_proxy_health(ctx=ctx)
-        assert "observability tools hidden" in result
-        assert "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true" in result
-
-    async def test_obs_tools_hint_present_when_hidden_with_servers(self, monkeypatch):
-        """The hint also lands in the populated branch."""
-        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
-        pm = _make_proxy_manager()
-        pm._connections["srv"] = UpstreamConnection(
-            name="srv",
-            config=UpstreamServerConfig(prefix="test"),
-            session=AsyncMock(),
-            tools=[MagicMock()],
-        )
-        ctx = _make_ctx(proxy_manager=pm)
-        result = await stm_proxy_health(ctx=ctx)
-        assert "observability tools hidden" in result
-
-    async def test_obs_tools_hint_absent_when_advertised(self, monkeypatch):
-        """Flag on → tools are visible, so no hint (would be misleading)."""
-        monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "true")
         pm = _make_proxy_manager()
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_health(ctx=ctx)

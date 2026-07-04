@@ -957,8 +957,10 @@ def stats(
     # keeps additional in-memory-only counters (cache hits, latency, reconnects,
     # …) that a separate CLI process cannot see. Name the source and point at
     # the live tool so a user comparing the two doesn't read the gap as a bug.
+    # Wording is generic (not the default filenames) because metrics.db_path and
+    # surfacing.feedback_db_path are both configurable.
     data_source = (
-        "on-disk stores only (proxy_metrics.db + stm_feedback.db); "
+        "on-disk stores only (metrics DB + surfacing-feedback DB); "
         "live in-memory counters via the stm_proxy_stats MCP tool"
     )
 
