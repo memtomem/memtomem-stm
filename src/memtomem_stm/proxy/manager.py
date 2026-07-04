@@ -2974,7 +2974,15 @@ class ProxyManager:
                     await self._reconnect_server(server)
                     conn = self._connections[server]
                 except Exception as reconnect_exc:
-                    logger.error("Reconnect to '%s' failed: %s", server, reconnect_exc)
+                    # Redact (#622, #605/#606 family): the reconnect reopens a
+                    # transport with the credentialed ``cfg.url``, so an httpx
+                    # error here embeds the token — the three sibling
+                    # reconnect-failure sites in this loop already scrub it.
+                    logger.error(
+                        "Reconnect to '%s' failed: %s",
+                        server,
+                        self._redacted_error(reconnect_exc, cfg.url),
+                    )
                     # Third terminal exit (#608): a mid-loop reconnect failure
                     # means the upstream is unreachable — count it, or a dead
                     # stdio upstream whose respawns fail escapes the breaker.
