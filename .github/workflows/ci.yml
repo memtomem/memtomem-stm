@@ -82,11 +82,12 @@ jobs:
   audit:
     # ADVISORY dependency vulnerability audit (#609). Exports the locked
     # dependency set (uv.lock, all groups) and runs pip-audit against it.
-    # continue-on-error keeps it non-blocking while the baseline is
-    # established; promote to required (flip to false + branch protection)
-    # once clean, mirroring the mypy convention above.
+    # Step-level continue-on-error mirrors the mypy convention above: the
+    # findings land in the job log without a red check on every PR while
+    # the baseline is being cleaned (50 known vulns in transitive dev deps
+    # at introduction time). Promote to required (drop the flag + branch
+    # protection) once Dependabot has cleaned the baseline.
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
@@ -96,6 +97,7 @@ jobs:
         run: uv export --frozen --no-emit-project -o requirements-audit.txt
       - name: pip-audit (advisory)
         run: uvx pip-audit -r requirements-audit.txt --disable-pip
+        continue-on-error: true
 
   bench_qa:
     # Required gate. Per-scenario floors (qa_gate_min, ratio_violation) are
