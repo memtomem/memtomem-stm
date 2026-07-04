@@ -1686,6 +1686,58 @@ class ProxyManager:
             return text
         return DefaultContentCleaner(cleaning_cfg).clean(text)
 
+    async def _compress_maybe_offthread(
+        self,
+        compressor: Any,
+        text: str,
+        *,
+        max_chars: int,
+        context_query: str | None,
+        scorer: Any,
+    ) -> str:
+        """Run a sync, scorer-carrying ``compress()`` without stalling the loop.
+
+        Every scorer-injected compressor call in the async pipeline routes
+        through here (#618): when the relevance scorer the compressor will
+        actually use does blocking I/O (``EmbeddingScorer``'s sync httpx call
+        — see ``RelevanceScorer.uses_blocking_io``), the whole sync
+        ``compress()`` runs in a worker thread via ``asyncio.to_thread`` so an
+        unresponsive embedding endpoint can't freeze every other proxied call
+        for up to the embedding timeout. With the default BM25 scorer the gate
+        is false and the call is made inline — no thread hop, byte-identical
+        behavior. ``getattr`` defaults unknown scorers to False (inline),
+        preserving the status quo for custom scorers that don't opt in.
+
+        ``scorer`` must be the instance the compressor captured, not a fresh
+        ``self._relevance_scorer`` read: after a scorer-only hot-reload the
+        cached selective compressor keeps its old scorer until the next
+        rebuild (see the note in ``_build_compressor_kwargs``), and gating on
+        the property would run a still-embedding-backed compress inline —
+        re-introducing the stall this helper exists to prevent.
+
+        Callers off-loading a compressor with shared mutable state (the cached
+        ``SelectiveCompressor`` and its pending store, alone or inside a
+        ``HybridCompressor``) must pin it with ``begin_use()`` while still
+        holding ``_selective_lock`` and balance with ``end_use()`` after this
+        call: a concurrent config-change rebuild (or ``stop()``) would
+        otherwise ``close()`` the store out from under the worker thread
+        (``SQLitePendingStore.close`` is not synchronized with ``put``). The
+        pin defers the close to the last in-flight user rather than holding
+        the lock across the compress, so concurrent SELECTIVE/HYBRID calls
+        run in parallel instead of surfacing spurious ``LOCK_TIMEOUT`` behind
+        a slow embedding endpoint.
+
+        Exceptions propagate with their original type (``asyncio.to_thread``
+        re-raises), so callers' ``except`` clauses — notably the
+        ``sqlite3.Error`` pending-store guard in ``_compress_and_surface`` —
+        behave identically on both paths.
+        """
+        if getattr(scorer, "uses_blocking_io", False):
+            return await asyncio.to_thread(
+                compressor.compress, text, max_chars=max_chars, context_query=context_query
+            )
+        return compressor.compress(text, max_chars=max_chars, context_query=context_query)
+
     async def _apply_compression(
         self,
         text: str,
@@ -1733,10 +1785,31 @@ class ProxyManager:
                     sel_compressor = self._rebuild_selective_compressor(sel_cfg)
                 else:
                     sel_compressor = self._selective_compressor
-            return (
-                sel_compressor.compress(text, max_chars=max_chars, context_query=context_query),
-                None,
-            )
+                # Pin the compressor before the lock drops: the off-thread
+                # compress below must not lose its pending store to a
+                # concurrent config-change rebuild's close(). begin_use/
+                # end_use defer that close to the last in-flight user, so
+                # concurrent SELECTIVE calls run in parallel instead of
+                # queueing on the lock (which would surface as spurious
+                # LOCK_TIMEOUT under a slow embedding endpoint).
+                _begin = getattr(sel_compressor, "begin_use", None)
+                if _begin is not None:
+                    _begin()
+            try:
+                return (
+                    await self._compress_maybe_offthread(
+                        sel_compressor,
+                        text,
+                        max_chars=max_chars,
+                        context_query=context_query,
+                        scorer=getattr(sel_compressor, "_scorer", None),
+                    ),
+                    None,
+                )
+            finally:
+                _end = getattr(sel_compressor, "end_use", None)
+                if _end is not None:
+                    _end()
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
@@ -1774,17 +1847,27 @@ class ProxyManager:
                 server,
                 tool,
             )
+            scorer = self._relevance_scorer
             return (
-                TruncateCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    TruncateCompressor(scorer=scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
+                    scorer=scorer,
                 ),
                 "no_config",
             )
 
         if compression == CompressionStrategy.TRUNCATE:
+            scorer = self._relevance_scorer
             return (
-                TruncateCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    TruncateCompressor(scorer=scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
+                    scorer=scorer,
                 ),
                 None,
             )
@@ -1795,17 +1878,27 @@ class ProxyManager:
         # remaining strategies routed through get_compressor (NONE, PROGRESSIVE,
         # EXTRACT_FIELDS) take neither a scorer nor a context_query.
         if compression == CompressionStrategy.SCHEMA_PRUNING:
+            scorer = self._relevance_scorer
             return (
-                SchemaPruningCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    SchemaPruningCompressor(scorer=scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
+                    scorer=scorer,
                 ),
                 None,
             )
 
         if compression == CompressionStrategy.SKELETON:
+            scorer = self._relevance_scorer
             return (
-                SkeletonCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    SkeletonCompressor(scorer=scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
+                    scorer=scorer,
                 ),
                 None,
             )
@@ -1951,15 +2044,36 @@ class ProxyManager:
             if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                 self._rebuild_selective_compressor(sel_cfg)
 
-        compressor = HybridCompressor(
-            head_chars=cfg.head_chars,
-            tail_mode=cfg.tail_mode,
-            min_toc_budget=cfg.min_toc_budget,
-            min_head_chars=cfg.min_head_chars,
-            head_ratio=cfg.head_ratio,
-            selective_compressor=self._selective_compressor,
-        )
-        return compressor.compress(text, max_chars=max_chars, context_query=context_query)
+            sel_compressor = self._selective_compressor
+            compressor = HybridCompressor(
+                head_chars=cfg.head_chars,
+                tail_mode=cfg.tail_mode,
+                min_toc_budget=cfg.min_toc_budget,
+                min_head_chars=cfg.min_head_chars,
+                head_ratio=cfg.head_ratio,
+                selective_compressor=sel_compressor,
+            )
+            # Pin the shared selective compressor before the lock drops —
+            # same rebuild/close race as the SELECTIVE branch: the hybrid TOC
+            # path writes through its pending store. The scorer gate reads
+            # the selective compressor's captured scorer (HybridCompressor
+            # has no scorer of its own; its truncate tail mode is
+            # query-blind).
+            _begin = getattr(sel_compressor, "begin_use", None)
+            if _begin is not None:
+                _begin()
+        try:
+            return await self._compress_maybe_offthread(
+                compressor,
+                text,
+                max_chars=max_chars,
+                context_query=context_query,
+                scorer=getattr(sel_compressor, "_scorer", None),
+            )
+        finally:
+            _end = getattr(sel_compressor, "end_use", None)
+            if _end is not None:
+                _end()
 
     async def _auto_index_response(
         self,
@@ -3258,8 +3372,13 @@ class ProxyManager:
                         tool,
                         exc_info=True,
                     )
-                    compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
-                        cleaned, max_chars=effective_max_chars, context_query=context_query
+                    _fb_scorer = self._relevance_scorer
+                    compressed = await self._compress_maybe_offthread(
+                        TruncateCompressor(scorer=_fb_scorer),
+                        cleaned,
+                        max_chars=effective_max_chars,
+                        context_query=context_query,
+                        scorer=_fb_scorer,
                     )
                     llm_fallback = None
                     selective_store_error = True
@@ -3381,10 +3500,13 @@ class ProxyManager:
                         # direct path when content is too small for progressive
                         # and lacks structure for hybrid.
                         if not progressive_fallback and not hybrid_fallback:
-                            compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
+                            _fb_scorer = self._relevance_scorer
+                            compressed = await self._compress_maybe_offthread(
+                                TruncateCompressor(scorer=_fb_scorer),
                                 cleaned,
                                 max_chars=effective_max_chars,
                                 context_query=context_query,
+                                scorer=_fb_scorer,
                             )
                             metrics_strategy = f"{original_strategy}→truncate_fallback"
                             # Re-check the ratio symmetrically with the hybrid

@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -846,6 +847,12 @@ class SelectiveCompressor:
         self._json_depth = json_depth
         self._min_section_chars = min_section_chars
         self._scorer = scorer or BM25Scorer()
+        # In-flight guard for the off-thread compress path (#618): close()
+        # defers to the last end_use() so a config-change rebuild can't pull
+        # the pending store out from under a worker thread mid-write.
+        self._use_lock = threading.Lock()
+        self._in_use = 0
+        self._close_requested = False
         if store is not None:
             self._store = store
         else:
@@ -990,17 +997,54 @@ class SelectiveCompressor:
 
         return "\n\n".join(selected_parts)
 
+    def begin_use(self) -> None:
+        """Register an in-flight ``compress()`` before the manager lock drops.
+
+        ``ProxyManager`` may run ``compress()`` in a worker thread (#618)
+        after releasing ``_selective_lock``; a concurrent config-change
+        rebuild (or ``stop()``) calling :meth:`close` in that window would
+        otherwise close the pending store mid-write. ``begin_use`` runs on
+        the event loop while the manager lock is still held, so a later
+        ``close()`` defers to the balancing :meth:`end_use` instead.
+        """
+        with self._use_lock:
+            self._in_use += 1
+
+    def end_use(self) -> None:
+        """Balance :meth:`begin_use`; the last one applies a deferred close."""
+        with self._use_lock:
+            self._in_use -= 1
+            should_close = self._close_requested and self._in_use == 0
+        if should_close:
+            self._close_store()
+
     def close(self) -> None:
         """Release the underlying pending store's OS resources.
 
         The SQLite backend holds a connection; the in-memory backend has
         nothing to release. Called by ``ProxyManager`` on stop and before it
         rebuilds a compressor for a changed config (#583), so a cached
-        SQLite-backed compressor does not leak its connection.
+        SQLite-backed compressor does not leak its connection. While a
+        ``begin_use``/``end_use`` span is in flight (an off-thread compress,
+        #618) the close is deferred to the last ``end_use`` — the store must
+        not disappear under a worker thread mid-write.
         """
+        with self._use_lock:
+            if self._in_use > 0:
+                self._close_requested = True
+                return
+        self._close_store()
+
+    def _close_store(self) -> None:
+        # Never raises: the deferred path runs inside the manager's `finally`
+        # after a successful compress, and a close failure must not eat that
+        # result (callers of close() already wrap or tolerate failures too).
         close = getattr(self._store, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                logger.debug("Failed to close pending store", exc_info=True)
 
     def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
         try:
