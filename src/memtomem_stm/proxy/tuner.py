@@ -3,7 +3,8 @@ tuning recommendations.
 
 Read-only analysis — does not modify config or data stores.  Agents
 (or operators) inspect recommendations via ``stm_tuning_recommendations``
-and apply them manually to ``stm_proxy.json``.
+and apply them with ``mms tune --apply`` (or edit ``stm_proxy.json``
+manually).
 """
 
 from __future__ import annotations
