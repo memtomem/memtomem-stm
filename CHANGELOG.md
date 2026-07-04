@@ -3,7 +3,25 @@
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
+Releases whose entries carry a `**Behavior change**:` marker open with an
+**Upgrade notes** block summarizing them — read that block first when
+upgrading. The convention starts after 0.1.31; older releases record behavior
+changes inline only. See the deprecation policy in
+[README](README.md#compatibility--deprecation-policy).
+
 ## [Unreleased]
+
+### Upgrade notes
+
+- **Per-upstream circuit breaker is on by default** (#620): after 3
+  consecutive failed calls an upstream's tools fail fast with `circuit_open`
+  for up to 60s instead of each call burning the full retry/deadline budget.
+  Set `circuit_max_failures: 0` on an upstream to restore the old
+  always-retry behavior.
+- **Embedding-scorer compression moved off the event loop** (#628): with an
+  embedding relevance scorer configured, compression now runs on a worker
+  thread so one slow endpoint no longer stalls concurrent calls. The default
+  BM25 path is byte-identical; per-call semantics are unchanged.
 
 ### Security
 
