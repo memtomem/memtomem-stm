@@ -456,6 +456,52 @@ class TestStatus:
         data = json.loads(result.output)
         assert data["error"] == "config_not_found"
 
+    def test_valid_json_invalid_schema_warns_exit_zero(self, runner, config):
+        """#611: valid JSON that fails model validation is exactly what a
+        running server silently degrades on — ``status`` must warn (but stay
+        exit 0; strictness lives in ``mms config validate``)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "a": {"prefix": "dup", "command": "a"},
+                        "b": {"prefix": "dup", "command": "b"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "fails validation" in result.output
+        assert "falls back to env/defaults" in result.output
+
+    def test_valid_json_invalid_schema_flagged_in_json(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "a": {"prefix": "dup", "command": "a"},
+                        "b": {"prefix": "dup", "command": "b"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert "Duplicate upstream prefixes" in data["config_error"]
+
+    def test_valid_config_marked_valid_in_json(self, runner, config):
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is True
+        assert data["config_error"] is None
+
     def test_json_redacts_origin_original(self, runner, config):
         """``origin.original`` is the verbatim host entry and may carry
         secrets — ``status --json`` must emit only the provenance summary
@@ -5867,12 +5913,45 @@ class TestHealth:
         assert "Surfacing Bootstrap" in result.output
         assert "feedback tables: missing" in result.output
 
+    def test_health_no_servers_from_invalid_schema_names_cause(self, runner, config):
+        """#611: a schema-invalid config is the classic cause of the
+        "No upstream servers" symptom on a running server — ``health`` must
+        lead with the cause (exit code unchanged)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "a": {"prefix": "dup", "command": "a"},
+                        "b": {"prefix": "dup", "command": "b"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert "Duplicate upstream prefixes" in data["config_error"]
+
+    def test_health_warns_on_invalid_schema_text(self, runner, config):
+        config.write_text(
+            json.dumps({"upstream_servers": {}, "default_max_result_chars": -1}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "fails validation" in result.output
+        assert "No upstream servers configured" in result.output
+
     def test_health_json_no_servers(self, runner, config):
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["servers"] == {}
+        assert data["config_valid"] is True
+        assert data["config_error"] is None
         assert data["surfacing"]["enabled"] is True
         assert data["surfacing"]["feedback_enabled"] is True
         assert data["surfacing"]["feedback_db"]["exists"] is False

@@ -63,13 +63,23 @@ class STMContext:
     feedback_tracker: FeedbackTracker | None
     compression_feedback_tracker: CompressionFeedbackTracker | None
     progressive_reads_tracker: ProgressiveReadsTracker | None
+    proxy_config_error: str | None = None
+    """Set when the proxy config file exists but failed to parse/validate at
+    startup (#611): the server is running env/default config — typically with
+    the proxy off — and only a buried stderr warning says why. Surfaced by
+    ``stm_proxy_health`` so the failure is visible from inside the client."""
 
 
 CtxType = Context[ServerSession, STMContext]
 
 
-def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, Any]) -> None:
+def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, Any]) -> str | None:
     """Load the JSON config file and overlay env vars on top of it, in place.
+
+    Returns the load error when the file exists but failed to parse/validate
+    (``None`` otherwise — including the deliberate missing-file no-swap), so
+    the lifespan can pin it on ``STMContext.proxy_config_error`` instead of
+    the failure living only in a stderr warning (#611).
 
     The documented precedence (env > file > defaults) is enforced by
     ``load_from_file``'s deep-merge: every ``MEMTOMEM_STM_PROXY__*`` var —
@@ -95,20 +105,21 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     but never surfacing's model-aware budgets
     (``effective_max_injection_chars`` / ``effective_max_results``).
     """
-    file_cfg = ProxyConfig.load_from_file(
+    result = ProxyConfig.load_from_file_with_status(
         config.proxy.config_path, env_overrides=proxy_env_overrides, missing_ok=False
     )
-    if file_cfg is not None:
-        config.proxy = file_cfg
+    if result.config is not None:
+        config.proxy = result.config
     if config.proxy.consumer_model and not config.surfacing.consumer_model:
         config.surfacing.consumer_model = config.proxy.consumer_model
+    return result.error
 
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     config = STMConfig()
     proxy_env_overrides = collect_proxy_env_overrides()
-    _apply_proxy_file_config(config, proxy_env_overrides)
+    proxy_config_error = _apply_proxy_file_config(config, proxy_env_overrides)
 
     # Shared state — populated only when proxy is enabled
     from memtomem_stm.proxy.cache import ProxyCache
@@ -360,6 +371,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             feedback_tracker=feedback_tracker,
             compression_feedback_tracker=compression_feedback_tracker,
             progressive_reads_tracker=progressive_reads_tracker,
+            proxy_config_error=proxy_config_error,
         )
         yield ctx
     finally:
@@ -776,12 +788,21 @@ async def stm_proxy_health(
 
     bootstrap_lines = _surfacing_bootstrap_lines(app)
 
+    # A broken config file is the likeliest cause of the "No upstream
+    # servers configured." symptom below — lead with it in both branches.
+    config_warning = []
+    if app.proxy_config_error:
+        config_warning.append(
+            "WARNING: proxy config file present but failed to parse — "
+            f"running env/default config: {app.proxy_config_error}"
+        )
+
     health = pm.get_upstream_health()
     if not health:
         head = "No upstream servers configured."
-        return "\n".join([head, *bootstrap_lines]) if bootstrap_lines else head
+        return "\n".join([*config_warning, head, *bootstrap_lines])
 
-    lines = ["Upstream Server Health", "====================="]
+    lines = [*config_warning, "Upstream Server Health", "====================="]
     for name, info in health.items():
         status = "connected" if info["connected"] else "DISCONNECTED"
         lines.append(

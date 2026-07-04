@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import types
+from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -59,6 +62,46 @@ def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, An
         else:
             out[k] = v
     return out
+
+
+def _permissive_mode(resolved: Path) -> int | None:
+    """Mode bits of *resolved* when it is group/world-accessible, else ``None``.
+
+    Shared by the load path and ``mms config validate`` so the two warnings
+    can't drift apart. ``None`` also covers a failed ``stat`` (best-effort).
+    """
+    try:
+        mode = resolved.stat().st_mode & 0o777
+    except OSError:
+        return None
+    return mode if mode & 0o077 else None
+
+
+def _sanitized_load_error(exc: Exception) -> str:
+    """Error summary safe to surface beyond the local process log.
+
+    ``ConfigLoadResult.error`` flows to the MCP client via
+    ``stm_proxy_health``, so it must not echo config *values*. Pydantic
+    smuggles them in two ways: ``input_value=...`` (dropped via
+    ``include_input=False``) and the rendered ``msg`` of a custom
+    model-validator — e.g. the duplicate-prefix check embeds the prefix
+    string, which is the secret itself if someone typos a token into a
+    ``prefix`` field. So the summary uses ``loc`` + the machine-readable
+    ``type`` code (``dict_type`` / ``value_error`` / ``missing`` …) only,
+    never ``msg``. Full messages stay in the local stderr log and in
+    ``mms config validate``, which reads the raw errors directly.
+
+    Non-pydantic errors (``json.JSONDecodeError``, the non-object-root
+    ``ValueError``) describe positions/types, not config values.
+    """
+    if isinstance(exc, ValidationError):
+        parts = []
+        for err in exc.errors(include_url=False, include_input=False):
+            loc = ".".join(str(part) for part in err["loc"])
+            parts.append(f"{loc} ({err['type']})" if loc else err["type"])
+        summary = "; ".join(parts)
+        return f"{exc.error_count()} validation error(s): {summary}"
+    return str(exc)
 
 
 def _env_override_hint(
@@ -953,6 +996,134 @@ class RelevanceScorerConfig(BaseModel):
         return self
 
 
+def _model_arms(annotation: Any) -> list[type[BaseModel]] | None:
+    """BaseModel arms of *annotation* after unwrapping ``Annotated``/unions.
+
+    Returns ``None`` when descending would risk false positives: a non-model
+    leaf, a mixed union (model | free-form), or anything else where key
+    existence isn't defined by a model schema. The classification is read off
+    the annotation itself — no name allowlist — so it stays correct as the
+    config models evolve.
+    """
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        arms: list[type[BaseModel]] = []
+        for arm in get_args(annotation):
+            if arm is type(None):
+                continue
+            sub = _model_arms(arm)
+            if sub is None:  # mixed union — don't guess, don't descend
+                return None
+            arms.extend(sub)
+        return arms or None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return [annotation]
+    return None
+
+
+def _container_value_arms(annotation: Any) -> tuple[str, list[type[BaseModel]]] | None:
+    """Classify a container annotation whose *values* are models.
+
+    Returns ``("dict", arms)`` for ``dict[str, Model]`` (user-defined keys —
+    descend into values only) or ``("list", arms)`` for ``list[Model]``;
+    ``None`` for free-form containers (``dict[str, str]``, ``dict[str, Any]``)
+    and everything else.
+    """
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    origin = get_origin(annotation)
+    if origin is dict:
+        args = get_args(annotation)
+        if len(args) == 2 and (arms := _model_arms(args[1])) is not None:
+            return ("dict", arms)
+    elif origin in (list, tuple, set):
+        args = get_args(annotation)
+        if args and (arms := _model_arms(args[0])) is not None:
+            return ("list", arms)
+    return None
+
+
+def _unknown_keys_via_arms(
+    arms: list[type[BaseModel]], data: Mapping[str, Any], prefix: str
+) -> list[str]:
+    """Unknown keys under a (possibly multi-arm) model annotation.
+
+    With several model arms (none in today's tree), only keys unknown to
+    *every* arm are flagged — conservative, no false positives.
+    """
+    per_arm = [find_unknown_keys(arm, data, prefix) for arm in arms]
+    common = set(per_arm[0])
+    for other in per_arm[1:]:
+        common &= set(other)
+    return sorted(common)
+
+
+def find_unknown_keys(
+    model_cls: type[BaseModel], data: Mapping[str, Any], prefix: str = ""
+) -> list[str]:
+    """Dotted paths in *data* that no field of *model_cls* (recursively) accepts.
+
+    The proxy config models deliberately keep pydantic's default
+    ``extra="ignore"`` for forward compatibility (older binaries must ignore
+    fields written by newer CLIs — see ``UpstreamServerConfig.origin``), which
+    means a typo'd key is silently dropped at load time. This walker gives the
+    load path and ``mms config validate`` a way to *name* those dropped keys
+    without giving up the lenient validation.
+
+    Key-existence only: a value of the wrong runtime type (a string where a
+    model object belongs) is skipped silently — ``model_validate`` owns type
+    errors. ``dict[str, Model]`` fields (``upstream_servers``,
+    ``tool_overrides``) have user-defined keys, so only their values are
+    descended; free-form leaves (``env``, ``headers``, ``origin.original``,
+    ``server_name_map``) are never descended.
+    """
+    unknown: list[str] = []
+    known: dict[str, Any] = {}
+    for name, field in model_cls.model_fields.items():
+        known[name] = field.annotation
+        if field.alias:
+            known[field.alias] = field.annotation
+    for key, value in data.items():
+        path = f"{prefix}{key}"
+        if key not in known:
+            unknown.append(path)
+            continue
+        annotation = known[key]
+        if (arms := _model_arms(annotation)) is not None:
+            if isinstance(value, Mapping):
+                unknown.extend(_unknown_keys_via_arms(arms, value, f"{path}."))
+        elif (container := _container_value_arms(annotation)) is not None:
+            kind, arms = container
+            if kind == "dict" and isinstance(value, Mapping):
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, Mapping):
+                        unknown.extend(
+                            _unknown_keys_via_arms(arms, sub_value, f"{path}.{sub_key}.")
+                        )
+            elif kind == "list" and isinstance(value, list):
+                for i, item in enumerate(value):
+                    if isinstance(item, Mapping):
+                        unknown.extend(_unknown_keys_via_arms(arms, item, f"{path}[{i}]."))
+    return sorted(unknown)
+
+
+@dataclass(frozen=True)
+class ConfigLoadResult:
+    """Outcome of ``ProxyConfig.load_from_file_with_status``.
+
+    ``error`` is set iff the file exists but failed to parse or validate —
+    the case a running server silently papers over by falling back to
+    env/default config. A missing file is not an error (``config`` may still
+    carry the env-only/defaults rebuild under ``missing_ok=True``).
+    """
+
+    config: ProxyConfig | None
+    error: str | None
+    unknown_keys: tuple[str, ...] = ()
+
+
 class ProxyConfig(BaseModel):
     enabled: bool = False
     config_path: Path = Path("~/.memtomem/stm_proxy.json")
@@ -1082,7 +1253,11 @@ class ProxyConfig(BaseModel):
 
     @staticmethod
     def load_from_file(
-        path: Path, env_overrides: dict[str, Any] | None = None, *, missing_ok: bool = True
+        path: Path,
+        env_overrides: dict[str, Any] | None = None,
+        *,
+        missing_ok: bool = True,
+        log_warnings: bool = True,
     ) -> ProxyConfig | None:
         """Load config from *path*. Returns ``None`` on parse/validation error
         (with ``missing_ok=True``, distinct from file-not-found which returns
@@ -1102,34 +1277,70 @@ class ProxyConfig(BaseModel):
         pre-check that races with file deletion. A file deleted between the
         existence check and the read also lands on ``None`` here, so every
         disappearance mode converges on "do not swap".
+
+        Callers that need to distinguish "missing" from "present but broken"
+        use ``load_from_file_with_status`` instead.
+        """
+        return ProxyConfig.load_from_file_with_status(
+            path, env_overrides, missing_ok=missing_ok, log_warnings=log_warnings
+        ).config
+
+    @staticmethod
+    def load_from_file_with_status(
+        path: Path,
+        env_overrides: dict[str, Any] | None = None,
+        *,
+        missing_ok: bool = True,
+        log_warnings: bool = True,
+    ) -> ConfigLoadResult:
+        """``load_from_file`` with the failure mode preserved in the result.
+
+        Same loading semantics and logging; additionally reports (a) an
+        ``error`` string when the file exists but fails to parse/validate —
+        so the server can surface "running defaults because the file is
+        broken" in health output instead of only a stderr line — and (b) the
+        ``unknown_keys`` the lenient validation silently dropped, walked over
+        the raw file dict *before* the env merge so an env-injected key can
+        never be misattributed as a file typo.
+
+        ``error`` is sanitized (location + message, never ``input_value``):
+        it flows to the MCP client via ``stm_proxy_health``, and a mistyped
+        secret-bearing field would otherwise embed the secret itself.
+
+        ``log_warnings=False`` suppresses the advisory warnings (permissive
+        mode, unknown keys) for re-loads of a file some earlier load already
+        warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
+        fallback, which would otherwise duplicate them at startup. Parse
+        *failures* are always logged: a silent ``None`` is the dark-failure
+        mode this module exists to prevent.
         """
         resolved = path.expanduser().resolve()
         if not resolved.exists():
             logger.debug("Proxy config file not found: %s", resolved)
             if not missing_ok:
-                return None
+                return ConfigLoadResult(config=None, error=None)
             if env_overrides:
                 try:
-                    return ProxyConfig.model_validate(env_overrides)
+                    return ConfigLoadResult(
+                        config=ProxyConfig.model_validate(env_overrides), error=None
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Env-only proxy config failed validation: %s%s — using defaults",
                         exc,
                         _env_override_hint(exc, env_overrides),
                     )
-            return ProxyConfig()
+            return ConfigLoadResult(config=ProxyConfig(), error=None)
         # Warn if config is group/world-readable (may contain API keys)
-        try:
-            mode = resolved.stat().st_mode & 0o777
-            if mode & 0o077:
-                logger.warning(
-                    "Proxy config %s has permissive mode %o — consider restricting to 0600",
-                    resolved,
-                    mode,
-                )
-        except OSError:
-            pass
+        mode = _permissive_mode(resolved)
+        if mode is not None and log_warnings:
+            logger.warning(
+                "Proxy config %s has permissive mode %o — consider restricting to 0600",
+                resolved,
+                mode,
+            )
         file_data: dict[str, Any] | None = None
+        unknown_keys: tuple[str, ...] = ()
         try:
             loaded = json.loads(resolved.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
@@ -1139,16 +1350,32 @@ class ProxyConfig(BaseModel):
                 # silently accepting an invalid config file.
                 raise ValueError(f"config root must be a JSON object, got {type(loaded).__name__}")
             file_data = loaded
+            unknown_keys = tuple(find_unknown_keys(ProxyConfig, file_data))
             data = _deep_merge(file_data, env_overrides) if env_overrides else file_data
-            return ProxyConfig.model_validate(data)
+            config = ProxyConfig.model_validate(data)
+            if unknown_keys and log_warnings:
+                # One aggregated line, not one per key: the hot-reload loader
+                # re-runs this on every mtime change.
+                logger.warning(
+                    "Proxy config %s has %d unknown key(s) (ignored — possible typo): %s",
+                    resolved,
+                    len(unknown_keys),
+                    ", ".join(unknown_keys),
+                )
+            return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:
+            # The parse-failure warning dominates; the unknown-keys warning is
+            # suppressed here but the paths stay in the result for `mms
+            # config validate` to report alongside the errors.
             logger.warning(
                 "Failed to parse proxy config %s: %s%s",
                 resolved,
                 exc,
                 _env_override_hint(exc, env_overrides, file_data),
             )
-            return None
+            return ConfigLoadResult(
+                config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
+            )
 
 
 class ProxyConfigLoader:

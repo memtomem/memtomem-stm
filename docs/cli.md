@@ -36,6 +36,7 @@ Options:
 
 Commands:
   add        Add an upstream MCP server to the proxy configuration.
+  config     Inspect and validate the proxy config file.
   daemon     Manage the local surfacing daemon (warm LTM connection for...
   eject      Restore imported upstream(s) to their host MCP client, then...
   health     Check upstream server connectivity.
@@ -397,6 +398,27 @@ Options:
 ```
 
 Shows the current proxy gateway configuration file path, enabled flag, and the list of configured upstream servers with their prefix, transport, command or URL, compression strategy, character budget, and surfacing toggle. In `--json` output, every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human-readable table never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
+
+When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `health` print a warning naming the first error — exit code unchanged. Use `mms config validate` for the strict check.
+
+### `config validate`
+
+```
+Usage: mms config validate [OPTIONS]
+
+Options:
+  --config TEXT  Path to the proxy config JSON.  [default: ~/.memtomem/stm_proxy.json]
+  --json         Output as JSON for scripting.
+```
+
+Strictly validates the config file *as written* — no `MEMTOMEM_STM_PROXY__*` env overlay, since this lints the artifact you edit and commit, not the runtime composite. Reports, with non-zero exit on any of them:
+
+- JSON parse errors and non-object roots,
+- schema validation errors (dotted location + message, one line each),
+- **unknown keys at every nesting level** (dotted paths like `upstream_servers.gh.tool_overides`). The runtime load deliberately keeps pydantic's `extra="ignore"` for forward compatibility, so a typo'd key silently vanishes there; this command is where typos fail loudly. The load path also logs one aggregated unknown-key warning per load,
+- a missing file (`status: "missing"` — a strict validator with nothing to validate fails, which is what a CI gate wants).
+
+Group/world-readable file permissions produce a warning line but exit 0 on their own. `--json` emits `{"config_path", "status": "ok"|"invalid"|"missing", "errors": [...], "unknown_keys": [...], "warnings": [...]}`.
 
 ### `stats`
 

@@ -411,7 +411,12 @@ class ProxyManager:
 
         servers = self._config.upstream_servers
         if not servers:
-            loaded = ProxyConfig.load_from_file(self._config.config_path)
+            # Fallback re-load of a file the server startup path typically
+            # already loaded (env-enabled proxy, upstreams only in the file).
+            # log_warnings=False so the advisory permissive-mode /
+            # unknown-key warnings don't fire twice per startup (#611);
+            # a parse *failure* still logs.
+            loaded = ProxyConfig.load_from_file(self._config.config_path, log_warnings=False)
             servers = loaded.upstream_servers if loaded else {}
 
         # Warn about dangerous config: compression active but auto_index disabled

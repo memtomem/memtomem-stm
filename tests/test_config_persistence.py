@@ -124,6 +124,160 @@ class TestProxyConfigLoader:
         assert "gh2" not in reloaded.upstream_servers
 
 
+# ── load_from_file_with_status / unknown-key warning (#611) ──────────────
+
+
+class TestLoadFromFileWithStatus:
+    def test_valid_file_no_error(self, tmp_path):
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is not None and result.config.enabled is True
+        assert result.error is None
+        assert result.unknown_keys == ()
+
+    def test_parse_failure_sets_error(self, tmp_path):
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None
+
+    def test_validation_failure_sets_error_and_keeps_unknown_keys(self, tmp_path):
+        # Duplicate prefixes fail the model validator; the typo'd key found
+        # before validation must survive into the result for `mms config
+        # validate` to report both.
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "bogus_key": 1,
+            "upstream_servers": {
+                "a": {"prefix": "dup", "command": "a"},
+                "b": {"prefix": "dup", "command": "b"},
+            },
+        }))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        # loc + type, not the raw validator message (which embeds prefixes).
+        assert result.error is not None and "value_error" in result.error
+        assert result.unknown_keys == ("bogus_key",)
+
+    def test_missing_file_is_not_an_error(self, tmp_path):
+        missing = tmp_path / "nonexistent.json"
+        strict = ProxyConfig.load_from_file_with_status(missing, missing_ok=False)
+        assert strict.config is None and strict.error is None
+        lenient = ProxyConfig.load_from_file_with_status(missing)
+        assert lenient.config is not None and lenient.error is None
+
+    def test_unknown_keys_warned_once_aggregated(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "max_result_char": 4000,
+            "cache": {"ttl_secondz": 60},
+        }))
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is not None
+        assert result.unknown_keys == ("cache.ttl_secondz", "max_result_char")
+        warnings = [r for r in caplog.records if "unknown key" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "cache.ttl_secondz" in warnings[0].getMessage()
+        assert "max_result_char" in warnings[0].getMessage()
+
+    def test_env_injected_keys_not_flagged_as_file_typos(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        # An env overlay carrying a key the file doesn't have (even a bogus
+        # one — extra="ignore" accepts it) must not surface as a file typo:
+        # the walk runs on the raw file dict before the merge.
+        overrides = {"default_max_result_chars": "9000", "bogus_env_key": "1"}
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, overrides)
+        assert result.config is not None
+        assert result.config.default_max_result_chars == 9000
+        assert result.unknown_keys == ()
+        assert not [r for r in caplog.records if "unknown key" in r.getMessage()]
+
+    def test_error_never_carries_input_values(self, tmp_path):
+        """codex review of #611: str(ValidationError) embeds input_value=...,
+        and a mistyped secret-bearing field (headers/env) would flow to the
+        MCP client via stm_proxy_health. The error must carry location +
+        message only."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "upstream_servers": {
+                "gh": {"prefix": "gh", "headers": "Bearer SECRET_TOKEN_ABC"}
+            }
+        }))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None
+        assert "SECRET_TOKEN_ABC" not in result.error
+        assert "upstream_servers.gh.headers" in result.error
+
+    def test_error_never_carries_custom_validator_values(self, tmp_path):
+        """Round-2 codex: pydantic input_value was only one leak channel —
+        a custom model-validator renders raw values into its message too
+        (the duplicate-prefix check embeds the prefix string). A secret
+        typo'd into a `prefix` field must not reach ConfigLoadResult.error,
+        which flows to the MCP client via stm_proxy_health."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "upstream_servers": {
+                "a": {"prefix": "SECRET_TOKEN_ABC", "command": "a"},
+                "b": {"prefix": "SECRET_TOKEN_ABC", "command": "b"},
+            }
+        }))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None
+        assert "SECRET_TOKEN_ABC" not in result.error
+        assert "value_error" in result.error
+
+    def test_log_warnings_false_suppresses_advisory_warnings(self, tmp_path, caplog):
+        """codex review of #611: ProxyManager.start()'s empty-upstreams
+        fallback re-loads a file the server startup already loaded — advisory
+        warnings (permissive mode, unknown keys) must not fire twice, while
+        the unknown_keys stay in the result and parse failures still log."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True, "max_result_char": 1}))
+        cfg_file.chmod(0o644)
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, log_warnings=False)
+        assert result.config is not None
+        assert result.unknown_keys == ("max_result_char",)
+        assert not [
+            r
+            for r in caplog.records
+            if "unknown key" in r.getMessage() or "permissive mode" in r.getMessage()
+        ]
+
+        caplog.clear()
+        cfg_file.write_text("{ broken")
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, log_warnings=False)
+        assert result.config is None
+        assert [r for r in caplog.records if "Failed to parse" in r.getMessage()]
+
+    def test_load_from_file_delegate_contract_unchanged(self, tmp_path):
+        good = tmp_path / "good.json"
+        good.write_text(json.dumps({"enabled": True}))
+        broken = tmp_path / "broken.json"
+        broken.write_text("{ nope")
+        missing = tmp_path / "missing.json"
+
+        assert ProxyConfig.load_from_file(good).enabled is True
+        assert ProxyConfig.load_from_file(broken) is None
+        assert ProxyConfig.load_from_file(missing).enabled is False  # defaults
+        assert ProxyConfig.load_from_file(missing, missing_ok=False) is None
+
+
 # ── MetricsStore persistence ─────────────────────────────────────────────
 
 

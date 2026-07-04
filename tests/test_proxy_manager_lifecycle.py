@@ -67,6 +67,32 @@ class TestStart:
         assert mock_conn.call_count == 1
         assert mock_conn.call_args_list[0].args[0] == "file_srv"
 
+    async def test_start_fallback_load_does_not_duplicate_advisory_warnings(
+        self, tmp_path, caplog
+    ):
+        """codex review of #611: the empty-upstreams fallback re-loads a file
+        the server startup path already loaded and warned about — start()
+        must not emit the advisory unknown-key / permissive-mode warnings a
+        second time."""
+        import json
+        import logging
+
+        cfg_file = tmp_path / "proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True, "max_result_char": 1}))
+        cfg_file.chmod(0o644)
+        mgr = _make_manager(servers={}, tmp_path=tmp_path)
+        with (
+            caplog.at_level(logging.WARNING),
+            patch.object(mgr, "_connect_server", new_callable=AsyncMock),
+        ):
+            await mgr.start()
+        assert not [
+            r
+            for r in caplog.records
+            if "unknown key" in r.getMessage() or "permissive mode" in r.getMessage()
+        ]
+        await mgr.stop()
+
     async def test_start_empty_servers_no_file_noop(self, tmp_path):
         """No servers configured and no file — start() completes without error."""
         mgr = _make_manager(servers={}, tmp_path=tmp_path)
