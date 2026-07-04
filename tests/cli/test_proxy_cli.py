@@ -7045,7 +7045,8 @@ class TestTune:
         backups = sorted(config.parent.glob("stm_proxy.json.bak-*"))
         assert len(backups) == 1
         assert backups[0].read_bytes() == before
-        assert (backups[0].stat().st_mode & 0o777) == 0o600
+        if sys.platform != "win32":  # chmod is a near-no-op on Windows
+            assert (backups[0].stat().st_mode & 0o777) == 0o600
         assert str(backups[0]) in result.output  # restore hint names the backup
 
     def test_backup_same_second_collision_uses_numbered_slot(self, tmp_path, monkeypatch):
