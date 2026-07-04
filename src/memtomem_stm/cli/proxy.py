@@ -22,6 +22,7 @@ from typing import Any, TextIO
 import click
 
 from memtomem_stm.cli._write_lock import with_config_write_lock
+from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
 from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
@@ -140,6 +141,33 @@ def _load(config_path: Path) -> dict[str, Any]:
         )
         raise SystemExit(1)
     return data
+
+
+def _schema_validation_error(data: dict[str, Any]) -> str | None:
+    """First schema-validation error for a raw config dict, or ``None``.
+
+    ``_load`` only guards JSON syntax and coarse shape; valid-JSON-but-
+    invalid-schema is exactly the case a running server silently degrades to
+    env/defaults on (#611). ``status`` / ``health`` warn on it — exit code
+    unchanged, since inspection commands stay lenient and strictness lives in
+    ``mms config validate``.
+    """
+    from pydantic import ValidationError
+
+    from memtomem_stm.proxy.config import ProxyConfig
+
+    try:
+        ProxyConfig.model_validate(data)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        loc = ".".join(str(part) for part in first["loc"])
+        return f"{loc}: {first['msg']}" if loc else first["msg"]
+    return None
+
+
+_CONFIG_INVALID_WARNING = (
+    "config file present but fails validation — a running server falls back to env/defaults"
+)
 
 
 def _save(config_path: Path, data: dict[str, Any]) -> None:
@@ -654,6 +682,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     data = _load(path)
     enabled = data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
+    config_error = _schema_validation_error(data)
 
     if as_json:
         click.echo(
@@ -661,6 +690,8 @@ def status(config_path: str, *, as_json: bool = False) -> None:
                 {
                     "config_path": str(resolved),
                     "enabled": enabled,
+                    "config_valid": config_error is None,
+                    "config_error": config_error,
                     "servers": _redacted_servers_json(servers),
                 },
                 indent=2,
@@ -669,6 +700,8 @@ def status(config_path: str, *, as_json: bool = False) -> None:
         )
         return
 
+    if config_error:
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
     click.echo(f"Servers: {len(servers)}")
@@ -3994,6 +4027,7 @@ def health(
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
+    config_error = _schema_validation_error(data)
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
     # ensure_ascii=False) so scripts piping the three commands through the
@@ -4002,12 +4036,19 @@ def health(
         if as_json:
             click.echo(
                 json.dumps(
-                    {"servers": {}, "surfacing": surfacing_status},
+                    {
+                        "servers": {},
+                        "config_valid": config_error is None,
+                        "config_error": config_error,
+                        "surfacing": surfacing_status,
+                    },
                     indent=2,
                     ensure_ascii=False,
                 )
             )
         else:
+            if config_error:
+                click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
             click.echo("No upstream servers configured.")
             click.echo("")
             for line in _format_surfacing_bootstrap(surfacing_status):
@@ -4019,13 +4060,20 @@ def health(
     if as_json:
         click.echo(
             json.dumps(
-                {"servers": results, "surfacing": surfacing_status},
+                {
+                    "servers": results,
+                    "config_valid": config_error is None,
+                    "config_error": config_error,
+                    "surfacing": surfacing_status,
+                },
                 indent=2,
                 ensure_ascii=False,
             )
         )
         return
 
+    if config_error:
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
     click.echo(_hdr("Upstream Server Health"))
     click.echo("=" * 30)
     for name, info in results.items():
@@ -4067,3 +4115,7 @@ cli.add_command(_hook_command)
 # `mms daemon ...` — manage the local surfacing daemon (Stage 2 warm LTM
 # connection for `mms hook`); lives in src/memtomem_stm/cli/daemon_cmd.py.
 cli.add_command(_daemon_group)
+
+# `mms config ...` — strict config-file linting (#611); lives in
+# src/memtomem_stm/cli/config_cmd.py.
+cli.add_command(_config_group)
