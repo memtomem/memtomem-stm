@@ -201,6 +201,50 @@ class TestLoadFromFileWithStatus:
         assert result.unknown_keys == ()
         assert not [r for r in caplog.records if "unknown key" in r.getMessage()]
 
+    def test_error_never_carries_input_values(self, tmp_path):
+        """codex review of #611: str(ValidationError) embeds input_value=...,
+        and a mistyped secret-bearing field (headers/env) would flow to the
+        MCP client via stm_proxy_health. The error must carry location +
+        message only."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "upstream_servers": {
+                "gh": {"prefix": "gh", "headers": "Bearer SECRET_TOKEN_ABC"}
+            }
+        }))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None
+        assert "SECRET_TOKEN_ABC" not in result.error
+        assert "upstream_servers.gh.headers" in result.error
+
+    def test_log_warnings_false_suppresses_advisory_warnings(self, tmp_path, caplog):
+        """codex review of #611: ProxyManager.start()'s empty-upstreams
+        fallback re-loads a file the server startup already loaded — advisory
+        warnings (permissive mode, unknown keys) must not fire twice, while
+        the unknown_keys stay in the result and parse failures still log."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True, "max_result_char": 1}))
+        cfg_file.chmod(0o644)
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, log_warnings=False)
+        assert result.config is not None
+        assert result.unknown_keys == ("max_result_char",)
+        assert not [
+            r
+            for r in caplog.records
+            if "unknown key" in r.getMessage() or "permissive mode" in r.getMessage()
+        ]
+
+        caplog.clear()
+        cfg_file.write_text("{ broken")
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, log_warnings=False)
+        assert result.config is None
+        assert [r for r in caplog.records if "Failed to parse" in r.getMessage()]
+
     def test_load_from_file_delegate_contract_unchanged(self, tmp_path):
         good = tmp_path / "good.json"
         good.write_text(json.dumps({"enabled": True}))

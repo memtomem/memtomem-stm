@@ -77,6 +77,25 @@ def _permissive_mode(resolved: Path) -> int | None:
     return mode if mode & 0o077 else None
 
 
+def _sanitized_load_error(exc: Exception) -> str:
+    """Error summary safe to surface beyond the local process log.
+
+    ``str(ValidationError)`` embeds ``input_value=...`` — for a mistyped
+    secret-bearing field (``headers``/``env``) that is the secret itself, and
+    ``ConfigLoadResult.error`` flows to the MCP client via
+    ``stm_proxy_health``. Rebuild from ``errors(include_input=False)``
+    (location + message only). Non-pydantic errors (``json.JSONDecodeError``,
+    the non-object-root ``ValueError``) describe positions/types, not values.
+    """
+    if isinstance(exc, ValidationError):
+        parts = []
+        for err in exc.errors(include_url=False, include_input=False):
+            loc = ".".join(str(part) for part in err["loc"])
+            parts.append(f"{loc}: {err['msg']}" if loc else err["msg"])
+        return "; ".join(parts)
+    return str(exc)
+
+
 def _env_override_hint(
     exc: Exception,
     env_overrides: dict[str, Any] | None,
@@ -1226,7 +1245,11 @@ class ProxyConfig(BaseModel):
 
     @staticmethod
     def load_from_file(
-        path: Path, env_overrides: dict[str, Any] | None = None, *, missing_ok: bool = True
+        path: Path,
+        env_overrides: dict[str, Any] | None = None,
+        *,
+        missing_ok: bool = True,
+        log_warnings: bool = True,
     ) -> ProxyConfig | None:
         """Load config from *path*. Returns ``None`` on parse/validation error
         (with ``missing_ok=True``, distinct from file-not-found which returns
@@ -1251,12 +1274,16 @@ class ProxyConfig(BaseModel):
         use ``load_from_file_with_status`` instead.
         """
         return ProxyConfig.load_from_file_with_status(
-            path, env_overrides, missing_ok=missing_ok
+            path, env_overrides, missing_ok=missing_ok, log_warnings=log_warnings
         ).config
 
     @staticmethod
     def load_from_file_with_status(
-        path: Path, env_overrides: dict[str, Any] | None = None, *, missing_ok: bool = True
+        path: Path,
+        env_overrides: dict[str, Any] | None = None,
+        *,
+        missing_ok: bool = True,
+        log_warnings: bool = True,
     ) -> ConfigLoadResult:
         """``load_from_file`` with the failure mode preserved in the result.
 
@@ -1267,6 +1294,17 @@ class ProxyConfig(BaseModel):
         ``unknown_keys`` the lenient validation silently dropped, walked over
         the raw file dict *before* the env merge so an env-injected key can
         never be misattributed as a file typo.
+
+        ``error`` is sanitized (location + message, never ``input_value``):
+        it flows to the MCP client via ``stm_proxy_health``, and a mistyped
+        secret-bearing field would otherwise embed the secret itself.
+
+        ``log_warnings=False`` suppresses the advisory warnings (permissive
+        mode, unknown keys) for re-loads of a file some earlier load already
+        warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
+        fallback, which would otherwise duplicate them at startup. Parse
+        *failures* are always logged: a silent ``None`` is the dark-failure
+        mode this module exists to prevent.
         """
         resolved = path.expanduser().resolve()
         if not resolved.exists():
@@ -1287,7 +1325,7 @@ class ProxyConfig(BaseModel):
             return ConfigLoadResult(config=ProxyConfig(), error=None)
         # Warn if config is group/world-readable (may contain API keys)
         mode = _permissive_mode(resolved)
-        if mode is not None:
+        if mode is not None and log_warnings:
             logger.warning(
                 "Proxy config %s has permissive mode %o — consider restricting to 0600",
                 resolved,
@@ -1307,7 +1345,7 @@ class ProxyConfig(BaseModel):
             unknown_keys = tuple(find_unknown_keys(ProxyConfig, file_data))
             data = _deep_merge(file_data, env_overrides) if env_overrides else file_data
             config = ProxyConfig.model_validate(data)
-            if unknown_keys:
+            if unknown_keys and log_warnings:
                 # One aggregated line, not one per key: the hot-reload loader
                 # re-runs this on every mtime change.
                 logger.warning(
@@ -1327,7 +1365,9 @@ class ProxyConfig(BaseModel):
                 exc,
                 _env_override_hint(exc, env_overrides, file_data),
             )
-            return ConfigLoadResult(config=None, error=str(exc), unknown_keys=unknown_keys)
+            return ConfigLoadResult(
+                config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
+            )
 
 
 class ProxyConfigLoader:
