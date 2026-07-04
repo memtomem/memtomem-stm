@@ -7086,6 +7086,45 @@ class TestTune:
         assert config.read_bytes() == before
         assert list(config.parent.glob("stm_proxy.json.bak-*")) == []
 
+    def test_apply_refuses_env_masked_invalid_raw_file(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """A malformed per-tool entry in the FILE can be masked from the typed
+        load by an env override (`_deep_merge` replaces a non-dict file leaf
+        with an env-built dict). ``--apply`` edits the file, so it must refuse
+        up front — otherwise a healthy sibling change strands behind the
+        post-mutation validation abort. Preview still runs, with a warning."""
+        metrics_db = tmp_path / "metrics.db"
+        payload = {
+            "enabled": True,
+            "upstream_servers": {
+                "srv": {
+                    "prefix": "s",
+                    "command": "npx",
+                    "tool_overrides": {"bad": "not-a-dict"},
+                }
+            },
+            "metrics": {"db_path": str(metrics_db)},
+        }
+        config.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__SRV__TOOL_OVERRIDES__BAD__MAX_RESULT_CHARS",
+            "4000",
+        )
+        self._seed_metrics(metrics_db)  # healthy recommendation on srv/big_tool
+        before = config.read_bytes()
+
+        applied = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert applied.exit_code == 1
+        assert "as written" in applied.output
+        assert config.read_bytes() == before
+        assert list(config.parent.glob("stm_proxy.json.bak-*")) == []
+
+        preview = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert preview.exit_code == 0, preview.output
+        assert "as written" in preview.output  # warning still surfaces
+        assert "srv/big_tool" in preview.output  # analysis itself still renders
+
     def test_apply_refuses_schema_invalid_config(self, runner, config, tmp_path):
         metrics_db = tmp_path / "metrics.db"
         config.write_text(

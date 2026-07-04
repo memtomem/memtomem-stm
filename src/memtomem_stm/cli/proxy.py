@@ -3158,6 +3158,30 @@ def tune(
         )
         sys.exit(1)
 
+    # Reaching here means the env-overlaid composite validated; the file AS
+    # WRITTEN can still be invalid (an env var can replace a malformed
+    # subtree). --apply edits the FILE, and its post-mutation validation
+    # covers the whole raw dict — so a masked pre-existing defect would
+    # abort the apply after all the analysis/selection work, or strand
+    # healthy sibling changes behind it. Refuse (or warn, for a preview)
+    # up front instead, pointing at the fix-it workflow.
+    raw_error = _schema_validation_error(data)
+    if raw_error is not None:
+        if do_apply:
+            click.echo(
+                f"{_err('Error:')} the config file as written fails validation "
+                f"({raw_error}) — fix it (see `mms config validate`) before applying "
+                "tuning overrides.",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(
+            f"{_warn('Warning:')} the config file as written fails validation "
+            f"({raw_error}) — --apply will refuse until it is fixed "
+            "(see `mms config validate`).",
+            err=True,
+        )
+
     metrics_path = typed_cfg.metrics.db_path.expanduser()
     if not metrics_path.exists():
         click.echo(f"No proxy metrics recorded yet at {metrics_path} — nothing to tune.")
