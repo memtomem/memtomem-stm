@@ -3,8 +3,9 @@
 ``EmbeddingScorer`` makes a synchronous httpx call inside ``score_sections``;
 every consumer runs on the asyncio event loop. ``ProxyManager`` routes each
 scorer-carrying sync ``compress()`` through ``_compress_maybe_offthread``,
-which hops to a worker thread only when the configured scorer declares
-``uses_blocking_io = True`` — the default BM25 path stays inline.
+which hops to a worker thread only when the scorer the compressor actually
+captured declares ``uses_blocking_io = True`` — the default BM25 path stays
+inline.
 
     uv run pytest tests/test_embedding_offload.py -v
 """
@@ -16,11 +17,11 @@ import inspect
 import re
 import sqlite3
 import threading
-import time
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
+from memtomem_stm.proxy.config import CompressionStrategy
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer, create_scorer
 
@@ -30,14 +31,11 @@ from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer, create_sco
 class _RecordingCompressor:
     """Records the thread each compress() call ran on."""
 
-    def __init__(self, sleep_seconds: float = 0.0) -> None:
-        self.sleep_seconds = sleep_seconds
+    def __init__(self) -> None:
         self.thread_ids: list[int] = []
 
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
         self.thread_ids.append(threading.get_ident())
-        if self.sleep_seconds:
-            time.sleep(self.sleep_seconds)
         return text[:max_chars]
 
 
@@ -57,14 +55,11 @@ class _BareScorer:
         return [0.0] * len(sections)
 
 
-def _manager_with(scorer: object) -> SimpleNamespace:
-    """A stub self for the helper: it only reads ``self._relevance_scorer``."""
-    return SimpleNamespace(_relevance_scorer=scorer)
-
-
 async def _run_helper(scorer: object, compressor: object, text: str = "x" * 200) -> str:
+    # The helper gates on the explicitly passed scorer (the instance the
+    # compressor captured), never on manager state — a bare stub self suffices.
     return await ProxyManager._compress_maybe_offthread(
-        _manager_with(scorer), compressor, text, max_chars=100, context_query="q"
+        SimpleNamespace(), compressor, text, max_chars=100, context_query="q", scorer=scorer
     )
 
 
@@ -119,32 +114,37 @@ class TestCompressMaybeOffthread:
         assert inline == offthread == text[:100]
 
     async def test_event_loop_stays_responsive_during_blocking_compress(self):
-        """The issue's acceptance test: a slow compress must not stall the loop.
+        """The issue's acceptance test: a blocked compress must not stall the loop.
 
-        Dual assertion per repo convention (absolute + relative): the call
-        itself takes at least the blocked duration, while concurrent heartbeat
-        gaps stay far below it — both in absolute ms and relative to the block.
+        Deterministic (no wall-clock bounds, so no flakiness on loaded CI):
+        the fake compress blocks on a gate event in the worker thread, and the
+        loop provably keeps running — it completes several sleeps and only
+        then releases the gate — while the compress is guaranteed in flight.
+        On the pre-#618 inline path not a single tick could run until
+        compress returned, so the in-flight assertions fail.
         """
-        block_seconds = 0.3
-        ticks: list[float] = []
+        started = threading.Event()
+        release = threading.Event()
 
-        async def heartbeat() -> None:
-            while True:
-                ticks.append(time.monotonic())
-                await asyncio.sleep(0.01)
+        class _GatedCompressor:
+            def compress(self, text: str, *, max_chars: int, context_query: str | None) -> str:
+                started.set()
+                assert release.wait(timeout=10), "test gate never released"
+                return text[:max_chars]
 
-        hb = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0)  # let the heartbeat start ticking
-        t0 = time.monotonic()
-        await _run_helper(_BlockingScorer(), _RecordingCompressor(sleep_seconds=block_seconds))
-        elapsed = time.monotonic() - t0
-        hb.cancel()
-
-        assert elapsed >= block_seconds, "compress must still pay its own wall time"
-        assert len(ticks) >= 3, "heartbeat never ran while compress was in flight"
-        gaps = [b - a for a, b in zip(ticks, ticks[1:])]
-        assert max(gaps) < 0.15, f"loop stalled {max(gaps):.3f}s during off-thread compress"
-        assert max(gaps) < 0.5 * block_seconds, "loop stall not far below the blocked duration"
+        task = asyncio.create_task(_run_helper(_BlockingScorer(), _GatedCompressor()))
+        try:
+            while not started.is_set():  # the loop is alive while compress starts
+                await asyncio.sleep(0.001)
+            ticks = 0
+            for _ in range(5):  # the loop is alive while compress is blocked
+                await asyncio.sleep(0.001)
+                ticks += 1
+            assert ticks == 5
+            assert not task.done(), "compress finished before the gate was released?"
+        finally:
+            release.set()
+        assert await task == "x" * 100
 
     async def test_exception_type_preserved_through_to_thread(self):
         """_compress_and_surface's ``except sqlite3.Error`` guard must keep
@@ -158,6 +158,65 @@ class TestCompressMaybeOffthread:
             await _run_helper(_BlockingScorer(), _FaultingCompressor())
 
 
+# ── SELECTIVE holds _selective_lock across the off-thread compress ────
+
+
+class TestSelectiveLockHeldDuringOffthreadCompress:
+    async def test_lock_held_until_compress_completes(self):
+        """A config-change rebuild ``close()``s the superseded selective
+        compressor's pending store, and ``SQLitePendingStore.close`` is not
+        synchronized with ``put`` — so the SELECTIVE branch must hold
+        ``_selective_lock`` for the whole off-thread compress, not just the
+        compressor lookup (codex review of #628)."""
+        started = threading.Event()
+        release = threading.Event()
+
+        class _GatedSelective:
+            _scorer = _BlockingScorer()
+
+            def compress(self, text: str, *, max_chars: int, context_query: str | None) -> str:
+                started.set()
+                assert release.wait(timeout=10), "test gate never released"
+                return text[:max_chars]
+
+        stub = SimpleNamespace(
+            _selective_lock=asyncio.Lock(),
+            _config=SimpleNamespace(lock_timeout_seconds=5.0),
+            _selective_compressor=_GatedSelective(),
+            _selective_compressor_cfg=None,
+        )
+        stub._compress_maybe_offthread = MethodType(ProxyManager._compress_maybe_offthread, stub)
+
+        task = asyncio.create_task(
+            ProxyManager._apply_compression(
+                stub,
+                "z" * 300,
+                CompressionStrategy.SELECTIVE,
+                100,
+                None,
+                None,
+                None,
+                "srv",
+                "tool",
+                context_query="q",
+            )
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            assert stub._selective_lock.locked(), (
+                "_selective_lock must stay held while the off-thread selective "
+                "compress is in flight — releasing it early lets a concurrent "
+                "rebuild close the pending store under the worker thread"
+            )
+        finally:
+            release.set()
+        compressed, llm_fallback = await task
+        assert compressed == "z" * 100
+        assert llm_fallback is None
+        assert not stub._selective_lock.locked()
+
+
 # ── every scorer-carrying compress site routes through the helper ─────
 
 
@@ -166,7 +225,7 @@ class TestAllScorerSitesRouteThroughHelper:
     a future scorer-carrying compress() added without the gate would silently
     reintroduce the event-loop stall."""
 
-    _RAW_SITE_RE = re.compile(r"scorer=self\._relevance_scorer\)\s*\.compress\(")
+    _RAW_SITE_RE = re.compile(r"scorer=(?:self\._relevance_scorer|_?\w*scorer)\)\s*\.compress\(")
 
     def _source(self, method_name: str) -> str:
         return inspect.getsource(getattr(ProxyManager, method_name))
@@ -191,6 +250,16 @@ class TestAllScorerSitesRouteThroughHelper:
             f"_compress_maybe_offthread call(s), found {actual} — if a site was "
             "added or removed deliberately, update this pin"
         )
+
+    def test_selective_and_hybrid_gate_on_captured_scorer(self):
+        """The gate must read the scorer the (possibly cached) compressor
+        actually holds, not a fresh ``self._relevance_scorer``: after a
+        scorer-only hot-reload the cached selective compressor keeps its old
+        scorer until the next rebuild, and gating on the property would run an
+        embedding-backed compress inline again (codex review of #628)."""
+        pin = 'scorer=getattr(sel_compressor, "_scorer", None)'
+        assert pin in self._source("_apply_compression")
+        assert pin in self._source("_apply_hybrid")
 
 
 # ── fallback_count under concurrent worker threads ────────────────────
