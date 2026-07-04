@@ -6,7 +6,11 @@ import logging
 from pathlib import Path
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.feedback_store import FeedbackStore, inspect_feedback_db
+from memtomem_stm.surfacing.feedback_store import (
+    FeedbackDbStatus,
+    FeedbackStore,
+    inspect_feedback_db,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +49,7 @@ class FeedbackTracker:
     def store(self) -> FeedbackStore:
         return self._store
 
-    def bootstrap_status(self) -> dict[str, object]:
+    def bootstrap_status(self) -> FeedbackDbStatus:
         return inspect_feedback_db(self._store.db_path)
 
     def close(self) -> None:

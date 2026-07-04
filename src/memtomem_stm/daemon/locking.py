@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -102,7 +103,7 @@ def single_owner_lock(path: Path) -> Iterator[bool]:
 
 
 def _try_lock(fd: int) -> bool:
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
+    if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
         import msvcrt
 
         try:
@@ -121,7 +122,7 @@ def _try_lock(fd: int) -> bool:
 
 def _unlock(fd: int) -> None:
     try:
-        if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
+        if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
             import msvcrt
 
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)

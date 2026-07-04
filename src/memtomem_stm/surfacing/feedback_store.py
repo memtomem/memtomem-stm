@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import TypedDict
 
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
@@ -124,10 +125,20 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
     logger.info("Migrated surfacing_events: relaxed NOT NULL on query column (#352 part 2)")
 
 
-def inspect_feedback_db(db_path: Path) -> dict[str, object]:
+class FeedbackDbStatus(TypedDict):
+    """Read-only schema snapshot returned by :func:`inspect_feedback_db`."""
+
+    path: str
+    exists: bool
+    initialized: bool
+    missing_tables: list[str]
+    error: str | None
+
+
+def inspect_feedback_db(db_path: Path) -> FeedbackDbStatus:
     """Inspect surfacing feedback DB schema without creating or migrating it."""
     resolved = db_path.expanduser().resolve()
-    status: dict[str, object] = {
+    status: FeedbackDbStatus = {
         "path": str(resolved),
         "exists": resolved.exists(),
         "initialized": False,
@@ -363,7 +374,7 @@ class FeedbackStore:
             return {}
 
         target_ids = list(dict.fromkeys(str(mid) for mid in memory_ids))
-        event_ids_by_memory = {mid: set() for mid in target_ids}
+        event_ids_by_memory: dict[str, set[str]] = {mid: set() for mid in target_ids}
         target_set = set(target_ids)
 
         placeholders = ", ".join("?" for _ in target_ids)

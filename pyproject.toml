@@ -92,4 +92,4 @@ markers = [
 python_version = "3.12"
 warn_unused_configs = true
 ignore_missing_imports = true
-disable_error_code = ["has-type", "attr-defined"]
+disable_error_code = ["has-type"]
