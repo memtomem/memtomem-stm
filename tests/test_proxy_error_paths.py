@@ -1595,6 +1595,61 @@ class TestUpstreamCircuitBreaker:
         assert breaker.failure_count == 0
         assert breaker.state == "closed"
 
+    async def test_protocol_round_trip_resets_failure_streak(self):
+        """A JSON-RPC protocol reply is a completed round-trip: it proves the
+        upstream is alive and must reset an accumulated transport-failure
+        streak, so failures separated by a protocol reply are not treated as
+        consecutive (regression for codex review of #608)."""
+        mgr = _make_manager(max_retries=0, circuit_max_failures=3)
+        session = _get_session(mgr)
+        breaker = mgr._connections["srv"].breaker
+
+        protocol_exc = Exception("bad params")
+        protocol_exc.error = SimpleNamespace(code=-32602)
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            # Two transport failures build the streak...
+            session.call_tool.side_effect = ConnectionError("down")
+            for _ in range(2):
+                with pytest.raises(ConnectionError):
+                    await mgr.call_tool("srv", "tool", {})
+            assert breaker.failure_count == 2
+
+            # ...a protocol round-trip resets it (upstream proven alive)...
+            session.call_tool.side_effect = protocol_exc
+            with pytest.raises(Exception, match="bad params"):
+                await mgr.call_tool("srv", "tool", {})
+            assert breaker.failure_count == 0
+            assert breaker.state == "closed"
+
+            # ...so a subsequent transport failure starts a fresh streak and
+            # does NOT open the breaker at the old count.
+            session.call_tool.side_effect = ConnectionError("down")
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+            assert breaker.failure_count == 1
+            assert breaker.state == "closed"
+
+    async def test_mid_loop_reconnect_failure_records_breaker_failure(self):
+        """The third terminal exit: a retryable transport error whose
+        follow-up ``_reconnect_server`` itself fails re-raises the reconnect
+        error and must still count one breaker failure (#608), or a dead
+        stdio upstream whose respawns fail escapes breaker counting."""
+        mgr = _make_manager(max_retries=3, circuit_max_failures=2, tools=_read_only_tools())
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+        breaker = mgr._connections["srv"].breaker
+
+        with patch.object(
+            mgr, "_reconnect_server", new_callable=AsyncMock, side_effect=OSError("respawn failed")
+        ):
+            with pytest.raises(OSError, match="respawn failed"):
+                await mgr.call_tool("srv", "tool", {})
+
+        # One breaker count for this call despite the mid-loop reconnect abort
+        assert breaker.failure_count == 1
+        assert breaker.state == "closed"
+
     async def test_half_open_probe_success_closes(self):
         mgr = _make_manager(max_retries=0, circuit_max_failures=1)
         session = _get_session(mgr)

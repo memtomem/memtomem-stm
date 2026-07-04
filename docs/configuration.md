@@ -350,8 +350,9 @@ Full example with all options:
 `circuit_max_failures` / `circuit_reset_seconds` configure the per-upstream
 circuit breaker (#608). The breaker counts **one failure per call** that
 exhausts its retry/deadline budget on a transport fault or timeout — not one
-per attempt, and not tool-level `isError` results (an erroring tool proves
-the upstream is alive, so it *closes* the breaker). After
+per attempt. Any completed round-trip *closes* the breaker instead — a
+tool-level `isError` result and a JSON-RPC protocol error both prove the
+upstream replied, so both reset the failure streak. After
 `circuit_max_failures` consecutive failed calls the breaker opens: further
 calls to that upstream fast-fail with a `circuit_open` error instead of
 paying the full retry/deadline cost, while cached responses keep serving and

@@ -2862,6 +2862,14 @@ class ProxyManager:
                     logger.debug(
                         "Protocol error %s for %s/%s, skipping retry", err_code, server, tool
                     )
+                    # A JSON-RPC error response is a completed round-trip: the
+                    # upstream received the request and replied, so the
+                    # transport is healthy. Like an ``isError`` result, it
+                    # closes the breaker — otherwise transport/timeout failures
+                    # separated by a proven-alive protocol reply would still
+                    # accumulate as "consecutive" and spuriously open it.
+                    if breaker is not None:
+                        breaker.record_success()
                     self.tracker.record_error(
                         CallMetrics(
                             server=server,
