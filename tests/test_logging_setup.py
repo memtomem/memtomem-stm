@@ -113,6 +113,40 @@ class TestFilePermissions:
         finally:
             handler.close()
 
+    @_skip_on_windows
+    def test_open_rejects_dangling_terminal_symlink(self, tmp_path):
+        # The real open must agree with log_file_writable(): os.open(O_CREAT)
+        # would otherwise follow the symlink and create the target, so a probe
+        # that said "not writable" would be contradicted by the server.
+        link = tmp_path / "broken.log"
+        link.symlink_to(tmp_path / "missing_target")
+        with pytest.raises(OSError):
+            open_private_log_handler(link)
+        assert not (tmp_path / "missing_target").exists()  # nothing created
+
+    @_skip_on_windows
+    def test_open_rejects_symlink_to_directory(self, tmp_path):
+        target = tmp_path / "realdir"
+        target.mkdir()
+        link = tmp_path / "link.log"
+        link.symlink_to(target)
+        with pytest.raises(OSError):
+            open_private_log_handler(link)
+
+    @_skip_on_windows
+    def test_open_accepts_symlink_to_regular_file(self, tmp_path):
+        target = tmp_path / "real.log"
+        target.touch()
+        target.chmod(0o600)
+        link = tmp_path / "link.log"
+        link.symlink_to(target)
+        handler = open_private_log_handler(link)
+        try:
+            handler.emit(logging.makeLogRecord({"msg": "through the link"}))
+        finally:
+            handler.close()
+        assert "through the link" in target.read_text()
+
 
 class TestConfigureServerLogging:
     def test_no_log_file_is_stderr_only(self, _restore_root_logging):

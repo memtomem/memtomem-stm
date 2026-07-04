@@ -17,6 +17,7 @@ redacted records.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sys
@@ -39,6 +40,30 @@ LOG_FILE_BACKUP_COUNT = 3
 while keeping enough history to cover a crash discovered a few days late."""
 
 
+def _unsafe_log_target_reason(target: Path) -> str | None:
+    """Why *target* can't be a hardened log file, or ``None`` if it's fine.
+
+    A single source of truth for the terminal-path rule, shared by the write
+    probe (``log_file_writable``) and the real open (``_open``) so the two
+    can't diverge: a 0o600 append log must resolve to a regular file, so a
+    dangling symlink (``os.open(O_CREAT)`` would silently create the target,
+    redirecting the log) and an existing non-regular target (directory /
+    special file / symlink to one) are refused. A symlink to an existing
+    regular file is allowed.
+    """
+    if target.is_symlink() and not target.exists():
+        return f"log path is a dangling symlink: {target}"
+    if target.exists() and not target.is_file():
+        return f"log path is not a regular file: {target}"
+    return None
+
+
+def _reject_unsafe_log_target(target: Path) -> None:
+    reason = _unsafe_log_target_reason(target)
+    if reason is not None:
+        raise OSError(errno.ELOOP, reason)
+
+
 class PrivateRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler whose files are created ``0o600``.
 
@@ -52,6 +77,7 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
     """
 
     def _open(self):  # type: ignore[override]
+        _reject_unsafe_log_target(Path(self.baseFilename))
         fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.fchmod(fd, 0o600)
@@ -134,14 +160,13 @@ def log_file_writable(path: Path) -> bool:
     probe it races the real open, but for a diagnostic that is acceptable.
     """
     resolved = path.expanduser()
-    # Broken symlink: exists() follows it and returns False, but the server's
-    # O_CREAT open would chase the missing target — not usable.
-    if resolved.is_symlink() and not resolved.exists():
+    # Terminal-path rule, shared with the real open so they can't disagree:
+    # dangling symlink or existing non-regular target → not usable.
+    if _unsafe_log_target_reason(resolved) is not None:
         return False
     if resolved.exists():
-        # Must be a regular file (is_file follows symlinks) openable for
-        # append — a directory / special file cannot be O_WRONLY'd.
-        return resolved.is_file() and os.access(resolved, os.W_OK)
+        # A regular file (possibly via symlink) must be writable for append.
+        return os.access(resolved, os.W_OK)
     # Missing file: mkdir(parents=True) needs the nearest existing ancestor to
     # be a writable, traversable *directory* (it fails on a non-directory).
     ancestor = resolved.parent
