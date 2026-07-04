@@ -953,6 +953,15 @@ def stats(
     )
     surfacing = read_surfacing_summary(feedback_path, tool=tool_filter)
 
+    # These numbers come only from the on-disk stores; the live MCP server
+    # keeps additional in-memory-only counters (cache hits, latency, reconnects,
+    # …) that a separate CLI process cannot see. Name the source and point at
+    # the live tool so a user comparing the two doesn't read the gap as a bug.
+    data_source = (
+        "on-disk stores only (proxy_metrics.db + stm_feedback.db); "
+        "live in-memory counters via the stm_proxy_stats MCP tool"
+    )
+
     if as_json:
         click.echo(
             json.dumps(
@@ -963,6 +972,7 @@ def stats(
                     "servers": len(proxy_cfg.upstream_servers),
                     "tool_filter": tool_filter,
                     "source_filter": source_filter,
+                    "data_source": data_source,
                     "compression": compression,
                     "surfacing": surfacing,
                 },
@@ -979,6 +989,7 @@ def stats(
         click.echo(f"Filter : tool={tool_filter}")
     if source_filter:
         click.echo(f"Source : {source_filter}")
+    click.echo(f"Data   : {data_source}")
     click.echo("")
     _render_compression_block(compression)
     click.echo("")
@@ -4064,11 +4075,14 @@ def health(
             click.echo("Run `mms add` (or `mms init`) to create a configuration.")
         return
 
+    from memtomem_stm.server import _hidden_obs_tools_hint
+
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
     config_error = _schema_validation_error(data)
     logging_status = _logging_destination_status()
+    obs_tools_hint = _hidden_obs_tools_hint()
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
     # ensure_ascii=False) so scripts piping the three commands through the
@@ -4083,6 +4097,8 @@ def health(
                         "config_error": config_error,
                         "surfacing": surfacing_status,
                         "logging": logging_status,
+                        "obs_tools_hidden": obs_tools_hint is not None,
+                        "obs_tools_hint": obs_tools_hint,
                     },
                     indent=2,
                     ensure_ascii=False,
@@ -4096,6 +4112,8 @@ def health(
             for line in _format_surfacing_bootstrap(surfacing_status):
                 click.echo(line)
             click.echo(_format_logging_destination(logging_status))
+            if obs_tools_hint:
+                click.echo(obs_tools_hint)
         return
 
     results = asyncio.run(_probe_servers(servers, timeout))
@@ -4109,6 +4127,8 @@ def health(
                     "config_error": config_error,
                     "surfacing": surfacing_status,
                     "logging": logging_status,
+                    "obs_tools_hidden": obs_tools_hint is not None,
+                    "obs_tools_hint": obs_tools_hint,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -4141,6 +4161,8 @@ def health(
     for line in _format_surfacing_bootstrap(surfacing_status):
         click.echo(line)
     click.echo(_format_logging_destination(logging_status))
+    if obs_tools_hint:
+        click.echo(obs_tools_hint)
 
 
 # `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py

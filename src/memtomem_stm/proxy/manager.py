@@ -1406,6 +1406,18 @@ class ProxyManager:
         """
         return self._selection_log
 
+    @property
+    def index_engine(self) -> "FileIndexer | None":
+        """The LTM write engine, or ``None`` when INDEX is unwired (#288).
+
+        Public read accessor for ``stm_index_stats`` — parity with
+        ``selection_log``; ``None`` is the structural-inactive signal the stats
+        tool renders distinctly from "wired but empty". The bundled ``mms``
+        server constructs ``ProxyManager`` without an engine, so Stage 4 is
+        skipped and this reads ``None`` there.
+        """
+        return self._index_engine
+
     # Delegates to proxy.tool_metadata module (backward-compatible)
     _truncate_description = staticmethod(truncate_description)
     _distill_schema = staticmethod(distill_schema)

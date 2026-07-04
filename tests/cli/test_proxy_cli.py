@@ -5944,6 +5944,32 @@ class TestHealth:
         assert "fails validation" in result.output
         assert "No upstream servers configured" in result.output
 
+    def test_health_obs_tools_hint_when_hidden(self, runner, config, monkeypatch):
+        """#613: flag off → ``mms health`` surfaces the hint so a user learns
+        the env flag that exposes the hidden observability tools."""
+        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "observability tools hidden" in result.output
+        assert "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true" in result.output
+
+    def test_health_obs_tools_hint_absent_when_advertised(self, runner, config, monkeypatch):
+        monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "true")
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "observability tools hidden" not in result.output
+
+    def test_health_json_obs_tools_hidden_key(self, runner, config, monkeypatch):
+        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["obs_tools_hidden"] is True
+        assert "observability tools hidden" in data["obs_tools_hint"]
+
     def test_health_logging_line_stderr_only(self, runner, config, monkeypatch):
         """#612: health always prints where logs go, so users learn the
         file-log option exists even while running stderr-only."""
