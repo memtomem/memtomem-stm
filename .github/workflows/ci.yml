@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege baseline (#609). Jobs that need more declare their own
+# block (job-level permissions fully replace this one — see
+# bench_qa_pr_comment's pull-requests:write).
+permissions:
+  contents: read
+
 jobs:
   # Windows runs on lint/typecheck/test are gating required checks alongside
   # ubuntu-latest. The matrix was introduced in #304 (P1a) with a
@@ -21,8 +27,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -36,8 +42,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -52,8 +58,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -62,8 +68,8 @@ jobs:
   notebooks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -72,6 +78,26 @@ jobs:
           uv run pytest --nbmake \
             notebooks/01_quickstart_proxy_setup.ipynb \
             --nbmake-timeout=180 --tb=short -q
+
+  audit:
+    # ADVISORY dependency vulnerability audit (#609). Exports the locked
+    # dependency set (uv.lock, all groups) and runs pip-audit against it.
+    # Step-level continue-on-error mirrors the mypy convention above: the
+    # findings land in the job log without a red check on every PR while
+    # the baseline is being cleaned (50 known vulns in transitive dev deps
+    # at introduction time). Promote to required (drop the flag + branch
+    # protection) once Dependabot has cleaned the baseline.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+      - name: Export locked requirements
+        run: uv export --frozen --no-emit-project -o requirements-audit.txt
+      - name: pip-audit (advisory)
+        run: uvx pip-audit -r requirements-audit.txt --disable-pip
+        continue-on-error: true
 
   bench_qa:
     # Required gate. Per-scenario floors (qa_gate_min, ratio_violation) are
@@ -85,8 +111,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -96,7 +122,7 @@ jobs:
         run: uv run pytest -m "bench_qa and not bench_qa_sweep" --tb=short -q
       - name: Upload bench_qa report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-qa-report
           path: bench-qa-report/
@@ -123,7 +149,7 @@ jobs:
     steps:
       - name: Download bench_qa report
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: bench-qa-report
           path: bench-qa-report
@@ -164,8 +190,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -175,7 +201,7 @@ jobs:
         run: uv run pytest -m "bench_qa_drift" --tb=short -q
       - name: Upload drift report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-qa-drift-report
           path: bench-qa-drift-report/
@@ -203,8 +229,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
       - run: uv sync --frozen
@@ -214,7 +240,7 @@ jobs:
         run: uv run pytest -m "bench_qa_perf" --tb=short -q
       - name: Upload perf report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-qa-perf-report
           path: bench-qa-perf-report/
