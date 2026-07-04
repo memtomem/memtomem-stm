@@ -11,13 +11,23 @@ import logging
 import math
 import os
 import re
+import threading
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
 
 class RelevanceScorer(Protocol):
-    """Scores sections by relevance to a query. Higher = more relevant."""
+    """Scores sections by relevance to a query. Higher = more relevant.
+
+    Implementations that perform blocking I/O inside ``score_sections``
+    (network calls, disk reads) should additionally set a class attribute
+    ``uses_blocking_io = True``. It is deliberately *not* part of the
+    Protocol body — callers read it via ``getattr(scorer, "uses_blocking_io",
+    False)`` so existing structural implementations stay conformant — and
+    async call sites use it to decide whether to off-load the surrounding
+    sync compression to a worker thread (#618).
+    """
 
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]: ...
 
@@ -46,6 +56,9 @@ class BM25Scorer:
     )
     _SUFFIX_RE = re.compile(r"(ing|ed|ly|tion|ness|ment|ies|es|s)$")
     _HEADING_WEIGHT = 3.0
+
+    # Pure CPU — safe to run inline on the event loop (see RelevanceScorer).
+    uses_blocking_io = False
 
     def __init__(self, *, k1: float = 1.5, b: float = 0.75) -> None:
         self._k1 = k1
@@ -127,6 +140,11 @@ class EmbeddingScorer:
     Falls back to BM25Scorer on any error (network, timeout, model not loaded).
     """
 
+    # Sync HTTP call inside score_sections — async call sites off-load the
+    # surrounding compression to a worker thread so the request can't stall
+    # the event loop for up to the full timeout (#618).
+    uses_blocking_io = True
+
     def __init__(
         self,
         provider: str = "ollama",
@@ -149,6 +167,11 @@ class EmbeddingScorer:
         self._api_key = api_key
         self._fallback = BM25Scorer()
         self.fallback_count: int = 0
+        # With uses_blocking_io=True the scorer runs on worker threads while
+        # manager metrics read fallback_count from the loop thread; the lock
+        # keeps concurrent increments from losing a count (the metrics
+        # boolean-delta would silently flip to False).
+        self._fallback_lock = threading.Lock()
 
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
         if not query or not sections:
@@ -161,7 +184,8 @@ class EmbeddingScorer:
             # we already have a working BM25 scorer and fallback_count surfaces
             # the rate. Full stack on every hit buries real errors in log-
             # aggregation pipelines, so log the exception message only.
-            self.fallback_count += 1
+            with self._fallback_lock:
+                self.fallback_count += 1
             logger.warning("EmbeddingScorer failed, falling back to BM25: %s", exc)
             return self._fallback.score_sections(query, sections)
 

@@ -1686,6 +1686,43 @@ class ProxyManager:
             return text
         return DefaultContentCleaner(cleaning_cfg).clean(text)
 
+    async def _compress_maybe_offthread(
+        self,
+        compressor: Any,
+        text: str,
+        *,
+        max_chars: int,
+        context_query: str | None,
+    ) -> str:
+        """Run a sync, scorer-carrying ``compress()`` without stalling the loop.
+
+        Every scorer-injected compressor call in the async pipeline routes
+        through here (#618): when the configured relevance scorer does
+        blocking I/O (``EmbeddingScorer``'s sync httpx call — see
+        ``RelevanceScorer.uses_blocking_io``), the whole sync ``compress()``
+        runs in a worker thread via ``asyncio.to_thread`` so an unresponsive
+        embedding endpoint can't freeze every other proxied call for up to
+        the embedding timeout. With the default BM25 scorer the gate is
+        false and the call is made inline — no thread hop, byte-identical
+        behavior. ``getattr`` defaults unknown scorers to False (inline),
+        preserving the status quo for custom scorers that don't opt in.
+
+        The ``_relevance_scorer`` property may hot-reload-swap between this
+        gate read and the compressor's already-captured scorer; worst case
+        one call blocks inline (the pre-#618 behavior) or takes a needless
+        hop — bounded to the transition call, so not worth a lock.
+
+        Exceptions propagate with their original type (``asyncio.to_thread``
+        re-raises), so callers' ``except`` clauses — notably the
+        ``sqlite3.Error`` pending-store guard in ``_compress_and_surface`` —
+        behave identically on both paths.
+        """
+        if getattr(self._relevance_scorer, "uses_blocking_io", False):
+            return await asyncio.to_thread(
+                compressor.compress, text, max_chars=max_chars, context_query=context_query
+            )
+        return compressor.compress(text, max_chars=max_chars, context_query=context_query)
+
     async def _apply_compression(
         self,
         text: str,
@@ -1734,7 +1771,9 @@ class ProxyManager:
                 else:
                     sel_compressor = self._selective_compressor
             return (
-                sel_compressor.compress(text, max_chars=max_chars, context_query=context_query),
+                await self._compress_maybe_offthread(
+                    sel_compressor, text, max_chars=max_chars, context_query=context_query
+                ),
                 None,
             )
 
@@ -1775,16 +1814,22 @@ class ProxyManager:
                 tool,
             )
             return (
-                TruncateCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    TruncateCompressor(scorer=self._relevance_scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
                 ),
                 "no_config",
             )
 
         if compression == CompressionStrategy.TRUNCATE:
             return (
-                TruncateCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    TruncateCompressor(scorer=self._relevance_scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
                 ),
                 None,
             )
@@ -1796,16 +1841,22 @@ class ProxyManager:
         # EXTRACT_FIELDS) take neither a scorer nor a context_query.
         if compression == CompressionStrategy.SCHEMA_PRUNING:
             return (
-                SchemaPruningCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    SchemaPruningCompressor(scorer=self._relevance_scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
                 ),
                 None,
             )
 
         if compression == CompressionStrategy.SKELETON:
             return (
-                SkeletonCompressor(scorer=self._relevance_scorer).compress(
-                    text, max_chars=max_chars, context_query=context_query
+                await self._compress_maybe_offthread(
+                    SkeletonCompressor(scorer=self._relevance_scorer),
+                    text,
+                    max_chars=max_chars,
+                    context_query=context_query,
                 ),
                 None,
             )
@@ -1959,7 +2010,9 @@ class ProxyManager:
             head_ratio=cfg.head_ratio,
             selective_compressor=self._selective_compressor,
         )
-        return compressor.compress(text, max_chars=max_chars, context_query=context_query)
+        return await self._compress_maybe_offthread(
+            compressor, text, max_chars=max_chars, context_query=context_query
+        )
 
     async def _auto_index_response(
         self,
@@ -3258,8 +3311,11 @@ class ProxyManager:
                         tool,
                         exc_info=True,
                     )
-                    compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
-                        cleaned, max_chars=effective_max_chars, context_query=context_query
+                    compressed = await self._compress_maybe_offthread(
+                        TruncateCompressor(scorer=self._relevance_scorer),
+                        cleaned,
+                        max_chars=effective_max_chars,
+                        context_query=context_query,
                     )
                     llm_fallback = None
                     selective_store_error = True
@@ -3381,7 +3437,8 @@ class ProxyManager:
                         # direct path when content is too small for progressive
                         # and lacks structure for hybrid.
                         if not progressive_fallback and not hybrid_fallback:
-                            compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
+                            compressed = await self._compress_maybe_offthread(
+                                TruncateCompressor(scorer=self._relevance_scorer),
                                 cleaned,
                                 max_chars=effective_max_chars,
                                 context_query=context_query,
