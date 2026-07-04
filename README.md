@@ -91,7 +91,7 @@ If you've already configured MCP servers in Claude Desktop, Claude Code, or a pr
 
 ```bash
 mms list      # show what you've added
-mms status    # show full config
+mms status    # config summary (enabled flag, server count)
 mms health    # check connectivity + surfacing readiness
 ```
 

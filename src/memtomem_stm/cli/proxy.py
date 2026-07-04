@@ -747,7 +747,7 @@ def _origin_cell(cfg: Any) -> str:
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def status(config_path: str, *, as_json: bool = False) -> None:
-    """Show proxy gateway configuration and server list."""
+    """Show proxy gateway config summary (path, enabled flag, server count)."""
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -763,8 +763,21 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     enabled = data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     config_error = _schema_validation_error(data)
+    # Same predicate as the `mms list` pruned marker (via _origin_cell), so
+    # this count and list's `*` rows can never disagree on what "pruned" means.
+    pruned_count = sum(
+        1
+        for cfg in servers.values()
+        if isinstance(cfg, dict) and _origin_fully_pruned(cfg.get("origin"))
+    )
 
     if as_json:
+        # The full (redacted) `servers` map stays in --json even though the
+        # human output below no longer prints per-server rows (#614) —
+        # scripts consume this shape (see the redaction tests / #476), and
+        # dropping it would break them for zero information gain. The two
+        # count keys are additive so callers can match the human summary
+        # without re-deriving the pruned predicate.
         click.echo(
             json.dumps(
                 {
@@ -772,6 +785,8 @@ def status(config_path: str, *, as_json: bool = False) -> None:
                     "enabled": enabled,
                     "config_valid": config_error is None,
                     "config_error": config_error,
+                    "server_count": len(servers),
+                    "pruned_count": pruned_count,
                     "servers": _redacted_servers_json(servers),
                 },
                 indent=2,
@@ -780,31 +795,21 @@ def status(config_path: str, *, as_json: bool = False) -> None:
         )
         return
 
+    # Human output is a config summary — per-server detail lives in
+    # `mms list` (#614: the two commands used to print near-identical
+    # output; status now answers "is the proxy set up and pointed at the
+    # right config", list answers "what servers are behind it").
     if config_error:
         click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
-    click.echo(f"Servers: {len(servers)}")
-
+    pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
+    click.echo(f"Servers: {len(servers)}{pruned_suffix}")
+    click.echo("")
     if servers:
-        click.echo("")
-        for name, cfg in servers.items():
-            transport = cfg.get("transport", "stdio")
-            prefix = cfg.get("prefix", "")
-            if transport == "stdio":
-                cmd = cfg.get("command", "")
-                args_str = " ".join(cfg.get("args", []))
-                detail = f"{cmd} {args_str}".strip()
-            else:
-                detail = cfg.get("url", "")
-            compression = cfg.get("compression", "auto")
-            max_chars = cfg.get("max_result_chars", 8000)
-            surfacing_on = cfg.get("surfacing_enabled", True)
-            click.echo(f"  {name:<20} prefix={prefix}  [{transport}] {detail}")
-            click.echo(
-                f"  {'':<20} compression={compression}  max_chars={max_chars}  "
-                f"surfacing={'on' if surfacing_on else 'off'}"
-            )
+        click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
+    else:
+        click.echo("Run `mms add` (or `mms init`) to register an upstream.")
 
 
 @cli.command(name="list")
@@ -850,9 +855,15 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     # accepts (``stdio`` / ``sse`` / ``streamable_http``) with at least
     # one space of padding. ORIGIN ``<16`` likewise fits the widest
     # source kind plus the pruned marker (``claude-desktop*``, 15).
+    # SURFACING ``<10`` fits its 9-char header; the per-server surfacing
+    # toggle's visible home is this table (#614 — `mms status` no longer
+    # prints per-server rows). ``max_result_chars`` deliberately has no
+    # column: the effective value is per-tool once `mms tune --apply`
+    # writes ``tool_overrides``, so a per-server number would mislead —
+    # read it via ``--json`` or the config file.
     header = (
         f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<16} {'COMPRESSION':<12} "
-        f"{'ORIGIN':<16} COMMAND / URL"
+        f"{'SURFACING':<10} {'ORIGIN':<16} COMMAND / URL"
     )
     click.echo(_hdr(header))
     click.echo("-" * len(header))
@@ -861,6 +872,7 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
         transport = cfg.get("transport", "stdio")
         prefix = cfg.get("prefix", "")
         compression = cfg.get("compression", "auto")
+        surfacing = "on" if cfg.get("surfacing_enabled", True) else "off"
         origin_cell = _origin_cell(cfg)
         any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
@@ -870,7 +882,8 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
         else:
             detail = cfg.get("url", "")
         click.echo(
-            f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} {origin_cell:<16} {detail}"
+            f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} "
+            f"{surfacing:<10} {origin_cell:<16} {detail}"
         )
     click.echo(f"\n{len(servers)} server(s) configured.")
     if any_pruned:
@@ -2878,7 +2891,8 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
 
     Writes ``surfacing_enabled`` into the upstream's entry in the proxy config
     (``stm_proxy.json``); a running proxy hot-reloads it without a restart, and
-    `mms status` shows the effective state. Because the flag lives in the shared
+    `mms list` shows the effective state (SURFACING column). Because the flag
+    lives in the shared
     config file rather than per-client env, every MCP client that proxies
     through this `mms` sees the same scope.
 

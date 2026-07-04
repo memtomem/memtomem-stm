@@ -129,7 +129,8 @@ For a **persistent, client-independent** toggle, set `surfacing_enabled` on the
 upstream itself in `stm_proxy.json` (`UpstreamServerConfig`, default `true`).
 Unlike the env glob — which each MCP client must carry in its own `env` block,
 and which can drift between clients — this lives in the shared proxy config that
-every client reads, hot-reloads without a restart, and shows up in `mms status`:
+every client reads, hot-reloads without a restart, and shows up in the
+`mms list` SURFACING column:
 
 ```bash
 mms surfacing context7 off    # disable surfacing for this upstream

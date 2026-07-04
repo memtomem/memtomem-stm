@@ -50,7 +50,7 @@ Commands:
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
   stats      Show proxy compression and surfacing stats from the...
-  status     Show proxy gateway configuration and server list.
+  status     Show proxy gateway config summary (path, enabled flag,...
   surfacing  Toggle proactive memory surfacing for an upstream server.
   tune       Preview and apply per-tool compression tuning recommendations.
   version    Show the installed memtomem-stm version.
@@ -202,7 +202,7 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, origin, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
 
 The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
@@ -259,11 +259,11 @@ mms add --import            # or --from-clients; skips anything already register
 mms add --import --prune    # TTY: per-entry confirm prompt (default No)
                             # non-TTY: unconditional — pass --prune to opt in
 
-# List configured upstreams
+# List configured upstreams (per-server detail: prefix, transport, surfacing, origin)
 mms list
 mms list --json            # machine-readable: {config_path, servers}
 
-# Show full status
+# Config summary (path, enabled flag, server count)
 mms status
 
 # Remove a server (STM config only)
@@ -375,7 +375,7 @@ Options:
   --config TEXT  [default: ~/.memtomem/stm_proxy.json]
 ```
 
-Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms status` shows it per server. A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
+Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms list` shows it per server (SURFACING column). A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
 
 ### `health`
 
@@ -413,7 +413,9 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Shows the current proxy gateway configuration file path, enabled flag, and the list of configured upstream servers with their prefix, transport, command or URL, compression strategy, character budget, and surfacing toggle. In `--json` output, every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human-readable table never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
+Shows a config summary: the configuration file path, enabled flag, schema-validation warning, and the server count (with a host-pruned count when any entry exists only behind STM). Per-server detail — prefix, transport, command/URL, compression, surfacing — lives in [`mms list`](#list); `status` answers "is the proxy set up and pointed at the right config", `list` answers "what servers are behind it". (#614 — the two commands used to print near-identical output.)
+
+`status --json` is unchanged by that split: it still carries the full redacted `servers` map (plus additive `server_count` / `pruned_count` keys), so scripted consumers keep working. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
 When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `health` print a warning naming the first error — exit code unchanged. Use `mms config validate` for the strict check.
 
