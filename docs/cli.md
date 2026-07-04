@@ -175,9 +175,12 @@ Options:
                                   confirm prompt (default No); non-TTY
                                   callers must pass the flag explicitly.
                                   Requires --from-clients / --import.
+  --json                          Output as JSON for scripting.
 ```
 
 Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
+
+With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `stdio_requires_command`, `url_required`, `malformed_args`, `invalid_env`, `validation_failed`). `--json` is a usage error with `--from-clients` — the import path is an interactive selection flow.
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`, and `~/Library/Application Support/Claude/claude_desktop_config.json`. Claude Desktop discovery is **macOS-only** — on Linux/Windows the Claude Desktop file isn't scanned, so register those servers with `mms add` instead (paste hints elsewhere in the wizard are OS-aware; only the Desktop scan path is pinned to macOS). This is the post-init equivalent of the `init` discovery step — servers already registered in this config are filtered out by name and by `(transport, command, args)` / `(transport, url)` signature before the selection UI. `--validate` and `--timeout` work on the selected subset.
 
@@ -209,9 +212,12 @@ Usage: mms remove [OPTIONS] NAME
 Options:
   --config TEXT  [default: ~/.memtomem/stm_proxy.json]
   -y, --yes      Skip confirmation.
+  --json         Output as JSON for scripting (requires --yes).
 ```
 
 Removes an upstream MCP server from the proxy configuration by name. Prompts for confirmation on a TTY unless `-y` or `--yes` is passed.
+
+With `--json`, stdout carries a single result document (`{"action": "remove", "ok": true, "config_path": ..., "name": ..., "removed": true, "warnings": [...]}`; the orphaning note below moves into `warnings`). `--json` never prompts: without `--yes` the command refuses with exit 2 and `{"error": "confirmation_required", ...}` — a formatting flag doesn't authorize a destructive write (same contract as [`mms host sync --json`](#mms-host--host-config-drift-inspection-and-sync)). Operational failures keep exit 1 with `{"error": "config_not_found" | "server_not_found", ...}`.
 
 `remove` only edits the STM config — it never touches host configs. If the entry was imported and every host original was pruned, removing it would leave the server registered **nowhere**, so the command prints a note (before the confirmation prompt) pointing at [`mms eject`](#eject), which restores the host entry instead. The hint is advisory; the removal itself is never blocked.
 
@@ -285,6 +291,7 @@ Options:
                  given.
   -y, --yes      Skip the confirm prompt (scripts / CI / non-TTY callers).
   --dry-run      Print what would be pruned; no writes.
+  --json         Output as JSON for scripting (requires --yes, or --dry-run).
 ```
 
 Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
@@ -297,11 +304,14 @@ STM's own config (`stm_proxy.json`) is never modified. Only source-client files 
 
 Before deleting a host entry, every prune path appends the verbatim entry (with its source and timestamp) to `~/.memtomem/pruned_upstreams.json` (mode `0600`) — backup-before-delete, so a crash mid-prune never loses the only copy. The log is append-only and advisory: [`mms eject`](#eject) suggests it when an entry has no recorded origin, but never restores from it without your confirmation.
 
+With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}]}` — `planned` is built from the same iteration as the human preview, and each `failed` row's `hint` is the exact manual removal command. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
+
 ```bash
 mms prune --all              # remove every dual-registered upstream (TTY: confirm prompt)
 mms prune --all --yes        # same, skip the prompt (CI / scripts)
 mms prune --all --dry-run    # preview without writes
 mms prune docs-langchain     # target specific upstreams
+mms prune --all --yes --json # machine-readable result summary
 ```
 
 ### `eject`
@@ -330,6 +340,8 @@ Options:
   --dry-run             Print the plan; no writes.
   -y, --yes             Skip the confirm prompt (scripts / CI / non-TTY
                         callers).
+  --json                Output as JSON for scripting (requires --yes, or
+                        --dry-run).
 ```
 
 The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from, verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
@@ -343,6 +355,7 @@ Key semantics:
 - **Verified release.** The STM entry is only removed once the host entry deep-equals the restore payload. The claude CLI re-serializes through its own schema and silently drops fields it doesn't know, so a clean `add-json` exit isn't proof; on mismatch the entry stays in STM (dual registration) unless you pass `--accept-schema-loss`.
 - **Secret gate.** Payloads with secret-classified `env`/`headers` values would appear on the `claude` argv (visible in the process list). On a TTY you get an explicit per-entry confirmation; non-TTY callers must pass `--allow-argv-secrets`. `--yes` never bypasses this gate.
 - **Failures are per-entry and non-fatal.** Each failed entry keeps its STM registration and prints an exact manual restore command; the run exits 1 if anything failed. When an entry has no origin, the [prune backup log](#prune) (`~/.memtomem/pruned_upstreams.json`) is suggested as a starting point for `--to` — verify it's current first; eject never auto-adopts it.
+- **`--json`.** stdout carries a single result document: `{"action": "eject", "ok": ..., "dry_run": ..., "keep": ..., "config_path": ..., "plan": [...], "restored": [...], "removed_from_stm": [...], "failed": [{"name", "error", "hint"}]}`, mirroring the human plan display per entry (`target`, `write`, `verbatim`, `warnings`, `pruned_duplicates`, `error`). The captured host original itself is never serialized into `plan` rows; each `failed` row's `hint` is the same manual restore command the terminal prints — like that stderr hint, it embeds the restore payload (secrets included), so treat failed-eject `--json` output like the config file itself. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`, and the secret gate fails the entry at plan time instead of confirming (pass `--allow-argv-secrets` to proceed).
 
 ```bash
 mms eject github                   # restore to its recorded origin, then remove from STM
