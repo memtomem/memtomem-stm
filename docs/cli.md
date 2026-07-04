@@ -50,7 +50,7 @@ Commands:
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
   stats      Show proxy compression and surfacing stats from the...
-  status     Show proxy gateway configuration and server list.
+  status     Show proxy gateway config summary (path, enabled flag,...
   surfacing  Toggle proactive memory surfacing for an upstream server.
   tune       Preview and apply per-tool compression tuning recommendations.
   version    Show the installed memtomem-stm version.
@@ -61,6 +61,8 @@ All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
 `mms --version` and `mms version` both print `memtomem-stm X.Y.Z` — the flag is the idiomatic Click form, the subcommand is kept for backwards compatibility.
 
 Output is colorized when writing to a terminal; set `NO_COLOR=1` to disable. JSON output (`--json`) and non-TTY streams (pipes, CI) are never colored.
+
+The `--json` single-document contract covers well-formed invocations: success and operational failures (including a config write-lock timeout) emit exactly one JSON object on stdout. **Usage errors are outside it** — a malformed invocation (unknown flag, missing argument, an incompatible flag combination such as `add --json --from-clients` or `tune --json --apply`) gets Click's standard plain-text usage message on stderr with exit 2 and an empty stdout, same as every read-only `--json` command today. One precedence note: the config write lock wraps the whole command (as it does for every mutator), so under contention a malformed invocation can surface the exit-1 lock-timeout error before argument validation ever runs — in `--json` mode that timeout is itself rendered as the JSON envelope (`"error": "config_lock_timeout"`).
 
 ### `init`
 
@@ -175,9 +177,12 @@ Options:
                                   confirm prompt (default No); non-TTY
                                   callers must pass the flag explicitly.
                                   Requires --from-clients / --import.
+  --json                          Output as JSON for scripting.
 ```
 
 Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
+
+With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `stdio_requires_command`, `url_required`, `malformed_args`, `invalid_env`, `validation_failed`). `--json` is a usage error with `--from-clients` — the import path is an interactive selection flow.
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`, and `~/Library/Application Support/Claude/claude_desktop_config.json`. Claude Desktop discovery is **macOS-only** — on Linux/Windows the Claude Desktop file isn't scanned, so register those servers with `mms add` instead (paste hints elsewhere in the wizard are OS-aware; only the Desktop scan path is pinned to macOS). This is the post-init equivalent of the `init` discovery step — servers already registered in this config are filtered out by name and by `(transport, command, args)` / `(transport, url)` signature before the selection UI. `--validate` and `--timeout` work on the selected subset.
 
@@ -197,7 +202,7 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, origin, and the command (stdio) or URL (SSE / HTTP). Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
 
 The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
@@ -209,9 +214,12 @@ Usage: mms remove [OPTIONS] NAME
 Options:
   --config TEXT  [default: ~/.memtomem/stm_proxy.json]
   -y, --yes      Skip confirmation.
+  --json         Output as JSON for scripting (requires --yes).
 ```
 
 Removes an upstream MCP server from the proxy configuration by name. Prompts for confirmation on a TTY unless `-y` or `--yes` is passed.
+
+With `--json`, stdout carries a single result document (`{"action": "remove", "ok": true, "config_path": ..., "name": ..., "removed": true, "warnings": [...]}`; the orphaning note below moves into `warnings`). `--json` never prompts: without `--yes` the command refuses with exit 2 and `{"error": "confirmation_required", ...}` — a formatting flag doesn't authorize a destructive write (same contract as [`mms host sync --json`](#mms-host--host-config-drift-inspection-and-sync)). Operational failures keep exit 1 with `{"error": "config_not_found" | "server_not_found", ...}`.
 
 `remove` only edits the STM config — it never touches host configs. If the entry was imported and every host original was pruned, removing it would leave the server registered **nowhere**, so the command prints a note (before the confirmation prompt) pointing at [`mms eject`](#eject), which restores the host entry instead. The hint is advisory; the removal itself is never blocked.
 
@@ -251,11 +259,11 @@ mms add --import            # or --from-clients; skips anything already register
 mms add --import --prune    # TTY: per-entry confirm prompt (default No)
                             # non-TTY: unconditional — pass --prune to opt in
 
-# List configured upstreams
+# List configured upstreams (per-server detail: prefix, transport, surfacing, origin)
 mms list
 mms list --json            # machine-readable: {config_path, servers}
 
-# Show full status
+# Config summary (path, enabled flag, server count)
 mms status
 
 # Remove a server (STM config only)
@@ -285,6 +293,7 @@ Options:
                  given.
   -y, --yes      Skip the confirm prompt (scripts / CI / non-TTY callers).
   --dry-run      Print what would be pruned; no writes.
+  --json         Output as JSON for scripting (requires --yes, or --dry-run).
 ```
 
 Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
@@ -297,11 +306,14 @@ STM's own config (`stm_proxy.json`) is never modified. Only source-client files 
 
 Before deleting a host entry, every prune path appends the verbatim entry (with its source and timestamp) to `~/.memtomem/pruned_upstreams.json` (mode `0600`) — backup-before-delete, so a crash mid-prune never loses the only copy. The log is append-only and advisory: [`mms eject`](#eject) suggests it when an entry has no recorded origin, but never restores from it without your confirmation.
 
+With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}]}` — `planned` is built from the same iteration as the human preview, and each `failed` row's `hint` is the exact manual removal command. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
+
 ```bash
 mms prune --all              # remove every dual-registered upstream (TTY: confirm prompt)
 mms prune --all --yes        # same, skip the prompt (CI / scripts)
 mms prune --all --dry-run    # preview without writes
 mms prune docs-langchain     # target specific upstreams
+mms prune --all --yes --json # machine-readable result summary
 ```
 
 ### `eject`
@@ -330,6 +342,8 @@ Options:
   --dry-run             Print the plan; no writes.
   -y, --yes             Skip the confirm prompt (scripts / CI / non-TTY
                         callers).
+  --json                Output as JSON for scripting (requires --yes, or
+                        --dry-run).
 ```
 
 The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from, verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
@@ -343,6 +357,7 @@ Key semantics:
 - **Verified release.** The STM entry is only removed once the host entry deep-equals the restore payload. The claude CLI re-serializes through its own schema and silently drops fields it doesn't know, so a clean `add-json` exit isn't proof; on mismatch the entry stays in STM (dual registration) unless you pass `--accept-schema-loss`.
 - **Secret gate.** Payloads with secret-classified `env`/`headers` values would appear on the `claude` argv (visible in the process list). On a TTY you get an explicit per-entry confirmation; non-TTY callers must pass `--allow-argv-secrets`. `--yes` never bypasses this gate.
 - **Failures are per-entry and non-fatal.** Each failed entry keeps its STM registration and prints an exact manual restore command; the run exits 1 if anything failed. When an entry has no origin, the [prune backup log](#prune) (`~/.memtomem/pruned_upstreams.json`) is suggested as a starting point for `--to` — verify it's current first; eject never auto-adopts it.
+- **`--json`.** stdout carries a single result document: `{"action": "eject", "ok": ..., "dry_run": ..., "keep": ..., "config_path": ..., "plan": [...], "restored": [...], "removed_from_stm": [...], "failed": [{"name", "error", "hint"}]}`, mirroring the human plan display per entry (`target`, `write`, `verbatim`, `warnings`, `pruned_duplicates`, `error`). The captured host original itself is never serialized into `plan` rows; each `failed` row's `hint` is the same manual restore command the terminal prints — like that stderr hint, it embeds the restore payload (secrets included), so treat failed-eject `--json` output like the config file itself. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`, and the secret gate fails the entry at plan time instead of confirming (pass `--allow-argv-secrets` to proceed).
 
 ```bash
 mms eject github                   # restore to its recorded origin, then remove from STM
@@ -360,7 +375,7 @@ Options:
   --config TEXT  [default: ~/.memtomem/stm_proxy.json]
 ```
 
-Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms status` shows it per server. A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
+Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms list` shows it per server (SURFACING column). A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
 
 ### `health`
 
@@ -398,7 +413,9 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Shows the current proxy gateway configuration file path, enabled flag, and the list of configured upstream servers with their prefix, transport, command or URL, compression strategy, character budget, and surfacing toggle. In `--json` output, every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human-readable table never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
+Shows a config summary: the configuration file path, enabled flag, schema-validation warning, and the server count (with a host-pruned count when any entry exists only behind STM). Per-server detail — prefix, transport, command/URL, compression, surfacing — lives in [`mms list`](#list); `status` answers "is the proxy set up and pointed at the right config", `list` answers "what servers are behind it". (#614 — the two commands used to print near-identical output.)
+
+`status --json` is unchanged by that split: it still carries the full redacted `servers` map (plus additive `server_count` / `pruned_count` keys), so scripted consumers keep working. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
 When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `health` print a warning naming the first error — exit code unchanged. Use `mms config validate` for the strict check.
 

@@ -449,6 +449,12 @@ class TestStatus:
         assert data["enabled"] is True
         assert "fs" in data["servers"]
         assert str(config) in data["config_path"]
+        # #614 additive keys — the full `servers` map above stays (scripted
+        # consumers + the redaction pins depend on it); the counts let
+        # callers match the human summary without re-deriving the pruned
+        # predicate.
+        assert data["server_count"] == 1
+        assert data["pruned_count"] == 0
 
     def test_json_missing_config(self, runner, config):
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
@@ -583,7 +589,10 @@ class TestStatus:
         for secret in ("ghp_strsecret", "Bearer leaked"):
             assert secret not in result.output
 
-    def test_shows_server_details(self, runner, config):
+    def test_human_output_is_summary_without_server_rows(self, runner, config):
+        """#614: status is the config summary; per-server rows moved to
+        ``mms list``. Pins the removal — none of the old per-server
+        fragments may reappear — and the pointer at the new home."""
         config.write_text(
             json.dumps(
                 {
@@ -604,10 +613,71 @@ class TestStatus:
         )
         result = runner.invoke(cli, ["status", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "fs" in result.output
-        assert "prefix=fs" in result.output
-        assert "uvx" in result.output
-        assert "compression=auto" in result.output
+        assert "Servers: 1" in result.output
+        assert "mms list" in result.output
+        assert "prefix=" not in result.output
+        assert "compression=" not in result.output
+        assert "surfacing=" not in result.output
+        assert "uvx" not in result.output
+
+    def test_servers_line_counts_host_pruned(self, runner, config):
+        """The host-pruned suffix uses the same every-source predicate as
+        the ``mms list`` ``*`` marker: fully-pruned entries count, an
+        entry with an un-pruned duplicate does not."""
+
+        def _entry(*, source_pruned: bool, dup_pruned: bool | None = None) -> dict:
+            duplicates = (
+                [] if dup_pruned is None else [{"kind": "claude-desktop", "pruned": dup_pruned}]
+            )
+            return {
+                "prefix": "xx",
+                "transport": "stdio",
+                "command": "npx",
+                "origin": {
+                    "schema_version": 1,
+                    "source": {"kind": "claude-user", "pruned": source_pruned},
+                    "duplicates": duplicates,
+                    "imported_at": "2026-06-11T00:00:00Z",
+                    "original": {"command": "npx"},
+                },
+            }
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "gone": _entry(source_pruned=True),
+                        "partial": _entry(source_pruned=True, dup_pruned=False),
+                        "manual": {"prefix": "mn", "command": "npx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "Servers: 3 (1 host-pruned)" in result.output
+        data = json.loads(runner.invoke(cli, ["status", "--json", *_cfg_args(config)]).output)
+        assert data["server_count"] == 3
+        assert data["pruned_count"] == 1
+
+    def test_no_pruned_suffix_when_nothing_pruned(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {"enabled": True, "upstream_servers": {"fs": {"prefix": "fs", "command": "x"}}}
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert "Servers: 1\n" in result.output
+
+    def test_empty_config_points_at_add(self, runner, config):
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "mms add" in result.output
+        assert "mms list" not in result.output
 
 
 # ── list command ─────────────────────────────────────────────────────────
@@ -674,9 +744,38 @@ class TestListServers:
         # The COMPRESSION column starts at the same offset on header
         # and row — drift used to put them several chars apart.
         assert header.index("COMPRESSION") == row.index("auto")
+        # Same pin for the SURFACING column added in #614 ("on" is the
+        # default — the flag is absent on this entry).
+        assert row[header.index("SURFACING") :].startswith("on")
         # Same pin for the ORIGIN column added in #475 PR4 ("-" is the
         # no-provenance cell; this entry was added manually).
         assert row[header.index("ORIGIN")] == "-"
+
+    def test_list_surfacing_column_shows_toggle(self, runner, config):
+        """The SURFACING column is the per-server toggle's visible home
+        (#614 — ``mms status`` no longer prints per-server rows): ``off``
+        when ``surfacing_enabled`` is false, ``on`` when absent (default)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "quiet": {"prefix": "q", "command": "npx", "surfacing_enabled": False},
+                        "loud": {"prefix": "l", "command": "npx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        header = next(line for line in lines if "SURFACING" in line)
+        offset = header.index("SURFACING")
+        quiet_row = next(line for line in lines if line.startswith("quiet"))
+        loud_row = next(line for line in lines if line.startswith("loud"))
+        assert quiet_row[offset:].startswith("off")
+        assert loud_row[offset:].startswith("on")
 
     def test_list_origin_column_summarizes_provenance(self, runner, config):
         """The ORIGIN column shows the recorded source kind for imported
@@ -1324,6 +1423,114 @@ class TestAddValidate:
         assert "Validated" not in result.output
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "lazy" in data["upstream_servers"]
+
+
+class TestAddJson:
+    """``mms add --json`` result summary (#614). Contract shared by all
+    mutating ``--json`` modes: stdout carries exactly one JSON document
+    (human diagnostics stay on stderr — asserted via ``result.stdout``,
+    which Click ≥8.2 exposes separately from the teed ``output``), every
+    payload has ``action``/``ok``, failures add ``error``/``message`` and
+    keep the non-JSON path's exit code."""
+
+    def test_success_shape_redacts_env_values(self, runner, config):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "gh", "--prefix", "gh", "--command", "npx",
+                "--env", "GITHUB_TOKEN=ghp_supersecret", "--json", *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["action"] == "add" and data["ok"] is True
+        assert data["name"] == "gh" and data["prefix"] == "gh"
+        assert data["server"]["env"]["GITHUB_TOKEN"] == REDACTED_DISPLAY
+        assert data["validated"] is False and data["tools_reachable"] is None
+        assert data["warnings"] == []
+        # The secret must not appear anywhere in the JSON document, while
+        # the on-disk config still carries it verbatim.
+        assert "ghp_supersecret" not in result.stdout
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert saved["upstream_servers"]["gh"]["env"]["GITHUB_TOKEN"] == "ghp_supersecret"
+
+    def test_duplicate_name_error_shape(self, runner, config):
+        runner.invoke(cli, ["add", "gh", "--prefix", "gh", "--command", "x", *_cfg_args(config)])
+        result = runner.invoke(
+            cli, ["add", "gh", "--prefix", "gh", "--command", "x", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["ok"] is False and data["error"] == "already_exists"
+        # The human stderr line still prints (wording shared across modes).
+        assert "already exists" in result.stderr
+
+    def test_invalid_prefix_error_shape(self, runner, config):
+        result = runner.invoke(
+            cli, ["add", "s", "--prefix", "9bad", "--command", "x", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["error"] == "invalid_prefix"
+
+    def test_missing_command_error_shape(self, runner, config):
+        result = runner.invoke(cli, ["add", "s", "--prefix", "s", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["error"] == "stdio_requires_command"
+
+    def test_warnings_land_in_payload_and_stderr(self, runner, config):
+        runner.invoke(cli, ["add", "one", "--prefix", "fs", "--command", "x", *_cfg_args(config)])
+        result = runner.invoke(
+            cli, ["add", "two", "--prefix", "fs", "--command", "x", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["ok"] is True
+        assert any("already used by server 'one'" in w for w in data["warnings"])
+        assert "already used by server 'one'" in result.stderr
+
+    def test_from_clients_is_usage_error(self, runner, config):
+        result = runner.invoke(cli, ["add", "--from-clients", "--json", *_cfg_args(config)])
+        assert result.exit_code == 2
+        assert "--json is not supported with --from-clients" in result.output
+
+    def test_validate_failure_error_shape_and_no_write(self, runner, config):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "bad", "--prefix", "bad", "--command", "__nonexistent_cmd_12345__",
+                "--validate", "--timeout", "3", "--json", *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "validation_failed"
+        if config.exists():
+            saved = json.loads(config.read_text(encoding="utf-8"))
+            assert "bad" not in saved.get("upstream_servers", {})
+
+    def test_validate_success_stdout_is_pure_json(self, config):
+        """Progress lines (``Validating...`` / ``Validated:``) are suppressed
+        in --json mode; ``tools_reachable`` carries the count instead. Real
+        subprocess for the same fileno() reason as ``TestAddValidate``."""
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "add", "fake", "--prefix", "fk",
+                "--command", sys.executable, "--args", str(_FAKE_SERVER),
+                "--validate", "--timeout", "15", "--json", "--config", str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        data = json.loads(proc.stdout)  # any progress line would break the parse
+        assert data["ok"] is True and data["validated"] is True
+        assert isinstance(data["tools_reachable"], int) and data["tools_reachable"] >= 1
+        assert "Validating" not in proc.stdout
 
 
 # ── init command (guided setup) ─────────────────────────────────────────
@@ -4214,6 +4421,85 @@ class TestPruneCommand:
         assert "boom" in result.output
         assert "claude mcp remove docs-langchain -s user" in result.output
 
+    # ── --json result summary (#614) ──
+
+    _DUAL_CANDIDATE = {
+        "name": "docs-langchain",
+        "source": "Claude Code (user)",
+        "entry": {"transport": "stdio", "command": "npx"},
+    }
+
+    def test_json_dry_run_shape_and_no_writes(self, runner, config, monkeypatch, fake_claude):
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["action"] == "prune" and data["ok"] is True and data["dry_run"] is True
+        assert data["planned"] == [{"name": "docs-langchain", "source": "Claude Code (user)"}]
+        assert data["pruned"] == [] and data["failed"] == []
+        assert fake_claude["calls"] == []
+
+    def test_json_without_yes_refuses_with_exit_2(self, runner, config, monkeypatch, fake_claude):
+        """--json never prompts — even where the TTY path would confirm —
+        because a formatting flag must not authorize destructive writes."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        result = runner.invoke(cli, ["prune", "--all", "--json", *_cfg_args(config)])
+        assert result.exit_code == 2
+        data = json.loads(result.stdout)
+        assert data["ok"] is False and data["error"] == "confirmation_required"
+        assert fake_claude["calls"] == []
+
+    def test_json_success_shape(self, runner, config, monkeypatch, fake_claude):
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["ok"] is True and data["dry_run"] is False
+        assert data["pruned"] == [{"name": "docs-langchain", "source": "Claude Code (user)"}]
+        assert data["failed"] == []
+
+    def test_json_partial_failure_carries_hint_and_exits_1(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        # json.loads tolerates leading whitespace, so pin byte-level purity
+        # too: the failure-block separator line must not reach stdout
+        # (codex #644 R1 caught exactly that leak).
+        assert result.stdout.startswith("{")
+        data = json.loads(result.stdout)  # stderr diagnostics must not corrupt stdout
+        assert data["ok"] is False
+        assert data["failed"][0]["name"] == "docs-langchain"
+        assert data["failed"][0]["hint"] == "claude mcp remove docs-langchain -s user"
+        # Human failure diagnostics still print to stderr in --json mode.
+        assert "could not remove" in result.stderr
+
+    def test_json_not_dual_registered_error_shape(self, runner, config, monkeypatch):
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [])
+        result = runner.invoke(cli, ["prune", "ghost", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "not_dual_registered" and data["names"] == ["ghost"]
+
+    def test_json_no_dual_registered_is_ok_with_empty_arrays(self, runner, config, monkeypatch):
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(monkeypatch, [])
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["ok"] is True
+        assert data["planned"] == [] and data["pruned"] == [] and data["failed"] == []
+
 
 # ── prune backup log + per-source pruned metadata (#475 PR2) ─────────────
 
@@ -5300,6 +5586,96 @@ class TestEjectCommand:
         assert "bad" in servers  # failed and was kept
         assert json.loads(target.read_text(encoding="utf-8"))["mcpServers"]["ok"] == ok_original
 
+    # ── --json result summary (#614) ──
+
+    def test_json_dry_run_plan_rows_without_payload(self, runner, config, tmp_path):
+        """Plan rows mirror the human display; ``_EjectPlan.payload`` (the
+        verbatim host entry, secrets included) is never serialized."""
+        target = tmp_path / ".mcp.json"
+        original = {"command": "npx", "env": {"TOKEN": "sekret_val"}}
+        self._seed_config(
+            config, {"demo": _eject_entry(kind="mcp-json", path=str(target), original=original)}
+        )
+        result = runner.invoke(cli, ["eject", "demo", "--dry-run", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["action"] == "eject" and data["ok"] is True and data["dry_run"] is True
+        row = data["plan"][0]
+        assert row["name"] == "demo" and row["write"] == "restore" and row["verbatim"] is True
+        assert row["target"] == {"kind": "mcp-json", "path": str(target)}
+        assert data["restored"] == [] and data["failed"] == []
+        assert "sekret_val" not in result.stdout
+
+    def test_json_without_yes_refuses_with_exit_2(self, runner, config, monkeypatch, tmp_path):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        target = tmp_path / ".mcp.json"
+        self._seed_config(config, {"demo": _eject_entry(kind="mcp-json", path=str(target))})
+        result = runner.invoke(cli, ["eject", "demo", "--json", *_cfg_args(config)])
+        assert result.exit_code == 2
+        data = json.loads(result.stdout)
+        assert data["error"] == "confirmation_required"
+        assert not target.exists()  # no writes before the refusal
+
+    def test_json_success_shape_and_stderr_note(self, runner, config, tmp_path):
+        target = tmp_path / ".mcp.json"
+        original = {"command": "npx", "env": {"TOKEN": "sekret_val"}}
+        self._seed_config(
+            config, {"demo": _eject_entry(kind="mcp-json", path=str(target), original=original)}
+        )
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["ok"] is True
+        assert data["restored"] == ["demo"] and data["removed_from_stm"] == ["demo"]
+        assert "demo" not in self._stm_servers(config)
+        # Success path never serializes the payload — secret stays out of stdout.
+        assert "sekret_val" not in result.stdout
+        # Last upstream gone → self-deregistration note moves to stderr.
+        assert "claude mcp remove memtomem-stm" in result.stderr
+
+    def test_json_keep_leaves_removed_from_stm_empty(self, runner, config, tmp_path):
+        target = tmp_path / ".mcp.json"
+        self._seed_config(config, {"demo": _eject_entry(kind="mcp-json", path=str(target))})
+        result = runner.invoke(
+            cli, ["eject", "demo", "--keep", "--yes", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["keep"] is True
+        assert data["restored"] == ["demo"] and data["removed_from_stm"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_json_host_write_failure_row_carries_manual_hint(
+        self, runner, config, fake_claude_host
+    ):
+        self._seed_config(config, {"demo": _eject_entry()})
+        fake_claude_host["rc"] = 1
+        fake_claude_host["stderr"] = "unknown command add-json"
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)  # stderr diagnostics must not corrupt stdout
+        assert data["ok"] is False
+        assert data["failed"][0]["name"] == "demo"
+        assert data["failed"][0]["hint"].startswith("claude mcp add-json demo")
+        assert "demo" in self._stm_servers(config)
+
+    def test_json_secret_gate_fails_plan_without_prompt(self, runner, config, monkeypatch):
+        """In --json mode the secret gate never prompts, even on a TTY —
+        the entry fails at plan time with the non-TTY wording."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+        result = runner.invoke(cli, ["eject", "demo", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["ok"] is False
+        assert "--allow-argv-secrets" in data["plan"][0]["error"]
+        assert "demo" in self._stm_servers(config)
+
 
 class TestDenormalizeClientEntry:
     """Unit pins for the degraded inverse of ``_normalize_client_entry``."""
@@ -5424,6 +5800,44 @@ class TestConfigWriteLock:
         assert result.exit_code == 1
         assert "timed out" in result.output
         assert "mutating the proxy config" in result.output
+
+    def test_lock_timeout_renders_json_envelope_in_json_mode(
+        self, runner, config, _hermetic_home
+    ):
+        """The lock is acquired before the callback runs, so the commands'
+        own --json error handling can never see a timeout — the decorator
+        must render the envelope itself (#614, codex #644 R1). Exit code
+        stays 1; stdout is exactly one JSON document."""
+        self._seed(config)
+        with self._hold_lock(_hermetic_home):
+            result = runner.invoke(
+                cli, ["remove", "srv", "--yes", "--json", *_cfg_args(config)]
+            )
+        assert result.exit_code == 1
+        assert result.stdout.lstrip().startswith("{")
+        data = json.loads(result.stdout)
+        assert data["action"] == "remove" and data["ok"] is False
+        assert data["error"] == "config_lock_timeout"
+        assert "timed out" in data["message"]
+        # Human diagnostics still land on stderr.
+        assert "timed out" in result.stderr
+
+    def test_lock_timeout_json_envelope_is_opt_in(self, runner, config, _hermetic_home):
+        """`mms tune` also names its flag ``as_json`` but is NOT opted in
+        to the JSON timeout envelope (its --json is a preview-only mode) —
+        pins that the decorator keys on json_envelope, not on flag-name
+        sniffing (codex #644 R2)."""
+        self._seed(config)
+        with self._hold_lock(_hermetic_home):
+            # --json + --apply is a usage error inside the callback, but the
+            # held lock times out first (same precedence as main for every
+            # mutator); a non-opted-in command must keep text rendering.
+            result = runner.invoke(
+                cli, ["tune", "--apply", "--yes", "--json", *_cfg_args(config)]
+            )
+        assert result.exit_code == 1
+        assert result.stdout.strip() == ""
+        assert "timed out" in result.output
 
     def test_read_and_dry_run_paths_skip_lock(
         self, runner, config, monkeypatch, _hermetic_home
@@ -5734,6 +6148,43 @@ class TestRemove:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "fs" in data["upstream_servers"]
 
+    # ── --json result summary (#614) ──
+
+    def test_json_success_shape(self, runner, config):
+        runner.invoke(cli, ["add", "fs", "--prefix", "fs", "--command", "x", *_cfg_args(config)])
+        result = runner.invoke(cli, ["remove", "fs", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["action"] == "remove" and data["ok"] is True
+        assert data["name"] == "fs" and data["removed"] is True and data["warnings"] == []
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert "fs" not in saved["upstream_servers"]
+
+    def test_json_without_yes_refuses_with_exit_2(self, runner, config):
+        """--json never reaches the confirm prompt: no input is supplied, so
+        a prompt would abort on EOF (exit 1) — the exit-2 envelope pins the
+        refuse-don't-prompt contract."""
+        runner.invoke(cli, ["add", "fs", "--prefix", "fs", "--command", "x", *_cfg_args(config)])
+        result = runner.invoke(cli, ["remove", "fs", "--json", *_cfg_args(config)])
+        assert result.exit_code == 2
+        data = json.loads(result.stdout)
+        assert data["ok"] is False and data["error"] == "confirmation_required"
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert "fs" in saved["upstream_servers"]
+
+    def test_json_server_not_found_error_shape(self, runner, config):
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["remove", "ghost", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["error"] == "server_not_found"
+
+    def test_json_config_not_found_error_shape(self, runner, tmp_path):
+        missing = tmp_path / "nope.json"
+        result = runner.invoke(cli, ["remove", "g", "--yes", "--json", "--config", str(missing)])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "config_not_found" and data["path"] == str(missing.resolve())
+
 
 class TestOriginFullyPruned:
     """The shared every-source predicate behind the ``mms list`` pruned
@@ -5876,6 +6327,19 @@ class TestRemoveEjectHint:
         result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "mms eject gh" in result.output
+
+    def test_json_mode_moves_hint_into_warnings(self, runner, config):
+        """In --json mode the orphaning hint moves off stdout into the
+        payload's ``warnings`` — same wording, no ANSI codes."""
+        self._seed(config, self._imported_entry())
+        result = runner.invoke(cli, ["remove", "gh", "--yes", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)  # hint on stdout would corrupt the parse
+        assert data["removed"] is True
+        assert len(data["warnings"]) == 1
+        assert "registered nowhere" in data["warnings"][0]
+        assert "mms eject gh" in data["warnings"][0]
+        assert "\x1b[" not in data["warnings"][0]
 
 
 # ── End-to-end ───────────────────────────────────────────────────────────
@@ -6903,17 +7367,23 @@ class TestSurfacingCommand:
         result = runner.invoke(cli, ["surfacing", "context7", "maybe", *_cfg_args(config)])
         assert result.exit_code != 0
 
-    def test_status_renders_surfacing_off(self, runner, config):
+    def test_list_renders_surfacing_off(self, runner, config):
+        """#614: the per-server surfacing state's visible home is the
+        ``mms list`` SURFACING column (status is a config summary now)."""
         self._seed(config, surfacing_enabled=False)
-        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "surfacing=off" in result.output
+        header = next(line for line in result.output.splitlines() if "SURFACING" in line)
+        row = next(line for line in result.output.splitlines() if line.startswith("context7"))
+        assert row[header.index("SURFACING") :].startswith("off")
 
-    def test_status_renders_surfacing_on_by_default(self, runner, config):
+    def test_list_renders_surfacing_on_by_default(self, runner, config):
         self._seed(config)
-        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "surfacing=on" in result.output
+        header = next(line for line in result.output.splitlines() if "SURFACING" in line)
+        row = next(line for line in result.output.splitlines() if line.startswith("context7"))
+        assert row[header.index("SURFACING") :].startswith("on")
 
 
 class TestTune:
