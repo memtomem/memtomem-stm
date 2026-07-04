@@ -82,6 +82,24 @@ class TestProxyNumericConstraints:
         )
         assert cfg.reconnect_delay_seconds == 5
 
+    def test_circuit_max_failures_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            UpstreamServerConfig(prefix="x", circuit_max_failures=-1)
+
+    def test_circuit_max_failures_zero_is_valid_disabled(self) -> None:
+        """0 disables the per-upstream breaker (#608) — must validate."""
+        cfg = UpstreamServerConfig(prefix="x", circuit_max_failures=0)
+        assert cfg.circuit_max_failures == 0
+
+    def test_circuit_reset_seconds_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            UpstreamServerConfig(prefix="x", circuit_reset_seconds=0)
+
+    def test_circuit_defaults(self) -> None:
+        cfg = UpstreamServerConfig(prefix="x")
+        assert cfg.circuit_max_failures == 3
+        assert cfg.circuit_reset_seconds == 60.0
+
     def test_hybrid_min_head_must_not_exceed_head(self) -> None:
         """min_head_chars > head_chars makes HybridCompressor's head-budget
         guard fall back to truncation on EVERY call — the operator's chosen

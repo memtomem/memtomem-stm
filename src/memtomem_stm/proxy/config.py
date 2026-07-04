@@ -575,6 +575,19 @@ class UpstreamServerConfig(BaseModel):
     (max_retries+1)`` worst-case blowout while still allowing multiple attempts
     within a bounded window. Default 180s = 2× ``call_timeout_seconds``.
     """
+    circuit_max_failures: int = Field(default=3, ge=0)
+    """Consecutive failed calls before this upstream's circuit breaker opens.
+
+    Counts one failure per *call* that exhausts its retry/deadline budget on a
+    transport fault or timeout — not one per attempt, and not tool-level
+    ``isError`` results (an erroring tool proves the upstream is alive). While
+    open, calls fast-fail with a ``circuit_open`` error instead of paying the
+    full retry/deadline cost; cached responses keep serving. ``0`` disables
+    the breaker for this upstream. Connect-time snapshot like ``max_retries``:
+    edits apply on the next restart, not via config hot-reload.
+    """
+    circuit_reset_seconds: float = Field(default=60.0, gt=0.0)
+    """Seconds an open circuit breaker waits before allowing a probe call."""
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
     origin: UpstreamOrigin | None = None

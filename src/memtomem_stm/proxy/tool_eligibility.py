@@ -189,6 +189,12 @@ UPSTREAM_ERROR_CATEGORIES: tuple[str, ...] = (
     ErrorCategory.TIMEOUT.value,
     ErrorCategory.PROTOCOL.value,
     ErrorCategory.UPSTREAM_ERROR.value,
+    # Breaker fast-fails (#608) are upstream-attributable by construction —
+    # the breaker only opens after consecutive transport/timeout failures.
+    # Excluding them would let fast-fail rows inflate the call-count
+    # denominator in ``get_tool_error_stats`` and *dilute* per-tool error
+    # rates during exactly the window the upstream is down.
+    ErrorCategory.CIRCUIT_OPEN.value,
 )
 
 

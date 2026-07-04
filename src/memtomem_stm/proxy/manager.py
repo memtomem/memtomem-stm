@@ -133,6 +133,7 @@ from memtomem_stm.proxy.metrics import (
     format_error_message_from_exc,
 )
 from memtomem_stm.observability.tracing import traced
+from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.redact import redact_exception_text
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
@@ -207,6 +208,11 @@ class UpstreamConnection:
     # collapsing a reconnect storm into one transport spawn.
     reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reconnect_generation: int = 0
+    # Per-upstream circuit breaker (#608). Lives on the connection because
+    # ``_reconnect_server`` mutates the connection in place (never replaces
+    # it), so breaker state survives reconnects. ``None`` when the upstream's
+    # ``circuit_max_failures`` is 0 (breaker disabled).
+    breaker: CircuitBreaker | None = None
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -947,8 +953,22 @@ class ProxyManager:
                     cfg.prefix,
                 )
 
+        breaker = (
+            CircuitBreaker(
+                max_failures=cfg.circuit_max_failures,
+                reset_timeout=cfg.circuit_reset_seconds,
+                name=f"upstream-{name}",
+            )
+            if cfg.circuit_max_failures > 0
+            else None
+        )
         self._connections[name] = UpstreamConnection(
-            name=name, config=cfg, session=session, tools=list(result.tools), stack=conn_stack
+            name=name,
+            config=cfg,
+            session=session,
+            tools=list(result.tools),
+            stack=conn_stack,
+            breaker=breaker,
         )
         # A successful connect clears any prior startup-failure record (#580).
         self._failed_servers.pop(name, None)
@@ -2285,6 +2305,13 @@ class ProxyManager:
                     1 for info in self._advertised_infos if info.server == name
                 ),
             }
+            # Per-upstream breaker (#608) — pure reads (#600). Absent when
+            # the breaker is disabled (circuit_max_failures=0), so renderers
+            # can distinguish "disabled" from "closed".
+            if conn.breaker is not None:
+                health[name]["circuit_state"] = conn.breaker.state
+                health[name]["circuit_failures"] = conn.breaker.failure_count
+                health[name]["circuit_reset_in"] = conn.breaker.time_until_reset
         for name, error in self._failed_servers.items():
             # A server can't be both connected and in the failed map (the
             # success path pops it), but guard against a stale entry anyway.
@@ -2712,6 +2739,39 @@ class ProxyManager:
         conn = self._connections[server]
         cfg = conn.config
         delay = cfg.reconnect_delay_seconds
+        breaker = conn.breaker
+
+        # Per-upstream circuit breaker fast-fail (#608). Checked here — after
+        # the cache fast-path in ``_call_tool_guarded`` — so cached responses
+        # keep serving while the upstream is down. ``is_open`` is a pure read
+        # (#600): once ``circuit_reset_seconds`` elapses it returns False and
+        # this call proceeds as the half-open probe (a probe may burn up to
+        # ``max_retries + 1`` attempts, matching the surfacing breaker's
+        # non-single-probe posture).
+        if breaker is not None and breaker.is_open:
+            remaining = breaker.time_until_reset or 0.0
+            msg = (
+                f"Upstream '{server}' temporarily unavailable: circuit breaker "
+                f"open after {breaker.failure_count} consecutive failures; "
+                f"retry in ~{remaining:.0f}s"
+            )
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=0,
+                    compressed_chars=0,
+                    is_error=True,
+                    error_category=ErrorCategory.CIRCUIT_OPEN,
+                    error_message=msg[:MAX_ERROR_MESSAGE_CHARS],
+                    trace_id=trace_id,
+                )
+            )
+            from mcp.server.fastmcp.exceptions import ToolError
+
+            tool_err = ToolError(msg)
+            _mark_recorded(tool_err)
+            raise tool_err
 
         # Overall-deadline policy: each attempt uses
         # ``min(call_timeout_seconds, remaining_deadline)`` as its effective
@@ -2745,6 +2805,8 @@ class ProxyManager:
                     )
                 )
                 _mark_recorded(deadline_exc)
+                if breaker is not None:
+                    breaker.record_failure()
                 try:
                     await self._reconnect_server(server)
                 except Exception as reconnect_exc:
@@ -2759,10 +2821,17 @@ class ProxyManager:
                 raise deadline_exc
             per_attempt_timeout = min(cfg.call_timeout_seconds, remaining_deadline)
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     conn.session.call_tool(tool, upstream_args),
                     timeout=per_attempt_timeout,
                 )
+                # Any completed round-trip proves the upstream is alive — an
+                # ``isError`` result (classified UPSTREAM_ERROR downstream) is
+                # a tool-level failure, not a dependency-health signal, so it
+                # still closes the breaker.
+                if breaker is not None:
+                    breaker.record_success()
+                return result
             except Exception as exc:
                 err_code = getattr(getattr(exc, "error", None), "code", None)
                 # Only retry transport/connection errors and MCP errors.
@@ -2793,6 +2862,14 @@ class ProxyManager:
                     logger.debug(
                         "Protocol error %s for %s/%s, skipping retry", err_code, server, tool
                     )
+                    # A JSON-RPC error response is a completed round-trip: the
+                    # upstream received the request and replied, so the
+                    # transport is healthy. Like an ``isError`` result, it
+                    # closes the breaker — otherwise transport/timeout failures
+                    # separated by a proven-alive protocol reply would still
+                    # accumulate as "consecutive" and spuriously open it.
+                    if breaker is not None:
+                        breaker.record_success()
                     self.tracker.record_error(
                         CallMetrics(
                             server=server,
@@ -2862,6 +2939,11 @@ class ProxyManager:
                         )
                     )
                     _mark_recorded(exc)
+                    # One breaker count per *call* (this terminal site), not
+                    # per attempt — the retry-continue path below records
+                    # nothing on the breaker.
+                    if breaker is not None:
+                        breaker.record_failure()
                     # Reconnect before raising so the NEXT call starts fresh
                     try:
                         await self._reconnect_server(server)
@@ -2893,6 +2975,11 @@ class ProxyManager:
                     conn = self._connections[server]
                 except Exception as reconnect_exc:
                     logger.error("Reconnect to '%s' failed: %s", server, reconnect_exc)
+                    # Third terminal exit (#608): a mid-loop reconnect failure
+                    # means the upstream is unreachable — count it, or a dead
+                    # stdio upstream whose respawns fail escapes the breaker.
+                    if breaker is not None:
+                        breaker.record_failure()
                     raise
 
         # The loop always returns on success or raises on every failure path;

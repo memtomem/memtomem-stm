@@ -93,6 +93,10 @@ class ErrorCategory(StrEnum):
     # call propagates as an MCP error since a lock timeout indicates a bug
     # (deadlock, stuck holder), not a slow external dependency.
     LOCK_TIMEOUT = "lock_timeout"
+    # Fast-fail: the per-upstream circuit breaker was open, upstream not called
+    # (#608). Distinct from TRANSPORT/TIMEOUT so dashboards can separate real
+    # faults from breaker rejections during an outage window.
+    CIRCUIT_OPEN = "circuit_open"
     # Note: LLM compression timeout (#207) is NOT an error category — the call
     # succeeds via graceful truncate fallback. The signal lives in the
     # ``compression_strategy`` column as ``"llm_summary→timeout_fallback"``;

@@ -757,6 +757,14 @@ async def stm_proxy_cache_clear(
 # Tool: stm_proxy_health
 # ---------------------------------------------------------------------------
 
+# Shared by the surfacing breaker line and the per-upstream breaker lines
+# (#608) so both render identical state labels.
+_CB_STATE_LABELS = {
+    "open": "open (failing)",
+    "half-open": "half-open (probe eligible)",
+    "closed": "closed (healthy)",
+}
+
 
 @_obs_tool
 async def stm_proxy_health(
@@ -785,6 +793,15 @@ async def stm_proxy_health(
         error = info.get("error")
         if error:
             lines.append(f"      startup connect failed: {error}")
+        # Per-upstream circuit breaker (#608). Key absent = breaker disabled
+        # (circuit_max_failures=0) or startup-failed server (no connection) —
+        # render nothing rather than a misleading "closed (healthy)".
+        circuit_state = info.get("circuit_state")
+        if circuit_state is not None:
+            cb_label = _CB_STATE_LABELS.get(circuit_state, circuit_state)
+            reset_in = info.get("circuit_reset_in")
+            suffix = f", retry in ~{reset_in:.0f}s" if reset_in is not None else ""
+            lines.append(f"      circuit breaker: {cb_label}{suffix}")
 
     surfacing = app.surfacing_engine
     if surfacing is not None:
@@ -794,11 +811,7 @@ async def stm_proxy_health(
         # an open breaker reads as ``half-open`` with ``is_open == False``, so
         # an ``is_open``-only check would report ``closed (healthy)`` before any
         # probe has actually succeeded — hiding a still-degraded dependency.
-        cb_state = {
-            "open": "open (failing)",
-            "half-open": "half-open (probe eligible)",
-            "closed": "closed (healthy)",
-        }.get(cb.state, cb.state)
+        cb_state = _CB_STATE_LABELS.get(cb.state, cb.state)
         lines.append(f"\nSurfacing circuit breaker: {cb_state}")
 
     lines.extend(_toolgraph_health_lines(pm.get_toolgraph_status()))

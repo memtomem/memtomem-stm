@@ -238,6 +238,8 @@ Full example with all options:
       "connect_timeout_seconds": 30.0,
       "call_timeout_seconds": 90.0,
       "overall_deadline_seconds": 180.0,
+      "circuit_max_failures": 3,
+      "circuit_reset_seconds": 60.0,
       "max_description_chars": 200,
       "strip_schema_descriptions": false,
       "cleaning": {
@@ -344,6 +346,22 @@ Full example with all options:
   }
 }
 ```
+
+`circuit_max_failures` / `circuit_reset_seconds` configure the per-upstream
+circuit breaker (#608). The breaker counts **one failure per call** that
+exhausts its retry/deadline budget on a transport fault or timeout — not one
+per attempt. Any completed round-trip *closes* the breaker instead — a
+tool-level `isError` result and a JSON-RPC protocol error both prove the
+upstream replied, so both reset the failure streak. After
+`circuit_max_failures` consecutive failed calls the breaker opens: further
+calls to that upstream fast-fail with a `circuit_open` error instead of
+paying the full retry/deadline cost, while cached responses keep serving and
+other upstreams are unaffected. After `circuit_reset_seconds` the next call
+goes through as a probe — success closes the breaker, failure re-opens it.
+Set `circuit_max_failures: 0` to disable the breaker for that upstream.
+Per-upstream breaker state is visible in `stm_proxy_health`. Like
+`max_retries`, these are connect-time snapshots: edits apply on the next
+restart, not via hot-reload.
 
 `selection_telemetry` (off by default) appends one `selection` + one
 `execution` JSONL record per proxied call — which tool the client picked out
@@ -560,6 +578,7 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 | Per-server compression, cleaning, `tool_overrides` | Yes | `compression`, `max_result_chars`, `retention_floor`, `cleaning.*`, `tool_overrides.*` take effect on the next tool call |
 | `relevance_scorer.*` | Yes | All five fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`). A change in any field rebuilds the scorer instance in place. |
 | `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
+| Per-server `circuit_*` breaker thresholds | **No** (restart) | The breaker is built at connect time on the connection object (#608), like the retry/timeout knobs. |
 | Adding / removing upstream servers | **No** (restart) | Transport connections are established once at startup. |
 
 Omitting `embedding_base_url` (or setting it to `null`) lets provider-aware defaults fill it in — `ollama → http://localhost:11434`, `openai → https://api.openai.com`.
