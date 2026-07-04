@@ -22,6 +22,12 @@ changes inline only. See the deprecation policy in
   embedding relevance scorer configured, compression now runs on a worker
   thread so one slow endpoint no longer stalls concurrent calls. The default
   BM25 path is byte-identical; per-call semantics are unchanged.
+- **`mms status` no longer prints per-server rows** (#645): status is now a
+  config summary; per-server detail (including the surfacing toggle) lives in
+  `mms list`, which gains a SURFACING column. Scripts scraping status's human
+  `compression=` / `surfacing=` lines must switch to `mms list` or
+  `mms status --json` — the JSON shape is unchanged apart from two additive
+  keys (`server_count`, `pruned_count`).
 
 ### Security
 
