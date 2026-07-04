@@ -80,19 +80,27 @@ def _permissive_mode(resolved: Path) -> int | None:
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
-    ``str(ValidationError)`` embeds ``input_value=...`` — for a mistyped
-    secret-bearing field (``headers``/``env``) that is the secret itself, and
     ``ConfigLoadResult.error`` flows to the MCP client via
-    ``stm_proxy_health``. Rebuild from ``errors(include_input=False)``
-    (location + message only). Non-pydantic errors (``json.JSONDecodeError``,
-    the non-object-root ``ValueError``) describe positions/types, not values.
+    ``stm_proxy_health``, so it must not echo config *values*. Pydantic
+    smuggles them in two ways: ``input_value=...`` (dropped via
+    ``include_input=False``) and the rendered ``msg`` of a custom
+    model-validator — e.g. the duplicate-prefix check embeds the prefix
+    string, which is the secret itself if someone typos a token into a
+    ``prefix`` field. So the summary uses ``loc`` + the machine-readable
+    ``type`` code (``dict_type`` / ``value_error`` / ``missing`` …) only,
+    never ``msg``. Full messages stay in the local stderr log and in
+    ``mms config validate``, which reads the raw errors directly.
+
+    Non-pydantic errors (``json.JSONDecodeError``, the non-object-root
+    ``ValueError``) describe positions/types, not config values.
     """
     if isinstance(exc, ValidationError):
         parts = []
         for err in exc.errors(include_url=False, include_input=False):
             loc = ".".join(str(part) for part in err["loc"])
-            parts.append(f"{loc}: {err['msg']}" if loc else err["msg"])
-        return "; ".join(parts)
+            parts.append(f"{loc} ({err['type']})" if loc else err["type"])
+        summary = "; ".join(parts)
+        return f"{exc.error_count()} validation error(s): {summary}"
     return str(exc)
 
 

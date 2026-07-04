@@ -157,7 +157,8 @@ class TestLoadFromFileWithStatus:
         }))
         result = ProxyConfig.load_from_file_with_status(cfg_file)
         assert result.config is None
-        assert result.error is not None and "Duplicate upstream prefixes" in result.error
+        # loc + type, not the raw validator message (which embeds prefixes).
+        assert result.error is not None and "value_error" in result.error
         assert result.unknown_keys == ("bogus_key",)
 
     def test_missing_file_is_not_an_error(self, tmp_path):
@@ -217,6 +218,25 @@ class TestLoadFromFileWithStatus:
         assert result.error is not None
         assert "SECRET_TOKEN_ABC" not in result.error
         assert "upstream_servers.gh.headers" in result.error
+
+    def test_error_never_carries_custom_validator_values(self, tmp_path):
+        """Round-2 codex: pydantic input_value was only one leak channel —
+        a custom model-validator renders raw values into its message too
+        (the duplicate-prefix check embeds the prefix string). A secret
+        typo'd into a `prefix` field must not reach ConfigLoadResult.error,
+        which flows to the MCP client via stm_proxy_health."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({
+            "upstream_servers": {
+                "a": {"prefix": "SECRET_TOKEN_ABC", "command": "a"},
+                "b": {"prefix": "SECRET_TOKEN_ABC", "command": "b"},
+            }
+        }))
+        result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is None
+        assert result.error is not None
+        assert "SECRET_TOKEN_ABC" not in result.error
+        assert "value_error" in result.error
 
     def test_log_warnings_false_suppresses_advisory_warnings(self, tmp_path, caplog):
         """codex review of #611: ProxyManager.start()'s empty-upstreams
