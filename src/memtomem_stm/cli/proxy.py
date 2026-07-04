@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, NoReturn, TextIO
 
 import click
 
@@ -652,6 +652,47 @@ def _redacted_servers_json(servers: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _echo_json(payload: dict[str, Any]) -> None:
+    """Emit the single JSON document of a mutating command's ``--json`` run.
+
+    In ``--json`` mode stdout carries exactly one JSON object — human
+    diagnostics stay on stderr — so ``mms <cmd> --json | jq`` parses on
+    success and failure alike. Same formatting as the read-only commands.
+    """
+    click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _json_fail(
+    action: str, code: str, message: str, *, exit_code: int = 1, **fields: Any
+) -> NoReturn:
+    """Failure envelope for a mutating command's ``--json`` mode.
+
+    Callers print their human stderr line first (wording shared with the
+    non-JSON path), then delegate the stdout document + exit here. ``code``
+    is the stable snake_case identifier scripts branch on; ``message`` is
+    the human sentence. Exit 1 = operational failure; exit 2 = consent
+    missing (`host sync --json` precedent — a formatting flag must not
+    authorize a destructive write, so ``--json`` without ``--yes`` refuses
+    rather than prompts).
+    """
+    _echo_json({"action": action, "ok": False, "error": code, "message": message, **fields})
+    sys.exit(exit_code)
+
+
+def _json_requires_yes(action: str) -> NoReturn:
+    """Refuse a prompting action in ``--json`` mode without ``--yes`` (exit 2)."""
+    click.echo(
+        f"{_err('Error:')} --json runs non-interactively; pass --yes to confirm.",
+        err=True,
+    )
+    _json_fail(
+        action,
+        "confirmation_required",
+        "--json runs non-interactively; pass --yes to confirm",
+        exit_code=2,
+    )
+
+
 def _origin_fully_pruned(origin: Any) -> bool:
     """True when provenance records *every* host source as pruned (#475 PR4).
 
@@ -1066,7 +1107,8 @@ def stats(
     "via STM. Default: interactive prompt on TTY, skip on non-TTY. Only "
     "valid with --from-clients/--import.",
 )
-@with_config_write_lock()
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
+@with_config_write_lock(json_envelope=True)
 def add(
     name: str | None,
     config_path: str,
@@ -1082,11 +1124,19 @@ def add(
     validate_timeout: int,
     from_clients: bool,
     prune: bool,
+    as_json: bool = False,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
     path = Path(config_path)
 
     if from_clients:
+        if as_json:
+            # The import path is an interactive TUI selection flow — no
+            # non-interactive contract to serialize yet (mirrors `mms tune`
+            # rejecting --json with --apply).
+            raise click.UsageError(
+                "--json is not supported with --from-clients/--import (interactive selection)."
+            )
         # Guard against mixing interactive-import with single-server manual
         # flags — silently ignoring them would be surprising. `--validate` /
         # `--timeout` / `--config` are shared with both paths and don't
@@ -1133,6 +1183,8 @@ def add(
             f"{_err('Error:')} server '{name}' already exists. Use `remove` first.",
             err=True,
         )
+        if as_json:
+            _json_fail("add", "already_exists", f"server '{name}' already exists", name=name)
         sys.exit(1)
 
     # VAL-1: prefix format validation
@@ -1143,6 +1195,8 @@ def add(
             "and must not contain '__'.",
             err=True,
         )
+        if as_json:
+            _json_fail("add", "invalid_prefix", f"invalid prefix '{prefix}'", name=name)
         sys.exit(1)
 
     # VAL-1b: prefix length vs the 64-char MCP tool name limit (#261). We
@@ -1169,37 +1223,60 @@ def add(
             "      loosens to match.",
             err=True,
         )
+        if as_json:
+            _json_fail(
+                "add",
+                "prefix_too_long",
+                f"prefix '{prefix}' is {len(prefix)} chars; max is {hard_limit}",
+                name=name,
+            )
         sys.exit(1)
+    # Non-abort warnings print to stderr in both modes AND land in the
+    # --json ``warnings`` array — one message string so wording can't fork.
+    warnings_json: list[str] = []
     if len(prefix) > warn_at:
         max_tool = tool_name_budget.TOOL_NAME_LIMIT - tool_name_budget.overhead() - len(prefix)
-        click.echo(
-            f"{_warn('Warning:')} prefix '{prefix}' ({len(prefix)} chars) "
+        warn_msg = (
+            f"prefix '{prefix}' ({len(prefix)} chars) "
             f"leaves only {max_tool} chars for upstream tool names — longer "
             f"ones will be silently dropped by clients. Consider a shorter "
             f"--prefix, or register STM as 'mms' in your client config. "
-            f"Proceeding.",
-            err=True,
+            f"Proceeding."
         )
+        click.echo(f"{_warn('Warning:')} {warn_msg}", err=True)
+        warnings_json.append(warn_msg)
 
     # VAL-2: duplicate prefix warning
     for srv_name, srv_cfg in servers.items():
         if srv_cfg.get("prefix") == prefix:
-            click.echo(
-                f"{_warn('Warning:')} prefix '{prefix}' is already used by server "
+            dup_msg = (
+                f"prefix '{prefix}' is already used by server "
                 f"'{srv_name}'. Duplicate-named tools will shadow each "
-                f"other at runtime. Proceeding anyway.",
-                err=True,
+                f"other at runtime. Proceeding anyway."
             )
+            click.echo(f"{_warn('Warning:')} {dup_msg}", err=True)
+            warnings_json.append(dup_msg)
             break
 
     # VAL-3: stdio requires --command
     if transport == "stdio" and not command:
         click.echo(f"{_err('Error:')} --command is required for stdio transport.", err=True)
+        if as_json:
+            _json_fail(
+                "add",
+                "stdio_requires_command",
+                "--command is required for stdio transport",
+                name=name,
+            )
         sys.exit(1)
 
     # VAL-4: sse/streamable_http requires --url
     if transport != "stdio" and not url:
         click.echo(f"{_err('Error:')} --url is required for {transport} transport.", err=True)
+        if as_json:
+            _json_fail(
+                "add", "url_required", f"--url is required for {transport} transport", name=name
+            )
         sys.exit(1)
 
     entry: dict[str, Any] = {
@@ -1215,6 +1292,8 @@ def add(
                 entry["args"] = _split_args(args_str)
             except ValueError as exc:
                 click.echo(f"{_err('Error:')} malformed --args: {exc}", err=True)
+                if as_json:
+                    _json_fail("add", "malformed_args", f"malformed --args: {exc}", name=name)
                 sys.exit(1)
     else:
         entry["url"] = url
@@ -1224,6 +1303,10 @@ def add(
         for pair in env_pairs:
             if "=" not in pair:
                 click.echo(f"{_err('Error:')} --env must be KEY=VALUE, got: {pair}", err=True)
+                if as_json:
+                    _json_fail(
+                        "add", "invalid_env", f"--env must be KEY=VALUE, got: {pair}", name=name
+                    )
                 sys.exit(1)
             k, v = pair.split("=", 1)
             if not k:
@@ -1231,6 +1314,13 @@ def add(
                     f"{_err('Error:')} --env key must be non-empty, got: {pair}",
                     err=True,
                 )
+                if as_json:
+                    _json_fail(
+                        "add",
+                        "invalid_env",
+                        f"--env key must be non-empty, got: {pair}",
+                        name=name,
+                    )
                 sys.exit(1)
             if k.upper() in _DANGEROUS_ENV_KEYS:
                 click.echo(
@@ -1238,20 +1328,52 @@ def add(
                     "(could enable code injection in spawned processes).",
                     err=True,
                 )
+                if as_json:
+                    _json_fail(
+                        "add",
+                        "invalid_env",
+                        f"--env key '{k}' is blocked for security reasons",
+                        name=name,
+                    )
                 sys.exit(1)
             env_dict[k] = v
         entry["env"] = env_dict
 
+    tools_reachable: int | None = None
     if validate:
-        click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
+        if not as_json:
+            click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
         probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
         if not probe["connected"]:
             click.echo(f"{_err('Error:')} validation failed — {probe['error']}", err=True)
+            if as_json:
+                _json_fail(
+                    "add", "validation_failed", f"validation failed — {probe['error']}", name=name
+                )
             sys.exit(1)
-        click.echo(f"{_ok('Validated:')} {probe['tools']} tool(s) reachable.")
+        tools_reachable = probe["tools"]
+        if not as_json:
+            click.echo(f"{_ok('Validated:')} {probe['tools']} tool(s) reachable.")
 
     servers[name] = entry
     _save(path, data)
+    if as_json:
+        _echo_json(
+            {
+                "action": "add",
+                "ok": True,
+                "config_path": str(path.expanduser().resolve()),
+                "name": name,
+                "prefix": prefix,
+                # Redacted like `status`/`list` --json: env/header values are
+                # secret-bearing and --json output is routinely piped to logs.
+                "server": _redacted_servers_json({name: entry})[name],
+                "validated": validate,
+                "tools_reachable": tools_reachable,
+                "warnings": warnings_json,
+            }
+        )
+        return
     click.echo(f"{_ok('Added')} server '{name}' (prefix={prefix})")
 
 
@@ -1859,20 +1981,29 @@ def _handle_source_prune(
 
 
 def _report_prune_results(
-    pruned: list[tuple[str, str]], failed: list[tuple[str, str, str]]
+    pruned: list[tuple[str, str]],
+    failed: list[tuple[str, str, str]],
+    *,
+    quiet_success: bool = False,
 ) -> bool:
     """Print the prune outcome — shared by ``_handle_source_prune`` and the
     ``prune`` command so the operator-facing wording cannot drift between
     them. Returns ``True`` when any removal failed (the command path exits
-    non-zero on that)."""
-    if pruned:
+    non-zero on that). ``quiet_success`` (the ``--json`` path) skips the
+    stdout success block — the JSON payload carries it — while the stderr
+    failure diagnostics still print."""
+    if pruned and not quiet_success:
         click.echo("")
         click.echo(f"{_ok('Removed from source client(s):')}")
         for name, src in pruned:
             click.echo(f"  {name} — {src}")
 
     if failed:
-        click.echo("")
+        # Visual separator: stdout in human mode, but it must not precede
+        # the JSON document in --json mode — stdout carries exactly one
+        # JSON object there (json.loads tolerates leading whitespace, so a
+        # naive parse test would not catch this).
+        click.echo("", err=quiet_success)
         click.echo(
             f"{_warn('Warning:')} could not remove {len(failed)} direct registration(s):",
             err=True,
@@ -2666,8 +2797,14 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
 @click.argument("name")
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
-@with_config_write_lock()
-def remove(name: str, config_path: str, yes: bool) -> None:
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output as JSON for scripting (requires --yes).",
+)
+@with_config_write_lock(json_envelope=True)
+def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> None:
     """Remove an upstream MCP server from the proxy configuration."""
     path = Path(config_path)
     # Missing-config guard matching prune/register: _load returns the default
@@ -2677,23 +2814,52 @@ def remove(name: str, config_path: str, yes: bool) -> None:
     if not resolved.exists():
         click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
         click.echo("  Run `mms init` first.", err=True)
+        if as_json:
+            _json_fail(
+                "remove",
+                "config_not_found",
+                f"config not found at {resolved}",
+                path=str(resolved),
+            )
         sys.exit(1)
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     if name not in servers:
         click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
+        if as_json:
+            _json_fail("remove", "server_not_found", f"server '{name}' not found", name=name)
         sys.exit(1)
 
+    warnings: list[str] = []
     hint = _remove_eject_hint(name, servers[name])
     if hint:
-        click.echo(hint)
+        if as_json:
+            # Same wording as the terminal hint; unstyle so the payload never
+            # carries ANSI codes (click only strips them on echo, not dumps).
+            warnings.append(click.unstyle(hint))
+        else:
+            click.echo(hint)
 
     if not yes:
+        if as_json:
+            _json_requires_yes("remove")
         click.confirm(f"Remove server '{name}'?", abort=True)
 
     del servers[name]
     _save(path, data)
+    if as_json:
+        _echo_json(
+            {
+                "action": "remove",
+                "ok": True,
+                "config_path": str(resolved),
+                "name": name,
+                "removed": True,
+                "warnings": warnings,
+            }
+        )
+        return
     click.echo(f"{_ok('Removed')} server '{name}'.")
 
 
@@ -3103,7 +3269,7 @@ def tune(
     assume_yes: bool,
     since_hours: float,
     tool_filter: str | None,
-    as_json: bool,
+    as_json: bool = False,
 ) -> None:
     """Preview and apply per-tool compression tuning recommendations.
 
@@ -3289,13 +3455,20 @@ def tune(
     is_flag=True,
     help="Print what would be pruned; no writes.",
 )
-@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")))
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output as JSON for scripting (requires --yes, or --dry-run).",
+)
+@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")), json_envelope=True)
 def prune(
     names: tuple[str, ...],
     config_path: str,
     all_servers: bool,
     assume_yes: bool,
     dry_run: bool,
+    as_json: bool = False,
 ) -> None:
     """Remove direct registrations for STM upstreams that are dual-registered.
 
@@ -3317,11 +3490,41 @@ def prune(
     if not resolved.exists():
         click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
         click.echo("  Run `mms init` first.", err=True)
+        if as_json:
+            _json_fail(
+                "prune",
+                "config_not_found",
+                f"config not found at {resolved}",
+                path=str(resolved),
+            )
         sys.exit(1)
+
+    def _prune_json_payload(
+        planned: list[dict[str, str]],
+        pruned: list[tuple[str, str]],
+        failed: list[tuple[str, str, str]],
+    ) -> dict[str, Any]:
+        # All keys always present (locked shape — `host sync --json` doctrine)
+        # so scripts can branch without existence checks.
+        return {
+            "action": "prune",
+            "ok": not failed,
+            "dry_run": dry_run,
+            "config_path": str(resolved),
+            "planned": planned,
+            "pruned": [{"name": n, "source": s} for n, s in pruned],
+            "failed": [
+                {"name": n, "source": s, "error": e, "hint": _source_removal_hint(n, s)}
+                for n, s, e in failed
+            ],
+        }
 
     data = _load(resolved)
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
+        if as_json:
+            _echo_json(_prune_json_payload([], [], []))
+            return
         click.echo("No upstream servers configured.")
         return
 
@@ -3346,20 +3549,34 @@ def prune(
                 "client, or registered with a different command/URL in the source.",
                 err=True,
             )
+            if as_json:
+                _json_fail(
+                    "prune",
+                    "not_dual_registered",
+                    f"not dual-registered: {', '.join(sorted(missing))}",
+                    names=sorted(missing),
+                )
             sys.exit(1)
         requested = set(names)
         dual = [c for c in dual if c["name"] in requested]
 
     if not dual:
+        if as_json:
+            _echo_json(_prune_json_payload([], [], []))
+            return
         click.echo("No dual-registered upstreams found.")
         return
 
     # Preview iteration must cover the same ``source + duplicate_in`` set
     # that ``_prune_imported_candidates`` acts on — otherwise a user could
     # approve fewer entries than get written. See
-    # ``test_duplicate_in_sources_all_pruned`` for the contract pin.
-    click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
+    # ``test_duplicate_in_sources_all_pruned`` for the contract pin. The
+    # ``--json`` ``planned`` rows come from this same loop so the machine
+    # plan and the human preview cannot drift.
+    if not as_json:
+        click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
     name_width = max((len(c["name"]) for c in dual), default=0)
+    planned: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for cand in dual:
         detail = _format_candidate_detail(cand["entry"])
@@ -3368,15 +3585,24 @@ def prune(
             if key in seen:
                 continue
             seen.add(key)
-            click.echo(f"  {cand['name']:<{name_width}}  {detail}  — {src}")
+            planned.append({"name": cand["name"], "source": src})
+            if not as_json:
+                click.echo(f"  {cand['name']:<{name_width}}  {detail}  — {src}")
 
     if dry_run:
+        if as_json:
+            _echo_json(_prune_json_payload(planned, [], []))
+            return
         click.echo("")
         click.echo(f"{_ok('Dry run:')} no writes performed.")
         return
 
     if assume_yes:
         proceed = True
+    elif as_json:
+        # Never prompt in --json mode, even on a TTY — a formatting flag
+        # must not authorize destructive writes (host sync precedent).
+        _json_requires_yes("prune")
     elif _should_use_tui():
         click.echo("")
         proceed = click.confirm("Remove from source(s)?", default=False)
@@ -3399,7 +3625,12 @@ def prune(
     # config untouched (the backup rows above are their only record).
     if _mark_pruned_sources(upstreams, dual, pruned, pruned_at):
         _save(resolved, data)
-    if _report_prune_results(pruned, failed):
+    # In --json mode the stdout success block is replaced by the payload;
+    # the stderr failure diagnostics keep printing (stdout stays pure JSON).
+    had_failures = _report_prune_results(pruned, failed, quiet_success=as_json)
+    if as_json:
+        _echo_json(_prune_json_payload(planned, pruned, failed))
+    if had_failures:
         sys.exit(1)
 
 
@@ -3682,12 +3913,16 @@ def _resolve_eject_plan(
     *,
     force: bool,
     allow_argv_secrets: bool,
+    interactive: bool = True,
 ) -> _EjectPlan:
     """Decide target, payload, and guards for one entry — no writes.
 
     Implements RFC #475 §4.3 steps 1–3 plus the secret gate's non-TTY
     branch. TTY secret confirmation is deferred to execution time so the
-    prompt sits next to the write it authorizes.
+    prompt sits next to the write it authorizes. ``interactive=False``
+    (the ``--json`` path, which never prompts) forces the secret gate down
+    the non-TTY branch even on a real TTY, so the entry fails with the
+    same wording in both modes.
     """
     if not isinstance(entry, dict):
         return _EjectPlan(name=name, error="entry is not an object — fix the config by hand")
@@ -3799,7 +4034,7 @@ def _resolve_eject_plan(
     if shell_out and not skip_write and not allow_argv_secrets:
         secret_keys = _payload_secret_keys(payload)
         if secret_keys:
-            if not _should_use_tui():
+            if not interactive or not _should_use_tui():
                 return _EjectPlan(
                     name=name,
                     error=(
@@ -3929,7 +4164,13 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     is_flag=True,
     help="Skip the confirm prompt (scripts / CI / non-TTY callers).",
 )
-@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")))
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output as JSON for scripting (requires --yes, or --dry-run).",
+)
+@with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")), json_envelope=True)
 def eject(
     names: tuple[str, ...],
     config_path: str,
@@ -3940,6 +4181,7 @@ def eject(
     accept_schema_loss: bool,
     dry_run: bool,
     assume_yes: bool,
+    as_json: bool = False,
 ) -> None:
     """Restore imported upstream(s) to their host MCP client, then remove from STM.
 
@@ -3954,6 +4196,13 @@ def eject(
     if not resolved.exists():
         click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
         click.echo("  Run `mms init` first.", err=True)
+        if as_json:
+            _json_fail(
+                "eject",
+                "config_not_found",
+                f"config not found at {resolved}",
+                path=str(resolved),
+            )
         sys.exit(1)
 
     data = _load(resolved)
@@ -3961,44 +4210,111 @@ def eject(
     missing = [n for n in names if n not in servers]
     if missing:
         click.echo(f"{_err('Error:')} not configured: {', '.join(missing)}.", err=True)
+        if as_json:
+            _json_fail(
+                "eject",
+                "not_configured",
+                f"not configured: {', '.join(missing)}",
+                names=missing,
+            )
         sys.exit(1)
 
     to_spec = _parse_eject_to(to_target) if to_target else None
     plans = [
         _resolve_eject_plan(
-            n, servers[n], to_spec, force=force, allow_argv_secrets=allow_argv_secrets
+            n,
+            servers[n],
+            to_spec,
+            force=force,
+            allow_argv_secrets=allow_argv_secrets,
+            # --json never prompts; route the secret gate to its non-TTY
+            # branch so the entry fails with the same wording either way.
+            interactive=not as_json,
         )
         for n in names
     ]
 
+    def _eject_json_payload(
+        restored_names: list[str],
+        failed_rows: list[tuple[_EjectPlan, str]],
+    ) -> dict[str, Any]:
+        # All keys always present (locked shape). ``plan`` mirrors the human
+        # plan display; ``_EjectPlan.payload`` is never serialized — it is
+        # the verbatim host entry and may carry secrets. ``failed[].hint``
+        # embeds the payload the same way the stderr hint already does.
+        return {
+            "action": "eject",
+            "ok": not failed_rows and not errors,
+            "dry_run": dry_run,
+            "keep": keep,
+            "config_path": str(resolved),
+            "plan": [
+                {
+                    "name": p.name,
+                    "target": None if p.error else {"kind": p.kind, "path": p.path},
+                    "write": None
+                    if p.error
+                    else (
+                        "skip_write"
+                        if p.skip_write
+                        else ("overwrite" if p.overwrite else "restore")
+                    ),
+                    "verbatim": p.verbatim,
+                    "warnings": list(p.warnings or []),
+                    "pruned_duplicates": list(p.pruned_duplicates or []),
+                    "error": p.error,
+                }
+                for p in plans
+            ],
+            "restored": restored_names,
+            "removed_from_stm": [] if keep else restored_names,
+            "failed": [
+                {
+                    "name": p.name,
+                    "error": err,
+                    "hint": _eject_manual_hint(p.name, p.kind, p.path, p.payload)
+                    if p.payload is not None
+                    else None,
+                }
+                for p, err in failed_rows
+            ],
+        }
+
     # Plan display — every entry, actionable or not, before any consent.
-    click.echo(_hdr(f"Eject plan ({len(plans)} entr{'y' if len(plans) == 1 else 'ies'}):"))
-    for plan in plans:
-        if plan.error:
-            click.echo(f"  {plan.name}: {_bad('cannot eject')} — {plan.error}")
-            continue
-        spec = _SOURCE_BY_KIND[plan.kind]
-        where = f"{spec.label}" + (f" [{plan.path}]" if plan.path else "")
-        action = (
-            "already present — skip write"
-            if plan.skip_write
-            else ("overwrite" if plan.overwrite else "restore")
-        )
-        body = "verbatim original" if plan.verbatim else "reconstructed entry"
-        click.echo(f"  {plan.name}: {action} → {where}  ({body})")
-        for w in plan.warnings or []:
-            click.echo(f"    {_warn('warning:')} {w}")
-        if plan.pruned_duplicates:
-            click.echo(
-                f"    {_warn('note:')} also pruned from {', '.join(plan.pruned_duplicates)} — "
-                "not restored here; originals remain in "
-                f"{_pruned_backup_path()} (restore manually if needed)"
+    # Suppressed in --json mode: the payload's ``plan`` rows carry it.
+    if not as_json:
+        click.echo(_hdr(f"Eject plan ({len(plans)} entr{'y' if len(plans) == 1 else 'ies'}):"))
+        for plan in plans:
+            if plan.error:
+                click.echo(f"  {plan.name}: {_bad('cannot eject')} — {plan.error}")
+                continue
+            spec = _SOURCE_BY_KIND[plan.kind]
+            where = f"{spec.label}" + (f" [{plan.path}]" if plan.path else "")
+            action = (
+                "already present — skip write"
+                if plan.skip_write
+                else ("overwrite" if plan.overwrite else "restore")
             )
+            body = "verbatim original" if plan.verbatim else "reconstructed entry"
+            click.echo(f"  {plan.name}: {action} → {where}  ({body})")
+            for w in plan.warnings or []:
+                click.echo(f"    {_warn('warning:')} {w}")
+            if plan.pruned_duplicates:
+                click.echo(
+                    f"    {_warn('note:')} also pruned from {', '.join(plan.pruned_duplicates)} — "
+                    "not restored here; originals remain in "
+                    f"{_pruned_backup_path()} (restore manually if needed)"
+                )
 
     errors = [p for p in plans if p.error]
     actionable = [p for p in plans if not p.error]
 
     if dry_run:
+        if as_json:
+            _echo_json(_eject_json_payload([], []))
+            if errors:
+                sys.exit(1)
+            return
         click.echo("")
         click.echo(f"{_ok('Dry run:')} no writes performed.")
         if errors:
@@ -4006,10 +4322,16 @@ def eject(
         return
 
     if not actionable:
+        if as_json:
+            _echo_json(_eject_json_payload([], []))
         sys.exit(1)
 
     if assume_yes:
         proceed = True
+    elif as_json:
+        # Never prompt in --json mode, even on a TTY — a formatting flag
+        # must not authorize destructive writes (host sync precedent).
+        _json_requires_yes("eject")
     elif _should_use_tui():
         click.echo("")
         verb = (
@@ -4085,7 +4407,7 @@ def eject(
     if config_changed:
         _save(resolved, data)
 
-    if restored:
+    if restored and not as_json:
         click.echo("")
         if keep:
             click.echo(f"{_ok('Restored to host (kept in STM):')}")
@@ -4101,7 +4423,8 @@ def eject(
             )
 
     if failed:
-        click.echo("")
+        if not as_json:
+            click.echo("")
         click.echo(f"{_warn('Warning:')} could not eject {len(failed)} entr(ies):", err=True)
         for plan, err in failed:
             click.echo(f"  {plan.name}: {err}", err=True)
@@ -4120,11 +4443,16 @@ def eject(
                 )
 
     if config_changed and not servers:
-        click.echo("")
+        # In --json mode the note goes to stderr so stdout stays pure JSON.
+        click.echo("", err=as_json)
         click.echo(
             f"{_warn('Note:')} no upstream servers remain. To also remove STM's own "
-            "client registration, run: claude mcp remove memtomem-stm"
+            "client registration, run: claude mcp remove memtomem-stm",
+            err=as_json,
         )
+
+    if as_json:
+        _echo_json(_eject_json_payload([p.name for p in restored], failed))
 
     if failed or errors:
         sys.exit(1)
