@@ -23,6 +23,7 @@ from memtomem_stm.logging_setup import (
     PrivateRotatingFileHandler,
     configure_server_logging,
     describe_log_destination,
+    log_file_writable,
     open_private_log_handler,
 )
 
@@ -163,10 +164,45 @@ class TestConfigureServerLogging:
             locked.chmod(0o700)
 
 
+class TestLogFileWritable:
+    def test_missing_file_writable_parent(self, tmp_path):
+        assert log_file_writable(tmp_path / "sub" / "stm.log") is True
+
+    @_skip_on_windows
+    def test_missing_file_unwritable_parent(self, tmp_path):
+        locked = tmp_path / "locked"
+        locked.mkdir(mode=0o500)
+        try:
+            assert log_file_writable(locked / "sub" / "stm.log") is False
+        finally:
+            locked.chmod(0o700)
+
+    @_skip_on_windows
+    def test_existing_unwritable_file(self, tmp_path):
+        path = tmp_path / "stm.log"
+        path.touch()
+        path.chmod(0o400)
+        try:
+            assert log_file_writable(path) is False
+        finally:
+            path.chmod(0o600)
+
+    def test_probe_does_not_create_anything(self, tmp_path):
+        path = tmp_path / "sub" / "stm.log"
+        log_file_writable(path)
+        assert not path.exists()
+        assert not path.parent.exists()
+
+
 class TestDescribeLogDestination:
     def test_unset(self):
         d = describe_log_destination(STMConfig(log_file=None, log_level="WARNING"))
-        assert d == {"log_level": "WARNING", "log_file": None, "destination": "stderr"}
+        assert d == {
+            "log_level": "WARNING",
+            "log_file": None,
+            "destination": "stderr",
+            "writable": None,
+        }
 
     def test_set(self, tmp_path):
         path = tmp_path / "stm.log"
@@ -174,6 +210,7 @@ class TestDescribeLogDestination:
         assert d["log_level"] == "DEBUG"
         assert d["log_file"] == str(path.expanduser())
         assert d["destination"] == "stderr+file"
+        assert d["writable"] is True
 
 
 class TestEnvWiring:

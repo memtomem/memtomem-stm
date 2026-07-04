@@ -114,11 +114,39 @@ def configure_server_logging(config: STMConfig) -> Path | None:
     return active_path
 
 
+def log_file_writable(path: Path) -> bool:
+    """Best-effort, non-mutating check that ``open_private_log_handler`` would
+    succeed for *path*.
+
+    ``mms health`` runs in a separate process from the server, so it cannot
+    observe the live handler — it can only tell whether the configured path
+    *would* open. Mirrors the handler's needs (create parent dirs, then the
+    file) without any side effect: an existing file must be writable; a
+    missing one needs its nearest existing ancestor writable + traversable.
+    """
+    resolved = path.expanduser()
+    if resolved.exists():
+        return os.access(resolved, os.W_OK)
+    ancestor = resolved.parent
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    return os.access(ancestor, os.W_OK | os.X_OK)
+
+
 def describe_log_destination(config: STMConfig) -> dict[str, Any]:
-    """Shared payload for ``mms health`` text and ``--json`` output."""
+    """Shared payload for ``mms health`` text and ``--json`` output.
+
+    ``writable`` reflects whether the configured ``log_file`` can be opened
+    right now (``None`` when unset). It is deliberately *configured*, not
+    *active*: a separate ``mms health`` process cannot see the running
+    server's handler, so an unwritable path means the server would fall back
+    to stderr — which the health text then says explicitly rather than
+    pointing at a file that receives nothing.
+    """
     log_file = str(config.log_file.expanduser()) if config.log_file is not None else None
     return {
         "log_level": config.log_level,
         "log_file": log_file,
         "destination": "stderr+file" if log_file else "stderr",
+        "writable": log_file_writable(config.log_file) if config.log_file is not None else None,
     }

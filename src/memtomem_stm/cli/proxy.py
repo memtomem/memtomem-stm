@@ -188,13 +188,20 @@ def _logging_destination_status() -> dict[str, Any]:
 
 def _format_logging_destination(status: dict[str, Any]) -> str:
     """One ``Logging:`` line — always printed, so users learn the file-log
-    option exists even while running stderr-only."""
+    option exists even while running stderr-only. When a configured log file
+    isn't writable, name stderr as the real destination (the server degrades
+    to it) instead of pointing at a file that receives nothing."""
     if "error" in status:
         return f"{_warn('Logging:')} {status['error']}"
     if status["log_file"]:
+        if status.get("writable"):
+            return (
+                f"Logging: stderr + file {status['log_file']} "
+                f"(level {status['log_level']}, rotating)"
+            )
         return (
-            f"Logging: stderr + file {status['log_file']} "
-            f"(level {status['log_level']}, rotating)"
+            f"{_warn('Logging:')} stderr only — configured log file {status['log_file']} "
+            "is not writable; the server falls back to stderr"
         )
     return "Logging: stderr only (set MEMTOMEM_STM_LOG_FILE for a persistent log)"
 
