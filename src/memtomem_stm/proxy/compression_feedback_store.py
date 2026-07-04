@@ -156,27 +156,36 @@ class CompressionFeedbackStore:
             )
             self._db.commit()
 
-    def get_tool_feedback_summary(self, since_seconds: float = 86400.0) -> dict[str, dict]:
-        """Aggregate feedback per tool for auto-tuner analysis.
+    def get_tool_feedback_summary(
+        self, since_seconds: float = 86400.0
+    ) -> dict[tuple[str, str], dict]:
+        """Aggregate feedback per ``(server, tool)`` for auto-tuner analysis.
 
-        Returns ``{tool: {"total": int, "by_kind": {kind: count}}}``
+        Returns ``{(server, tool): {"total": int, "by_kind": {kind: count}}}``
         within the given time window.  Returns an empty dict when the
         store is closed or there are no rows.
+
+        Keyed by ``(server, tool)``, not tool name alone: rows are recorded
+        with both, and two upstreams can expose the same tool name — a
+        tool-only aggregate would attribute one server's feedback to the
+        other's profile, and the tuner turns that into a per-server config
+        recommendation.
         """
         if self._db is None:
             return {}
         cutoff = time.time() - since_seconds
         rows = self._db.execute(
-            "SELECT tool, kind, COUNT(*) FROM compression_feedback "
-            "WHERE created_at >= ? GROUP BY tool, kind",
+            "SELECT server, tool, kind, COUNT(*) FROM compression_feedback "
+            "WHERE created_at >= ? GROUP BY server, tool, kind",
             (cutoff,),
         ).fetchall()
-        result: dict[str, dict] = {}
-        for tool_name, kind, count in rows:
-            if tool_name not in result:
-                result[tool_name] = {"total": 0, "by_kind": {}}
-            result[tool_name]["total"] += count
-            result[tool_name]["by_kind"][kind] = count
+        result: dict[tuple[str, str], dict] = {}
+        for server_name, tool_name, kind, count in rows:
+            key = (server_name, tool_name)
+            if key not in result:
+                result[key] = {"total": 0, "by_kind": {}}
+            result[key]["total"] += count
+            result[key]["by_kind"][kind] = count
         return result
 
     def get_stats(self, tool: str | None = None) -> dict:

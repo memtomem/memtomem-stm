@@ -99,7 +99,7 @@ class CompressionTuner:
 
         profiles: list[ToolProfile] = []
         for r in raw:
-            fb = feedback.get(r["tool"], {})
+            fb = feedback.get((r["server"], r["tool"]), {})
             fb_total = fb.get("total", 0)
             fb_kinds = fb.get("by_kind", {})
             fb_dominant = max(fb_kinds, key=fb_kinds.get) if fb_kinds else None
