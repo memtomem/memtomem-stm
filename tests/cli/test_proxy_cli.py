@@ -5944,7 +5944,37 @@ class TestHealth:
         assert "fails validation" in result.output
         assert "No upstream servers configured" in result.output
 
-    def test_health_json_no_servers(self, runner, config):
+    def test_health_logging_line_stderr_only(self, runner, config, monkeypatch):
+        """#612: health always prints where logs go, so users learn the
+        file-log option exists even while running stderr-only."""
+        monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "Logging: stderr only" in result.output
+        assert "MEMTOMEM_STM_LOG_FILE" in result.output
+
+    def test_health_logging_line_with_file(self, runner, config, tmp_path, monkeypatch):
+        logf = tmp_path / "stm.log"
+        monkeypatch.setenv("MEMTOMEM_STM_LOG_FILE", str(logf))
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert f"stderr + file {logf}" in result.output
+        assert "rotating" in result.output
+
+    def test_health_json_logging_key(self, runner, config, tmp_path, monkeypatch):
+        logf = tmp_path / "stm.log"
+        monkeypatch.setenv("MEMTOMEM_STM_LOG_FILE", str(logf))
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        logging_status = json.loads(result.output)["logging"]
+        assert logging_status["log_file"] == str(logf)
+        assert logging_status["destination"] == "stderr+file"
+
+    def test_health_json_no_servers(self, runner, config, monkeypatch):
+        monkeypatch.delenv("MEMTOMEM_STM_LOG_FILE", raising=False)
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert result.exit_code == 0
@@ -5952,6 +5982,7 @@ class TestHealth:
         assert data["servers"] == {}
         assert data["config_valid"] is True
         assert data["config_error"] is None
+        assert data["logging"]["destination"] == "stderr"
         assert data["surfacing"]["enabled"] is True
         assert data["surfacing"]["feedback_enabled"] is True
         assert data["surfacing"]["feedback_db"]["exists"] is False

@@ -31,6 +31,17 @@ loggers.  Default `WARNING`.  Read once at startup — restart to
 apply changes.
 
 ```bash
+export MEMTOMEM_STM_LOG_FILE=~/.memtomem/stm.log   # opt-in rotating file log
+```
+
+Adds a rotating file handler alongside stderr (the server otherwise
+logs to stderr only, which an MCP client captures or drops). File
+created `0o600`, parent dir `0o700`; rotates at 2 MiB with 3 backups.
+Unset (default) keeps stderr-only logging. `mms health` prints the
+active destination. A path that can't be opened degrades to a
+stderr warning, not a crash.
+
+```bash
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # opt in
 ```
 

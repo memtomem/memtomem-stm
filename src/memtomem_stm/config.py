@@ -187,6 +187,14 @@ class STMConfig(BaseSettings):
     )
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
+    log_file: Path | None = None
+    """Opt-in rotating file log (#612), e.g. ``~/.memtomem/stm.log`` — set via
+    ``MEMTOMEM_STM_LOG_FILE``. For an MCP-launched stdio server, stderr is
+    captured (or dropped) by the client, so this is the diagnosable trail.
+    Written in addition to stderr via a size-rotating handler (2 MiB × 3
+    backups), file ``0o600`` / parent ``0o700`` per the data-at-rest
+    convention. ``None`` (default) keeps stderr-only logging. Stored raw;
+    ``expanduser()`` happens at the use site (like ``data_dir``)."""
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
