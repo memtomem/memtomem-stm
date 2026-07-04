@@ -1212,3 +1212,113 @@ class TestDaemonRestartCli:
 
         assert result.exit_code == 0, result.output
         assert "still shutting down" in result.output
+
+
+# ── daemon run + handshake coercion helpers ─────────────────────────────────
+
+
+class TestRunCmd:
+    """``mms daemon run`` — the long-lived entry point had no direct test.
+
+    ``run_cmd`` is three load-bearing lines: load config, route logging by
+    ``--detached``, and exit with the server loop's return code. The server
+    loop itself is covered in ``tests/daemon/test_server.py``; here it is
+    stubbed so only the command layer is under test.
+    """
+
+    def _invoke_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str], rc: int
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        seen: dict = {}
+
+        def fake_run(config):
+            seen["config"] = config
+            return rc
+
+        def fake_configure_logging(config, *, detached):
+            seen["detached"] = detached
+
+        # run_cmd imports memtomem_stm.daemon.server.run lazily at call time,
+        # so patching the source module attribute is sufficient.
+        monkeypatch.setattr("memtomem_stm.daemon.server.run", fake_run)
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd._configure_logging", fake_configure_logging
+        )
+        return CliRunner().invoke(_cli(), ["daemon", "run", *args]), seen
+
+    def test_exit_code_is_server_return_code(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        result, seen = self._invoke_run(monkeypatch, tmp_path, [], rc=3)
+        assert result.exit_code == 3
+        assert isinstance(seen["config"], STMConfig)
+
+    def test_foreground_default_routes_logging_to_stderr_handler(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        result, seen = self._invoke_run(monkeypatch, tmp_path, [], rc=0)
+        assert result.exit_code == 0
+        assert seen["detached"] is False
+
+    def test_detached_flag_routes_logging_to_file_handler(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        result, seen = self._invoke_run(monkeypatch, tmp_path, ["--detached"], rc=0)
+        assert result.exit_code == 0
+        assert seen["detached"] is True
+
+
+class TestHandshakeCoercionHelpers:
+    """Direct unit table for ``_as_int`` / ``_as_float``.
+
+    The stop/status corrupted-handshake tests above exercise these only
+    through full CLI invocations; this pins each rejection branch —
+    bool-reject (JSON ``true`` must not become pid 1), TypeError,
+    ValueError, and OverflowError — at the helper level.
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (42, 42),
+            ("42", 42),
+            (42.9, 42),
+            (True, -1),  # bool-reject: JSON true would coerce to pid 1
+            (False, -1),
+            (None, -1),  # TypeError
+            ("junk", -1),  # ValueError
+            (float("inf"), -1),  # OverflowError (JSON Infinity)
+            (float("-inf"), -1),
+            (float("nan"), -1),  # ValueError
+        ],
+    )
+    def test_as_int(self, value, expected):
+        from memtomem_stm.cli.daemon_cmd import _as_int
+
+        assert _as_int(value, default=-1) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (1.5, 1.5),
+            ("1.5", 1.5),
+            (7, 7.0),
+            (True, 0.0),  # bool-reject
+            (False, 0.0),
+            (None, 0.0),  # TypeError
+            ("junk", 0.0),  # ValueError
+            (10**400, 0.0),  # OverflowError: huge int -> float
+        ],
+    )
+    def test_as_float(self, value, expected):
+        from memtomem_stm.cli.daemon_cmd import _as_float
+
+        assert _as_float(value, default=0.0) == expected
+
+    def test_as_float_passes_through_infinity(self):
+        """float('inf') IS a valid float — _as_float guards conversion
+        failures only; range/semantic checks belong to the call sites."""
+        from memtomem_stm.cli.daemon_cmd import _as_float
+
+        assert _as_float(float("inf"), default=0.0) == float("inf")
