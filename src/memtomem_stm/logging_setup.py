@@ -79,10 +79,14 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
     def _open(self):  # type: ignore[override]
         _reject_unsafe_log_target(Path(self.baseFilename))
         fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-        except OSError:
-            pass
+        # Race-free tighten of a pre-existing permissive file. os.fchmod is
+        # POSIX-only; Windows has no fchmod (and ignores POSIX modes anyway),
+        # so guard it — the sibling stores' perm-assertion tests skip Windows.
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
         return os.fdopen(fd, "a", encoding="utf-8")
 
 
