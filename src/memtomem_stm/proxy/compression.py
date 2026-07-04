@@ -11,7 +11,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from memtomem_stm.proxy.pending_store import PendingStore
 
 try:
     import httpx
@@ -839,7 +842,7 @@ class SelectiveCompressor:
         pending_ttl_seconds: float = 300.0,
         json_depth: int = 1,
         min_section_chars: int = 50,
-        store: object | None = None,
+        store: PendingStore | None = None,
         scorer: RelevanceScorer | None = None,
     ) -> None:
         self._max_pending = max_pending
@@ -1866,7 +1869,11 @@ class SchemaPruningCompressor:
             if isinstance(data, dict):
                 # Most compact value form (stubbed nesting + minimal strings) so
                 # as many keys as possible survive before any are dropped.
-                items = list(self._prune(data, max_str=0, max_array=2, max_depth=1).items())
+                # _prune preserves the container kind, so a dict input stays a dict.
+                pruned_dict = cast(
+                    dict[str, Any], self._prune(data, max_str=0, max_array=2, max_depth=1)
+                )
+                items = list(pruned_dict.items())
                 total = len(items)
                 # Collision-safe marker key: never clobber (or repurpose as the
                 # marker) a real top-level "_pruned" field, which would skew the

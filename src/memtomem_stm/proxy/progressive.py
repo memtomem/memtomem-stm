@@ -10,8 +10,12 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from memtomem_stm.proxy.compression import PendingSelection
+
+if TYPE_CHECKING:
+    from memtomem_stm.proxy.pending_store import PendingStore
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,7 @@ class ProgressiveStoreAdapter:
     by encoding ProgressiveResponse into PendingSelection with format="progressive".
     """
 
-    def __init__(self, store: object) -> None:
+    def __init__(self, store: PendingStore) -> None:
         self._store = store
 
     def put(self, key: str, resp: ProgressiveResponse) -> None:
