@@ -49,6 +49,7 @@ from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
     ExposureProfile,
+    ExtractionStrategy,
     HybridConfig,
     LLMCompressorConfig,
     ProgressiveConfig,
@@ -141,6 +142,31 @@ from memtomem_stm.utils.redact import redact_exception_text
 _NO_RETRY_CODES = {-32600, -32601, -32602, -32603}  # INVALID_REQUEST/METHOD/PARAMS/INTERNAL
 
 logger = logging.getLogger(__name__)
+
+
+def _describe_llm_destination(llm: LLMCompressorConfig) -> str:
+    """Human-readable provider + endpoint for the #610 startup warning."""
+    if llm.base_url:
+        return f"{llm.provider.value} ({llm.base_url})"
+    return llm.provider.value
+
+
+def _llm_compression_leaks(
+    compression: CompressionStrategy, llm: LLMCompressorConfig | None
+) -> bool:
+    """True when an LLM_SUMMARY path will send raw text UNSCANNED off-machine.
+
+    Requires an explicit ``llm_summary`` strategy (``auto`` resolves at runtime
+    and would produce noisy static false positives), an attached LLM config
+    with the privacy scan disabled, and an external destination (#610).
+    """
+    return (
+        compression == CompressionStrategy.LLM_SUMMARY
+        and llm is not None
+        and not llm.privacy_scan_enabled
+        and llm.is_external_destination()
+    )
+
 
 # Errors the tool-graph consult treats as "graph unreachable" → on_unreachable.
 # ``eligible_tools()`` already wraps transport failures into
@@ -459,6 +485,78 @@ class ProxyManager:
                     "config is enabled but inert; extracted facts will not be stored",
                     ", ".join(ext_paths),
                 )
+
+        # #610: warn loudly when an LLM path will send raw upstream responses
+        # UNSCANNED to an external provider (privacy_scan_enabled=false). The
+        # scan is default-on; an operator who flips it off otherwise gets no
+        # signal that credential redaction (#289) is now off. Scoped to
+        # *external* destinations — a local Ollama endpoint never leaves the
+        # machine, so a scan-off local path is not flagged.
+        #
+        # Compression (Stage 2) runs in every deployment, so its warning is
+        # unconditional. Extraction (Stage 4b) only fires when an index engine
+        # is wired (gated at the call site, manager.py ~L3768); the standalone
+        # ``mms`` server has none, so extraction never reaches the provider
+        # there — its warning is gated on the same condition to stay accurate.
+        comp_leak_paths: list[str] = []
+        comp_dests: set[str] = set()
+        default_comp = self._config.default_compression
+        for srv_name, srv_cfg in servers.items():
+            srv_comp = (
+                srv_cfg.compression if "compression" in srv_cfg.model_fields_set else default_comp
+            )
+            srv_llm = srv_cfg.llm
+            srv_leaks = _llm_compression_leaks(srv_comp, srv_llm)
+            if srv_leaks and srv_llm is not None:
+                comp_leak_paths.append(f"server '{srv_name}'")
+                comp_dests.add(_describe_llm_destination(srv_llm))
+            for tool_name, override in srv_cfg.tool_overrides.items():
+                tool_comp = override.compression if override.compression is not None else srv_comp
+                tool_llm = override.llm or srv_llm
+                # A tool that inherits both strategy and llm from the server is
+                # already covered by the server-level entry — don't double-list.
+                inherits = override.compression is None and override.llm is None
+                if (
+                    _llm_compression_leaks(tool_comp, tool_llm)
+                    and tool_llm is not None
+                    and not (srv_leaks and inherits)
+                ):
+                    comp_leak_paths.append(f"server '{srv_name}' tool '{tool_name}'")
+                    comp_dests.add(_describe_llm_destination(tool_llm))
+        if comp_leak_paths:
+            logger.warning(
+                "LLM compression enabled (%s) with privacy_scan_enabled=false — raw "
+                "upstream responses will be sent UNSCANNED to %s; credential "
+                "redaction (#289) is off",
+                ", ".join(comp_leak_paths),
+                ", ".join(sorted(comp_dests)),
+            )
+
+        if self._index_engine is not None:
+            ext_llm = ext_cfg.effective_llm()
+            if (
+                ext_cfg.strategy in (ExtractionStrategy.LLM, ExtractionStrategy.HYBRID)
+                and not ext_llm.privacy_scan_enabled
+                and ext_llm.is_external_destination()
+            ):
+                ext_leak_paths: list[str] = []
+                if ext_cfg.enabled:
+                    ext_leak_paths.append("extraction.enabled")
+                for srv_name, srv_cfg in servers.items():
+                    if srv_cfg.extraction is True:
+                        ext_leak_paths.append(f"server '{srv_name}'")
+                    for tool_name, override in srv_cfg.tool_overrides.items():
+                        if override.extraction is True:
+                            ext_leak_paths.append(f"server '{srv_name}' tool '{tool_name}'")
+                if ext_leak_paths:
+                    logger.warning(
+                        "LLM extraction enabled (%s) with privacy_scan_enabled=false — "
+                        "raw upstream responses will be sent UNSCANNED to %s; credential "
+                        "redaction (#289) is off",
+                        ", ".join(ext_leak_paths),
+                        _describe_llm_destination(ext_llm),
+                    )
+
         for srv_name, srv_cfg in servers.items():
             if (
                 srv_cfg.compression not in (CompressionStrategy.NONE, CompressionStrategy.AUTO)

@@ -253,6 +253,42 @@ class TestLLMCompressorApiKey:
             LLMCompressorConfig(provider=LLMProvider.OPENAI)
 
 
+class TestLLMExternalDestination:
+    """``LLMCompressorConfig.is_external_destination`` — powers the #610
+    scan-off startup warning. OpenAI/Anthropic always leave the machine; Ollama
+    only when its ``base_url`` host is non-loopback."""
+
+    def test_openai_is_external(self) -> None:
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="sk-x")
+        assert cfg.is_external_destination() is True
+
+    def test_anthropic_is_external(self) -> None:
+        cfg = LLMCompressorConfig(provider=LLMProvider.ANTHROPIC, api_key="ant-x")
+        assert cfg.is_external_destination() is True
+
+    def test_ollama_localhost_is_local(self) -> None:
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA, base_url="http://localhost:11434"
+        )
+        assert cfg.is_external_destination() is False
+
+    def test_ollama_loopback_ip_is_local(self) -> None:
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA, base_url="http://127.0.0.1:11434"
+        )
+        assert cfg.is_external_destination() is False
+
+    def test_ollama_empty_base_url_is_local(self) -> None:
+        cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA, base_url="")
+        assert cfg.is_external_destination() is False
+
+    def test_ollama_remote_host_is_external(self) -> None:
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA, base_url="http://192.168.1.5:11434"
+        )
+        assert cfg.is_external_destination() is True
+
+
 class TestSurfacingNumericConstraints:
     def test_surfacing_min_score_range(self) -> None:
         with pytest.raises(ValidationError):

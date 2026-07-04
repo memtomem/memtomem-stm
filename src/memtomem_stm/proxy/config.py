@@ -7,6 +7,7 @@ import logging
 import os
 import types
 from collections.abc import Mapping
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -270,6 +271,12 @@ class LLMProvider(StrEnum):
     OLLAMA = "ollama"
 
 
+# Hosts whose traffic never leaves the machine — a scan-off LLM path pointed
+# here does not cross a trust boundary, so the #610 startup warning stays
+# silent for them.
+_LOCAL_LLM_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", ""})
+
+
 class LLMCompressorConfig(BaseModel):
     provider: LLMProvider = LLMProvider.OPENAI
     model: str = "gpt-4.1-mini"
@@ -295,6 +302,19 @@ class LLMCompressorConfig(BaseModel):
     # body is known to be sensitive-free or you are using a self-hosted
     # provider you trust (e.g. local Ollama). See #289.
     privacy_scan_enabled: bool = True
+
+    def is_external_destination(self) -> bool:
+        """True when this LLM path sends text off the machine.
+
+        OpenAI / Anthropic are always external. Ollama is treated as local only
+        when its ``base_url`` host is loopback (the common self-hosted case);
+        an Ollama endpoint on a remote host still crosses the boundary. Used by
+        the #610 startup warning to avoid false alarms on local Ollama.
+        """
+        if self.provider in (LLMProvider.OPENAI, LLMProvider.ANTHROPIC):
+            return True
+        host = urlparse(self.base_url).hostname or ""
+        return host not in _LOCAL_LLM_HOSTS
 
     @model_validator(mode="after")
     def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:
