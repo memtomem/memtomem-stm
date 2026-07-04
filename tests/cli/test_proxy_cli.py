@@ -7167,6 +7167,24 @@ class TestMergeTuneChanges:
         assert len(skipped) == 1
         assert "ghost" in skipped[0]
 
+    @pytest.mark.parametrize(
+        "raw_entry",
+        ["not-a-dict", {"command": "npx", "tool_overrides": "not-a-dict"}],
+        ids=["server-entry-not-dict", "tool-overrides-not-dict"],
+    )
+    def test_unwritable_raw_entry_is_skipped_not_crashed(self, raw_entry):
+        """An env override for ``upstream_servers`` can mask a malformed file
+        entry from the typed validation the command runs, so the raw-dict
+        writability guard is the only thing between the tuner and an
+        AttributeError inside ``_apply_tune_changes``."""
+        from memtomem_stm.cli.proxy import _merge_tune_changes
+
+        rec = self._rec("srv", "t", [self._action("max_result_chars", None, "16000")])
+        changes, skipped = _merge_tune_changes([rec], {"srv": raw_entry})
+        assert changes == []
+        assert len(skipped) == 1
+        assert "malformed" in skipped[0]
+
     def test_non_numeric_budget_recommendation_is_skipped_not_fatal(self):
         from memtomem_stm.cli.proxy import _merge_tune_changes
 

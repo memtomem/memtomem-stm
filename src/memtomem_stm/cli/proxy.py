@@ -2800,6 +2800,11 @@ def _merge_tune_changes(
     Recommendations for servers absent from the raw config file are split off
     as human-readable skip warnings: the metrics DB can carry rows for an
     env-only or since-renamed upstream that has no dict entry to write into.
+    The same guard covers a raw entry that isn't writable — a non-dict server
+    value, or a non-dict ``tool_overrides`` — because the *typed* validation
+    the command runs sees the env-overlaid composite, and an env override for
+    ``upstream_servers`` can mask a malformed file entry that
+    ``_apply_tune_changes`` would then crash on.
     """
     merged: dict[tuple[str, str, str], _TuneChange] = {}
     merge_counts: dict[tuple[str, str, str], int] = {}
@@ -2807,12 +2812,16 @@ def _merge_tune_changes(
     skipped_servers: set[str] = set()
 
     for rec in recs:
-        if rec.server not in raw_servers:
+        entry = raw_servers.get(rec.server)
+        if not isinstance(entry, dict) or not isinstance(entry.get("tool_overrides", {}), dict):
             if rec.server not in skipped_servers:
                 skipped_servers.add(rec.server)
+                if entry is None:
+                    detail = "is not in the config file (env-defined or renamed upstream)"
+                else:
+                    detail = "has a malformed entry in the config file"
                 skipped.append(
-                    f"{rec.server}/{rec.tool}: server '{rec.server}' is not in the config "
-                    "file (env-defined or renamed upstream) — nothing to write"
+                    f"{rec.server}/{rec.tool}: server '{rec.server}' {detail} — nothing to write"
                 )
             continue
         for action in rec.actions:
