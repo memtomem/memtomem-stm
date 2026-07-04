@@ -455,6 +455,45 @@ def _obs_tool(fn):
     return fn
 
 
+# The observability tools gated behind ``@_obs_tool`` — the ones hidden from
+# ``tools/list`` when ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` is off.
+# Source of truth for the "N tools hidden" discoverability hint (#613) so the
+# count stays in sync with the decorated set; a regression test pins this tuple
+# against the actually-gated tools (flag-on minus flag-off).
+_OBSERVABILITY_TOOL_NAMES: tuple[str, ...] = (
+    "stm_proxy_stats",
+    "stm_proxy_cache_clear",
+    "stm_proxy_health",
+    "stm_surfacing_stats",
+    "stm_index_stats",
+    "stm_selection_stats",
+    "stm_compression_stats",
+    "stm_progressive_stats",
+    "stm_tuning_recommendations",
+)
+
+
+def _hidden_obs_tools_hint() -> str | None:
+    """One-line hint that observability tools are hidden, or ``None`` (#613).
+
+    Returns ``None`` when the tools are advertised. Driven off
+    ``_should_advertise_obs_tools()`` — the same signal that actually gates
+    registration — so the hint never claims tools are hidden when they aren't
+    (or vice versa).
+
+    Consumed by the ``mms health`` CLI, not by ``stm_proxy_health``: that MCP
+    tool is itself one of the gated tools, so it is unreachable over MCP in the
+    exact state (flag off) where the hint applies. The CLI command is always
+    available regardless of the flag, so it is the reachable operator surface.
+    """
+    if _should_advertise_obs_tools():
+        return None
+    return (
+        f"{len(_OBSERVABILITY_TOOL_NAMES)} observability tools hidden; "
+        "set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to expose them"
+    )
+
+
 # STM utility tools exposed over MCP. Kept as an explicit tuple (not a
 # ``stm_*`` prefix sweep) so the set is a deliberate choice and the
 # advertise-order regression test can pin the exact membership. Order
@@ -798,6 +837,12 @@ async def stm_proxy_health(
             f"running env/default config: {app.proxy_config_error}"
         )
 
+    # NB: the observability-tools discoverability hint (#613) is intentionally
+    # NOT emitted here. ``stm_proxy_health`` is itself gated by ``@_obs_tool``,
+    # so in the only state where the hint applies (flag off) this tool is not in
+    # ``tools/list`` and an MCP client cannot reach it; with the flag on there
+    # is nothing to hint. The reachable operator surface is ``mms health`` (a
+    # CLI command, always available), which carries the hint instead.
     health = pm.get_upstream_health()
     if not health:
         head = "No upstream servers configured."
@@ -1454,6 +1499,13 @@ async def stm_index_stats(
     pm = app.proxy_manager
     if pm is None:
         return "Proxy is not enabled."
+
+    # Distinguish "structurally inactive" from "wired but no traffic". The
+    # bundled ``mms`` server wires no index engine (#288), so Stage 4 is
+    # silently skipped and this tool would otherwise read as permanently empty
+    # — indistinguishable from an engine that simply hasn't been hit yet.
+    if pm.index_engine is None:
+        return "INDEX stage inactive in this server (no index engine wired) — see #288."
 
     with traced("stm_index_stats", metadata={"tool": tool}):
         snapshot = pm.index_observability.snapshot()

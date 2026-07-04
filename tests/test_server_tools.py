@@ -13,9 +13,12 @@ from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.server import (
     STMContext,
+    _hidden_obs_tools_hint,
+    _OBSERVABILITY_TOOL_NAMES,
     _should_advertise_obs_tools,
     stm_compression_feedback,
     stm_compression_stats,
+    stm_index_stats,
     stm_progressive_stats,
     stm_proxy_cache_clear,
     stm_proxy_health,
@@ -417,6 +420,17 @@ class TestHealth:
         result = await stm_proxy_health(ctx=ctx)
         assert "No upstream servers configured" in result
         assert "failed to parse" not in result
+
+    async def test_no_obs_tools_hint_over_mcp(self, monkeypatch):
+        """#613: the hidden-tools hint is NOT emitted over MCP. stm_proxy_health
+        is itself gated, so it is unreachable in the flag-off state where the
+        hint would apply; emitting it here would be dead + misleading. The hint
+        lives on the always-available ``mms health`` CLI instead."""
+        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
+        pm = _make_proxy_manager()
+        ctx = _make_ctx(proxy_manager=pm)
+        result = await stm_proxy_health(ctx=ctx)
+        assert "observability tools hidden" not in result
 
     async def test_config_error_shown_without_upstreams(self):
         """#611: a broken config file typically manifests as zero upstreams —
@@ -2082,9 +2096,37 @@ class TestApplyProxyFileConfig:
         assert _apply_proxy_file_config(config2, {}) is None
 
 
+# ── stm_index_stats — structurally inactive vs wired-but-empty (#613) ─────
+
+
+class TestIndexStatsInactive:
+    async def test_no_index_engine_reports_inactive(self):
+        """The bundled ``mms`` server wires no index engine (#288); the tool
+        must say so rather than return the generic "no activity" message that
+        an operator can't distinguish from an engine that hasn't been hit."""
+        pm = _make_proxy_manager()  # constructed without index_engine → None
+        assert pm.index_engine is None
+        ctx = _make_ctx(proxy_manager=pm)
+        result = await stm_index_stats(ctx=ctx)
+        assert "INDEX stage inactive" in result
+        assert "#288" in result
+
+    async def test_wired_but_empty_reports_no_activity(self):
+        """With an engine wired but zero traffic, the distinct
+        "No INDEX activity recorded" message is kept — the two cases must not
+        collapse into one."""
+        cfg = ProxyConfig(config_path="/tmp/p.json", upstream_servers={})
+        pm = ProxyManager(cfg, TokenTracker(), index_engine=MagicMock())
+        assert pm.index_engine is not None
+        ctx = _make_ctx(proxy_manager=pm)
+        result = await stm_index_stats(ctx=ctx)
+        assert "No INDEX activity recorded" in result
+        assert "INDEX stage inactive" not in result
+
+
 # ── advertise_observability_tools flag ──────────────────────────────────
 #
-# The flag hides 8 observability tools from the MCP ``tools/list`` surface
+# The flag hides 9 observability tools from the MCP ``tools/list`` surface
 # while keeping them importable from Python. Registration happens at
 # module import, so the end-to-end assertion uses a subprocess to get a
 # fresh interpreter under the intended env var.
@@ -2186,6 +2228,26 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert callable(stm_proxy_stats)
         assert callable(stm_surfacing_stats)
         assert callable(stm_tuning_recommendations)
+
+    def test_obs_tool_names_constant_matches_gated_set(self):
+        """#613: ``_OBSERVABILITY_TOOL_NAMES`` (source of truth for the
+        hidden-tools hint count) must equal the tools that actually appear
+        only when the flag is on — otherwise the "N tools hidden" count drifts
+        when an observability tool is added or removed."""
+        on = set(self._list_registered(env_override="true"))
+        off = set(self._list_registered(env_override="false"))
+        gated = on - off
+        assert set(_OBSERVABILITY_TOOL_NAMES) == gated
+
+    def test_hidden_hint_count_matches_constant(self, monkeypatch):
+        """The hint's number is derived from the constant, not hardcoded."""
+        monkeypatch.delenv(_FLAG_ENV, raising=False)
+        hint = _hidden_obs_tools_hint()
+        assert hint is not None
+        assert hint.startswith(f"{len(_OBSERVABILITY_TOOL_NAMES)} observability tools hidden")
+
+        monkeypatch.setenv(_FLAG_ENV, "true")
+        assert _hidden_obs_tools_hint() is None
 
 
 # ── advertise order — proxied before STM utility tools (#228) ─────────────
