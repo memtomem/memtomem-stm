@@ -36,6 +36,7 @@ Options:
 
 Commands:
   add        Add an upstream MCP server to the proxy configuration.
+  config     Inspect and validate the proxy config file.
   daemon     Manage the local surfacing daemon (warm LTM connection for...
   eject      Restore imported upstream(s) to their host MCP client, then...
   health     Check upstream server connectivity.
