@@ -158,63 +158,151 @@ class TestCompressMaybeOffthread:
             await _run_helper(_BlockingScorer(), _FaultingCompressor())
 
 
-# ── SELECTIVE holds _selective_lock across the off-thread compress ────
+# ── SELECTIVE pins the compressor instead of holding the lock ─────────
 
 
-class TestSelectiveLockHeldDuringOffthreadCompress:
-    async def test_lock_held_until_compress_completes(self):
-        """A config-change rebuild ``close()``s the superseded selective
-        compressor's pending store, and ``SQLitePendingStore.close`` is not
-        synchronized with ``put`` — so the SELECTIVE branch must hold
-        ``_selective_lock`` for the whole off-thread compress, not just the
-        compressor lookup (codex review of #628)."""
-        started = threading.Event()
+class _GatedSelectiveFake:
+    """Duck-typed selective compressor: gated compress + use-pin counters."""
+
+    _scorer = _BlockingScorer()
+
+    def __init__(self, release: threading.Event) -> None:
+        self.release = release
+        self.started = threading.Event()
+        self.entered = 0
+        self._entered_lock = threading.Lock()
+        self.begin_calls = 0
+        self.end_calls = 0
+
+    def begin_use(self) -> None:
+        self.begin_calls += 1
+
+    def end_use(self) -> None:
+        self.end_calls += 1
+
+    def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
+        with self._entered_lock:
+            self.entered += 1
+        self.started.set()
+        assert self.release.wait(timeout=10), "test gate never released"
+        return text[:max_chars]
+
+
+def _selective_stub(compressor: object, lock_timeout: float = 5.0) -> SimpleNamespace:
+    stub = SimpleNamespace(
+        _selective_lock=asyncio.Lock(),
+        _config=SimpleNamespace(lock_timeout_seconds=lock_timeout),
+        _selective_compressor=compressor,
+        _selective_compressor_cfg=None,
+    )
+    stub._compress_maybe_offthread = MethodType(ProxyManager._compress_maybe_offthread, stub)
+    return stub
+
+
+def _selective_call(stub: SimpleNamespace, text: str = "z" * 300):
+    return ProxyManager._apply_compression(
+        stub,
+        text,
+        CompressionStrategy.SELECTIVE,
+        100,
+        None,
+        None,
+        None,
+        "srv",
+        "tool",
+        context_query="q",
+    )
+
+
+class TestSelectivePinsCompressorNotLock:
+    async def test_lock_released_and_compressor_pinned_during_compress(self):
+        """The SELECTIVE branch must pin the compressor (begin_use under the
+        lock) and release ``_selective_lock`` before the off-thread compress:
+        holding the lock across a slow embedding compress turns normal
+        backpressure into spurious LOCK_TIMEOUT errors (codex round 2 of
+        #628), while pinning defers a concurrent rebuild's close() until the
+        last in-flight user drains."""
         release = threading.Event()
+        comp = _GatedSelectiveFake(release)
+        stub = _selective_stub(comp)
 
-        class _GatedSelective:
-            _scorer = _BlockingScorer()
-
-            def compress(self, text: str, *, max_chars: int, context_query: str | None) -> str:
-                started.set()
-                assert release.wait(timeout=10), "test gate never released"
-                return text[:max_chars]
-
-        stub = SimpleNamespace(
-            _selective_lock=asyncio.Lock(),
-            _config=SimpleNamespace(lock_timeout_seconds=5.0),
-            _selective_compressor=_GatedSelective(),
-            _selective_compressor_cfg=None,
-        )
-        stub._compress_maybe_offthread = MethodType(ProxyManager._compress_maybe_offthread, stub)
-
-        task = asyncio.create_task(
-            ProxyManager._apply_compression(
-                stub,
-                "z" * 300,
-                CompressionStrategy.SELECTIVE,
-                100,
-                None,
-                None,
-                None,
-                "srv",
-                "tool",
-                context_query="q",
-            )
-        )
+        task = asyncio.create_task(_selective_call(stub))
         try:
-            while not started.is_set():
+            while not comp.started.is_set():
                 await asyncio.sleep(0.001)
-            assert stub._selective_lock.locked(), (
-                "_selective_lock must stay held while the off-thread selective "
-                "compress is in flight — releasing it early lets a concurrent "
-                "rebuild close the pending store under the worker thread"
+            assert comp.begin_calls == 1, "compressor must be pinned before compress starts"
+            assert comp.end_calls == 0
+            assert not stub._selective_lock.locked(), (
+                "_selective_lock must be released during the off-thread "
+                "compress — holding it serializes concurrent SELECTIVE calls "
+                "into LOCK_TIMEOUT failures behind a slow embedding endpoint"
             )
         finally:
             release.set()
         compressed, llm_fallback = await task
         assert compressed == "z" * 100
         assert llm_fallback is None
-        assert not stub._selective_lock.locked()
+        assert comp.end_calls == 1, "the pin must be balanced after compress"
+
+    async def test_concurrent_selective_calls_run_in_parallel(self):
+        """codex round-2 regression: N concurrent slow SELECTIVE calls must
+        all be in flight simultaneously — with the lock held across compress,
+        entry would cap at 1 and later waiters would hit LockTimeoutError at
+        the (deliberately tiny) timeout below."""
+        release = threading.Event()
+        comp = _GatedSelectiveFake(release)
+        stub = _selective_stub(comp, lock_timeout=0.5)
+
+        tasks = [asyncio.create_task(_selective_call(stub)) for _ in range(4)]
+        try:
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while comp.entered < 4:
+                assert asyncio.get_running_loop().time() < deadline, (
+                    f"only {comp.entered}/4 compress calls in flight — "
+                    "concurrent SELECTIVE calls are serializing"
+                )
+                await asyncio.sleep(0.001)
+        finally:
+            release.set()
+        results = await asyncio.gather(*tasks)
+        assert all(r == ("z" * 100, None) for r in results)
+        assert comp.begin_calls == 4
+        assert comp.end_calls == 4
+
+
+class TestSelectiveDeferredClose:
+    def _sqlite_compressor(self, tmp_path):
+        from memtomem_stm.proxy.compression import SelectiveCompressor
+        from memtomem_stm.proxy.pending_store import SQLitePendingStore
+
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        return SelectiveCompressor(store=store), store
+
+    def test_close_deferred_while_in_use(self, tmp_path):
+        """close() during an in-flight use span must leave the store usable
+        (a worker thread may be mid-put) and apply on the last end_use()."""
+        comp, store = self._sqlite_compressor(tmp_path)
+        comp.begin_use()
+        comp.close()
+        assert store._db is not None, "store closed under an in-flight compress"
+        # The store still works mid-span — this is the mid-put scenario.
+        assert comp.compress("## A\n" + "a" * 300, max_chars=100) is not None
+        comp.end_use()
+        assert store._db is None, "deferred close never applied"
+
+    def test_close_immediate_when_idle(self, tmp_path):
+        comp, store = self._sqlite_compressor(tmp_path)
+        comp.close()
+        assert store._db is None
+
+    def test_end_use_without_close_keeps_store_open(self, tmp_path):
+        comp, store = self._sqlite_compressor(tmp_path)
+        comp.begin_use()
+        comp.end_use()
+        assert store._db is not None
+        comp.close()
+        assert store._db is None
 
 
 # ── every scorer-carrying compress site routes through the helper ─────

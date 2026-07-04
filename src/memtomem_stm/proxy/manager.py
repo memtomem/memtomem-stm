@@ -1717,12 +1717,15 @@ class ProxyManager:
 
         Callers off-loading a compressor with shared mutable state (the cached
         ``SelectiveCompressor`` and its pending store, alone or inside a
-        ``HybridCompressor``) must hold ``_selective_lock`` across this call:
-        a concurrent config-change rebuild would otherwise ``close()`` the
-        store out from under the worker thread (``SQLitePendingStore.close``
-        is not synchronized with ``put``). ``stop()`` still closes without the
-        lock — a call in flight during shutdown may fail, as it already can on
-        connection teardown.
+        ``HybridCompressor``) must pin it with ``begin_use()`` while still
+        holding ``_selective_lock`` and balance with ``end_use()`` after this
+        call: a concurrent config-change rebuild (or ``stop()``) would
+        otherwise ``close()`` the store out from under the worker thread
+        (``SQLitePendingStore.close`` is not synchronized with ``put``). The
+        pin defers the close to the last in-flight user rather than holding
+        the lock across the compress, so concurrent SELECTIVE/HYBRID calls
+        run in parallel instead of surfacing spurious ``LOCK_TIMEOUT`` behind
+        a slow embedding endpoint.
 
         Exceptions propagate with their original type (``asyncio.to_thread``
         re-raises), so callers' ``except`` clauses — notably the
@@ -1782,11 +1785,17 @@ class ProxyManager:
                     sel_compressor = self._rebuild_selective_compressor(sel_cfg)
                 else:
                     sel_compressor = self._selective_compressor
-                # Compress under the lock: an off-thread compress must not
-                # race a config-change rebuild that closes this compressor's
-                # pending store. Serializes concurrent SELECTIVE calls — the
-                # pre-#618 inline path serialized the entire event loop, so
-                # this is strictly narrower.
+                # Pin the compressor before the lock drops: the off-thread
+                # compress below must not lose its pending store to a
+                # concurrent config-change rebuild's close(). begin_use/
+                # end_use defer that close to the last in-flight user, so
+                # concurrent SELECTIVE calls run in parallel instead of
+                # queueing on the lock (which would surface as spurious
+                # LOCK_TIMEOUT under a slow embedding endpoint).
+                _begin = getattr(sel_compressor, "begin_use", None)
+                if _begin is not None:
+                    _begin()
+            try:
                 return (
                     await self._compress_maybe_offthread(
                         sel_compressor,
@@ -1797,6 +1806,10 @@ class ProxyManager:
                     ),
                     None,
                 )
+            finally:
+                _end = getattr(sel_compressor, "end_use", None)
+                if _end is not None:
+                    _end()
 
         if compression == CompressionStrategy.LLM_SUMMARY:
             if llm_cfg is not None:
@@ -2040,11 +2053,16 @@ class ProxyManager:
                 head_ratio=cfg.head_ratio,
                 selective_compressor=sel_compressor,
             )
-            # Compress under the lock — same rebuild/close race as the
-            # SELECTIVE branch: the hybrid TOC path writes through the shared
-            # selective compressor's pending store. The scorer gate reads the
-            # selective compressor's captured scorer (HybridCompressor has no
-            # scorer of its own; its truncate tail mode is query-blind).
+            # Pin the shared selective compressor before the lock drops —
+            # same rebuild/close race as the SELECTIVE branch: the hybrid TOC
+            # path writes through its pending store. The scorer gate reads
+            # the selective compressor's captured scorer (HybridCompressor
+            # has no scorer of its own; its truncate tail mode is
+            # query-blind).
+            _begin = getattr(sel_compressor, "begin_use", None)
+            if _begin is not None:
+                _begin()
+        try:
             return await self._compress_maybe_offthread(
                 compressor,
                 text,
@@ -2052,6 +2070,10 @@ class ProxyManager:
                 context_query=context_query,
                 scorer=getattr(sel_compressor, "_scorer", None),
             )
+        finally:
+            _end = getattr(sel_compressor, "end_use", None)
+            if _end is not None:
+                _end()
 
     async def _auto_index_response(
         self,
