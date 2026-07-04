@@ -13,7 +13,7 @@ cd memtomem-stm
 uv sync
 
 # Run tests (same filter CI uses)
-uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"
+uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"
 
 # Lint and format
 uv run ruff check src
@@ -45,7 +45,7 @@ The LTM core lives in a separate repository: [memtomem/memtomem](https://github.
 2. Keep changes focused — one feature or fix per PR
 3. Add tests for new functionality
 4. Ensure `uv run ruff check src` and `uv run ruff format --check src` pass
-5. Ensure `uv run pytest -m "not ollama and not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"` passes
+5. Ensure `uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"` passes
 6. Ensure `uv run mypy src` passes (required in CI on both Linux and Windows)
 7. Write a clear commit message describing the "why"
 8. Sign the CLA on your first pull request (see below)

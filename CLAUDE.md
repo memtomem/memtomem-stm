@@ -11,15 +11,17 @@ Requires Python 3.12+ and `uv`.
 
 ```bash
 uv sync                                                    # install deps
-uv run pytest -m "not ollama"                              # tests (CI filter)
+uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"  # tests (CI filter)
 uv run ruff check src && uv run ruff format --check src    # lint (required)
 uv run mypy src                                            # typecheck (required)
 ```
 
-The `ollama` marker auto-skips when Ollama isn't running; CI always uses
-`-m "not ollama"`. `ruff`, `mypy`, and tests must pass to merge. mypy must be
-clean on Windows too — CI typechecks both platforms, so POSIX-only stdlib
-usage (`fcntl`, `os.killpg`, …) needs a `sys.platform` guard mypy can narrow.
+The filter excludes only the `bench_qa_*` markers CI runs in separate jobs;
+live-Ollama tests are out of scope — Ollama code paths are tested with mocked
+transport / dead ports only (#637). `ruff`, `mypy`, and tests must pass to
+merge. mypy must be clean on Windows too — CI typechecks both platforms, so
+POSIX-only stdlib usage (`fcntl`, `os.killpg`, …) needs a `sys.platform` guard
+mypy can narrow.
 
 ## Invariants when editing
 

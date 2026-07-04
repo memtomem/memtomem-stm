@@ -22,11 +22,12 @@ def _read(relative: str) -> str:
 
 
 def _canonical_ci_test_filter() -> str:
-    """The single CI ``test``-job ``pytest -m`` filter (the one with ``not ollama``).
+    """The single CI ``test``-job ``pytest -m`` filter (the one with ``not bench_qa_meta``).
 
-    Shared source of truth for the README + CONTRIBUTING pins below: both
-    quickstarts must quote this verbatim, or a contributor runs straight into
-    the ``bench_qa_*`` jobs CI deliberately splits into separate workflows.
+    Shared source of truth for the CLAUDE.md + README + CONTRIBUTING pins
+    below: all three quickstarts must quote this verbatim, or a contributor
+    runs straight into the ``bench_qa_*`` jobs CI deliberately splits into
+    separate workflows.
     """
     ci = _read(".github/workflows/ci.yml")
     # Double-quoted ``pytest -m "…"`` is what the workflow uses today. If the
@@ -34,18 +35,18 @@ def _canonical_ci_test_filter() -> str:
     # this regex falls through to zero matches and we want a loud failure
     # pointing operators back here rather than a cryptic IndexError.
     ci_filters = re.findall(r'pytest -m "([^"]+)"', ci)
-    test_job_filters = [f for f in ci_filters if "not ollama" in f]
+    test_job_filters = [f for f in ci_filters if "not bench_qa_meta" in f]
     if not test_job_filters:
         pytest.fail(
             "Could not locate CI's pytest filter — expected a double-quoted "
-            '`pytest -m "…not ollama…"` in .github/workflows/ci.yml. '
+            '`pytest -m "…not bench_qa_meta…"` in .github/workflows/ci.yml. '
             "The workflow was likely refactored; update this helper and the "
-            "docs that quote it (README.md, CONTRIBUTING.md) together."
+            "docs that quote it (CLAUDE.md, README.md, CONTRIBUTING.md) together."
         )
     if len(test_job_filters) > 1:
         pytest.fail(
-            "Multiple CI jobs now use `not ollama` — this helper picks the "
-            "first match, which may not be the one the docs should mirror. "
+            "Multiple CI jobs now use `not bench_qa_meta` — this helper picks "
+            "the first match, which may not be the one the docs should mirror. "
             f"Filters found: {test_job_filters!r}. Parse by job name or pin "
             "the canonical one explicitly."
         )
@@ -58,8 +59,8 @@ def test_contributing_pytest_command_matches_ci() -> None:
     The CI ``test`` job filters out ``bench_qa_meta`` (intentional-failure
     self-tests — see ``pyproject.toml`` markers table) and
     ``bench_qa_llm_judge`` (requires ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY``)
-    in addition to ``ollama``. A shorter filter in CONTRIBUTING leads new
-    contributors straight into those expected failures.
+    among others. A shorter filter in CONTRIBUTING leads new contributors
+    straight into those expected failures.
     """
     canonical = _canonical_ci_test_filter()
     contributing_filters = re.findall(r'pytest -m "([^"]+)"', _read("CONTRIBUTING.md"))
@@ -85,6 +86,24 @@ def test_readme_pytest_command_matches_ci() -> None:
         f"README.md must quote the CI pytest filter verbatim.\n"
         f"  CI uses: {canonical!r}\n"
         f"  README has: {readme_filters!r}"
+    )
+
+
+def test_claude_md_pytest_command_matches_ci() -> None:
+    """CLAUDE.md's Commands ``pytest -m`` filter must match CI's verbatim.
+
+    CLAUDE.md quoted the short ``-m "not ollama"`` form until #637 — a
+    no-op filter (the marker had zero usages) that also under-filtered:
+    it didn't exclude ``bench_qa_meta``, whose tests fail by design. Pin
+    CLAUDE.md to the same source of truth as README/CONTRIBUTING so the
+    command Claude Code runs from context is always the CI command.
+    """
+    canonical = _canonical_ci_test_filter()
+    claude_md_filters = re.findall(r'pytest -m "([^"]+)"', _read("CLAUDE.md"))
+    assert canonical in claude_md_filters, (
+        f"CLAUDE.md must quote the CI pytest filter verbatim.\n"
+        f"  CI uses: {canonical!r}\n"
+        f"  CLAUDE.md has: {claude_md_filters!r}"
     )
 
 
