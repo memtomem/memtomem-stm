@@ -770,3 +770,150 @@ def test_deprecation_policy_and_upgrade_notes_convention_exist() -> None:
         "tell readers releases with behavior changes open with an 'Upgrade "
         "notes' block."
     )
+
+
+def test_compression_md_llm_section_documents_privacy_scan() -> None:
+    """docs/compression.md's ``## LLM Compression`` section must surface
+    ``privacy_scan_enabled``.
+
+    ``LLMCompressorConfig.privacy_scan_enabled``
+    (``src/memtomem_stm/proxy/config.py``, default ``True``) is the credential
+    scan that keeps API keys / passwords / JWTs out of the outbound LLM call
+    (#289); flipping it off sends raw upstream responses to the provider
+    unscanned, and ``ProxyManager.start()`` logs a startup WARNING for that
+    state on external destinations (#610). Undocumented, the knob and its
+    warning are invisible to anyone not reading the source.
+    """
+    from memtomem_stm.proxy.config import LLMCompressorConfig
+
+    assert "privacy_scan_enabled" in LLMCompressorConfig.model_fields, (
+        "LLMCompressorConfig lost `privacy_scan_enabled` — the knob was "
+        "renamed or removed; update docs/compression.md and this test together."
+    )
+    comp_md = _read("docs/compression.md")
+    section_match = re.search(
+        r"##\s+LLM Compression[^\n]*\n(.*?)(?=\n##\s|\Z)",
+        comp_md,
+        re.DOTALL,
+    )
+    if not section_match:
+        pytest.fail(
+            "docs/compression.md lost its `## LLM Compression` H2 section — "
+            "either restructure the test or restore the section heading."
+        )
+    section_body = section_match.group(1)
+    if "privacy_scan_enabled" not in section_body:
+        pytest.fail(
+            "docs/compression.md `## LLM Compression` section must mention "
+            "`privacy_scan_enabled` — in the JSON example or the credential "
+            "scan prose. Without it, the default-on scan (#289) and the "
+            "scan-disabled startup warning (#610) are undiscoverable."
+        )
+
+
+def test_configuration_full_example_documents_extraction_block() -> None:
+    """docs/configuration.md's full-example must carry an ``extraction`` block
+    whose keys match ``ExtractionConfig``, plus the two top-level knobs
+    ``default_compression`` / ``max_upstream_chars``.
+
+    ``ExtractionConfig`` (``src/memtomem_stm/proxy/config.py``) is a whole
+    config subtree the "Full example with all options" block omitted entirely —
+    it appeared only in the inert-note prose. It is inert in the bundled ``mms``
+    server (#288) but valid config for library callers, and the #610
+    scan-disabled warning walks the extraction path too, so operators need to
+    see its shape. Scoped to the ``## Config File`` section so moving the block
+    into prose cannot satisfy the check.
+    """
+    import json
+
+    from memtomem_stm.proxy.config import ExtractionConfig
+
+    config_md = _read("docs/configuration.md")
+    section_match = re.search(
+        r"##\s+Config File[^\n]*\n(.*?)(?=\n##\s|\Z)",
+        config_md,
+        re.DOTALL,
+    )
+    if not section_match:
+        pytest.fail(
+            "docs/configuration.md lost its `## Config File` H2 section — "
+            "either restructure the test or restore the section heading."
+        )
+    block_match = re.search(r"```json\n(.*?)\n```", section_match.group(1), re.DOTALL)
+    if not block_match:
+        pytest.fail(
+            "docs/configuration.md `## Config File` section lost its ```json "
+            "fenced example — restore the full-example block or update the test."
+        )
+    example = json.loads(block_match.group(1))
+
+    for top_level in ("default_compression", "max_upstream_chars"):
+        if top_level not in example:
+            pytest.fail(
+                f"docs/configuration.md full-example omits top-level "
+                f"`{top_level}` — it exists on ProxyConfig "
+                "(src/memtomem_stm/proxy/config.py). Keep it visible in the "
+                "example so operators discover it without reading CHANGELOG."
+            )
+
+    if "extraction" not in example:
+        pytest.fail(
+            "docs/configuration.md full-example omits the `extraction` block — "
+            "add it mirroring ExtractionConfig. It is inert in the bundled "
+            "server (#288) but valid config for library callers, and the #610 "
+            "scan-disabled warning covers the extraction path."
+        )
+    documented = set(example["extraction"])
+    expected = set(ExtractionConfig.model_fields)
+    missing = expected - documented
+    if missing:
+        pytest.fail(
+            f"docs/configuration.md `extraction` example is missing field(s): "
+            f"{sorted(missing)!r}. Keep it in sync with ExtractionConfig "
+            "(src/memtomem_stm/proxy/config.py)."
+        )
+
+
+def test_cli_md_stats_documents_source_filter() -> None:
+    """docs/cli.md's ``### `stats` `` section must document the ``--source``
+    provenance filter.
+
+    ``mms stats`` grew a ``--source [mcp|hook]`` option (#512) that filters
+    compression rows by provenance — ``mcp`` (proxied upstream tools) vs
+    ``hook`` (native built-in tools recorded by ``mms hook``). It shipped
+    undocumented; without it, an operator comparing hook vs proxied compression
+    has no surface telling them the split exists. Anchored to the live click
+    option so a rename fails here, and scoped to the ``### `stats` `` section.
+    """
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    stats_cmd = mms_cli.commands.get("stats")
+    assert stats_cmd is not None, "`mms stats` is gone — update docs/cli.md and this test"
+    source_param = next(
+        (p for p in stats_cmd.params if "--source" in getattr(p, "opts", [])),
+        None,
+    )
+    if source_param is None:
+        pytest.fail(
+            "`mms stats` no longer exposes a `--source` option — it was "
+            "renamed or removed; update docs/cli.md and this test together."
+        )
+    choices = set(getattr(source_param.type, "choices", ()))
+    assert choices == {"mcp", "hook"}, (
+        f"`mms stats --source` choices changed to {sorted(choices)!r} — "
+        "update the docs and this test."
+    )
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `stats`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    if not section_match:
+        pytest.fail("docs/cli.md must have a ### `stats` section")
+    section = section_match.group(1)
+    for token in ("--source", "mcp", "hook"):
+        if token not in section:
+            pytest.fail(
+                f"docs/cli.md `stats` section must mention {token!r} — the "
+                "`--source` provenance filter (mcp = proxied upstream, hook = "
+                "native built-in tools recorded by `mms hook`) is otherwise "
+                "undiscoverable (#512)."
+            )

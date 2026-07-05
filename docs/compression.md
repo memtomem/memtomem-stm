@@ -255,18 +255,22 @@ Routes through an external LLM for intelligent summarization:
     "provider": "openai",
     "model": "gpt-4.1-mini",
     "api_key": "sk-...",
+    "base_url": "",
     "max_tokens": 500,
     "llm_timeout_seconds": 60.0,
+    "privacy_scan_enabled": true,
     "system_prompt": "Summarize concisely, preserving key information. Under {max_chars} chars."
   }
 }
 ```
 
-Providers: `openai`, `anthropic`, `ollama`. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait. On timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and records the strategy as `llm_summary→{timeout,privacy,circuit_breaker,llm_error}_fallback` in `proxy_metrics` for observability. A successful call whose summary still exceeds `max_chars` is clamped by the same truncation and recorded as `llm_summary→llm_overlength_fallback` — the model overshot the length instruction; the endpoint is fine, so the circuit breaker is unaffected.
+Providers: `openai`, `anthropic`, `ollama`. `base_url` (default `""`) overrides the provider endpoint — required to point `ollama` at a non-default host, and how OpenAI/Anthropic get aimed at a compatible gateway. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait. On timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and records the strategy as `llm_summary→{timeout,privacy,circuit_breaker,llm_error}_fallback` in `proxy_metrics` for observability. A successful call whose summary still exceeds `max_chars` is clamped by the same truncation and recorded as `llm_summary→llm_overlength_fallback` — the model overshot the length instruction; the endpoint is fine, so the circuit breaker is unaffected.
 
 > **`api_key` is validated eagerly.** Every `llm` block in the config is validated when the config loads — for `provider: openai` / `anthropic`, a missing `api_key` (and missing `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env var) fails the load even if nothing selects the `llm_summary` strategy or the block sits under a disabled `extraction`. This keeps the startup fail-fast for configs that DO use the LLM. Don't leave placeholder `llm` blocks you aren't using — remove them, or point them at `provider: ollama` (no key required).
 
-Credential-bearing content (API keys, passwords, provider tokens, JWTs, private keys) is auto-detected and **never** sent to external LLMs — falls back to local truncation. Email addresses alone do **not** trigger this fallback: they appear in ordinary compressible content (git logs, issue threads, contact pages), and routing on them silently degraded the chosen strategy to truncation. Emails remain protected where storage is at stake — surfacing query persistence hashes any query matching the full sensitive set (credentials *and* emails) before it reaches disk.
+Credential-bearing content (API keys, passwords, provider tokens, JWTs, private keys) is auto-detected and **never** sent to external LLMs — falls back to local truncation. This scan is governed by `privacy_scan_enabled` (default `true`); an operator who flips `compression: llm_summary` gets the protection without remembering a second knob. Email addresses alone do **not** trigger this fallback: they appear in ordinary compressible content (git logs, issue threads, contact pages), and routing on them silently degraded the chosen strategy to truncation. Emails remain protected where storage is at stake — surfacing query persistence hashes any query matching the full sensitive set (credentials *and* emails) before it reaches disk.
+
+> **Disabling the scan (`privacy_scan_enabled: false`) sends raw upstream responses to the LLM provider unscanned.** Set it off only when the response body is known to be sensitive-free, or for a self-hosted provider you trust (e.g. local Ollama). To catch an accidental flip, `ProxyManager.start()` logs a startup **WARNING** naming each enabled LLM site (compression and, in library mode, extraction) and the destination when the scan is off — but only for **external** destinations: OpenAI/Anthropic always qualify, Ollama only on a non-loopback `base_url`, so the common local-Ollama-with-scan-off setup stays silent (`is_external_destination()`, #610). Only an explicit `compression: llm_summary` is flagged, not `auto` (which resolves at runtime).
 
 `LLMCompressor` holds a single `httpx.AsyncClient` for the life of the instance. `ProxyManager` caches one compressor per active `llm` config and swaps it (awaiting `close()` on the old one) whenever the config changes at runtime, so integrators generally do not need to manage it directly. If you construct an `LLMCompressor` standalone, `await compressor.close()` before discarding it to release the client.
 
