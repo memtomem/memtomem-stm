@@ -370,6 +370,24 @@ Full example with all options:
     "health_min_calls": 5,
     "health_error_rate_threshold": 0.95,
     "review_risk_penalty": 0.5
+  },
+  "toolgraph": {
+    "enabled": false,
+    "command": "toolgraph",
+    "args": ["serve"],
+    "env": null,
+    "agent_id": "stm-proxy",
+    "server_name_map": {},
+    "query_profile": "strict",
+    "on_unreachable": "open",
+    "on_agent_not_found": "fail_start",
+    "on_protocol_error": "fail_start",
+    "on_tool_not_found": "open",
+    "risk_penalty_scale": 1.0,
+    "timeout_seconds": 5.0,
+    "consult_cache_enabled": true,
+    "consult_cache_path": "~/.memtomem/toolgraph_consult.db",
+    "consult_cache_max_scopes": 64
   }
 }
 ```

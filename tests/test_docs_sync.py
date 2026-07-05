@@ -790,6 +790,14 @@ def test_compression_md_llm_section_documents_privacy_scan() -> None:
         "LLMCompressorConfig lost `privacy_scan_enabled` — the knob was "
         "renamed or removed; update docs/compression.md and this test together."
     )
+    # The docstring/prose claim the scan is default-on; pin that against source
+    # so a flipped default can't leave the docs silently wrong. Read the field
+    # default directly — instantiating LLMCompressorConfig() validates api_key.
+    assert LLMCompressorConfig.model_fields["privacy_scan_enabled"].default is True, (
+        "LLMCompressorConfig.privacy_scan_enabled default is no longer True — "
+        "docs/compression.md says the credential scan is default-on; update "
+        "both together."
+    )
     comp_md = _read("docs/compression.md")
     section_match = re.search(
         r"##\s+LLM Compression[^\n]*\n(.*?)(?=\n##\s|\Z)",
@@ -809,24 +817,41 @@ def test_compression_md_llm_section_documents_privacy_scan() -> None:
             "scan prose. Without it, the default-on scan (#289) and the "
             "scan-disabled startup warning (#610) are undiscoverable."
         )
+    # The token appearing only in the JSON example would leave the #610
+    # scan-disabled behavior undocumented; require the warning prose too so the
+    # operator-facing consequence can't be silently dropped.
+    lowered = section_body.lower()
+    if "warning" not in lowered or "unscanned" not in lowered:
+        pytest.fail(
+            "docs/compression.md `## LLM Compression` section must describe the "
+            "scan-disabled consequence — the startup WARNING and that raw "
+            "responses go to the provider UNSCANNED (#610). Found the "
+            "`privacy_scan_enabled` token but not the warning prose."
+        )
 
 
-def test_configuration_full_example_documents_extraction_block() -> None:
-    """docs/configuration.md's full-example must carry an ``extraction`` block
-    whose keys match ``ExtractionConfig``, plus the two top-level knobs
-    ``default_compression`` / ``max_upstream_chars``.
+def test_configuration_full_example_documents_all_config_blocks() -> None:
+    """docs/configuration.md's "Full example with all options" must carry the
+    ``extraction`` and ``toolgraph`` blocks — with keys AND default values that
+    match ``ExtractionConfig`` / ``ToolgraphConfig`` exactly — plus the two
+    top-level knobs ``default_compression`` / ``max_upstream_chars`` at their
+    ProxyConfig defaults.
 
-    ``ExtractionConfig`` (``src/memtomem_stm/proxy/config.py``) is a whole
-    config subtree the "Full example with all options" block omitted entirely —
-    it appeared only in the inert-note prose. It is inert in the bundled ``mms``
-    server (#288) but valid config for library callers, and the #610
-    scan-disabled warning walks the extraction path too, so operators need to
-    see its shape. Scoped to the ``## Config File`` section so moving the block
-    into prose cannot satisfy the check.
+    ``ExtractionConfig`` and ``ToolgraphConfig``
+    (``src/memtomem_stm/proxy/config.py``) are whole config subtrees the "all
+    options" block omitted while documenting their siblings (``auto_index`` /
+    ``exposure``). Comparing each documented block to ``Model().model_dump(
+    mode="json")`` (rather than just a key-subset check) pins the example to the
+    real defaults — a renamed key, a stray/typo'd key, or a drifted default all
+    fail loudly. Scoped to the ``## Config File`` section so moving a block into
+    prose cannot satisfy the check.
+
+    ``config_path`` is intentionally excluded: it is a runtime-populated field
+    (the path the config was loaded from), not a user-authored config key.
     """
     import json
 
-    from memtomem_stm.proxy.config import ExtractionConfig
+    from memtomem_stm.proxy.config import ExtractionConfig, ProxyConfig, ToolgraphConfig
 
     config_md = _read("docs/configuration.md")
     section_match = re.search(
@@ -847,6 +872,7 @@ def test_configuration_full_example_documents_extraction_block() -> None:
         )
     example = json.loads(block_match.group(1))
 
+    proxy_defaults = ProxyConfig().model_dump(mode="json")
     for top_level in ("default_compression", "max_upstream_chars"):
         if top_level not in example:
             pytest.fail(
@@ -855,23 +881,34 @@ def test_configuration_full_example_documents_extraction_block() -> None:
                 "(src/memtomem_stm/proxy/config.py). Keep it visible in the "
                 "example so operators discover it without reading CHANGELOG."
             )
+        if example[top_level] != proxy_defaults[top_level]:
+            pytest.fail(
+                f"docs/configuration.md full-example shows `{top_level}: "
+                f"{example[top_level]!r}` but the ProxyConfig default is "
+                f"{proxy_defaults[top_level]!r} — the 'all options' example "
+                "should show real defaults."
+            )
 
-    if "extraction" not in example:
-        pytest.fail(
-            "docs/configuration.md full-example omits the `extraction` block — "
-            "add it mirroring ExtractionConfig. It is inert in the bundled "
-            "server (#288) but valid config for library callers, and the #610 "
-            "scan-disabled warning covers the extraction path."
-        )
-    documented = set(example["extraction"])
-    expected = set(ExtractionConfig.model_fields)
-    missing = expected - documented
-    if missing:
-        pytest.fail(
-            f"docs/configuration.md `extraction` example is missing field(s): "
-            f"{sorted(missing)!r}. Keep it in sync with ExtractionConfig "
-            "(src/memtomem_stm/proxy/config.py)."
-        )
+    expected_blocks = {
+        "extraction": ExtractionConfig().model_dump(mode="json"),
+        "toolgraph": ToolgraphConfig().model_dump(mode="json"),
+    }
+    for name, defaults in expected_blocks.items():
+        if name not in example:
+            pytest.fail(
+                f"docs/configuration.md full-example omits the `{name}` block — "
+                f"add it mirroring {name.capitalize()}Config's defaults. The "
+                "'all options' claim (and this test) require every ProxyConfig "
+                "sub-block to appear."
+            )
+        if example[name] != defaults:
+            pytest.fail(
+                f"docs/configuration.md `{name}` example does not match "
+                f"{name.capitalize()}Config defaults.\n"
+                f"  documented: {example[name]!r}\n"
+                f"  defaults:   {defaults!r}\n"
+                "Keep the example in sync with src/memtomem_stm/proxy/config.py."
+            )
 
 
 def test_cli_md_stats_documents_source_filter() -> None:
@@ -917,3 +954,13 @@ def test_cli_md_stats_documents_source_filter() -> None:
                 "native built-in tools recorded by `mms hook`) is otherwise "
                 "undiscoverable (#512)."
             )
+    # A bare token list could pass while mapping the two provenances backwards;
+    # pin the semantics (mcp → proxied upstream, hook → native built-in) so the
+    # prose can't invert without failing.
+    lowered = section.lower()
+    if "proxied" not in lowered or "native" not in lowered:
+        pytest.fail(
+            "docs/cli.md `stats` section must map the `--source` values: `mcp` "
+            "to proxied upstream tools and `hook` to native built-in tools. "
+            "Found the flag tokens but not the provenance mapping prose."
+        )
