@@ -444,12 +444,15 @@ Group/world-readable file permissions produce a warning line but exit 0 on their
 Usage: mms stats [OPTIONS]
 
 Options:
-  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
-  --tool TEXT    Filter to one upstream tool name.
-  --json         Output as JSON for scripting.
+  --config TEXT              [default: ~/.memtomem/stm_proxy.json]
+  --tool TEXT                Filter to one upstream tool name.
+  --source [mcp|hook]        Filter compression rows by provenance: 'mcp'
+                             (proxied upstream tools) or 'hook' (native
+                             built-in tools recorded by 'mms hook').
+  --json                     Output as JSON for scripting.
 ```
 
-Shows proxy compression and surfacing statistics from the persistent databases (`proxy_metrics.db` and `stm_feedback.db`). 
+Shows proxy compression and surfacing statistics from the persistent databases (`proxy_metrics.db` and `stm_feedback.db`). `--source mcp` limits the compression rows to proxied upstream tools, `--source hook` to native built-in tools recorded by `mms hook`; omit it to include both. 
 
 It reads these files read-only (without creating or migrating them) and reports all-time totals. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
 

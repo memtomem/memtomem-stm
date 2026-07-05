@@ -229,6 +229,8 @@ Full example with all options:
 {
   "enabled": true,
   "default_max_result_chars": 16000,
+  "default_compression": "auto",
+  "max_upstream_chars": 10000000,
   "min_result_retention": 0.65,
   "consumer_model": "",
   "context_budget_ratio": 0.05,
@@ -318,6 +320,18 @@ Full example with all options:
     "memory_dir": "~/.memtomem/proxy_index",
     "namespace": "proxy-{server}"
   },
+  "extraction": {
+    "enabled": false,
+    "strategy": "llm",
+    "llm": null,
+    "max_facts": 10,
+    "min_response_chars": 500,
+    "dedup_threshold": 0.92,
+    "memory_dir": "~/.memtomem/extracted_facts",
+    "namespace": "facts-{server}",
+    "background": true,
+    "max_input_chars": 20000
+  },
   "relevance_scorer": {
     "scorer": "bm25",
     "embedding_provider": "ollama",
@@ -356,9 +370,37 @@ Full example with all options:
     "health_min_calls": 5,
     "health_error_rate_threshold": 0.95,
     "review_risk_penalty": 0.5
+  },
+  "toolgraph": {
+    "enabled": false,
+    "command": "toolgraph",
+    "args": ["serve"],
+    "env": null,
+    "agent_id": "stm-proxy",
+    "server_name_map": {},
+    "query_profile": "strict",
+    "on_unreachable": "open",
+    "on_agent_not_found": "fail_start",
+    "on_protocol_error": "fail_start",
+    "on_tool_not_found": "open",
+    "risk_penalty_scale": 1.0,
+    "timeout_seconds": 5.0,
+    "consult_cache_enabled": true,
+    "consult_cache_path": "~/.memtomem/toolgraph_consult.db",
+    "consult_cache_max_scopes": 64
   }
 }
 ```
+
+The `auto_index` and `extraction` blocks are **inert in the bundled `mms`
+server** — it constructs `ProxyManager` without an `index_engine`, so Stage 4
+is skipped and the proxy logs a "config is enabled but inert" startup warning
+naming each site (#288). They are valid config and take effect only for library
+callers that wire an `index_engine` themselves (see the auto-indexing note in
+the [env-var section](#environment-variables) above). `extraction.llm` accepts
+the same `LLMCompressorConfig` shape as [LLM compression](compression.md#llm-compression),
+including `privacy_scan_enabled`; leaving it `null` uses the default local
+Ollama extractor.
 
 `circuit_max_failures` / `circuit_reset_seconds` configure the per-upstream
 circuit breaker (#608). The breaker counts **one failure per call** that
