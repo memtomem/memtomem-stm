@@ -21,6 +21,25 @@ def _read(relative: str) -> str:
     return (REPO_ROOT / relative).read_text(encoding="utf-8")
 
 
+def _fwd_slash(obj: object) -> object:
+    """Normalize backslashes to forward slashes in every string leaf.
+
+    ``Model().model_dump(mode="json")`` serializes ``Path`` fields with the
+    host separator, so a default like ``Path("~/.memtomem/...")`` dumps to
+    ``~\\.memtomem\\...`` on Windows. Docs always use forward slashes; compare
+    both sides through this normalizer so the config-example pins are
+    cross-platform (CI runs the suite on Windows too). No legitimate config
+    string value carries an intentional backslash, so this is loss-free.
+    """
+    if isinstance(obj, str):
+        return obj.replace("\\", "/")
+    if isinstance(obj, dict):
+        return {k: _fwd_slash(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_fwd_slash(v) for v in obj]
+    return obj
+
+
 def _canonical_ci_test_filter() -> str:
     """The single CI ``test``-job ``pytest -m`` filter (the one with ``not bench_qa_meta``).
 
@@ -901,7 +920,7 @@ def test_configuration_full_example_documents_all_config_blocks() -> None:
                 "'all options' claim (and this test) require every ProxyConfig "
                 "sub-block to appear."
             )
-        if example[name] != defaults:
+        if _fwd_slash(example[name]) != _fwd_slash(defaults):
             pytest.fail(
                 f"docs/configuration.md `{name}` example does not match "
                 f"{name.capitalize()}Config defaults.\n"
