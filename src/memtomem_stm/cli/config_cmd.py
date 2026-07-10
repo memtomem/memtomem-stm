@@ -24,7 +24,12 @@ from pathlib import Path
 import click
 from pydantic import ValidationError
 
-from memtomem_stm.proxy.config import ProxyConfig, _permissive_mode, find_unknown_keys
+from memtomem_stm.proxy.config import (
+    ProxyConfig,
+    _has_annotation_policy,
+    _permissive_mode,
+    find_unknown_keys,
+)
 
 # Mirrors cli/proxy.py:_DEFAULT_CONFIG (not imported — see module docstring).
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
@@ -99,6 +104,17 @@ def validate_command(config_path: str, as_json: bool) -> None:
                 for err in exc.errors():
                     loc = ".".join(str(part) for part in err["loc"])
                     errors.append(f"{loc}: {err['msg']}" if loc else err["msg"])
+            cache = data.get("cache")
+            cache_enabled = cache.get("enabled", True) if isinstance(cache, dict) else True
+            if cache_enabled and not _has_annotation_policy(data):
+                # Same advisory (and same shared predicate) as the runtime
+                # load path; advisory-only, so it never flips the exit code.
+                warnings.append(
+                    "cache.tool_annotation_policy not set — using the 'conservative' "
+                    "default. New configs are created with 'strict'; add "
+                    '"cache": {"tool_annotation_policy": "strict"} (or "conservative" '
+                    "to pin current behavior) to silence this."
+                )
         if errors or unknown_keys:
             status = "invalid"
 

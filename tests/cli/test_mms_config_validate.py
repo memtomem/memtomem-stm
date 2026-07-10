@@ -57,6 +57,41 @@ class TestConfigValidate:
         assert result.exit_code == 0, result.output
         assert "OK" in result.output
 
+    def test_missing_cache_policy_warns_but_exits_zero(self, runner, config):
+        """A key-less legacy config gets the same migration advisory as the
+        runtime load path — as a warning only, so validate stays usable as a
+        CI gate on configs that are merely un-migrated, not broken."""
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        config.chmod(0o600)
+        result = _validate(runner, config)
+        assert result.exit_code == 0, result.output
+        assert "tool_annotation_policy" in result.output
+        assert '"cache": {"tool_annotation_policy": "strict"}' in result.output
+
+    def test_cache_policy_present_no_advisory(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "conservative"},
+                    "upstream_servers": {},
+                }
+            )
+        )
+        config.chmod(0o600)
+        result = _validate(runner, config)
+        assert result.exit_code == 0, result.output
+        assert "tool_annotation_policy not set" not in result.output
+
+    def test_cache_disabled_no_missing_policy_advisory(self, runner, config):
+        config.write_text(
+            json.dumps({"enabled": True, "cache": {"enabled": False}, "upstream_servers": {}})
+        )
+        config.chmod(0o600)
+        result = _validate(runner, config)
+        assert result.exit_code == 0, result.output
+        assert "tool_annotation_policy" not in result.output
+
     def test_unknown_keys_exit_one_with_dotted_paths(self, runner, config):
         config.write_text(
             json.dumps(
