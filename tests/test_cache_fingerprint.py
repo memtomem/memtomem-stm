@@ -1,9 +1,9 @@
-"""Tests for ``compression_fingerprint`` — the compression-settings hash in the
+"""Tests for ``compression_fingerprint`` — the settings hash in the
 response-cache key.
 
-The cache stores the COMPRESSED response body, so any setting that changes the
-compressed bytes must rotate the cache key; otherwise a config change (hot
-reload included) keeps serving bodies compressed under the old settings.
+The cache stores the shaped+compressed response body, so any setting that
+changes those bytes must rotate the cache key; otherwise a config change (hot
+reload included) keeps serving bodies produced under the old settings.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from memtomem_stm.proxy.manager import (
 )
 
 _MIN_RETENTION = 0.65
+_MAX_UPSTREAM = 10_000_000
 
 
 def _tc(**overrides) -> ToolConfig:
@@ -47,6 +48,10 @@ def _tc(**overrides) -> ToolConfig:
     return ToolConfig(**base)
 
 
+def _fp(tc: ToolConfig, *, min_retention=_MIN_RETENTION, max_upstream=_MAX_UPSTREAM) -> str:
+    return compression_fingerprint(tc, min_retention, max_upstream)
+
+
 class TestFieldClassification:
     def test_every_tool_config_field_is_classified(self):
         """Adding a ``ToolConfig`` field must force a decision: does it change
@@ -59,12 +64,12 @@ class TestFieldClassification:
 
     def test_fingerprint_payload_covers_declared_fields(self):
         """The function body and the declared classification cannot drift:
-        every fingerprinted field name appears as a payload key."""
-        fp_default = compression_fingerprint(_tc(), _MIN_RETENTION)
+        every fingerprinted field name changes the fingerprint."""
+        fp_default = _fp(_tc())
         assert isinstance(fp_default, str) and len(fp_default) == 64
         for field in _FINGERPRINT_FIELDS:
             mutated = _mutate(field)
-            assert compression_fingerprint(mutated, _MIN_RETENTION) != fp_default, (
+            assert _fp(mutated) != fp_default, (
                 f"mutating fingerprinted field {field!r} did not change the fingerprint"
             )
 
@@ -86,12 +91,16 @@ def _mutate(field: str) -> ToolConfig:
 
 class TestFingerprintBehavior:
     def test_deterministic(self):
-        assert compression_fingerprint(_tc(), _MIN_RETENTION) == compression_fingerprint(
-            _tc(), _MIN_RETENTION
-        )
+        assert _fp(_tc()) == _fp(_tc())
 
     def test_min_result_retention_changes_fingerprint(self):
-        assert compression_fingerprint(_tc(), 0.65) != compression_fingerprint(_tc(), 0.3)
+        assert _fp(_tc(), min_retention=0.65) != _fp(_tc(), min_retention=0.3)
+
+    def test_max_upstream_chars_changes_fingerprint(self):
+        """``max_upstream_chars`` truncates ``original_text`` at Stage-3 SHAPE
+        (before cleaning/compression), so an oversized response is cached under
+        this budget — lowering it must rotate the key."""
+        assert _fp(_tc(), max_upstream=10_000_000) != _fp(_tc(), max_upstream=5_000)
 
     def test_api_key_does_not_change_fingerprint(self):
         """``llm.api_key`` never affects the compressed bytes, it is secret
@@ -100,21 +109,17 @@ class TestFingerprintBehavior:
         machine."""
         a = _tc(llm=LLMCompressorConfig(model="m", api_key="sk-one"))
         b = _tc(llm=LLMCompressorConfig(model="m", api_key="sk-two"))
-        assert compression_fingerprint(a, _MIN_RETENTION) == compression_fingerprint(
-            b, _MIN_RETENTION
-        )
+        assert _fp(a) == _fp(b)
 
     def test_llm_model_changes_fingerprint(self):
         a = _tc(llm=LLMCompressorConfig(model="m1", api_key="sk-test"))
         b = _tc(llm=LLMCompressorConfig(model="m2", api_key="sk-test"))
-        assert compression_fingerprint(a, _MIN_RETENTION) != compression_fingerprint(
-            b, _MIN_RETENTION
-        )
+        assert _fp(a) != _fp(b)
 
     def test_excluded_fields_do_not_change_fingerprint(self):
-        base = compression_fingerprint(_tc(), _MIN_RETENTION)
-        assert compression_fingerprint(_tc(auto_index_enabled=True), _MIN_RETENTION) == base
-        assert compression_fingerprint(_tc(extraction_enabled=True), _MIN_RETENTION) == base
+        base = _fp(_tc())
+        assert _fp(_tc(auto_index_enabled=True)) == base
+        assert _fp(_tc(extraction_enabled=True)) == base
 
     def test_path_and_enum_fields_serialize(self):
         """``SelectiveConfig.pending_store_path`` is a ``Path`` and several
@@ -127,16 +132,13 @@ class TestFingerprintBehavior:
             llm=LLMCompressorConfig(api_key="sk-test"),
             progressive=ProgressiveConfig(),
         )
-        fp = compression_fingerprint(tc, _MIN_RETENTION)
-        assert len(fp) == 64
+        assert len(_fp(tc)) == 64
 
     def test_none_sub_configs_distinct_from_defaults(self):
         """``hybrid=None`` (resolver found no config) and an explicit default
         ``HybridConfig()`` hash differently — the compressor behaves
         differently in the two cases, so they must not share rows."""
-        assert compression_fingerprint(_tc(hybrid=None), _MIN_RETENTION) != compression_fingerprint(
-            _tc(hybrid=HybridConfig()), _MIN_RETENTION
-        )
+        assert _fp(_tc(hybrid=None)) != _fp(_tc(hybrid=HybridConfig()))
 
 
 class TestManagerWiring:
@@ -161,11 +163,9 @@ class TestCanonicalization:
         ToolConfigs always agree."""
         a = _tc(cleaning=CleaningConfig(strip_html=True, deduplicate=True))
         b = _tc(cleaning=CleaningConfig(deduplicate=True, strip_html=True))
-        assert compression_fingerprint(a, _MIN_RETENTION) == compression_fingerprint(
-            b, _MIN_RETENTION
-        )
+        assert _fp(a) == _fp(b)
 
     def test_fingerprint_is_hex_sha256(self):
-        fp = compression_fingerprint(_tc(), _MIN_RETENTION)
+        fp = _fp(_tc())
         int(fp, 16)  # raises if not hex
         assert len(fp) == 64

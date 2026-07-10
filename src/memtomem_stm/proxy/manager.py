@@ -245,14 +245,25 @@ _FINGERPRINT_FIELDS = frozenset(
 _FINGERPRINT_EXCLUDED_FIELDS = frozenset({"auto_index_enabled", "extraction_enabled"})
 
 
-def compression_fingerprint(tc: ToolConfig, min_result_retention: float) -> str:
-    """SHA-256 fingerprint of the resolved compression settings for a tool.
+def compression_fingerprint(
+    tc: ToolConfig, min_result_retention: float, max_upstream_chars: int
+) -> str:
+    """SHA-256 fingerprint of the settings that shape the cached response body.
 
-    Folded into the response-cache key so a body compressed under one
+    Folded into the response-cache key so a body produced under one
     configuration is never served after the configuration changes (hot reload
     included). Fingerprints the RESOLVED ``ToolConfig`` — post
     default/server/tool-override merge and token→char budget conversion — so
-    the fingerprint changes exactly when the effective settings do.
+    the fingerprint changes exactly when the effective settings do, plus the
+    two ``ProxyConfig`` globals that alter the cached bytes but live outside
+    ``ToolConfig``:
+
+    - ``min_result_retention`` — the global floor of the compression ratio
+      guard (``manager.py`` Stage 2).
+    - ``max_upstream_chars`` — the Stage-3 SHAPE truncation applied to
+      ``original_text`` BEFORE cleaning/compression (``_shape_response``); an
+      oversized response is cut to this budget, and that cut text is what gets
+      compressed and cached, so lowering the limit must rotate the key.
 
     ``llm.api_key`` is excluded: it never affects the output bytes, it is
     secret material, and the config validator injects it from the environment,
@@ -272,6 +283,7 @@ def compression_fingerprint(tc: ToolConfig, min_result_retention: float) -> str:
             tc.llm.model_dump(mode="json", exclude={"api_key"}) if tc.llm is not None else None
         ),
         "min_result_retention": min_result_retention,
+        "max_upstream_chars": max_upstream_chars,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -1863,7 +1875,9 @@ class ProxyManager:
         if server not in self._connections:
             return ""
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
-        return compression_fingerprint(tc, cfg_snap.min_result_retention)
+        return compression_fingerprint(
+            tc, cfg_snap.min_result_retention, cfg_snap.max_upstream_chars
+        )
 
     def _clean_content(self, text: str, cleaning_cfg: CleaningConfig) -> str:
         if not cleaning_cfg.enabled:

@@ -991,6 +991,23 @@ class TestCacheKeyComponents:
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.call_count == 2
 
+    async def test_max_upstream_chars_change_stops_serving_old_rows(self, build):
+        # ``max_upstream_chars`` truncates ``original_text`` at Stage-3 SHAPE,
+        # before cleaning/compression, so an oversized response is cached under
+        # that budget. Lowering it must rotate the fingerprint (else the next
+        # identical call serves a body shaped under the old, larger limit).
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("x" * 5000)
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 1  # steady-state hit
+
+        mgr._config.max_upstream_chars = 1000  # oversized response now truncates
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 2
+
     async def test_store_passes_key_components(self, build):
         # The Stage-5 store must key on the SAME components the lookup used;
         # a store under different components is unreachable (hit rate 0%).
