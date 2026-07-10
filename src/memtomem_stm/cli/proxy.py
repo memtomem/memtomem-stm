@@ -408,6 +408,11 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
     if mcp_path.exists():
         try:
             raw = mcp_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            # Not an OSError — read_text raises it from the decode step.
+            click.echo(f"{_err('Error:')} {mcp_path} is not valid UTF-8: {exc}", err=True)
+            click.echo("    Registration aborted; the file was not modified.", err=True)
+            raise SystemExit(1) from exc
         except OSError as exc:
             click.echo(f"{_err('Error:')} Could not read {mcp_path}: {exc}", err=True)
             click.echo("    Registration aborted; the file was not modified.", err=True)
@@ -422,8 +427,8 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
             )
             click.echo(
                 "    Registration aborted; the file was not modified. Fix the JSON "
-                f"(python3 -m json.tool {mcp_path}) or rename the file aside "
-                "(e.g. .mcp.json.bak) and re-run.",
+                f"(python3 -m json.tool {shlex.quote(str(mcp_path))}) or rename the "
+                "file aside (e.g. .mcp.json.bak) and re-run.",
                 err=True,
             )
             raise SystemExit(1) from exc

@@ -1309,6 +1309,22 @@ class TestWriteMcpJsonParseSafety:
         assert "line 1" in err  # JSONDecodeError position surfaced
         assert "not modified" in err
 
+    def test_invalid_utf8_aborts_and_leaves_bytes_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # UnicodeDecodeError is a ValueError, not an OSError — it must get the
+        # same styled abort, not an unhandled traceback (codex catch, PR #653).
+        mcp_path = tmp_path / ".mcp.json"
+        prior = b'\xff\xfe{"mcpServers": {}}'
+        mcp_path.write_bytes(prior)
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._write(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert mcp_path.read_bytes() == prior
+        assert "not valid UTF-8" in capsys.readouterr().err
+
     def test_top_level_non_dict_aborts_and_leaves_bytes_untouched(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
