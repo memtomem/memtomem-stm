@@ -16,6 +16,26 @@ from pydantic import ConfigDict
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+from mcp.types import CallToolResult, TextContent
+
+
+def to_call_tool_result(result: str | list | CallToolResult) -> CallToolResult:
+    """Normalize a ``ProxyManager.call_tool`` return into a ``CallToolResult``.
+
+    The proxy handler always returns a full ``CallToolResult`` to FastMCP:
+    both ``FuncMetadata.convert_result`` and the lowlevel ``call_tool`` handler
+    pass a ``CallToolResult`` through verbatim, which is what preserves
+    ``structuredContent``/``_meta`` and the content-block order end to end.
+    The ``str``/``list`` shapes wrap into exactly the envelope the lowlevel
+    server would synthesize for them (single ``TextContent`` / the blocks,
+    ``structuredContent=None``, ``isError=False``) — wire-identical to the
+    pre-envelope behavior.
+    """
+    if isinstance(result, CallToolResult):
+        return result
+    if isinstance(result, str):
+        return CallToolResult(content=[TextContent(type="text", text=result)])
+    return CallToolResult(content=list(result))
 
 
 class _ProxyPassthroughArgs(ArgModelBase):
@@ -30,12 +50,47 @@ class _ProxyPassthroughArgs(ArgModelBase):
         return result
 
 
-_PASSTHROUGH_METADATA = FuncMetadata(
+class _ProxyFuncMetadata(FuncMetadata):
+    """FuncMetadata that may CARRY an upstream ``outputSchema`` (FastMCP's
+    ``Tool.output_schema`` cached_property reads ``fn_metadata.output_schema``,
+    which is how the schema reaches tools/list) but never VALIDATES results
+    against it: we cannot build a pydantic output model from an arbitrary
+    upstream JSON schema, the upstream server already validated its own
+    result, and the base ``convert_result`` asserts ``output_model`` is set
+    whenever ``output_schema`` is — which would turn every proxied call into
+    an AssertionError. The proxy handler always returns a ``CallToolResult``
+    (see ``to_call_tool_result``), so the ``super()`` tail is defensive-only.
+    """
+
+    def convert_result(self, result: Any) -> Any:
+        if isinstance(result, CallToolResult):
+            return result
+        return super().convert_result(result)
+
+
+_PASSTHROUGH_METADATA = _ProxyFuncMetadata(
     arg_model=_ProxyPassthroughArgs,
     output_schema=None,
     output_model=None,
     wrap_output=False,
 )
+
+
+def _passthrough_metadata(output_schema: dict[str, Any] | None) -> _ProxyFuncMetadata:
+    """Passthrough metadata for one proxied tool.
+
+    Returns the shared singleton when the upstream declared no
+    ``outputSchema`` (the overwhelmingly common case — keeps object identity
+    for existing pins) and a per-tool instance carrying the schema otherwise.
+    """
+    if output_schema is None:
+        return _PASSTHROUGH_METADATA
+    return _ProxyFuncMetadata(
+        arg_model=_ProxyPassthroughArgs,
+        output_schema=output_schema,
+        output_model=None,
+        wrap_output=False,
+    )
 
 
 def _tag_annotations_title(annotations: Any, server_name: str) -> Any:
@@ -76,13 +131,28 @@ def register_proxy_tool(
 ) -> None:
     """Register a proxy tool with the upstream's actual schema and annotations."""
     tagged_annotations = _tag_annotations_title(info.annotations, info.server)
+    # ``getattr`` + dict narrowing (not attribute access) so a pre-envelope
+    # ``ProxyToolInfo`` shape — the degradation tests' SimpleNamespace and
+    # MagicMock stand-ins included — still registers rather than aborting
+    # before ``add_tool`` or feeding a non-dict into Tool validation.
+    raw_output_schema = getattr(info, "output_schema", None)
+    raw_meta = getattr(info, "meta", None)
+    output_schema = raw_output_schema if isinstance(raw_output_schema, dict) else None
+    tool_meta = raw_meta if isinstance(raw_meta, dict) else None
+    add_tool_kwargs: dict[str, Any] = {
+        "name": info.prefixed_name,
+        "description": f"[proxied] {info.description}",
+        "annotations": tagged_annotations,
+    }
+    if tool_meta is not None:
+        # ``meta=`` is public FastMCP API (mcp >= 1.12) and flows to
+        # tools/list as ``_meta``. Passed only when the upstream set it, so
+        # meta-less tools produce exactly the pre-envelope call — and an SDK
+        # that drops the kwarg fails only meta-bearing tools into the
+        # version-drift warning below instead of all of them.
+        add_tool_kwargs["meta"] = tool_meta
     try:
-        server.add_tool(
-            handler,
-            name=info.prefixed_name,
-            description=f"[proxied] {info.description}",
-            annotations=tagged_annotations,
-        )
+        server.add_tool(handler, **add_tool_kwargs)
     except Exception:
         import logging
 
@@ -119,7 +189,13 @@ def register_proxy_tool(
         # original signature-derived model — would reject the very args
         # the advertised schema invites.
         try:
-            registered.fn_metadata = _PASSTHROUGH_METADATA
+            registered.fn_metadata = _passthrough_metadata(output_schema)
+            # ``Tool.output_schema`` is a functools.cached_property over
+            # ``fn_metadata.output_schema``; drop any value cached before the
+            # overwrite so tools/list reads the upstream schema, not a stale
+            # signature-derived one. dict.pop on a pydantic v2 model's
+            # ``__dict__`` cannot raise.
+            registered.__dict__.pop("output_schema", None)
             if info.input_schema:
                 registered.parameters = info.input_schema
         except Exception:

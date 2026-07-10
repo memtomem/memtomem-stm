@@ -44,11 +44,19 @@ class ShapedResponse:
     set). ``non_text_content`` is the preserved non-text content list (consumed
     by the cache-store gate and the final return shape). When ``passthrough`` is
     non-None the caller short-circuits.
+
+    ``non_text_before_first_text`` is the number of non-text blocks that
+    preceded the FIRST text block in the upstream content array. The final
+    return shape puts the (single, merged) processed text back at that
+    position, so non-text blocks keep their relative order and a leading
+    image/resource stays leading. 0 when there is no text (passthrough) or the
+    content started with text.
     """
 
     original_text: str
     non_text_content: list[Any]
     passthrough: ShapePassthrough | None = None
+    non_text_before_first_text: int = 0
 
 
 @dataclass(frozen=True, slots=True)

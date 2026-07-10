@@ -20,12 +20,13 @@ logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS proxy_cache (
-    cache_key   TEXT    PRIMARY KEY,
-    server      TEXT    NOT NULL,
-    tool        TEXT    NOT NULL,
-    result      TEXT    NOT NULL,
-    created_at  REAL    NOT NULL,
-    ttl_seconds REAL
+    cache_key     TEXT    PRIMARY KEY,
+    server        TEXT    NOT NULL,
+    tool          TEXT    NOT NULL,
+    result        TEXT    NOT NULL,
+    created_at    REAL    NOT NULL,
+    ttl_seconds   REAL,
+    envelope_safe INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -47,11 +48,15 @@ class CacheEntry:
         return time.time() >= self.created_at + self.ttl_seconds
 
 
-# Bump when the key derivation changes shape so ``initialize()`` can purge
-# rows written under an older scheme (opaque hashes make them unreachable but
-# otherwise immortal for ``ttl_seconds NULL`` rows). Stored in SQLite's
-# ``PRAGMA user_version``.
-_KEY_SCHEMA_VERSION = 2
+# Bump when the key derivation OR the row contract changes shape so
+# ``initialize()`` can purge rows written under an older scheme (opaque hashes
+# make them unreachable but otherwise immortal for ``ttl_seconds NULL`` rows).
+# Stored in SQLite's ``PRAGMA user_version``.
+# v3: envelope contract — only ``isError=false``, text-only responses without
+# ``structuredContent`` or result-level ``_meta`` are stored, recorded in the
+# ``envelope_safe`` column. Legacy rows cannot prove that, so the bump drops
+# the whole table (and, via the DROP, adds the column).
+_KEY_SCHEMA_VERSION = 3
 
 
 def _make_key(
@@ -142,21 +147,22 @@ class ProxyCache:
         try:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
+            # One-time purge on schema change, run BEFORE table creation: rows
+            # keyed under an older ``_make_key`` shape are opaque hashes no
+            # current lookup can ever produce, so they would sit as dead
+            # weight — forever, for ``ttl_seconds NULL`` rows — while still
+            # counting against ``max_entries``. DROP (not DELETE) so the
+            # recreate below also picks up column additions (v3:
+            # ``envelope_safe``) without a separate ALTER migration.
+            # ``user_version`` is 0 for both fresh and pre-versioning
+            # databases; the DROP on a fresh database is a no-op.
+            (schema_version,) = db.execute("PRAGMA user_version").fetchone()
+            if schema_version < _KEY_SCHEMA_VERSION:
+                db.execute("DROP TABLE IF EXISTS proxy_cache")
+                db.execute(f"PRAGMA user_version = {_KEY_SCHEMA_VERSION}")
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
             db.commit()
-            # One-time purge on key-schema change: rows keyed under an older
-            # ``_make_key`` shape are opaque hashes no current lookup can ever
-            # produce, so they would sit as dead weight — forever, for
-            # ``ttl_seconds NULL`` rows — while still counting against
-            # ``max_entries``. ``user_version`` is 0 for both fresh and
-            # pre-versioning databases; the DELETE on a fresh database is a
-            # no-op.
-            (schema_version,) = db.execute("PRAGMA user_version").fetchone()
-            if schema_version < _KEY_SCHEMA_VERSION:
-                db.execute("DELETE FROM proxy_cache")
-                db.execute(f"PRAGMA user_version = {_KEY_SCHEMA_VERSION}")
-                db.commit()
             # Startup purge of expired rows, running against the local
             # ``db`` before it is handed off to ``self._db``. Failures fall
             # through to the outer except so ``self._db`` stays ``None``.
@@ -227,7 +233,8 @@ class ProxyCache:
         try:
             with self._lock:
                 row = self._db.execute(
-                    "SELECT result, created_at, ttl_seconds FROM proxy_cache WHERE cache_key = ?",
+                    "SELECT result, created_at, ttl_seconds, envelope_safe "
+                    "FROM proxy_cache WHERE cache_key = ?",
                     (key,),
                 ).fetchone()
         except sqlite3.Error:
@@ -274,6 +281,15 @@ class ProxyCache:
                     tool,
                     exc_info=True,
                 )
+            return None
+        if not row[3]:
+            # Envelope-safety marker (v3): every row written by ``set()`` is
+            # marked 1; an unmarked row can only come from an out-of-band
+            # writer (an older binary, external SQL) and cannot prove it is a
+            # text-only success without ``structuredContent``/``_meta``, so
+            # serving it could silently drop envelope fields. Checked after
+            # the privacy eviction (which must still fire for unmarked rows)
+            # and before expiry (an unmarked row is a miss either way).
             return None
         if entry.is_expired():
             return None
@@ -354,14 +370,21 @@ class ProxyCache:
         )
         now = time.time()
         with self._lock:
+            # ``envelope_safe`` is written on BOTH the insert and the conflict
+            # branches: the manager's store-side gate guarantees everything
+            # reaching ``set()`` is envelope-safe, and an upsert over an
+            # unmarked out-of-band row must re-mark it or the key would miss
+            # forever — ``set()`` always leaves a servable row.
             self._db.execute(
                 """
-                INSERT INTO proxy_cache (cache_key, server, tool, result, created_at, ttl_seconds)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO proxy_cache
+                    (cache_key, server, tool, result, created_at, ttl_seconds, envelope_safe)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(cache_key) DO UPDATE SET
-                    result      = excluded.result,
-                    created_at  = excluded.created_at,
-                    ttl_seconds = excluded.ttl_seconds
+                    result        = excluded.result,
+                    created_at    = excluded.created_at,
+                    ttl_seconds   = excluded.ttl_seconds,
+                    envelope_safe = excluded.envelope_safe
                 """,
                 (key, server, tool, result, now, ttl_seconds),
             )

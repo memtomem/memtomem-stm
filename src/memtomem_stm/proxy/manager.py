@@ -144,6 +144,13 @@ from memtomem_stm.utils.redact import redact_exception_text
 # Retrying these wastes time and can damage the connection.
 _NO_RETRY_CODES = {-32600, -32601, -32602, -32603}  # INVALID_REQUEST/METHOD/PARAMS/INTERNAL
 
+# ToolError message for an upstream isError result whose content carries no
+# text at all (non-text-only or empty). ToolError is text-only, so this
+# placeholder is the best signal we can propagate; the non-text blocks and any
+# structuredContent/_meta on the errored result are dropped (structured-error
+# propagation is deferred with structured-result caching).
+_NON_TEXT_ERROR_TEXT = "[upstream error: non-text error content]"
+
 logger = logging.getLogger(__name__)
 
 
@@ -203,6 +210,10 @@ class ProxyToolInfo:
     server: str
     original_name: str
     annotations: Any = None  # MCP ToolAnnotations (readOnlyHint, destructiveHint, etc.)
+    # Upstream tools/list envelope fields, advertised verbatim (description
+    # budgeting and schema distillation apply to the INPUT side only).
+    output_schema: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = None  # tool-level ``_meta``
 
 
 @dataclass(frozen=True, slots=True)
@@ -1571,6 +1582,8 @@ class ProxyManager:
                             server=conn.name,
                             original_name=t.name,
                             annotations=getattr(t, "annotations", None),
+                            output_schema=getattr(t, "outputSchema", None),
+                            meta=getattr(t, "meta", None),
                         ),
                         raw_description=t.description or "",
                         raw_schema=t.inputSchema,
@@ -2724,8 +2737,14 @@ class ProxyManager:
         arguments: dict[str, Any],
         *,
         trace_id: str | None = None,
-    ) -> str | list:
+    ) -> str | list | CallToolResult:
         """Forward a tool call to upstream, compress, surface, and return.
+
+        Return shape: ``str`` (text-only response, or a cache hit), ``list``
+        of content blocks (mixed/non-text response), or a full
+        ``CallToolResult`` when the upstream result carries envelope fields
+        (``structuredContent`` / result-level ``_meta``) that a bare
+        text/list return would drop.
 
         Wraps the entire call pipeline in a Langfuse observation span when
         Langfuse is configured. The span carries ``server``, ``tool``, and
@@ -2955,7 +2974,7 @@ class ProxyManager:
         arguments: dict[str, Any],
         *,
         trace_id: str,
-    ) -> tuple[str | list, bool]:
+    ) -> tuple[str | list | CallToolResult, bool]:
         """Cache stampede guard: serialize identical concurrent ``call_tool``
         invocations on a per-key lock so a cold cache + duplicate requests
         trigger one upstream call rather than N.
@@ -3393,10 +3412,16 @@ class ProxyManager:
         max_upstream = cfg_snap.max_upstream_chars
         text_parts: list[str] = []
         non_text_content: list = []
+        non_text_before_first_text = 0
         total_chars = 0
         oversize = False
         for content in result.content or []:
             if content.type == "text":
+                if not text_parts:
+                    # Anchor for the final return shape: the processed text is
+                    # reinserted where the upstream's FIRST text block sat, so
+                    # non-text blocks keep their relative positions.
+                    non_text_before_first_text = len(non_text_content)
                 remaining = max_upstream - total_chars
                 if remaining <= 0:
                     oversize = True
@@ -3437,6 +3462,7 @@ class ProxyManager:
         return ShapedResponse(
             original_text="\n".join(text_parts),
             non_text_content=non_text_content,
+            non_text_before_first_text=non_text_before_first_text,
         )
 
     async def _compress_and_surface(
@@ -4269,12 +4295,19 @@ class ProxyManager:
         cache_args: dict[str, Any],
         comp: CompressionResult,
         non_text_content: list,
+        has_result_envelope: bool,
         cfg_snap: ProxyConfig,
         context_query: str | None,
         config_fingerprint: str,
     ) -> None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
+
+        Only envelope-safe responses are ever stored: text-only content with no
+        result-level ``structuredContent``/``_meta`` (``has_result_envelope``)
+        — the ``result TEXT`` schema can reproduce nothing else, and a hit that
+        dropped those fields would break the envelope-preservation contract.
+        Rows written here are marked ``envelope_safe`` by ``ProxyCache.set``.
 
         Cache writes are an optional fast-path: a SQLite lock timeout, disk full,
         or any other store error must NOT propagate to the agent and discard a
@@ -4313,12 +4346,17 @@ class ProxyManager:
         """
         if self._cache is None:
             return
-        if non_text_content:
-            # A non-text / mixed response is never STORED (only its text twin for
-            # the same key could have been). Invalidate that prior row when caching
-            # is disabled (resolved ttl<=0); the explicit ttl<=0 branch below does
-            # the same for text responses. The non-text-ONLY response early-returns
-            # in ``_call_tool_inner`` and invalidates there instead.
+        if non_text_content or has_result_envelope:
+            # A non-text / mixed response is never STORED (only its text twin
+            # for the same key could have been), and neither is a response
+            # carrying result-level envelope fields (``structuredContent`` /
+            # ``_meta``): the ``result TEXT`` cache serves plain text, so a
+            # hit would silently drop those fields even when the content is
+            # text-only. Invalidate the prior row when caching is disabled
+            # (resolved ttl<=0); the explicit ttl<=0 branch below does the
+            # same for text responses. The non-text-ONLY response
+            # early-returns in ``_call_tool_inner`` and invalidates there
+            # instead.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
@@ -4395,7 +4433,7 @@ class ProxyManager:
         *,
         trace_id: str | None = None,
         cfg_snap: ProxyConfig | None = None,
-    ) -> str | list:
+    ) -> str | list | CallToolResult:
         # Public entry point ``call_tool`` generates the trace_id and passes
         # it in so it can match the enclosing Langfuse span. Direct callers
         # (tests and internal dispatch) that don't care about tracing omit
@@ -4464,6 +4502,62 @@ class ProxyManager:
         # orchestrator owns the metric write + return shape (R8).
         shaped = self._shape_response(result, server, tool, cfg_snap=cfg_snap)
         non_text_content = shaped.non_text_content
+        original_text = shaped.original_text
+        # Result-level envelope fields (MCP: ``structuredContent`` and
+        # ``_meta``, exposed as ``meta`` on the pydantic model). Both are
+        # ``dict | None`` per spec; the isinstance narrowing tolerates fakes
+        # that model only ``content``/``isError`` (SimpleNamespace misses the
+        # attribute, MagicMock fabricates a truthy non-dict) as well as
+        # spec-noncompliant upstreams. When either field is present the
+        # return shape below is a full ``CallToolResult`` so the fields reach
+        # the client verbatim, and the Stage-5 store is bypassed — a
+        # ``result TEXT`` cache hit could never reproduce them.
+        raw_structured = getattr(result, "structuredContent", None)
+        raw_meta = getattr(result, "meta", None)
+        structured_content: dict[str, Any] | None = (
+            raw_structured if isinstance(raw_structured, dict) else None
+        )
+        result_meta: dict[str, Any] | None = raw_meta if isinstance(raw_meta, dict) else None
+        has_result_envelope = structured_content is not None or result_meta is not None
+
+        # The isError check runs BEFORE the no-text passthrough early-return:
+        # a non-text-only (or empty-content) error must surface as an error,
+        # not as a passthrough success (previously it leaked as one).
+        if result.isError:
+            error_text = original_text or _NON_TEXT_ERROR_TEXT
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=len(original_text),
+                    compressed_chars=len(original_text),
+                    is_error=True,
+                    error_category=ErrorCategory.UPSTREAM_ERROR,
+                    error_message=error_text[:MAX_ERROR_MESSAGE_CHARS],
+                    trace_id=trace_id,
+                )
+            )
+            # Propagate upstream isError so FastMCP sets isError=true on the
+            # proxied response instead of silently converting to a normal
+            # result. ToolError is text-only: non-text error content and any
+            # structuredContent/_meta on the errored result are dropped
+            # (deferred with structured-result caching).
+            from mcp.server.fastmcp.exceptions import ToolError
+
+            tool_err = ToolError(error_text)
+            _mark_recorded(tool_err)
+            # The error raises before the Stage-5 store, so an error under a
+            # disabled cache (ttl<=0) would otherwise leave a prior cached
+            # text row for this key live. All error shapes (text-only, mixed,
+            # non-text-only) are invalidated here (#541). Mark the exception
+            # so the raised-failure backstop in ``_call_tool_guarded`` does
+            # not repeat the DELETE.
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
+            _mark_cache_invalidated(tool_err)
+            raise tool_err
+
         if shaped.passthrough is not None:
             # Both passthrough shapes are live upstream calls, so both record the
             # 0/0 metric — otherwise an eligible empty response would carry a
@@ -4488,42 +4582,20 @@ class ProxyManager:
             self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
+            if has_result_envelope:
+                # A structured-only / meta-only response is a real result, not
+                # an empty one — return the envelope (content preserved as-is,
+                # possibly []) instead of the sentinel or a bare list that
+                # would drop the fields. ``_meta=`` is the pydantic alias
+                # (``populate_by_name`` is unset on mcp types).
+                return mcp_types.CallToolResult(
+                    content=list(non_text_content),
+                    structuredContent=structured_content,
+                    _meta=result_meta,
+                )
             if shaped.passthrough.has_non_text:
                 return non_text_content
             return "[empty response]"
-        original_text = shaped.original_text
-
-        if result.isError:
-            self.tracker.record_error(
-                CallMetrics(
-                    server=server,
-                    tool=tool,
-                    original_chars=len(original_text),
-                    compressed_chars=len(original_text),
-                    is_error=True,
-                    error_category=ErrorCategory.UPSTREAM_ERROR,
-                    error_message=original_text[:MAX_ERROR_MESSAGE_CHARS],
-                    trace_id=trace_id,
-                )
-            )
-            # Propagate upstream isError so FastMCP sets isError=true on the
-            # proxied response instead of silently converting to a normal result.
-            from mcp.server.fastmcp.exceptions import ToolError
-
-            tool_err = ToolError(original_text)
-            _mark_recorded(tool_err)
-            # The error raises before the Stage-5 store, so a text-bearing error
-            # (text-only or mixed) under a disabled cache (ttl<=0) would otherwise
-            # leave a prior cached text row for this key live. A non-text-ONLY
-            # error has no text and is invalidated by the passthrough branch above
-            # instead; here we cover the text-bearing shapes (#541). Mark the
-            # exception so the raised-failure backstop in ``_call_tool_guarded``
-            # does not repeat the DELETE.
-            self._invalidate_disabled_cache(
-                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
-            )
-            _mark_cache_invalidated(tool_err)
-            raise tool_err
 
         # Resolve effective settings (using config snapshot)
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
@@ -4635,15 +4707,44 @@ class ProxyManager:
             cache_args=cache_args,
             comp=comp,
             non_text_content=non_text_content,
+            has_result_envelope=has_result_envelope,
             cfg_snap=cfg_snap,
             context_query=context_query,
             config_fingerprint=config_fp,
         )
 
-        # Combine compressed text with preserved non-text content
+        # Final return shape. The processed text (single, merged block) is
+        # reinserted at the upstream's first-text position so non-text blocks
+        # keep their relative order. When the result carries envelope fields
+        # the shape is a full ``CallToolResult`` — the text twin is the
+        # compressed, token-budgeted view while ``structuredContent``/``_meta``
+        # pass verbatim (clients consuming structuredContent get full
+        # fidelity). Progressive/selective continuations
+        # (``stm_proxy_read_more`` / ``stm_proxy_select_chunks``) return plain
+        # text and do not re-carry the envelope.
         if non_text_content:
             from mcp.types import TextContent
 
-            return [TextContent(type="text", text=final_result), *non_text_content]
+            k = shaped.non_text_before_first_text
+            content_blocks: list = [
+                *non_text_content[:k],
+                TextContent(type="text", text=final_result),
+                *non_text_content[k:],
+            ]
+            if has_result_envelope:
+                return mcp_types.CallToolResult(
+                    content=content_blocks,
+                    structuredContent=structured_content,
+                    _meta=result_meta,
+                )
+            return content_blocks
 
+        if has_result_envelope:
+            from mcp.types import TextContent
+
+            return mcp_types.CallToolResult(
+                content=[TextContent(type="text", text=final_result)],
+                structuredContent=structured_content,
+                _meta=result_meta,
+            )
         return final_result

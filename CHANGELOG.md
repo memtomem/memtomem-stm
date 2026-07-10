@@ -13,6 +13,18 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- MCP result-envelope preservation through the proxy. tools/list now
+  advertises the upstream tool's `outputSchema` and `_meta`; call results
+  carrying `structuredContent` or result-level `_meta` return them verbatim
+  (text content is still compressed — clients consuming `structuredContent`
+  get full fidelity), and content-block order is preserved (the processed
+  text is reinserted at the upstream's first-text position instead of
+  always leading). **Behavior change**: the response cache narrows to
+  envelope-safe rows — only successful, text-only responses without
+  `structuredContent`/`_meta` are stored (errors and non-text responses
+  were already uncached) — and the cache schema bump wipes existing rows
+  once on first start after upgrading (one-time cold start; entries
+  repopulate on use).
 - **Behavior change**: new config files are created with an explicit
   `"cache": {"tool_annotation_policy": "strict"}` — `mms init`, `mms add`
   against a missing config, and `mms add --from-clients` all write it, so
@@ -35,6 +47,12 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Behavior change**: a non-text-only (or empty-content) upstream error
+  now surfaces as a tool error. Previously the no-text passthrough
+  early-return ran before the `isError` check, so such an error was
+  returned to the client as a successful non-text response; it now raises
+  with a `[upstream error: non-text error content]` placeholder message
+  and is recorded as an upstream error in the metrics.
 - `mms add`'s `invalid_env` diagnostics no longer echo the raw `--env`
   argument: a malformed pair (`--env =tok`, or a bare token missing `KEY=`)
   is likely a stray credential, and both stderr and the `--json` error
