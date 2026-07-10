@@ -21,7 +21,7 @@ changes inline only. See the deprecation policy in
   supported them, so header-authenticated servers failed import and probe.
   Header values are stored in plaintext in the config file (0600 perms);
   `--json` outputs mask them. `--header` with `--transport stdio` is
-  rejected (`header_requires_http`). (#N)
+  rejected (`header_requires_http`). (#656)
 
 ### Fixed
 
