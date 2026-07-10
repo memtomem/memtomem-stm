@@ -20,7 +20,7 @@ changes inline only. See the deprecation policy in
   re-prompt on a colliding prefix. Prefix format/uniqueness rules now live in
   one shared module (`proxy/prefixes.py`) used by both the CLI pre-save
   checks and the runtime `ProxyConfig` validators, so the two sides cannot
-  diverge again.
+  diverge again. (#654)
 
 ## [0.1.32] — 2026-07-05
 
