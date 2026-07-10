@@ -1114,6 +1114,14 @@ def stats(
 @click.option("--url", default="", help="Endpoint URL (SSE / HTTP).")
 @click.option("--env", "env_pairs", multiple=True, metavar="KEY=VALUE")
 @click.option(
+    "--header",
+    "header_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="HTTP header for sse/streamable_http transports (repeatable). "
+    "Values are stored in plaintext in the config file (0600 perms).",
+)
+@click.option(
     "--compression",
     type=click.Choice(["auto", "none", "truncate", "selective", "hybrid"]),
     default="auto",
@@ -1146,7 +1154,8 @@ def stats(
     help="Import additional servers interactively from existing MCP clients "
     "(Claude Desktop / Code, project .mcp.json). Reuses init's discovery + "
     "TUI flow. Skips candidates already registered in this config. "
-    "Incompatible with NAME / --prefix / --command / --args / --url / --env.",
+    "Incompatible with NAME / --prefix / --command / --args / --url / --env "
+    "/ --header.",
 )
 @click.option(
     "--prune",
@@ -1169,6 +1178,7 @@ def add(
     transport: str,
     url: str,
     env_pairs: tuple[str, ...],
+    header_pairs: tuple[str, ...],
     compression: str,
     max_result_chars: int,
     validate: bool,
@@ -1205,6 +1215,8 @@ def add(
             conflicts.append("--url")
         if env_pairs:
             conflicts.append("--env")
+        if header_pairs:
+            conflicts.append("--header")
         if conflicts:
             raise click.UsageError(
                 f"--from-clients cannot be combined with: {', '.join(conflicts)}."
@@ -1341,6 +1353,22 @@ def add(
             )
         sys.exit(1)
 
+    # VAL-5: --header only applies to HTTP transports; a header on a stdio
+    # entry would be silently ignored by the runtime.
+    if transport == "stdio" and header_pairs:
+        click.echo(
+            f"{_err('Error:')} --header requires an HTTP transport (sse/streamable_http).",
+            err=True,
+        )
+        if as_json:
+            _json_fail(
+                "add",
+                "header_requires_http",
+                "--header requires an HTTP transport (sse/streamable_http)",
+                name=name,
+            )
+        sys.exit(1)
+
     entry: dict[str, Any] = {
         "prefix": prefix,
         "transport": transport,
@@ -1400,6 +1428,40 @@ def add(
                 sys.exit(1)
             env_dict[k] = v
         entry["env"] = env_dict
+
+    if header_pairs:
+        headers_dict: dict[str, str] = {}
+        for pair in header_pairs:
+            if "=" not in pair:
+                click.echo(f"{_err('Error:')} --header must be KEY=VALUE, got: {pair}", err=True)
+                if as_json:
+                    _json_fail(
+                        "add",
+                        "invalid_header",
+                        f"--header must be KEY=VALUE, got: {pair}",
+                        name=name,
+                    )
+                sys.exit(1)
+            k, v = pair.split("=", 1)
+            if not k:
+                click.echo(
+                    f"{_err('Error:')} --header key must be non-empty, got: {pair}",
+                    err=True,
+                )
+                if as_json:
+                    _json_fail(
+                        "add",
+                        "invalid_header",
+                        f"--header key must be non-empty, got: {pair}",
+                        name=name,
+                    )
+                sys.exit(1)
+            # Deliberately NO _DANGEROUS_ENV_KEYS check here: that list guards
+            # env injection into spawned processes; headers are sent over HTTP
+            # and never touch a subprocess environment. A header literally
+            # named "PATH" is legal.
+            headers_dict[k] = v
+        entry["headers"] = headers_dict
 
     tools_reachable: int | None = None
     if validate:
@@ -1527,6 +1589,13 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
                 entry["env"] = safe_env
     else:
         entry["url"] = url
+        headers = raw.get("headers")
+        if isinstance(headers, dict):
+            # Unlike env, no dangerous-key filter: headers go on HTTP
+            # requests, not into a spawned process's environment.
+            safe_headers = {str(k): str(v) for k, v in headers.items() if isinstance(k, str)}
+            if safe_headers:
+                entry["headers"] = safe_headers
     return entry
 
 
@@ -3725,9 +3794,10 @@ def _denormalize_client_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], li
 
     Degraded inverse of :func:`_normalize_client_entry` for entries without
     an ``origin.original`` (manual ``mms add``, pre-#475 imports). Forward
-    normalization is lossy — HTTP ``headers`` are never imported and
-    ``_DANGEROUS_ENV_KEYS`` are filtered — so the reconstruction cannot
-    recover those; the returned warnings name what may be missing. STM-only
+    normalization is lossy — ``_DANGEROUS_ENV_KEYS`` are filtered, and
+    imports made before HTTP ``headers`` were captured carry none — so the
+    reconstruction cannot recover those; the returned warnings name what may
+    be missing. STM-only
     fields (prefix, compression, budgets, ...) are dropped by construction:
     the host entry is built from the transport-identifying fields alone.
     """
@@ -3753,7 +3823,10 @@ def _denormalize_client_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], li
         if isinstance(headers, dict) and headers:
             payload["headers"] = {str(k): str(v) for k, v in headers.items()}
         else:
-            warnings.append("HTTP headers are not captured by import — the restored entry has none")
+            warnings.append(
+                "no HTTP headers recorded on this entry — imports made before "
+                "headers were captured restore with none"
+            )
     return payload, warnings
 
 
@@ -4573,11 +4646,19 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
         )
     elif transport == "sse":
         sdk_timeout = remaining()
-        ctx = sse_client(cfg.get("url", ""), timeout=sdk_timeout, sse_read_timeout=sdk_timeout)
+        ctx = sse_client(
+            cfg.get("url", ""),
+            headers=cfg.get("headers"),
+            timeout=sdk_timeout,
+            sse_read_timeout=sdk_timeout,
+        )
     else:
         sdk_timeout = remaining()
         ctx = streamablehttp_client(
-            cfg.get("url", ""), timeout=sdk_timeout, sse_read_timeout=sdk_timeout
+            cfg.get("url", ""),
+            headers=cfg.get("headers"),
+            timeout=sdk_timeout,
+            sse_read_timeout=sdk_timeout,
         )
 
     async with AsyncExitStack() as stack:

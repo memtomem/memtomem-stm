@@ -11,6 +11,18 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms add --header KEY=VALUE` (repeatable) registers HTTP headers for
+  `sse` / `streamable_http` upstreams. Headers now also flow through
+  `--from-clients` / `mms init` import discovery and the `mms add
+  --validate` / `mms health` probes — previously the CLI dropped them
+  everywhere even though the config schema and runtime transport already
+  supported them, so header-authenticated servers failed import and probe.
+  Header values are stored in plaintext in the config file (0600 perms);
+  `--json` outputs mask them. `--header` with `--transport stdio` is
+  rejected (`header_requires_http`). (#N)
+
 ### Fixed
 
 - **Behavior change**: the response-cache key now includes the call's

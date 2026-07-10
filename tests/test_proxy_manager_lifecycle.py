@@ -959,3 +959,64 @@ class TestCleanupLogCredentialRedaction:
                     await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
 
         self._assert_redacted(caplog, "Reconnect to 'bad' failed")
+
+
+# ── _open_transport ──────────────────────────────────────────────────────
+
+
+class TestOpenTransportHeaders:
+    """Pins that the runtime transport passes configured HTTP headers to the
+    SDK clients — the last leg of the headers-plumbing chain (CLI persist →
+    probe → runtime). No prior test covered this pass-through."""
+
+    def test_sse_passes_url_and_headers(self, monkeypatch):
+        from memtomem_stm.proxy import manager as mod
+
+        captured = {}
+        sentinel = object()
+
+        def fake_sse_client(url, *, headers=None):
+            captured.update({"url": url, "headers": headers})
+            return sentinel
+
+        monkeypatch.setattr(mod, "sse_client", fake_sse_client)
+
+        cfg = UpstreamServerConfig(
+            prefix="api",
+            transport=TransportType.SSE,
+            url="https://up.example/sse",
+            headers={"Authorization": "Bearer t"},
+        )
+        mgr = _make_manager(servers={"api": cfg})
+
+        assert mgr._open_transport(cfg) is sentinel
+        assert captured == {
+            "url": "https://up.example/sse",
+            "headers": {"Authorization": "Bearer t"},
+        }
+
+    def test_streamable_http_passes_url_and_headers(self, monkeypatch):
+        from memtomem_stm.proxy import manager as mod
+
+        captured = {}
+        sentinel = object()
+
+        def fake_streamablehttp_client(url, *, headers=None):
+            captured.update({"url": url, "headers": headers})
+            return sentinel
+
+        monkeypatch.setattr(mod, "streamablehttp_client", fake_streamablehttp_client)
+
+        cfg = UpstreamServerConfig(
+            prefix="api",
+            transport=TransportType.STREAMABLE_HTTP,
+            url="https://up.example/mcp",
+            headers={"X-Project": "stm"},
+        )
+        mgr = _make_manager(servers={"api": cfg})
+
+        assert mgr._open_transport(cfg) is sentinel
+        assert captured == {
+            "url": "https://up.example/mcp",
+            "headers": {"X-Project": "stm"},
+        }

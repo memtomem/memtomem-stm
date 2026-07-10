@@ -664,3 +664,5 @@ sequenceDiagram
 | `stdio` (default) | `command`, `args`, `env` | Standard subprocess MCP server |
 | `sse` | `url`, `headers` | Server-Sent Events over HTTP |
 | `streamable_http` | `url`, `headers` | HTTP streamable responses |
+
+`headers` values (e.g. `Authorization`) are stored in the config file in plaintext — the file is chmod `0600` best-effort, but treat it as secret-bearing. CLI `--json` surfaces (`mms list` / `status` / `add`) mask the values, keys preserved. Register headers with `mms add --header KEY=VALUE` (repeatable).

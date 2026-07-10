@@ -154,6 +154,10 @@ Options:
                                   [default: stdio]
   --url TEXT                      Endpoint URL (SSE / HTTP).
   --env KEY=VALUE
+  --header KEY=VALUE              HTTP header for sse/streamable_http
+                                  transports (repeatable). Values are stored
+                                  in plaintext in the config file (0600
+                                  perms).
   --compression [auto|none|truncate|selective|hybrid]
                                   'auto' picks strategy per response by
                                   content type.  [default: auto]
@@ -169,7 +173,8 @@ Options:
                                   Reuses init's discovery + TUI flow.
                                   Skips candidates already registered.
                                   Incompatible with NAME / --prefix /
-                                  --command / --args / --url / --env.
+                                  --command / --args / --url / --env /
+                                  --header.
   --prune                         After a successful --import, remove the
                                   direct registrations from source MCP
                                   clients so tools are reachable via STM
@@ -182,9 +187,11 @@ Options:
 
 Use `--validate` to catch typos and misconfigurations at registration time instead of the next time the proxy starts. Without it `add` only writes the config — bad entries are discovered later via `mms health` or when the proxy fails to spawn.
 
+For `sse`/`streamable_http` servers that need HTTP authentication, pass `--header KEY=VALUE` (repeatable). The same headers are sent on the `--validate` / `mms health` probes and on every runtime connection, so a header-authenticated server validates with exactly the credentials it will run with. Header values are written to the config file in **plaintext** — the file is chmod `0600` best-effort, but treat it as secret-bearing; `--json` output masks the values (keys preserved). `--header` with `--transport stdio` is rejected (`header_requires_http`): the runtime would silently ignore it.
+
 A `--prefix` already used by another registered server is rejected before anything is written (`duplicate_prefix`): the proxy's config loader refuses duplicate prefixes, so saving one would leave a config the server can't start with. The interactive flows (`mms init`, `add --from-clients`) re-prompt on a colliding prefix for the same reason.
 
-With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `malformed_args`, `invalid_env`, `validation_failed`). `--json` is a usage error with `--from-clients` — the import path is an interactive selection flow.
+With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `header_requires_http`, `malformed_args`, `invalid_env`, `invalid_header`, `validation_failed`). `--json` is a usage error with `--from-clients` — the import path is an interactive selection flow.
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`, and `~/Library/Application Support/Claude/claude_desktop_config.json`. Claude Desktop discovery is **macOS-only** — on Linux/Windows the Claude Desktop file isn't scanned, so register those servers with `mms add` instead (paste hints elsewhere in the wizard are OS-aware; only the Desktop scan path is pinned to macOS). This is the post-init equivalent of the `init` discovery step — servers already registered in this config are filtered out by name and by `(transport, command, args)` / `(transport, url)` signature before the selection UI. `--validate` and `--timeout` work on the selected subset.
 
