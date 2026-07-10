@@ -17,6 +17,7 @@ shadow the reseed mid-run).
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -362,11 +363,19 @@ class TestConfigChangeDetection:
 
     async def test_damped_failure_redacts_the_attempted_credential(self, tmp_path):
         """The damped-failure warning is redacted against the config actually
-        attempted. Even if the file rotates B→C (distinct credential) during
-        establish, the request attempts B and redacts B's token — C's
-        credential is never attempted and never appears. Under the pre-fix
-        re-read the reconnect would attempt C but the wrapper would redact with
-        B's url, leaking C's token."""
+        attempted, reproducing the reload race faithfully: the request resolved
+        B (``fresh_cfg``) but the live snapshot has ALREADY rotated to C by the
+        time the reconnect runs. The fix attempts B (the passed cfg) and redacts
+        B's token; the damped fingerprint is B's. Under the pre-fix re-read,
+        ``_reconnect_server`` would instead read the live snapshot C, attempt C,
+        yet the wrapper would damp/redact with B — so C's credential would leak
+        and B would be wrongly suppressed.
+
+        Driven through ``_maybe_reconnect_for_config_change`` directly with the
+        loader pre-seeded to C: this is exactly the state after the file moved
+        on between the request pinning its ``cfg_snap`` (B) and the reconnect
+        firing — no lock choreography needed because the divergence already
+        exists when the wrapper is entered."""
         import logging
 
         cfg_a = _sse_cfg("https://old.example/sse")
@@ -374,13 +383,13 @@ class TestConfigChangeDetection:
         cfg_c = _sse_cfg("https://carol:tok-c@c.example/sse")
         mgr = _make_manager(tmp_path, {"srv": cfg_a})
         conn = _seed_connection(mgr, "srv", cfg_a)
-        conn.session.call_tool = AsyncMock(return_value=_ok_result())
-        _reseed(mgr, tmp_path, {"srv": cfg_b})
+        # The live snapshot is already C; the request still holds B.
+        _reseed(mgr, tmp_path, {"srv": cfg_c})
+
+        attempted: list[str] = []
 
         def _open(cfg):
-            # File rotates to C mid-establish; the error embeds the url of
-            # whatever config was actually attempted.
-            _reseed(mgr, tmp_path, {"srv": cfg_c})
+            attempted.append(cfg.url)
             raise ConnectionError(f"connection failed for {cfg.url}")
 
         records: list[logging.LogRecord] = []
@@ -396,16 +405,64 @@ class TestConfigChangeDetection:
         mgr_logger.setLevel(logging.DEBUG)
         try:
             with patch.object(mgr, "_open_transport", side_effect=_open):
-                await _fetch(mgr)
+                await mgr._maybe_reconnect_for_config_change(conn, cfg_b)
         finally:
             mgr_logger.removeHandler(handler)
             mgr_logger.setLevel(prev_level)
 
+        assert attempted == [cfg_b.url]  # attempted the resolved B, not live C
         assert conn.last_failed_connection_fp == _connection_fingerprint(cfg_b)
         all_text = "\n".join(r.getMessage() for r in records)
         assert "tok-c" not in all_text  # C never attempted, never logged
         assert "tok-b" not in all_text  # B attempted but redacted
         assert "***@b.example" in all_text
+
+    async def test_generation_skip_does_not_damp_and_redetects_next_call(self, tmp_path):
+        """When a config-change reconnect is skipped because another reconnect
+        already advanced the generation while we waited on the lock, the wrapper
+        must NOT damp the skipped config (it was never attempted) — so the very
+        next request still detects and applies it. The skip's ``record_success``
+        is acceptable: a concurrent reconnect genuinely completed."""
+        cfg_a = _sse_cfg("https://old.example/sse")
+        cfg_b = _sse_cfg("https://b.example/sse")  # what a concurrent reconnect landed
+        cfg_c = _sse_cfg("https://c.example/sse")  # what THIS request wants
+        mgr = _make_manager(tmp_path, {"srv": cfg_a})
+        conn = _seed_connection(mgr, "srv", cfg_a)
+        conn.session.call_tool = AsyncMock(return_value=_ok_result())
+
+        opens: list[str] = []
+
+        def _open(cfg):
+            opens.append(cfg.url)
+            return _mock_transport()
+
+        # Hold the reconnect lock, start the wrapper (it blocks trying to
+        # reconnect to C), then simulate a concurrent reconnect completing:
+        # bump the generation and land B. Releasing the lock lets the wrapper's
+        # reconnect wake, see the generation advanced, and skip.
+        async with conn.reconnect_lock:
+            task = asyncio.create_task(mgr._maybe_reconnect_for_config_change(conn, cfg_c))
+            await asyncio.sleep(0)  # let the task reach the lock and block
+            conn.reconnect_generation += 1
+            conn.config = cfg_b
+        await task
+
+        assert opens == []  # C was never attempted (skipped)
+        assert conn.last_failed_connection_fp is None  # skipped ≠ failed → not damped
+
+        # Next request still sees C in the file and applies it.
+        _reseed(mgr, tmp_path, {"srv": cfg_c})
+        new_session = _mock_session()
+        new_session.call_tool = AsyncMock(return_value=_ok_result("on-c"))
+        with (
+            patch.object(mgr, "_open_transport", side_effect=_open),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=new_session),
+        ):
+            result = await _fetch(mgr)
+
+        assert opens == [cfg_c.url]  # re-detected and applied on the next call
+        assert result.content[0].text == "on-c"
+        assert conn.config is cfg_c
 
     async def test_successful_failure_triggered_reconnect_clears_damper(self, tmp_path):
         """Any successful reconnect (config-change OR failure-triggered)
@@ -428,8 +485,6 @@ class TestConfigChangeDetection:
         """Acceptance (ii): two concurrent calls that both observe the config
         change collapse into ONE reconnect — the lock waiter skips via the
         generation check and proceeds on the freshly swapped session."""
-        import asyncio
-
         cfg_a = _sse_cfg("https://old.example/sse")
         cfg_b = _sse_cfg("https://new.example/sse")
         mgr = _make_manager(tmp_path, {"srv": cfg_a})
