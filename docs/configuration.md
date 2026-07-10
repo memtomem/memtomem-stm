@@ -403,6 +403,24 @@ the same `LLMCompressorConfig` shape as [LLM compression](compression.md#llm-com
 including `privacy_scan_enabled`; leaving it `null` uses the default local
 Ollama extractor.
 
+The per-upstream timeout fields form a three-part contract:
+
+- **Connect/discovery deadline** — `connect_timeout_seconds` is one end-to-end
+  budget covering transport entry (process spawn or HTTP/SSE connect), MCP
+  `initialize()`, and the `tools/list` discovery call; each phase gets whatever
+  remains, so a slow phase never grants later phases a fresh window. It applies
+  identically at first connect and at every reconnect. For `sse` /
+  `streamable_http` the same value is also passed to the SDK client factory as
+  its `timeout=` (the HTTP connect budget); the stream read timeout
+  (`sse_read_timeout`) stays at the SDK default so long-lived streams don't
+  inherit the connect budget.
+- **Per-attempt tool-call timeout** — `call_timeout_seconds` bounds each
+  `tools/call` attempt; a timed-out attempt is cancelled, the session is
+  reconnected, and the retry loop proceeds (subject to the replay-safety gate).
+- **Overall call deadline** — `overall_deadline_seconds` caps the total
+  wall-clock across all attempts of one call: each attempt's effective timeout
+  is `min(call_timeout_seconds, remaining deadline)`.
+
 `circuit_max_failures` / `circuit_reset_seconds` configure the per-upstream
 circuit breaker (#608). The breaker counts **one failure per call** that
 exhausts its retry/deadline budget on a transport fault or timeout — not one
@@ -415,9 +433,10 @@ paying the full retry/deadline cost, while cached responses keep serving and
 other upstreams are unaffected. After `circuit_reset_seconds` the next call
 goes through as a probe — success closes the breaker, failure re-opens it.
 Set `circuit_max_failures: 0` to disable the breaker for that upstream.
-Per-upstream breaker state is visible in `stm_proxy_health`. Like
-`max_retries`, these are connect-time snapshots: edits apply on the next
-restart, not via hot-reload.
+Per-upstream breaker state is visible in `stm_proxy_health`. Unlike
+`max_retries` and the timeout knobs (read per call from the hot-reloaded
+config), the `circuit_*` thresholds are baked into the breaker at connect
+time: edits apply on the next restart, not via hot-reload.
 
 `selection_telemetry` (off by default) appends one `selection` + one
 `execution` JSONL record per proxied call — which tool the client picked out
@@ -632,9 +651,12 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 | Setting group | Hot-reload? | Notes |
 |---------------|-------------|-------|
 | Per-server compression, cleaning, `tool_overrides` | Yes | `compression`, `max_result_chars`, `retention_floor`, `cleaning.*`, `tool_overrides.*` take effect on the next tool call |
+| Per-server retry/timeout/cache knobs | Yes | `max_retries`, `call_timeout_seconds`, `overall_deadline_seconds`, `reconnect_delay_seconds`, `max_reconnect_delay_seconds`, `cache`, `cache_ttl_seconds` are read per call |
+| Connection-affecting fields (`transport`, `url`, `headers`, `command`, `args`, `env`; `connect_timeout_seconds` on `sse`/`streamable_http`) | Yes (live reconnect) | Applied on the next uncached call: the replacement connection is prepared first, then swapped in. If it can't connect, the old connection keeps serving and the failed edit isn't retried until the config changes again. |
 | `relevance_scorer.*` | Yes | All five fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`). A change in any field rebuilds the scorer instance in place. |
 | `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
-| Per-server `circuit_*` breaker thresholds | **No** (restart) | The breaker is built at connect time on the connection object (#608), like the retry/timeout knobs. |
+| Per-server `prefix` | **No** (restart) | Part of the tool names registered with the client at startup — the advertisement is session-stable. |
+| Per-server `circuit_*` breaker thresholds | **No** (restart) | The breaker is built at connect time on the connection object (#608). |
 | Adding / removing upstream servers | **No** (restart) | Transport connections are established once at startup. |
 
 Omitting `embedding_base_url` (or setting it to `null`) lets provider-aware defaults fill it in — `ollama → http://localhost:11434`, `openai → https://api.openai.com`.
