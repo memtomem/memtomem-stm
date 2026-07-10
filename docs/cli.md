@@ -406,12 +406,45 @@ Options:
 
 Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running. It also prints a **Surfacing Bootstrap** section that checks surfacing config, feedback DB readiness, and the configured LTM MCP server.
 
+Probe results are **staged**: a failing server's `DISCONNECTED` line names the last stage that completed (`configured → transport connected → MCP initialized → tools discovered`), so a dead binary, a broken MCP handshake, and a failing `tools/list` are distinguishable at a glance. `--json` server entries carry the additive `stage` / `failed_stage` / `transport` keys next to the unchanged `connected` / `tools` / `overflowing` / `error` fields. Probe error strings are sanitized before rendering — configured `env` / `headers` values and URL credentials are replaced with `<REDACTED>` even when an upstream echoes them back in an exception message. For a pass/fail verdict with next actions instead of raw connectivity detail, use [`mms doctor`](#doctor).
+
 `--names` re-runs the same composed-name overflow check the proxy applies at boot (#261), so an operator diagnosing "one tool from server X went silently missing after registration" can answer the question without restarting STM. The flag uses the default client server name `memtomem-stm` (12 chars) for the `mcp__<client-server>__…` template; if you registered STM under a shorter alias like `mms`, set `MMS_CLIENT_SERVER_NAME=mms` so the budget calculation matches the surface name your client actually composes.
 
 The LTM probe honors the same `--timeout` budget, supports `stdio`, `sse`, and
 `streamable_http`, and requires the target server to advertise `mem_search`.
 When `mem_do` is available, the version probe is best-effort and does not
 decide readiness.
+
+### `doctor`
+
+```
+Usage: mms doctor [OPTIONS]
+
+Options:
+  --config TEXT            [default: ~/.memtomem/stm_proxy.json]
+  --json                   Output as JSON for scripting.
+  --timeout INTEGER RANGE  Per-server connection timeout in seconds.
+                           [default: 10; x>=1]
+```
+
+One read-only diagnostic pass over the whole setup, designed for "I just installed this — why isn't it working?". Every check prints `PASS` / `WARN` / `FAIL`, a short cause, and — for anything that isn't a `PASS` — a `next:` line you can run as-is. **Exit code is 1 when any check FAILs; WARN-only runs exit 0.** That makes `mms doctor` the scriptable success gate for a fresh install: [`health`](#health) stays the always-exit-0 connectivity inspection, [`config validate`](#config-validate) stays the strict schema lint.
+
+Checks, in order:
+
+| check | reuses | FAIL / WARN when |
+|---|---|---|
+| `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
+| `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root (short-circuits) |
+| `config schema` | the `status`/`health` schema check | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults |
+| `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
+| `prefixes` | the shared `proxy/prefixes.py` validators the runtime load path enforces | FAIL: empty or duplicate prefixes (same wording as the server's load rejection) |
+| `upstream: <name>` | the same staged probe as `health` | FAIL: probe failed — names the stage reached; a dead stdio binary gets a `command -v <cmd>` next action |
+| `cache policy` | the `config validate` advisory predicate | WARN: cache enabled but `tool_annotation_policy` unset (conservative default caches unclassified tools) |
+| `ltm server` | the `health` LTM probe | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features (memory surfacing) are disabled, the proxy core is unaffected |
+
+`--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Short-circuited runs contain only the checks that executed. Secrets never appear: probe errors are pre-sanitized and `env`/`headers` values are never printed.
+
+Doctor changes nothing — no config writes, no state mutation — so it's safe to run at any time, including against a live proxy's config.
 
 ### `status`
 

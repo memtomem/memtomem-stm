@@ -13,6 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `mms doctor` — one read-only diagnostic pass over the whole setup:
+  config file presence, JSON validity, schema validation, per-transport
+  required fields, prefix conflicts (same shared validators the server's
+  load path enforces), a staged connection probe per upstream, the
+  cache-policy advisory, and the LTM probe. Each check prints
+  `PASS`/`WARN`/`FAIL` with a runnable `next:` command; exit code is 1 on
+  any FAIL and 0 on WARN-only, making doctor the scriptable success gate
+  for a fresh install. The LTM check never FAILs — an unconfigured or
+  unreachable LTM only disables memory surfacing, not the proxy core.
+- Staged probe results in `mms health` / `mms add --validate`: a failing
+  upstream now reports the last stage that completed (`configured →
+  transport connected → MCP initialized → tools discovered`) instead of a
+  bare boolean, so a dead binary, a broken MCP handshake, and a failing
+  `tools/list` are distinguishable. `health --json` server entries gain
+  additive `stage` / `failed_stage` / `transport` keys (existing
+  `connected` / `tools` / `overflowing` / `error` fields unchanged).
 - Live reconnect for connection-affecting per-server config edits.
   Hot-reloaded changes to `transport` / `url` / `headers` / `command` /
   `args` / `env` (and `connect_timeout_seconds` on network transports) are
@@ -75,6 +91,13 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Probe failure messages no longer echo configured secrets. Upstream and
+  LTM probe errors rendered by `mms health` / `mms doctor` /
+  `mms add --validate` / import flows are sanitized against the server's
+  own `env` and `headers` values and URL credentials (longest-first,
+  empty-safe replacement) before display — previously an upstream
+  exception that embedded an Authorization header (e.g. a 401 body)
+  reached the terminal and `--json` output verbatim.
 - **Behavior change**: a non-text-only (or empty-content) upstream error
   now surfaces as a tool error. Previously the no-text passthrough
   early-return ran before the `isError` check, so such an error was
