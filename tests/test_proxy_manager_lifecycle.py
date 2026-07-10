@@ -587,7 +587,7 @@ class TestConnectDeadlineEndToEnd:
         mock_session, mock_transport = self._mocks()
 
         async def _consuming_enter(*_args):
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
             return (AsyncMock(), AsyncMock())
 
         mock_transport.__aenter__ = AsyncMock(side_effect=_consuming_enter)
@@ -604,9 +604,14 @@ class TestConnectDeadlineEndToEnd:
         assert len(recorded) == 3
         # Phase 1 gets (approximately) the full budget…
         assert 0.4 < recorded[0] <= 0.5
-        # …and the sleep(0.2) inside transport entry guarantees initialize is
-        # offered at most 0.3s — strictly less than the 0.5s full budget.
-        assert recorded[1] <= 0.31
+        # …and the sleep(0.3) inside transport entry means initialize is offered
+        # only the REMAINDER (~0.2s), not a fresh 0.5s budget. Asserted both
+        # relatively (strictly below phase 1's grant by more than the timer
+        # jitter) and with a loose absolute ceiling, so Windows' coarse sleep
+        # granularity can't flake it while a fresh-budget regression (initialize
+        # offered ~0.5 again) still fails both checks.
+        assert recorded[1] < recorded[0] - 0.1
+        assert recorded[1] < 0.4
         # list_tools gets whatever remains after initialize.
         assert recorded[2] <= recorded[1]
 
