@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -55,3 +56,33 @@ def redact_exception_text(text: str, url: str) -> str:
     if userinfo:
         out = out.replace(f"{userinfo}@", "***@")
     return out
+
+
+def sanitize_secrets(
+    text: str, secret_values: Iterable[str], *, placeholder: str = "<REDACTED>"
+) -> str:
+    """Replace every occurrence of each secret value in *text* with *placeholder*.
+
+    Central sanitizer for **free-form strings** — exception messages, probe
+    failure causes, log lines — where the configured ``env``/``headers``
+    values (or URL credentials) may be echoed verbatim by an SDK or
+    validation error. Structured mapping *outputs* (``--json`` server dumps)
+    are a different contract: they mask every value by key position via
+    ``_mask_mapping_values`` and never need to know the values. This helper
+    is for text that already interpolated the values.
+
+    Substitution rules are normalized deliberately:
+
+    - **Empty values are dropped** — a naive ``text.replace("", ph)`` would
+      interleave the placeholder between every character of the message.
+    - **Duplicate values are deduplicated** — each distinct value is
+      substituted once (``str.replace`` already replaces all occurrences).
+    - **Longer values are substituted first** — if ``"abc"`` were replaced
+      before ``"abcdef"``, the leftover ``"def"`` suffix of the longer
+      secret would leak. Ties break lexicographically for determinism.
+    """
+    if not text:
+        return text
+    for value in sorted({v for v in secret_values if v}, key=lambda v: (-len(v), v)):
+        text = text.replace(value, placeholder)
+    return text
