@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **Behavior change**: new config files are created with an explicit
+  `"cache": {"tool_annotation_policy": "strict"}` — `mms init`, `mms add`
+  against a missing config, and `mms add --from-clients` all write it, so
+  fresh setups cache only tools that declare `readOnlyHint: true`. The
+  schema default stays `conservative`: existing configs without the key
+  keep their behavior and are never retro-migrated, but loading one now
+  logs a one-line migration advisory (also shown by `mms config validate`;
+  suppressed when the cache is disabled or an env override sets the
+  policy). The per-tool / per-server `cache: true` override is the
+  strict-mode allowlist for un-annotated read-only tools — no new setting.
 - `mms add --header KEY=VALUE` (repeatable) registers HTTP headers for
   `sse` / `streamable_http` upstreams. Headers now also flow through
   `--from-clients` / `mms init` import discovery and the `mms add

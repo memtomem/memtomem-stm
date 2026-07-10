@@ -500,8 +500,11 @@ class ToolOverrideConfig(BaseModel):
     ``CacheConfig.tool_annotation_policy``. ``True`` force-caches this tool
     (overriding the annotation policy — e.g. to re-enable caching for a tool an
     upstream mis-annotates as a writer); ``False`` never caches it (e.g. a
-    volatile read tool, or a writer on an upstream that omits annotations). The
-    privacy / transient-key store guards still apply when ``True``."""
+    volatile read tool, or a writer on an upstream that omits annotations).
+    Under the ``strict`` policy — which new configs set explicitly — ``True``
+    is the supported allowlist for a known-read-only tool whose upstream omits
+    annotations. The privacy / transient-key store guards still apply when
+    ``True``."""
     cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
     """Per-tool override for the response-cache TTL (seconds). ``None`` (default)
     defers to the server-level ``cache_ttl_seconds``, then to the global
@@ -599,8 +602,10 @@ class UpstreamServerConfig(BaseModel):
     cache: bool | None = None
     """Per-server response-cache opt-in/out (see ``ToolOverrideConfig.cache``).
     ``None`` (default) defers to the global ``CacheConfig.tool_annotation_policy``;
-    ``True``/``False`` force every tool on this upstream in/out of the cache. A
-    per-tool ``cache`` override wins over this."""
+    ``True``/``False`` force every tool on this upstream in/out of the cache —
+    ``True`` is the server-wide strict-mode allowlist for a trusted read-only
+    upstream that omits annotations. A per-tool ``cache`` override wins over
+    this."""
     cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
     """Per-server response-cache TTL override (see
     ``ToolOverrideConfig.cache_ttl_seconds``). ``None`` (default) defers to the
@@ -719,9 +724,16 @@ class CacheConfig(BaseModel):
       drops caching for every upstream that omits annotations.
     - ``ignore``: pre-gate behavior — cache every tool regardless of annotations.
 
+    The ``conservative`` default is a compatibility choice for files that
+    predate the knob: NEW config files (``mms init`` / ``mms add`` /
+    ``mms add --from-clients``) are written with an explicit ``"strict"``, and
+    loading a file without the key logs a migration advisory.
+
     A per-tool / per-server ``cache`` override (``ToolOverrideConfig.cache`` /
-    ``UpstreamServerConfig.cache``) takes precedence over this policy. The privacy
-    and transient-key store guards always apply on top, regardless of this knob."""
+    ``UpstreamServerConfig.cache``) takes precedence over this policy — under
+    ``strict`` that override is the allowlist for un-annotated read-only tools.
+    The privacy and transient-key store guards always apply on top, regardless
+    of this knob."""
 
 
 class MetricsConfig(BaseModel):
