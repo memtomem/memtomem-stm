@@ -1177,6 +1177,107 @@ class TestAddValidation:
         assert result.exit_code == 1
         assert "blocked for security reasons" in result.output
 
+    def test_header_requires_kv_format(self, runner, config):
+        """A pair without "=" is likely a stray credential pasted bare —
+        the diagnostic must not echo it (stderr and --json errors are piped
+        to CI logs), unlike the --env diagnostics which name the pair."""
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--transport",
+                "sse",
+                "--url",
+                "https://example.com/sse",
+                "--header",
+                "Bearer_ghp_supersecret",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "--header #1 must be KEY=VALUE" in result.output
+        assert "ghp_supersecret" not in result.output
+
+    def test_header_rejects_empty_key(self, runner, config):
+        """`--header =VALUE` has an empty key; VALUE may be a credential, so
+        the diagnostic names the argument position, never the raw pair."""
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--transport",
+                "sse",
+                "--url",
+                "https://example.com/sse",
+                "--header",
+                "A=b",
+                "--header",
+                "=Bearer_ghp_supersecret",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "--header #2 key must be non-empty" in result.output
+        assert "ghp_supersecret" not in result.output
+
+    def test_header_allows_dangerous_env_names(self, runner, config):
+        """Intentional asymmetry with ``--env``: ``_DANGEROUS_ENV_KEYS``
+        guards env injection into spawned processes, while headers are HTTP
+        request metadata that never touch a subprocess environment — a header
+        literally named PATH or LD_PRELOAD is legal (contrast with
+        ``test_env_blocks_dangerous_injection_keys``)."""
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--transport",
+                "sse",
+                "--url",
+                "https://example.com/sse",
+                "--header",
+                "PATH=/x",
+                "--header",
+                "LD_PRELOAD=v",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["upstream_servers"]["s"]["headers"] == {"PATH": "/x", "LD_PRELOAD": "v"}
+
+    def test_header_rejected_for_stdio_transport(self, runner, config):
+        """A header on a stdio entry would be silently ignored by the
+        runtime — reject at registration time instead."""
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--command",
+                "x",
+                "--header",
+                "Authorization=Bearer t",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        assert "--header requires an HTTP transport" in result.output
+        # No partial entry written.
+        if config.exists():
+            data = json.loads(config.read_text(encoding="utf-8"))
+            assert "s" not in data.get("upstream_servers", {})
+
 
 class TestAtomicSave:
     """Direct exercises of ``_save``'s atomic-rename behaviour.
@@ -1440,6 +1541,34 @@ class TestAddPersistence:
         # don't support it; the CLI silently ignores the OSError).
         assert config.exists()
 
+    @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+    def test_add_persists_headers_for_http_transports(self, runner, config, transport):
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "api",
+                "--prefix",
+                "api",
+                "--transport",
+                transport,
+                "--url",
+                "https://example.com/mcp",
+                "--header",
+                "Authorization=Bearer abc",
+                "--header",
+                "X-Two=2=2",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        srv = data["upstream_servers"]["api"]
+        assert srv["transport"] == transport
+        # "2=2" pins split("=", 1): only the first "=" separates key/value.
+        assert srv["headers"] == {"Authorization": "Bearer abc", "X-Two": "2=2"}
+
     def test_add_malformed_args_fails_cleanly(self, runner, config):
         """shlex can't parse unterminated quotes — must error, not crash."""
         result = runner.invoke(
@@ -1552,6 +1681,44 @@ class TestAddValidate:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "lazy" in data["upstream_servers"]
 
+    def test_validate_probe_receives_headers(self, runner, config, monkeypatch):
+        """`add --header ... --validate` must probe with the same headers it
+        is about to persist — otherwise a header-authenticated server fails
+        validation for an entry that would work at runtime."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        probe_calls: list[dict] = []
+
+        async def fake_probe_servers(servers, timeout):
+            probe_calls.append(dict(servers))
+            return {
+                n: {"connected": True, "tools": 1, "overflowing": [], "error": None}
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "api",
+                "--prefix",
+                "api",
+                "--transport",
+                "sse",
+                "--url",
+                "https://example.com/sse",
+                "--header",
+                "A=b",
+                "--validate",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert len(probe_calls) == 1
+        assert probe_calls[0]["api"]["headers"] == {"A": "b"}
+
 
 class TestAddJson:
     """``mms add --json`` result summary (#614). Contract shared by all
@@ -1604,6 +1771,55 @@ class TestAddJson:
         result = runner.invoke(cli, ["add", "s", "--prefix", "s", "--json", *_cfg_args(config)])
         assert result.exit_code == 1
         assert json.loads(result.stdout)["error"] == "stdio_requires_command"
+
+    def test_success_shape_redacts_header_values(self, runner, config):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "api", "--prefix", "api", "--transport", "sse",
+                "--url", "https://example.com/sse",
+                "--header", "Authorization=Bearer_ghp_supersecret", "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["ok"] is True
+        assert data["server"]["headers"]["Authorization"] == REDACTED_DISPLAY
+        # The secret must not appear anywhere in the JSON document, while
+        # the on-disk config still carries it verbatim.
+        assert "ghp_supersecret" not in result.stdout
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        headers = saved["upstream_servers"]["api"]["headers"]
+        assert headers["Authorization"] == "Bearer_ghp_supersecret"
+
+    def test_invalid_header_error_shape(self, runner, config):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "s", "--prefix", "s", "--transport", "sse",
+                "--url", "https://x", "--header", "=Bearer_ghp_supersecret", "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "invalid_header"
+        # The malformed argument may BE a credential — neither the JSON
+        # payload nor the human stderr line may carry it.
+        assert "ghp_supersecret" not in result.stdout
+        assert "ghp_supersecret" not in result.stderr
+
+    def test_header_on_stdio_error_shape(self, runner, config):
+        result = runner.invoke(
+            cli,
+            [
+                "add", "s", "--prefix", "s", "--command", "x",
+                "--header", "A=b", "--json", *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["error"] == "header_requires_http"
 
     def test_duplicate_prefix_error_shape_and_no_write(self, runner, config):
         runner.invoke(cli, ["add", "one", "--prefix", "fs", "--command", "x", *_cfg_args(config)])
@@ -2033,6 +2249,36 @@ class TestInitDiscoveryHelpers:
         assert entry is not None
         assert entry["env"] == {"API_KEY": "ok"}
 
+    @pytest.mark.parametrize("type_hint", ["http", "sse"])
+    def test_normalize_copies_headers_for_http_and_sse(self, type_hint):
+        """HTTP headers carry auth for remote servers — dropping them at
+        import time made header-authenticated servers fail behind STM while
+        the direct registration kept working. Unlike env, no dangerous-key
+        filter applies (headers never touch a subprocess environment).
+        Non-str values are coerced like env values."""
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        entry = _normalize_client_entry(
+            {
+                "type": type_hint,
+                "url": "https://example.com/mcp",
+                "headers": {"Authorization": "Bearer t", "X-Int": 1},
+            }
+        )
+        assert entry is not None
+        assert entry["headers"] == {"Authorization": "Bearer t", "X-Int": "1"}
+
+    @pytest.mark.parametrize("headers", [["Authorization: x"], {}, "Authorization=x", None])
+    def test_normalize_ignores_non_dict_or_empty_headers(self, headers):
+        from memtomem_stm.cli.proxy import _normalize_client_entry
+
+        raw: dict = {"type": "http", "url": "https://example.com/mcp"}
+        if headers is not None:
+            raw["headers"] = headers
+        entry = _normalize_client_entry(raw)
+        assert entry is not None
+        assert "headers" not in entry
+
     def test_normalize_rejects_unsupported_shape(self):
         """No command + no url + no recognized type → can't import."""
         from memtomem_stm.cli.proxy import _normalize_client_entry
@@ -2186,9 +2432,10 @@ class TestInitDiscoverySources:
         assert cands[0]["raw"] == {"command": "node", "args": ["a.js"]}
 
     def test_raw_is_verbatim_where_normalization_is_lossy(self, tmp_path, monkeypatch):
-        """``_normalize_client_entry`` drops HTTP ``headers``, dangerous env
-        keys, and unknown fields. ``raw`` must keep all of them — it is the
-        restore payload for ``mms eject`` (#475)."""
+        """``_normalize_client_entry`` drops dangerous env keys and unknown
+        fields (HTTP ``headers`` are copied since the headers-plumbing
+        change). ``raw`` must keep everything verbatim — it is the restore
+        payload for ``mms eject`` (#475)."""
         from memtomem_stm.cli.proxy import _discover_candidates
 
         home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
@@ -2206,7 +2453,7 @@ class TestInitDiscoverySources:
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
         assert cands[0]["raw"] == raw_entry
-        assert "headers" not in cands[0]["entry"]
+        assert cands[0]["entry"]["headers"] == {"Authorization": "Bearer tok"}
         assert "unknown_host_field" not in cands[0]["entry"]
 
     def test_discovers_desktop_config(self, tmp_path, monkeypatch):
@@ -3756,6 +4003,8 @@ class TestAddFromClients:
                 "fs",
                 "--command",
                 "x",
+                "--header",
+                "A=b",
                 *_cfg_args(config),
             ],
         )
@@ -3765,6 +4014,7 @@ class TestAddFromClients:
         assert "NAME" in result.output
         assert "--prefix" in result.output
         assert "--command" in result.output
+        assert "--header" in result.output
 
     def test_validate_flag_probes_only_picked_servers(self, runner, config, monkeypatch):
         """With --validate, the selected subset gets probed; unpicked
@@ -7184,19 +7434,30 @@ class TestHealth:
 
         def fake_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
             captured.update(
-                {"url": url, "timeout": timeout, "sse_read_timeout": sse_read_timeout}
+                {
+                    "url": url,
+                    "headers": headers,
+                    "timeout": timeout,
+                    "sse_read_timeout": sse_read_timeout,
+                }
             )
             return HangingTransport()
 
         monkeypatch.setattr(client_path, fake_client)
 
-        cfg = {"transport": transport, "url": "https://up.example/mcp", "prefix": "up"}
+        cfg = {
+            "transport": transport,
+            "url": "https://up.example/mcp",
+            "prefix": "up",
+            "headers": {"X-Api-Key": "k"},
+        }
         start = time.monotonic()
         with pytest.raises(asyncio.TimeoutError):
             asyncio.run(proxy_mod._probe_one(cfg, 0.1))
         elapsed = time.monotonic() - start
         assert elapsed < 5.0, f"transport-enter stall ran {elapsed:.2f}s past the 0.1s budget"
         assert captured["url"] == "https://up.example/mcp"
+        assert captured["headers"] == {"X-Api-Key": "k"}
         assert captured["timeout"] == pytest.approx(0.1, rel=0.1)
         assert captured["sse_read_timeout"] == pytest.approx(0.1, rel=0.1)
 
