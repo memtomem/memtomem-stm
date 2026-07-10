@@ -352,24 +352,29 @@ def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
 
     A change in any of these requires re-establishing the connection to take
     effect (hot-reload classification, PR ⑦); everything else on
-    ``UpstreamServerConfig`` is read per call and needs no reconnect.
-    ``connect_timeout_seconds`` counts only for network transports, where it
-    is baked into the SDK client factory as the httpx connect budget; for
-    stdio it is consumed per connection attempt, so an edit simply applies to
-    the next reconnect. The tuple doubles as the damping key for failed
-    config-change reconnects.
+    ``UpstreamServerConfig`` is read per call and needs no reconnect. Only the
+    fields the ACTIVE transport actually consumes are included, so editing an
+    inactive field (a ``command`` on an SSE server, a ``url`` on a stdio one)
+    does not churn the connection. ``transport`` itself is always present, so
+    switching transport type reconnects. ``connect_timeout_seconds`` counts
+    only for network transports, where it is baked into the SDK client factory
+    as the httpx connect budget; for stdio it is consumed per connection
+    attempt, so an edit simply applies to the next reconnect. The tuple doubles
+    as the damping key for failed config-change reconnects.
     """
-    fp: tuple[Any, ...] = (
+    if cfg.transport == TransportType.STDIO:
+        return (
+            cfg.transport,
+            cfg.command,
+            tuple(cfg.args),
+            tuple(sorted((cfg.env or {}).items())),
+        )
+    return (
         cfg.transport,
         cfg.url,
         tuple(sorted((cfg.headers or {}).items())),
-        cfg.command,
-        tuple(cfg.args),
-        tuple(sorted((cfg.env or {}).items())),
+        cfg.connect_timeout_seconds,
     )
-    if cfg.transport != TransportType.STDIO:
-        fp += (cfg.connect_timeout_seconds,)
-    return fp
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -1245,8 +1250,20 @@ class ProxyManager:
         self._failed_servers.pop(name, None)
         logger.info("Connected to '%s' (%s tools discovered)", name, len(tools))
 
-    async def _reconnect_server(self, name: str) -> None:
+    async def _reconnect_server(self, name: str, cfg: UpstreamServerConfig | None = None) -> None:
         conn = self._connections[name]
+
+        # A reconnect applies the config the CALLER resolved and will damp /
+        # redact against — passed in so the fingerprint recorded on failure and
+        # the url used to scrub the error both match the config actually
+        # attempted (a re-read of ``self._config`` here could diverge from the
+        # caller's snapshot mid-race, damping the wrong fingerprint and
+        # redacting with the wrong token). ``None`` (direct callers / tests)
+        # falls back to the current snapshot, and to the connect-time config if
+        # the server key vanished from the file — adding/removing servers stays
+        # restart-only.
+        if cfg is None:
+            cfg = self._config.upstream_servers.get(name) or conn.config
 
         # Serialize concurrent reconnects for this server (#586). Capture the
         # generation BEFORE acquiring: if it advanced while we waited, another
@@ -1260,15 +1277,6 @@ class ProxyManager:
                     "Skipping reconnect for '%s' — another reconnect already completed", name
                 )
                 return
-
-            # A reconnect applies the CURRENT file config, not the connect-time
-            # snapshot: url/headers/env/timeout edits land on the next reconnect
-            # instead of requiring a restart. Fall back to the old snapshot only
-            # if the server key vanished from the file (adding/removing servers
-            # stays restart-only).
-            cfg = self._config.upstream_servers.get(name)
-            if cfg is None:
-                cfg = conn.config
 
             # Prepare-first: build the replacement connection while the old one
             # stays untouched. If _establish_connection raises, ``conn`` still
@@ -3216,12 +3224,14 @@ class ProxyManager:
     ) -> None:
         """Apply a hot-reloaded connection-affecting edit via live reconnect.
 
-        Prepare-first semantics come from ``_reconnect_server`` (which re-reads
-        the current snapshot itself, under the reconnect lock): the replacement
+        Prepare-first semantics come from ``_reconnect_server``: the replacement
         is fully established before the swap, so on failure the OLD connection
         keeps serving — this wrapper swallows the failure, damps the exact
         failed fingerprint (no per-call retry storm against a broken edit), and
-        lets the call proceed on the old connection. Failure-TRIGGERED
+        lets the call proceed on the old connection. ``fresh_cfg`` is passed
+        straight into ``_reconnect_server`` so the config attempted is exactly
+        the one whose fingerprint we damp and whose url we redact against — no
+        re-read can slip a different generation in between. Failure-TRIGGERED
         reconnects are deliberately not damped: they are driven by call
         failures with their own backoff and breaker accounting.
         """
@@ -3232,7 +3242,7 @@ class ProxyManager:
             return
         logger.info("Connection config for '%s' changed; applying via live reconnect", conn.name)
         try:
-            await self._reconnect_server(conn.name)
+            await self._reconnect_server(conn.name, fresh_cfg)
         except Exception as exc:
             conn.last_failed_connection_fp = new_fp
             # Redact + no exc_info (#605): the attempt opened a transport with
@@ -3355,7 +3365,7 @@ class ProxyManager:
                 if breaker is not None:
                     breaker.record_failure()
                 try:
-                    await self._reconnect_server(server)
+                    await self._reconnect_server(server, cfg)
                 except Exception as reconnect_exc:
                     # Redact + no exc_info (#605): the reconnect reopens a transport
                     # with the credentialed ``cfg.url``, so a failure's traceback
@@ -3432,7 +3442,7 @@ class ProxyManager:
                     )
                     _mark_recorded(exc)
                     try:
-                        await self._reconnect_server(server)
+                        await self._reconnect_server(server, cfg)
                     except Exception as reconnect_exc:
                         # Expected fallback: the primary error is already being
                         # re-raised and carries the actionable trace. The
@@ -3493,7 +3503,7 @@ class ProxyManager:
                         breaker.record_failure()
                     # Reconnect before raising so the NEXT call starts fresh
                     try:
-                        await self._reconnect_server(server)
+                        await self._reconnect_server(server, cfg)
                     except Exception as reconnect_exc:
                         # Same reasoning as the protocol-error path above:
                         # the primary failure is being re-raised, the
@@ -3518,7 +3528,7 @@ class ProxyManager:
                 delay = min(max(delay * 2, 0.1), cfg.max_reconnect_delay_seconds)
                 self.tracker.record_reconnect()
                 try:
-                    await self._reconnect_server(server)
+                    await self._reconnect_server(server, cfg)
                     conn = self._connections[server]
                 except Exception as reconnect_exc:
                     # Redact (#622, #605/#606 family): the reconnect reopens a

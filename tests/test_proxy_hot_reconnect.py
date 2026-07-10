@@ -328,6 +328,85 @@ class TestConfigChangeDetection:
         assert conn.config is cfg_c
         assert conn.last_failed_connection_fp is None
 
+    async def test_reconnect_honors_passed_cfg_over_diverged_snapshot(self, tmp_path):
+        """Reload-generation race fix (codex #1/#2): ``_reconnect_server``
+        attempts and redacts against the cfg the caller PASSED, ignoring a
+        ``self._config`` that has since diverged. The detection wrapper passes
+        the fingerprinted ``fresh_cfg``, so the config attempted == damped ==
+        redacted are one and the same even if the file moved on.
+
+        A re-read of ``self._config`` inside the reconnect (the pre-fix
+        behavior) would instead attempt C here — leaving C retried on every
+        call, B wrongly suppressed, and B's credential un-redacted."""
+        cfg_b = _sse_cfg("https://alice:tok-b@b.example/sse")
+        cfg_c = _sse_cfg("https://carol:tok-c@c.example/sse")
+        mgr = _make_manager(tmp_path, {"srv": cfg_b})
+        _seed_connection(mgr, "srv", _sse_cfg("https://old.example/sse"))
+        # The live snapshot is C — diverged from the B we pass in.
+        _reseed(mgr, tmp_path, {"srv": cfg_c})
+
+        attempted: list[str] = []
+
+        def _open(cfg):
+            attempted.append(cfg.url)
+            return _mock_transport()
+
+        with (
+            patch.object(mgr, "_open_transport", side_effect=_open),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=_mock_session()),
+        ):
+            await mgr._reconnect_server("srv", cfg_b)
+
+        assert attempted == [cfg_b.url]  # honored the passed cfg, not snapshot C
+        assert mgr._connections["srv"].config is cfg_b
+
+    async def test_damped_failure_redacts_the_attempted_credential(self, tmp_path):
+        """The damped-failure warning is redacted against the config actually
+        attempted. Even if the file rotates B→C (distinct credential) during
+        establish, the request attempts B and redacts B's token — C's
+        credential is never attempted and never appears. Under the pre-fix
+        re-read the reconnect would attempt C but the wrapper would redact with
+        B's url, leaking C's token."""
+        import logging
+
+        cfg_a = _sse_cfg("https://old.example/sse")
+        cfg_b = _sse_cfg("https://alice:tok-b@b.example/sse")
+        cfg_c = _sse_cfg("https://carol:tok-c@c.example/sse")
+        mgr = _make_manager(tmp_path, {"srv": cfg_a})
+        conn = _seed_connection(mgr, "srv", cfg_a)
+        conn.session.call_tool = AsyncMock(return_value=_ok_result())
+        _reseed(mgr, tmp_path, {"srv": cfg_b})
+
+        def _open(cfg):
+            # File rotates to C mid-establish; the error embeds the url of
+            # whatever config was actually attempted.
+            _reseed(mgr, tmp_path, {"srv": cfg_c})
+            raise ConnectionError(f"connection failed for {cfg.url}")
+
+        records: list[logging.LogRecord] = []
+
+        class _H(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        mgr_logger = logging.getLogger("memtomem_stm.proxy.manager")
+        handler = _H()
+        mgr_logger.addHandler(handler)
+        prev_level = mgr_logger.level
+        mgr_logger.setLevel(logging.DEBUG)
+        try:
+            with patch.object(mgr, "_open_transport", side_effect=_open):
+                await _fetch(mgr)
+        finally:
+            mgr_logger.removeHandler(handler)
+            mgr_logger.setLevel(prev_level)
+
+        assert conn.last_failed_connection_fp == _connection_fingerprint(cfg_b)
+        all_text = "\n".join(r.getMessage() for r in records)
+        assert "tok-c" not in all_text  # C never attempted, never logged
+        assert "tok-b" not in all_text  # B attempted but redacted
+        assert "***@b.example" in all_text
+
     async def test_successful_failure_triggered_reconnect_clears_damper(self, tmp_path):
         """Any successful reconnect (config-change OR failure-triggered)
         proves the current config connects and clears the damper."""
@@ -476,6 +555,28 @@ class TestHotReloadClassification:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as rec:
             await _fetch(mgr)
         rec.assert_awaited_once()
+
+    async def test_fingerprint_ignores_inactive_transport_fields(self, tmp_path):
+        """The fingerprint carries only the fields the active transport uses, so
+        editing a dormant field (a stdio ``command`` on an SSE server, or an
+        SSE ``url`` on a stdio server) does not churn a live connection."""
+        sse = _sse_cfg("https://up.example/sse")
+        sse_cmd_edit = sse.model_copy(update={"command": "changed", "args": ["x"]})
+        assert _connection_fingerprint(sse) == _connection_fingerprint(sse_cmd_edit)
+
+        stdio = UpstreamServerConfig(prefix="srv", command="echo", args=["a"])
+        stdio_url_edit = stdio.model_copy(
+            update={"headers": {"X": "y"}, "connect_timeout_seconds": 5.0}
+        )
+        assert _connection_fingerprint(stdio) == _connection_fingerprint(stdio_url_edit)
+
+        # …but an ACTIVE-field edit still rotates the fingerprint.
+        assert _connection_fingerprint(sse) != _connection_fingerprint(
+            sse.model_copy(update={"url": "https://other.example/sse"})
+        )
+        assert _connection_fingerprint(stdio) != _connection_fingerprint(
+            stdio.model_copy(update={"args": ["b"]})
+        )
 
 
 # ── live stdio transport (real anyio scopes) ─────────────────────────────
