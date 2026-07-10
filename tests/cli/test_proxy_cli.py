@@ -8025,6 +8025,343 @@ class TestHealth:
         assert data["servers"]["docs"]["tools"] == 2
 
 
+# ── doctor command ──────────────────────────────────────────────────────
+
+
+class TestDoctor:
+    """``mms doctor`` — read-only staged diagnostics (⑧).
+
+    Contract: any FAIL → exit 1, WARN-only → exit 0 (doctor passing is the
+    quickstart success gate, so it must be scriptable); LTM problems are
+    never FAIL — LTM is optional and only surfacing depends on it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, monkeypatch, tmp_path):
+        set_home(monkeypatch, tmp_path / "home")
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
+
+    @staticmethod
+    def _healthy_config(config, *, strict_cache: bool = True) -> None:
+        data = {
+            "upstream_servers": {
+                "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+            }
+        }
+        if strict_cache:
+            data["cache"] = {"tool_annotation_policy": "strict"}
+        config.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_healthy_config_warn_only_exits_zero(self, runner, config, monkeypatch):
+        """정상 scenario: all checks PASS except the expected LTM WARN —
+        WARN-only must exit 0 or a fresh install without a memtomem server
+        could never pass the quickstart gate."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "upstream: fake" in result.output
+        assert "2 tool(s)" in result.output
+        assert "Summary: 0 FAIL, 1 WARN," in result.output
+
+    def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
+        """LTM 미설정 scenario: WARN with the ratified messaging — names
+        surfacing as the only casualty, never reads as an install failure."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0
+        ltm_line = next(line for line in result.output.splitlines() if "ltm server" in line)
+        assert "WARN" in ltm_line
+        assert "FAIL" not in ltm_line
+        assert "surfacing" in result.output
+        assert "proxy core is unaffected" in result.output
+
+    def test_missing_config_fails_and_short_circuits(self, runner, tmp_path):
+        missing = tmp_path / "nope.json"
+        result = runner.invoke(cli, ["doctor", "--config", str(missing)])
+        assert result.exit_code == 1
+        assert "not found" in result.output
+        assert "next: mms init" in result.output
+        # Short-circuit: nothing downstream of the missing file is checked.
+        assert "config JSON" not in result.output
+        assert "ltm server" not in result.output
+
+    def test_broken_json_fails_and_short_circuits(self, runner, config):
+        """잘못된 JSON scenario."""
+        config.write_text("{oops", encoding="utf-8")
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "invalid JSON" in result.output
+        assert "next: mms config validate" in result.output
+        assert "config schema" not in result.output
+        assert "upstream" not in result.output
+        assert "ltm server" not in result.output
+
+    def test_bad_transport_config_fails(self, runner, config, monkeypatch):
+        """잘못된 transport scenario: sse without url."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {"api": {"prefix": "api", "transport": "sse"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(
+                    stage=ProbeStage.CONFIGURED, transport="sse", error="no url"
+                )
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "api: url is required for sse transport" in result.output
+
+    def test_prefix_conflict_fails_with_shared_wording(self, runner, config, monkeypatch):
+        """prefix 충돌 scenario: the FAIL detail is the same
+        ``format_collision_error`` text the runtime load rejection uses."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "a": {"prefix": "dup", "transport": "stdio", "command": "x"},
+                        "b": {"prefix": "dup", "transport": "stdio", "command": "y"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "Duplicate upstream prefixes detected" in result.output
+        assert "unique --prefix" in result.output
+
+    def test_offline_server_fails_with_stage_and_stdio_note(self, runner, config):
+        """서버 offline scenario: a dead stdio binary FAILs after
+        'configured' with the stdio-child rendering detail and a runnable
+        ``command -v`` next action. Real probe — no monkeypatch."""
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bad",
+                            "transport": "stdio",
+                            "command": "__nonexistent_cmd_12345__",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["doctor", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "failed after 'configured'" in result.output
+        assert "stdio child process did not start" in result.output
+        assert "next: command -v __nonexistent_cmd_12345__" in result.output
+
+    def test_cache_policy_unset_warns(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config, strict_cache=False)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0  # WARN-only
+        assert "tool_annotation_policy not set" in result.output
+        assert '"tool_annotation_policy": "strict"' in result.output
+
+    def test_json_output_pure_and_staged(self, runner, config, monkeypatch):
+        """``--json`` emits exactly one parseable document (no logger
+        bleed) carrying the checks list and the staged server payload."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["status"] == "warn"  # the expected LTM WARN
+        check_ids = [c["id"] for c in data["checks"]]
+        assert check_ids == [
+            "config_file",
+            "config_json",
+            "config_schema",
+            "server_transports",
+            "prefixes",
+            "upstream:fake",
+            "cache_policy",
+            "ltm",
+        ]
+        assert data["servers"]["fake"]["stage"] == "tools_discovered"
+        assert data["surfacing"]["ltm_server"]["connected"] is False
+
+    def test_json_short_circuit_omits_unexecuted_checks(self, runner, config):
+        config.write_text("{oops", encoding="utf-8")
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["status"] == "fail"
+        assert [c["id"] for c in data["checks"]] == ["config_file", "config_json"]
+        assert "servers" not in data
+        assert "surfacing" not in data
+
+    def test_output_never_contains_configured_secret_values(self, runner, config, monkeypatch):
+        """Token-never-output regression through doctor: the config carries a
+        header token; neither text nor ``--json`` output may echo it (probe
+        errors arrive pre-sanitized from ``_probe_one`` — see
+        ``TestHealth.test_probe_error_sanitizes_header_and_env_values``)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "api": {
+                            "prefix": "api",
+                            "transport": "sse",
+                            "url": "https://up.example/sse",
+                            "headers": {"Authorization": "Bearer sekrit-token-123"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "api": StagedProbeResult(
+                    stage=ProbeStage.TRANSPORT_CONNECTED,
+                    transport="sse",
+                    error="401 Unauthorized: Bearer <REDACTED>",
+                )
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        for extra in ([], ["--json"]):
+            result = runner.invoke(cli, ["doctor", *extra, *_cfg_args(config)])
+            assert result.exit_code == 1
+            assert "sekrit-token-123" not in result.output
+            assert "<REDACTED>" in result.output
+
+    def test_doctor_live_fake_server_passes(self, config):
+        """Real MCP child end-to-end (bypasses ``CliRunner`` — its stderr
+        buffer has no ``fileno()``; see ``TestAddValidate``). The autouse
+        fixture's ``__missing_ltm__`` env is inherited by the child, so the
+        LTM check stays a deterministic WARN and the run exits 0."""
+        import subprocess
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fk",
+                            "transport": "stdio",
+                            "command": sys.executable,
+                            "args": [str(_FAKE_SERVER)],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from memtomem_stm.cli.proxy import cli; cli()",
+                "doctor",
+                "--timeout",
+                "15",
+                "--config",
+                str(config),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        assert "upstream: fake" in proc.stdout
+        assert "Summary: 0 FAIL," in proc.stdout
+
+    def test_doctor_uses_shared_validators_and_staged_probe(self):
+        """Source inspection (mechanism pin, idiom from
+        ``TestSharedValidatorWiring``): doctor must consume the same shared
+        functions the runtime/CLI already use — prefix validators, the
+        staged probe, the surfacing bootstrap, the cache-policy predicate,
+        and the transport-field rule shared with ``add``."""
+        import inspect
+
+        from memtomem_stm.cli import proxy as cli_proxy
+
+        assert cli_proxy.doctor.callback is not None
+        src = inspect.getsource(cli_proxy.doctor.callback)
+        assert "prefixes.prefix_collisions(" in src
+        assert "prefixes.empty_prefix_keys(" in src
+        assert "prefixes.format_collision_error(" in src
+        assert "_probe_servers(" in src
+        assert "_surfacing_bootstrap_status(" in src
+        assert "_has_annotation_policy(" in src
+        assert "_transport_field_error(" in src
+
+    def test_health_and_add_share_the_same_probe_and_transport_rule(self):
+        import inspect
+
+        from memtomem_stm.cli import proxy as cli_proxy
+
+        assert cli_proxy.health.callback is not None
+        assert "_probe_servers(" in inspect.getsource(cli_proxy.health.callback)
+        assert cli_proxy.add.callback is not None
+        assert "_transport_field_error(" in inspect.getsource(cli_proxy.add.callback)
+
+
 # ── probe error helpers ──────────────────────────────────────────────────
 
 

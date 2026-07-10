@@ -190,6 +190,20 @@ _CONFIG_INVALID_WARNING = (
 )
 
 
+def _transport_field_error(transport: str, command: str, url: str) -> str | None:
+    """Missing required connection field for *transport*, or ``None``.
+
+    Single source of truth for which field each transport needs — shared by
+    ``add`` (VAL-3/VAL-4, rendered with a ``--`` option flavor) and ``mms
+    doctor`` (raw config dicts), so the two can't drift.
+    """
+    if transport == "stdio" and not command:
+        return "command is required for stdio transport"
+    if transport != "stdio" and not url:
+        return f"url is required for {transport} transport"
+    return None
+
+
 def _logging_destination_status() -> dict[str, Any]:
     """Active log destination for ``mms health`` (#612) — the point of the
     opt-in file log is diagnosability, so health says where to look.
@@ -1351,25 +1365,14 @@ def add(
             )
         sys.exit(1)
 
-    # VAL-3: stdio requires --command
-    if transport == "stdio" and not command:
-        click.echo(f"{_err('Error:')} --command is required for stdio transport.", err=True)
+    # VAL-3/VAL-4: per-transport required field (shared with `mms doctor`);
+    # the `--` prefix turns the config-flavored message into the option name.
+    field_error = _transport_field_error(transport, command, url)
+    if field_error:
+        click.echo(f"{_err('Error:')} --{field_error}.", err=True)
         if as_json:
-            _json_fail(
-                "add",
-                "stdio_requires_command",
-                "--command is required for stdio transport",
-                name=name,
-            )
-        sys.exit(1)
-
-    # VAL-4: sse/streamable_http requires --url
-    if transport != "stdio" and not url:
-        click.echo(f"{_err('Error:')} --url is required for {transport} transport.", err=True)
-        if as_json:
-            _json_fail(
-                "add", "url_required", f"--url is required for {transport} transport", name=name
-            )
+            code = "stdio_requires_command" if transport == "stdio" else "url_required"
+            _json_fail("add", code, f"--{field_error}", name=name)
         sys.exit(1)
 
     # VAL-5: --header only applies to HTTP transports; a header on a stdio
@@ -5260,6 +5263,294 @@ def health(
     click.echo(_format_logging_destination(logging_status))
     if obs_tools_hint:
         click.echo(obs_tools_hint)
+
+
+# ── doctor command ──────────────────────────────────────────────────────
+
+
+_DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default=str(_DEFAULT_CONFIG),
+    show_default=True,
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output as JSON for scripting.",
+)
+@click.option(
+    "--timeout",
+    default=10,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Per-server connection timeout in seconds.",
+)
+def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> None:
+    """Diagnose the proxy setup end-to-end (read-only).
+
+    Runs the existing status/health/config checks as one PASS/WARN/FAIL
+    report with a copy-paste next action per failing check. Exit code is 1
+    when any check FAILs; WARN-only runs exit 0 — `mms doctor` passing is
+    the quickstart success gate, so it must be scriptable. `health` stays
+    the always-exit-0 inspection command; strict config linting stays in
+    `mms config validate`. Never modifies the config or any other state.
+    """
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+    cfg_arg = f"--config {resolved}"
+
+    checks: list[dict[str, Any]] = []
+
+    def check(
+        check_id: str, label: str, status: str, detail: str, next_action: str | None = None
+    ) -> None:
+        checks.append(
+            {
+                "id": check_id,
+                "label": label,
+                "status": status,
+                "detail": detail,
+                "next_action": next_action,
+            }
+        )
+
+    servers_payload: dict[str, Any] | None = None
+    surfacing_status: dict[str, Any] | None = None
+
+    # 1. config file exists — every later check reads it, so FAIL
+    # short-circuits the report instead of cascading noise.
+    if not resolved.exists():
+        check("config_file", "config file", "FAIL", f"not found: {resolved}", "mms init")
+    else:
+        check("config_file", "config file", "PASS", str(resolved))
+
+        # 2. JSON validity — mirrors `mms config validate`'s parse guard
+        # (NOT `_load`, which SystemExits with its own styled message).
+        data: dict[str, Any] | None = None
+        try:
+            loaded = json.loads(resolved.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+                check("config_json", "config JSON", "PASS", "parses as an object")
+            else:
+                check(
+                    "config_json",
+                    "config JSON",
+                    "FAIL",
+                    f"root must be a JSON object, got {type(loaded).__name__}",
+                    f"mms config validate {cfg_arg}",
+                )
+        except json.JSONDecodeError as exc:
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                f"invalid JSON: {exc}",
+                f"mms config validate {cfg_arg}",
+            )
+        except OSError as exc:
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                f"cannot read file: {exc}",
+                f"mms config validate {cfg_arg}",
+            )
+
+        if data is not None:
+            # 3. schema validation — same lazy-pydantic path `status`/`health`
+            # warn through; here it FAILs (a running server would silently
+            # fall back to env/defaults) but does NOT short-circuit: the
+            # transport/prefix/probe checks operate on the raw dicts and
+            # stay meaningful.
+            schema_error = _schema_validation_error(data)
+            if schema_error:
+                check(
+                    "config_schema",
+                    "config schema",
+                    "FAIL",
+                    f"{_CONFIG_INVALID_WARNING}: {schema_error}",
+                    f"mms config validate {cfg_arg}",
+                )
+            else:
+                check("config_schema", "config schema", "PASS", "valid")
+
+            raw_servers = data.get("upstream_servers", {})
+            servers = (
+                {n: c for n, c in raw_servers.items() if isinstance(c, dict)}
+                if isinstance(raw_servers, dict)
+                else {}
+            )
+
+            if servers:
+                # 4. per-transport required fields — shared with `add`
+                # VAL-3/VAL-4 via `_transport_field_error`.
+                transport_problems = [
+                    f"{n}: {terr}"
+                    for n, cfg in servers.items()
+                    if (
+                        terr := _transport_field_error(
+                            str(cfg.get("transport", "stdio") or "stdio"),
+                            str(cfg.get("command", "") or ""),
+                            str(cfg.get("url", "") or ""),
+                        )
+                    )
+                ]
+                if transport_problems:
+                    check(
+                        "server_transports",
+                        "server transports",
+                        "FAIL",
+                        "; ".join(transport_problems),
+                        f"mms remove <name> {cfg_arg}  "
+                        "# then re-add with --command (stdio) or --url (sse/http)",
+                    )
+                else:
+                    check(
+                        "server_transports",
+                        "server transports",
+                        "PASS",
+                        f"{len(servers)} server(s) have their required connection fields",
+                    )
+
+                # 5. prefixes — same shared validators the runtime load path
+                # uses (`proxy/prefixes.py`), so doctor can't disagree with
+                # what the server would refuse.
+                prefix_map = {n: str(cfg.get("prefix", "") or "") for n, cfg in servers.items()}
+                prefix_problems = []
+                empty = prefixes.empty_prefix_keys(prefix_map)
+                if empty:
+                    prefix_problems.append(f"empty prefix: {', '.join(empty)}")
+                collisions = prefixes.prefix_collisions(prefix_map)
+                if collisions:
+                    prefix_problems.append(prefixes.format_collision_error(collisions))
+                if prefix_problems:
+                    check(
+                        "prefixes",
+                        "prefixes",
+                        "FAIL",
+                        "; ".join(prefix_problems),
+                        f"mms remove <name> {cfg_arg}  # then re-add with a unique --prefix",
+                    )
+                else:
+                    check("prefixes", "prefixes", "PASS", "unique and non-empty")
+
+                # 6. staged probe per server — the shared StagedProbeResult
+                # `health` renders; doctor adds the per-stage next action.
+                results = asyncio.run(_probe_servers(servers, timeout))
+                servers_payload = {n: r.as_dict() for n, r in results.items()}
+                for n, r in results.items():
+                    if r.connected:
+                        check(f"upstream:{n}", f"upstream: {n}", "PASS", f"{r.tools} tool(s)")
+                        continue
+                    detail = f"failed after '{r.stage.display()}' — {r.error}"
+                    timed_out = (r.error or "").startswith("timeout")
+                    if (
+                        r.transport == "stdio"
+                        and r.stage is ProbeStage.CONFIGURED
+                        and not timed_out
+                    ):
+                        # Transport-neutral stage names; the child-process
+                        # detail is stdio-only rendering, not a stage.
+                        detail += " (stdio child process did not start)"
+                        next_cmd = f"command -v {servers[n].get('command', '')}"
+                    elif timed_out:
+                        next_cmd = f"mms health --timeout {max(30, timeout)} {cfg_arg}"
+                    else:
+                        next_cmd = f"mms health {cfg_arg}"
+                    check(f"upstream:{n}", f"upstream: {n}", "FAIL", detail, next_cmd)
+            else:
+                check(
+                    "upstreams",
+                    "upstreams",
+                    "WARN",
+                    "no upstream servers configured",
+                    f"mms add <name> --prefix <prefix> --command <command> {cfg_arg}",
+                )
+
+            # 7. cache policy — same condition + shared predicate as
+            # `mms config validate` and the runtime load advisory (#658).
+            from memtomem_stm.proxy.config import _has_annotation_policy
+
+            cache = data.get("cache")
+            cache_enabled = cache.get("enabled", True) if isinstance(cache, dict) else True
+            if not cache_enabled:
+                check("cache_policy", "cache policy", "PASS", "cache disabled")
+            elif _has_annotation_policy(data):
+                policy = cache["tool_annotation_policy"] if isinstance(cache, dict) else None
+                check("cache_policy", "cache policy", "PASS", f"tool_annotation_policy={policy}")
+            else:
+                check(
+                    "cache_policy",
+                    "cache policy",
+                    "WARN",
+                    "cache.tool_annotation_policy not set — using the 'conservative' "
+                    "default (unclassified tools are cached); new configs are created "
+                    "with 'strict'",
+                    'add "cache": {"tool_annotation_policy": "strict"} to '
+                    f'{resolved}  # or "conservative" to pin current behavior',
+                )
+
+            # 8. LTM server — never FAIL: LTM is optional, and an unreachable
+            # or unconfigured LTM only disables surfacing, not the proxy
+            # core. A FAIL here would break the exit-code gate on every
+            # fresh install without a memtomem server.
+            surfacing_status = _surfacing_bootstrap_status(float(timeout))
+            ltm = surfacing_status.get("ltm_server")
+            if isinstance(ltm, dict) and ltm.get("connected"):
+                detail = str(ltm.get("display") or ltm.get("command") or "")
+                if ltm.get("version"):
+                    detail = f"{detail}, version {ltm['version']}"
+                check("ltm", "ltm server", "PASS", f"connectable ({detail})")
+            else:
+                if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
+                    cause = "surfacing disabled"
+                elif isinstance(ltm, dict) and ltm.get("error"):
+                    cause = str(ltm["error"])
+                else:
+                    cause = str(surfacing_status.get("error") or "status unavailable")
+                check(
+                    "ltm",
+                    "ltm server",
+                    "WARN",
+                    f"{cause} — only LTM-dependent features (memory surfacing) are "
+                    "disabled; the proxy core is unaffected",
+                    "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
+                    "  # see docs/surfacing.md",
+                )
+
+    counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
+    overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")
+
+    if as_json:
+        payload: dict[str, Any] = {
+            "config_path": str(resolved),
+            "status": overall,
+            "checks": checks,
+        }
+        if servers_payload is not None:
+            payload["servers"] = servers_payload
+        if surfacing_status is not None:
+            payload["surfacing"] = surfacing_status
+        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        click.echo(_hdr(f"Doctor: {resolved}"))
+        click.echo("=" * 30)
+        for c in checks:
+            styled = _DOCTOR_STYLES[c["status"]](c["status"])
+            click.echo(f"  {styled}  {c['label']:<18} {c['detail']}")
+            if c["next_action"]:
+                click.echo(f"        next: {c['next_action']}")
+        click.echo(f"Summary: {counts['FAIL']} FAIL, {counts['WARN']} WARN, {counts['PASS']} PASS")
+
+    if counts["FAIL"]:
+        sys.exit(1)
 
 
 # `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py
