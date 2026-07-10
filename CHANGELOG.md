@@ -19,7 +19,7 @@ changes inline only. See the deprecation policy in
   payload are routinely piped to CI logs. The messages now name the 1-based
   argument position instead. The dangerous-key diagnostic still names the
   offending KEY (keys are not secret-bearing). Mirrors the `--header`
-  diagnostics shipped in #656. (#657)
+  diagnostics in #656. (#657)
 - **Behavior change**: the response-cache key now includes the call's
   `_context_query` and a fingerprint of the resolved compression settings.
   The cache stores the *compressed* body, and compression is query-aware
