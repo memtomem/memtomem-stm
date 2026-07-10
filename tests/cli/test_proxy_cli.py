@@ -1276,6 +1276,111 @@ class TestAtomicSave:
         assert not target.exists()  # original was never written
 
 
+class TestWriteMcpJsonParseSafety:
+    """Parse/shape failures must abort registration, never rewrite the file.
+
+    The previous behavior swallowed ``JSONDecodeError``/``OSError``, fell back
+    to ``{}``, and the subsequent (atomic) write then discarded every
+    registration already present in ``.mcp.json``. Byte-identical comparison
+    via ``read_bytes`` on purpose — text-level reads can hide e.g.
+    trailing-newline rewrites.
+    """
+
+    @staticmethod
+    def _write(target_dir: Path) -> Path:
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        return _write_mcp_json_for_stm(target_dir, "memtomem-stm", [])
+
+    def test_corrupt_json_aborts_and_leaves_bytes_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        corrupt = b'{"mcpServers": {"existing": {"command": "keep-me"}}'  # missing brace
+        mcp_path.write_bytes(corrupt)
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._write(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert mcp_path.read_bytes() == corrupt
+        err = capsys.readouterr().err
+        assert "Failed to parse" in err
+        assert "line 1" in err  # JSONDecodeError position surfaced
+        assert "not modified" in err
+
+    def test_top_level_non_dict_aborts_and_leaves_bytes_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        prior = b'["valid json", "wrong shape"]'
+        mcp_path.write_bytes(prior)
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._write(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert mcp_path.read_bytes() == prior
+        assert "top-level must be a JSON object" in capsys.readouterr().err
+
+    def test_mcp_servers_non_dict_aborts_and_leaves_bytes_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        prior = b'{"mcpServers": ["not", "a", "mapping"]}'
+        mcp_path.write_bytes(prior)
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._write(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert mcp_path.read_bytes() == prior
+        assert "'mcpServers' must be an object" in capsys.readouterr().err
+
+    def test_unreadable_file_aborts_without_write(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Previously an OSError on read also fell back to {} and overwrote.
+        mcp_path = tmp_path / ".mcp.json"
+        prior = b'{"mcpServers": {"existing": {"command": "keep-me"}}}'
+        mcp_path.write_bytes(prior)
+
+        def boom(self: Path, *args: object, **kwargs: object) -> str:
+            raise OSError("simulated read failure")
+
+        monkeypatch.setattr(Path, "read_text", boom)
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._write(tmp_path)
+
+        assert excinfo.value.code == 1
+        monkeypatch.undo()
+        assert mcp_path.read_bytes() == prior
+        assert "Could not read" in capsys.readouterr().err
+
+    def test_valid_file_merge_preserves_siblings_and_unknown_fields(self, tmp_path: Path) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"existing": {"command": "keep-me"}},
+                    "unknownTopLevel": {"custom": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self._write(tmp_path)
+
+        data = json.loads(mcp_path.read_text(encoding="utf-8"))
+        assert data["mcpServers"]["existing"] == {"command": "keep-me"}
+        assert data["unknownTopLevel"] == {"custom": True}
+        assert data["mcpServers"]["memtomem-stm"] == {"command": "memtomem-stm"}
+
+
 class TestAddPersistence:
     def test_add_persists_full_entry(self, runner, config):
         result = runner.invoke(
