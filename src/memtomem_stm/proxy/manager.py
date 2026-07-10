@@ -1214,7 +1214,6 @@ class ProxyManager:
 
     async def _reconnect_server(self, name: str) -> None:
         conn = self._connections[name]
-        cfg = conn.config
 
         # Serialize concurrent reconnects for this server (#586). Capture the
         # generation BEFORE acquiring: if it advanced while we waited, another
@@ -1229,28 +1228,48 @@ class ProxyManager:
                 )
                 return
 
-            if conn.stack is not None:
-                try:
-                    await conn.stack.aclose()
-                except Exception as cleanup_exc:
-                    # Redact + no exc_info (#605): the previous stack wraps a
-                    # transport opened with the credentialed ``cfg.url``, so a
-                    # close failure's traceback tail could leak the token at DEBUG.
-                    logger.debug(
-                        "Failed to close previous stack for '%s': %s",
-                        name,
-                        self._redacted_error(cleanup_exc, cfg.url),
-                    )
+            # A reconnect applies the CURRENT file config, not the connect-time
+            # snapshot: url/headers/env/timeout edits land on the next reconnect
+            # instead of requiring a restart. Fall back to the old snapshot only
+            # if the server key vanished from the file (adding/removing servers
+            # stays restart-only).
+            cfg = self._config.upstream_servers.get(name)
+            if cfg is None:
+                cfg = conn.config
 
+            # Prepare-first: build the replacement connection while the old one
+            # stays untouched. If _establish_connection raises, ``conn`` still
+            # holds the previous session/stack/config — for a config-change
+            # reconnect the old (healthy) connection keeps serving, and for a
+            # failure-triggered reconnect the caller's raise/skip semantics are
+            # unchanged.
             session, conn_stack, tools = await self._establish_connection(name, cfg)
 
+            old_stack = conn.stack
+            # The old stack wraps a transport opened with the OLD credentialed
+            # url — capture it before the swap so the cleanup log redacts the
+            # right token.
+            old_url = conn.config.url
             conn.session = session
             conn.stack = conn_stack
             conn.tools = tools
+            conn.config = cfg
             # Bump the generation only on a successful reconnect so a waiter
             # skips its own; a failed attempt leaves it unchanged so the next
             # caller retries rather than silently skipping.
             conn.reconnect_generation += 1
+
+            if old_stack is not None:
+                try:
+                    await old_stack.aclose()
+                except Exception as cleanup_exc:
+                    # Redact + no exc_info (#605): a close failure's traceback
+                    # tail could leak the token at DEBUG.
+                    logger.debug(
+                        "Failed to close previous stack for '%s': %s",
+                        name,
+                        self._redacted_error(cleanup_exc, old_url),
+                    )
             logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
 
     def _make_message_handler(self, name: str) -> Any:
