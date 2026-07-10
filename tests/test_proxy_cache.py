@@ -571,14 +571,14 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 2
+            assert version == 3
         finally:
             reopened.close()
 
     def test_current_version_rows_survive_reopen(self, tmp_path):
         db_path = tmp_path / "c.db"
         cache = ProxyCache(db_path, max_entries=10)
-        cache.initialize()  # stamps user_version = 2
+        cache.initialize()  # stamps user_version = 3
         cache.set("s", "t", {"a": 1}, "row", ttl_seconds=None)
         cache.close()
 
@@ -588,3 +588,76 @@ class TestKeySchemaVersionPurge:
             assert reopened.get("s", "t", {"a": 1}) == "row"
         finally:
             reopened.close()
+
+    def test_v2_table_reopen_wipes_and_adds_marker_column(self, tmp_path):
+        """A v2-era database (old six-column table, user_version=2) is dropped
+        and recreated on open: rows are gone and the recreated table carries
+        the ``envelope_safe`` column."""
+        db_path = tmp_path / "c.db"
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            """
+            CREATE TABLE proxy_cache (
+                cache_key   TEXT    PRIMARY KEY,
+                server      TEXT    NOT NULL,
+                tool        TEXT    NOT NULL,
+                result      TEXT    NOT NULL,
+                created_at  REAL    NOT NULL,
+                ttl_seconds REAL
+            )
+            """
+        )
+        db.execute(
+            "INSERT INTO proxy_cache VALUES ('k', 's', 't', 'v2-row', ?, NULL)",
+            (time.time(),),
+        )
+        db.execute("PRAGMA user_version = 2")
+        db.commit()
+        db.close()
+
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()
+        try:
+            assert cache.stats()["total_entries"] == 0
+            columns = {
+                row[1] for row in cache._db.execute("PRAGMA table_info(proxy_cache)").fetchall()
+            }
+            assert "envelope_safe" in columns
+            (version,) = cache._db.execute("PRAGMA user_version").fetchone()
+            assert version == 3
+        finally:
+            cache.close()
+
+
+class TestEnvelopeSafeMarker:
+    """v3 rows carry ``envelope_safe=1``; unmarked rows are never served."""
+
+    def _insert_unmarked_row(self, cache: ProxyCache, key: str, result: str) -> None:
+        # Simulate an out-of-band writer (older binary / external SQL) that
+        # names the pre-v3 columns only, leaving envelope_safe at DEFAULT 0.
+        cache._db.execute(
+            "INSERT INTO proxy_cache (cache_key, server, tool, result, created_at, ttl_seconds) "
+            "VALUES (?, 's', 't', ?, ?, NULL)",
+            (key, result, time.time()),
+        )
+        cache._db.commit()
+
+    def test_set_get_round_trip_serves_marked_rows(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {"a": 1}, "marked", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {"a": 1}) == "marked"
+        (flag,) = proxy_cache._db.execute("SELECT envelope_safe FROM proxy_cache").fetchone()
+        assert flag == 1
+
+    def test_unmarked_row_is_a_miss(self, proxy_cache: ProxyCache):
+        key = _make_key("s", "t", {"a": 1})
+        self._insert_unmarked_row(proxy_cache, key, "unmarked")
+        assert proxy_cache.get("s", "t", {"a": 1}) is None
+
+    def test_set_over_unmarked_row_re_marks_it(self, proxy_cache: ProxyCache):
+        """The UPSERT's conflict branch must re-mark the row: without
+        ``envelope_safe = excluded.envelope_safe`` an unmarked row upserted by
+        ``set()`` would keep the 0 marker and miss forever."""
+        key = _make_key("s", "t", {"a": 1})
+        self._insert_unmarked_row(proxy_cache, key, "unmarked")
+        proxy_cache.set("s", "t", {"a": 1}, "re-marked", ttl_seconds=60.0)
+        assert proxy_cache.get("s", "t", {"a": 1}) == "re-marked"
