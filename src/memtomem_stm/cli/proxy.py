@@ -1390,27 +1390,31 @@ def add(
 
     if env_pairs:
         env_dict: dict[str, str] = {}
-        for pair in env_pairs:
+        for idx, pair in enumerate(env_pairs, start=1):
+            # Never echo the raw argument in these diagnostics: a malformed
+            # --env is likely a stray credential (`--env =tok`, or a bare
+            # token missing KEY=), and both stderr and the --json error
+            # payload are routinely piped to CI logs and transcripts. The
+            # dangerous-key diagnostic below still names the KEY — keys are
+            # not secret-bearing.
             if "=" not in pair:
-                click.echo(f"{_err('Error:')} --env must be KEY=VALUE, got: {pair}", err=True)
+                msg = (
+                    f"--env #{idx} must be KEY=VALUE "
+                    "(raw argument withheld: env values may be secrets)"
+                )
+                click.echo(f"{_err('Error:')} {msg}", err=True)
                 if as_json:
-                    _json_fail(
-                        "add", "invalid_env", f"--env must be KEY=VALUE, got: {pair}", name=name
-                    )
+                    _json_fail("add", "invalid_env", msg, name=name)
                 sys.exit(1)
             k, v = pair.split("=", 1)
             if not k:
-                click.echo(
-                    f"{_err('Error:')} --env key must be non-empty, got: {pair}",
-                    err=True,
+                msg = (
+                    f"--env #{idx} key must be non-empty "
+                    "(raw argument withheld: env values may be secrets)"
                 )
+                click.echo(f"{_err('Error:')} {msg}", err=True)
                 if as_json:
-                    _json_fail(
-                        "add",
-                        "invalid_env",
-                        f"--env key must be non-empty, got: {pair}",
-                        name=name,
-                    )
+                    _json_fail("add", "invalid_env", msg, name=name)
                 sys.exit(1)
             if k.upper() in _DANGEROUS_ENV_KEYS:
                 click.echo(

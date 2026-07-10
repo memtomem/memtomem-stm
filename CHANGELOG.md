@@ -25,6 +25,13 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms add`'s `invalid_env` diagnostics no longer echo the raw `--env`
+  argument: a malformed pair (`--env =tok`, or a bare token missing `KEY=`)
+  is likely a stray credential, and both stderr and the `--json` error
+  payload are routinely piped to CI logs. The messages now name the 1-based
+  argument position instead. The dangerous-key diagnostic still names the
+  offending KEY (keys are not secret-bearing). Mirrors the `--header`
+  diagnostics in #656. (#657)
 - **Behavior change**: the response-cache key now includes the call's
   `_context_query` and a fingerprint of the resolved compression settings.
   The cache stores the *compressed* body, and compression is query-aware
