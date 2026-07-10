@@ -13,6 +13,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Behavior change**: the response-cache key now includes the call's
+  `_context_query` and a fingerprint of the resolved compression settings.
+  The cache stores the *compressed* body, and compression is query-aware
+  (BM25 relevance budgets) and config-dependent — previously the same
+  tool+args under a different query context, or after a compression-setting
+  hot reload, was served a body compressed for another query / under old
+  settings. Consequences: a one-time full cache purge on first start after
+  upgrade (key schema v2, tracked via SQLite `user_version`); callers passing
+  a per-turn-varying `_context_query` re-fetch instead of hitting the cache;
+  compression-config changes immediately stop old rows from being served.
+  (#655)
 - **Behavior change**: `mms add` now rejects a duplicate `--prefix` (exit 1,
   `duplicate_prefix` in `--json` mode, config file untouched) instead of
   warning and saving a config the proxy's runtime validator then refuses to
