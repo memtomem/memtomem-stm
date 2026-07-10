@@ -26,9 +26,17 @@ from click.testing import CliRunner
 
 from memtomem_stm.cli.proxy import cli
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
+from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 from helpers import set_home
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
+
+
+def _probe_ok(tools: int = 1, overflowing: tuple[str, ...] = ()) -> StagedProbeResult:
+    """Fully-successful staged probe result for fake ``_probe_servers``."""
+    return StagedProbeResult(
+        stage=ProbeStage.TOOLS_DISCOVERED, tools=tools, overflowing=overflowing
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1754,10 +1762,7 @@ class TestAddValidate:
 
         async def fake_probe_servers(servers, timeout):
             probe_calls.append(dict(servers))
-            return {
-                n: {"connected": True, "tools": 1, "overflowing": [], "error": None}
-                for n in servers
-            }
+            return {n: _probe_ok(tools=1) for n in servers}
 
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
 
@@ -4155,7 +4160,7 @@ class TestAddFromClients:
 
         async def fake_probe_servers(servers, timeout):
             probe_calls.append(dict(servers))
-            return {n: {"connected": True, "tools": 3, "error": None} for n in servers}
+            return {n: _probe_ok(tools=3) for n in servers}
 
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
 
@@ -7564,10 +7569,12 @@ class TestHealth:
             "headers": {"X-Api-Key": "k"},
         }
         start = time.monotonic()
-        with pytest.raises(asyncio.TimeoutError):
-            asyncio.run(proxy_mod._probe_one(cfg, 0.1))
+        result = asyncio.run(proxy_mod._probe_one(cfg, 0.1))
         elapsed = time.monotonic() - start
         assert elapsed < 5.0, f"transport-enter stall ran {elapsed:.2f}s past the 0.1s budget"
+        assert result.connected is False
+        assert result.error == "timeout (0.1s)"
+        assert result.stage is ProbeStage.CONFIGURED
         assert captured["url"] == "https://up.example/mcp"
         assert captured["headers"] == {"X-Api-Key": "k"}
         assert captured["timeout"] == pytest.approx(0.1, rel=0.1)
@@ -7610,10 +7617,14 @@ class TestHealth:
 
         cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
         start = time.monotonic()
-        with pytest.raises(asyncio.TimeoutError):
-            asyncio.run(proxy_mod._probe_one(cfg, 0.1))
+        result = asyncio.run(proxy_mod._probe_one(cfg, 0.1))
         elapsed = time.monotonic() - start
         assert elapsed < 5.0, f"list_tools stall ran {elapsed:.2f}s past the 0.1s budget"
+        assert result.connected is False
+        assert result.error == "timeout (0.1s)"
+        # Connect and initialize completed — the stall was in discovery.
+        assert result.stage is ProbeStage.MCP_INITIALIZED
+        assert result.failed_stage is ProbeStage.TOOLS_DISCOVERED
 
     def test_safe_probe_classifies_deadline_timeout(self, monkeypatch):
         """The end-to-end deadline surfaces through ``_probe_servers`` as
@@ -7633,8 +7644,201 @@ class TestHealth:
 
         cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
         results = asyncio.run(proxy_mod._probe_servers({"up": cfg}, 0.1))
-        assert results["up"]["connected"] is False
-        assert results["up"]["error"] == "timeout (0.1s)"
+        assert results["up"].connected is False
+        assert results["up"].error == "timeout (0.1s)"
+        assert results["up"].stage is ProbeStage.CONFIGURED
+
+    @staticmethod
+    def _fake_session_cls(
+        *, init_exc: Exception | None = None, tools_exc: Exception | None = None
+    ):
+        """ClientSession stand-in that fails at a chosen probe phase."""
+
+        class FakeTool:
+            name = "t1"
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def initialize(self):
+                if init_exc is not None:
+                    raise init_exc
+
+            async def list_tools(self):
+                if tools_exc is not None:
+                    raise tools_exc
+                return SimpleNamespace(tools=[FakeTool()])
+
+        return FakeSession
+
+    def test_probe_stage_progression(self, monkeypatch):
+        """``_probe_one`` records the last phase that completed — the whole
+        point of the staged refactor (⑧): a user must be able to tell
+        transport failure / handshake failure / discovery failure apart."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
+
+        # Transport enter fails → nothing beyond CONFIGURED.
+        class BrokenTransport:
+            async def __aenter__(self):
+                raise ConnectionRefusedError("connection refused")
+
+            async def __aexit__(self, *_args):
+                return None
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: BrokenTransport())
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.stage is ProbeStage.CONFIGURED
+        assert result.failed_stage is ProbeStage.TRANSPORT_CONNECTED
+        assert result.connected is False
+
+        # initialize() fails → TRANSPORT_CONNECTED reached.
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr(
+            "mcp.ClientSession", self._fake_session_cls(init_exc=RuntimeError("bad handshake"))
+        )
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.stage is ProbeStage.TRANSPORT_CONNECTED
+        assert result.failed_stage is ProbeStage.MCP_INITIALIZED
+        assert result.error == "bad handshake"
+
+        # list_tools() fails → MCP_INITIALIZED reached.
+        monkeypatch.setattr(
+            "mcp.ClientSession", self._fake_session_cls(tools_exc=RuntimeError("no tools rpc"))
+        )
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.stage is ProbeStage.MCP_INITIALIZED
+        assert result.failed_stage is ProbeStage.TOOLS_DISCOVERED
+
+        # Full success → TOOLS_DISCOVERED, tool count carried.
+        monkeypatch.setattr("mcp.ClientSession", self._fake_session_cls())
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.stage is ProbeStage.TOOLS_DISCOVERED
+        assert result.connected is True
+        assert result.tools == 1
+        assert result.failed_stage is None
+
+    def test_probe_error_sanitizes_header_and_env_values(self, monkeypatch):
+        """A probe exception that echoes a configured header/env value (401
+        bodies do) must reach ``health`` output sanitized — free-form
+        strings bypass the mapping redactors, so ``_probe_one`` scrubs them
+        against the server's own config before storing (⑧)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr(
+            "mcp.ClientSession",
+            self._fake_session_cls(
+                init_exc=RuntimeError("401 Unauthorized: Bearer sekrit-token-123")
+            ),
+        )
+        cfg = {
+            "transport": "sse",
+            "url": "https://up.example/sse",
+            "prefix": "up",
+            "headers": {"Authorization": "Bearer sekrit-token-123"},
+        }
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.error is not None
+        assert "sekrit-token-123" not in result.error
+        assert "<REDACTED>" in result.error
+
+    def test_health_output_sanitizes_probe_error_text_and_json(self, runner, config, monkeypatch):
+        """End-to-end: the sanitized probe error is what ``mms health``
+        renders — the raw header value never appears in text or ``--json``
+        output (ratified ⑧ regression: raw token never in output)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "api": {
+                            "prefix": "api",
+                            "transport": "sse",
+                            "url": "https://up.example/sse",
+                            "headers": {"Authorization": "Bearer sekrit-token-123"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "api": StagedProbeResult(
+                    stage=ProbeStage.TRANSPORT_CONNECTED,
+                    transport="sse",
+                    error="401 Unauthorized: Bearer <REDACTED>",
+                )
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "sekrit-token-123" not in result.output
+        assert "<REDACTED>" in result.output
+        assert "last successful stage: transport connected" in result.output
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "sekrit-token-123" not in result.output
+        data = json.loads(result.output)
+        assert data["servers"]["api"]["stage"] == "transport_connected"
+        assert data["servers"]["api"]["failed_stage"] == "mcp_initialized"
+
+    def test_health_json_keeps_legacy_probe_keys(self, runner, config, monkeypatch):
+        """``health --json`` server entries stay backward-compatible: the
+        pre-staged keys keep their shapes and ``stage``/``failed_stage``/
+        ``transport`` are additive (⑧)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {"upstream_servers": {"ok": {"prefix": "ok", "transport": "stdio", "command": "x"}}}
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {"ok": _probe_ok(tools=3)}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        entry = json.loads(result.output)["servers"]["ok"]
+        assert entry["connected"] is True
+        assert entry["tools"] == 3
+        assert entry["overflowing"] == []
+        assert entry["error"] is None
+        assert entry["stage"] == "tools_discovered"
+        assert entry["failed_stage"] is None
+        assert entry["transport"] == "stdio"
 
     def test_health_error_unwraps_taskgroup_wrapper(self, runner, config):
         """Probe failures inside an anyio TaskGroup are wrapped as
@@ -7730,12 +7934,9 @@ class TestHealth:
 
         async def fake_probe_servers(servers, timeout):
             return {
-                "docs": {
-                    "connected": True,
-                    "tools": 2,
-                    "overflowing": ["query_docs_filesystem_docs_by_lang_chain"],
-                    "error": None,
-                }
+                "docs": _probe_ok(
+                    tools=2, overflowing=("query_docs_filesystem_docs_by_lang_chain",)
+                )
             }
 
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
@@ -7773,14 +7974,7 @@ class TestHealth:
         )
 
         async def fake_probe_servers(servers, timeout):
-            return {
-                "ok": {
-                    "connected": True,
-                    "tools": 3,
-                    "overflowing": [],
-                    "error": None,
-                }
-            }
+            return {"ok": _probe_ok(tools=3)}
 
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
 
@@ -7812,12 +8006,9 @@ class TestHealth:
 
         async def fake_probe_servers(servers, timeout):
             return {
-                "docs": {
-                    "connected": True,
-                    "tools": 2,
-                    "overflowing": ["query_docs_filesystem_docs_by_lang_chain"],
-                    "error": None,
-                }
+                "docs": _probe_ok(
+                    tools=2, overflowing=("query_docs_filesystem_docs_by_lang_chain",)
+                )
             }
 
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
