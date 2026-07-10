@@ -1573,6 +1573,37 @@ class TestAddPersistence:
         # don't support it; the CLI silently ignores the OSError).
         assert config.exists()
 
+    def test_add_missing_config_writes_strict_cache_policy(self, runner, config):
+        """`mms add` against a missing config file creates one — that fresh
+        file must carry the same explicit strict policy as an init-generated
+        config (the new-config template is path-independent)."""
+        assert not config.exists()
+        result = runner.invoke(
+            cli,
+            ["add", "fs", "--prefix", "fs", "--command", "uvx", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["cache"] == {"tool_annotation_policy": "strict"}
+
+    def test_add_existing_config_without_policy_not_retro_migrated(self, runner, config):
+        """`mms add` into an existing key-less config must NOT inject the
+        strict policy — adopting it is the operator's call (the load-time
+        advisory points them at it); add only appends the server entry."""
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "fs", "--prefix", "fs", "--command", "uvx", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "cache" not in data
+        assert "fs" in data["upstream_servers"]
+
     @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
     def test_add_persists_headers_for_http_transports(self, runner, config, transport):
         result = runner.invoke(
@@ -1977,6 +2008,27 @@ class TestInit:
         assert srv["transport"] == "stdio"
         assert srv["command"] == "npx"
         assert srv["args"] == ["-y", "@modelcontextprotocol/server-fs"]
+
+    def test_init_writes_strict_cache_policy(self, runner, config, no_discovery):
+        """New configs opt into the strict annotation policy explicitly; the
+        schema default stays conservative for key-less legacy files. Raw JSON
+        asserted AND round-tripped through the loader so a key the schema
+        doesn't accept would fail here instead of looking applied on disk."""
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["cache"] == {"tool_annotation_policy": "strict"}
+
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        loaded = ProxyConfig.load_from_file(config)
+        assert loaded is not None
+        assert loaded.cache.tool_annotation_policy == "strict"
 
     def test_init_custom_config_warns_registered_entry_reads_default(
         self, runner, config, no_discovery
@@ -3873,6 +3925,34 @@ class TestAddFromClients:
         fs = data["upstream_servers"]["filesystem"]
         assert fs["command"] == "npx"
         assert fs["prefix"] == "filesystem"  # default suggestion
+
+    def test_from_clients_fresh_config_writes_strict_cache_policy(
+        self, runner, config, monkeypatch
+    ):
+        """`add --from-clients` with no config file yet creates one — same
+        strict template as init/add. An EXISTING config is not retro-migrated
+        (covered for the shared _load path by TestAddPersistence)."""
+        assert not config.exists()
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "filesystem",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx", "args": []},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["cache"] == {"tool_annotation_policy": "strict"}
+        assert "filesystem" in data["upstream_servers"]
 
     def test_from_clients_import_alias(self, runner, config, monkeypatch):
         """`--import` is a flag synonym for `--from-clients`; must hit the
