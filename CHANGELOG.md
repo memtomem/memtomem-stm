@@ -9,6 +9,19 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- **Behavior change**: `mms add` now rejects a duplicate `--prefix` (exit 1,
+  `duplicate_prefix` in `--json` mode, config file untouched) instead of
+  warning and saving a config the proxy's runtime validator then refuses to
+  load. The interactive prefix prompts (`mms init`, `add --from-clients`)
+  re-prompt on a colliding prefix. Prefix format/uniqueness rules now live in
+  one shared module (`proxy/prefixes.py`) used by both the CLI pre-save
+  checks and the runtime `ProxyConfig` validators, so the two sides cannot
+  diverge again. (#654)
+
 ## [0.1.32] — 2026-07-05
 
 ### Upgrade notes

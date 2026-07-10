@@ -1059,19 +1059,26 @@ class TestAddValidation:
         assert result.exit_code == 1
         assert "already exists" in result.output
 
-    def test_warns_on_duplicate_prefix_but_succeeds(self, runner, config):
-        """Duplicate prefix is a warning, not an error — `add` still proceeds."""
+    def test_rejects_duplicate_prefix_without_writing(self, runner, config):
+        """Duplicate prefix is a hard reject — the runtime validator refuses
+        to load such a config, so `add` must not save one. The config file
+        stays byte-identical."""
         runner.invoke(
             cli,
             ["add", "fs1", "--prefix", "fs", "--command", "x", *_cfg_args(config)],
         )
+        before = config.read_bytes()
         result = runner.invoke(
             cli,
             ["add", "fs2", "--prefix", "fs", "--command", "y", *_cfg_args(config)],
         )
-        assert result.exit_code == 0
-        assert "Warning" in result.output
-        assert "already used by server 'fs1'" in result.output
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "Duplicate upstream prefixes detected" in result.output
+        # Both the colliding prefix and the existing server key are named.
+        assert "'fs'" in result.output
+        assert "fs1" in result.output
+        assert config.read_bytes() == before
 
     def test_stdio_requires_command(self, runner, config):
         result = runner.invoke(
@@ -1598,16 +1605,33 @@ class TestAddJson:
         assert result.exit_code == 1
         assert json.loads(result.stdout)["error"] == "stdio_requires_command"
 
-    def test_warnings_land_in_payload_and_stderr(self, runner, config):
+    def test_duplicate_prefix_error_shape_and_no_write(self, runner, config):
         runner.invoke(cli, ["add", "one", "--prefix", "fs", "--command", "x", *_cfg_args(config)])
+        before = config.read_bytes()
         result = runner.invoke(
             cli, ["add", "two", "--prefix", "fs", "--command", "x", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["ok"] is False and data["error"] == "duplicate_prefix"
+        # The human stderr line still prints (wording shared across modes).
+        assert "Duplicate upstream prefixes detected" in result.stderr
+        assert config.read_bytes() == before
+
+    def test_warnings_land_in_payload_and_stderr(self, runner, config, monkeypatch):
+        """Non-abort warnings (here: the long-prefix soft warning) print to
+        stderr AND land in the ``warnings`` array."""
+        monkeypatch.delenv("MMS_CLIENT_SERVER_NAME", raising=False)
+        warn_prefix = "a" * 22  # 1 over warn threshold, well under hard limit
+        result = runner.invoke(
+            cli,
+            ["add", "s", "--prefix", warn_prefix, "--command", "x", "--json", *_cfg_args(config)],
         )
         assert result.exit_code == 0
         data = json.loads(result.stdout)
         assert data["ok"] is True
-        assert any("already used by server 'one'" in w for w in data["warnings"])
-        assert "already used by server 'one'" in result.stderr
+        assert any("silently dropped" in w for w in data["warnings"])
+        assert "silently dropped" in result.stderr
 
     def test_from_clients_is_usage_error(self, runner, config):
         result = runner.invoke(cli, ["add", "--from-clients", "--json", *_cfg_args(config)])
@@ -2359,6 +2383,38 @@ class TestInitImportFlow:
         assert servers["filesystem"]["command"] == "npx"
         assert servers["filesystem"]["prefix"] == "filesystem"  # default suggestion
         assert servers["docs"]["url"] == "https://docs.example/mcp"
+
+    def test_user_typed_duplicate_prefix_reprompts(self, runner, config, monkeypatch):
+        """Overriding the suggested prefix with one already claimed in the
+        same run re-prompts instead of saving a config the runtime pydantic
+        validator would refuse to load."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "a",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "ca"},
+                },
+                {
+                    "name": "b",
+                    "source": "Y",
+                    "entry": {"transport": "stdio", "command": "cb"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            # pick all; accept default 'a'; type colliding 'a' for the
+            # second server (re-prompt), then a unique 'b2'.
+            input="all\n\na\nb2\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "already used" in result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["upstream_servers"]["a"]["prefix"] == "a"
+        assert data["upstream_servers"]["b"]["prefix"] == "b2"
 
     def test_import_subset_by_number(self, runner, config, monkeypatch):
         """Numeric picks only import the chosen servers — not all of them."""
