@@ -93,6 +93,7 @@ If you've already configured MCP servers in Claude Desktop, Claude Code, or a pr
 mms list      # show what you've added
 mms status    # config summary (enabled flag, server count)
 mms health    # check connectivity + surfacing readiness
+mms doctor    # one PASS/WARN/FAIL diagnosis with next actions (exit 0 = setup OK)
 ```
 
 ### 2. Connect your AI client to STM
@@ -132,11 +133,27 @@ Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
 > assumption is conservative and at worst causes a few false-positive
 > warnings on borderline prefixes.
 
-### 3. Use the proxied tools
+### 3. Verify the setup
+
+Setup is done when **`mms doctor` exits 0** and your client lists a first
+proxied tool (e.g. `fs__read_file`) — not merely when registration
+succeeded. `doctor` runs one read-only pass over the config, each upstream
+connection (naming the stage a failure happened in), the cache policy, and
+the LTM server, printing `PASS`/`WARN`/`FAIL` with a runnable `next:`
+command per problem:
+
+```bash
+mms doctor    # exit 0 (WARNs allowed) = setup OK; exit 1 = fix the FAIL lines
+```
+
+Without a memtomem LTM server an `ltm server` WARN is expected — it only
+means memory surfacing is disabled; the proxy core is unaffected.
+
+### 4. Use the proxied tools
 
 Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, etc.). The CLEAN / COMPRESS / SURFACE stages run automatically — responses are cleaned, compressed, cached, and (when an LTM server is configured) enriched with relevant memories. The INDEX stage (auto_index / extraction) is currently inactive in the standalone server; see [#288](https://github.com/memtomem/memtomem-stm/issues/288).
 
-To check connectivity and surfacing readiness from your shell, run
+To inspect connectivity and surfacing readiness in detail, run
 `mms health` (`mms status` shows the static config only — it doesn't probe
 connectivity). If you want the agent to call operator-facing MCP
 tools such as `stm_proxy_stats`, start STM with

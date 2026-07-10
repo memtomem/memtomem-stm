@@ -18,6 +18,7 @@ from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
+from urllib.parse import unquote, urlsplit
 
 import click
 
@@ -40,8 +41,13 @@ from memtomem_stm.mms.import_hosts import (
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from memtomem_stm.mms.state import utc_now_iso
 from memtomem_stm.proxy import prefixes, tool_name_budget
+from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 from memtomem_stm.utils.fileio import atomic_write_text
-from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
+from memtomem_stm.utils.redact import (
+    redact_exception_text,
+    redact_url_userinfo,
+    sanitize_secrets,
+)
 
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
 logger = logging.getLogger(__name__)
@@ -182,6 +188,20 @@ def _schema_validation_error(data: dict[str, Any]) -> str | None:
 _CONFIG_INVALID_WARNING = (
     "config file present but fails validation — a running server falls back to env/defaults"
 )
+
+
+def _transport_field_error(transport: str, command: str, url: str) -> str | None:
+    """Missing required connection field for *transport*, or ``None``.
+
+    Single source of truth for which field each transport needs — shared by
+    ``add`` (VAL-3/VAL-4, rendered with a ``--`` option flavor) and ``mms
+    doctor`` (raw config dicts), so the two can't drift.
+    """
+    if transport == "stdio" and not command:
+        return "command is required for stdio transport"
+    if transport != "stdio" and not url:
+        return f"url is required for {transport} transport"
+    return None
 
 
 def _logging_destination_status() -> dict[str, Any]:
@@ -1345,25 +1365,14 @@ def add(
             )
         sys.exit(1)
 
-    # VAL-3: stdio requires --command
-    if transport == "stdio" and not command:
-        click.echo(f"{_err('Error:')} --command is required for stdio transport.", err=True)
+    # VAL-3/VAL-4: per-transport required field (shared with `mms doctor`);
+    # the `--` prefix turns the config-flavored message into the option name.
+    field_error = _transport_field_error(transport, command, url)
+    if field_error:
+        click.echo(f"{_err('Error:')} --{field_error}.", err=True)
         if as_json:
-            _json_fail(
-                "add",
-                "stdio_requires_command",
-                "--command is required for stdio transport",
-                name=name,
-            )
-        sys.exit(1)
-
-    # VAL-4: sse/streamable_http requires --url
-    if transport != "stdio" and not url:
-        click.echo(f"{_err('Error:')} --url is required for {transport} transport.", err=True)
-        if as_json:
-            _json_fail(
-                "add", "url_required", f"--url is required for {transport} transport", name=name
-            )
+            code = "stdio_requires_command" if transport == "stdio" else "url_required"
+            _json_fail("add", code, f"--{field_error}", name=name)
         sys.exit(1)
 
     # VAL-5: --header only applies to HTTP transports; a header on a stdio
@@ -1484,16 +1493,15 @@ def add(
         if not as_json:
             click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
         probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
-        if not probe["connected"]:
-            click.echo(f"{_err('Error:')} validation failed — {probe['error']}", err=True)
+        if not probe.connected:
+            msg = f"validation failed — {probe.error} (stage reached: {probe.stage.display()})"
+            click.echo(f"{_err('Error:')} {msg}", err=True)
             if as_json:
-                _json_fail(
-                    "add", "validation_failed", f"validation failed — {probe['error']}", name=name
-                )
+                _json_fail("add", "validation_failed", msg, name=name)
             sys.exit(1)
-        tools_reachable = probe["tools"]
+        tools_reachable = probe.tools
         if not as_json:
-            click.echo(f"{_ok('Validated:')} {probe['tools']} tool(s) reachable.")
+            click.echo(f"{_ok('Validated:')} {probe.tools} tool(s) reachable.")
 
     servers[name] = entry
     _save(path, data)
@@ -2522,10 +2530,10 @@ def _add_from_clients(
         click.echo(f"Validating {len(imported)} server(s) (timeout={validate_timeout}s)...")
         probes = asyncio.run(_probe_servers(imported, validate_timeout))
         for n, probe in probes.items():
-            if probe["connected"]:
-                click.echo(f"  {_ok('Reachable:')} {n} — {probe['tools']} tool(s).")
+            if probe.connected:
+                click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
             else:
-                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe['error']}", err=True)
+                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
                 click.echo("  Saving anyway. Run `mms health` later to retry.", err=True)
 
     servers.update(imported)
@@ -2819,10 +2827,10 @@ def init(
         click.echo(f"Validating {len(probe_map)} server(s) (timeout=10s)...")
         probes = asyncio.run(_probe_servers(probe_map, 10))
         for n, probe in probes.items():
-            if probe["connected"]:
-                click.echo(f"  {_ok('Reachable:')} {n} — {probe['tools']} tool(s).")
+            if probe.connected:
+                click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
             else:
-                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe['error']}", err=True)
+                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
                 click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
 
     data: dict[str, Any] = {
@@ -4631,7 +4639,7 @@ def eject(
 # ── health command ──────────────────────────────────────────────────────
 
 
-async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
+async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     """Probe a single upstream server: connect, initialize, list tools.
 
     *timeout* is an **end-to-end** budget shared across transport connect +
@@ -4641,7 +4649,14 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
     Mirrors ``_probe_ltm_mcp_server``'s deadline pattern; previously only
     ``initialize()`` was bounded, so a network upstream hanging on TCP
     connect (or any upstream stalling on ``tools/list``) blocked the probe
-    indefinitely and ``_safe_probe``'s timeout classification never fired.
+    indefinitely and the timeout classification never fired.
+
+    Returns a ``StagedProbeResult`` instead of raising: the exception has
+    already unwound the stage ladder by the time a caller could catch it,
+    so classifying here is the only way to preserve *which* phase failed.
+    Failure causes are sanitized against the server's configured
+    ``env``/``headers`` values (and URL credentials) before being stored —
+    ``health``/``doctor`` render ``error`` verbatim.
     """
     from mcp import ClientSession
     from mcp.client.sse import sse_client
@@ -4656,47 +4671,77 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> dict[str, Any]:
         # returning a bogus result on an exhausted budget.
         return max(1e-3, deadline - asyncio.get_running_loop().time())
 
-    transport = cfg.get("transport", "stdio")
-    if transport == "stdio":
-        ctx = stdio_client(
-            StdioServerParameters(
-                command=cfg.get("command", ""),
-                args=cfg.get("args", []),
-                env=cfg.get("env"),
+    transport = str(cfg.get("transport", "stdio"))
+    stage = ProbeStage.CONFIGURED
+    tools = 0
+    overflowing: tuple[str, ...] = ()
+    try:
+        if transport == "stdio":
+            ctx = stdio_client(
+                StdioServerParameters(
+                    command=cfg.get("command", ""),
+                    args=cfg.get("args", []),
+                    env=cfg.get("env"),
+                )
             )
-        )
-    elif transport == "sse":
-        sdk_timeout = remaining()
-        ctx = sse_client(
-            cfg.get("url", ""),
-            headers=cfg.get("headers"),
-            timeout=sdk_timeout,
-            sse_read_timeout=sdk_timeout,
-        )
-    else:
-        sdk_timeout = remaining()
-        ctx = streamablehttp_client(
-            cfg.get("url", ""),
-            headers=cfg.get("headers"),
-            timeout=sdk_timeout,
-            sse_read_timeout=sdk_timeout,
-        )
+        elif transport == "sse":
+            sdk_timeout = remaining()
+            ctx = sse_client(
+                cfg.get("url", ""),
+                headers=cfg.get("headers"),
+                timeout=sdk_timeout,
+                sse_read_timeout=sdk_timeout,
+            )
+        else:
+            sdk_timeout = remaining()
+            ctx = streamablehttp_client(
+                cfg.get("url", ""),
+                headers=cfg.get("headers"),
+                timeout=sdk_timeout,
+                sse_read_timeout=sdk_timeout,
+            )
 
-    async with AsyncExitStack() as stack:
-        streams = await asyncio.wait_for(stack.enter_async_context(ctx), timeout=remaining())
-        async with ClientSession(streams[0], streams[1]) as session:
-            await asyncio.wait_for(session.initialize(), timeout=remaining())
-            result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
-            prefix = cfg.get("prefix", "")
-            overflowing = [
-                t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
-            ]
-            return {
-                "connected": True,
-                "tools": len(result.tools),
-                "overflowing": overflowing,
-                "error": None,
-            }
+        async with AsyncExitStack() as stack:
+            streams = await asyncio.wait_for(stack.enter_async_context(ctx), timeout=remaining())
+            stage = ProbeStage.TRANSPORT_CONNECTED
+            async with ClientSession(streams[0], streams[1]) as session:
+                await asyncio.wait_for(session.initialize(), timeout=remaining())
+                stage = ProbeStage.MCP_INITIALIZED
+                result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
+                prefix = cfg.get("prefix", "")
+                tools = len(result.tools)
+                overflowing = tuple(
+                    t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
+                )
+                # Only now is discovery genuinely complete. Setting the stage
+                # after processing the result (not right after list_tools)
+                # keeps a malformed-result failure classified as an
+                # MCP_INITIALIZED failure instead of being swallowed by the
+                # post-discovery teardown-noise path below.
+                stage = ProbeStage.TOOLS_DISCOVERED
+    except Exception as exc:
+        # A failure raised *after* discovery completed is teardown noise —
+        # anyio transports commonly re-raise a background-task error from the
+        # context ``__aexit__``. The probe already got the tool list, so it
+        # succeeded; reporting DISCONNECTED "failed after tools discovered"
+        # would be wrong. Return the success result and drop the cleanup
+        # error (it's not actionable for a connectivity probe).
+        if stage is ProbeStage.TOOLS_DISCOVERED:
+            return StagedProbeResult(
+                stage=stage, transport=transport, tools=tools, overflowing=overflowing
+            )
+        # ``asyncio.wait_for`` raises ``TimeoutError`` directly, but anyio's
+        # TaskGroup (wrapped by the SDK transports) re-raises failures as
+        # ``ExceptionGroup`` leaves — dispatch on the root cause so
+        # ``--timeout N`` always renders as ``timeout (Ns)`` rather than a
+        # wrapper type name.
+        root = _root_cause_exc(exc)
+        if isinstance(root, TimeoutError):
+            error = f"timeout ({timeout}s)"
+        else:
+            error = _sanitize_probe_error(_root_cause_message(exc), cfg)
+        return StagedProbeResult(stage=stage, transport=transport, error=error)
+    return StagedProbeResult(stage=stage, transport=transport, tools=tools, overflowing=overflowing)
 
 
 def _format_command_for_display(command: str, args: list[str]) -> str:
@@ -4909,8 +4954,11 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
             status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
         else:
             # httpx exceptions embed the full request URL — userinfo included
-            # — so the rendered message is scrubbed against the raw url.
+            # — so the rendered message is scrubbed against the raw url, then
+            # against the configured header values (a 401 body can echo the
+            # Authorization header back into the exception text).
             message = redact_exception_text(str(root), url) or type(root).__name__
+            message = sanitize_secrets(message, list((headers or {}).values()))
             status["error"] = f"{display}: {message}"
     else:
         status.update(probe)
@@ -4934,6 +4982,81 @@ def _root_cause_exc(exc: BaseException) -> BaseException:
 def _root_cause_message(exc: BaseException) -> str:
     cur = _root_cause_exc(exc)
     return str(cur) or type(cur).__name__
+
+
+# Values shorter than this are not treated as redactable secrets: a 1-3 char
+# token like "k", "1", or "on" occurs incidentally all over ordinary
+# diagnostic text, so redacting it globally corrupts the message far more than
+# it protects — and a secret that short isn't meaningfully protectable anyway.
+_MIN_REDACTABLE_SECRET_LEN = 4
+
+
+def _probe_secret_values(cfg: dict[str, Any]) -> list[str]:
+    """Secret-bearing values from a raw server config dict.
+
+    Everything ``sanitize_secrets`` must scrub out of a probe failure
+    message: all ``env`` values (stdio child environment), all ``headers``
+    values (HTTP auth), and the URL userinfo. SDK/validation exceptions
+    interpolate these verbatim (a 401 body can echo the Authorization
+    header back), and the mapping redactors only cover structured output.
+
+    Trivially short values are dropped (see ``_MIN_REDACTABLE_SECRET_LEN``)
+    so redaction can't mangle ordinary diagnostic text.
+    """
+    values: list[str] = []
+    for key in ("env", "headers"):
+        mapping = cfg.get(key)
+        if isinstance(mapping, dict):
+            values.extend(str(v) for v in mapping.values())
+    url = cfg.get("url", "")
+    if isinstance(url, str) and url:
+        try:
+            userinfo = urlsplit(url).netloc.rpartition("@")[0]
+        except ValueError:
+            userinfo = ""
+        if userinfo:
+            # Add the combined ``user:pass`` plus the individual username and
+            # password (and their percent-decoded forms): an exception may
+            # report only one component, or a form the SDK URL-decoded, so
+            # the combined string alone wouldn't match.
+            for part in (userinfo, *userinfo.split(":", 1)):
+                if part:
+                    values.append(part)
+                    decoded = unquote(part)
+                    if decoded != part:
+                        values.append(decoded)
+    return [v for v in values if len(v) >= _MIN_REDACTABLE_SECRET_LEN]
+
+
+def _sanitize_probe_error(text: str, cfg: dict[str, Any]) -> str:
+    """Sanitize a probe failure message against *cfg*'s secret values.
+
+    ``redact_exception_text`` first (it rewrites full-URL forms httpx embeds,
+    keeping the host readable), then ``sanitize_secrets`` for the raw
+    env/header values themselves.
+    """
+    url = cfg.get("url", "")
+    if isinstance(url, str) and url:
+        text = redact_exception_text(text, url)
+    return sanitize_secrets(text, _probe_secret_values(cfg))
+
+
+def _all_config_secret_values(data: dict[str, Any]) -> list[str]:
+    """Every secret value across all configured upstream servers.
+
+    Used to scrub free-form diagnostics that aren't bound to one server —
+    a pydantic schema-validation error can embed the rejected ``input_value``
+    (or a validator message quoting it), so a malformed ``headers``/``env``
+    value could otherwise reach ``mms doctor`` output.
+    """
+    servers = data.get("upstream_servers", {})
+    if not isinstance(servers, dict):
+        return []
+    values: list[str] = []
+    for cfg in servers.values():
+        if isinstance(cfg, dict):
+            values.extend(_probe_secret_values(cfg))
+    return values
 
 
 def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
@@ -5023,26 +5146,21 @@ def _silenced_mcp_sdk_logs() -> Iterator[None]:
         sdk_logger.setLevel(prior)
 
 
-async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, dict[str, Any]]:
-    """Probe all servers in parallel, returning per-server results."""
+async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, StagedProbeResult]:
+    """Probe all servers in parallel, returning per-server staged results."""
 
-    async def _safe_probe(name: str, cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    async def _safe_probe(name: str, cfg: dict[str, Any]) -> tuple[str, StagedProbeResult]:
         try:
             result = await _probe_one(cfg, timeout)
-        except asyncio.TimeoutError:
-            result = {
-                "connected": False,
-                "tools": 0,
-                "overflowing": [],
-                "error": f"timeout ({timeout}s)",
-            }
         except Exception as exc:
-            # anyio raises ``ExceptionGroup`` when probe failures bubble out
-            # of the TaskGroup; that's already an ``Exception`` subclass,
-            # so the existing catch surface is fine. ``_root_cause_message``
-            # walks the wrapper to surface the real cause.
-            err = _root_cause_message(exc)
-            result = {"connected": False, "tools": 0, "overflowing": [], "error": err}
+            # ``_probe_one`` classifies its own failures; this is a
+            # last-resort guard so one server's unexpected bug can't kill
+            # the whole ``gather``.
+            result = StagedProbeResult(
+                stage=ProbeStage.CONFIGURED,
+                transport=str(cfg.get("transport", "stdio")),
+                error=_sanitize_probe_error(_root_cause_message(exc), cfg),
+            )
         return name, result
 
     with _silenced_mcp_sdk_logs():
@@ -5110,6 +5228,11 @@ def health(
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
     config_error = _schema_validation_error(data)
+    if config_error:
+        # A schema error can echo the rejected input_value (or a validator
+        # message quoting it), so scrub it against configured server secrets
+        # before it lands in text/--json output.
+        config_error = sanitize_secrets(config_error, _all_config_secret_values(data))
     logging_status = _logging_destination_status()
     obs_tools_hint = _hidden_obs_tools_hint()
 
@@ -5151,7 +5274,10 @@ def health(
         click.echo(
             json.dumps(
                 {
-                    "servers": results,
+                    # Legacy probe keys plus additive ``stage`` /
+                    # ``failed_stage`` / ``transport`` — scripts written
+                    # against the pre-staged shape keep working.
+                    "servers": {n: r.as_dict() for n, r in results.items()},
                     "config_valid": config_error is None,
                     "config_error": config_error,
                     "surfacing": surfacing_status,
@@ -5170,28 +5296,322 @@ def health(
     click.echo(_hdr("Upstream Server Health"))
     click.echo("=" * 30)
     for name, info in results.items():
-        if info["connected"]:
-            click.echo(f"  {name}: {_ok('connected')} ({info['tools']} tools)")
+        if info.connected:
+            click.echo(f"  {name}: {_ok('connected')} ({info.tools} tools)")
             if show_names:
-                overflowing = info.get("overflowing", [])
-                if overflowing:
+                if info.overflowing:
                     click.echo(
-                        f"    {_warn('overflow:')} {len(overflowing)} tool(s) "
+                        f"    {_warn('overflow:')} {len(info.overflowing)} tool(s) "
                         f"would exceed the {tool_name_budget.TOOL_NAME_LIMIT}-char "
                         f"client limit and will be silently dropped:"
                     )
-                    for t_name in overflowing:
+                    for t_name in info.overflowing:
                         click.echo(f"      - {t_name}")
                 else:
                     click.echo("    all tool names fit")
         else:
-            click.echo(f"  {name}: {_bad('DISCONNECTED')} — {info['error']}")
+            click.echo(
+                f"  {name}: {_bad('DISCONNECTED')} — {info.error} "
+                f"(last successful stage: {info.stage.display()})"
+            )
     click.echo("")
     for line in _format_surfacing_bootstrap(surfacing_status):
         click.echo(line)
     click.echo(_format_logging_destination(logging_status))
     if obs_tools_hint:
         click.echo(obs_tools_hint)
+
+
+# ── doctor command ──────────────────────────────────────────────────────
+
+
+_DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
+
+
+@cli.command()
+@click.option(
+    "--config",
+    "config_path",
+    default=str(_DEFAULT_CONFIG),
+    show_default=True,
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Output as JSON for scripting.",
+)
+@click.option(
+    "--timeout",
+    default=10,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Per-server connection timeout in seconds.",
+)
+def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> None:
+    """Diagnose the proxy setup end-to-end (read-only).
+
+    Runs the existing status/health/config checks as one PASS/WARN/FAIL
+    report with a copy-paste next action per failing check. Exit code is 1
+    when any check FAILs; WARN-only runs exit 0 — `mms doctor` passing is
+    the quickstart success gate, so it must be scriptable. `health` stays
+    the always-exit-0 inspection command; strict config linting stays in
+    `mms config validate`. Never modifies the config or any other state.
+    """
+    path = Path(config_path)
+    resolved = path.expanduser().resolve()
+    cfg_arg = f"--config {resolved}"
+
+    checks: list[dict[str, Any]] = []
+
+    def check(
+        check_id: str, label: str, status: str, detail: str, next_action: str | None = None
+    ) -> None:
+        checks.append(
+            {
+                "id": check_id,
+                "label": label,
+                "status": status,
+                "detail": detail,
+                "next_action": next_action,
+            }
+        )
+
+    servers_payload: dict[str, Any] | None = None
+    surfacing_status: dict[str, Any] | None = None
+
+    # 1. config file exists — every later check reads it, so FAIL
+    # short-circuits the report instead of cascading noise.
+    if not resolved.exists():
+        check("config_file", "config file", "FAIL", f"not found: {resolved}", "mms init")
+    else:
+        check("config_file", "config file", "PASS", str(resolved))
+
+        # 2. JSON validity — mirrors `mms config validate`'s parse guard
+        # (NOT `_load`, which SystemExits with its own styled message).
+        data: dict[str, Any] | None = None
+        try:
+            loaded = json.loads(resolved.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+                check("config_json", "config JSON", "PASS", "parses as an object")
+            else:
+                check(
+                    "config_json",
+                    "config JSON",
+                    "FAIL",
+                    f"root must be a JSON object, got {type(loaded).__name__}",
+                    f"mms config validate {cfg_arg}",
+                )
+        except json.JSONDecodeError as exc:
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                f"invalid JSON: {exc}",
+                f"mms config validate {cfg_arg}",
+            )
+        except OSError as exc:
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                f"cannot read file: {exc}",
+                f"mms config validate {cfg_arg}",
+            )
+
+        if data is not None:
+            # 3. schema validation — same lazy-pydantic path `status`/`health`
+            # warn through; here it FAILs (a running server would silently
+            # fall back to env/defaults) but does NOT short-circuit: the
+            # transport/prefix/probe checks operate on the raw dicts and
+            # stay meaningful.
+            schema_error = _schema_validation_error(data)
+            if schema_error:
+                # A pydantic error can echo the rejected input_value (or a
+                # validator message quoting it), so scrub it against every
+                # configured server's secrets before it reaches the report.
+                schema_error = sanitize_secrets(schema_error, _all_config_secret_values(data))
+                check(
+                    "config_schema",
+                    "config schema",
+                    "FAIL",
+                    f"{_CONFIG_INVALID_WARNING}: {schema_error}",
+                    f"mms config validate {cfg_arg}",
+                )
+            else:
+                check("config_schema", "config schema", "PASS", "valid")
+
+            raw_servers = data.get("upstream_servers", {})
+            servers = (
+                {n: c for n, c in raw_servers.items() if isinstance(c, dict)}
+                if isinstance(raw_servers, dict)
+                else {}
+            )
+
+            if servers:
+                # 4. per-transport required fields — shared with `add`
+                # VAL-3/VAL-4 via `_transport_field_error`.
+                transport_problems = [
+                    f"{n}: {terr}"
+                    for n, cfg in servers.items()
+                    if (
+                        terr := _transport_field_error(
+                            str(cfg.get("transport", "stdio") or "stdio"),
+                            str(cfg.get("command", "") or ""),
+                            str(cfg.get("url", "") or ""),
+                        )
+                    )
+                ]
+                if transport_problems:
+                    check(
+                        "server_transports",
+                        "server transports",
+                        "FAIL",
+                        "; ".join(transport_problems),
+                        f"mms remove <name> {cfg_arg}  "
+                        "# then re-add with --command (stdio) or --url (sse/http)",
+                    )
+                else:
+                    check(
+                        "server_transports",
+                        "server transports",
+                        "PASS",
+                        f"{len(servers)} server(s) have their required connection fields",
+                    )
+
+                # 5. prefixes — same shared validators the runtime load path
+                # uses (`proxy/prefixes.py`), so doctor can't disagree with
+                # what the server would refuse.
+                prefix_map = {n: str(cfg.get("prefix", "") or "") for n, cfg in servers.items()}
+                prefix_problems = []
+                empty = prefixes.empty_prefix_keys(prefix_map)
+                if empty:
+                    prefix_problems.append(f"empty prefix: {', '.join(empty)}")
+                collisions = prefixes.prefix_collisions(prefix_map)
+                if collisions:
+                    prefix_problems.append(prefixes.format_collision_error(collisions))
+                if prefix_problems:
+                    check(
+                        "prefixes",
+                        "prefixes",
+                        "FAIL",
+                        "; ".join(prefix_problems),
+                        f"mms remove <name> {cfg_arg}  # then re-add with a unique --prefix",
+                    )
+                else:
+                    check("prefixes", "prefixes", "PASS", "unique and non-empty")
+
+                # 6. staged probe per server — the shared StagedProbeResult
+                # `health` renders; doctor adds the per-stage next action.
+                results = asyncio.run(_probe_servers(servers, timeout))
+                servers_payload = {n: r.as_dict() for n, r in results.items()}
+                for n, r in results.items():
+                    if r.connected:
+                        check(f"upstream:{n}", f"upstream: {n}", "PASS", f"{r.tools} tool(s)")
+                        continue
+                    detail = f"failed after '{r.stage.display()}' — {r.error}"
+                    timed_out = (r.error or "").startswith("timeout")
+                    if (
+                        r.transport == "stdio"
+                        and r.stage is ProbeStage.CONFIGURED
+                        and not timed_out
+                    ):
+                        # Transport-neutral stage names; the child-process
+                        # detail is stdio-only rendering, not a stage.
+                        detail += " (stdio child process did not start)"
+                        next_cmd = f"command -v {servers[n].get('command', '')}"
+                    elif timed_out:
+                        next_cmd = f"mms health --timeout {max(30, timeout)} {cfg_arg}"
+                    else:
+                        next_cmd = f"mms health {cfg_arg}"
+                    check(f"upstream:{n}", f"upstream: {n}", "FAIL", detail, next_cmd)
+            else:
+                check(
+                    "upstreams",
+                    "upstreams",
+                    "WARN",
+                    "no upstream servers configured",
+                    f"mms add <name> --prefix <prefix> --command <command> {cfg_arg}",
+                )
+
+            # 7. cache policy — same condition + shared predicate as
+            # `mms config validate` and the runtime load advisory (#658).
+            from memtomem_stm.proxy.config import _has_annotation_policy
+
+            cache = data.get("cache")
+            cache_enabled = cache.get("enabled", True) if isinstance(cache, dict) else True
+            if not cache_enabled:
+                check("cache_policy", "cache policy", "PASS", "cache disabled")
+            elif _has_annotation_policy(data):
+                policy = cache["tool_annotation_policy"] if isinstance(cache, dict) else None
+                check("cache_policy", "cache policy", "PASS", f"tool_annotation_policy={policy}")
+            else:
+                check(
+                    "cache_policy",
+                    "cache policy",
+                    "WARN",
+                    "cache.tool_annotation_policy not set — using the 'conservative' "
+                    "default (unclassified tools are cached); new configs are created "
+                    "with 'strict'",
+                    'add "cache": {"tool_annotation_policy": "strict"} to '
+                    f'{resolved}  # or "conservative" to pin current behavior',
+                )
+
+            # 8. LTM server — never FAIL: LTM is optional, and an unreachable
+            # or unconfigured LTM only disables surfacing, not the proxy
+            # core. A FAIL here would break the exit-code gate on every
+            # fresh install without a memtomem server.
+            surfacing_status = _surfacing_bootstrap_status(float(timeout))
+            ltm = surfacing_status.get("ltm_server")
+            if isinstance(ltm, dict) and ltm.get("connected"):
+                detail = str(ltm.get("display") or ltm.get("command") or "")
+                if ltm.get("version"):
+                    detail = f"{detail}, version {ltm['version']}"
+                check("ltm", "ltm server", "PASS", f"connectable ({detail})")
+            else:
+                if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
+                    cause = "surfacing disabled"
+                elif isinstance(ltm, dict) and ltm.get("error"):
+                    cause = str(ltm["error"])
+                else:
+                    cause = str(surfacing_status.get("error") or "status unavailable")
+                check(
+                    "ltm",
+                    "ltm server",
+                    "WARN",
+                    f"{cause} — only LTM-dependent features (memory surfacing) are "
+                    "disabled; the proxy core is unaffected",
+                    "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
+                    "  # see docs/surfacing.md",
+                )
+
+    counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
+    overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")
+
+    if as_json:
+        payload: dict[str, Any] = {
+            "config_path": str(resolved),
+            "status": overall,
+            "checks": checks,
+        }
+        if servers_payload is not None:
+            payload["servers"] = servers_payload
+        if surfacing_status is not None:
+            payload["surfacing"] = surfacing_status
+        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        click.echo(_hdr(f"Doctor: {resolved}"))
+        click.echo("=" * 30)
+        for c in checks:
+            styled = _DOCTOR_STYLES[c["status"]](c["status"])
+            click.echo(f"  {styled}  {c['label']:<18} {c['detail']}")
+            if c["next_action"]:
+                click.echo(f"        next: {c['next_action']}")
+        click.echo(f"Summary: {counts['FAIL']} FAIL, {counts['WARN']} WARN, {counts['PASS']} PASS")
+
+    if counts["FAIL"]:
+        sys.exit(1)
 
 
 # `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py

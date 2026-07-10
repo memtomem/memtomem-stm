@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -55,3 +57,45 @@ def redact_exception_text(text: str, url: str) -> str:
     if userinfo:
         out = out.replace(f"{userinfo}@", "***@")
     return out
+
+
+def sanitize_secrets(
+    text: str, secret_values: Iterable[str], *, placeholder: str = "<REDACTED>"
+) -> str:
+    """Replace every occurrence of each secret value in *text* with *placeholder*.
+
+    Central sanitizer for **free-form strings** — exception messages, probe
+    failure causes, log lines — where the configured ``env``/``headers``
+    values (or URL credentials) may be echoed verbatim by an SDK or
+    validation error. Structured mapping *outputs* (``--json`` server dumps)
+    are a different contract: they mask every value by key position via
+    ``_mask_mapping_values`` and never need to know the values. This helper
+    is for text that already interpolated the values.
+
+    Substitution rules are normalized deliberately:
+
+    - **Empty values are dropped** — a naive ``text.replace("", ph)`` would
+      interleave the placeholder between every character of the message.
+    - **Duplicate values are deduplicated** — each distinct value is
+      substituted once.
+    - **Longer values are matched first** — if ``"abc"`` were matched
+      before ``"abcdef"``, the leftover ``"def"`` suffix of the longer
+      secret would leak. Ties break lexicographically for determinism.
+
+    Replacement is a **single regex pass over the original text**, not
+    sequential ``str.replace`` calls: sequential passes let a later, shorter
+    secret rewrite a placeholder a previous pass just inserted (e.g. a
+    secret ``"RED"`` corrupting the ``"<REDACTED>"`` already written), which
+    both mangles the message and can re-expose fragments. A single pass
+    consumes each matched span once and never re-scans inserted text.
+    """
+    if not text:
+        return text
+    values = sorted({v for v in secret_values if v}, key=lambda v: (-len(v), v))
+    if not values:
+        return text
+    # Ordered alternation: at any position Python's regex engine tries the
+    # alternatives left-to-right, so longest-first ordering makes the longest
+    # matching secret win, matching the rule above.
+    pattern = re.compile("|".join(re.escape(v) for v in values))
+    return pattern.sub(lambda _m: placeholder, text)
