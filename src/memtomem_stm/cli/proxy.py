@@ -39,11 +39,9 @@ from memtomem_stm.mms.import_hosts import (
 )
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from memtomem_stm.mms.state import utc_now_iso
-from memtomem_stm.proxy import tool_name_budget
+from memtomem_stm.proxy import prefixes, tool_name_budget
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
-
-_PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
 logger = logging.getLogger(__name__)
@@ -1241,13 +1239,9 @@ def add(
         sys.exit(1)
 
     # VAL-1: prefix format validation
-    if not _PREFIX_RE.match(prefix) or "__" in prefix:
-        click.echo(
-            f"{_err('Error:')} invalid prefix '{prefix}'. "
-            "Must start with a letter, contain only letters/digits/underscores, "
-            "and must not contain '__'.",
-            err=True,
-        )
+    format_error = prefixes.prefix_format_error(prefix)
+    if format_error:
+        click.echo(f"{_err('Error:')} {format_error}", err=True)
         if as_json:
             _json_fail("add", "invalid_prefix", f"invalid prefix '{prefix}'", name=name)
         sys.exit(1)
@@ -1299,17 +1293,32 @@ def add(
         click.echo(f"{_warn('Warning:')} {warn_msg}", err=True)
         warnings_json.append(warn_msg)
 
-    # VAL-2: duplicate prefix warning
-    for srv_name, srv_cfg in servers.items():
-        if srv_cfg.get("prefix") == prefix:
-            dup_msg = (
-                f"prefix '{prefix}' is already used by server "
-                f"'{srv_name}'. Duplicate-named tools will shadow each "
-                f"other at runtime. Proceeding anyway."
+    # VAL-2: duplicate prefix — hard reject. The runtime pydantic validator
+    # (``ProxyConfig._check_unique_upstream_prefixes``) refuses to load a
+    # config with a shared prefix, so saving one here would strand the user
+    # with a server that silently fails to start. Same shared detection as
+    # the runtime (``proxy/prefixes.py``) so the two can't diverge.
+    collisions = prefixes.prefix_collisions(
+        {
+            **{s: str(c.get("prefix", "")) for s, c in servers.items()},
+            name: prefix,
+        }
+    )
+    if collisions:
+        click.echo(
+            f"{_err('Error:')} {prefixes.format_collision_error(collisions)}. "
+            "The proxy refuses to load configs with duplicate prefixes — "
+            "pick a different --prefix.",
+            err=True,
+        )
+        if as_json:
+            _json_fail(
+                "add",
+                "duplicate_prefix",
+                prefixes.format_collision_error(collisions),
+                name=name,
             )
-            click.echo(f"{_warn('Warning:')} {dup_msg}", err=True)
-            warnings_json.append(dup_msg)
-            break
+        sys.exit(1)
 
     # VAL-3: stdio requires --command
     if transport == "stdio" and not command:
@@ -1433,8 +1442,14 @@ def add(
 # ── init command ────────────────────────────────────────────────────────
 
 
-def _prompt_prefix(default: str | None = None) -> str:
-    """Prompt for a prefix until it passes the same rules as ``add --prefix``."""
+def _prompt_prefix(default: str | None = None, taken: set[str] | None = None) -> str:
+    """Prompt for a prefix until it passes the same rules as ``add --prefix``.
+
+    ``taken`` holds prefixes already claimed (existing config entries plus
+    earlier picks in the same run) — a colliding value re-prompts, because
+    the runtime refuses to load configs with duplicate prefixes and the
+    suggestion default alone can't stop a user-typed collision.
+    """
     while True:
         value = click.prompt(
             "Tool prefix (letters/digits/underscores, e.g. 'fs')",
@@ -1442,12 +1457,19 @@ def _prompt_prefix(default: str | None = None) -> str:
             default=default,
             show_default=default is not None,
         )
-        if _PREFIX_RE.match(value) and "__" not in value:
-            return value
-        click.echo(
-            f"  {_warn('Invalid:')} must start with a letter, contain only letters/digits/"
-            "underscores, and not contain '__'. Try again."
-        )
+        if prefixes.prefix_format_error(value):
+            click.echo(
+                f"  {_warn('Invalid:')} must start with a letter, contain only letters/digits/"
+                "underscores, and not contain '__'. Try again."
+            )
+            continue
+        if taken and value in taken:
+            click.echo(
+                f"  {_warn('Invalid:')} prefix '{value}' is already used by another "
+                "server. Pick a unique prefix."
+            )
+            continue
+        return value
 
 
 # ── discovery of already-registered MCP servers ─────────────────────────
@@ -2402,7 +2424,7 @@ def _add_from_clients(
         cand = new_candidates[idx]
         click.echo(_hdr(f"Configuring '{cand['name']}'"))
         suggested = _suggest_prefix(cand["name"], used_prefixes)
-        prefix = _prompt_prefix(default=suggested)
+        prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
         used_prefixes.add(prefix)
         entry = {"prefix": prefix, **cand["entry"]}
         origin = _build_origin(cand, imported_at)
@@ -2621,7 +2643,7 @@ def init(
             cand = candidates[idx]
             click.echo(_hdr(f"Configuring '{cand['name']}'"))
             suggested = _suggest_prefix(cand["name"], used_prefixes)
-            prefix = _prompt_prefix(default=suggested)
+            prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
             used_prefixes.add(prefix)
             entry = {"prefix": prefix, **cand["entry"]}
             origin = _build_origin(cand, imported_at)

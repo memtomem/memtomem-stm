@@ -16,6 +16,8 @@ from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
+from memtomem_stm.proxy import prefixes
+
 logger = logging.getLogger(__name__)
 
 
@@ -1214,10 +1216,8 @@ class ProxyConfig(BaseModel):
         # empty prefix also slips past the uniqueness check below. Fail
         # at config load and name the upstream key so the user sees
         # which entry has the typo.
-        empty = sorted(
-            server_key
-            for server_key, cfg in self.upstream_servers.items()
-            if not cfg.prefix.strip()
+        empty = prefixes.empty_prefix_keys(
+            {server_key: cfg.prefix for server_key, cfg in self.upstream_servers.items()}
         )
         if empty:
             raise ValueError(f"Empty upstream prefix in upstreams: {empty}")
@@ -1230,16 +1230,13 @@ class ProxyConfig(BaseModel):
         # defense-in-depth and silently drops the second-loaded duplicate
         # with a logger.warning, so the user sees mysterious missing tools
         # instead of a config error. Surface the collision at load time.
-        by_prefix: dict[str, list[str]] = {}
-        for server_key, cfg in self.upstream_servers.items():
-            by_prefix.setdefault(cfg.prefix, []).append(server_key)
-        collisions = {prefix: sorted(keys) for prefix, keys in by_prefix.items() if len(keys) > 1}
+        # The detection + wording live in ``proxy/prefixes.py``, shared with
+        # the CLI's pre-save check so both sides can't diverge.
+        collisions = prefixes.prefix_collisions(
+            {server_key: cfg.prefix for server_key, cfg in self.upstream_servers.items()}
+        )
         if collisions:
-            details = "; ".join(
-                f"prefix '{prefix}' used by upstreams: {keys}"
-                for prefix, keys in sorted(collisions.items())
-            )
-            raise ValueError(f"Duplicate upstream prefixes detected: {details}")
+            raise ValueError(prefixes.format_collision_error(collisions))
         return self
 
     def effective_max_result_chars(self) -> int:
