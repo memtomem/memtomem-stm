@@ -14,6 +14,13 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
+# Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
+# annotation is a STRING under ``from __future__ import annotations``, and
+# FastMCP's ``func_metadata`` resolves it against this module's globals at
+# ``add_tool`` time — a function-local import would NameError there and send
+# every proxied tool down the registration degradation path.
+from mcp.types import CallToolResult
+
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
@@ -345,8 +352,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             await proxy_manager.start()
 
             # Register proxy tools with upstream schema + annotations
-            from mcp.types import CallToolResult
-
             from memtomem_stm.proxy._fastmcp_compat import (
                 register_proxy_tool,
                 to_call_tool_result,
