@@ -393,7 +393,13 @@ def _remove_from_claude_code(name: str = "memtomem-stm") -> None:
 
 
 def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list[str]) -> Path:
-    """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry."""
+    """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry.
+
+    Aborts (``SystemExit(1)``, same convention as ``_load``) when an existing
+    file cannot be read or parsed as a JSON object: merging is impossible, and
+    the previous behavior — falling back to ``{}`` — silently discarded every
+    registration already in the file. On abort the file is left untouched.
+    """
     entry: dict[str, Any] = {"command": server_cmd}
     if server_args:
         entry["args"] = server_args
@@ -401,17 +407,51 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
     existing: dict[str, Any]
     if mcp_path.exists():
         try:
-            loaded = json.loads(mcp_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            loaded = None
-        existing = loaded if isinstance(loaded, dict) else {}
+            raw = mcp_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            # Not an OSError — read_text raises it from the decode step.
+            click.echo(f"{_err('Error:')} {mcp_path} is not valid UTF-8: {exc}", err=True)
+            click.echo("    Registration aborted; the file was not modified.", err=True)
+            raise SystemExit(1) from exc
+        except OSError as exc:
+            click.echo(f"{_err('Error:')} Could not read {mcp_path}: {exc}", err=True)
+            click.echo("    Registration aborted; the file was not modified.", err=True)
+            raise SystemExit(1) from exc
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            click.echo(
+                f"{_err('Error:')} Failed to parse {mcp_path}: {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno}).",
+                err=True,
+            )
+            click.echo(
+                "    Registration aborted; the file was not modified. Fix the JSON "
+                f"(python3 -m json.tool {shlex.quote(str(mcp_path))}) or rename the "
+                "file aside (e.g. .mcp.json.bak) and re-run.",
+                err=True,
+            )
+            raise SystemExit(1) from exc
+        if not isinstance(loaded, dict):
+            click.echo(
+                f"{_err('Error:')} {mcp_path} top-level must be a JSON object, "
+                f"got {type(loaded).__name__}. Registration aborted; the file was "
+                "not modified.",
+                err=True,
+            )
+            raise SystemExit(1)
+        existing = loaded
     else:
         existing = {}
     servers = existing.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
-        existing["mcpServers"] = {"memtomem-stm": entry}
-    else:
-        servers["memtomem-stm"] = entry
+        click.echo(
+            f"{_err('Error:')} {mcp_path} 'mcpServers' must be an object, got "
+            f"{type(servers).__name__}. Registration aborted; the file was not modified.",
+            err=True,
+        )
+        raise SystemExit(1)
+    servers["memtomem-stm"] = entry
     # Atomic like every sibling config writer (_save, _desktop_json_remove_entry):
     # Claude Code re-reads .mcp.json at project load, and a crash/disk-full
     # mid-write must leave the prior contents, not truncated JSON. Unlike
