@@ -1069,3 +1069,69 @@ class TestCacheKeyComponents:
         await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": 42})
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.call_count == 1  # second call is a HIT
+
+
+# ── Hot-reloaded cache overrides (PR ⑦ classification) ──────────────────
+
+
+def _reseed_server(mgr, **updates):
+    """Simulate a hot-reload that edits the ``srv`` per-server config: install
+    a new snapshot in the config loader without touching ``conn.config``."""
+    old_srv = mgr._config.upstream_servers["srv"]
+    new_srv = old_srv.model_copy(update=updates)
+    mgr._config_loader.seed(mgr._config.model_copy(update={"upstream_servers": {"srv": new_srv}}))
+    return new_srv
+
+
+class TestHotReloadedOverrides:
+    """Per-server / per-tool cache knobs ride the hot-reloaded snapshot: an
+    edit applies on the NEXT call — no reconnect, no restart. (Previously they
+    were read from the connection's connect-time snapshot, contradicting the
+    docs' hot-reload table.)"""
+
+    async def test_server_cache_off_applies_next_call_without_reconnect(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert _eligible(mgr, "reader") is True
+
+        _reseed_server(mgr, cache=False)
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as rec:
+            await mgr.call_tool("srv", "reader", {"q": "a"})
+
+        # The edit took effect (no cache serve → upstream re-hit) without any
+        # reconnect: ``cache`` is not a connection-affecting field.
+        assert session.call_tool.await_count == 2
+        assert _eligible(mgr, "reader") is False
+        rec.assert_not_awaited()
+
+    async def test_ttl_edit_applies_next_call(self, build):
+        mgr, _, _ = build(tools=[_tool("t")], global_ttl=3600.0)
+        assert _resolve_ttl(mgr, "t") == 3600.0
+
+        _reseed_server(mgr, cache_ttl_seconds=5.0)
+        assert _resolve_ttl(mgr, "t") == 5.0
+
+        _reseed_server(mgr, tool_overrides={"t": ToolOverrideConfig(cache_ttl_seconds=1.0)})
+        assert _resolve_ttl(mgr, "t") == 1.0
+
+    async def test_cache_hit_skips_change_detection(self, build):
+        """The cache fast-path never touches the connection, so it deliberately
+        bypasses config-change detection — only an uncached call applies a
+        pending connection edit."""
+        mgr, _, _ = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})  # miss → stored
+
+        with patch.object(
+            mgr, "_maybe_reconnect_for_config_change", new_callable=AsyncMock
+        ) as detect:
+            await mgr.call_tool("srv", "reader", {"q": "a"})  # served from cache
+
+        assert session.call_tool.await_count == 1
+        detect.assert_not_awaited()

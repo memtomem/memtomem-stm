@@ -337,6 +337,44 @@ class UpstreamConnection:
     # it), so breaker state survives reconnects. ``None`` when the upstream's
     # ``circuit_max_failures`` is 0 (breaker disabled).
     breaker: CircuitBreaker | None = None
+    # Damper for config-change reconnects: the ``_connection_fingerprint`` of
+    # the last hot-reloaded connection config that FAILED to connect. While
+    # the file still carries this exact config, calls keep serving on the old
+    # connection instead of re-attempting the broken edit on every request;
+    # any further edit (different fingerprint) or any successful reconnect
+    # clears it. Lives on the connection for the same stable-identity reason
+    # as the lock/generation/breaker.
+    last_failed_connection_fp: tuple[Any, ...] | None = None
+
+
+def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
+    """Frozen view of the fields that define the live transport's identity.
+
+    A change in any of these requires re-establishing the connection to take
+    effect (hot-reload classification, PR ⑦); everything else on
+    ``UpstreamServerConfig`` is read per call and needs no reconnect. Only the
+    fields the ACTIVE transport actually consumes are included, so editing an
+    inactive field (a ``command`` on an SSE server, a ``url`` on a stdio one)
+    does not churn the connection. ``transport`` itself is always present, so
+    switching transport type reconnects. ``connect_timeout_seconds`` counts
+    only for network transports, where it is baked into the SDK client factory
+    as the httpx connect budget; for stdio it is consumed per connection
+    attempt, so an edit simply applies to the next reconnect. The tuple doubles
+    as the damping key for failed config-change reconnects.
+    """
+    if cfg.transport == TransportType.STDIO:
+        return (
+            cfg.transport,
+            cfg.command,
+            tuple(cfg.args),
+            tuple(sorted((cfg.env or {}).items())),
+        )
+    return (
+        cfg.transport,
+        cfg.url,
+        tuple(sorted((cfg.headers or {}).items())),
+        cfg.connect_timeout_seconds,
+    )
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -1064,11 +1102,18 @@ class ProxyManager:
                 )
 
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
+        # ``timeout=`` is the httpx connect budget (the transport-socket leg of
+        # the timeout contract); ``sse_read_timeout`` is deliberately left at
+        # the SDK default — long-lived streams must not inherit the connect
+        # budget or legitimately slow tool calls (bounded separately by
+        # ``call_timeout_seconds``) would be killed mid-read.
         match cfg.transport:
             case TransportType.SSE:
-                return sse_client(cfg.url, headers=cfg.headers)
+                return sse_client(cfg.url, headers=cfg.headers, timeout=cfg.connect_timeout_seconds)
             case TransportType.STREAMABLE_HTTP:
-                return streamablehttp_client(cfg.url, headers=cfg.headers)
+                return streamablehttp_client(
+                    cfg.url, headers=cfg.headers, timeout=cfg.connect_timeout_seconds
+                )
             case _:
                 return stdio_client(
                     StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
@@ -1084,6 +1129,60 @@ class ProxyManager:
         be truncated past ``redact_exception_text``'s reach.
         """
         return redact_exception_text(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_MESSAGE_CHARS]
+
+    async def _establish_connection(
+        self, name: str, cfg: UpstreamServerConfig
+    ) -> tuple[ClientSession, AsyncExitStack, list[Any]]:
+        """Open transport + session and discover tools under ONE end-to-end
+        ``connect_timeout_seconds`` deadline.
+
+        Transport entry, ``initialize()``, and ``tools/list`` each get
+        ``deadline - now`` — a slow phase cannot grant later phases a fresh
+        budget (same contract as the CLI probe's ``_probe_one``). The session
+        ``__aenter__`` is not wrapped: it is an in-process task-group start
+        with no I/O, and it still sits inside the wall-clock deadline. On any
+        failure the partial stack is rolled back (redacted log — the transport
+        was opened with the credentialed ``cfg.url``) and the exception
+        re-raised; the caller sees either a fully-discovered connection or
+        nothing.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cfg.connect_timeout_seconds
+
+        def remaining() -> float:
+            # Clamp like _probe_one: a deadline that expired between phases
+            # still surfaces as asyncio.TimeoutError, not ValueError.
+            return max(1e-3, deadline - loop.time())
+
+        conn_stack = AsyncExitStack()
+        try:
+            streams = await asyncio.wait_for(
+                conn_stack.enter_async_context(self._open_transport(cfg)), timeout=remaining()
+            )
+            session = await conn_stack.enter_async_context(
+                ClientSession(
+                    streams[0], streams[1], message_handler=self._make_message_handler(name)
+                )
+            )
+            await asyncio.wait_for(session.initialize(), timeout=remaining())
+            result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
+        except BaseException:
+            # Roll back any contexts we entered (transport subprocess, session
+            # streams) — including on cancellation, so a timed-out phase can't
+            # leak file descriptors or child processes.
+            try:
+                await conn_stack.aclose()
+            except Exception as cleanup_exc:
+                # Redact + no exc_info (#580): the transport was opened with
+                # the credentialed ``cfg.url``, so a cleanup failure's
+                # traceback tail could otherwise leak the token even at DEBUG.
+                logger.debug(
+                    "Error during connection cleanup for '%s': %s",
+                    name,
+                    self._redacted_error(cleanup_exc, cfg.url),
+                )
+            raise
+        return session, conn_stack, list(result.tools)
 
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
@@ -1102,31 +1201,7 @@ class ProxyManager:
             )
             return
 
-        conn_stack = AsyncExitStack()
-        try:
-            transport_ctx = self._open_transport(cfg)
-            streams = await conn_stack.enter_async_context(transport_ctx)
-            read, write = streams[0], streams[1]
-            session = await conn_stack.enter_async_context(
-                ClientSession(read, write, message_handler=self._make_message_handler(name))
-            )
-            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-            result = await session.list_tools()
-        except BaseException:
-            # Roll back any contexts we entered before the connection becomes
-            # visible to stop()/reconnect cleanup.
-            try:
-                await conn_stack.aclose()
-            except Exception as cleanup_exc:
-                # Redact + no exc_info (#580): a network transport was opened
-                # with the credentialed ``cfg.url``, so a cleanup failure's
-                # traceback tail could otherwise leak the token even at DEBUG.
-                logger.debug(
-                    "Error during initial connection cleanup for '%s': %s",
-                    name,
-                    self._redacted_error(cleanup_exc, cfg.url),
-                )
-            raise
+        session, conn_stack, tools = await self._establish_connection(name, cfg)
 
         # #261 operator guidance, logged at discovery where the config
         # context is at hand. The tool itself stays in ``conn.tools``: the
@@ -1136,7 +1211,7 @@ class ProxyManager:
         # Antigravity, Anthropic SDK) silently drop tools whose composed
         # name overflows the 64-char regex — better one withheld tool than
         # a mystery-missing one.
-        for t in result.tools:
+        for t in tools:
             if tool_name_budget.overflows(cfg.prefix, t.name):
                 logger.warning(
                     "Tool '%s' from upstream '%s' will not be advertised: "
@@ -1167,17 +1242,28 @@ class ProxyManager:
             name=name,
             config=cfg,
             session=session,
-            tools=list(result.tools),
+            tools=tools,
             stack=conn_stack,
             breaker=breaker,
         )
         # A successful connect clears any prior startup-failure record (#580).
         self._failed_servers.pop(name, None)
-        logger.info("Connected to '%s' (%s tools discovered)", name, len(result.tools))
+        logger.info("Connected to '%s' (%s tools discovered)", name, len(tools))
 
-    async def _reconnect_server(self, name: str) -> None:
+    async def _reconnect_server(self, name: str, cfg: UpstreamServerConfig | None = None) -> None:
         conn = self._connections[name]
-        cfg = conn.config
+
+        # A reconnect applies the config the CALLER resolved and will damp /
+        # redact against — passed in so the fingerprint recorded on failure and
+        # the url used to scrub the error both match the config actually
+        # attempted (a re-read of ``self._config`` here could diverge from the
+        # caller's snapshot mid-race, damping the wrong fingerprint and
+        # redacting with the wrong token). ``None`` (direct callers / tests)
+        # falls back to the current snapshot, and to the connect-time config if
+        # the server key vanished from the file — adding/removing servers stays
+        # restart-only.
+        if cfg is None:
+            cfg = self._config.upstream_servers.get(name) or conn.config
 
         # Serialize concurrent reconnects for this server (#586). Capture the
         # generation BEFORE acquiring: if it advanced while we waited, another
@@ -1192,53 +1278,62 @@ class ProxyManager:
                 )
                 return
 
-            if conn.stack is not None:
-                try:
-                    await conn.stack.aclose()
-                except Exception as cleanup_exc:
-                    # Redact + no exc_info (#605): the previous stack wraps a
-                    # transport opened with the credentialed ``cfg.url``, so a
-                    # close failure's traceback tail could leak the token at DEBUG.
-                    logger.debug(
-                        "Failed to close previous stack for '%s': %s",
-                        name,
-                        self._redacted_error(cleanup_exc, cfg.url),
-                    )
-
-            conn_stack = AsyncExitStack()
+            # Prepare-first: build the replacement connection while the old one
+            # stays untouched. If _establish_connection raises, ``conn`` still
+            # holds the previous session/stack/config — for a config-change
+            # reconnect the old (healthy) connection keeps serving, and for a
+            # failure-triggered reconnect the caller's raise/skip semantics are
+            # unchanged.
+            #
+            # The establish runs in a CHILD task so the new transport's anyio
+            # cancel scopes never land on THIS task's scope stack. With them
+            # here, the old-stack aclose() below would be a same-task
+            # out-of-order scope exit, and a real stdio transport's close
+            # (which cancels its task group) then cancels THIS task — the
+            # CancelledError escapes every except-Exception guard and kills
+            # the tool call that triggered the reconnect. In the child, the
+            # scopes die with the task and the later close of this stack is a
+            # cross-task exit — the mode every reconnect-opened stack already
+            # exercises in production (opened in a since-finished request
+            # task) and the cleanup guards already swallow.
+            establish = asyncio.create_task(self._establish_connection(name, cfg))
             try:
-                transport_ctx = self._open_transport(cfg)
-                streams = await conn_stack.enter_async_context(transport_ctx)
-                read, write = streams[0], streams[1]
-                session = await conn_stack.enter_async_context(
-                    ClientSession(read, write, message_handler=self._make_message_handler(name))
-                )
-                await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-                result = await session.list_tools()
-            except BaseException:
-                # Roll back any contexts we entered (transport subprocess, session
-                # streams). Without this, a failed reconnect leaks file descriptors
-                # and child processes across retry storms.
-                try:
-                    await conn_stack.aclose()
-                except Exception as cleanup_exc:
-                    # Redact + no exc_info (#605): the rolled-back stack wraps a
-                    # transport just opened with the credentialed ``cfg.url``, so a
-                    # close failure's traceback tail could leak the token at DEBUG.
-                    logger.debug(
-                        "Error during reconnect cleanup for '%s': %s",
-                        name,
-                        self._redacted_error(cleanup_exc, cfg.url),
-                    )
+                session, conn_stack, tools = await establish
+            except asyncio.CancelledError:
+                # Our caller was cancelled while we waited: don't orphan the
+                # child — its own BaseException handler rolls back the
+                # partial stack once the cancel lands.
+                establish.cancel()
                 raise
 
+            old_stack = conn.stack
+            # The old stack wraps a transport opened with the OLD credentialed
+            # url — capture it before the swap so the cleanup log redacts the
+            # right token.
+            old_url = conn.config.url
             conn.session = session
             conn.stack = conn_stack
-            conn.tools = list(result.tools)
+            conn.tools = tools
+            conn.config = cfg
+            # Any successful reconnect proves the current config connects —
+            # clear the config-change damper so detection resumes normally.
+            conn.last_failed_connection_fp = None
             # Bump the generation only on a successful reconnect so a waiter
             # skips its own; a failed attempt leaves it unchanged so the next
             # caller retries rather than silently skipping.
             conn.reconnect_generation += 1
+
+            if old_stack is not None:
+                try:
+                    await old_stack.aclose()
+                except Exception as cleanup_exc:
+                    # Redact + no exc_info (#605): a close failure's traceback
+                    # tail could leak the token at DEBUG.
+                    logger.debug(
+                        "Failed to close previous stack for '%s': %s",
+                        name,
+                        self._redacted_error(cleanup_exc, old_url),
+                    )
             logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
 
     def _make_message_handler(self, name: str) -> Any:
@@ -1538,6 +1633,10 @@ class ProxyManager:
         global_strip = self._config.strip_schema_descriptions
 
         for conn in self._connections.values():
+            # Deliberately the connect-time snapshot: the advertisement is
+            # session-stable (``prefix`` is restart-only, and the exposed set
+            # must not drift between startup registration and later calls),
+            # unlike per-call tool-config resolution which hot-reloads.
             cfg = conn.config
             max_desc = cfg.max_description_chars
             strip = cfg.strip_schema_descriptions or global_strip
@@ -1801,7 +1900,10 @@ class ProxyManager:
     ) -> ToolConfig:
         config = proxy_cfg or self._config
         conn = self._connections[server]
-        cfg = conn.config
+        # Per-server fields ride the hot-reloaded snapshot: compression /
+        # cleaning / tool_overrides / budget edits apply on the next tool call
+        # without a reconnect (the behavior docs/configuration.md promises).
+        cfg = self._server_cfg(conn, config)
 
         # #292: ``ProxyConfig.default_compression`` was previously unread, so
         # an operator setting it in ``stm_proxy.json`` saw no effect on any
@@ -2765,7 +2867,9 @@ class ProxyManager:
             trace_id = uuid.uuid4().hex[:16]
         # Selection telemetry (#467): the prefixed name shares the
         # ``candidate_tools`` vocabulary, so replay tooling can match the
-        # selected tool against the advertised set verbatim.
+        # selected tool against the advertised set verbatim. Connect-time
+        # snapshot on purpose — ``prefix`` is restart-only, like the
+        # advertisement it must match.
         selected_tool = f"{self._connections[server].config.prefix}__{tool}"
         candidate_features, ranker_version = self._rank_candidates(arguments)
         selection_id = self._log_selection(
@@ -3104,6 +3208,59 @@ class ProxyManager:
             finally:
                 self._key_locks.pop(cache_key, None)
 
+    def _server_cfg(self, conn: UpstreamConnection, cfg_snap: ProxyConfig) -> UpstreamServerConfig:
+        """Latest per-server config from the hot-reloaded snapshot.
+
+        Falls back to the connect-time snapshot when the key is absent (server
+        removed from the file mid-session — adding/removing servers stays
+        restart-only). Callers pass their per-request ``cfg_snap`` so one
+        request never mixes two reload generations.
+        """
+        fresh = cfg_snap.upstream_servers.get(conn.name)
+        return conn.config if fresh is None else fresh
+
+    async def _maybe_reconnect_for_config_change(
+        self, conn: UpstreamConnection, fresh_cfg: UpstreamServerConfig
+    ) -> None:
+        """Apply a hot-reloaded connection-affecting edit via live reconnect.
+
+        Prepare-first semantics come from ``_reconnect_server``: the replacement
+        is fully established before the swap, so on failure the OLD connection
+        keeps serving — this wrapper swallows the failure, damps the exact
+        failed fingerprint (no per-call retry storm against a broken edit), and
+        lets the call proceed on the old connection. ``fresh_cfg`` is passed
+        straight into ``_reconnect_server`` so the config attempted is exactly
+        the one whose fingerprint we damp and whose url we redact against — no
+        re-read can slip a different generation in between. Failure-TRIGGERED
+        reconnects are deliberately not damped: they are driven by call
+        failures with their own backoff and breaker accounting.
+        """
+        new_fp = _connection_fingerprint(fresh_cfg)
+        if new_fp == _connection_fingerprint(conn.config):
+            return
+        if new_fp == conn.last_failed_connection_fp:
+            return
+        logger.info("Connection config for '%s' changed; applying via live reconnect", conn.name)
+        try:
+            await self._reconnect_server(conn.name, fresh_cfg)
+        except Exception as exc:
+            conn.last_failed_connection_fp = new_fp
+            # Redact + no exc_info (#605): the attempt opened a transport with
+            # the NEW credentialed url.
+            logger.warning(
+                "Live reconnect for changed config of '%s' failed; keeping the "
+                "existing connection (won't retry until the config changes "
+                "again): %s",
+                conn.name,
+                self._redacted_error(exc, fresh_cfg.url),
+            )
+        else:
+            # A successful initialize + tools/list is a completed round-trip:
+            # close the breaker so a config fix isn't fast-failed for up to
+            # ``circuit_reset_seconds`` by the OLD config's failure streak.
+            if conn.breaker is not None:
+                conn.breaker.record_success()
+
     async def _fetch_upstream(
         self,
         server: str,
@@ -3124,11 +3281,20 @@ class ProxyManager:
         before this call so the cache-key snapshot stays trace-free.
 
         ``cfg_snap`` is the caller's per-request config snapshot, used by the
-        timeout-replay guard (#578); ``None`` (direct test callers) falls back
-        to the live config.
+        timeout-replay guard (#578) and the per-server knobs below; ``None``
+        (direct test callers) falls back to the live config.
         """
         conn = self._connections[server]
-        cfg = conn.config
+        # Per-server retry/deadline knobs come from the hot-reloaded snapshot
+        # (edits apply on the next call), pinned once per call — a reload
+        # mid-request can't move the deadline under a running retry loop.
+        cfg = self._server_cfg(conn, cfg_snap if cfg_snap is not None else self._config)
+        # Connection-affecting edits (url/headers/transport/command/args/env)
+        # are applied here via live reconnect — BEFORE the breaker check, so a
+        # config fix isn't fast-failed by the old config's failure streak. The
+        # cache fast-path in ``_call_tool_guarded`` intentionally bypasses
+        # this: a cache hit never touches the connection.
+        await self._maybe_reconnect_for_config_change(conn, cfg)
         delay = cfg.reconnect_delay_seconds
         breaker = conn.breaker
 
@@ -3199,7 +3365,7 @@ class ProxyManager:
                 if breaker is not None:
                     breaker.record_failure()
                 try:
-                    await self._reconnect_server(server)
+                    await self._reconnect_server(server, cfg)
                 except Exception as reconnect_exc:
                     # Redact + no exc_info (#605): the reconnect reopens a transport
                     # with the credentialed ``cfg.url``, so a failure's traceback
@@ -3276,7 +3442,7 @@ class ProxyManager:
                     )
                     _mark_recorded(exc)
                     try:
-                        await self._reconnect_server(server)
+                        await self._reconnect_server(server, cfg)
                     except Exception as reconnect_exc:
                         # Expected fallback: the primary error is already being
                         # re-raised and carries the actionable trace. The
@@ -3337,7 +3503,7 @@ class ProxyManager:
                         breaker.record_failure()
                     # Reconnect before raising so the NEXT call starts fresh
                     try:
-                        await self._reconnect_server(server)
+                        await self._reconnect_server(server, cfg)
                     except Exception as reconnect_exc:
                         # Same reasoning as the protocol-error path above:
                         # the primary failure is being re-raised, the
@@ -3362,7 +3528,7 @@ class ProxyManager:
                 delay = min(max(delay * 2, 0.1), cfg.max_reconnect_delay_seconds)
                 self.tracker.record_reconnect()
                 try:
-                    await self._reconnect_server(server)
+                    await self._reconnect_server(server, cfg)
                     conn = self._connections[server]
                 except Exception as reconnect_exc:
                     # Redact (#622, #605/#606 family): the reconnect reopens a
@@ -4095,22 +4261,22 @@ class ProxyManager:
           3. the global ``CacheConfig.default_ttl_seconds``.
 
         At levels 1-2, ``None`` means *inherit the next level* (NOT never-expires);
-        only the global default's ``None`` means never-expires. Per-tool/server
-        overrides are read from ``conn.config`` (the connect-time snapshot), so —
-        like the ``cache`` bool — an override edited after startup is picked up on
-        the next reconnect/restart, not via mtime hot-reload; the global fallback
-        is the hot-reloaded ``cfg_snap``. An unknown server (direct dispatch /
-        tests with no registered connection) falls back to the global, mirroring
+        only the global default's ``None`` means never-expires. Every level —
+        per-tool, per-server, and the global default — is read from the caller's
+        hot-reloaded ``cfg_snap``, so a TTL edit applies on the next call without
+        a reconnect. An unknown server (direct dispatch / tests with no
+        registered connection) falls back to the global, mirroring
         ``_tool_cache_eligible`` returning ``True`` on that path."""
         global_ttl = cfg_snap.cache.default_ttl_seconds
         conn = self._connections.get(server)
         if conn is None:
             return global_ttl
-        override = conn.config.tool_overrides.get(tool)
+        srv_cfg = self._server_cfg(conn, cfg_snap)
+        override = srv_cfg.tool_overrides.get(tool)
         if override is not None and override.cache_ttl_seconds is not None:
             return override.cache_ttl_seconds
-        if conn.config.cache_ttl_seconds is not None:
-            return conn.config.cache_ttl_seconds
+        if srv_cfg.cache_ttl_seconds is not None:
+            return srv_cfg.cache_ttl_seconds
         return global_ttl
 
     def _tool_cache_eligible(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> bool:
@@ -4130,21 +4296,18 @@ class ProxyManager:
         conn = self._connections.get(server)
         if conn is None:
             return True
-        # Per-tool / per-server ``cache`` overrides are read from ``conn.config``
-        # (the connection's connect-time snapshot), mirroring ``_resolve_tool_config``
-        # which resolves every other per-server/tool field (``compression``,
-        # ``tool_overrides.*``, ...) from the same source. Like those, an override
-        # edited AFTER startup is picked up on the next reconnect/restart, not via
-        # mtime hot-reload — connections hold their connect-time config. The
-        # annotation POLICY below, by contrast, is read from the hot-reloaded
-        # ``cfg_snap``, so the safety-critical writer gate tracks config edits even
-        # though the manual override escape-hatch follows the existing per-server
-        # reload semantics.
-        override = conn.config.tool_overrides.get(tool)
+        # Per-tool / per-server ``cache`` overrides ride the hot-reloaded
+        # ``cfg_snap``, mirroring ``_resolve_tool_config`` — an override edited
+        # after startup applies on the next call, same as the annotation POLICY
+        # below. Tool *annotations*, by contrast, still come from the
+        # ``conn.tools`` snapshot, refreshed only at connect/reconnect or on a
+        # ``tools/list_changed`` notification (#557).
+        srv_cfg = self._server_cfg(conn, cfg_snap)
+        override = srv_cfg.tool_overrides.get(tool)
         if override is not None and override.cache is not None:
             return override.cache
-        if conn.config.cache is not None:
-            return conn.config.cache
+        if srv_cfg.cache is not None:
+            return srv_cfg.cache
 
         policy = cfg_snap.cache.tool_annotation_policy
         if policy == "ignore":
@@ -4200,14 +4363,18 @@ class ProxyManager:
         conn = self._connections.get(server)
         if conn is None:
             return True
-        override = conn.config.tool_overrides.get(tool)
+        # Overrides ride the hot-reloaded ``cfg_snap`` (same as
+        # ``_tool_cache_eligible``): an operator's replay-safety assertion
+        # applies on the next call, not the next reconnect.
+        srv_cfg = self._server_cfg(conn, cfg_snap)
+        override = srv_cfg.tool_overrides.get(tool)
         if override is not None and override.cache is not None:
             if override.cache is True:
                 return True
             # ``cache: false`` set per-tool: fall through to annotations, and
             # skip the per-server override (the per-tool setting shadows it,
             # mirroring the cache-eligibility precedence).
-        elif conn.config.cache is True:
+        elif srv_cfg.cache is True:
             return True
 
         policy = cfg_snap.cache.tool_annotation_policy

@@ -13,6 +13,34 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- Live reconnect for connection-affecting per-server config edits.
+  Hot-reloaded changes to `transport` / `url` / `headers` / `command` /
+  `args` / `env` (and `connect_timeout_seconds` on network transports) are
+  now applied on the next uncached call to that upstream: the replacement
+  connection is fully established first, then swapped in and the old one
+  closed. If the edited config can't connect, the old connection keeps
+  serving and the failed edit is attempted once — not per call — until the
+  config changes again. Reconnects (including failure-triggered ones) now
+  read the current config snapshot instead of the connect-time one.
+  **Behavior change**: per-server retry/timeout/cache knobs (`max_retries`,
+  `call_timeout_seconds`, `overall_deadline_seconds`, reconnect delays,
+  `cache`, `cache_ttl_seconds`) previously froze at connect time; they are
+  now read per call from the hot-reloaded config, as the docs' hot-reload
+  table already promised. A successful config-change reconnect also closes
+  the upstream's circuit breaker, so a fixed `url` isn't fast-failed by the
+  old config's failure streak. `prefix` and `circuit_*` stay restart-only.
+- **Behavior change**: `connect_timeout_seconds` is now an end-to-end
+  connect/discovery deadline — one shared budget over transport entry
+  (process spawn / HTTP connect), MCP `initialize()`, and the `tools/list`
+  discovery call, applied identically at first connect and every reconnect.
+  Previously only `initialize()` was bounded, so a hung TCP connect or a
+  stalled `tools/list` blocked forever; a slow phase also no longer grants
+  later phases a fresh window. For `sse` / `streamable_http` the value is
+  additionally passed to the SDK client factory as its HTTP connect
+  `timeout=` (the stream read timeout stays at the SDK default). The
+  per-upstream timeout contract (connect/discovery vs per-attempt
+  `call_timeout_seconds` vs `overall_deadline_seconds`) is now documented
+  in `docs/configuration.md`.
 - MCP result-envelope preservation through the proxy. tools/list now
   advertises the upstream tool's `outputSchema` and `_meta`; call results
   carrying `structuredContent` or result-level `_meta` return them verbatim

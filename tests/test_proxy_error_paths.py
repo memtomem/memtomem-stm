@@ -6,7 +6,7 @@ import asyncio
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -147,7 +147,7 @@ class TestTransportFailureRetry:
 
         assert result == "ok"
         assert session.call_tool.call_count == 2
-        mock_reconnect.assert_awaited_once_with("srv")
+        mock_reconnect.assert_awaited_once_with("srv", ANY)
 
     async def test_retries_exhaust_then_raises(self):
         mgr = _make_manager(max_retries=2)
@@ -248,7 +248,7 @@ class TestTransportFailureRetry:
 
         reconnect_calls: list[str] = []
 
-        async def track_reconnect(name):
+        async def track_reconnect(name, cfg=None):
             reconnect_calls.append(name)
 
         with patch.object(mgr, "_reconnect_server", side_effect=track_reconnect):
@@ -285,7 +285,7 @@ class TestProtocolError:
         # Only 1 attempt — no retries
         assert session.call_tool.call_count == 1
         # But reconnect IS called to keep connection healthy
-        mock_reconnect.assert_awaited_once_with("srv")
+        mock_reconnect.assert_awaited_once_with("srv", ANY)
 
     async def test_protocol_error_reconnect_failure_still_raises_original(self):
         """If reconnect fails after protocol error, the original error propagates."""
@@ -363,7 +363,7 @@ class TestReconnectFailure:
 
         reconnect_count = 0
 
-        async def flaky_reconnect(name):
+        async def flaky_reconnect(name, cfg=None):
             nonlocal reconnect_count
             reconnect_count += 1
             if reconnect_count >= 2:
@@ -956,7 +956,7 @@ class TestCallTimeout:
 
         assert "fresh" in result
         assert attempts == 2
-        mock_reconnect.assert_awaited_with("srv")
+        mock_reconnect.assert_awaited_with("srv", ANY)
 
     async def test_hanging_upstream_without_retries_raises_timeout(self):
         """With ``max_retries=0`` a hanging upstream must surface
@@ -979,7 +979,7 @@ class TestCallTimeout:
 
         # Terminal retry path still reconnects before re-raising so the next
         # call (if any) starts on a fresh session.
-        mock_reconnect.assert_awaited_with("srv")
+        mock_reconnect.assert_awaited_with("srv", ANY)
 
     async def test_reconnect_between_attempts_drops_stale_session(self):
         """After a call times out, the next attempt must run on the freshly
@@ -1008,7 +1008,7 @@ class TestCallTimeout:
 
         reconnect_timing: list[int] = []
 
-        async def tracking_reconnect(_name):
+        async def tracking_reconnect(_name, _cfg=None):
             # Record how many call_tool invocations had happened by the time
             # reconnect fires — must be exactly 1 (post-timeout, pre-retry).
             reconnect_timing.append(len(call_log))
@@ -1130,7 +1130,7 @@ class TestTimeoutReplayGuard:
                 await mgr.call_tool("srv", "tool", {})
 
         assert session.call_tool.call_count == 1, "writer tool must not be re-invoked on timeout"
-        mock_reconnect.assert_awaited_once_with("srv")
+        mock_reconnect.assert_awaited_once_with("srv", ANY)
 
     async def test_unannotated_timeout_not_retried(self):
         """The core case: a tool with NO annotations (may-mutate per spec) is
@@ -1153,7 +1153,7 @@ class TestTimeoutReplayGuard:
                 await mgr.call_tool("srv", "tool", {})
 
         assert session.call_tool.call_count == 1
-        mock_reconnect.assert_awaited_once_with("srv")
+        mock_reconnect.assert_awaited_once_with("srv", ANY)
 
     async def test_readonly_timeout_is_retried(self):
         """A declared read-only tool is replay-safe: timeout still retries."""
@@ -1197,7 +1197,7 @@ class TestTimeoutReplayGuard:
 
         assert result == "ok"
         assert session.call_tool.call_count == 2
-        mock_reconnect.assert_awaited_once_with("srv")
+        mock_reconnect.assert_awaited_once_with("srv", ANY)
 
     async def test_ignore_policy_keeps_replay(self):
         """``tool_annotation_policy=ignore`` opts out of annotation trust, so a
