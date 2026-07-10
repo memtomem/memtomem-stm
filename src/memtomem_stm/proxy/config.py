@@ -81,6 +81,17 @@ def _permissive_mode(resolved: Path) -> int | None:
     return mode if mode & 0o077 else None
 
 
+def _has_annotation_policy(data: dict[str, Any]) -> bool:
+    """Whether a raw config dict explicitly sets ``cache.tool_annotation_policy``.
+
+    Shared by the load path and ``mms config validate`` so the two
+    missing-policy advisories can't drift apart. A non-dict ``cache`` value
+    counts as unset — validation will reject it separately.
+    """
+    cache = data.get("cache")
+    return isinstance(cache, dict) and "tool_annotation_policy" in cache
+
+
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
@@ -1326,8 +1337,8 @@ class ProxyConfig(BaseModel):
         secret-bearing field would otherwise embed the secret itself.
 
         ``log_warnings=False`` suppresses the advisory warnings (permissive
-        mode, unknown keys) for re-loads of a file some earlier load already
-        warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
+        mode, unknown keys, missing ``cache.tool_annotation_policy``) for
+        re-loads of a file some earlier load already warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
         fallback, which would otherwise duplicate them at startup. Parse
         *failures* are always logged: a silent ``None`` is the dark-failure
         mode this module exists to prevent.
@@ -1379,6 +1390,21 @@ class ProxyConfig(BaseModel):
                     resolved,
                     len(unknown_keys),
                     ", ".join(unknown_keys),
+                )
+            if log_warnings and config.cache.enabled and not _has_annotation_policy(data):
+                # Migration advisory: new configs written by `mms init`/`mms add`
+                # carry an explicit "strict", but a key-less legacy file keeps
+                # the conservative Pydantic default. Checked against the MERGED
+                # data (not the raw file) so an env-supplied policy — an
+                # explicit operator choice — suppresses it. Skipped with the
+                # cache disabled: the only other policy reader, the timeout-
+                # retry gate, treats strict and conservative identically.
+                logger.warning(
+                    "Proxy config %s does not set cache.tool_annotation_policy — using the "
+                    "'conservative' default. New configs are created with 'strict'; add "
+                    '"cache": {"tool_annotation_policy": "strict"} (or "conservative" to '
+                    "pin current behavior) to silence this.",
+                    resolved,
                 )
             return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:
