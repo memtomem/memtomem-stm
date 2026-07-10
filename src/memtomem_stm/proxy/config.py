@@ -635,6 +635,20 @@ class UpstreamServerConfig(BaseModel):
     reconnect_delay_seconds: float = Field(default=1.0, ge=0.0)
     max_reconnect_delay_seconds: float = Field(default=30.0, ge=0.0)
     connect_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    """End-to-end budget for establishing a session with this upstream.
+
+    One shared monotonic deadline covers transport entry (process spawn or
+    HTTP/SSE connect), MCP ``initialize()``, and the ``tools/list`` discovery
+    call — each phase gets whatever budget remains, so a slow phase cannot
+    grant later phases a fresh window. Applied identically at first connect
+    and at every reconnect.
+
+    For network transports the same value is also passed as the SDK client
+    factory's ``timeout=`` (the httpx connect budget); ``sse_read_timeout``
+    stays at the SDK default so long-lived streams don't inherit the connect
+    budget. Contrast with ``call_timeout_seconds`` (per tool-call attempt)
+    and ``overall_deadline_seconds`` (per tool call across retries).
+    """
     call_timeout_seconds: float = Field(default=90.0, gt=0.0)
     """Per-attempt timeout for ``session.call_tool()`` against this upstream.
 

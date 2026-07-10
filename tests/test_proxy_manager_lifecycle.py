@@ -67,9 +67,7 @@ class TestStart:
         assert mock_conn.call_count == 1
         assert mock_conn.call_args_list[0].args[0] == "file_srv"
 
-    async def test_start_fallback_load_does_not_duplicate_advisory_warnings(
-        self, tmp_path, caplog
-    ):
+    async def test_start_fallback_load_does_not_duplicate_advisory_warnings(self, tmp_path, caplog):
         """codex review of #611: the empty-upstreams fallback re-loads a file
         the server startup path already loaded and warned about — start()
         must not emit the advisory unknown-key / permissive-mode warnings a
@@ -450,7 +448,168 @@ class TestConnectTimeout:
         assert "Failed to connect to upstream server 'slow'" in caplog.text
 
 
-class TestConnectServerCleanup:
+class TestConnectDeadlineEndToEnd:
+    """PR ⑦ timeout contract: ``connect_timeout_seconds`` is ONE end-to-end
+    budget over transport entry + initialize + tools/list, applied identically
+    at first connect and reconnect. Previously only ``initialize()`` was
+    bounded — a hung TCP connect or a stalled ``tools/list`` blocked forever."""
+
+    @staticmethod
+    def _mocks(*, slow_transport=False, slow_list_tools=False):
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.initialize = AsyncMock()
+        if slow_list_tools:
+
+            async def _slow_list():
+                await asyncio.sleep(10)
+
+            mock_session.list_tools = _slow_list
+        else:
+            mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+        mock_transport = AsyncMock()
+        if slow_transport:
+
+            async def _slow_enter(*_args):
+                await asyncio.sleep(10)
+
+            mock_transport.__aenter__ = AsyncMock(side_effect=_slow_enter)
+        else:
+            mock_transport.__aenter__ = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
+        mock_transport.__aexit__ = AsyncMock(return_value=False)
+        return mock_session, mock_transport
+
+    async def test_connect_times_out_on_slow_transport_entry(self):
+        import pytest as _pt
+
+        cfg = UpstreamServerConfig(prefix="slow", connect_timeout_seconds=0.05)
+        mgr = _make_manager(servers={"slow": cfg})
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+        mock_session, mock_transport = self._mocks(slow_transport=True)
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            with _pt.raises(asyncio.TimeoutError):
+                await mgr._connect_server("slow", cfg)
+
+        assert "slow" not in mgr._connections
+
+    async def test_connect_times_out_on_slow_list_tools(self):
+        import pytest as _pt
+
+        cfg = UpstreamServerConfig(prefix="slow", connect_timeout_seconds=0.05)
+        mgr = _make_manager(servers={"slow": cfg})
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+        mock_session, mock_transport = self._mocks(slow_list_tools=True)
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            with _pt.raises(asyncio.TimeoutError):
+                await mgr._connect_server("slow", cfg)
+
+        # Partial unwind: both entered contexts are rolled back.
+        assert "slow" not in mgr._connections
+        mock_session.__aexit__.assert_awaited_once()
+        mock_transport.__aexit__.assert_awaited_once()
+
+    async def test_reconnect_times_out_on_slow_transport_entry(self):
+        import pytest as _pt
+
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=0.05)
+        mgr = _make_manager(servers={"srv": cfg})
+        old_session = AsyncMock()
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=cfg, session=old_session, tools=[], stack=AsyncMock()
+        )
+        mock_session, mock_transport = self._mocks(slow_transport=True)
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            with _pt.raises(asyncio.TimeoutError):
+                await mgr._reconnect_server("srv")
+
+        conn = mgr._connections["srv"]
+        assert conn.session is old_session
+        assert conn.reconnect_generation == 0
+
+    async def test_reconnect_times_out_on_slow_list_tools(self):
+        import pytest as _pt
+
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=0.05)
+        mgr = _make_manager(servers={"srv": cfg})
+        old_session = AsyncMock()
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=cfg, session=old_session, tools=[], stack=AsyncMock()
+        )
+        mock_session, mock_transport = self._mocks(slow_list_tools=True)
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+        ):
+            with _pt.raises(asyncio.TimeoutError):
+                await mgr._reconnect_server("srv")
+
+        conn = mgr._connections["srv"]
+        assert conn.session is old_session
+        assert conn.reconnect_generation == 0
+        # The partial NEW stack is rolled back on failure.
+        mock_session.__aexit__.assert_awaited_once()
+        mock_transport.__aexit__.assert_awaited_once()
+
+    async def test_deadline_is_shared_across_phases(self):
+        """The budget is one deadline, not per-phase: after transport entry
+        consumes real time, ``initialize()`` must be offered only the
+        remainder — a regression back to a fresh ``connect_timeout_seconds``
+        per phase would record the full budget again."""
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=0.5)
+        mgr = _make_manager(servers={"srv": cfg})
+        with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
+            await mgr.start()
+
+        recorded: list[float] = []
+        real_wait_for = asyncio.wait_for
+
+        async def spy_wait_for(awaitable, timeout=None):
+            recorded.append(timeout)
+            return await real_wait_for(awaitable, timeout)
+
+        mock_session, mock_transport = self._mocks()
+
+        async def _consuming_enter(*_args):
+            await asyncio.sleep(0.2)
+            return (AsyncMock(), AsyncMock())
+
+        mock_transport.__aenter__ = AsyncMock(side_effect=_consuming_enter)
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=mock_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
+            patch("memtomem_stm.proxy.manager.asyncio.wait_for", spy_wait_for),
+        ):
+            await mgr._connect_server("srv", cfg)
+
+        assert "srv" in mgr._connections
+        # Three bounded phases: transport entry, initialize, list_tools.
+        assert len(recorded) == 3
+        # Phase 1 gets (approximately) the full budget…
+        assert 0.4 < recorded[0] <= 0.5
+        # …and the sleep(0.2) inside transport entry guarantees initialize is
+        # offered at most 0.3s — strictly less than the 0.5s full budget.
+        assert recorded[1] <= 0.31
+        # list_tools gets whatever remains after initialize.
+        assert recorded[2] <= recorded[1]
+
     async def test_connect_server_closes_partial_stack_when_list_tools_fails(self):
         """Failed initial connection must not leave transport/session cleanup
         deferred until ProxyManager.stop().
@@ -519,7 +678,7 @@ class TestConnectServerCleanup:
                 with _pt.raises(RuntimeError, match="catalog failed"):
                     await mgr._connect_server("bad", cfg)
 
-        assert "Error during initial connection cleanup for 'bad'" in caplog.text
+        assert "Error during connection cleanup for 'bad'" in caplog.text
         assert "s3cr3t-token" not in caplog.text
         assert "alice:s3cr3t-token" not in caplog.text
         assert "***@ltm.example.com" in caplog.text
@@ -843,7 +1002,7 @@ class TestCleanupLogCredentialRedaction:
                 with _pt.raises(RuntimeError, match="catalog failed"):
                     await mgr._reconnect_server("bad")
 
-        self._assert_redacted(caplog, "Error during reconnect cleanup for 'bad'")
+        self._assert_redacted(caplog, "Error during connection cleanup for 'bad'")
 
     def _seed_fetch_conn(self, mgr, cfg):
         """A connection whose session.call_tool is a controllable AsyncMock."""
@@ -965,18 +1124,21 @@ class TestCleanupLogCredentialRedaction:
 
 
 class TestOpenTransportHeaders:
-    """Pins that the runtime transport passes configured HTTP headers to the
-    SDK clients — the last leg of the headers-plumbing chain (CLI persist →
-    probe → runtime). No prior test covered this pass-through."""
+    """Pins that the runtime transport passes configured HTTP headers and the
+    connect budget to the SDK clients — the last leg of the headers-plumbing
+    chain (CLI persist → probe → runtime). ``timeout=`` is the transport-socket
+    leg of the timeout contract; ``sse_read_timeout`` must stay at the SDK
+    default (long-lived streams don't inherit the connect budget), so the fake
+    factories deliberately do NOT accept it."""
 
-    def test_sse_passes_url_and_headers(self, monkeypatch):
+    def test_sse_passes_url_headers_and_timeout(self, monkeypatch):
         from memtomem_stm.proxy import manager as mod
 
         captured = {}
         sentinel = object()
 
-        def fake_sse_client(url, *, headers=None):
-            captured.update({"url": url, "headers": headers})
+        def fake_sse_client(url, *, headers=None, timeout=5):
+            captured.update({"url": url, "headers": headers, "timeout": timeout})
             return sentinel
 
         monkeypatch.setattr(mod, "sse_client", fake_sse_client)
@@ -986,6 +1148,7 @@ class TestOpenTransportHeaders:
             transport=TransportType.SSE,
             url="https://up.example/sse",
             headers={"Authorization": "Bearer t"},
+            connect_timeout_seconds=7.5,
         )
         mgr = _make_manager(servers={"api": cfg})
 
@@ -993,16 +1156,17 @@ class TestOpenTransportHeaders:
         assert captured == {
             "url": "https://up.example/sse",
             "headers": {"Authorization": "Bearer t"},
+            "timeout": 7.5,
         }
 
-    def test_streamable_http_passes_url_and_headers(self, monkeypatch):
+    def test_streamable_http_passes_url_headers_and_timeout(self, monkeypatch):
         from memtomem_stm.proxy import manager as mod
 
         captured = {}
         sentinel = object()
 
-        def fake_streamablehttp_client(url, *, headers=None):
-            captured.update({"url": url, "headers": headers})
+        def fake_streamablehttp_client(url, *, headers=None, timeout=30):
+            captured.update({"url": url, "headers": headers, "timeout": timeout})
             return sentinel
 
         monkeypatch.setattr(mod, "streamablehttp_client", fake_streamablehttp_client)
@@ -1012,6 +1176,7 @@ class TestOpenTransportHeaders:
             transport=TransportType.STREAMABLE_HTTP,
             url="https://up.example/mcp",
             headers={"X-Project": "stm"},
+            connect_timeout_seconds=12.0,
         )
         mgr = _make_manager(servers={"api": cfg})
 
@@ -1019,4 +1184,5 @@ class TestOpenTransportHeaders:
         assert captured == {
             "url": "https://up.example/mcp",
             "headers": {"X-Project": "stm"},
+            "timeout": 12.0,
         }

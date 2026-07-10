@@ -338,11 +338,16 @@ class TestHandlerAndScheduling:
 
 class TestSessionWiring:
     def test_both_connect_paths_pass_message_handler(self):
-        """``_connect_server`` and ``_reconnect_server`` build their
-        ``ClientSession`` identically; a unit spy can't tell the two call
-        sites apart, so pin the wiring at the source level (the reconnect
-        path silently dropping the handler would disable refresh exactly for
-        long-lived flaky servers — the ones that need it most)."""
+        """``_connect_server`` and ``_reconnect_server`` must both build their
+        ``ClientSession`` with the message handler; a unit spy can't tell the
+        two call sites apart, so pin the wiring at the source level (the
+        reconnect path silently dropping the handler would disable refresh
+        exactly for long-lived flaky servers — the ones that need it most).
+        Both paths now delegate session construction to the shared
+        ``_establish_connection`` helper, so pin (a) that each still routes
+        through the helper and (b) that the helper wires the handler."""
         for method in (ProxyManager._connect_server, ProxyManager._reconnect_server):
             src = inspect.getsource(method)
-            assert "message_handler=self._make_message_handler(name)" in src, method.__name__
+            assert "self._establish_connection(name, cfg)" in src, method.__name__
+        helper_src = inspect.getsource(ProxyManager._establish_connection)
+        assert "message_handler=self._make_message_handler(name)" in helper_src

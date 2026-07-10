@@ -1064,11 +1064,18 @@ class ProxyManager:
                 )
 
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
+        # ``timeout=`` is the httpx connect budget (the transport-socket leg of
+        # the timeout contract); ``sse_read_timeout`` is deliberately left at
+        # the SDK default — long-lived streams must not inherit the connect
+        # budget or legitimately slow tool calls (bounded separately by
+        # ``call_timeout_seconds``) would be killed mid-read.
         match cfg.transport:
             case TransportType.SSE:
-                return sse_client(cfg.url, headers=cfg.headers)
+                return sse_client(cfg.url, headers=cfg.headers, timeout=cfg.connect_timeout_seconds)
             case TransportType.STREAMABLE_HTTP:
-                return streamablehttp_client(cfg.url, headers=cfg.headers)
+                return streamablehttp_client(
+                    cfg.url, headers=cfg.headers, timeout=cfg.connect_timeout_seconds
+                )
             case _:
                 return stdio_client(
                     StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
@@ -1084,6 +1091,60 @@ class ProxyManager:
         be truncated past ``redact_exception_text``'s reach.
         """
         return redact_exception_text(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_MESSAGE_CHARS]
+
+    async def _establish_connection(
+        self, name: str, cfg: UpstreamServerConfig
+    ) -> tuple[ClientSession, AsyncExitStack, list[Any]]:
+        """Open transport + session and discover tools under ONE end-to-end
+        ``connect_timeout_seconds`` deadline.
+
+        Transport entry, ``initialize()``, and ``tools/list`` each get
+        ``deadline - now`` — a slow phase cannot grant later phases a fresh
+        budget (same contract as the CLI probe's ``_probe_one``). The session
+        ``__aenter__`` is not wrapped: it is an in-process task-group start
+        with no I/O, and it still sits inside the wall-clock deadline. On any
+        failure the partial stack is rolled back (redacted log — the transport
+        was opened with the credentialed ``cfg.url``) and the exception
+        re-raised; the caller sees either a fully-discovered connection or
+        nothing.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cfg.connect_timeout_seconds
+
+        def remaining() -> float:
+            # Clamp like _probe_one: a deadline that expired between phases
+            # still surfaces as asyncio.TimeoutError, not ValueError.
+            return max(1e-3, deadline - loop.time())
+
+        conn_stack = AsyncExitStack()
+        try:
+            streams = await asyncio.wait_for(
+                conn_stack.enter_async_context(self._open_transport(cfg)), timeout=remaining()
+            )
+            session = await conn_stack.enter_async_context(
+                ClientSession(
+                    streams[0], streams[1], message_handler=self._make_message_handler(name)
+                )
+            )
+            await asyncio.wait_for(session.initialize(), timeout=remaining())
+            result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
+        except BaseException:
+            # Roll back any contexts we entered (transport subprocess, session
+            # streams) — including on cancellation, so a timed-out phase can't
+            # leak file descriptors or child processes.
+            try:
+                await conn_stack.aclose()
+            except Exception as cleanup_exc:
+                # Redact + no exc_info (#580): the transport was opened with
+                # the credentialed ``cfg.url``, so a cleanup failure's
+                # traceback tail could otherwise leak the token even at DEBUG.
+                logger.debug(
+                    "Error during connection cleanup for '%s': %s",
+                    name,
+                    self._redacted_error(cleanup_exc, cfg.url),
+                )
+            raise
+        return session, conn_stack, list(result.tools)
 
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
@@ -1102,31 +1163,7 @@ class ProxyManager:
             )
             return
 
-        conn_stack = AsyncExitStack()
-        try:
-            transport_ctx = self._open_transport(cfg)
-            streams = await conn_stack.enter_async_context(transport_ctx)
-            read, write = streams[0], streams[1]
-            session = await conn_stack.enter_async_context(
-                ClientSession(read, write, message_handler=self._make_message_handler(name))
-            )
-            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-            result = await session.list_tools()
-        except BaseException:
-            # Roll back any contexts we entered before the connection becomes
-            # visible to stop()/reconnect cleanup.
-            try:
-                await conn_stack.aclose()
-            except Exception as cleanup_exc:
-                # Redact + no exc_info (#580): a network transport was opened
-                # with the credentialed ``cfg.url``, so a cleanup failure's
-                # traceback tail could otherwise leak the token even at DEBUG.
-                logger.debug(
-                    "Error during initial connection cleanup for '%s': %s",
-                    name,
-                    self._redacted_error(cleanup_exc, cfg.url),
-                )
-            raise
+        session, conn_stack, tools = await self._establish_connection(name, cfg)
 
         # #261 operator guidance, logged at discovery where the config
         # context is at hand. The tool itself stays in ``conn.tools``: the
@@ -1136,7 +1173,7 @@ class ProxyManager:
         # Antigravity, Anthropic SDK) silently drop tools whose composed
         # name overflows the 64-char regex — better one withheld tool than
         # a mystery-missing one.
-        for t in result.tools:
+        for t in tools:
             if tool_name_budget.overflows(cfg.prefix, t.name):
                 logger.warning(
                     "Tool '%s' from upstream '%s' will not be advertised: "
@@ -1167,13 +1204,13 @@ class ProxyManager:
             name=name,
             config=cfg,
             session=session,
-            tools=list(result.tools),
+            tools=tools,
             stack=conn_stack,
             breaker=breaker,
         )
         # A successful connect clears any prior startup-failure record (#580).
         self._failed_servers.pop(name, None)
-        logger.info("Connected to '%s' (%s tools discovered)", name, len(result.tools))
+        logger.info("Connected to '%s' (%s tools discovered)", name, len(tools))
 
     async def _reconnect_server(self, name: str) -> None:
         conn = self._connections[name]
@@ -1205,36 +1242,11 @@ class ProxyManager:
                         self._redacted_error(cleanup_exc, cfg.url),
                     )
 
-            conn_stack = AsyncExitStack()
-            try:
-                transport_ctx = self._open_transport(cfg)
-                streams = await conn_stack.enter_async_context(transport_ctx)
-                read, write = streams[0], streams[1]
-                session = await conn_stack.enter_async_context(
-                    ClientSession(read, write, message_handler=self._make_message_handler(name))
-                )
-                await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-                result = await session.list_tools()
-            except BaseException:
-                # Roll back any contexts we entered (transport subprocess, session
-                # streams). Without this, a failed reconnect leaks file descriptors
-                # and child processes across retry storms.
-                try:
-                    await conn_stack.aclose()
-                except Exception as cleanup_exc:
-                    # Redact + no exc_info (#605): the rolled-back stack wraps a
-                    # transport just opened with the credentialed ``cfg.url``, so a
-                    # close failure's traceback tail could leak the token at DEBUG.
-                    logger.debug(
-                        "Error during reconnect cleanup for '%s': %s",
-                        name,
-                        self._redacted_error(cleanup_exc, cfg.url),
-                    )
-                raise
+            session, conn_stack, tools = await self._establish_connection(name, cfg)
 
             conn.session = session
             conn.stack = conn_stack
-            conn.tools = list(result.tools)
+            conn.tools = tools
             # Bump the generation only on a successful reconnect so a waiter
             # skips its own; a failed attempt leaves it unchanged so the next
             # caller retries rather than silently skipping.
