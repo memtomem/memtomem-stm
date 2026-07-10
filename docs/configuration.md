@@ -311,7 +311,8 @@ Full example with all options:
     "enabled": true,
     "db_path": "~/.memtomem/proxy_cache.db",
     "default_ttl_seconds": 3600,
-    "max_entries": 10000
+    "max_entries": 10000,
+    "tool_annotation_policy": "conservative"
   },
   "auto_index": {
     "enabled": false,

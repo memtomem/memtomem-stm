@@ -113,10 +113,23 @@ def _split_args(args_str: str) -> list[str]:
     return shlex.split(args_str)
 
 
+def _new_config_cache_block() -> dict[str, Any]:
+    """Cache block written into every NEW config file (init/add/import).
+
+    New configs opt into the "strict" annotation policy — cache only tools
+    that explicitly declare ``readOnlyHint=True`` — while the schema default
+    stays "conservative" so existing key-less files keep their behavior
+    (they get a migration advisory at load time instead). A fresh dict per
+    call: ``add`` mutates ``_load``'s returned dict before saving, so a
+    shared module-level constant could alias across loads.
+    """
+    return {"tool_annotation_policy": "strict"}
+
+
 def _load(config_path: Path) -> dict[str, Any]:
     resolved = config_path.expanduser().resolve()
     if not resolved.exists():
-        return {"enabled": True, "upstream_servers": {}}
+        return {"enabled": True, "cache": _new_config_cache_block(), "upstream_servers": {}}
     try:
         data = json.loads(resolved.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError) as exc:
@@ -2812,7 +2825,12 @@ def init(
                 click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe['error']}", err=True)
                 click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
 
-    data: dict[str, Any] = {"enabled": True, **proxy_fields, "upstream_servers": imported}
+    data: dict[str, Any] = {
+        "enabled": True,
+        "cache": _new_config_cache_block(),
+        **proxy_fields,
+        "upstream_servers": imported,
+    }
     _save(path, data)
 
     click.echo("")

@@ -81,6 +81,17 @@ def _permissive_mode(resolved: Path) -> int | None:
     return mode if mode & 0o077 else None
 
 
+def _has_annotation_policy(data: dict[str, Any]) -> bool:
+    """Whether a raw config dict explicitly sets ``cache.tool_annotation_policy``.
+
+    Shared by the load path and ``mms config validate`` so the two
+    missing-policy advisories can't drift apart. A non-dict ``cache`` value
+    counts as unset — validation will reject it separately.
+    """
+    cache = data.get("cache")
+    return isinstance(cache, dict) and "tool_annotation_policy" in cache
+
+
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
@@ -489,8 +500,11 @@ class ToolOverrideConfig(BaseModel):
     ``CacheConfig.tool_annotation_policy``. ``True`` force-caches this tool
     (overriding the annotation policy — e.g. to re-enable caching for a tool an
     upstream mis-annotates as a writer); ``False`` never caches it (e.g. a
-    volatile read tool, or a writer on an upstream that omits annotations). The
-    privacy / transient-key store guards still apply when ``True``."""
+    volatile read tool, or a writer on an upstream that omits annotations).
+    Under the ``strict`` policy — which new configs set explicitly — ``True``
+    is the supported allowlist for a known-read-only tool whose upstream omits
+    annotations. The privacy / transient-key store guards still apply when
+    ``True``."""
     cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
     """Per-tool override for the response-cache TTL (seconds). ``None`` (default)
     defers to the server-level ``cache_ttl_seconds``, then to the global
@@ -588,8 +602,10 @@ class UpstreamServerConfig(BaseModel):
     cache: bool | None = None
     """Per-server response-cache opt-in/out (see ``ToolOverrideConfig.cache``).
     ``None`` (default) defers to the global ``CacheConfig.tool_annotation_policy``;
-    ``True``/``False`` force every tool on this upstream in/out of the cache. A
-    per-tool ``cache`` override wins over this."""
+    ``True``/``False`` force every tool on this upstream in/out of the cache —
+    ``True`` is the server-wide strict-mode allowlist for a trusted read-only
+    upstream that omits annotations. A per-tool ``cache`` override wins over
+    this."""
     cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
     """Per-server response-cache TTL override (see
     ``ToolOverrideConfig.cache_ttl_seconds``). ``None`` (default) defers to the
@@ -708,9 +724,16 @@ class CacheConfig(BaseModel):
       drops caching for every upstream that omits annotations.
     - ``ignore``: pre-gate behavior — cache every tool regardless of annotations.
 
+    The ``conservative`` default is a compatibility choice for files that
+    predate the knob: NEW config files (``mms init`` / ``mms add`` /
+    ``mms add --from-clients``) are written with an explicit ``"strict"``, and
+    loading a file without the key logs a migration advisory.
+
     A per-tool / per-server ``cache`` override (``ToolOverrideConfig.cache`` /
-    ``UpstreamServerConfig.cache``) takes precedence over this policy. The privacy
-    and transient-key store guards always apply on top, regardless of this knob."""
+    ``UpstreamServerConfig.cache``) takes precedence over this policy — under
+    ``strict`` that override is the allowlist for un-annotated read-only tools.
+    The privacy and transient-key store guards always apply on top, regardless
+    of this knob."""
 
 
 class MetricsConfig(BaseModel):
@@ -1326,8 +1349,8 @@ class ProxyConfig(BaseModel):
         secret-bearing field would otherwise embed the secret itself.
 
         ``log_warnings=False`` suppresses the advisory warnings (permissive
-        mode, unknown keys) for re-loads of a file some earlier load already
-        warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
+        mode, unknown keys, missing ``cache.tool_annotation_policy``) for
+        re-loads of a file some earlier load already warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
         fallback, which would otherwise duplicate them at startup. Parse
         *failures* are always logged: a silent ``None`` is the dark-failure
         mode this module exists to prevent.
@@ -1379,6 +1402,21 @@ class ProxyConfig(BaseModel):
                     resolved,
                     len(unknown_keys),
                     ", ".join(unknown_keys),
+                )
+            if log_warnings and config.cache.enabled and not _has_annotation_policy(data):
+                # Migration advisory: new configs written by `mms init`/`mms add`
+                # carry an explicit "strict", but a key-less legacy file keeps
+                # the conservative Pydantic default. Checked against the MERGED
+                # data (not the raw file) so an env-supplied policy — an
+                # explicit operator choice — suppresses it. Skipped with the
+                # cache disabled: the only other policy reader, the timeout-
+                # retry gate, treats strict and conservative identically.
+                logger.warning(
+                    "Proxy config %s does not set cache.tool_annotation_policy — using the "
+                    "'conservative' default. New configs are created with 'strict'; add "
+                    '"cache": {"tool_annotation_policy": "strict"} (or "conservative" to '
+                    "pin current behavior) to silence this.",
+                    resolved,
                 )
             return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:

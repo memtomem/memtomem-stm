@@ -870,7 +870,12 @@ def test_configuration_full_example_documents_all_config_blocks() -> None:
     """
     import json
 
-    from memtomem_stm.proxy.config import ExtractionConfig, ProxyConfig, ToolgraphConfig
+    from memtomem_stm.proxy.config import (
+        CacheConfig,
+        ExtractionConfig,
+        ProxyConfig,
+        ToolgraphConfig,
+    )
 
     config_md = _read("docs/configuration.md")
     section_match = re.search(
@@ -909,6 +914,11 @@ def test_configuration_full_example_documents_all_config_blocks() -> None:
             )
 
     expected_blocks = {
+        # ``cache`` pins ``tool_annotation_policy`` into the example at its
+        # SCHEMA default (conservative) — new configs are written with an
+        # explicit "strict", but the full example documents what a key-less
+        # file resolves to.
+        "cache": CacheConfig().model_dump(mode="json"),
         "extraction": ExtractionConfig().model_dump(mode="json"),
         "toolgraph": ToolgraphConfig().model_dump(mode="json"),
     }

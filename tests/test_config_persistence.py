@@ -265,6 +265,98 @@ class TestLoadFromFileWithStatus:
         assert result.config is None
         assert [r for r in caplog.records if "Failed to parse" in r.getMessage()]
 
+    def test_missing_cache_policy_warns_with_migration_hint(self, tmp_path, caplog):
+        """A legacy file that never sets cache.tool_annotation_policy keeps the
+        conservative default but gets a one-line migration advisory (new
+        configs are written with an explicit "strict")."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is not None
+        assert result.config.cache.tool_annotation_policy == "conservative"
+        advisories = [
+            r for r in caplog.records if "tool_annotation_policy" in r.getMessage()
+        ]
+        assert len(advisories) == 1
+        msg = advisories[0].getMessage()
+        assert '"cache": {"tool_annotation_policy": "strict"}' in msg
+
+    def test_cache_block_without_policy_still_warns(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True, "cache": {"max_entries": 5}}))
+        with caplog.at_level(logging.WARNING):
+            ProxyConfig.load_from_file_with_status(cfg_file)
+        assert [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()]
+
+    def test_cache_policy_present_suppresses_warning(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        for policy in ("conservative", "strict", "ignore"):
+            caplog.clear()
+            cfg_file.write_text(
+                json.dumps({"enabled": True, "cache": {"tool_annotation_policy": policy}})
+            )
+            with caplog.at_level(logging.WARNING):
+                result = ProxyConfig.load_from_file_with_status(cfg_file)
+            assert result.config is not None
+            assert not [
+                r for r in caplog.records if "tool_annotation_policy" in r.getMessage()
+            ], policy
+
+    def test_env_override_policy_suppresses_missing_policy_warning(self, tmp_path, caplog):
+        """The advisory checks the MERGED data: a policy supplied via
+        MEMTOMEM_STM_PROXY__* env override is an explicit operator choice,
+        not an accidental reliance on the default."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        overrides = {"cache": {"tool_annotation_policy": "strict"}}
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, overrides)
+        assert result.config is not None
+        assert result.config.cache.tool_annotation_policy == "strict"
+        assert not [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()]
+
+    def test_cache_disabled_suppresses_missing_policy_warning(self, tmp_path, caplog):
+        """With the cache off, conservative vs strict changes nothing (the
+        timeout-retry gate treats them identically) — no advisory noise."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True, "cache": {"enabled": False}}))
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file)
+        assert result.config is not None
+        assert not [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()]
+
+    def test_log_warnings_false_suppresses_cache_policy_warning(self, tmp_path, caplog):
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(cfg_file, log_warnings=False)
+        assert result.config is not None
+        assert not [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()]
+
+    def test_missing_file_no_cache_policy_warning(self, tmp_path, caplog):
+        """Nothing to migrate: the defaults path and the env-only path never
+        fire the advisory (branch placement, pinned here against refactors)."""
+        import logging
+
+        missing = tmp_path / "nonexistent.json"
+        with caplog.at_level(logging.WARNING):
+            ProxyConfig.load_from_file_with_status(missing)
+            ProxyConfig.load_from_file_with_status(missing, {"enabled": "true"})
+        assert not [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()]
+
     def test_load_from_file_delegate_contract_unchanged(self, tmp_path):
         good = tmp_path / "good.json"
         good.write_text(json.dumps({"enabled": True}))

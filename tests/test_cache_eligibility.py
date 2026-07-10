@@ -250,6 +250,26 @@ class TestOverridePrecedence:
         )
         assert _eligible(mgr, "t") is True
 
+    def test_tool_override_true_beats_strict_policy_unannotated(self, build):
+        # Pins the strict-mode ALLOWLIST: new configs are written with
+        # policy="strict" (caches nothing un-annotated), and a per-tool
+        # ``cache: true`` is the documented opt-in for a known-read-only
+        # tool whose upstream omits annotations. The override must stay
+        # ahead of the policy or the documented allowlist silently breaks.
+        mgr, _, _ = build(
+            policy="strict",
+            tools=[_tool("t")],
+            tool_overrides={"t": ToolOverrideConfig(cache=True)},
+        )
+        assert _eligible(mgr, "t") is True
+
+    def test_server_cache_true_beats_strict_policy_unannotated(self, build):
+        # Server-wide flavor of the strict-mode allowlist: ``cache: true`` on
+        # the upstream entry opts every un-annotated tool of a trusted
+        # read-only server back into caching under policy="strict".
+        mgr, _, _ = build(policy="strict", server_cache=True, tools=[_tool("t")])
+        assert _eligible(mgr, "t") is True
+
     def test_server_override_false_applies_when_no_tool_override(self, build):
         mgr, _, _ = build(server_cache=False, tools=[_tool("t", _ann(read_only=True))])
         assert _eligible(mgr, "t") is False
