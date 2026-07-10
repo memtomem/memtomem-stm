@@ -3393,10 +3393,16 @@ class ProxyManager:
         max_upstream = cfg_snap.max_upstream_chars
         text_parts: list[str] = []
         non_text_content: list = []
+        non_text_before_first_text = 0
         total_chars = 0
         oversize = False
         for content in result.content or []:
             if content.type == "text":
+                if not text_parts:
+                    # Anchor for the final return shape: the processed text is
+                    # reinserted where the upstream's FIRST text block sat, so
+                    # non-text blocks keep their relative positions.
+                    non_text_before_first_text = len(non_text_content)
                 remaining = max_upstream - total_chars
                 if remaining <= 0:
                     oversize = True
@@ -3437,6 +3443,7 @@ class ProxyManager:
         return ShapedResponse(
             original_text="\n".join(text_parts),
             non_text_content=non_text_content,
+            non_text_before_first_text=non_text_before_first_text,
         )
 
     async def _compress_and_surface(
