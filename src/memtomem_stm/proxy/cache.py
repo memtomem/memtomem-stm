@@ -47,8 +47,36 @@ class CacheEntry:
         return time.time() >= self.created_at + self.ttl_seconds
 
 
-def _make_key(server: str, tool: str, args: dict[str, Any]) -> str:
-    raw = f"{server}:{tool}:{json.dumps(args, sort_keys=True)}"
+# Bump when the key derivation changes shape so ``initialize()`` can purge
+# rows written under an older scheme (opaque hashes make them unreachable but
+# otherwise immortal for ``ttl_seconds NULL`` rows). Stored in SQLite's
+# ``PRAGMA user_version``.
+_KEY_SCHEMA_VERSION = 2
+
+
+def _make_key(
+    server: str,
+    tool: str,
+    args: dict[str, Any],
+    *,
+    context_query: str | None = None,
+    config_fingerprint: str = "",
+) -> str:
+    # ``context_query`` and ``config_fingerprint`` are part of the key because
+    # the stored body is the COMPRESSED response: compression is query-aware
+    # (BM25 relevance budgets) and config-dependent, so the same tool+args can
+    # legitimately map to different cached bodies. ``json.dumps`` keeps ``None``
+    # (absent) distinct from ``""`` and the literal string ``"null"``.
+    raw = "\x00".join(
+        [
+            str(_KEY_SCHEMA_VERSION),
+            server,
+            tool,
+            json.dumps(args, sort_keys=True),
+            config_fingerprint,
+            json.dumps(context_query),
+        ]
+    )
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -117,6 +145,18 @@ class ProxyCache:
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
             db.commit()
+            # One-time purge on key-schema change: rows keyed under an older
+            # ``_make_key`` shape are opaque hashes no current lookup can ever
+            # produce, so they would sit as dead weight — forever, for
+            # ``ttl_seconds NULL`` rows — while still counting against
+            # ``max_entries``. ``user_version`` is 0 for both fresh and
+            # pre-versioning databases; the DELETE on a fresh database is a
+            # no-op.
+            (schema_version,) = db.execute("PRAGMA user_version").fetchone()
+            if schema_version < _KEY_SCHEMA_VERSION:
+                db.execute("DELETE FROM proxy_cache")
+                db.execute(f"PRAGMA user_version = {_KEY_SCHEMA_VERSION}")
+                db.commit()
             # Startup purge of expired rows, running against the local
             # ``db`` before it is handed off to ``self._db``. Failures fall
             # through to the outer except so ``self._db`` stays ``None``.
@@ -170,10 +210,20 @@ class ProxyCache:
             self._db.close()
             self._db = None
 
-    def get(self, server: str, tool: str, args: dict[str, Any]) -> str | None:
+    def get(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        context_query: str | None = None,
+        config_fingerprint: str = "",
+    ) -> str | None:
         if self._db is None:
             return None
-        key = _make_key(server, tool, args)
+        key = _make_key(
+            server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
+        )
         try:
             with self._lock:
                 row = self._db.execute(
@@ -229,7 +279,15 @@ class ProxyCache:
             return None
         return entry.result
 
-    def invalidate(self, server: str, tool: str, args: dict[str, Any]) -> None:
+    def invalidate(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        context_query: str | None = None,
+        config_fingerprint: str = "",
+    ) -> None:
         """Delete any cached row for ``(server, tool, args)`` — a single
         best-effort DELETE, keyed exactly as ``set``/``get`` (``_make_key``).
 
@@ -239,7 +297,9 @@ class ProxyCache:
         for the same key (#541)."""
         if self._db is None:
             return
-        key = _make_key(server, tool, args)
+        key = _make_key(
+            server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
+        )
         with self._lock:
             self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
             self._db.commit()
@@ -251,6 +311,9 @@ class ProxyCache:
         args: dict[str, Any],
         result: str,
         ttl_seconds: float | None,
+        *,
+        context_query: str | None = None,
+        config_fingerprint: str = "",
     ) -> None:
         if self._db is None:
             return
@@ -267,7 +330,13 @@ class ProxyCache:
             # to 0 via hot-reload), and leaving that live row would keep serving
             # stale content. This mirrors the pre-short-circuit behavior, which
             # overwrote the key with a born-expired row.
-            self.invalidate(server, tool, args)
+            self.invalidate(
+                server,
+                tool,
+                args,
+                context_query=context_query,
+                config_fingerprint=config_fingerprint,
+            )
             return
         if contains_sensitive_content(result):
             # SECURITY.md: responses that look like secrets are never
@@ -280,7 +349,9 @@ class ProxyCache:
                 tool,
             )
             return
-        key = _make_key(server, tool, args)
+        key = _make_key(
+            server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
+        )
         now = time.time()
         with self._lock:
             self._db.execute(

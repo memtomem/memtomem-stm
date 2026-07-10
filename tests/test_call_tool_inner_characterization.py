@@ -237,7 +237,12 @@ class TestCacheStoresPreSurfacing:
 
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "COMPRESSED-SENTINEL [[SURFACED]]"  # compressed, then surfaced
-        cached = cache.get("srv", "tool", {})
+        cached = cache.get(
+            "srv",
+            "tool",
+            {},
+            config_fingerprint=mgr._cache_key_fingerprint("srv", "tool", cfg_snap=mgr._config),
+        )
         assert cached == "COMPRESSED-SENTINEL"  # pre-surfacing compressed only
 
     async def test_cache_key_args_exclude_trace_id(self, make_mgr):

@@ -555,8 +555,17 @@ class TestManagerWireIn:
 
         cache = ProxyCache(tmp_path / "cache.db")
         cache.initialize()
-        cache.set("srv", "tool", {"q": "hit"}, "cached!", ttl_seconds=300.0)
         mgr, log = _make_manager(tmp_path, cache=cache)
+        # Seed AFTER building the manager: the lookup key includes the
+        # compression-settings fingerprint the manager derives per tool.
+        cache.set(
+            "srv",
+            "tool",
+            {"q": "hit"},
+            "cached!",
+            ttl_seconds=300.0,
+            config_fingerprint=mgr._cache_key_fingerprint("srv", "tool", cfg_snap=mgr._config),
+        )
         mgr.get_proxy_tools()
         mgr._connections["srv"].session.call_tool.return_value = _make_result("live!")
 

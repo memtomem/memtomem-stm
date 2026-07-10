@@ -76,6 +76,21 @@ def _empty_result():
     return SimpleNamespace(content=[], isError=False)
 
 
+def _fp(mgr, tool, server="srv"):
+    """The fingerprint the manager keys rows under for ``(server, tool)``.
+
+    Direct ``ProxyCache.get``/``set`` calls that interact with manager-stored
+    rows must pass it — the manager never uses the default ``""`` for a
+    registered server."""
+    return mgr._cache_key_fingerprint(server, tool, cfg_snap=mgr._config)
+
+
+def _get(mgr, cache, tool, args, server="srv"):
+    """Fingerprint-aware ``cache.get`` for rows the manager stored (no
+    ``_context_query`` in these tests, so only the fingerprint is needed)."""
+    return cache.get(server, tool, args, config_fingerprint=_fp(mgr, tool, server))
+
+
 def _build(
     tmp_path: Path,
     *,
@@ -272,7 +287,7 @@ class TestCallToolHonoursEligibility:
         await mgr.call_tool("srv", "writer", {"x": 1})
 
         assert session.call_tool.await_count == 2  # not served from cache
-        assert cache.get("srv", "writer", {"x": 1}) is None  # not stored
+        assert _get(mgr, cache, "writer", {"x": 1}) is None  # not stored
 
     async def test_read_only_tool_is_served_from_cache(self, build):
         """A readOnlyHint=True tool hits the upstream once; the identical repeat is
@@ -285,7 +300,7 @@ class TestCallToolHonoursEligibility:
         await mgr.call_tool("srv", "reader", {"q": "a"})
 
         assert session.call_tool.await_count == 1  # second served from cache
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
     async def test_unannotated_tool_still_cached_default(self, build):
         """Behavior preservation: the un-annotated majority is cached as before
@@ -311,7 +326,7 @@ class TestCallToolHonoursEligibility:
         await mgr.call_tool("srv", "vol", {})
 
         assert session.call_tool.await_count == 2
-        assert cache.get("srv", "vol", {}) is None
+        assert _get(mgr, cache, "vol", {}) is None
 
 
 @pytest.mark.asyncio
@@ -360,7 +375,7 @@ class TestUnstorableAccounting:
         assert summary["cache_misses"] == 2
         assert summary["cache_unstorable"] == 2
         assert summary["cache_hits"] == 0
-        assert cache.get("srv", "mixed", {"q": "a"}) is None
+        assert _get(mgr, cache, "mixed", {"q": "a"}) is None
 
     async def test_nontext_only_response_counts_unstorable(self, build):
         mgr, _, _ = build(tools=[_tool("img", _ann(read_only=True))])
@@ -433,7 +448,7 @@ class TestUnstorableAccounting:
         await mgr.call_tool("srv", "reader", {"q": "a"})  # miss → stored
         await mgr.call_tool("srv", "reader", {"q": "a"})  # hit
 
-        stored = cache.get("srv", "reader", {"q": "a"})
+        stored = _get(mgr, cache, "reader", {"q": "a"})
         assert stored is not None
         summary = mgr.tracker.get_summary()
         assert summary["cache_hits"] == 1
@@ -454,7 +469,7 @@ class TestTtlZeroDisablesServing:
 
         await mgr.call_tool("srv", "reader", {"q": "a"})  # cached under default TTL
         assert session.call_tool.await_count == 1
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         # Operator lowers the cache TTL to 0 (hot-reload). The previously-cached
         # live row must no longer be served, and the next call must hit upstream.
@@ -462,7 +477,7 @@ class TestTtlZeroDisablesServing:
 
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.await_count == 2  # not served from the stale row
-        assert cache.get("srv", "reader", {"q": "a"}) is None  # old row invalidated
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None  # old row invalidated
 
 
 # ── Unit: per-tool / per-server TTL override resolution ──────────────────
@@ -584,14 +599,14 @@ class TestPerToolTtlOverrideBehavior:
         await mgr.call_tool("srv", "vol", {})
         await mgr.call_tool("srv", "vol", {})
         assert session.call_tool.await_count == 2
-        assert cache.get("srv", "vol", {}) is None
+        assert _get(mgr, cache, "vol", {}) is None
 
         # plain on the same server: default global TTL → second call served.
         await mgr.call_tool("srv", "plain", {"q": 1})
         assert session.call_tool.await_count == 3  # first plain hits upstream
         await mgr.call_tool("srv", "plain", {"q": 1})
         assert session.call_tool.await_count == 3  # second served from cache
-        assert cache.get("srv", "plain", {"q": 1}) is not None
+        assert _get(mgr, cache, "plain", {"q": 1}) is not None
 
 
 # ── Integration: ttl<=0 invalidation of non-text / mixed responses (#541) ─
@@ -611,20 +626,34 @@ class TestTtlZeroNonTextInvalidation:
         # Direct helper unit: a positive resolved TTL must leave the row intact
         # (invalidation is gated on ttl<=0, so no spurious deletes).
         mgr, _, cache = build(global_ttl=3600.0, tools=[_tool("reader", _ann(read_only=True))])
-        cache.set("srv", "reader", {"q": "a"}, "payload", ttl_seconds=3600.0)
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        cache.set(
+            "srv",
+            "reader",
+            {"q": "a"},
+            "payload",
+            ttl_seconds=3600.0,
+            config_fingerprint=_fp(mgr, "reader"),
+        )
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._invalidate_disabled_cache("srv", "reader", {"q": "a"}, cfg_snap=mgr._config)
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
     async def test_invalidate_helper_deletes_under_zero_ttl(self, build):
         mgr, _, cache = build(global_ttl=3600.0, tools=[_tool("reader", _ann(read_only=True))])
-        cache.set("srv", "reader", {"q": "a"}, "payload", ttl_seconds=3600.0)
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        cache.set(
+            "srv",
+            "reader",
+            {"q": "a"},
+            "payload",
+            ttl_seconds=3600.0,
+            config_fingerprint=_fp(mgr, "reader"),
+        )
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         mgr._invalidate_disabled_cache("srv", "reader", {"q": "a"}, cfg_snap=mgr._config)
-        assert cache.get("srv", "reader", {"q": "a"}) is None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None
 
     async def test_nontext_only_response_invalidates_prior_text_row(self, build):
         # Site A: the non-text-ONLY early return in ``_call_tool_inner``.
@@ -633,14 +662,14 @@ class TestTtlZeroNonTextInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})  # text cached under default TTL
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         # Caching disabled, and the SAME key now returns a non-text response.
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _nontext_result()
         await mgr.call_tool("srv", "reader", {"q": "a"})
 
-        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None  # stale text row gone
 
     async def test_mixed_response_invalidates_prior_text_row(self, build):
         # Site B: the mixed (text+non-text) branch in ``_store_cache``.
@@ -649,13 +678,13 @@ class TestTtlZeroNonTextInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _mixed_result("payload")
         result = await mgr.call_tool("srv", "reader", {"q": "a"})
 
-        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None  # stale text row gone
         # mixed response still returns text + the preserved non-text content.
         assert isinstance(result, list)
 
@@ -668,7 +697,7 @@ class TestTtlZeroNonTextInvalidation:
         # Cache a text row under the global positive TTL (no override yet).
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "vol", {})
-        assert cache.get("srv", "vol", {}) is not None
+        assert _get(mgr, cache, "vol", {}) is not None
 
         # Disable caching for THIS tool only, then flip to a non-text response.
         mgr._connections["srv"].config.tool_overrides["vol"] = ToolOverrideConfig(
@@ -676,7 +705,7 @@ class TestTtlZeroNonTextInvalidation:
         )
         session.call_tool.return_value = _nontext_result()
         await mgr.call_tool("srv", "vol", {})
-        assert cache.get("srv", "vol", {}) is None
+        assert _get(mgr, cache, "vol", {}) is None
 
     async def test_lower_to_zero_then_raise_does_not_resurface_stale_row(self, build):
         # Full #541 sequence: cache under positive TTL → lower to 0 → a non-text
@@ -688,7 +717,7 @@ class TestTtlZeroNonTextInvalidation:
         session.call_tool.return_value = _text_result("stale-text")
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.await_count == 1
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         # Lower to 0; identical call now returns non-text → invalidates the row.
         mgr._config.cache.default_ttl_seconds = 0
@@ -703,7 +732,7 @@ class TestTtlZeroNonTextInvalidation:
         session.call_tool.return_value = _text_result("fresh-text")
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.await_count == 3  # not served from the stale row
-        assert cache.get("srv", "reader", {"q": "a"}) is not None  # fresh row cached
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None  # fresh row cached
 
 
 @pytest.mark.asyncio
@@ -724,14 +753,14 @@ class TestTtlZeroErrorAndEmptyInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _mixed_error_result("boom")
         with pytest.raises(ToolError):
             await mgr.call_tool("srv", "reader", {"q": "a"})
 
-        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None  # stale text row gone
 
     async def test_text_only_error_invalidates_prior_text_row(self, build):
         from mcp.server.fastmcp.exceptions import ToolError
@@ -741,14 +770,14 @@ class TestTtlZeroErrorAndEmptyInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _error_result("boom")
         with pytest.raises(ToolError):
             await mgr.call_tool("srv", "reader", {"q": "a"})
 
-        assert cache.get("srv", "reader", {"q": "a"}) is None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None
 
     async def test_empty_response_invalidates_prior_text_row(self, build):
         mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
@@ -756,14 +785,14 @@ class TestTtlZeroErrorAndEmptyInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _empty_result()
         result = await mgr.call_tool("srv", "reader", {"q": "a"})
 
         assert result == "[empty response]"
-        assert cache.get("srv", "reader", {"q": "a"}) is None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None
 
 
 @pytest.mark.asyncio
@@ -782,7 +811,7 @@ class TestTtlZeroTextStoreSkipInvalidation:
         session = mgr._connections["srv"].session
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "t", {"q": "a"})
-        assert cache.get("srv", "t", {"q": "a"}) is not None
+        assert _get(mgr, cache, "t", {"q": "a"}) is not None
 
         # Disable caching globally AND make the tool cache-ineligible (cache=False).
         # Without the hoisted ttl<=0 invalidation, _store_cache would take the
@@ -793,7 +822,7 @@ class TestTtlZeroTextStoreSkipInvalidation:
         session.call_tool.return_value = _text_result("new-payload")
         await mgr.call_tool("srv", "t", {"q": "a"})
 
-        assert cache.get("srv", "t", {"q": "a"}) is None  # stale row invalidated
+        assert _get(mgr, cache, "t", {"q": "a"}) is None  # stale row invalidated
 
 
 @pytest.mark.asyncio
@@ -812,14 +841,14 @@ class TestTtlZeroRaisedFailureInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.side_effect = RuntimeError("upstream died")
         with pytest.raises(RuntimeError, match="upstream died"):
             await mgr.call_tool("srv", "reader", {"q": "a"})
 
-        assert cache.get("srv", "reader", {"q": "a"}) is None  # stale text row gone
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None  # stale text row gone
 
     async def test_upstream_raise_under_positive_ttl_leaves_row(self, build):
         # Under an ENABLED cache a failure must NOT delete the live row — the
@@ -830,7 +859,7 @@ class TestTtlZeroRaisedFailureInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         session.call_tool.side_effect = RuntimeError("blip")
         # The enabled-cache path serves the live row without hitting upstream,
@@ -839,7 +868,7 @@ class TestTtlZeroRaisedFailureInvalidation:
         with pytest.raises(RuntimeError, match="blip"):
             await mgr.call_tool("srv", "reader", {"q": "other"})
 
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
     async def test_raise_window_does_not_resurface_stale_row(self, build):
         # Full #541 sequence with a raised failure in the disabled window:
@@ -864,7 +893,7 @@ class TestTtlZeroRaisedFailureInvalidation:
         session.call_tool.return_value = _text_result("fresh-text")
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.await_count == 3  # not served from the stale row
-        assert cache.get("srv", "reader", {"q": "a"}) is not None  # fresh row cached
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None  # fresh row cached
 
     async def test_is_error_raise_invalidates_exactly_once(self, build):
         # The isError branch invalidates inside ``_call_tool_inner`` and marks
@@ -879,7 +908,7 @@ class TestTtlZeroRaisedFailureInvalidation:
 
         session.call_tool.return_value = _text_result("payload")
         await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert cache.get("srv", "reader", {"q": "a"}) is not None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is not None
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _error_result("boom")
@@ -888,7 +917,7 @@ class TestTtlZeroRaisedFailureInvalidation:
                 await mgr.call_tool("srv", "reader", {"q": "a"})
 
         assert spy.call_count == 1  # isError site only; backstop skipped via marker
-        assert cache.get("srv", "reader", {"q": "a"}) is None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None
 
     async def test_unmarked_raise_invalidates_via_backstop_once(self, build):
         # Complement of the exactly-once test: a plain raise carries no marker,
@@ -908,4 +937,115 @@ class TestTtlZeroRaisedFailureInvalidation:
                 await mgr.call_tool("srv", "reader", {"q": "a"})
 
         assert spy.call_count == 1
-        assert cache.get("srv", "reader", {"q": "a"}) is None
+        assert _get(mgr, cache, "reader", {"q": "a"}) is None
+
+
+# ── Cache-key components: _context_query + compression fingerprint ───────
+
+
+@pytest.mark.asyncio
+class TestCacheKeyComponents:
+    """The cache key includes ``_context_query`` and a fingerprint of the
+    resolved compression settings: the stored body is the COMPRESSED response,
+    which is query-aware (BM25 budgets) and config-dependent, so neither a
+    different query context nor a config hot reload may serve another key's
+    row."""
+
+    async def test_different_context_query_is_a_separate_entry(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 1
+        # Same args, different query context → MISS, its own row.
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "beta"})
+        assert session.call_tool.call_count == 2
+        assert cache.stats()["total_entries"] == 2
+        # Repeat of the first query context → HIT (no third upstream call).
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 2
+
+    async def test_no_query_and_query_do_not_share_a_row(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 2
+        assert cache.stats()["total_entries"] == 2
+
+    async def test_config_change_stops_serving_old_rows(self, build):
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 1  # steady-state hit
+
+        # Hot-reload of a byte-affecting global → fingerprint rotates → the
+        # pre-change row is never served again.
+        mgr._config.min_result_retention = 0.11
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 2
+
+    async def test_max_upstream_chars_change_stops_serving_old_rows(self, build):
+        # ``max_upstream_chars`` truncates ``original_text`` at Stage-3 SHAPE,
+        # before cleaning/compression, so an oversized response is cached under
+        # that budget. Lowering it must rotate the fingerprint (else the next
+        # identical call serves a body shaped under the old, larger limit).
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("x" * 5000)
+
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 1  # steady-state hit
+
+        mgr._config.max_upstream_chars = 1000  # oversized response now truncates
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 2
+
+    async def test_scorer_change_stops_serving_old_rows(self, build):
+        # The query-aware compressors build budget from the relevance scorer, so
+        # a bm25→embedding switch changes the cached bytes for a query-bearing
+        # call. The fingerprint must rotate on the scorer config change.
+        from memtomem_stm.proxy.config import RelevanceScorerConfig
+
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 1  # steady-state hit
+
+        mgr._config.relevance_scorer = RelevanceScorerConfig(scorer="embedding")
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 2
+
+    async def test_store_passes_key_components(self, build):
+        # The Stage-5 store must key on the SAME components the lookup used;
+        # a store under different components is unreachable (hit rate 0%).
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        with patch.object(cache, "set", wraps=cache.set) as spy:
+            await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        kwargs = spy.call_args.kwargs
+        assert kwargs["context_query"] == "alpha"
+        assert kwargs["config_fingerprint"] == _fp(mgr, "reader")
+
+    async def test_non_string_context_query_keys_like_absent(self, build):
+        # Mirrors the pipeline's isinstance-str coercion: a malformed
+        # ``_context_query`` behaves exactly like no query, including in the key.
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": 42})
+        await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert session.call_tool.call_count == 1  # second call is a HIT

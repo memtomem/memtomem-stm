@@ -313,7 +313,7 @@ class TestProxyManagerRatioGuard:
         first = await mgr.call_tool("srv", "tool", {})
         assert "stm_proxy_read_more" not in first  # passthrough, no footer
         # The degraded passthrough must not have entered the cache.
-        assert cache.get("srv", "tool", {}) is None
+        assert cache.stats()["total_entries"] == 0  # nothing stored under ANY key
 
         # Call 2: store recovered (real method restored). It must be a cache
         # MISS that re-runs upstream + progressive — not a replay of the
@@ -407,7 +407,7 @@ class TestProxyManagerRatioGuard:
         )
         first = await mgr.call_tool("srv", "tool", {})
         assert '"selection_key"' not in first  # truncated, no TOC key
-        assert cache.get("srv", "tool", {}) is None  # degradation not cached
+        assert cache.stats()["total_entries"] == 0  # degradation not cached under ANY key
 
         # Call 2: store recovered (real method restored). Cache MISS that
         # re-runs upstream + the real SELECTIVE TOC — not a cached truncation.
