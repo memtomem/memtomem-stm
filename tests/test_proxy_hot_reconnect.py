@@ -5,11 +5,14 @@ a reconnect applies the CURRENT config snapshot (not the connect-time one),
 the replacement connection is prepared before the old one is torn down, and
 a failed replacement leaves the previous connection serving.
 
-All transports are mocked (CLAUDE.md: no live upstreams). The config loader
-is reseeded via ``ProxyConfigLoader.seed`` with a ``tmp_path``-based config
-path — the path never exists on disk, so the mtime probe keeps returning the
-seeded snapshot deterministically (a real file at a shared path like
-``/tmp/proxy.json`` could shadow the reseed mid-run).
+Transports are mocked except in ``TestLiveStdioReconnect``, which spawns a
+real local stdio child on purpose — anyio cancel-scope semantics are invisible
+to mocks (no LIVE-SERVICE dependency; CLAUDE.md's mocked-transport rule targets
+Ollama/network upstreams). The config loader is reseeded via
+``ProxyConfigLoader.seed`` with a ``tmp_path``-based config path — the path
+never exists on disk, so the mtime probe keeps returning the seeded snapshot
+deterministically (a real file at a shared path like ``/tmp/proxy.json`` could
+shadow the reseed mid-run).
 """
 
 from __future__ import annotations
@@ -473,3 +476,93 @@ class TestHotReloadClassification:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as rec:
             await _fetch(mgr)
         rec.assert_awaited_once()
+
+
+# ── live stdio transport (real anyio scopes) ─────────────────────────────
+
+_ECHO_SERVER_SRC = """
+import os
+import sys
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("echo")
+TAG = sys.argv[1] if len(sys.argv) > 1 else "noarg"
+
+
+@mcp.tool()
+def greet() -> str:
+    return f"hello from {os.environ.get('GREETING', 'default')}/{TAG}"
+
+
+mcp.run()
+"""
+
+
+def _child_env(greeting: str) -> dict[str, str]:
+    """Minimal child env: the marker under test plus the platform vars a bare
+    Python subprocess needs (StdioServerParameters env REPLACES the default
+    environment rather than merging)."""
+    import os
+
+    env = {"GREETING": greeting}
+    for key in ("PATH", "HOME", "SYSTEMROOT", "USERPROFILE", "TEMP", "TMP"):
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    return env
+
+
+class TestLiveStdioReconnect:
+    """End-to-end against a REAL stdio child process — the mocked-transport
+    suites cannot see anyio cancel-scope semantics. Regression pin for the
+    prepare-first ordering: with the replacement's scopes opened on the
+    calling task, closing the old stack afterward is a same-task
+    out-of-order scope exit and the old stdio transport's close CANCELS the
+    calling task — the CancelledError escapes every except-Exception guard
+    and kills the tool call that triggered the reconnect. The fix opens the
+    replacement in a child task."""
+
+    async def test_config_change_live_reconnect_same_task(self, tmp_path):
+        import sys
+
+        server_py = tmp_path / "echo_server.py"
+        server_py.write_text(_ECHO_SERVER_SRC)
+
+        def _cfg(greeting: str, tag: str) -> UpstreamServerConfig:
+            return UpstreamServerConfig(
+                prefix="echo",
+                command=sys.executable,
+                args=[str(server_py), tag],
+                env=_child_env(greeting),
+            )
+
+        cfg_a = _cfg("alpha", "v1")
+        cfg_b = _cfg("beta", "v2")
+        mgr = _make_manager(tmp_path, {"echo": cfg_a})
+        await mgr.start()
+        try:
+            assert "echo" in mgr._connections, mgr._failed_servers
+
+            r1 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
+            assert "hello from alpha/v1" in r1.content[0].text
+
+            _reseed(mgr, tmp_path, {"echo": cfg_b})
+
+            # Same task as the connect: before the child-task fix this call
+            # died with CancelledError while closing the old stack.
+            r2 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
+            assert "hello from beta/v2" in r2.content[0].text
+
+            conn = mgr._connections["echo"]
+            assert conn.reconnect_generation == 1
+            assert conn.config is cfg_b
+
+            # The swapped connection must survive further calls (scope stack
+            # left consistent), including a SECOND same-task reconnect.
+            _reseed(mgr, tmp_path, {"echo": cfg_a})
+            r3 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
+            assert "hello from alpha/v1" in r3.content[0].text
+            assert mgr._connections["echo"].reconnect_generation == 2
+        finally:
+            await mgr.stop()

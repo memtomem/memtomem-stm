@@ -1276,7 +1276,27 @@ class ProxyManager:
             # reconnect the old (healthy) connection keeps serving, and for a
             # failure-triggered reconnect the caller's raise/skip semantics are
             # unchanged.
-            session, conn_stack, tools = await self._establish_connection(name, cfg)
+            #
+            # The establish runs in a CHILD task so the new transport's anyio
+            # cancel scopes never land on THIS task's scope stack. With them
+            # here, the old-stack aclose() below would be a same-task
+            # out-of-order scope exit, and a real stdio transport's close
+            # (which cancels its task group) then cancels THIS task — the
+            # CancelledError escapes every except-Exception guard and kills
+            # the tool call that triggered the reconnect. In the child, the
+            # scopes die with the task and the later close of this stack is a
+            # cross-task exit — the mode every reconnect-opened stack already
+            # exercises in production (opened in a since-finished request
+            # task) and the cleanup guards already swallow.
+            establish = asyncio.create_task(self._establish_connection(name, cfg))
+            try:
+                session, conn_stack, tools = await establish
+            except asyncio.CancelledError:
+                # Our caller was cancelled while we waited: don't orphan the
+                # child — its own BaseException handler rolls back the
+                # partial stack once the cancel lands.
+                establish.cancel()
+                raise
 
             old_stack = conn.stack
             # The old stack wraps a transport opened with the OLD credentialed
