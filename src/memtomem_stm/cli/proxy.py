@@ -18,7 +18,7 @@ from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import click
 
@@ -4715,6 +4715,16 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                     t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
                 )
     except Exception as exc:
+        # A failure raised *after* discovery completed is teardown noise —
+        # anyio transports commonly re-raise a background-task error from the
+        # context ``__aexit__``. The probe already got the tool list, so it
+        # succeeded; reporting DISCONNECTED "failed after tools discovered"
+        # would be wrong. Return the success result and drop the cleanup
+        # error (it's not actionable for a connectivity probe).
+        if stage is ProbeStage.TOOLS_DISCOVERED:
+            return StagedProbeResult(
+                stage=stage, transport=transport, tools=tools, overflowing=overflowing
+            )
         # ``asyncio.wait_for`` raises ``TimeoutError`` directly, but anyio's
         # TaskGroup (wrapped by the SDK transports) re-raises failures as
         # ``ExceptionGroup`` leaves — dispatch on the root cause so
@@ -4990,7 +5000,16 @@ def _probe_secret_values(cfg: dict[str, Any]) -> list[str]:
         except ValueError:
             userinfo = ""
         if userinfo:
-            values.append(userinfo)
+            # Add the combined ``user:pass`` plus the individual username and
+            # password (and their percent-decoded forms): an exception may
+            # report only one component, or a form the SDK URL-decoded, so
+            # the combined string alone wouldn't match.
+            for part in (userinfo, *userinfo.split(":", 1)):
+                if part:
+                    values.append(part)
+                    decoded = unquote(part)
+                    if decoded != part:
+                        values.append(decoded)
     return values
 
 
@@ -5005,6 +5024,24 @@ def _sanitize_probe_error(text: str, cfg: dict[str, Any]) -> str:
     if isinstance(url, str) and url:
         text = redact_exception_text(text, url)
     return sanitize_secrets(text, _probe_secret_values(cfg))
+
+
+def _all_config_secret_values(data: dict[str, Any]) -> list[str]:
+    """Every secret value across all configured upstream servers.
+
+    Used to scrub free-form diagnostics that aren't bound to one server —
+    a pydantic schema-validation error can embed the rejected ``input_value``
+    (or a validator message quoting it), so a malformed ``headers``/``env``
+    value could otherwise reach ``mms doctor`` output.
+    """
+    servers = data.get("upstream_servers", {})
+    if not isinstance(servers, dict):
+        return []
+    values: list[str] = []
+    for cfg in servers.values():
+        if isinstance(cfg, dict):
+            values.extend(_probe_secret_values(cfg))
+    return values
 
 
 def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
@@ -5176,6 +5213,11 @@ def health(
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
     config_error = _schema_validation_error(data)
+    if config_error:
+        # A schema error can echo the rejected input_value (or a validator
+        # message quoting it), so scrub it against configured server secrets
+        # before it lands in text/--json output.
+        config_error = sanitize_secrets(config_error, _all_config_secret_values(data))
     logging_status = _logging_destination_status()
     obs_tools_hint = _hidden_obs_tools_hint()
 
@@ -5371,6 +5413,10 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
             # stay meaningful.
             schema_error = _schema_validation_error(data)
             if schema_error:
+                # A pydantic error can echo the rejected input_value (or a
+                # validator message quoting it), so scrub it against every
+                # configured server's secrets before it reaches the report.
+                schema_error = sanitize_secrets(schema_error, _all_config_secret_values(data))
                 check(
                     "config_schema",
                     "config schema",

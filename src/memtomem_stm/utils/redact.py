@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -76,13 +77,25 @@ def sanitize_secrets(
     - **Empty values are dropped** — a naive ``text.replace("", ph)`` would
       interleave the placeholder between every character of the message.
     - **Duplicate values are deduplicated** — each distinct value is
-      substituted once (``str.replace`` already replaces all occurrences).
-    - **Longer values are substituted first** — if ``"abc"`` were replaced
+      substituted once.
+    - **Longer values are matched first** — if ``"abc"`` were matched
       before ``"abcdef"``, the leftover ``"def"`` suffix of the longer
       secret would leak. Ties break lexicographically for determinism.
+
+    Replacement is a **single regex pass over the original text**, not
+    sequential ``str.replace`` calls: sequential passes let a later, shorter
+    secret rewrite a placeholder a previous pass just inserted (e.g. a
+    secret ``"RED"`` corrupting the ``"<REDACTED>"`` already written), which
+    both mangles the message and can re-expose fragments. A single pass
+    consumes each matched span once and never re-scans inserted text.
     """
     if not text:
         return text
-    for value in sorted({v for v in secret_values if v}, key=lambda v: (-len(v), v)):
-        text = text.replace(value, placeholder)
-    return text
+    values = sorted({v for v in secret_values if v}, key=lambda v: (-len(v), v))
+    if not values:
+        return text
+    # Ordered alternation: at any position Python's regex engine tries the
+    # alternatives left-to-right, so longest-first ordering makes the longest
+    # matching secret win, matching the rule above.
+    pattern = re.compile("|".join(re.escape(v) for v in values))
+    return pattern.sub(lambda _m: placeholder, text)

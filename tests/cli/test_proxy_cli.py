@@ -7733,6 +7733,34 @@ class TestHealth:
         assert result.tools == 1
         assert result.failed_stage is None
 
+    def test_teardown_error_after_discovery_reports_success(self, monkeypatch):
+        """A failure raised while *leaving* the transport/session context —
+        anyio commonly re-raises a background-task error from ``__aexit__`` —
+        after tools/list already succeeded is cleanup noise, not a probe
+        failure. The probe got the tool list, so it must report connected."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class TransportRaisingOnExit:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                # Mirrors an anyio TaskGroup surfacing a background error at
+                # scope exit, after the useful work already completed.
+                raise RuntimeError("cancel scope teardown error")
+
+        monkeypatch.setattr(
+            "mcp.client.sse.sse_client", lambda url, **_kw: TransportRaisingOnExit()
+        )
+        monkeypatch.setattr("mcp.ClientSession", self._fake_session_cls())
+
+        cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.connected is True
+        assert result.stage is ProbeStage.TOOLS_DISCOVERED
+        assert result.error is None
+        assert result.tools == 1
+
     def test_probe_error_sanitizes_header_and_env_values(self, monkeypatch):
         """A probe exception that echoes a configured header/env value (401
         bodies do) must reach ``health`` output sanitized — free-form
@@ -8288,6 +8316,34 @@ class TestDoctor:
             assert result.exit_code == 1
             assert "sekrit-token-123" not in result.output
             assert "<REDACTED>" in result.output
+
+    def test_schema_error_does_not_leak_header_value(self, runner, config):
+        """A schema-validation FAIL can echo the rejected input_value (or a
+        validator message quoting it). A malformed server whose sibling
+        carries a secret header must not leak that header into the schema
+        check's text or --json output."""
+        config.write_text(
+            json.dumps(
+                {
+                    # ``default_max_result_chars`` invalid → schema error;
+                    # the sibling server carries a secret header value.
+                    "default_max_result_chars": -1,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "api": {
+                            "prefix": "api",
+                            "transport": "sse",
+                            "url": "https://up.example/sse",
+                            "headers": {"Authorization": "Bearer sekrit-token-123"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        for extra in ([], ["--json"]):
+            result = runner.invoke(cli, ["doctor", "--timeout", "3", *extra, *_cfg_args(config)])
+            assert "sekrit-token-123" not in result.output
 
     def test_doctor_live_fake_server_passes(self, config):
         """Real MCP child end-to-end (bypasses ``CliRunner`` — its stderr

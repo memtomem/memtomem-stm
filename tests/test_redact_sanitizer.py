@@ -60,3 +60,17 @@ class TestSanitizeSecrets:
         # rewriting the placeholder just inserted.
         out = sanitize_secrets("v=RED", ["RED"])
         assert out == "v=<REDACTED>"
+
+    def test_second_secret_does_not_cascade_into_first_placeholder(self) -> None:
+        # Regression: sequential str.replace let a later short secret ("RED")
+        # rewrite the "<REDACTED>" a previous pass inserted for a longer
+        # secret, producing "<<REDACTED>ACTED>". A single regex pass over the
+        # original text consumes each span once and never re-scans inserts.
+        out = sanitize_secrets("x=long-secret", ["long-secret", "RED"])
+        assert out == "x=<REDACTED>"
+
+    def test_placeholder_with_backslash_not_treated_as_group_ref(self) -> None:
+        # A custom placeholder containing regex-replacement metacharacters
+        # (\1, \g<...>) must be inserted literally, not interpreted.
+        out = sanitize_secrets("t=abc", ["abc"], placeholder=r"\1<X>")
+        assert out == r"t=\1<X>"
