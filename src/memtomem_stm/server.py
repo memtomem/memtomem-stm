@@ -345,11 +345,24 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             await proxy_manager.start()
 
             # Register proxy tools with upstream schema + annotations
-            from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+            from mcp.types import CallToolResult
+
+            from memtomem_stm.proxy._fastmcp_compat import (
+                register_proxy_tool,
+                to_call_tool_result,
+            )
 
             def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
-                async def proxy_tool(**kwargs: object) -> str | list:
-                    return await pm.call_tool(server_name, tool_name, dict(kwargs))
+                # The bare ``-> CallToolResult`` annotation matters: FastMCP's
+                # ``func_metadata`` special-cases it (return without output
+                # validation) but REJECTS a Union containing it, and the
+                # returned envelope passes through ``convert_result`` and the
+                # lowlevel handler verbatim — preserving structuredContent,
+                # result-level _meta, isError, and content order end to end.
+                async def proxy_tool(**kwargs: object) -> CallToolResult:
+                    return to_call_tool_result(
+                        await pm.call_tool(server_name, tool_name, dict(kwargs))
+                    )
 
                 return proxy_tool
 

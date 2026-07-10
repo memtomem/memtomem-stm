@@ -16,6 +16,26 @@ from pydantic import ConfigDict
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+from mcp.types import CallToolResult, TextContent
+
+
+def to_call_tool_result(result: str | list | CallToolResult) -> CallToolResult:
+    """Normalize a ``ProxyManager.call_tool`` return into a ``CallToolResult``.
+
+    The proxy handler always returns a full ``CallToolResult`` to FastMCP:
+    both ``FuncMetadata.convert_result`` and the lowlevel ``call_tool`` handler
+    pass a ``CallToolResult`` through verbatim, which is what preserves
+    ``structuredContent``/``_meta`` and the content-block order end to end.
+    The ``str``/``list`` shapes wrap into exactly the envelope the lowlevel
+    server would synthesize for them (single ``TextContent`` / the blocks,
+    ``structuredContent=None``, ``isError=False``) — wire-identical to the
+    pre-envelope behavior.
+    """
+    if isinstance(result, CallToolResult):
+        return result
+    if isinstance(result, str):
+        return CallToolResult(content=[TextContent(type="text", text=result)])
+    return CallToolResult(content=list(result))
 
 
 class _ProxyPassthroughArgs(ArgModelBase):
