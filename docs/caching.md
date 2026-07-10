@@ -14,7 +14,7 @@ sequenceDiagram
     participant LTM as memtomem LTM
 
     Agent->>STM: tool call (server, tool, args)
-    STM->>Cache: lookup(SHA-256 of server:tool:args)
+    STM->>Cache: lookup(SHA-256 of server:tool:args:query:settings-fp)
     alt cache miss
         Cache-->>STM: none
         STM->>Up: forward call
@@ -46,7 +46,8 @@ The key insight: **the cache stores pre-surfacing content**. Surfacing runs on e
 
 Key details:
 
-- Cache key = SHA-256 of `server:tool:args` (argument order independent)
+- Cache key = SHA-256 over `server`, `tool`, `args` (argument order independent), the call's `_context_query`, and a fingerprint of the resolved compression settings. The stored body is the *compressed* response — compression is query-aware (BM25 relevance budgets) and config-dependent — so the same tool+args under a different query context, or after a compression-setting change (hot reload included), gets its own entry instead of being served a body compressed for someone else's query or under old settings. The flip side: callers that pass a different `_context_query` on every call re-fetch instead of hitting the cache.
+- **Key-schema upgrades purge the cache once** — rows written under an older key derivation are unreachable by any new lookup, so on first start after an upgrade that changes the key shape the cache is emptied (tracked via SQLite `user_version`). One-time cold start; entries repopulate on use.
 - **Pre-surfacing content is cached** — surfacing is re-applied on cache hit, so memories stay fresh
 - **Mutating tools are not cached** — the cache is on by default for *every* tool of *every* upstream, so without a gate a write tool (`create_*` / `send_*` / `write_*` / `delete_*`) called twice with identical args within the TTL would be served the first call's cached success *without re-executing the side effect*. The `tool_annotation_policy` gates eligibility on the upstream tool's MCP annotations (`readOnlyHint` / `destructiveHint`):
   - `conservative` (default) — cache everything except tools that self-declare as writers (`readOnlyHint: false` or `destructiveHint: true`). Keeps caching for read-only and un-annotated tools. A tool declaring *both* `readOnlyHint: true` and `destructiveHint: true` is contradictory and is deliberately treated as a writer — the MCP spec scopes `destructiveHint` to `readOnlyHint: false` tools, but distrusting a self-contradiction only costs a cache slot, while trusting it could replay a side effect; use a per-tool `cache: true` to opt such a tool back in.

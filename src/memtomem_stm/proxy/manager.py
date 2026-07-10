@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
+import json
 import logging
 import sqlite3
 import time as _time
@@ -216,6 +218,63 @@ class ToolConfig:
     extraction_enabled: bool = False
     progressive: ProgressiveConfig | None = None
     retention_floor: float | None = None
+
+
+# Field classification for ``compression_fingerprint``. Every ``ToolConfig``
+# field must appear in exactly one of these sets (pinned by a test), so adding
+# a field forces the author to decide whether it can change the compressed
+# bytes stored in the response cache.
+#   - Fingerprinted: settings that change what COMPRESS (or Stage-1 CLEAN)
+#     writes into ``comp.compressed``, or that gate whether a full body may be
+#     stored/served at all (``progressive.chunk_size``).
+#   - Excluded: Stage-4 side-band stages (auto-index / extraction) consume the
+#     pipeline output but never alter the cached payload; keying on them would
+#     invalidate the cache on unrelated toggles.
+_FINGERPRINT_FIELDS = frozenset(
+    {
+        "compression",
+        "max_chars",
+        "retention_floor",
+        "cleaning",
+        "hybrid",
+        "selective",
+        "progressive",
+        "llm",
+    }
+)
+_FINGERPRINT_EXCLUDED_FIELDS = frozenset({"auto_index_enabled", "extraction_enabled"})
+
+
+def compression_fingerprint(tc: ToolConfig, min_result_retention: float) -> str:
+    """SHA-256 fingerprint of the resolved compression settings for a tool.
+
+    Folded into the response-cache key so a body compressed under one
+    configuration is never served after the configuration changes (hot reload
+    included). Fingerprints the RESOLVED ``ToolConfig`` — post
+    default/server/tool-override merge and token→char budget conversion — so
+    the fingerprint changes exactly when the effective settings do.
+
+    ``llm.api_key`` is excluded: it never affects the output bytes, it is
+    secret material, and the config validator injects it from the environment,
+    which would make the fingerprint environment-dependent.
+    """
+    payload: dict[str, Any] = {
+        "compression": tc.compression.value,
+        "max_chars": tc.max_chars,
+        "retention_floor": tc.retention_floor,
+        "cleaning": tc.cleaning.model_dump(mode="json"),
+        "hybrid": tc.hybrid.model_dump(mode="json") if tc.hybrid is not None else None,
+        "selective": tc.selective.model_dump(mode="json") if tc.selective is not None else None,
+        "progressive": (
+            tc.progressive.model_dump(mode="json") if tc.progressive is not None else None
+        ),
+        "llm": (
+            tc.llm.model_dump(mode="json", exclude={"api_key"}) if tc.llm is not None else None
+        ),
+        "min_result_retention": min_result_retention,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 @dataclass
@@ -1791,6 +1850,21 @@ class ProxyManager:
             retention_floor=retention_floor,
         )
 
+    def _cache_key_fingerprint(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> str:
+        """Compression-settings fingerprint for the response-cache key.
+
+        An unknown server (direct dispatch / tests with no registered
+        connection) yields ``""`` — mirroring the unknown-server posture of
+        ``_resolve_cache_ttl`` and ``_tool_cache_eligible``, and keeping
+        ``_resolve_tool_config``'s ``self._connections[server]`` lookup from
+        raising here. Such a call fails at the upstream fetch before any
+        store, so the placeholder key is never persisted.
+        """
+        if server not in self._connections:
+            return ""
+        tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
+        return compression_fingerprint(tc, cfg_snap.min_result_retention)
+
     def _clean_content(self, text: str, cleaning_cfg: CleaningConfig) -> str:
         if not cleaning_cfg.enabled:
             return text
@@ -2869,6 +2943,16 @@ class ProxyManager:
         upstream_args = (
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
+        # Same isinstance-str coercion as ``_call_tool_inner`` so the key the
+        # lookup computes here matches the key the store computes there.
+        raw_context_query = arguments.get("_context_query") if arguments else None
+        context_query = raw_context_query if isinstance(raw_context_query, str) else None
+        # One snapshot for the whole guarded section (each ``self._config``
+        # read is a loader call, and a hot reload mid-request must not split
+        # the fast-path get key from the stampede-lock key). The same snapshot
+        # is threaded into ``_call_tool_inner`` so a confirmed miss stores
+        # under the fingerprint this lookup missed on.
+        cfg_snap = self._config
 
         # No cache configured, OR a non-positive configured TTL disables it: go
         # straight through (no lookup, no store, no stampede lock). The TTL check
@@ -2881,11 +2965,13 @@ class ProxyManager:
         # The resolved TTL honors any per-tool/server ``cache_ttl_seconds``
         # override, so a tool whose override is 0 bypasses the lookup for THAT
         # tool exactly as the global ttl<=0 does (per-row TTL is frozen at write).
-        cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=self._config)
+        cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
         if self._cache is None or (cache_ttl is not None and cache_ttl <= 0):
             try:
                 return (
-                    await self._call_tool_inner(server, tool, arguments, trace_id=trace_id),
+                    await self._call_tool_inner(
+                        server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
+                    ),
                     False,
                 )
             except Exception as exc:
@@ -2901,7 +2987,7 @@ class ProxyManager:
                 # second DELETE.
                 if not getattr(exc, "_stm_cache_invalidated", False):
                     self._invalidate_disabled_cache(
-                        server, tool, upstream_args, cfg_snap=self._config
+                        server, tool, upstream_args, cfg_snap=cfg_snap, context_query=context_query
                     )
                 raise
 
@@ -2912,21 +2998,45 @@ class ProxyManager:
         # NO stampede lock, so every call re-runs and its side effect re-executes.
         # Gating the lookup (not just the store in ``_store_cache``) also refuses
         # to serve any row cached before this gate existed.
-        if not self._tool_cache_eligible(server, tool, cfg_snap=self._config):
-            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id), False
+        if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
+            return (
+                await self._call_tool_inner(
+                    server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
+                ),
+                False,
+            )
+
+        # Computed once (after the zero-cost bypass paths above) and shared by
+        # the fast-path get, the stampede-lock key, and the in-lock double-check
+        # so all three derive from the same config snapshot.
+        config_fp = self._cache_key_fingerprint(server, tool, cfg_snap=cfg_snap)
 
         # Fast-path: cache hit without lock contention.
-        cached = self._cache.get(server, tool, upstream_args)
+        cached = self._cache.get(
+            server, tool, upstream_args, context_query=context_query, config_fingerprint=config_fp
+        )
         if cached is not None:
             return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
 
-        cache_key = _cache_key(server, tool, upstream_args)
+        # ``context_query`` is part of the lock key on purpose: two concurrent
+        # calls that differ only in query context store DIFFERENT rows, so
+        # collapsing them would serve one caller a body compressed for the
+        # other's query — the collision the key exists to prevent.
+        cache_key = _cache_key(
+            server, tool, upstream_args, context_query=context_query, config_fingerprint=config_fp
+        )
         lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
         async with lock:
             try:
                 # Double-check inside the lock: a coroutine that held the
                 # lock ahead of us may have populated the cache already.
-                cached = self._cache.get(server, tool, upstream_args)
+                cached = self._cache.get(
+                    server,
+                    tool,
+                    upstream_args,
+                    context_query=context_query,
+                    config_fingerprint=config_fp,
+                )
                 if cached is not None:
                     return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
                 # Eligible cache lookup confirmed missing (the lock-free fast-path
@@ -2937,7 +3047,7 @@ class ProxyManager:
                 # miss would skew the hit-rate diagnostics.
                 self.tracker.record_cache_miss()
                 return await self._call_tool_inner(
-                    server, tool, arguments, trace_id=trace_id
+                    server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
                 ), False
             finally:
                 self._key_locks.pop(cache_key, None)
@@ -4050,7 +4160,13 @@ class ProxyManager:
         return read_only is True and destructive is not True
 
     def _invalidate_disabled_cache(
-        self, server: str, tool: str, cache_args: dict[str, Any], *, cfg_snap: ProxyConfig
+        self,
+        server: str,
+        tool: str,
+        cache_args: dict[str, Any],
+        *,
+        cfg_snap: ProxyConfig,
+        context_query: str | None = None,
     ) -> None:
         """Best-effort delete of any cached row for ``(server, tool, cache_args)``
         when the resolved TTL is ``<= 0`` (caching disabled), for a non-text /
@@ -4063,13 +4179,25 @@ class ProxyManager:
         window the lookup serves the stale text (#541). Resolving the TTL is a
         config read (no I/O); the DELETE runs only on the ``ttl<=0`` path, bounded
         to the non-text calls that actually occur — preserving #536's zero-I/O
-        posture for the steady-state text / no-row disabled-cache path."""
+        posture for the steady-state text / no-row disabled-cache path.
+
+        The key fingerprint is computed HERE (cold path only) rather than by
+        callers, keeping the steady-state paths free of the resolve. The DELETE
+        therefore targets the current query+fingerprint row only; rows stored
+        under other fingerprints are unreachable by any current lookup anyway.
+        """
         if self._cache is None:
             return
         ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
         if ttl is not None and ttl <= 0:
             try:
-                self._cache.invalidate(server, tool, cache_args)
+                self._cache.invalidate(
+                    server,
+                    tool,
+                    cache_args,
+                    context_query=context_query,
+                    config_fingerprint=self._cache_key_fingerprint(server, tool, cfg_snap=cfg_snap),
+                )
             except Exception:
                 logger.warning(
                     "Cache invalidation failed for %s/%s — response unaffected",
@@ -4109,6 +4237,8 @@ class ProxyManager:
         comp: CompressionResult,
         non_text_content: list,
         cfg_snap: ProxyConfig,
+        context_query: str | None,
+        config_fingerprint: str,
     ) -> None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
@@ -4157,7 +4287,9 @@ class ProxyManager:
             # the same for text responses. The non-text-ONLY response early-returns
             # in ``_call_tool_inner`` and invalidates there instead.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
-            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
             return
         cache_ttl = self._resolve_cache_ttl(server, tool, cfg_snap=cfg_snap)
         if cache_ttl is not None and cache_ttl <= 0:
@@ -4168,7 +4300,9 @@ class ProxyManager:
             # reason (cache-ineligible / progressive passthrough / transient key),
             # not only on the path that happens to reach ``set`` (#541; surfaced
             # by the codex review of #550).
-            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
             return
         if not self._tool_cache_eligible(server, tool, cfg_snap=cfg_snap):
             logger.debug(
@@ -4209,6 +4343,8 @@ class ProxyManager:
                     cache_args,
                     comp.compressed,
                     ttl_seconds=cache_ttl,
+                    context_query=context_query,
+                    config_fingerprint=config_fingerprint,
                 )
             except Exception:
                 logger.warning(
@@ -4225,6 +4361,7 @@ class ProxyManager:
         arguments: dict[str, Any],
         *,
         trace_id: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> str | list:
         # Public entry point ``call_tool`` generates the trace_id and passes
         # it in so it can match the enclosing Langfuse span. Direct callers
@@ -4236,7 +4373,12 @@ class ProxyManager:
 
         # Snapshot config once to avoid intra-request inconsistency from
         # hot-reload changing the config between accesses.
-        cfg_snap = self._config
+        # ``_call_tool_guarded`` passes ITS snapshot in so the Stage-5 store
+        # keys on the same fingerprint the (missed) lookup used — otherwise a
+        # hot reload landing between the two reads would store under a key the
+        # stampede lock isn't holding. Direct callers (tests) omit it.
+        if cfg_snap is None:
+            cfg_snap = self._config
 
         # Extract _context_query before forwarding. Coerce non-str values to
         # None at the single extraction point — the cache-hit path already
@@ -4248,6 +4390,10 @@ class ProxyManager:
         upstream_args = (
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
+        # Cache-key fingerprint of the resolved compression settings, paired
+        # with ``context_query`` everywhere a key is derived below (store +
+        # disabled-cache invalidations).
+        config_fp = self._cache_key_fingerprint(server, tool, cfg_snap=cfg_snap)
 
         # Cache lookup, hit path, and miss accounting are all owned by
         # ``_call_tool_guarded``: a hit returns there, an ELIGIBLE miss is
@@ -4306,7 +4452,9 @@ class ProxyManager:
             # invalidation in ``_store_cache`` so a stale prior text row for
             # this key is dropped while caching is disabled (#541).
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
-            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
             if shaped.passthrough.has_non_text:
                 return non_text_content
             return "[empty response]"
@@ -4338,7 +4486,9 @@ class ProxyManager:
             # instead; here we cover the text-bearing shapes (#541). Mark the
             # exception so the raised-failure backstop in ``_call_tool_guarded``
             # does not repeat the DELETE.
-            self._invalidate_disabled_cache(server, tool, cache_args, cfg_snap=cfg_snap)
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
             _mark_cache_invalidated(tool_err)
             raise tool_err
 
@@ -4453,6 +4603,8 @@ class ProxyManager:
             comp=comp,
             non_text_content=non_text_content,
             cfg_snap=cfg_snap,
+            context_query=context_query,
+            config_fingerprint=config_fp,
         )
 
         # Combine compressed text with preserved non-text content

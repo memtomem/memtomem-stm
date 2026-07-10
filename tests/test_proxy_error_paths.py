@@ -874,10 +874,16 @@ class TestCacheWithErrors:
         cache_store: dict[str, str] = {}
 
         cache = MagicMock()
-        cache.get.side_effect = lambda srv, tl, a: cache_store.get(f"{srv}|{tl}|{a}")
 
-        def _set(srv, tl, a, result, ttl_seconds=None):
-            cache_store[f"{srv}|{tl}|{a}"] = result
+        def _fake_key(srv, tl, a, kw):
+            # Mirror the real key inputs: context_query + config_fingerprint
+            # are part of the key, so the fake store must not collapse them.
+            return f"{srv}|{tl}|{a}|{kw.get('context_query')}|{kw.get('config_fingerprint')}"
+
+        cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(_fake_key(srv, tl, a, kw))
+
+        def _set(srv, tl, a, result, ttl_seconds=None, **kw):
+            cache_store[_fake_key(srv, tl, a, kw)] = result
 
         cache.set.side_effect = _set
         mgr._cache = cache
@@ -1342,7 +1348,7 @@ class TestTransientKeyResponsesNotCached:
                 "transient-key TOC must not be cached; the second identical call "
                 f"should re-run upstream (saw {session.call_tool.call_count})"
             )
-            assert cache.get("srv", "tool", {"x": 1}) is None
+            assert cache.stats()["total_entries"] == 0  # nothing stored under ANY key
         finally:
             cache.close()
 
@@ -1398,7 +1404,7 @@ class TestTransientKeyResponsesNotCached:
                 "progressive first-chunk must not be cached; the second identical "
                 f"call should re-run upstream (saw {session.call_tool.call_count})"
             )
-            assert cache.get("srv", "tool", {"x": 1}) is None
+            assert cache.stats()["total_entries"] == 0  # nothing stored under ANY key
         finally:
             cache.close()
 

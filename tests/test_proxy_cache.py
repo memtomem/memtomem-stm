@@ -494,3 +494,97 @@ class TestMakeKey:
         k1 = _make_key("s", "t", {"a": 1})
         k2 = _make_key("s", "t", {"a": 2})
         assert k1 != k2
+
+    def test_context_query_changes_key(self):
+        # The stored body is the COMPRESSED response and compression is
+        # query-aware (BM25 budgets), so two calls that differ only in query
+        # context must never share a row.
+        base = _make_key("s", "t", {"a": 1})
+        q1 = _make_key("s", "t", {"a": 1}, context_query="find auth code")
+        q2 = _make_key("s", "t", {"a": 1}, context_query="billing systems")
+        assert len({base, q1, q2}) == 3
+
+    def test_context_query_none_empty_and_null_string_distinct(self):
+        # JSON-encoding the query keeps the "no query" sentinel distinct from
+        # both the empty string and the literal string "null".
+        absent = _make_key("s", "t", {})
+        empty = _make_key("s", "t", {}, context_query="")
+        null_str = _make_key("s", "t", {}, context_query="null")
+        assert len({absent, empty, null_str}) == 3
+
+    def test_config_fingerprint_changes_key(self):
+        fp_a = _make_key("s", "t", {"a": 1}, config_fingerprint="aaa")
+        fp_b = _make_key("s", "t", {"a": 1}, config_fingerprint="bbb")
+        default = _make_key("s", "t", {"a": 1})
+        assert len({fp_a, fp_b, default}) == 3
+
+    def test_same_components_same_key(self):
+        k1 = _make_key("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
+        k2 = _make_key("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
+        assert k1 == k2
+
+
+class TestKeyComponentsRoundtrip:
+    def test_same_args_different_query_are_separate_entries(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {"a": 1}, "for-q1", ttl_seconds=60.0, context_query="q1")
+        proxy_cache.set("s", "t", {"a": 1}, "for-q2", ttl_seconds=60.0, context_query="q2")
+        assert proxy_cache.get("s", "t", {"a": 1}, context_query="q1") == "for-q1"
+        assert proxy_cache.get("s", "t", {"a": 1}, context_query="q2") == "for-q2"
+        assert proxy_cache.get("s", "t", {"a": 1}) is None  # no-query key untouched
+
+    def test_fingerprint_mismatch_is_a_miss(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {"a": 1}, "old-config", ttl_seconds=60.0, config_fingerprint="v1")
+        assert proxy_cache.get("s", "t", {"a": 1}, config_fingerprint="v2") is None
+        assert proxy_cache.get("s", "t", {"a": 1}, config_fingerprint="v1") == "old-config"
+
+    def test_invalidate_targets_matching_components_only(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {"a": 1}, "for-q1", ttl_seconds=60.0, context_query="q1")
+        proxy_cache.set("s", "t", {"a": 1}, "for-q2", ttl_seconds=60.0, context_query="q2")
+        proxy_cache.invalidate("s", "t", {"a": 1}, context_query="q1")
+        assert proxy_cache.get("s", "t", {"a": 1}, context_query="q1") is None
+        assert proxy_cache.get("s", "t", {"a": 1}, context_query="q2") == "for-q2"
+
+    def test_ttl_zero_self_heal_deletes_matching_component_row(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {"a": 1}, "live", ttl_seconds=60.0, context_query="q1")
+        # ttl<=0 is do-not-store but must delete the existing row for the SAME
+        # key components.
+        proxy_cache.set("s", "t", {"a": 1}, "ignored", ttl_seconds=0.0, context_query="q1")
+        assert proxy_cache.get("s", "t", {"a": 1}, context_query="q1") is None
+
+
+class TestKeySchemaVersionPurge:
+    def test_pre_versioning_rows_are_purged_once(self, tmp_path):
+        """Rows written before the key-schema bump are opaque hashes no current
+        lookup can produce — dead weight that never expires for ``ttl NULL``
+        rows. ``initialize()`` purges them exactly once via ``user_version``."""
+        db_path = tmp_path / "c.db"
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()
+        # Simulate a legacy database: rows present but user_version still 0.
+        cache.set("s", "t", {"a": 1}, "v1-row", ttl_seconds=None)
+        cache._db.execute("PRAGMA user_version = 0")
+        cache._db.commit()
+        cache.close()
+
+        reopened = ProxyCache(db_path, max_entries=10)
+        reopened.initialize()
+        try:
+            assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
+            (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
+            assert version == 2
+        finally:
+            reopened.close()
+
+    def test_current_version_rows_survive_reopen(self, tmp_path):
+        db_path = tmp_path / "c.db"
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()  # stamps user_version = 2
+        cache.set("s", "t", {"a": 1}, "row", ttl_seconds=None)
+        cache.close()
+
+        reopened = ProxyCache(db_path, max_entries=10)
+        reopened.initialize()
+        try:
+            assert reopened.get("s", "t", {"a": 1}) == "row"
+        finally:
+            reopened.close()
