@@ -337,6 +337,39 @@ class UpstreamConnection:
     # it), so breaker state survives reconnects. ``None`` when the upstream's
     # ``circuit_max_failures`` is 0 (breaker disabled).
     breaker: CircuitBreaker | None = None
+    # Damper for config-change reconnects: the ``_connection_fingerprint`` of
+    # the last hot-reloaded connection config that FAILED to connect. While
+    # the file still carries this exact config, calls keep serving on the old
+    # connection instead of re-attempting the broken edit on every request;
+    # any further edit (different fingerprint) or any successful reconnect
+    # clears it. Lives on the connection for the same stable-identity reason
+    # as the lock/generation/breaker.
+    last_failed_connection_fp: tuple[Any, ...] | None = None
+
+
+def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
+    """Frozen view of the fields that define the live transport's identity.
+
+    A change in any of these requires re-establishing the connection to take
+    effect (hot-reload classification, PR ⑦); everything else on
+    ``UpstreamServerConfig`` is read per call and needs no reconnect.
+    ``connect_timeout_seconds`` counts only for network transports, where it
+    is baked into the SDK client factory as the httpx connect budget; for
+    stdio it is consumed per connection attempt, so an edit simply applies to
+    the next reconnect. The tuple doubles as the damping key for failed
+    config-change reconnects.
+    """
+    fp: tuple[Any, ...] = (
+        cfg.transport,
+        cfg.url,
+        tuple(sorted((cfg.headers or {}).items())),
+        cfg.command,
+        tuple(cfg.args),
+        tuple(sorted((cfg.env or {}).items())),
+    )
+    if cfg.transport != TransportType.STDIO:
+        fp += (cfg.connect_timeout_seconds,)
+    return fp
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -1254,6 +1287,9 @@ class ProxyManager:
             conn.stack = conn_stack
             conn.tools = tools
             conn.config = cfg
+            # Any successful reconnect proves the current config connects —
+            # clear the config-change damper so detection resumes normally.
+            conn.last_failed_connection_fp = None
             # Bump the generation only on a successful reconnect so a waiter
             # skips its own; a failed attempt leaves it unchanged so the next
             # caller retries rather than silently skipping.
@@ -1569,6 +1605,10 @@ class ProxyManager:
         global_strip = self._config.strip_schema_descriptions
 
         for conn in self._connections.values():
+            # Deliberately the connect-time snapshot: the advertisement is
+            # session-stable (``prefix`` is restart-only, and the exposed set
+            # must not drift between startup registration and later calls),
+            # unlike per-call tool-config resolution which hot-reloads.
             cfg = conn.config
             max_desc = cfg.max_description_chars
             strip = cfg.strip_schema_descriptions or global_strip
@@ -1832,7 +1872,10 @@ class ProxyManager:
     ) -> ToolConfig:
         config = proxy_cfg or self._config
         conn = self._connections[server]
-        cfg = conn.config
+        # Per-server fields ride the hot-reloaded snapshot: compression /
+        # cleaning / tool_overrides / budget edits apply on the next tool call
+        # without a reconnect (the behavior docs/configuration.md promises).
+        cfg = self._server_cfg(conn, config)
 
         # #292: ``ProxyConfig.default_compression`` was previously unread, so
         # an operator setting it in ``stm_proxy.json`` saw no effect on any
@@ -2796,7 +2839,9 @@ class ProxyManager:
             trace_id = uuid.uuid4().hex[:16]
         # Selection telemetry (#467): the prefixed name shares the
         # ``candidate_tools`` vocabulary, so replay tooling can match the
-        # selected tool against the advertised set verbatim.
+        # selected tool against the advertised set verbatim. Connect-time
+        # snapshot on purpose — ``prefix`` is restart-only, like the
+        # advertisement it must match.
         selected_tool = f"{self._connections[server].config.prefix}__{tool}"
         candidate_features, ranker_version = self._rank_candidates(arguments)
         selection_id = self._log_selection(
@@ -3135,6 +3180,57 @@ class ProxyManager:
             finally:
                 self._key_locks.pop(cache_key, None)
 
+    def _server_cfg(self, conn: UpstreamConnection, cfg_snap: ProxyConfig) -> UpstreamServerConfig:
+        """Latest per-server config from the hot-reloaded snapshot.
+
+        Falls back to the connect-time snapshot when the key is absent (server
+        removed from the file mid-session — adding/removing servers stays
+        restart-only). Callers pass their per-request ``cfg_snap`` so one
+        request never mixes two reload generations.
+        """
+        fresh = cfg_snap.upstream_servers.get(conn.name)
+        return conn.config if fresh is None else fresh
+
+    async def _maybe_reconnect_for_config_change(
+        self, conn: UpstreamConnection, fresh_cfg: UpstreamServerConfig
+    ) -> None:
+        """Apply a hot-reloaded connection-affecting edit via live reconnect.
+
+        Prepare-first semantics come from ``_reconnect_server`` (which re-reads
+        the current snapshot itself, under the reconnect lock): the replacement
+        is fully established before the swap, so on failure the OLD connection
+        keeps serving — this wrapper swallows the failure, damps the exact
+        failed fingerprint (no per-call retry storm against a broken edit), and
+        lets the call proceed on the old connection. Failure-TRIGGERED
+        reconnects are deliberately not damped: they are driven by call
+        failures with their own backoff and breaker accounting.
+        """
+        new_fp = _connection_fingerprint(fresh_cfg)
+        if new_fp == _connection_fingerprint(conn.config):
+            return
+        if new_fp == conn.last_failed_connection_fp:
+            return
+        logger.info("Connection config for '%s' changed; applying via live reconnect", conn.name)
+        try:
+            await self._reconnect_server(conn.name)
+        except Exception as exc:
+            conn.last_failed_connection_fp = new_fp
+            # Redact + no exc_info (#605): the attempt opened a transport with
+            # the NEW credentialed url.
+            logger.warning(
+                "Live reconnect for changed config of '%s' failed; keeping the "
+                "existing connection (won't retry until the config changes "
+                "again): %s",
+                conn.name,
+                self._redacted_error(exc, fresh_cfg.url),
+            )
+        else:
+            # A successful initialize + tools/list is a completed round-trip:
+            # close the breaker so a config fix isn't fast-failed for up to
+            # ``circuit_reset_seconds`` by the OLD config's failure streak.
+            if conn.breaker is not None:
+                conn.breaker.record_success()
+
     async def _fetch_upstream(
         self,
         server: str,
@@ -3155,11 +3251,20 @@ class ProxyManager:
         before this call so the cache-key snapshot stays trace-free.
 
         ``cfg_snap`` is the caller's per-request config snapshot, used by the
-        timeout-replay guard (#578); ``None`` (direct test callers) falls back
-        to the live config.
+        timeout-replay guard (#578) and the per-server knobs below; ``None``
+        (direct test callers) falls back to the live config.
         """
         conn = self._connections[server]
-        cfg = conn.config
+        # Per-server retry/deadline knobs come from the hot-reloaded snapshot
+        # (edits apply on the next call), pinned once per call — a reload
+        # mid-request can't move the deadline under a running retry loop.
+        cfg = self._server_cfg(conn, cfg_snap if cfg_snap is not None else self._config)
+        # Connection-affecting edits (url/headers/transport/command/args/env)
+        # are applied here via live reconnect — BEFORE the breaker check, so a
+        # config fix isn't fast-failed by the old config's failure streak. The
+        # cache fast-path in ``_call_tool_guarded`` intentionally bypasses
+        # this: a cache hit never touches the connection.
+        await self._maybe_reconnect_for_config_change(conn, cfg)
         delay = cfg.reconnect_delay_seconds
         breaker = conn.breaker
 
@@ -4126,22 +4231,22 @@ class ProxyManager:
           3. the global ``CacheConfig.default_ttl_seconds``.
 
         At levels 1-2, ``None`` means *inherit the next level* (NOT never-expires);
-        only the global default's ``None`` means never-expires. Per-tool/server
-        overrides are read from ``conn.config`` (the connect-time snapshot), so —
-        like the ``cache`` bool — an override edited after startup is picked up on
-        the next reconnect/restart, not via mtime hot-reload; the global fallback
-        is the hot-reloaded ``cfg_snap``. An unknown server (direct dispatch /
-        tests with no registered connection) falls back to the global, mirroring
+        only the global default's ``None`` means never-expires. Every level —
+        per-tool, per-server, and the global default — is read from the caller's
+        hot-reloaded ``cfg_snap``, so a TTL edit applies on the next call without
+        a reconnect. An unknown server (direct dispatch / tests with no
+        registered connection) falls back to the global, mirroring
         ``_tool_cache_eligible`` returning ``True`` on that path."""
         global_ttl = cfg_snap.cache.default_ttl_seconds
         conn = self._connections.get(server)
         if conn is None:
             return global_ttl
-        override = conn.config.tool_overrides.get(tool)
+        srv_cfg = self._server_cfg(conn, cfg_snap)
+        override = srv_cfg.tool_overrides.get(tool)
         if override is not None and override.cache_ttl_seconds is not None:
             return override.cache_ttl_seconds
-        if conn.config.cache_ttl_seconds is not None:
-            return conn.config.cache_ttl_seconds
+        if srv_cfg.cache_ttl_seconds is not None:
+            return srv_cfg.cache_ttl_seconds
         return global_ttl
 
     def _tool_cache_eligible(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> bool:
@@ -4161,21 +4266,18 @@ class ProxyManager:
         conn = self._connections.get(server)
         if conn is None:
             return True
-        # Per-tool / per-server ``cache`` overrides are read from ``conn.config``
-        # (the connection's connect-time snapshot), mirroring ``_resolve_tool_config``
-        # which resolves every other per-server/tool field (``compression``,
-        # ``tool_overrides.*``, ...) from the same source. Like those, an override
-        # edited AFTER startup is picked up on the next reconnect/restart, not via
-        # mtime hot-reload — connections hold their connect-time config. The
-        # annotation POLICY below, by contrast, is read from the hot-reloaded
-        # ``cfg_snap``, so the safety-critical writer gate tracks config edits even
-        # though the manual override escape-hatch follows the existing per-server
-        # reload semantics.
-        override = conn.config.tool_overrides.get(tool)
+        # Per-tool / per-server ``cache`` overrides ride the hot-reloaded
+        # ``cfg_snap``, mirroring ``_resolve_tool_config`` — an override edited
+        # after startup applies on the next call, same as the annotation POLICY
+        # below. Tool *annotations*, by contrast, still come from the
+        # ``conn.tools`` snapshot, refreshed only at connect/reconnect or on a
+        # ``tools/list_changed`` notification (#557).
+        srv_cfg = self._server_cfg(conn, cfg_snap)
+        override = srv_cfg.tool_overrides.get(tool)
         if override is not None and override.cache is not None:
             return override.cache
-        if conn.config.cache is not None:
-            return conn.config.cache
+        if srv_cfg.cache is not None:
+            return srv_cfg.cache
 
         policy = cfg_snap.cache.tool_annotation_policy
         if policy == "ignore":
@@ -4231,14 +4333,18 @@ class ProxyManager:
         conn = self._connections.get(server)
         if conn is None:
             return True
-        override = conn.config.tool_overrides.get(tool)
+        # Overrides ride the hot-reloaded ``cfg_snap`` (same as
+        # ``_tool_cache_eligible``): an operator's replay-safety assertion
+        # applies on the next call, not the next reconnect.
+        srv_cfg = self._server_cfg(conn, cfg_snap)
+        override = srv_cfg.tool_overrides.get(tool)
         if override is not None and override.cache is not None:
             if override.cache is True:
                 return True
             # ``cache: false`` set per-tool: fall through to annotations, and
             # skip the per-server override (the per-tool setting shadows it,
             # mirroring the cache-eligibility precedence).
-        elif conn.config.cache is True:
+        elif srv_cfg.cache is True:
             return True
 
         policy = cfg_snap.cache.tool_annotation_policy
