@@ -210,6 +210,10 @@ class ProxyToolInfo:
     server: str
     original_name: str
     annotations: Any = None  # MCP ToolAnnotations (readOnlyHint, destructiveHint, etc.)
+    # Upstream tools/list envelope fields, advertised verbatim (description
+    # budgeting and schema distillation apply to the INPUT side only).
+    output_schema: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = None  # tool-level ``_meta``
 
 
 @dataclass(frozen=True, slots=True)
@@ -1578,6 +1582,8 @@ class ProxyManager:
                             server=conn.name,
                             original_name=t.name,
                             annotations=getattr(t, "annotations", None),
+                            output_schema=getattr(t, "outputSchema", None),
+                            meta=getattr(t, "meta", None),
                         ),
                         raw_description=t.description or "",
                         raw_schema=t.inputSchema,
