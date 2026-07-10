@@ -1097,6 +1097,8 @@ class TestAddValidation:
         assert "--url is required" in result.output
 
     def test_env_requires_kv_format(self, runner, config):
+        """A pair without "=" is likely a stray credential pasted bare —
+        the diagnostic must not echo it (stderr is piped to CI logs)."""
         result = runner.invoke(
             cli,
             [
@@ -1107,14 +1109,17 @@ class TestAddValidation:
                 "--command",
                 "x",
                 "--env",
-                "MALFORMED",
+                "ghp_supersecret",
                 *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
-        assert "--env must be KEY=VALUE" in result.output
+        assert "--env #1 must be KEY=VALUE" in result.output
+        assert "ghp_supersecret" not in result.output
 
     def test_env_rejects_empty_key(self, runner, config):
+        """`--env =VALUE` has an empty key; VALUE may be a credential, so
+        the diagnostic names the argument position, never the raw pair."""
         result = runner.invoke(
             cli,
             [
@@ -1125,12 +1130,39 @@ class TestAddValidation:
                 "--command",
                 "x",
                 "--env",
-                "=value",
+                "A=b",
+                "--env",
+                "=ghp_supersecret",
                 *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
-        assert "--env key must be non-empty" in result.output
+        assert "--env #2 key must be non-empty" in result.output
+        assert "ghp_supersecret" not in result.output
+
+    def test_env_invalid_json_shape_withholds_value(self, runner, config):
+        """The --json error payload lands in scripts and CI logs — the
+        malformed argument must not appear in stdout or stderr."""
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--command",
+                "x",
+                "--env",
+                "=ghp_supersecret",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "invalid_env"
+        assert "ghp_supersecret" not in result.stdout
+        assert "ghp_supersecret" not in result.stderr
 
     @pytest.mark.parametrize(
         "key",
