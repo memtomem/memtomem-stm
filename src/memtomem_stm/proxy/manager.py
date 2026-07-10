@@ -57,6 +57,7 @@ from memtomem_stm.proxy.config import (
     ProgressiveConfig,
     ProxyConfig,
     ProxyConfigLoader,
+    RelevanceScorerConfig,
     SelectiveConfig,
     ToolgraphConfig,
     TransportType,
@@ -246,7 +247,10 @@ _FINGERPRINT_EXCLUDED_FIELDS = frozenset({"auto_index_enabled", "extraction_enab
 
 
 def compression_fingerprint(
-    tc: ToolConfig, min_result_retention: float, max_upstream_chars: int
+    tc: ToolConfig,
+    min_result_retention: float,
+    max_upstream_chars: int,
+    relevance_scorer: RelevanceScorerConfig,
 ) -> str:
     """SHA-256 fingerprint of the settings that shape the cached response body.
 
@@ -255,7 +259,7 @@ def compression_fingerprint(
     included). Fingerprints the RESOLVED ``ToolConfig`` — post
     default/server/tool-override merge and token→char budget conversion — so
     the fingerprint changes exactly when the effective settings do, plus the
-    two ``ProxyConfig`` globals that alter the cached bytes but live outside
+    ``ProxyConfig`` globals that alter the cached bytes but live outside
     ``ToolConfig``:
 
     - ``min_result_retention`` — the global floor of the compression ratio
@@ -264,10 +268,21 @@ def compression_fingerprint(
       ``original_text`` BEFORE cleaning/compression (``_shape_response``); an
       oversized response is cut to this budget, and that cut text is what gets
       compressed and cached, so lowering the limit must rotate the key.
+    - ``relevance_scorer`` — the query-aware compressors (TRUNCATE,
+      SCHEMA_PRUNING, SKELETON) allocate budget with this scorer, so switching
+      bm25↔embedding or changing the embedding model changes the cached bytes
+      for a query-bearing call. Those compressors are rebuilt per call from the
+      current scorer (``self._relevance_scorer``), so the bytes track the live
+      scorer; keying on ``cfg_snap.relevance_scorer`` rotates the key on the
+      same change. (The cached SELECTIVE/HYBRID compressor lifecycle does NOT
+      reach cached bytes: their cacheable paths are the query-blind truncate
+      fallbacks, while the scorer-driven TOC paths carry a transient retrieval
+      key and are never stored.)
 
-    ``llm.api_key`` is excluded: it never affects the output bytes, it is
-    secret material, and the config validator injects it from the environment,
-    which would make the fingerprint environment-dependent.
+    Secret / environment-injected fields are excluded so the fingerprint stays
+    machine-independent: ``llm.api_key`` (validator injects from env), and the
+    scorer's OpenAI embedding key is likewise read from ``OPENAI_API_KEY`` and
+    never lives in ``RelevanceScorerConfig``.
     """
     payload: dict[str, Any] = {
         "compression": tc.compression.value,
@@ -284,6 +299,7 @@ def compression_fingerprint(
         ),
         "min_result_retention": min_result_retention,
         "max_upstream_chars": max_upstream_chars,
+        "relevance_scorer": relevance_scorer.model_dump(mode="json"),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -1876,7 +1892,10 @@ class ProxyManager:
             return ""
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
         return compression_fingerprint(
-            tc, cfg_snap.min_result_retention, cfg_snap.max_upstream_chars
+            tc,
+            cfg_snap.min_result_retention,
+            cfg_snap.max_upstream_chars,
+            cfg_snap.relevance_scorer,
         )
 
     def _clean_content(self, text: str, cleaning_cfg: CleaningConfig) -> str:

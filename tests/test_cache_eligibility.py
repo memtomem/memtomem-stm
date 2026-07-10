@@ -1008,6 +1008,24 @@ class TestCacheKeyComponents:
         await mgr.call_tool("srv", "reader", {"q": "a"})
         assert session.call_tool.call_count == 2
 
+    async def test_scorer_change_stops_serving_old_rows(self, build):
+        # The query-aware compressors build budget from the relevance scorer, so
+        # a bm25→embedding switch changes the cached bytes for a query-bearing
+        # call. The fingerprint must rotate on the scorer config change.
+        from memtomem_stm.proxy.config import RelevanceScorerConfig
+
+        mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _text_result("payload")
+
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 1  # steady-state hit
+
+        mgr._config.relevance_scorer = RelevanceScorerConfig(scorer="embedding")
+        await mgr.call_tool("srv", "reader", {"q": "a", "_context_query": "alpha"})
+        assert session.call_tool.call_count == 2
+
     async def test_store_passes_key_components(self, build):
         # The Stage-5 store must key on the SAME components the lookup used;
         # a store under different components is unreachable (hit rate 0%).

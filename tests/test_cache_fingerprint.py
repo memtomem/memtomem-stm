@@ -18,6 +18,7 @@ from memtomem_stm.proxy.config import (
     HybridConfig,
     LLMCompressorConfig,
     ProgressiveConfig,
+    RelevanceScorerConfig,
     SelectiveConfig,
 )
 from memtomem_stm.proxy.manager import (
@@ -29,6 +30,7 @@ from memtomem_stm.proxy.manager import (
 
 _MIN_RETENTION = 0.65
 _MAX_UPSTREAM = 10_000_000
+_SCORER = RelevanceScorerConfig()
 
 
 def _tc(**overrides) -> ToolConfig:
@@ -48,8 +50,14 @@ def _tc(**overrides) -> ToolConfig:
     return ToolConfig(**base)
 
 
-def _fp(tc: ToolConfig, *, min_retention=_MIN_RETENTION, max_upstream=_MAX_UPSTREAM) -> str:
-    return compression_fingerprint(tc, min_retention, max_upstream)
+def _fp(
+    tc: ToolConfig,
+    *,
+    min_retention=_MIN_RETENTION,
+    max_upstream=_MAX_UPSTREAM,
+    scorer=_SCORER,
+) -> str:
+    return compression_fingerprint(tc, min_retention, max_upstream, scorer)
 
 
 class TestFieldClassification:
@@ -101,6 +109,20 @@ class TestFingerprintBehavior:
         (before cleaning/compression), so an oversized response is cached under
         this budget — lowering it must rotate the key."""
         assert _fp(_tc(), max_upstream=10_000_000) != _fp(_tc(), max_upstream=5_000)
+
+    def test_scorer_type_changes_fingerprint(self):
+        """The query-aware compressors (TRUNCATE/SCHEMA_PRUNING/SKELETON)
+        allocate budget with the relevance scorer, so switching bm25↔embedding
+        changes the cached bytes for a query-bearing call — the key must
+        rotate."""
+        bm25 = RelevanceScorerConfig(scorer="bm25")
+        embed = RelevanceScorerConfig(scorer="embedding")
+        assert _fp(_tc(), scorer=bm25) != _fp(_tc(), scorer=embed)
+
+    def test_embedding_model_changes_fingerprint(self):
+        a = RelevanceScorerConfig(scorer="embedding", embedding_model="nomic-embed-text")
+        b = RelevanceScorerConfig(scorer="embedding", embedding_model="mxbai-embed-large")
+        assert _fp(_tc(), scorer=a) != _fp(_tc(), scorer=b)
 
     def test_api_key_does_not_change_fingerprint(self):
         """``llm.api_key`` never affects the compressed bytes, it is secret
