@@ -4708,12 +4708,17 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                 await asyncio.wait_for(session.initialize(), timeout=remaining())
                 stage = ProbeStage.MCP_INITIALIZED
                 result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
-                stage = ProbeStage.TOOLS_DISCOVERED
                 prefix = cfg.get("prefix", "")
                 tools = len(result.tools)
                 overflowing = tuple(
                     t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
                 )
+                # Only now is discovery genuinely complete. Setting the stage
+                # after processing the result (not right after list_tools)
+                # keeps a malformed-result failure classified as an
+                # MCP_INITIALIZED failure instead of being swallowed by the
+                # post-discovery teardown-noise path below.
+                stage = ProbeStage.TOOLS_DISCOVERED
     except Exception as exc:
         # A failure raised *after* discovery completed is teardown noise —
         # anyio transports commonly re-raise a background-task error from the
@@ -4979,6 +4984,13 @@ def _root_cause_message(exc: BaseException) -> str:
     return str(cur) or type(cur).__name__
 
 
+# Values shorter than this are not treated as redactable secrets: a 1-3 char
+# token like "k", "1", or "on" occurs incidentally all over ordinary
+# diagnostic text, so redacting it globally corrupts the message far more than
+# it protects — and a secret that short isn't meaningfully protectable anyway.
+_MIN_REDACTABLE_SECRET_LEN = 4
+
+
 def _probe_secret_values(cfg: dict[str, Any]) -> list[str]:
     """Secret-bearing values from a raw server config dict.
 
@@ -4987,6 +4999,9 @@ def _probe_secret_values(cfg: dict[str, Any]) -> list[str]:
     values (HTTP auth), and the URL userinfo. SDK/validation exceptions
     interpolate these verbatim (a 401 body can echo the Authorization
     header back), and the mapping redactors only cover structured output.
+
+    Trivially short values are dropped (see ``_MIN_REDACTABLE_SECRET_LEN``)
+    so redaction can't mangle ordinary diagnostic text.
     """
     values: list[str] = []
     for key in ("env", "headers"):
@@ -5010,7 +5025,7 @@ def _probe_secret_values(cfg: dict[str, Any]) -> list[str]:
                     decoded = unquote(part)
                     if decoded != part:
                         values.append(decoded)
-    return values
+    return [v for v in values if len(v) >= _MIN_REDACTABLE_SECRET_LEN]
 
 
 def _sanitize_probe_error(text: str, cfg: dict[str, Any]) -> str:

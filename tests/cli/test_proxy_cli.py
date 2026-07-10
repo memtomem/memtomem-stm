@@ -7733,6 +7733,76 @@ class TestHealth:
         assert result.tools == 1
         assert result.failed_stage is None
 
+    def test_malformed_tool_result_is_classified_not_swallowed(self, monkeypatch):
+        """A failure while *processing* the tools/list result (before the
+        stage advances to TOOLS_DISCOVERED) must be reported as a discovery
+        failure — not mistaken for post-discovery teardown noise and
+        returned as a false success."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class BadResultSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                # Result object missing ``.tools`` → AttributeError while
+                # counting, after list_tools itself returned.
+                return SimpleNamespace()
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr("mcp.ClientSession", BadResultSession)
+
+        cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        assert result.connected is False
+        assert result.stage is ProbeStage.MCP_INITIALIZED
+        assert result.failed_stage is ProbeStage.TOOLS_DISCOVERED
+        assert result.error
+
+    def test_short_secret_values_do_not_corrupt_error_text(self, monkeypatch):
+        """A trivially short header/env value ("k") must not be redacted —
+        redacting it globally would mangle ordinary words ("link") in the
+        error. Only meaningfully long secrets are scrubbed."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr(
+            "mcp.ClientSession",
+            self._fake_session_cls(init_exc=RuntimeError("network link down")),
+        )
+        cfg = {
+            "transport": "sse",
+            "url": "https://up.example/sse",
+            "prefix": "up",
+            "headers": {"X-Api-Key": "k"},
+        }
+        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
+        # "k" (< 4 chars) is not treated as a secret, so "link" stays intact.
+        assert result.error == "network link down"
+
     def test_teardown_error_after_discovery_reports_success(self, monkeypatch):
         """A failure raised while *leaving* the transport/session context —
         anyio commonly re-raises a background-task error from ``__aexit__`` —
