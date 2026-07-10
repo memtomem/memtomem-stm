@@ -1431,30 +1431,29 @@ def add(
 
     if header_pairs:
         headers_dict: dict[str, str] = {}
-        for pair in header_pairs:
+        for idx, pair in enumerate(header_pairs, start=1):
+            # Unlike the --env diagnostics above, these NEVER echo the raw
+            # argument: a malformed --header is likely a stray credential
+            # (e.g. `--header =Bearer_tok`), and both stderr and the --json
+            # error payload are routinely piped to CI logs and transcripts.
             if "=" not in pair:
-                click.echo(f"{_err('Error:')} --header must be KEY=VALUE, got: {pair}", err=True)
+                msg = (
+                    f"--header #{idx} must be KEY=VALUE "
+                    "(raw argument withheld: header values may be secrets)"
+                )
+                click.echo(f"{_err('Error:')} {msg}", err=True)
                 if as_json:
-                    _json_fail(
-                        "add",
-                        "invalid_header",
-                        f"--header must be KEY=VALUE, got: {pair}",
-                        name=name,
-                    )
+                    _json_fail("add", "invalid_header", msg, name=name)
                 sys.exit(1)
             k, v = pair.split("=", 1)
             if not k:
-                click.echo(
-                    f"{_err('Error:')} --header key must be non-empty, got: {pair}",
-                    err=True,
+                msg = (
+                    f"--header #{idx} key must be non-empty "
+                    "(raw argument withheld: header values may be secrets)"
                 )
+                click.echo(f"{_err('Error:')} {msg}", err=True)
                 if as_json:
-                    _json_fail(
-                        "add",
-                        "invalid_header",
-                        f"--header key must be non-empty, got: {pair}",
-                        name=name,
-                    )
+                    _json_fail("add", "invalid_header", msg, name=name)
                 sys.exit(1)
             # Deliberately NO _DANGEROUS_ENV_KEYS check here: that list guards
             # env injection into spawned processes; headers are sent over HTTP

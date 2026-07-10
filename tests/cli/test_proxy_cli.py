@@ -1178,6 +1178,9 @@ class TestAddValidation:
         assert "blocked for security reasons" in result.output
 
     def test_header_requires_kv_format(self, runner, config):
+        """A pair without "=" is likely a stray credential pasted bare —
+        the diagnostic must not echo it (stderr and --json errors are piped
+        to CI logs), unlike the --env diagnostics which name the pair."""
         result = runner.invoke(
             cli,
             [
@@ -1190,14 +1193,17 @@ class TestAddValidation:
                 "--url",
                 "https://example.com/sse",
                 "--header",
-                "MALFORMED",
+                "Bearer_ghp_supersecret",
                 *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
-        assert "--header must be KEY=VALUE" in result.output
+        assert "--header #1 must be KEY=VALUE" in result.output
+        assert "ghp_supersecret" not in result.output
 
     def test_header_rejects_empty_key(self, runner, config):
+        """`--header =VALUE` has an empty key; VALUE may be a credential, so
+        the diagnostic names the argument position, never the raw pair."""
         result = runner.invoke(
             cli,
             [
@@ -1210,12 +1216,15 @@ class TestAddValidation:
                 "--url",
                 "https://example.com/sse",
                 "--header",
-                "=value",
+                "A=b",
+                "--header",
+                "=Bearer_ghp_supersecret",
                 *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
-        assert "--header key must be non-empty" in result.output
+        assert "--header #2 key must be non-empty" in result.output
+        assert "ghp_supersecret" not in result.output
 
     def test_header_allows_dangerous_env_names(self, runner, config):
         """Intentional asymmetry with ``--env``: ``_DANGEROUS_ENV_KEYS``
@@ -1789,12 +1798,17 @@ class TestAddJson:
             cli,
             [
                 "add", "s", "--prefix", "s", "--transport", "sse",
-                "--url", "https://x", "--header", "MALFORMED", "--json",
+                "--url", "https://x", "--header", "=Bearer_ghp_supersecret", "--json",
                 *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
-        assert json.loads(result.stdout)["error"] == "invalid_header"
+        data = json.loads(result.stdout)
+        assert data["error"] == "invalid_header"
+        # The malformed argument may BE a credential — neither the JSON
+        # payload nor the human stderr line may carry it.
+        assert "ghp_supersecret" not in result.stdout
+        assert "ghp_supersecret" not in result.stderr
 
     def test_header_on_stdio_error_shape(self, runner, config):
         result = runner.invoke(
