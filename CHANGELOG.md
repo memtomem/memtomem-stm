@@ -9,10 +9,24 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
 ## [0.1.34] — 2026-07-12
+
+### Upgrade notes
+
+- **Background LTM warm-up is enabled by default** (#664, #671): server and
+  daemon startup now launches a best-effort, host-owned LTM warm-up task so
+  the usual ~9s child/model cold start is paid before the first surfacing
+  call. It never blocks the proxy MCP initialize handshake, and lazy start
+  remains the retry path after failure. Set
+  `MEMTOMEM_STM_SURFACING__WARMUP_ENABLED=false` when spawning one LTM child
+  per proxy process is undesirable, such as with many short-lived proxies.
 
 ### Added
 
+- Background LTM warm-up at server/daemon startup, controlled by the new
+  `surfacing.warmup_enabled` setting (default: `true`). (#664, #671)
 - Durable surfacing fault counters (#666): timeout / breaker-open / degraded-LTM
   skips now persist day-aggregated to `surfacing_faults` in the feedback DB,
   and `mms stats` renders them with a warning line — previously these signals
