@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import uuid
 
 from mcp.server.fastmcp import FastMCP
@@ -194,7 +195,20 @@ if __name__ == "__main__":
         default=None,
         help="Optional JSON array of mem_search seeds (bench_qa mode).",
     )
+    parser.add_argument(
+        "--startup-delay",
+        metavar="SECONDS",
+        type=float,
+        default=0.0,
+        help=(
+            "Sleep before serving (process/transport startup delay). Models the real "
+            "LTM cold start — child spawn + embedding-model load before the server "
+            "answers initialize (#664)."
+        ),
+    )
     args = parser.parse_args()
     if args.seeds is not None:
         _SEEDS = _load_seeds(args.seeds)
+    if args.startup_delay > 0:
+        time.sleep(args.startup_delay)
     mcp.run()
