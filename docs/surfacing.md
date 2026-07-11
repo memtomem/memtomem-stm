@@ -79,7 +79,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Precision/cost gate — **distinct** from the proxy-level `ExtractionConfig.min_response_chars` (`500`); see the tuning note below. |
 | `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
-| `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response) |
+| `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if first-call injection matters more than latency. |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
 | `max_surfacings_per_minute` | `15` | Global rate limit |
 | `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_surfacing_stats`. |
