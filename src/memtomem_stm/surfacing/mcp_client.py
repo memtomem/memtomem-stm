@@ -243,6 +243,23 @@ class _OwnerRequest:
     cancel_requested: bool = False
 
 
+def _discard_future_result(fut: asyncio.Future[None]) -> None:
+    """Retrieve a resolved future's result/exception so asyncio never warns
+    it went unobserved.
+
+    Used when the submitting caller was cancelled and left while the owner
+    task may still resolve ``req.fut`` afterward (its rollback sets an
+    exception, or a queued-skip cancels it). A cancelled future has nothing
+    to retrieve.
+    """
+    if fut.cancelled():
+        return
+    try:
+        fut.exception()
+    except asyncio.CancelledError:  # pragma: no cover - resolved-cancelled race
+        pass
+
+
 class McpClientSearchAdapter:
     """Connects to a memtomem MCP server and calls mem_search.
 
@@ -497,27 +514,40 @@ class McpClientSearchAdapter:
         req = _OwnerRequest(op, asyncio.get_running_loop().create_future())
         self._requests.put_nowait(req)
         try:
-            await req.fut
+            # ``shield`` so that cancelling the *caller* (SurfacingEngine's
+            # ``asyncio.wait_for`` timeout) does NOT cancel ``req.fut`` — we
+            # need it to stay pending in the handler below. Awaiting a future
+            # directly auto-cancels it when the awaiting task is cancelled, so
+            # the ``not req.fut.done()`` guard would always be false on the
+            # timeout path: ``owner.cancel()`` would be skipped and the
+            # in-flight ``_do_start`` left running orphaned, leaking its
+            # transport when a retry overwrote ``self._stack``.
+            await asyncio.shield(req.fut)
         except asyncio.CancelledError:
-            # The caller was cancelled (SurfacingEngine's ``asyncio.wait_for``
-            # timeout) while the op was queued or in flight. Flag the request
-            # and, if it is the one currently executing, cancel the owner —
-            # the cancellation lands *inside* the owner task, so
-            # ``_do_start``'s rollback acloses the contexts task-locally
-            # (scope-safe); the owner then uncancels itself and keeps serving.
+            # The caller was cancelled while the op was queued or in flight.
+            # Flag the request and, if it is the one currently executing,
+            # cancel the owner — the cancellation lands *inside* the owner
+            # task, so ``_do_start``'s rollback acloses the contexts
+            # task-locally (scope-safe); the owner then uncancels itself and
+            # keeps serving.
             #
             # The ``not req.fut.done()`` guard makes the cancel precise: the
             # owner sets ``req.fut`` before advancing ``_current_req`` and
             # before dequeuing the next op, and there is no ``await`` between
-            # this check and ``owner.cancel()``, so when the future is still
-            # pending the owner is provably suspended *inside this op* — the
-            # cancel cannot land on a later op's caller. If the future is
-            # already resolved (op finished, and the cancel merely raced the
-            # ``wait_for`` timeout) we skip the cancel entirely.
+            # this check and ``owner.cancel()``, so a still-pending future
+            # proves the owner is suspended *inside this op* — the cancel
+            # cannot land on a later op's caller.
             req.cancel_requested = True
             if self._current_req is req and not req.fut.done():
                 self._op_cancel_pending = True
                 owner.cancel()
+            # The caller is leaving, but the owner may still resolve req.fut
+            # (rollback sets an exception, or the queued-skip cancels it).
+            # Retrieve that result so it is never reported as unobserved.
+            if req.fut.done():
+                _discard_future_result(req.fut)
+            else:
+                req.fut.add_done_callback(_discard_future_result)
             raise
 
     async def _owner_loop(self) -> None:
@@ -527,7 +557,11 @@ class McpClientSearchAdapter:
                 try:
                     req = await self._requests.get()
                     if req.cancel_requested or req.fut.cancelled():
-                        continue  # caller gave up while queued
+                        # Caller gave up while queued. Resolve the (shielded,
+                        # still-pending) future so it is not left dangling.
+                        if not req.fut.done():
+                            req.fut.cancel()
+                        continue
                     self._current_req = req
                     try:
                         if req.op == "close":

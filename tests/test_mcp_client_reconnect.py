@@ -986,10 +986,16 @@ class _TrackingTransport:
 
 
 class _OkSession:
-    """Fake ClientSession serving a canned compact mem_search hit."""
+    """Fake ClientSession serving a canned compact mem_search hit.
 
-    def __init__(self, *_args, **_kwargs):
-        pass
+    ``initialize`` optionally blocks on ``record["init_gate"]`` so a test can
+    park the start op *after* the transport context is registered on the
+    exit stack — exercising the rollback path that must aclose an
+    already-entered transport in the owner task.
+    """
+
+    def __init__(self, record: dict):
+        self._record = record
 
     async def __aenter__(self):
         return self
@@ -998,7 +1004,9 @@ class _OkSession:
         return None
 
     async def initialize(self):
-        pass
+        gate = self._record.get("init_gate")
+        if gate is not None:
+            await gate.wait()
 
     async def call_tool(self, _name, _args):
         return _result_with_text(_COMPACT_HIT)
@@ -1016,7 +1024,7 @@ class TestOwnerTaskLifecycle:
         from memtomem_stm.surfacing import mcp_client as mod
 
         monkeypatch.setattr(mod, "stdio_client", lambda _params: _TrackingTransport(record, gate))
-        monkeypatch.setattr(mod, "ClientSession", _OkSession)
+        monkeypatch.setattr(mod, "ClientSession", lambda *_a, **_k: _OkSession(record))
         # result_format pinned to compact so no version negotiation runs.
         return McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
 
@@ -1076,24 +1084,55 @@ class TestOwnerTaskLifecycle:
     async def test_caller_cancelled_mid_start_owner_survives(self, monkeypatch):
         """Outer wait_for cancels the caller while the start op is in flight
         in the owner: rollback runs in the owner task, the sticky flag
-        resets, and the owner keeps serving the next attempt."""
+        resets, and the owner keeps serving the next attempt.
+
+        Regression for the cancellation half of #663 (round-2): the start is
+        parked at ``initialize`` — *after* the transport is registered on the
+        exit stack — so a broken cancel path (one that let the orphaned start
+        complete) would leak that transport. The fix cancels the owner
+        in-flight (via ``asyncio.shield`` on the request future), rolling the
+        transport back in-task, so its id lands in ``exited_ids`` and the
+        final stop leaves no transport entered-but-unclosed.
+        """
         record: dict = {}
-        gate = asyncio.Event()
-        adapter = self._adapter(monkeypatch, record, gate)
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate  # block the start at initialize()
+        adapter = self._adapter(monkeypatch, record)
 
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        # The start blocked at initialize(), so its transport is already
+        # entered by the time the caller times out.
+        first_id = record["last_entered_id"]
+
+        # owner.cancel() is scheduled from _submit's handler; the rollback
+        # then runs in the owner task on a later turn. Yield until it lands.
+        for _ in range(100):
+            if first_id in record.get("exited_ids", []):
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("timed-out start's transport was never rolled back")
 
         assert adapter._start_attempted is False
         assert adapter._session is None
         owner = adapter._owner_task
         assert owner is not None and not owner.done(), "op cancel must not kill the owner"
+        # The in-flight start was cancelled and rolled back IN the owner task,
+        # so the already-entered transport is exited (not left orphaned/leaked).
+        assert first_id in record.get("exited_ids", []), (
+            "timed-out start must roll its transport back, not leak it"
+        )
 
-        gate.set()
+        record["init_gate"] = None  # let the retry's start complete
         _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
         assert outcome == "ok"
         assert record["enters"] == 2  # first attempt rolled back, second succeeded
+
         await adapter.stop()
+        # Every transport ever entered has been exited — nothing leaked.
+        assert sorted(record["exited_ids"]) == [1, 2]
 
     @pytest.mark.asyncio
     async def test_caller_cancelled_while_queued_op_is_skipped(self, monkeypatch):
