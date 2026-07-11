@@ -321,19 +321,23 @@ class DaemonServer:
 
         Since #663 the adapter marshals its lifecycle ops through an internal
         owner task, so scope enter/exit happen in the same task and
-        ``adapter.stop()`` is expected to succeed cleanly from here. The
-        sweep below is retained as belt-and-braces: if the owner task itself
-        was lost (external cancellation mid-lifetime), the contexts are
-        abandoned rather than exited and the warm LTM child can still leak.
-        A direct child present both before and after a failed stop is the
-        leaked LTM child — this process spawns no other children — so
-        terminate it. (Sweep removal is tracked as a follow-up once #663
+        ``adapter.stop()`` succeeds cleanly in the common case. The sweep is
+        retained as belt-and-braces — but it must run whether ``stop()``
+        raised OR returned: ``stop()`` now *returns normally* while abandoning
+        a live child in two cases (owner task lost mid-lifetime, so its
+        contexts are abandoned unclosed; or ``stop()``'s own bounded-join
+        timeout against a stuck ``aclose``). Keying the sweep off an exception
+        (as the pre-#663 cross-task error did) would silently skip it there.
+        So always compare the direct children before and after: one present in
+        both snapshots is the leaked LTM child — this process spawns no other
+        children — so terminate it. A clean stop reaps its child (mcp's stdio
+        shutdown awaits exit), so the child is gone from the post snapshot and
+        nothing is killed. (Sweep removal is tracked as a follow-up once #663
         has soaked.)
         """
         before = _direct_child_pids()
         try:
             await self._adapter.stop()
-            return
         except Exception as exc:
             if is_clean_cancel_scope_shutdown(exc):
                 logger.warning(

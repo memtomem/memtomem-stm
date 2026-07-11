@@ -636,11 +636,14 @@ async def test_teardown_sweeps_on_generic_stop_failure(
     assert killed == [{222}]
 
 
-async def test_teardown_clean_adapter_stop_skips_sweep(
+async def test_teardown_clean_adapter_stop_still_probes_but_kills_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A successful stop() already awaited the child's exit (mcp's stdio
-    # shutdown sequence) — no second probe, no kill.
+    # Since #663 stop() can RETURN normally while abandoning a live child
+    # (owner lost mid-lifetime, or the bounded-join timeout), so the sweep
+    # must run even on a normal return — it can no longer be keyed off an
+    # exception. A genuinely clean stop reaps its child, so the post-stop
+    # snapshot is empty and nothing is killed.
     server = DaemonServer(_config(tmp_path))
     server._adapter = AsyncMock()
     probes: list[int] = []
@@ -652,8 +655,28 @@ async def test_teardown_clean_adapter_stop_skips_sweep(
 
     monkeypatch.setattr(daemon_server, "_terminate_leaked_children", _record)
     await server._teardown()
-    assert probes == [1]  # only the pre-stop snapshot
-    assert killed == []
+    assert probes == [1, 1]  # both the pre- and post-stop snapshots
+    assert killed == []  # nothing survived a clean stop
+
+
+async def test_teardown_sweeps_leaked_child_on_normal_stop_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #663 round-4: stop() returns normally but abandons a live child (owner
+    # lost / bounded-join timeout). The sweep must still terminate a child
+    # present both before and after the normal-return stop().
+    server = DaemonServer(_config(tmp_path))
+    server._adapter = AsyncMock()  # stop() returns normally, no raise
+    snapshots = iter([{111, 222}, {222}])  # 222 survives the abandoning stop
+    monkeypatch.setattr(daemon_server, "_direct_child_pids", lambda: next(snapshots))
+    killed: list[set[int]] = []
+
+    async def _record(pids: set[int]) -> None:
+        killed.append(pids)
+
+    monkeypatch.setattr(daemon_server, "_terminate_leaked_children", _record)
+    await server._teardown()
+    assert killed == [{222}]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based probe is POSIX-only")
