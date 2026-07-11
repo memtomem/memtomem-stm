@@ -14,6 +14,8 @@ Response (daemon → hook)::
 
     {"v": 2, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
     {"v": 2, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
+    # ping "ltm" is one of warm | warming | down | cold (#664); clients
+    # treat it as an opaque display string.
 
 ``op`` is one of :data:`OP_SURFACE`, :data:`OP_PING`, :data:`OP_SHUTDOWN`. The
 token gates *use* of the loopback port (any local process can ``connect`` to
