@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -145,6 +146,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     langfuse_client = None
     tracker = TokenTracker()
     proxy_manager: ProxyManager | None = None
+    warmup_task: asyncio.Task[None] | None = None
 
     # Wrap init + yield in a single try/finally so a failure between
     # resource acquisition and yield (e.g. proxy_cache.initialize() or
@@ -242,7 +244,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             # runs its lifecycle ops in an internal owner task (#663), so
             # the deferred start no longer ties anyio cancel scopes to the
             # request-handler task that happens to trigger it, and the
-            # lifespan ``stop()`` below is task-safe.
+            # lifespan ``stop()`` below is task-safe. The warm-up spawned
+            # below (#664) pre-pays the ~9s LTM cold start in a background
+            # task — initialize is still never blocked, and the lazy start
+            # remains the fallback when warm-up is disabled or fails.
             if config.surfacing.enabled:
                 try:
                     from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
@@ -294,6 +299,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         feedback_db,
                         feedback_tables,
                     )
+                    if config.surfacing.warmup_enabled:
+                        warmup_task = asyncio.create_task(mcp_adapter.warm_up(), name="ltm-warmup")
 
             # Response cache
             if config.proxy.cache.enabled:
@@ -426,6 +433,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                     resource.close()
                 except Exception:
                     logger.warning("Failed to close %s", name, exc_info=True)
+        if warmup_task is not None:
+            # Cancelling mid-start abandons the op (#664) — it finishes in
+            # the adapter's owner task, and ``stop()``'s bounded join below
+            # closes or cancels it in-task.
+            warmup_task.cancel()
+            try:
+                await warmup_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if mcp_adapter is not None:
             try:
                 await mcp_adapter.stop()

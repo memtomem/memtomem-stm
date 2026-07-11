@@ -248,9 +248,9 @@ def _discard_future_result(fut: asyncio.Future[None]) -> None:
     it went unobserved.
 
     Used when the submitting caller was cancelled and left while the owner
-    task may still resolve ``req.fut`` afterward (its rollback sets an
-    exception, or a queued-skip cancels it). A cancelled future has nothing
-    to retrieve.
+    task may still resolve ``req.fut`` afterward (the abandoned op finishes
+    with a result or an exception, or a queued-skip cancels it). A cancelled
+    future has nothing to retrieve.
     """
     if fut.cancelled():
         return
@@ -309,7 +309,6 @@ class McpClientSearchAdapter:
         self._requests: asyncio.Queue[_OwnerRequest] = asyncio.Queue()
         self._owner_task: asyncio.Task[None] | None = None
         self._current_req: _OwnerRequest | None = None
-        self._op_cancel_pending = False
         self._stopped = False
 
     async def start(self) -> None:
@@ -317,26 +316,69 @@ class McpClientSearchAdapter:
 
         The actual context setup runs in the adapter's owner task (#663);
         this wrapper only marshals the request and mirrors its outcome —
-        exceptions and cancellation included — back to the caller, so the
-        lazy-start semantics in ``_heal_if_needed`` are unchanged.
+        exceptions included — back to the caller. Cancelling the caller does
+        NOT cancel the op: an in-flight start is abandoned to finish in the
+        owner task so the LTM child keeps warming (#664).
         """
         await self._submit("start")
 
+    async def warm_up(self) -> None:
+        """Best-effort, single-shot background warm-up of the LTM child (#664).
+
+        Awaits ``start()`` and swallows every failure (including the
+        ``RuntimeError`` ``_submit`` raises when the adapter is already
+        stopped — a normal shutdown race). Deliberately never touches
+        ``_start_attempted``: a failed warm-up leaves the lazy-start gate
+        armed, so ``_heal_if_needed`` still performs its one lazy retry on
+        the first real call. Racing that first lazy start is safe — the
+        owner task serializes ops and the second start no-ops on
+        ``_do_start``'s live-session guard.
+        """
+        try:
+            await self.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info(
+                "LTM warm-up failed — lazy start will retry on first use: %s",
+                self._scrub_exc(exc),
+            )
+
+    @property
+    def warming(self) -> bool:
+        """True while a start/reconnect op is in flight and no session is
+        published yet — the "child is warming" window a warm-up task or an
+        abandoned start (#664) leaves behind. Cheap read for status probes
+        (daemon ``_ltm_warmth``)."""
+        req = self._current_req
+        return self._session is None and req is not None and req.op in ("start", "reconnect")
+
     async def _do_start(self) -> None:
         """Enter the transport/session contexts. Owner-task only (#663)."""
+        if self._session is not None:
+            # An abandoned start (#664) already warmed the session while this
+            # op sat in the queue; starting again would overwrite _stack and
+            # leak the live transport/child.
+            return
         stack = AsyncExitStack()
         self._stack = stack
         try:
             transport = self._open_transport()
             streams = await stack.enter_async_context(transport)
-            self._session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
-            await self._session.initialize()
+            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await session.initialize()
             logger.info(
                 "MCP client connected to memtomem server via %s: %s",
                 self._config.ltm_mcp_transport,
                 self._target_display(),
             )
-            await self._negotiate_format()
+            await self._negotiate_format(session)
+            # Publish only after initialize + negotiation succeed: `_session`
+            # is the readiness signal `_heal_if_needed`'s fast path trusts
+            # without taking `_start_lock`, and an abandoned start (#664) runs
+            # concurrently with later callers — publishing earlier would hand
+            # them a session that never completed the MCP handshake.
+            self._session = session
         except BaseException:
             # Roll back any contexts we entered (transport subprocess, session
             # streams) so a failed start — common during reconnect storms —
@@ -389,21 +431,25 @@ class McpClientSearchAdapter:
         """
         return redact_exception_text(str(exc), self._config.ltm_mcp_url)
 
-    async def _negotiate_format(self) -> None:
+    async def _negotiate_format(self, session: ClientSession | None = None) -> None:
         """Downgrade to compact if core doesn't advertise structured support.
 
-        Called at the end of ``start()``. When ``result_format`` is
-        ``"structured"``, asks the remote server for its capabilities via
-        ``mem_do(action="version")``.  If the response doesn't list
-        ``"structured"`` in ``capabilities.search_formats`` — or if the
-        call fails (older core versions don't implement this action) —
-        the parser is silently downgraded to ``CompactResultParser``.
+        Called at the end of ``_do_start`` with the not-yet-published session
+        (``self._session`` only becomes visible after negotiation succeeds,
+        #664). When ``result_format`` is ``"structured"``, asks the remote
+        server for its capabilities via ``mem_do(action="version")``.  If the
+        response doesn't list ``"structured"`` in
+        ``capabilities.search_formats`` — or if the call fails (older core
+        versions don't implement this action) — the parser is silently
+        downgraded to ``CompactResultParser``.
         """
-        if not isinstance(self._parser, StructuredResultParser) or self._session is None:
+        if session is None:
+            session = self._session
+        if not isinstance(self._parser, StructuredResultParser) or session is None:
             return
 
         try:
-            result = await self._session.call_tool("mem_do", {"action": "version"})
+            result = await session.call_tool("mem_do", {"action": "version"})
             text_parts = [c.text or "" for c in result.content if c.type == "text"]
             if text_parts:
                 data = json.loads(text_parts[0])
@@ -427,7 +473,10 @@ class McpClientSearchAdapter:
 
         Safe to call from any task: the context teardown runs in the owner
         task that entered the contexts (#663). Idempotent; stop before any
-        start is a no-op.
+        start is a no-op. If an abandoned start (#664) is still in flight,
+        the bounded join below cancels the owner after
+        ``_STOP_TIMEOUT_SECONDS`` — the cancel lands inside ``_do_start``,
+        whose rollback acloses the contexts in-task, so nothing leaks.
         """
         self._stopped = True
         owner = self._owner_task
@@ -510,40 +559,30 @@ class McpClientSearchAdapter:
         """Marshal a lifecycle op to the owner task and await its outcome."""
         if self._stopped:
             raise RuntimeError("MCP adapter is stopped")
-        owner = self._ensure_owner()
+        self._ensure_owner()
         req = _OwnerRequest(op, asyncio.get_running_loop().create_future())
         self._requests.put_nowait(req)
         try:
             # ``shield`` so that cancelling the *caller* (SurfacingEngine's
-            # ``asyncio.wait_for`` timeout) does NOT cancel ``req.fut`` — we
-            # need it to stay pending in the handler below. Awaiting a future
-            # directly auto-cancels it when the awaiting task is cancelled, so
-            # the ``not req.fut.done()`` guard would always be false on the
-            # timeout path: ``owner.cancel()`` would be skipped and the
-            # in-flight ``_do_start`` left running orphaned, leaking its
-            # transport when a retry overwrote ``self._stack``.
+            # ``asyncio.wait_for`` timeout) does NOT cancel ``req.fut`` — the
+            # owner keeps running the op after the caller leaves, and it must
+            # be able to resolve the future (success or failure) so the
+            # discard callback below can observe the outcome.
             await asyncio.shield(req.fut)
         except asyncio.CancelledError:
             # The caller was cancelled while the op was queued or in flight.
-            # Flag the request and, if it is the one currently executing,
-            # cancel the owner — the cancellation lands *inside* the owner
-            # task, so ``_do_start``'s rollback acloses the contexts
-            # task-locally (scope-safe); the owner then uncancels itself and
-            # keeps serving.
-            #
-            # The ``not req.fut.done()`` guard makes the cancel precise: the
-            # owner sets ``req.fut`` before advancing ``_current_req`` and
-            # before dequeuing the next op, and there is no ``await`` between
-            # this check and ``owner.cancel()``, so a still-pending future
-            # proves the owner is suspended *inside this op* — the cancel
-            # cannot land on a later op's caller.
+            # A queued op is flagged so the owner skips it (nobody is waiting
+            # for it). An in-flight op is deliberately ABANDONED — left
+            # running in the owner task — so a slow LTM start (~9s ONNX model
+            # load vs the 3s surfacing timeout, #664) completes and warms
+            # ``_session`` for the next caller; cancelling the owner here
+            # used to roll back the half-warmed child on every timeout, so
+            # the LTM never reached a warm state.
             req.cancel_requested = True
-            if self._current_req is req and not req.fut.done():
-                self._op_cancel_pending = True
-                owner.cancel()
             # The caller is leaving, but the owner may still resolve req.fut
-            # (rollback sets an exception, or the queued-skip cancels it).
-            # Retrieve that result so it is never reported as unobserved.
+            # (the abandoned op sets a result or an exception, or the
+            # queued-skip cancels it). Retrieve that result so it is never
+            # reported as unobserved.
             if req.fut.done():
                 _discard_future_result(req.fut)
             else:
@@ -574,6 +613,13 @@ class McpClientSearchAdapter:
                             # queued op can never interleave between them.
                             await self._do_close(swallow_errors=True)
                         await self._do_start()
+                        if req.op == "reconnect":
+                            # Clear the flag owner-side: a caller cancelled
+                            # mid-reconnect never reaches the clear in
+                            # ``_heal_if_needed``, and without this the next
+                            # call would run a redundant close+start cycle
+                            # against the fresh session just built here.
+                            self._needs_reconnect = False
                         if not req.fut.done():
                             req.fut.set_result(None)
                     except asyncio.CancelledError:
@@ -598,30 +644,19 @@ class McpClientSearchAdapter:
                     finally:
                         self._current_req = None
                 except asyncio.CancelledError:
-                    task = asyncio.current_task()
                     if self._stopped:
-                        # Shutdown has precedence over op-cancel recovery. A
-                        # caller timeout and ``stop()``'s bounded join can both
-                        # cancel this owner; if we absorbed the cancellation and
-                        # kept serving (as ``_op_cancel_pending`` would), the
-                        # owner would run on into the queued close op while
-                        # ``stop()``'s ``wait_for(owner)`` waited for it —
-                        # defeating the bound. Exit cleanly instead: the
-                        # in-flight op's own rollback already aclosed its stack
-                        # in this task, and ``uncancel``-ing (rather than
-                        # re-raising) makes ``await owner`` complete normally so
-                        # ``stop()`` never sees a stray ``CancelledError``.
+                        # ``stop()``'s bounded join cancelled the owner (a
+                        # caller timeout never does — it abandons the op,
+                        # #664). Exit cleanly: the in-flight op's own rollback
+                        # already aclosed its stack in this task, and
+                        # ``uncancel``-ing (rather than re-raising) makes
+                        # ``await owner`` complete normally so ``stop()``
+                        # never sees a stray ``CancelledError``.
+                        task = asyncio.current_task()
                         if task is not None:
                             while task.uncancel() > 0:
                                 pass
                         return
-                    if self._op_cancel_pending:
-                        # Abandoned op, not owner shutdown: absorb the
-                        # cancellation and keep serving.
-                        self._op_cancel_pending = False
-                        if task is not None:
-                            task.uncancel()
-                        continue
                     raise
         finally:
             # Fail-fast everything still queued so no caller ever hangs on
@@ -696,15 +731,14 @@ class McpClientSearchAdapter:
                 except asyncio.CancelledError:
                     # Outer wait_for / timeout cancelled us mid-init
                     # (SurfacingEngine wraps adapter calls in
-                    # ``asyncio.wait_for``). ``start()``'s BaseException
-                    # handler already cleared ``_session`` and unwound
-                    # the AsyncExitStack — without resetting
-                    # ``_start_attempted`` here, every subsequent cycle
-                    # would short-circuit on the sticky flag and
-                    # surfacing would stay permanently off in exactly
-                    # the slow-startup environments this patch targets.
-                    # Propagate per the cooperative cancellation
-                    # contract (#290).
+                    # ``asyncio.wait_for``). The in-flight start keeps
+                    # running abandoned in the owner task (#664); reset
+                    # the sticky flag so the next call re-enters this
+                    # path instead of short-circuiting — its start op
+                    # then either no-ops on ``_do_start``'s session
+                    # guard (the abandoned start succeeded) or genuinely
+                    # retries (it failed). Propagate per the cooperative
+                    # cancellation contract (#290).
                     self._start_attempted = False
                     raise
                 except Exception as exc:

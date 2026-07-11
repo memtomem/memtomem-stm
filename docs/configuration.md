@@ -126,9 +126,11 @@ export MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH=~/.memtomem/stm_feedbac
 
 ```bash
 export MEMTOMEM_STM_SURFACING__ENABLED=true
+export MEMTOMEM_STM_SURFACING__WARMUP_ENABLED=true          # background LTM warm-up at startup (#664); false = lazy-only first-use start
 export MEMTOMEM_STM_SURFACING__MIN_SCORE=0.03
 export MEMTOMEM_STM_SURFACING__MAX_RESULTS=3
 export MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS=5000
+export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3.0         # cold-start escape hatch: raise past the LTM child's model-load time (#664)
 export MEMTOMEM_STM_SURFACING__FEEDBACK_ENABLED=true
 export MEMTOMEM_STM_SURFACING__AUTO_TUNE_ENABLED=true
 export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=0       # 0=disabled; >0 expands ±N adjacent chunks

@@ -994,9 +994,11 @@ class _OkSession:
     """Fake ClientSession serving a canned compact mem_search hit.
 
     ``initialize`` optionally blocks on ``record["init_gate"]`` so a test can
-    park the start op *after* the transport context is registered on the
-    exit stack — exercising the rollback path that must aclose an
-    already-entered transport in the owner task.
+    park the start op *after* the transport context is registered on the exit
+    stack, and raises once when ``record["init_raise_once"]`` is set — so a
+    test can fail exactly one (possibly abandoned, #664) start attempt.
+    ``call_tool`` counts invocations in ``record["call_tool_count"]`` so a
+    test can assert no RPC ever reached a half-initialized session.
     """
 
     def __init__(self, record: dict):
@@ -1012,8 +1014,11 @@ class _OkSession:
         gate = self._record.get("init_gate")
         if gate is not None:
             await gate.wait()
+        if self._record.pop("init_raise_once", False):
+            raise RuntimeError("initialize failed once")
 
     async def call_tool(self, _name, _args):
+        self._record["call_tool_count"] = self._record.get("call_tool_count", 0) + 1
         return _result_with_text(_COMPACT_HIT)
 
 
@@ -1086,57 +1091,254 @@ class TestOwnerTaskLifecycle:
         assert adapter._owner_task is None
 
     @pytest.mark.asyncio
-    async def test_caller_cancelled_mid_start_owner_survives(self, monkeypatch):
+    async def test_caller_cancelled_mid_start_abandons_op_and_warms(self, monkeypatch):
         """Outer wait_for cancels the caller while the start op is in flight
-        in the owner: rollback runs in the owner task, the sticky flag
-        resets, and the owner keeps serving the next attempt.
+        in the owner: the op is ABANDONED — it keeps running in the owner
+        task and publishes the session when done — instead of being rolled
+        back (#664).
 
-        Regression for the cancellation half of #663 (round-2): the start is
-        parked at ``initialize`` — *after* the transport is registered on the
-        exit stack — so a broken cancel path (one that let the orphaned start
-        complete) would leak that transport. The fix cancels the owner
-        in-flight (via ``asyncio.shield`` on the request future), rolling the
-        transport back in-task, so its id lands in ``exited_ids`` and the
-        final stop leaves no transport entered-but-unclosed.
+        Regression for the never-warms loop: the surfacing timeout (3s) is
+        below the LTM cold start (~9s ONNX model load), so rolling the start
+        back on every caller timeout meant every cycle re-paid the full cold
+        start and the LTM never reached a warm state. The start is parked at
+        ``initialize`` — after the transport is registered on the exit stack
+        — the caller times out, and the SAME start attempt must finish: the
+        next call meets the warm session with no second transport enter.
         """
         record: dict = {}
         init_gate = asyncio.Event()
-        record["init_gate"] = init_gate  # block the start at initialize()
+        record["init_gate"] = init_gate  # park the start at initialize()
         adapter = self._adapter(monkeypatch, record)
 
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(adapter.search("q"), timeout=0.05)
 
-        # The start blocked at initialize(), so its transport is already
-        # entered by the time the caller times out.
         first_id = record["last_entered_id"]
+        # The sticky flag resets so a retry stays possible, but the in-flight
+        # start is NOT rolled back: its transport stays entered, the owner
+        # stays alive serving it.
+        assert adapter._start_attempted is False
+        assert adapter._session is None
+        owner = adapter._owner_task
+        assert owner is not None and not owner.done(), "op cancel must not kill the owner"
+        await asyncio.sleep(0.02)  # give a broken (rollback) path time to land
+        assert first_id not in record.get("exited_ids", []), (
+            "timed-out start must be abandoned to finish warming, not rolled back"
+        )
 
-        # owner.cancel() is scheduled from _submit's handler; the rollback
-        # then runs in the owner task on a later turn. Yield until it lands.
+        # Let the abandoned start finish: it publishes the session.
+        init_gate.set()
+        for _ in range(100):
+            if adapter._session is not None:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("abandoned start never completed and published the session")
+
+        # The next call meets the warm session — same transport, no respawn.
+        _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
+        assert outcome == "ok"
+        assert record["enters"] == 1, "the abandoned start must warm the ONE child"
+
+        await adapter.stop()
+        # The single transport ever entered is exited by stop — nothing leaked.
+        assert record["exited_ids"] == [first_id]
+
+    @pytest.mark.asyncio
+    async def test_no_rpc_reaches_half_initialized_session(self, monkeypatch):
+        """While an abandoned start is still parked inside ``initialize()``,
+        the session must not be visible: ``_session`` publishes only after
+        the full handshake (#664), so a second caller during the warm-up
+        window degrades on its own timeout instead of issuing ``call_tool``
+        against a session that never completed ``initialize``."""
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        adapter = self._adapter(monkeypatch, record)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q1"), timeout=0.05)
+
+        # Abandoned start is mid-initialize: not published, no RPC possible.
+        assert adapter._session is None
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q2"), timeout=0.05)
+        assert adapter._session is None
+        assert record.get("call_tool_count", 0) == 0, (
+            "no call_tool may reach a session that has not finished initialize()"
+        )
+
+        init_gate.set()
+        for _ in range(100):
+            if adapter._session is not None:
+                break
+            await asyncio.sleep(0)
+        _, _, outcome = await asyncio.wait_for(adapter.search("q3"), timeout=1.0)
+        assert outcome == "ok"
+        assert record["enters"] == 1  # q2's queued start op was skipped, not run
+
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_session_publishes_only_after_negotiation(self, monkeypatch):
+        """The publication contract covers format negotiation too: with
+        ``result_format="structured"``, ``_do_start`` issues the version
+        ``call_tool`` before publishing — while that call is parked,
+        ``_session`` stays ``None`` and a concurrent search cannot issue
+        ``mem_search`` (#664 review follow-up)."""
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        record: dict = {}
+        neg_gate = asyncio.Event()
+
+        class _GatedNegotiationSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def initialize(self):
+                return None
+
+            async def call_tool(self, name, args):
+                record.setdefault("call_tools", []).append((name, args))
+                if args == {"action": "version"}:
+                    record["version_started"] = True
+                    await neg_gate.wait()
+                    return _result_with_text(
+                        json.dumps({"capabilities": {"search_formats": ["structured"]}})
+                    )
+                return _result_with_text(json.dumps({"results": [], "hints": []}))
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: _TrackingTransport(record))
+        monkeypatch.setattr(mod, "ClientSession", lambda *_a, **_k: _GatedNegotiationSession())
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+
+        start_task = asyncio.create_task(adapter.start())
+        for _ in range(100):
+            if record.get("version_started"):
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("version negotiation call never started")
+
+        # initialize() succeeded but negotiation is in flight: not published.
+        assert adapter._session is None
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+        assert adapter._session is None
+        assert all(args == {"action": "version"} for _, args in record["call_tools"]), (
+            "no mem_search may be issued before negotiation completes"
+        )
+
+        neg_gate.set()
+        await asyncio.wait_for(start_task, timeout=1.0)
+        assert adapter._session is not None
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_second_start_op_noops_after_abandoned_start_succeeds(self, monkeypatch):
+        """The double-start race (#664): caller 1 times out (start abandoned,
+        sticky flag reset), caller 2 re-arms the flag and queues a SECOND
+        start op behind the abandoned one. Once the abandoned op publishes
+        the session, the second op must no-op on ``_do_start``'s session
+        guard — running it would overwrite ``_stack`` and leak the live
+        transport/child."""
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        adapter = self._adapter(monkeypatch, record)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        # Caller 2 without a timeout: its start op queues behind the
+        # abandoned in-flight one and waits for the owner to serve it.
+        second_start = asyncio.create_task(adapter.start())
+        await asyncio.sleep(0.01)
+
+        init_gate.set()
+        await asyncio.wait_for(second_start, timeout=1.0)
+        assert adapter._session is not None
+        assert record["enters"] == 1, "second start op must no-op, not respawn"
+
+        _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
+        assert outcome == "ok"
+
+        await adapter.stop()
+        assert record["exited_ids"] == [record["last_entered_id"]]
+
+    @pytest.mark.asyncio
+    async def test_abandoned_start_failure_allows_genuine_retry(self, monkeypatch):
+        """If the ABANDONED start ultimately fails, nothing was published, so
+        the next call's start op is a genuine retry (the session guard does
+        not fire) — failure of an abandoned attempt must not wedge surfacing
+        off (#664)."""
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        record["init_raise_once"] = True  # first attempt fails after the gate
+        adapter = self._adapter(monkeypatch, record)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        first_id = record["last_entered_id"]
+        init_gate.set()
+        # The abandoned attempt fails and rolls back its own transport.
         for _ in range(100):
             if first_id in record.get("exited_ids", []):
                 break
             await asyncio.sleep(0)
         else:
-            pytest.fail("timed-out start's transport was never rolled back")
-
-        assert adapter._start_attempted is False
+            pytest.fail("failed abandoned start never rolled back its transport")
         assert adapter._session is None
-        owner = adapter._owner_task
-        assert owner is not None and not owner.done(), "op cancel must not kill the owner"
-        # The in-flight start was cancelled and rolled back IN the owner task,
-        # so the already-entered transport is exited (not left orphaned/leaked).
-        assert first_id in record.get("exited_ids", []), (
-            "timed-out start must roll its transport back, not leak it"
-        )
 
-        record["init_gate"] = None  # let the retry's start complete
+        # Next call retries for real (flag was reset by the caller cancel).
         _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
         assert outcome == "ok"
-        assert record["enters"] == 2  # first attempt rolled back, second succeeded
+        assert record["enters"] == 2
 
         await adapter.stop()
-        # Every transport ever entered has been exited — nothing leaked.
+        assert sorted(record["exited_ids"]) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_mid_reconnect_clears_flag_owner_side(self, monkeypatch):
+        """A caller cancelled mid-reconnect abandons the op; when the owner
+        finishes it, the owner clears ``_needs_reconnect`` itself — otherwise
+        the next call would run a redundant close+start cycle against the
+        fresh session the abandoned reconnect just built (#664)."""
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+        await adapter.start()
+        assert record["enters"] == 1
+
+        adapter._needs_reconnect = True
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate  # park the reconnect's start half
+
+        caller = asyncio.create_task(adapter.search("q"))
+        await asyncio.sleep(0.01)  # heal path entered _reconnect, parked
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        init_gate.set()
+        for _ in range(100):
+            if not adapter._needs_reconnect:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("abandoned reconnect never cleared _needs_reconnect")
+        assert adapter._session is not None
+
+        record["init_gate"] = None
+        _, _, outcome = await asyncio.wait_for(adapter.search("q2"), timeout=1.0)
+        assert outcome == "ok"
+        assert record["enters"] == 2, "next RPC must not reconnect again"
+
+        await adapter.stop()
         assert sorted(record["exited_ids"]) == [1, 2]
 
     @pytest.mark.asyncio
@@ -1224,19 +1426,14 @@ class TestOwnerTaskLifecycle:
         assert adapter._owner_task is not None and adapter._owner_task.done()
 
     @pytest.mark.asyncio
-    async def test_shutdown_cancel_not_absorbed_as_op_cancel(self, monkeypatch):
-        """Shutdown precedence (#663 round-3): ``_op_cancel_pending`` is a
-        shared flag. If a caller timeout armed op-recovery and then ``stop()``
-        cancels the same owner, the owner must give shutdown precedence and
-        exit — not absorb the cancellation and resume serving (which, because
-        ``stop()``'s ``wait_for(owner)`` waits for the task to finish, would
-        defeat the bounded join).
-
-        Reproduces the exact race state the ordering creates — ``stop()`` has
-        set ``_stopped`` while a prior caller-cancel left ``_op_cancel_pending``
-        set — and cancels the owner while it is between ops. With the fix the
-        owner exits; without it the owner uncancels and loops back to
-        ``queue.get()``, never finishing.
+    async def test_shutdown_cancel_exits_owner(self, monkeypatch):
+        """Shutdown precedence (#663 round-3): when ``stop()`` has set
+        ``_stopped`` and its bounded join cancels the owner, the owner must
+        exit — not treat the cancellation as recoverable and resume serving
+        (which, because ``stop()``'s ``wait_for(owner)`` waits for the task
+        to finish, would defeat the bounded join). Cancels the owner while it
+        is between ops; with the fix the owner exits, without it the owner
+        uncancels and loops back to ``queue.get()``, never finishing.
         """
         record: dict = {}
         adapter = self._adapter(monkeypatch, record)
@@ -1244,8 +1441,7 @@ class TestOwnerTaskLifecycle:
         owner = adapter._owner_task
         assert owner is not None and not owner.done()
 
-        # The race window: a caller-cancel armed op-recovery, stop() has begun.
-        adapter._op_cancel_pending = True
+        # The race window: stop() has begun, its bounded join cancels the owner.
         adapter._stopped = True
         owner.cancel()
 
@@ -1259,3 +1455,118 @@ class TestOwnerTaskLifecycle:
         # A subsequent stop() is a clean no-op (owner already gone).
         await asyncio.wait_for(adapter.stop(), timeout=1.0)
         assert adapter._stack is None and adapter._session is None
+
+
+# ── Background warm-up (#664 PR 2) ───────────────────────────────────────
+
+
+class TestWarmUp:
+    """``warm_up()`` pre-warms the LTM child from a host-owned background
+    task, pre-paying the ~9s cold start so a surfacing call that arrives
+    after it completes meets a warm session (#664). It is best-effort:
+    failures are swallowed and never arm the lazy-start sticky flag, so
+    ``_heal_if_needed`` keeps its one lazy retry on first real use.
+    """
+
+    def _adapter(self, monkeypatch, record: dict, gate: asyncio.Event | None = None):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: _TrackingTransport(record, gate))
+        monkeypatch.setattr(mod, "ClientSession", lambda *_a, **_k: _OkSession(record))
+        return McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+
+    @pytest.mark.asyncio
+    async def test_warm_up_publishes_session_and_first_search_reuses_it(self, monkeypatch):
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+
+        await adapter.warm_up()
+        assert adapter._session is not None
+        assert adapter._start_attempted is False, "warm_up must not arm the lazy-start gate"
+
+        _, _, outcome = await adapter.search("q")
+        assert outcome == "ok"
+        assert record["enters"] == 1, "first search must reuse the warmed child"
+
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_warm_up_failure_swallowed_and_lazy_retry_intact(self, monkeypatch):
+        record: dict = {"init_raise_once": True}
+        adapter = self._adapter(monkeypatch, record)
+
+        await adapter.warm_up()  # must not raise
+        assert adapter._session is None
+        assert adapter._start_attempted is False, (
+            "a failed warm-up must leave the lazy retry available"
+        )
+
+        # First real call performs the one lazy retry and succeeds.
+        _, _, outcome = await adapter.search("q")
+        assert outcome == "ok"
+        assert record["enters"] == 2, "lazy retry must spawn a fresh transport"
+
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_warming_property_during_inflight_start(self, monkeypatch):
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        adapter = self._adapter(monkeypatch, record)
+        assert adapter.warming is False, "fresh adapter is not warming"
+
+        task = asyncio.create_task(adapter.warm_up())
+        for _ in range(100):
+            if adapter.warming:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("warming never became True while start was in flight")
+        assert adapter._session is None
+
+        init_gate.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        assert adapter._session is not None
+        assert adapter.warming is False, "published session ends the warming window"
+
+        await adapter.stop()
+        assert adapter.warming is False
+
+    @pytest.mark.asyncio
+    async def test_warm_up_cancel_abandons_inflight_start(self, monkeypatch):
+        """Cancelling the host's warm-up task (shutdown, or just teardown
+        racing a slow start) abandons the in-flight op per #664: the start
+        finishes in the owner task and still publishes the session."""
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        adapter = self._adapter(monkeypatch, record)
+
+        task = asyncio.create_task(adapter.warm_up())
+        for _ in range(100):
+            if adapter.warming:
+                break
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        first_id = record["last_entered_id"]
+        owner = adapter._owner_task
+        assert owner is not None and not owner.done(), "cancel must not kill the owner"
+        await asyncio.sleep(0.02)
+        assert first_id not in record.get("exited_ids", []), (
+            "cancelled warm-up must abandon the start, not roll it back"
+        )
+
+        init_gate.set()
+        for _ in range(100):
+            if adapter._session is not None:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("abandoned warm-up start never published the session")
+
+        await adapter.stop()
+        assert record["exited_ids"] == [first_id]
