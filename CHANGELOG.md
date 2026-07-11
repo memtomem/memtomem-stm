@@ -9,7 +9,37 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.1.33] — 2026-07-11
+
+### Upgrade notes
+
+- **Per-server retry/timeout/cache knobs now hot-reload** (#660): `max_retries`,
+  `call_timeout_seconds`, `overall_deadline_seconds`, reconnect delays,
+  `cache`, and `cache_ttl_seconds` previously froze at connect time; they are
+  now read per call from the hot-reloaded config. Connection-affecting edits
+  (`transport`/`url`/`headers`/`command`/`args`/`env`) reconnect live on the
+  next uncached call. `prefix` and `circuit_*` stay restart-only.
+- **`connect_timeout_seconds` is now an end-to-end connect/discovery
+  deadline** (#660): one shared budget over transport entry, MCP
+  `initialize()`, and `tools/list` — previously only `initialize()` was
+  bounded, so a hung connect or stalled discovery blocked forever.
+- **One-time response-cache wipe on first start after upgrading** (#659,
+  #655): the cache narrows to envelope-safe rows (successful, text-only, no
+  `structuredContent`/`_meta`) and the key gains the call's `_context_query`
+  plus a compression-config fingerprint; both changes bump the cache schema,
+  purging existing rows once (entries repopulate on use).
+- **Non-text upstream errors now surface as tool errors** (#659): previously
+  they were returned as successful non-text responses.
+- **New config files write `"tool_annotation_policy": "strict"`** (#658):
+  fresh setups cache only tools declaring `readOnlyHint: true`. Existing
+  configs keep the `conservative` default and are never retro-migrated;
+  loading one logs a migration advisory.
+- **`mms add` rejects a duplicate `--prefix`** (#654): exit 1 with the config
+  file untouched, instead of warning and saving a config the runtime
+  validator then refuses to load.
+- **Registration aborts on a corrupt `.mcp.json`** (#653): `mms init` /
+  `mms register` now fail with exit 1 and leave the file byte-identical,
+  instead of "succeeding" by overwriting it with only the memtomem-stm entry.
 
 ### Added
 
@@ -21,14 +51,14 @@ changes inline only. See the deprecation policy in
   `PASS`/`WARN`/`FAIL` with a runnable `next:` command; exit code is 1 on
   any FAIL and 0 on WARN-only, making doctor the scriptable success gate
   for a fresh install. The LTM check never FAILs — an unconfigured or
-  unreachable LTM only disables memory surfacing, not the proxy core.
+  unreachable LTM only disables memory surfacing, not the proxy core. (#661)
 - Staged probe results in `mms health` / `mms add --validate`: a failing
   upstream now reports the last stage that completed (`configured →
   transport connected → MCP initialized → tools discovered`) instead of a
   bare boolean, so a dead binary, a broken MCP handshake, and a failing
   `tools/list` are distinguishable. `health --json` server entries gain
   additive `stage` / `failed_stage` / `transport` keys (existing
-  `connected` / `tools` / `overflowing` / `error` fields unchanged).
+  `connected` / `tools` / `overflowing` / `error` fields unchanged). (#661)
 - Live reconnect for connection-affecting per-server config edits.
   Hot-reloaded changes to `transport` / `url` / `headers` / `command` /
   `args` / `env` (and `connect_timeout_seconds` on network transports) are
@@ -45,6 +75,7 @@ changes inline only. See the deprecation policy in
   table already promised. A successful config-change reconnect also closes
   the upstream's circuit breaker, so a fixed `url` isn't fast-failed by the
   old config's failure streak. `prefix` and `circuit_*` stay restart-only.
+  (#660)
 - **Behavior change**: `connect_timeout_seconds` is now an end-to-end
   connect/discovery deadline — one shared budget over transport entry
   (process spawn / HTTP connect), MCP `initialize()`, and the `tools/list`
@@ -56,7 +87,7 @@ changes inline only. See the deprecation policy in
   `timeout=` (the stream read timeout stays at the SDK default). The
   per-upstream timeout contract (connect/discovery vs per-attempt
   `call_timeout_seconds` vs `overall_deadline_seconds`) is now documented
-  in `docs/configuration.md`.
+  in `docs/configuration.md`. (#660)
 - MCP result-envelope preservation through the proxy. tools/list now
   advertises the upstream tool's `outputSchema` and `_meta`; call results
   carrying `structuredContent` or result-level `_meta` return them verbatim
@@ -68,7 +99,7 @@ changes inline only. See the deprecation policy in
   `structuredContent`/`_meta` are stored (errors and non-text responses
   were already uncached) — and the cache schema bump wipes existing rows
   once on first start after upgrading (one-time cold start; entries
-  repopulate on use).
+  repopulate on use). (#659)
 - **Behavior change**: new config files are created with an explicit
   `"cache": {"tool_annotation_policy": "strict"}` — `mms init`, `mms add`
   against a missing config, and `mms add --from-clients` all write it, so
@@ -79,6 +110,7 @@ changes inline only. See the deprecation policy in
   suppressed when the cache is disabled or an env override sets the
   policy). The per-tool / per-server `cache: true` override is the
   strict-mode allowlist for un-annotated read-only tools — no new setting.
+  (#658)
 - `mms add --header KEY=VALUE` (repeatable) registers HTTP headers for
   `sse` / `streamable_http` upstreams. Headers now also flow through
   `--from-clients` / `mms init` import discovery and the `mms add
@@ -97,13 +129,13 @@ changes inline only. See the deprecation policy in
   own `env` and `headers` values and URL credentials (longest-first,
   empty-safe replacement) before display — previously an upstream
   exception that embedded an Authorization header (e.g. a 401 body)
-  reached the terminal and `--json` output verbatim.
+  reached the terminal and `--json` output verbatim. (#661)
 - **Behavior change**: a non-text-only (or empty-content) upstream error
   now surfaces as a tool error. Previously the no-text passthrough
   early-return ran before the `isError` check, so such an error was
   returned to the client as a successful non-text response; it now raises
   with a `[upstream error: non-text error content]` placeholder message
-  and is recorded as an upstream error in the metrics.
+  and is recorded as an upstream error in the metrics. (#659)
 - `mms add`'s `invalid_env` diagnostics no longer echo the raw `--env`
   argument: a malformed pair (`--env =tok`, or a bare token missing `KEY=`)
   is likely a stray credential, and both stderr and the `--json` error
@@ -130,6 +162,16 @@ changes inline only. See the deprecation policy in
   one shared module (`proxy/prefixes.py`) used by both the CLI pre-save
   checks and the runtime `ProxyConfig` validators, so the two sides cannot
   diverge again. (#654)
+- **Behavior change**: client registration (`mms init` / `mms register`) now
+  aborts when the target directory's `.mcp.json` cannot be parsed or merged,
+  instead of overwriting it. The writer fell back to `{}` when the existing
+  file was unreadable or invalid JSON — the subsequent write silently
+  discarded every registration already in the file — and replaced a
+  valid-but-wrong-shape top level or `mcpServers` wholesale. Registration now
+  fails with exit 1 and leaves the file byte-identical, reporting the JSON
+  parse position and a recovery hint; a missing file still creates a fresh
+  one, and a valid file still merges, preserving sibling registrations and
+  unknown top-level fields. (#653)
 
 ## [0.1.32] — 2026-07-05
 
