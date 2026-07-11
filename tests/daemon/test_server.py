@@ -727,8 +727,10 @@ async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
 
 async def test_daemon_warmup_warms_ltm_without_a_surface_call(tmp_path: Path) -> None:
     # End-to-end for #664 PR 2: with warmup_enabled the daemon's startup task
-    # warms the (fake) stdio LTM child on its own — no hook/surface traffic —
-    # so the FIRST surfacing call meets a warm session.
+    # warms the (fake) stdio LTM child on its own — no hook/surface traffic.
+    # Once it publishes the session (polled below), a call meets a warm
+    # session; the warm-up only pre-pays the cold start, it does not
+    # guarantee the very first call arrives after it completes.
     cfg = _config(tmp_path)
     cfg.surfacing.warmup_enabled = True
     cfg.surfacing.ltm_mcp_command = sys.executable

@@ -1462,9 +1462,10 @@ class TestOwnerTaskLifecycle:
 
 class TestWarmUp:
     """``warm_up()`` pre-warms the LTM child from a host-owned background
-    task so even the FIRST surfacing call meets a warm session (#664). It is
-    best-effort: failures are swallowed and never arm the lazy-start sticky
-    flag, so ``_heal_if_needed`` keeps its one lazy retry on first real use.
+    task, pre-paying the ~9s cold start so a surfacing call that arrives
+    after it completes meets a warm session (#664). It is best-effort:
+    failures are swallowed and never arm the lazy-start sticky flag, so
+    ``_heal_if_needed`` keeps its one lazy retry on first real use.
     """
 
     def _adapter(self, monkeypatch, record: dict, gate: asyncio.Event | None = None):
