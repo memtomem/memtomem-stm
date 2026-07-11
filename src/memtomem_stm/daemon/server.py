@@ -319,16 +319,16 @@ class DaemonServer:
     async def _stop_adapter(self) -> None:
         """Stop the LTM adapter without leaking its warm child process.
 
-        The adapter lazy-starts inside whichever connection-handler task
-        first needed LTM, so the stdio transport's anyio cancel scopes belong
-        to that (long-finished) task. Exiting them here — the serve task —
-        makes anyio raise its cross-task cancel-scope RuntimeError partway
-        through the transport's unwind, leaving the warm LTM child's reaping
-        unverified (today's mcp happens to terminate the child before the
-        scope exit, but that ordering is an implementation detail). When the
-        stop fails for any reason, sweep: a direct child present both before
-        and after a failed stop is the leaked LTM child — this process spawns
-        no other children — so terminate it.
+        Since #663 the adapter marshals its lifecycle ops through an internal
+        owner task, so scope enter/exit happen in the same task and
+        ``adapter.stop()`` is expected to succeed cleanly from here. The
+        sweep below is retained as belt-and-braces: if the owner task itself
+        was lost (external cancellation mid-lifetime), the contexts are
+        abandoned rather than exited and the warm LTM child can still leak.
+        A direct child present both before and after a failed stop is the
+        leaked LTM child — this process spawns no other children — so
+        terminate it. (Sweep removal is tracked as a follow-up once #663
+        has soaked.)
         """
         before = _direct_child_pids()
         try:

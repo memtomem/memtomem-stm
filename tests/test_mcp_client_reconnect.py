@@ -619,6 +619,10 @@ class TestStartCleansUpOnFailure:
         assert adapter._stack is None
         assert adapter._session is None
 
+        # start() now marshals to the adapter's owner task (#663) — join it
+        # so no pending task leaks into event-loop teardown.
+        await adapter.stop()
+
 
 # ── c.text=None tolerance (PR #114 parity) ──────────────────────────────
 
@@ -946,3 +950,205 @@ class TestLazyStart:
         assert attempt == 2
         assert outcome in {"ok", "empty_content", "empty_results"}
         assert adapter._session is mock_session
+
+
+# ── Owner-task lifecycle (#663) ──────────────────────────────────────────
+
+
+_COMPACT_HIT = "[1] 0.90 | [default] note.md\nowner task test content"
+
+
+class _TrackingTransport:
+    """Fake stdio transport recording which task enters/exits its context."""
+
+    def __init__(self, record: dict, gate: asyncio.Event | None = None):
+        self._record = record
+        self._gate = gate
+
+    async def __aenter__(self):
+        self._record["enter_task"] = asyncio.current_task()
+        self._record["enters"] = self._record.get("enters", 0) + 1
+        if self._gate is not None:
+            await self._gate.wait()
+        return (MagicMock(), MagicMock())
+
+    async def __aexit__(self, *args):
+        self._record["exit_task"] = asyncio.current_task()
+        return None
+
+
+class _OkSession:
+    """Fake ClientSession serving a canned compact mem_search hit."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def initialize(self):
+        pass
+
+    async def call_tool(self, _name, _args):
+        return _result_with_text(_COMPACT_HIT)
+
+
+class TestOwnerTaskLifecycle:
+    """#663: lifecycle ops must enter AND exit the transport/session contexts
+    in one dedicated owner task. Under lazy start the first RPC arrives in a
+    short-lived request-handler task; entering anyio cancel scopes there
+    corrupted that task's scope stack on exit (killing the STM server right
+    after the first successful surfacing) and made ``stop()`` from the
+    lifespan task raise the cross-task cancel-scope RuntimeError."""
+
+    def _adapter(self, monkeypatch, record: dict, gate: asyncio.Event | None = None):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: _TrackingTransport(record, gate))
+        monkeypatch.setattr(mod, "ClientSession", _OkSession)
+        # result_format pinned to compact so no version negotiation runs.
+        return McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+
+    @pytest.mark.asyncio
+    async def test_contexts_enter_and_exit_in_owner_task(self, monkeypatch):
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+
+        async def caller():
+            _, _, outcome = await adapter.search("q")
+            assert outcome == "ok"
+            return asyncio.current_task()
+
+        caller_task = asyncio.create_task(caller())
+        await caller_task
+        assert record["enter_task"] is not caller_task, (
+            "contexts must not be entered in the request task"
+        )
+
+        # Stop from yet another task: exit must still happen in the task
+        # that entered (the owner), and nothing may raise.
+        await asyncio.create_task(adapter.stop())
+        assert record["exit_task"] is record["enter_task"]
+
+    @pytest.mark.asyncio
+    async def test_lazy_start_survives_request_task_exit(self, monkeypatch):
+        """The #663 shape: the request task that triggered the lazy start
+        exits, a later request from a different task still works, and a
+        final stop from the main task is clean."""
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+
+        await asyncio.create_task(adapter.search("first"))  # task exits after this
+        results, _, outcome = await asyncio.create_task(adapter.search("second"))
+        assert outcome == "ok"
+        assert len(results) == 1
+        assert record["enters"] == 1  # one session, reused across tasks
+
+        await adapter.stop()
+        assert adapter._session is None
+        assert adapter._owner_task is not None and adapter._owner_task.done()
+
+    @pytest.mark.asyncio
+    async def test_stop_before_start_and_double_stop_and_rpc_after_stop(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+
+        await adapter.stop()  # stop before any start: no-op, no owner spawned
+        assert adapter._owner_task is None
+        await adapter.stop()  # idempotent
+
+        # RPC after stop must degrade fast, not hang or spawn anything.
+        results, hints, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
+        assert (results, hints, outcome) == ([], [], "no_session")
+        assert adapter._owner_task is None
+
+    @pytest.mark.asyncio
+    async def test_caller_cancelled_mid_start_owner_survives(self, monkeypatch):
+        """Outer wait_for cancels the caller while the start op is in flight
+        in the owner: rollback runs in the owner task, the sticky flag
+        resets, and the owner keeps serving the next attempt."""
+        record: dict = {}
+        gate = asyncio.Event()
+        adapter = self._adapter(monkeypatch, record, gate)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(adapter.search("q"), timeout=0.05)
+
+        assert adapter._start_attempted is False
+        assert adapter._session is None
+        owner = adapter._owner_task
+        assert owner is not None and not owner.done(), "op cancel must not kill the owner"
+
+        gate.set()
+        _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
+        assert outcome == "ok"
+        assert record["enters"] == 2  # first attempt rolled back, second succeeded
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_caller_cancelled_while_queued_op_is_skipped(self, monkeypatch):
+        record: dict = {}
+        gate = asyncio.Event()
+        adapter = self._adapter(monkeypatch, record, gate)
+
+        t1 = asyncio.create_task(adapter.start())
+        await asyncio.sleep(0.01)  # owner picked up op1, blocked on the gate
+        t2 = asyncio.create_task(adapter.start())
+        await asyncio.sleep(0.01)  # op2 queued behind op1
+        t2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t2
+
+        gate.set()
+        await t1  # op1 unaffected by op2's abandonment
+        assert adapter._session is not None
+        assert record["enters"] == 1, "abandoned queued op must not run"
+        owner = adapter._owner_task
+        assert owner is not None and not owner.done()
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_owner_crash_recovers_without_hanging(self, monkeypatch):
+        """If the owner task is lost to an external cancellation, in-flight
+        RPCs on the existing session keep working and the next lifecycle op
+        recreates the owner instead of hanging on a dead queue."""
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+
+        await adapter.start()
+        owner = adapter._owner_task
+        assert owner is not None
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+
+        # call_tool is task-agnostic — the surviving session still serves.
+        _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
+        assert outcome == "ok"
+
+        # A lifecycle op recreates the owner rather than hanging.
+        await asyncio.wait_for(adapter._reconnect(), timeout=1.0)
+        assert adapter._owner_task is not owner
+        assert adapter._session is not None
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_unblocks_stuck_start_caller(self, monkeypatch):
+        """stop() against an owner stuck mid-start must cancel the op
+        in-task, resolve the stuck caller (→ no_session), and return in
+        bounded time."""
+        record: dict = {}
+        gate = asyncio.Event()  # never set — start blocks forever
+        adapter = self._adapter(monkeypatch, record, gate)
+        adapter._STOP_TIMEOUT_SECONDS = 0.2  # type: ignore[misc]
+
+        t1 = asyncio.create_task(adapter.search("q"))
+        await asyncio.sleep(0.05)  # owner blocked inside the transport enter
+
+        await asyncio.wait_for(adapter.stop(), timeout=2.0)
+
+        results, hints, outcome = await asyncio.wait_for(t1, timeout=1.0)
+        assert (results, hints, outcome) == ([], [], "no_session")
+        assert adapter._owner_task is not None and adapter._owner_task.done()

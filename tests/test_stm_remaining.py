@@ -595,8 +595,10 @@ class TestMcpClientSearchAdapter:
         mock_session = AsyncMock()
         mock_session.call_tool.side_effect = ConnectionError("lost")
         adapter._session = mock_session
-        # Prevent reconnect from hitting a real server
-        adapter.start = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
+        # Prevent reconnect from hitting a real server. Mock ``_reconnect``
+        # itself: since #663 the real ``_reconnect`` marshals to the owner
+        # task's ``_do_start`` and no longer routes through ``start()``.
+        adapter._reconnect = AsyncMock(side_effect=ConnectionError("reconnect failed"))  # type: ignore[method-assign]
 
         results, hints, outcome = await adapter.search("query")
         assert results == []

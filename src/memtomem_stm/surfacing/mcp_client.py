@@ -228,6 +228,21 @@ def get_parser(fmt: str = "compact") -> ResultParser:
 _compact_parser = CompactResultParser()
 
 
+@dataclass
+class _OwnerRequest:
+    """A lifecycle op marshalled to the adapter's owner task (#663).
+
+    ``fut`` mirrors the op's outcome back to the submitting caller.
+    ``cancel_requested`` marks a request whose caller was cancelled while
+    the request was still queued — the owner skips it instead of running
+    an op nobody is waiting for.
+    """
+
+    op: Literal["start", "reconnect", "close"]
+    fut: asyncio.Future[None]
+    cancel_requested: bool = False
+
+
 class McpClientSearchAdapter:
     """Connects to a memtomem MCP server and calls mem_search.
 
@@ -257,9 +272,41 @@ class McpClientSearchAdapter:
         # lifespan behavior).
         self._start_attempted = False
         self._start_lock = asyncio.Lock()
+        # #663: anyio cancel scopes are task-affine — the transport/session
+        # contexts entered by ``_do_start`` MUST be exited by the same task.
+        # Under lazy start (#338) the first RPC arrives in a short-lived
+        # request-handler task of the lowlevel MCP server; entering the
+        # contexts there corrupted that task's scope stack when it exited
+        # (killing the whole STM server right after the first successful
+        # surfacing) and made a later ``stop()`` from the lifespan task raise
+        # "Attempted to exit cancel scope in a different task than it was
+        # entered in". All lifecycle ops (start / reconnect / close) are
+        # therefore marshalled through a single long-lived owner task that
+        # both enters and exits every context. ``call_tool`` itself rides
+        # anyio memory-object streams and is task-agnostic, so the RPC
+        # bodies (``search`` / ``increment_access`` / ``scratch_list``) keep
+        # running in their caller tasks. A per-op ``anyio.CancelScope`` in
+        # the owner would NOT work instead: the transport scopes entered
+        # inside the op outlive the op (until close), so wrapping them would
+        # violate LIFO scope exit — the very RuntimeError being fixed here.
+        self._requests: asyncio.Queue[_OwnerRequest] = asyncio.Queue()
+        self._owner_task: asyncio.Task[None] | None = None
+        self._current_req: _OwnerRequest | None = None
+        self._op_cancel_pending = False
+        self._stopped = False
 
     async def start(self) -> None:
-        """Connect to the memtomem MCP server."""
+        """Connect to the memtomem MCP server.
+
+        The actual context setup runs in the adapter's owner task (#663);
+        this wrapper only marshals the request and mirrors its outcome —
+        exceptions and cancellation included — back to the caller, so the
+        lazy-start semantics in ``_heal_if_needed`` are unchanged.
+        """
+        await self._submit("start")
+
+    async def _do_start(self) -> None:
+        """Enter the transport/session contexts. Owner-task only (#663)."""
         stack = AsyncExitStack()
         self._stack = stack
         try:
@@ -353,12 +400,174 @@ class McpClientSearchAdapter:
         logger.info("Core does not advertise structured format — falling back to compact")
         self._parser = CompactResultParser()
 
+    # Bounded join for the owner task at ``stop()``. Generous: a healthy
+    # owner only has to finish (or roll back) the current lifecycle op and
+    # aclose the exit stack.
+    _STOP_TIMEOUT_SECONDS = 5.0
+
     async def stop(self) -> None:
-        """Disconnect from the memtomem MCP server."""
-        if self._stack:
-            await self._stack.aclose()
+        """Disconnect from the memtomem MCP server.
+
+        Safe to call from any task: the context teardown runs in the owner
+        task that entered the contexts (#663). Idempotent; stop before any
+        start is a no-op.
+        """
+        self._stopped = True
+        owner = self._owner_task
+        if owner is None or owner.done():
+            # Never started, or the owner already exited. If the owner died
+            # with contexts still open (external cancellation mid-lifetime),
+            # no task can exit those scopes safely anymore — abandon them
+            # (the daemon's leak sweep covers the child process) instead of
+            # tripping the cross-task cancel-scope RuntimeError.
+            if self._stack is not None:
+                logger.warning(
+                    "LTM adapter owner task already gone — abandoning open MCP client contexts"
+                )
             self._stack = None
             self._session = None
+            return
+        req = _OwnerRequest("close", asyncio.get_running_loop().create_future())
+        self._requests.put_nowait(req)
+        try:
+            # ``wait_for`` cancels the owner on timeout (delivered inside the
+            # owner task → any in-flight op rolls back in-task) and awaits it
+            # before raising, so no extra cancel/join pass is needed.
+            await asyncio.wait_for(owner, timeout=self._STOP_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning("LTM adapter owner task did not stop within timeout — cancelled")
+        finally:
+            # The close future may have been failed by the owner's drain
+            # (close queued behind a stuck op) — consume it so it never
+            # surfaces as an "exception was never retrieved" warning.
+            if not req.fut.done():
+                req.fut.cancel()
+            elif not req.fut.cancelled():
+                req.fut.exception()
+            self._stack = None
+            self._session = None
+
+    async def _do_close(self, *, swallow_errors: bool = False) -> None:
+        """Exit the transport/session contexts. Owner-task only (#663)."""
+        if self._stack:
+            try:
+                await self._stack.aclose()
+            except Exception:
+                if not swallow_errors:
+                    raise
+                logger.debug("Error closing MCP client stack during reconnect", exc_info=True)
+            finally:
+                self._stack = None
+                self._session = None
+
+    def _ensure_owner(self) -> asyncio.Task[None]:
+        """Return the live owner task, (re)creating it if needed.
+
+        Created lazily on the first lifecycle op so constructing the adapter
+        in ``app_lifespan`` stays I/O-free (#338). If a previous owner died
+        without ``stop()`` (external cancellation), recreate it so the
+        adapter degrades to "start can be retried" instead of hanging every
+        subsequent caller; the sticky ``_start_attempted`` flag still governs
+        whether a retry actually happens.
+        """
+        owner = self._owner_task
+        if owner is None or owner.done():
+            if owner is not None and not self._stopped:
+                logger.warning("LTM adapter owner task exited unexpectedly — recreating")
+            owner = asyncio.create_task(self._owner_loop(), name="ltm-adapter-owner")
+            self._owner_task = owner
+        return owner
+
+    async def _submit(self, op: Literal["start", "reconnect"]) -> None:
+        """Marshal a lifecycle op to the owner task and await its outcome."""
+        if self._stopped:
+            raise RuntimeError("MCP adapter is stopped")
+        owner = self._ensure_owner()
+        req = _OwnerRequest(op, asyncio.get_running_loop().create_future())
+        self._requests.put_nowait(req)
+        try:
+            await req.fut
+        except asyncio.CancelledError:
+            # The caller was cancelled (SurfacingEngine's ``asyncio.wait_for``
+            # timeout) while the op was queued or in flight. Flag the request
+            # and, if it is the one currently executing, cancel the owner —
+            # the cancellation lands *inside* the owner task, so
+            # ``_do_start``'s rollback acloses the contexts task-locally
+            # (scope-safe); the owner then uncancels itself and keeps
+            # serving. Benign micro-race: if the owner finishes the op
+            # between the ``_current_req`` check and ``owner.cancel()``, the
+            # cancel clips ``queue.get()`` or the next op instead —
+            # ``_op_cancel_pending`` makes the owner swallow it, and at worst
+            # one other caller sees a spurious ``CancelledError`` (engine
+            # records ``error_other`` once).
+            req.cancel_requested = True
+            if self._current_req is req:
+                self._op_cancel_pending = True
+                owner.cancel()
+            raise
+
+    async def _owner_loop(self) -> None:
+        """Serve lifecycle ops in one task so scope enter/exit match (#663)."""
+        try:
+            while True:
+                try:
+                    req = await self._requests.get()
+                    if req.cancel_requested or req.fut.cancelled():
+                        continue  # caller gave up while queued
+                    self._current_req = req
+                    try:
+                        if req.op == "close":
+                            await self._do_close()
+                            if not req.fut.done():
+                                req.fut.set_result(None)
+                            return
+                        if req.op == "reconnect":
+                            # Close-then-start as one atomic op so another
+                            # queued op can never interleave between them.
+                            await self._do_close(swallow_errors=True)
+                        await self._do_start()
+                        if not req.fut.done():
+                            req.fut.set_result(None)
+                    except asyncio.CancelledError:
+                        # If the cancel did NOT come from this op's caller
+                        # (its future would already be cancelled), the caller
+                        # is still awaiting — fail its future so it degrades
+                        # to ``no_session`` instead of hanging forever.
+                        if not req.fut.done():
+                            req.fut.set_exception(RuntimeError("LTM adapter owner task stopped"))
+                        raise
+                    except BaseException as exc:
+                        if not req.fut.done():
+                            req.fut.set_exception(exc)
+                        else:
+                            # Caller already left (cancelled future) — log
+                            # instead of losing the failure entirely.
+                            logger.debug(
+                                "LTM lifecycle op %s failed after caller left: %s",
+                                req.op,
+                                self._scrub_exc(exc),
+                            )
+                    finally:
+                        self._current_req = None
+                except asyncio.CancelledError:
+                    if self._op_cancel_pending:
+                        # Abandoned op, not owner shutdown: absorb the
+                        # cancellation and keep serving.
+                        self._op_cancel_pending = False
+                        task = asyncio.current_task()
+                        if task is not None:
+                            task.uncancel()
+                        continue
+                    raise
+        finally:
+            # Fail-fast everything still queued so no caller ever hangs on
+            # an abandoned future (they surface as ``no_session`` through
+            # ``_heal_if_needed``'s exception path).
+            self._current_req = None
+            while not self._requests.empty():
+                leftover = self._requests.get_nowait()
+                if not leftover.fut.done():
+                    leftover.fut.set_exception(RuntimeError("LTM adapter owner task stopped"))
 
     # Transient failure modes that warrant tearing down and rebuilding the
     # connection. stdio pipe failures surface as OSError / EOFError /
@@ -379,17 +588,18 @@ class McpClientSearchAdapter:
     )
 
     async def _reconnect(self) -> None:
-        """Tear down and re-establish the MCP connection."""
+        """Tear down and re-establish the MCP connection.
+
+        Runs close-then-start as one atomic op in the owner task (#663);
+        close errors are swallowed there, matching the old stop-then-start
+        behavior.
+        """
         logger.info(
             "Attempting MCP adapter reconnect via %s to %s",
             self._config.ltm_mcp_transport,
             self._target_display(),
         )
-        try:
-            await self.stop()
-        except Exception:
-            pass
-        await self.start()
+        await self._submit("reconnect")
         logger.info("MCP adapter reconnected successfully")
 
     async def _heal_if_needed(self) -> bool:

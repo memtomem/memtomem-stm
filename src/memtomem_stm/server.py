@@ -238,7 +238,11 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             # eagerly awaiting ``start()`` here used to block the proxy's
             # own MCP initialize handshake long enough for hosts (e.g.
             # codex with a 60s startup_timeout) to time out and respawn
-            # the proxy, leaving two parallel LTM children.
+            # the proxy, leaving two parallel LTM children. The adapter
+            # runs its lifecycle ops in an internal owner task (#663), so
+            # the deferred start no longer ties anyio cancel scopes to the
+            # request-handler task that happens to trigger it, and the
+            # lifespan ``stop()`` below is task-safe.
             if config.surfacing.enabled:
                 try:
                     from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
