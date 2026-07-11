@@ -959,21 +959,29 @@ _COMPACT_HIT = "[1] 0.90 | [default] note.md\nowner task test content"
 
 
 class _TrackingTransport:
-    """Fake stdio transport recording which task enters/exits its context."""
+    """Fake stdio transport recording which task enters/exits its context.
+
+    Each instance gets a monotonic ``id`` so a test can assert *which*
+    transport was exited — an abandoned (never-aclosed) stack leaves its
+    id out of ``record["exited_ids"]`` entirely.
+    """
 
     def __init__(self, record: dict, gate: asyncio.Event | None = None):
         self._record = record
         self._gate = gate
+        self._id = record["next_id"] = record.get("next_id", 0) + 1
 
     async def __aenter__(self):
         self._record["enter_task"] = asyncio.current_task()
         self._record["enters"] = self._record.get("enters", 0) + 1
+        self._record["last_entered_id"] = self._id
         if self._gate is not None:
             await self._gate.wait()
         return (MagicMock(), MagicMock())
 
     async def __aexit__(self, *args):
         self._record["exit_task"] = asyncio.current_task()
+        self._record.setdefault("exited_ids", []).append(self._id)
         return None
 
 
@@ -1113,13 +1121,21 @@ class TestOwnerTaskLifecycle:
     async def test_owner_crash_recovers_without_hanging(self, monkeypatch):
         """If the owner task is lost to an external cancellation, in-flight
         RPCs on the existing session keep working and the next lifecycle op
-        recreates the owner instead of hanging on a dead queue."""
+        recreates the owner instead of hanging on a dead queue.
+
+        Regression for the crash-recovery half of #663: the replacement
+        owner must NOT aclose the contexts entered by the dead owner (their
+        anyio cancel scopes are affine to that gone task — acloseing them
+        cross-task re-raises the very RuntimeError being fixed). It abandons
+        the stale stack unclosed instead.
+        """
         record: dict = {}
         adapter = self._adapter(monkeypatch, record)
 
         await adapter.start()
         owner = adapter._owner_task
         assert owner is not None
+        stale_id = record["last_entered_id"]  # transport entered by the dead owner
         owner.cancel()
         with pytest.raises(asyncio.CancelledError):
             await owner
@@ -1128,11 +1144,21 @@ class TestOwnerTaskLifecycle:
         _, _, outcome = await asyncio.wait_for(adapter.search("q"), timeout=1.0)
         assert outcome == "ok"
 
-        # A lifecycle op recreates the owner rather than hanging.
+        # A lifecycle op recreates the owner rather than hanging. The stale
+        # contexts are abandoned (not aclosed cross-task), so a fresh
+        # transport is entered.
         await asyncio.wait_for(adapter._reconnect(), timeout=1.0)
         assert adapter._owner_task is not owner
         assert adapter._session is not None
+        assert record["last_entered_id"] != stale_id, "reconnect must enter a fresh transport"
+        assert stale_id not in record.get("exited_ids", []), (
+            "the dead owner's contexts must be abandoned, not aclosed cross-task"
+        )
+
         await adapter.stop()
+        # Final stop closes only the live (post-reconnect) transport; the
+        # stale one stays leaked for the process/daemon sweep to reap.
+        assert stale_id not in record.get("exited_ids", [])
 
     @pytest.mark.asyncio
     async def test_stop_unblocks_stuck_start_caller(self, monkeypatch):

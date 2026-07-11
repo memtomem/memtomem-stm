@@ -474,6 +474,17 @@ class McpClientSearchAdapter:
         if owner is None or owner.done():
             if owner is not None and not self._stopped:
                 logger.warning("LTM adapter owner task exited unexpectedly — recreating")
+                if self._stack is not None:
+                    # The dead owner entered these contexts; their anyio
+                    # cancel scopes are affine to that (now-gone) task, so a
+                    # replacement owner must NEVER aclose them — doing so
+                    # would re-raise the very cross-task cancel-scope error
+                    # this design fixes (and ``reconnect`` would swallow it,
+                    # leaking the LTM child). Abandon them unclosed instead;
+                    # the daemon leak sweep / process exit reaps the child.
+                    logger.warning("abandoning MCP client contexts entered by the dead owner task")
+                    self._stack = None
+                    self._session = None
             owner = asyncio.create_task(self._owner_loop(), name="ltm-adapter-owner")
             self._owner_task = owner
         return owner
@@ -493,15 +504,18 @@ class McpClientSearchAdapter:
             # and, if it is the one currently executing, cancel the owner —
             # the cancellation lands *inside* the owner task, so
             # ``_do_start``'s rollback acloses the contexts task-locally
-            # (scope-safe); the owner then uncancels itself and keeps
-            # serving. Benign micro-race: if the owner finishes the op
-            # between the ``_current_req`` check and ``owner.cancel()``, the
-            # cancel clips ``queue.get()`` or the next op instead —
-            # ``_op_cancel_pending`` makes the owner swallow it, and at worst
-            # one other caller sees a spurious ``CancelledError`` (engine
-            # records ``error_other`` once).
+            # (scope-safe); the owner then uncancels itself and keeps serving.
+            #
+            # The ``not req.fut.done()`` guard makes the cancel precise: the
+            # owner sets ``req.fut`` before advancing ``_current_req`` and
+            # before dequeuing the next op, and there is no ``await`` between
+            # this check and ``owner.cancel()``, so when the future is still
+            # pending the owner is provably suspended *inside this op* — the
+            # cancel cannot land on a later op's caller. If the future is
+            # already resolved (op finished, and the cancel merely raced the
+            # ``wait_for`` timeout) we skip the cancel entirely.
             req.cancel_requested = True
-            if self._current_req is req:
+            if self._current_req is req and not req.fut.done():
                 self._op_cancel_pending = True
                 owner.cancel()
             raise
