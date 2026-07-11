@@ -96,6 +96,10 @@ def _config(tmp_path: Path) -> STMConfig:
     s = cfg.surfacing
     s.feedback_db_path = tmp_path / "feedback.db"
     s.enabled = True
+    # Warm-up off by default in tests: real-_build_engine tests would
+    # otherwise eagerly spawn the (default memtomem-server) LTM child at
+    # startup. The dedicated warm-up tests opt back in.
+    s.warmup_enabled = False
     s.min_response_chars = 10
     s.timeout_seconds = 5.0
     s.min_score = 0.02
@@ -716,6 +720,74 @@ async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError(f"leaked LTM child process(es) after teardown: {ltm_children}")
         await asyncio.sleep(0.1)
+
+
+# ── startup warm-up (#664 PR 2) ───────────────────────────────────────────────
+
+
+async def test_daemon_warmup_warms_ltm_without_a_surface_call(tmp_path: Path) -> None:
+    # End-to-end for #664 PR 2: with warmup_enabled the daemon's startup task
+    # warms the (fake) stdio LTM child on its own — no hook/surface traffic.
+    # Once it publishes the session (polled below), a call meets a warm
+    # session; the warm-up only pre-pays the cold start, it does not
+    # guarantee the very first call arrives after it completes.
+    cfg = _config(tmp_path)
+    cfg.surfacing.warmup_enabled = True
+    cfg.surfacing.ltm_mcp_command = sys.executable
+    cfg.surfacing.ltm_mcp_args = [str(_FAKE_LTM_SERVER)]
+    server, task = await _start(cfg)  # real _build_engine
+    try:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while getattr(server._adapter, "_session", None) is None:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("warm-up never published an LTM session")
+            await asyncio.sleep(0.05)
+        hs = await client.ping(cfg, timeout=2.0)
+        assert hs is not None
+        assert hs["ltm"] == "warm"
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_daemon_skips_warmup_when_disabled(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)  # warmup_enabled=False from the helper
+    cfg.surfacing.ltm_mcp_command = sys.executable
+    cfg.surfacing.ltm_mcp_args = [str(_FAKE_LTM_SERVER)]
+    server, task = await _start(cfg)  # real _build_engine
+    try:
+        await asyncio.sleep(0.3)  # a would-be warm-up gets plenty of turns
+        assert getattr(server._adapter, "_session", None) is None
+        hs = await client.ping(cfg, timeout=2.0)
+        assert hs is not None
+        assert hs["ltm"] == "cold"
+    finally:
+        await _stop(cfg, task)
+
+
+class _WarmthStub:
+    """Plain attribute stub for _ltm_warmth — NOT AsyncMock/MagicMock, whose
+    auto-created attributes are truthy and would false-positive ``warming``."""
+
+    def __init__(self, session: object | None, warming: bool, start_attempted: bool) -> None:
+        self._session = session
+        self.warming = warming
+        self._start_attempted = start_attempted
+
+
+async def test_ltm_warmth_priority(tmp_path: Path) -> None:
+    # warm > warming > down > cold (#664). "warming beats down" is the fix
+    # for the PR-1-deferred misreport: an in-flight lazy start has
+    # _start_attempted=True and must read "warming", not "down".
+    server = DaemonServer(_config(tmp_path))
+    cases = [
+        (_WarmthStub(session=object(), warming=True, start_attempted=True), "warm"),
+        (_WarmthStub(session=None, warming=True, start_attempted=True), "warming"),
+        (_WarmthStub(session=None, warming=False, start_attempted=True), "down"),
+        (_WarmthStub(session=None, warming=False, start_attempted=False), "cold"),
+    ]
+    for stub, expected in cases:
+        server._adapter = stub  # type: ignore[assignment]
+        assert server._ltm_warmth() == expected, expected
 
 
 # ── lifetime ownership lock ───────────────────────────────────────────────────

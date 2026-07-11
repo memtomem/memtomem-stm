@@ -74,12 +74,13 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Global on/off switch |
+| `warmup_enabled` | `true` | Kick a background LTM warm-up right after server/daemon startup, pre-paying the ~9s cold start so the first surfacing call is warm **if** warm-up has finished by then (a call arriving mid-warm-up still times out, then the abandoned start finishes for the next one — see `timeout_seconds`) (#664). Runs in a host-owned task and never blocks the proxy's own MCP initialize handshake. Best-effort: on failure, the lazy start on first use is the retry. Disable when eagerly spawning an LTM child per proxy process is undesirable (e.g. many short-lived proxies). |
 | `min_score` | `0.03` | Minimum search score to include a result |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Precision/cost gate — **distinct** from the proxy-level `ExtractionConfig.min_response_chars` (`500`); see the tuning note below. |
 | `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
-| `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if first-call injection matters more than latency. |
+| `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). With `warmup_enabled` (default) the child already starts warming at startup, so the first call usually fits this budget. Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if warm-up is disabled and first-call injection matters more than latency. |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
 | `max_surfacings_per_minute` | `15` | Global rate limit |
 | `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_surfacing_stats`. |

@@ -31,6 +31,14 @@ class SurfacingConfig(BaseModel):
     """
 
     enabled: bool = True
+    warmup_enabled: bool = True
+    """Kick a background LTM warm-up right after server/daemon startup (#664).
+    The warm-up runs in a host-owned task so it never blocks the proxy's own
+    MCP initialize handshake (#338). Best-effort and single-shot: on failure
+    the lazy start on first use remains the retry path. Disable via
+    ``MEMTOMEM_STM_SURFACING__WARMUP_ENABLED=false`` when eagerly spawning an
+    LTM child per proxy process is undesirable (e.g. many short-lived
+    proxies)."""
     feedback_db_path: Path = Path("~/.memtomem/stm_feedback.db")
     """Path to the SQLite store for surfacing events, feedback, and
     ``seen_memories`` cross-session dedup. Configurable so tests and

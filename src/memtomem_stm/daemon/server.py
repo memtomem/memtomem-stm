@@ -1,8 +1,10 @@
 """The daemon server loop — one warm engine behind a loopback socket.
 
-Holds a single long-lived :class:`SurfacingEngine` and a single lazily-started
-LTM ``McpClientSearchAdapter`` for the process lifetime, so each ``mms hook``
-call is a sub-second round trip instead of a ~6s cold start. Requests are
+Holds a single long-lived :class:`SurfacingEngine` and a single LTM
+``McpClientSearchAdapter`` for the process lifetime — warmed at startup by a
+background task when ``surfacing.warmup_enabled`` (#664), lazily started on
+first use otherwise — so each ``mms hook`` call is a sub-second round trip
+instead of a ~6s cold start. Requests are
 token-authenticated and dispatched over the newline-JSON
 :mod:`~memtomem_stm.daemon.protocol`.
 
@@ -229,10 +231,25 @@ class DaemonServer:
         logger.info("STM daemon listening on %s:%d (pid=%d)", self._host, self._port, os.getpid())
 
         idle_task = asyncio.create_task(self._idle_watch())
+        warmup_task: asyncio.Task[None] | None = None
+        # ``_adapter is not None`` matters beyond type-narrowing: tests stub
+        # ``_build_engine`` with an engine-only wiring that leaves the
+        # adapter unset.
+        if self._adapter is not None and self._config.surfacing.warmup_enabled:
+            warmup_task = asyncio.create_task(self._adapter.warm_up(), name="ltm-warmup")
         try:
             async with server:
                 await self._shutdown_event.wait()
         finally:
+            if warmup_task is not None:
+                # Cancelling mid-start abandons the op (#664) — it finishes
+                # in the adapter's owner task and ``_teardown``'s
+                # ``adapter.stop()`` bounded join closes it in-task.
+                warmup_task.cancel()
+                try:
+                    await warmup_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             idle_task.cancel()
             try:
                 await idle_task
@@ -410,9 +427,18 @@ class DaemonServer:
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
 
     def _ltm_warmth(self) -> str:
-        """Best-effort LTM connection state for ``ping`` (status nicety)."""
+        """Best-effort LTM connection state for ``ping`` (status nicety).
+
+        Priority: warm > warming > down > cold. ``warming`` covers a
+        start/reconnect op in flight (the startup warm-up task, or an
+        abandoned lazy start still finishing, #664). A *failed* warm-up
+        reads ``cold`` — accurate enough, since the lazy retry on first
+        use is still pending.
+        """
         if getattr(self._adapter, "_session", None) is not None:
             return "warm"
+        if getattr(self._adapter, "warming", False):
+            return "warming"
         if getattr(self._adapter, "_start_attempted", False):
             return "down"
         return "cold"

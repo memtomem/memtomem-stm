@@ -1455,3 +1455,118 @@ class TestOwnerTaskLifecycle:
         # A subsequent stop() is a clean no-op (owner already gone).
         await asyncio.wait_for(adapter.stop(), timeout=1.0)
         assert adapter._stack is None and adapter._session is None
+
+
+# ── Background warm-up (#664 PR 2) ───────────────────────────────────────
+
+
+class TestWarmUp:
+    """``warm_up()`` pre-warms the LTM child from a host-owned background
+    task, pre-paying the ~9s cold start so a surfacing call that arrives
+    after it completes meets a warm session (#664). It is best-effort:
+    failures are swallowed and never arm the lazy-start sticky flag, so
+    ``_heal_if_needed`` keeps its one lazy retry on first real use.
+    """
+
+    def _adapter(self, monkeypatch, record: dict, gate: asyncio.Event | None = None):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: _TrackingTransport(record, gate))
+        monkeypatch.setattr(mod, "ClientSession", lambda *_a, **_k: _OkSession(record))
+        return McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+
+    @pytest.mark.asyncio
+    async def test_warm_up_publishes_session_and_first_search_reuses_it(self, monkeypatch):
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+
+        await adapter.warm_up()
+        assert adapter._session is not None
+        assert adapter._start_attempted is False, "warm_up must not arm the lazy-start gate"
+
+        _, _, outcome = await adapter.search("q")
+        assert outcome == "ok"
+        assert record["enters"] == 1, "first search must reuse the warmed child"
+
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_warm_up_failure_swallowed_and_lazy_retry_intact(self, monkeypatch):
+        record: dict = {"init_raise_once": True}
+        adapter = self._adapter(monkeypatch, record)
+
+        await adapter.warm_up()  # must not raise
+        assert adapter._session is None
+        assert adapter._start_attempted is False, (
+            "a failed warm-up must leave the lazy retry available"
+        )
+
+        # First real call performs the one lazy retry and succeeds.
+        _, _, outcome = await adapter.search("q")
+        assert outcome == "ok"
+        assert record["enters"] == 2, "lazy retry must spawn a fresh transport"
+
+        await adapter.stop()
+
+    @pytest.mark.asyncio
+    async def test_warming_property_during_inflight_start(self, monkeypatch):
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        adapter = self._adapter(monkeypatch, record)
+        assert adapter.warming is False, "fresh adapter is not warming"
+
+        task = asyncio.create_task(adapter.warm_up())
+        for _ in range(100):
+            if adapter.warming:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("warming never became True while start was in flight")
+        assert adapter._session is None
+
+        init_gate.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        assert adapter._session is not None
+        assert adapter.warming is False, "published session ends the warming window"
+
+        await adapter.stop()
+        assert adapter.warming is False
+
+    @pytest.mark.asyncio
+    async def test_warm_up_cancel_abandons_inflight_start(self, monkeypatch):
+        """Cancelling the host's warm-up task (shutdown, or just teardown
+        racing a slow start) abandons the in-flight op per #664: the start
+        finishes in the owner task and still publishes the session."""
+        record: dict = {}
+        init_gate = asyncio.Event()
+        record["init_gate"] = init_gate
+        adapter = self._adapter(monkeypatch, record)
+
+        task = asyncio.create_task(adapter.warm_up())
+        for _ in range(100):
+            if adapter.warming:
+                break
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        first_id = record["last_entered_id"]
+        owner = adapter._owner_task
+        assert owner is not None and not owner.done(), "cancel must not kill the owner"
+        await asyncio.sleep(0.02)
+        assert first_id not in record.get("exited_ids", []), (
+            "cancelled warm-up must abandon the start, not roll it back"
+        )
+
+        init_gate.set()
+        for _ in range(100):
+            if adapter._session is not None:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("abandoned warm-up start never published the session")
+
+        await adapter.stop()
+        assert record["exited_ids"] == [first_id]

@@ -205,6 +205,18 @@ class TestSurfacingLtmTransportConfig:
         assert cfg.ltm_mcp_headers == {"Authorization": "Bearer token"}
 
 
+class TestSurfacingWarmupConfig:
+    """#664 PR 2: background LTM warm-up defaults on and is env-toggleable
+    (surfacing config is env-only — there is no surfacing JSON section)."""
+
+    def test_warmup_enabled_defaults_true(self) -> None:
+        assert SurfacingConfig().warmup_enabled is True
+
+    def test_warmup_enabled_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__WARMUP_ENABLED", "false")
+        assert STMConfig().surfacing.warmup_enabled is False
+
+
 class TestLLMCompressorApiKey:
     """``provider=openai|anthropic`` with empty ``api_key`` used to send a
     malformed ``Bearer `` header and silently fall back to truncate; validate
