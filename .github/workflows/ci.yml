@@ -79,25 +79,35 @@ jobs:
             --nbmake-timeout=180 --tb=short -q
 
   audit:
-    # ADVISORY dependency vulnerability audit (#609). Exports the locked
-    # dependency set (uv.lock, all groups) and runs pip-audit against it.
-    # Step-level continue-on-error (the convention mypy used during its
-    # advisory phase, pre-#617) keeps the findings in the job log without
-    # a red check on every PR while the baseline is being cleaned (50 known
-    # vulns in transitive dev deps at introduction time). Promote to
-    # required (drop the flag + branch protection) once Dependabot has
-    # cleaned the baseline.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           version: "latest"
-      - name: Export locked requirements
-        run: uv export --frozen --no-emit-project -o requirements-audit.txt
-      - name: pip-audit (advisory)
-        run: uvx pip-audit -r requirements-audit.txt --disable-pip
-        continue-on-error: true
+      - name: Audit locked runtime dependencies
+        run: scripts/audit-dependencies.sh runtime
+
+  audit_extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "latest"
+      - name: Audit locked optional extras
+        run: scripts/audit-dependencies.sh extras
+
+  audit_dev:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "latest"
+      - name: Audit locked development closure (advisory)
+        run: scripts/audit-dependencies.sh dev
 
   bench_qa:
     # Required gate. Per-scenario floors (qa_gate_min, ratio_violation) are

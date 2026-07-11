@@ -20,6 +20,12 @@ changes inline only. See the deprecation policy in
   pipeline dead on LTM timeouts for days looked merely quiet from the CLI.
   Rows share the `stats_retention_days` sweep.
 
+### Security
+
+- Raised runtime and optional-extra dependency floors to patched versions.
+  Locked runtime and extras audits are now blocking CI and release gates;
+  the full development closure remains advisory.
+
 ## [0.1.33] — 2026-07-11
 
 ### Upgrade notes
