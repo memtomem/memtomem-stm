@@ -322,6 +322,37 @@ class McpClientSearchAdapter:
         """
         await self._submit("start")
 
+    async def warm_up(self) -> None:
+        """Best-effort, single-shot background warm-up of the LTM child (#664).
+
+        Awaits ``start()`` and swallows every failure (including the
+        ``RuntimeError`` ``_submit`` raises when the adapter is already
+        stopped — a normal shutdown race). Deliberately never touches
+        ``_start_attempted``: a failed warm-up leaves the lazy-start gate
+        armed, so ``_heal_if_needed`` still performs its one lazy retry on
+        the first real call. Racing that first lazy start is safe — the
+        owner task serializes ops and the second start no-ops on
+        ``_do_start``'s live-session guard.
+        """
+        try:
+            await self.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info(
+                "LTM warm-up failed — lazy start will retry on first use: %s",
+                self._scrub_exc(exc),
+            )
+
+    @property
+    def warming(self) -> bool:
+        """True while a start/reconnect op is in flight and no session is
+        published yet — the "child is warming" window a warm-up task or an
+        abandoned start (#664) leaves behind. Cheap read for status probes
+        (daemon ``_ltm_warmth``)."""
+        req = self._current_req
+        return self._session is None and req is not None and req.op in ("start", "reconnect")
+
     async def _do_start(self) -> None:
         """Enter the transport/session contexts. Owner-task only (#663)."""
         if self._session is not None:
