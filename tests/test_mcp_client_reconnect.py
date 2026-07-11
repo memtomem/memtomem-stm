@@ -980,6 +980,11 @@ class _TrackingTransport:
         return (MagicMock(), MagicMock())
 
     async def __aexit__(self, *args):
+        # Optional stalled-rollback hook: block the aclose until released, to
+        # exercise stop()'s bounded join racing a caller-cancel rollback.
+        exit_gate = self._record.get("exit_gate")
+        if exit_gate is not None:
+            await exit_gate.wait()
         self._record["exit_task"] = asyncio.current_task()
         self._record.setdefault("exited_ids", []).append(self._id)
         return None
@@ -1217,3 +1222,40 @@ class TestOwnerTaskLifecycle:
         results, hints, outcome = await asyncio.wait_for(t1, timeout=1.0)
         assert (results, hints, outcome) == ([], [], "no_session")
         assert adapter._owner_task is not None and adapter._owner_task.done()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancel_not_absorbed_as_op_cancel(self, monkeypatch):
+        """Shutdown precedence (#663 round-3): ``_op_cancel_pending`` is a
+        shared flag. If a caller timeout armed op-recovery and then ``stop()``
+        cancels the same owner, the owner must give shutdown precedence and
+        exit — not absorb the cancellation and resume serving (which, because
+        ``stop()``'s ``wait_for(owner)`` waits for the task to finish, would
+        defeat the bounded join).
+
+        Reproduces the exact race state the ordering creates — ``stop()`` has
+        set ``_stopped`` while a prior caller-cancel left ``_op_cancel_pending``
+        set — and cancels the owner while it is between ops. With the fix the
+        owner exits; without it the owner uncancels and loops back to
+        ``queue.get()``, never finishing.
+        """
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+        await adapter.start()
+        owner = adapter._owner_task
+        assert owner is not None and not owner.done()
+
+        # The race window: a caller-cancel armed op-recovery, stop() has begun.
+        adapter._op_cancel_pending = True
+        adapter._stopped = True
+        owner.cancel()
+
+        # Give the owner a few turns to process the cancellation.
+        for _ in range(50):
+            if owner.done():
+                break
+            await asyncio.sleep(0)
+        assert owner.done(), "owner must exit on a shutdown cancel, not resume serving"
+
+        # A subsequent stop() is a clean no-op (owner already gone).
+        await asyncio.wait_for(adapter.stop(), timeout=1.0)
+        assert adapter._stack is None and adapter._session is None

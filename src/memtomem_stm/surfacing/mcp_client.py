@@ -598,11 +598,27 @@ class McpClientSearchAdapter:
                     finally:
                         self._current_req = None
                 except asyncio.CancelledError:
+                    task = asyncio.current_task()
+                    if self._stopped:
+                        # Shutdown has precedence over op-cancel recovery. A
+                        # caller timeout and ``stop()``'s bounded join can both
+                        # cancel this owner; if we absorbed the cancellation and
+                        # kept serving (as ``_op_cancel_pending`` would), the
+                        # owner would run on into the queued close op while
+                        # ``stop()``'s ``wait_for(owner)`` waited for it —
+                        # defeating the bound. Exit cleanly instead: the
+                        # in-flight op's own rollback already aclosed its stack
+                        # in this task, and ``uncancel``-ing (rather than
+                        # re-raising) makes ``await owner`` complete normally so
+                        # ``stop()`` never sees a stray ``CancelledError``.
+                        if task is not None:
+                            while task.uncancel() > 0:
+                                pass
+                        return
                     if self._op_cancel_pending:
                         # Abandoned op, not owner shutdown: absorb the
                         # cancellation and keep serving.
                         self._op_cancel_pending = False
-                        task = asyncio.current_task()
                         if task is not None:
                             task.uncancel()
                         continue
