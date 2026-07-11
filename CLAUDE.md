@@ -43,8 +43,9 @@ mypy can narrow.
   architecture write-up lives in the private
   `memtomem-docs/memtomem-stm/guides-archived/pipeline.md`.
 - **Line length 100**, target `py312` (`tool.ruff`, `tool.mypy`).
-- `.claude/` and `scripts/` are gitignored — don't commit anything under them,
-  and don't assume other contributors have the same contents there.
+- `.claude/` and `scripts/` are gitignored except for the tracked
+  `scripts/audit-dependencies.sh` release/CI gate — don't commit other files
+  under them, and don't assume contributors have the same local contents.
 
 ## PRs
 

@@ -24,7 +24,7 @@ changes inline only. See the deprecation policy in
 
 - Raised runtime and optional-extra dependency floors to patched versions.
   Locked runtime and extras audits are now blocking CI and release gates;
-  the full development closure remains advisory.
+  the full development closure remains advisory. (#673)
 
 ## [0.1.33] — 2026-07-11
 
