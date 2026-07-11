@@ -319,21 +319,25 @@ class DaemonServer:
     async def _stop_adapter(self) -> None:
         """Stop the LTM adapter without leaking its warm child process.
 
-        The adapter lazy-starts inside whichever connection-handler task
-        first needed LTM, so the stdio transport's anyio cancel scopes belong
-        to that (long-finished) task. Exiting them here — the serve task —
-        makes anyio raise its cross-task cancel-scope RuntimeError partway
-        through the transport's unwind, leaving the warm LTM child's reaping
-        unverified (today's mcp happens to terminate the child before the
-        scope exit, but that ordering is an implementation detail). When the
-        stop fails for any reason, sweep: a direct child present both before
-        and after a failed stop is the leaked LTM child — this process spawns
-        no other children — so terminate it.
+        Since #663 the adapter marshals its lifecycle ops through an internal
+        owner task, so scope enter/exit happen in the same task and
+        ``adapter.stop()`` succeeds cleanly in the common case. The sweep is
+        retained as belt-and-braces — but it must run whether ``stop()``
+        raised OR returned: ``stop()`` now *returns normally* while abandoning
+        a live child in two cases (owner task lost mid-lifetime, so its
+        contexts are abandoned unclosed; or ``stop()``'s own bounded-join
+        timeout against a stuck ``aclose``). Keying the sweep off an exception
+        (as the pre-#663 cross-task error did) would silently skip it there.
+        So always compare the direct children before and after: one present in
+        both snapshots is the leaked LTM child — this process spawns no other
+        children — so terminate it. A clean stop reaps its child (mcp's stdio
+        shutdown awaits exit), so the child is gone from the post snapshot and
+        nothing is killed. (Sweep removal is tracked as a follow-up once #663
+        has soaked.)
         """
         before = _direct_child_pids()
         try:
             await self._adapter.stop()
-            return
         except Exception as exc:
             if is_clean_cancel_scope_shutdown(exc):
                 logger.warning(

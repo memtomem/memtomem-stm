@@ -126,6 +126,44 @@ async def test_increment_access_via_remote_stdio_mcp_server():
 
 
 @pytest.mark.asyncio
+async def test_lazy_start_from_request_task_then_stop_from_main_task():
+    """#663 regression: the lazy LTM start used to enter the stdio transport's
+    anyio cancel scopes in whichever request-handler task issued the first
+    RPC. When that short-lived task exited, the scope stack corrupted — the
+    STM session server died right after the first successful surfacing, and
+    ``stop()`` from the lifespan task raised "Attempted to exit cancel scope
+    in a different task than it was entered in". With the owner-task
+    lifecycle, contexts enter and exit in one dedicated task, so the session
+    survives the request task's exit and stop() is clean from any task.
+    """
+    import asyncio
+
+    config = _stdio_config()
+    adapter = McpClientSearchAdapter(config)
+    # No eager start: the first search below triggers the lazy start inside
+    # a short-lived task, simulating a lowlevel-server request handler.
+    try:
+        results1, _, outcome1 = await asyncio.create_task(adapter.search("JWT authentication"))
+        assert outcome1 == "ok"
+        assert results1
+
+        # The request task above has exited; a second RPC from a different
+        # task must still be served by the same child session.
+        results2, _, outcome2 = await asyncio.create_task(adapter.search("JWT authentication"))
+        assert outcome2 == "ok"
+        assert results2
+
+        # increment_access / scratch_list from yet more tasks share the
+        # owner-owned session (call_tool is task-agnostic).
+        await asyncio.create_task(adapter.increment_access(["mid-1"]))
+    finally:
+        # Pre-#663 this raised the cross-task cancel-scope RuntimeError.
+        await adapter.stop()
+
+    assert adapter._session is None
+
+
+@pytest.mark.asyncio
 async def test_format_negotiation_keeps_structured_with_capable_server():
     """When core advertises structured support, negotiation keeps StructuredResultParser."""
     from memtomem_stm.surfacing.mcp_client import StructuredResultParser
