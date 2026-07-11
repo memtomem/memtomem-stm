@@ -238,14 +238,10 @@ def test_parse_scratch_list_blank_text():
 
 def test_parse_scratch_list_single_entry():
     text = (
-        "Working memory: 1 entries\n"
-        "\n"
-        "  current_task: drafting follow-up 4 implementation plan..."
+        "Working memory: 1 entries\n\n  current_task: drafting follow-up 4 implementation plan..."
     )
     entries = McpClientSearchAdapter._parse_scratch_list(text)
-    assert entries == [
-        {"key": "current_task", "value": "drafting follow-up 4 implementation plan"}
-    ]
+    assert entries == [{"key": "current_task", "value": "drafting follow-up 4 implementation plan"}]
 
 
 def test_parse_scratch_list_with_expiry_and_promotion():
@@ -272,10 +268,7 @@ def test_parse_scratch_list_with_expiry_and_promotion():
 
 def test_parse_scratch_list_skips_non_entry_lines():
     text = (
-        "Working memory: 1 entries\n"
-        "header line\n"
-        "  current_task: actual entry...\n"
-        "trailing footer"
+        "Working memory: 1 entries\nheader line\n  current_task: actual entry...\ntrailing footer"
     )
     entries = McpClientSearchAdapter._parse_scratch_list(text)
     assert entries == [{"key": "current_task", "value": "actual entry"}]
