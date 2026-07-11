@@ -1007,7 +1007,7 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     faults = summary.get("faults") or {}
     if faults:
         window_days = summary.get("faults_window_days")
-        click.echo(f"  pipeline faults (last {window_days}d):")
+        click.echo(f"  pipeline faults (last {window_days} UTC days):")
         for kind, count in sorted(faults.items()):
             click.echo(f"    {kind:<20} {count}")
         last_at = summary.get("faults_last_at")

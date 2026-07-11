@@ -19,10 +19,19 @@ logger = logging.getLogger(__name__)
 _NEGATIVE_FEEDBACK_RATINGS = ("not_relevant", "already_known")
 
 _FAULT_SUMMARY_WINDOW_DAYS = 7
-"""Lookback window for the fault counters in ``read_surfacing_summary``.
-Recent-window rather than all-time: the counters answer "is surfacing
-degraded *now*", and a long-fixed incident from months ago shouldn't keep
-the stats output warning forever."""
+"""Lookback window for the fault counters in ``read_surfacing_summary``,
+counted in whole UTC calendar days (today plus the prior
+``_FAULT_SUMMARY_WINDOW_DAYS - 1``). Recent-window rather than all-time:
+the counters answer "is surfacing degraded *now*", and a long-fixed
+incident from months ago shouldn't keep the stats output warning forever.
+
+Calendar-day, not a rolling ``now - 7*86400`` cutoff: ``surfacing_faults``
+is aggregated one row per ``(day, server, tool, kind)``, so the finest
+honest filter granularity is the ``day`` column. A sub-day rolling cutoff
+on ``last_at`` would pass a boundary day's whole ``count`` — including
+faults from earlier that day that predate the cutoff — and over-report the
+window it advertises. Filtering on ``day`` keeps the count exact for the
+stored granularity at the cost of naming the window in calendar days."""
 
 _HASHED_QUERY_RE = re.compile(r"sha256:[0-9a-f]{16}")
 """Exact shape of the opaque ID written under
@@ -287,8 +296,16 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         # by a pre-faults version simply reports empty counters rather than
         # erroring the whole summary.
         if "surfacing_faults" in tables:
-            fault_where = " WHERE last_at >= ?"
-            fault_params: list[object] = [time.time() - _FAULT_SUMMARY_WINDOW_DAYS * 86400.0]
+            # Filter on the ``day`` column (calendar-day granularity matching
+            # the row aggregation), not a sub-day ``last_at`` cutoff that would
+            # over-count a boundary day's whole bucket. Lower bound is inclusive
+            # of today plus the prior WINDOW-1 days.
+            cutoff_day = time.strftime(
+                "%Y-%m-%d",
+                time.gmtime(time.time() - (_FAULT_SUMMARY_WINDOW_DAYS - 1) * 86400.0),
+            )
+            fault_where = " WHERE day >= ?"
+            fault_params: list[object] = [cutoff_day]
             if tool is not None:
                 fault_where += " AND tool = ?"
                 fault_params.append(tool)

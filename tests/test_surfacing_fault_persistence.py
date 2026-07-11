@@ -246,16 +246,49 @@ class TestSummaryFaults:
         assert summary["faults"] == {"error_timeout": 1}
 
     def test_summary_faults_outside_window_excluded(self, tmp_path):
+        # The window filter is on the calendar-day bucket, not last_at, so a
+        # row whose *day* predates the window is excluded even though its
+        # last_at value is irrelevant to the filter. Backdate both to an old
+        # UTC day 8 days ago.
+        old_ts = time.time() - 8 * 86400.0
+        old_day = time.strftime("%Y-%m-%d", time.gmtime(old_ts))
         db_path = tmp_path / "f.db"
         store = FeedbackStore(db_path)
         store.initialize()
         store.record_fault("gh", "read_file", "error_timeout")
-        store._db.execute("UPDATE surfacing_faults SET last_at = ?", (time.time() - 8 * 86400.0,))
+        store._db.execute("UPDATE surfacing_faults SET day = ?, last_at = ?", (old_day, old_ts))
         store._db.commit()
         store.close()
         summary = read_surfacing_summary(db_path)
         assert summary["faults"] == {}
         assert summary["faults_last_at"] is None
+
+    def test_summary_window_is_calendar_day_exact(self, tmp_path):
+        # Regression (codex review #666): the window filter must not sum a
+        # boundary day's whole bucket when only part of it is in range. With
+        # day-granular filtering, a bucket dated just inside the window is
+        # fully counted and one dated just outside is fully excluded — no
+        # partial-day over-count. Row A on the inclusive cutoff day (today −
+        # (WINDOW−1)) counts; row B one day older does not.
+        from memtomem_stm.surfacing.feedback_store import _FAULT_SUMMARY_WINDOW_DAYS
+
+        now = time.time()
+        in_day = time.strftime(
+            "%Y-%m-%d", time.gmtime(now - (_FAULT_SUMMARY_WINDOW_DAYS - 1) * 86400.0)
+        )
+        out_day = time.strftime("%Y-%m-%d", time.gmtime(now - _FAULT_SUMMARY_WINDOW_DAYS * 86400.0))
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store._db.executemany(
+            "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
+            "VALUES (?, 'gh', 'read_file', 'error_timeout', ?, ?)",
+            [(in_day, 5, now), (out_day, 9, now)],
+        )
+        store._db.commit()
+        store.close()
+        summary = read_surfacing_summary(db_path)
+        assert summary["faults"] == {"error_timeout": 5}
 
     def test_summary_tolerates_pre_faults_schema(self, tmp_path):
         # A DB last written by a pre-faults version has no surfacing_faults
@@ -282,7 +315,7 @@ class TestSummaryFaults:
         store.close()
         _render_surfacing_block(read_surfacing_summary(db_path))
         out = capsys.readouterr().out
-        assert "pipeline faults (last 7d):" in out
+        assert "pipeline faults (last 7 UTC days):" in out
         assert "error_timeout" in out
         assert "last fault:" in out
         assert "degraded-LTM faults" in out
