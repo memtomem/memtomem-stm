@@ -16,6 +16,7 @@ import tomllib
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
 from urllib.parse import unquote, urlsplit
@@ -1003,6 +1004,24 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
     click.echo(f"  feedback ratings: {summary['total_feedback']}")
     for rating, count in sorted((summary.get("rating_distribution") or {}).items()):
         click.echo(f"    {rating:<20} {count}")
+    faults = summary.get("faults") or {}
+    if faults:
+        window_days = summary.get("faults_window_days")
+        click.echo(f"  pipeline faults (last {window_days}d):")
+        for kind, count in sorted(faults.items()):
+            click.echo(f"    {kind:<20} {count}")
+        last_at = summary.get("faults_last_at")
+        if isinstance(last_at, (int, float)):
+            last_str = datetime.fromtimestamp(last_at).strftime("%Y-%m-%d %H:%M")
+            click.echo(f"    last fault: {last_str}")
+        click.echo(
+            "  "
+            + _warn(
+                "surfacing has been skipping on degraded-LTM faults — "
+                "see stm-daemon.log / server stderr; timeouts usually mean the "
+                "LTM answers slower than surfacing.timeout_seconds"
+            )
+        )
 
 
 @cli.command()

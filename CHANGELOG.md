@@ -9,6 +9,17 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Added
+
+- Durable surfacing fault counters (#666): timeout / breaker-open / degraded-LTM
+  skips now persist day-aggregated to `surfacing_faults` in the feedback DB,
+  and `mms stats` renders them with a warning line — previously these signals
+  lived only in per-process memory (`stm_surfacing_stats`), so a surfacing
+  pipeline dead on LTM timeouts for days looked merely quiet from the CLI.
+  Rows share the `stats_retention_days` sweep.
+
 ## [0.1.33] — 2026-07-11
 
 ### Upgrade notes

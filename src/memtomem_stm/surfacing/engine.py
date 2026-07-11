@@ -170,6 +170,25 @@ class SurfacingEngine:
         result cache is empty (it only filters cache hits)."""
         return self._cache.clear()
 
+    def _persist_fault(self, server: str, tool: str, kind: str) -> None:
+        """Best-effort durable counterpart to the in-memory fault counters.
+
+        The ``SurfacingObservability`` counters answer "why isn't surfacing
+        firing" only for the *current* process; the daemon idle-exits and MCP
+        session servers restart, so a timeout/breaker loop that spans hours is
+        invisible to ``mms stats`` (which reads on-disk stores only). Persist
+        the degraded-dependency subset — never healthy skips — through the
+        feedback store's day-aggregated upsert. Recording sits on failure
+        branches already returning the original response, so any store error
+        degrades to a missing counter, never a raised exception.
+        """
+        if self._feedback_tracker is None:
+            return
+        try:
+            self._feedback_tracker.record_fault(server, tool, kind)
+        except Exception:
+            logger.debug("Failed to persist surfacing fault counter", exc_info=True)
+
     def _persistable_query(self, query: str) -> str:
         """Return the form of ``query`` that gets written to
         ``surfacing_events.query`` (#352 part 3).
@@ -295,6 +314,7 @@ class SurfacingEngine:
 
         if self._circuit_breaker.is_open:
             self._observability.record_skip(tool, "circuit_open")
+            self._persist_fault(server, tool, "circuit_open")
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
             return response_text
 
@@ -325,6 +345,7 @@ class SurfacingEngine:
             return result
         except asyncio.TimeoutError:
             self._observability.record_outcome(tool, "error_timeout")
+            self._persist_fault(server, tool, "error_timeout")
             logger.warning(
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
@@ -340,6 +361,7 @@ class SurfacingEngine:
             return response_text
         except Exception:
             self._observability.record_outcome(tool, "error_other")
+            self._persist_fault(server, tool, "error_other")
             logger.warning("Surfacing failed for %s/%s", server, tool, exc_info=True)
             self._circuit_breaker.record_failure()
             return response_text
@@ -795,12 +817,15 @@ class SurfacingEngine:
                 )
                 self._warned_ltm_unavailable = True
             self._observability.record_skip(tool, "ltm_unavailable")
+            self._persist_fault(server, tool, "ltm_unavailable")
             return response_text
         if outcome == "call_error":
             self._observability.record_skip(tool, "ltm_call_failed")
+            self._persist_fault(server, tool, "ltm_call_failed")
             return response_text
         if outcome == "empty_content":
             self._observability.record_skip(tool, "ltm_parse_empty")
+            self._persist_fault(server, tool, "ltm_parse_empty")
             return response_text
 
         # Parent trust-UX hints (parent PR #231): log at INFO even when results
@@ -1001,6 +1026,19 @@ class SurfacingEngine:
                 )
         except Exception:
             logger.warning("Failed to delete expired surfacing_events", exc_info=True)
+        # Fault counters share the stats-retention knob: they are read by the
+        # same stats surfaces and one day-aggregated row per (day, server,
+        # tool, kind) never grows fast enough to deserve its own setting.
+        try:
+            deleted = store.delete_faults_older_than(stats_retention_days * 86400.0)
+            if deleted:
+                logger.info(
+                    "Deleted %d surfacing_faults rows older than %d days",
+                    deleted,
+                    stats_retention_days,
+                )
+        except Exception:
+            logger.warning("Failed to delete expired surfacing_faults", exc_info=True)
 
     def _maybe_cleanup_expired(self) -> None:
         """Run periodic store maintenance at most once per cleanup interval.
