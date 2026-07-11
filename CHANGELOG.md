@@ -9,7 +9,7 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.1.34] — 2026-07-12
 
 ### Added
 
@@ -22,6 +22,17 @@ changes inline only. See the deprecation policy in
 
 ### Security
 
+- Surfaced memory fields are now serialized as inert, single-line Markdown
+  data before injection. Control/bidi characters, HTML delimiters/entities,
+  Markdown delimiters, and Unicode compatibility confusables can no longer
+  create a second `<surfaced-memories>` boundary. Invalid memory ids omit only
+  the copyable id token; feedback for the surfacing remains available.
+  ([GHSA-43hx-xm7w-3mhj](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-43hx-xm7w-3mhj))
+- LTM recovery is generation-aware and shares exactly one reconnect flight per
+  dirty session. Caller cancellation no longer aborts a reconnect for other
+  waiters, and cancellation during any post-reconnect retry dirties only that
+  new session generation.
+  ([GHSA-72jh-722p-rqr3](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-72jh-722p-rqr3))
 - Raised runtime and optional-extra dependency floors to patched versions.
   Locked runtime and extras audits are now blocking CI and release gates;
   the full development closure remains advisory. (#673)
