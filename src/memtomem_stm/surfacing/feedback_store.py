@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 
 _NEGATIVE_FEEDBACK_RATINGS = ("not_relevant", "already_known")
 
+_FAULT_SUMMARY_WINDOW_DAYS = 7
+"""Lookback window for the fault counters in ``read_surfacing_summary``,
+counted in whole UTC calendar days (today plus the prior
+``_FAULT_SUMMARY_WINDOW_DAYS - 1``). Recent-window rather than all-time:
+the counters answer "is surfacing degraded *now*", and a long-fixed
+incident from months ago shouldn't keep the stats output warning forever.
+
+Calendar-day, not a rolling ``now - 7*86400`` cutoff: ``surfacing_faults``
+is aggregated one row per ``(day, server, tool, kind)``, so the finest
+honest filter granularity is the ``day`` column. A sub-day rolling cutoff
+on ``last_at`` would pass a boundary day's whole ``count`` — including
+faults from earlier that day that predate the cutoff — and over-report the
+window it advertises. Filtering on ``day`` keeps the count exact for the
+stored granularity at the cost of naming the window in calendar days."""
+
 _HASHED_QUERY_RE = re.compile(r"sha256:[0-9a-f]{16}")
 """Exact shape of the opaque ID written under
 ``SurfacingConfig.persist_query_text=False`` (#352 part 3): the literal
@@ -59,6 +74,22 @@ CREATE TABLE IF NOT EXISTS auto_tune_adjustments (
     updated_at  REAL    NOT NULL
 );
 
+-- Durable per-day fault counters for the surfacing pipeline. The in-memory
+-- ``SurfacingObservability`` counters die with the process (and the daemon
+-- idle-exits routinely), so ``mms stats`` — which reads on-disk stores only —
+-- could not distinguish "surfacing intentionally quiet" from "surfacing dead
+-- on LTM timeouts / open breaker". Day-aggregated upserts keep cardinality
+-- bounded: one row per (day, server, tool, kind).
+CREATE TABLE IF NOT EXISTS surfacing_faults (
+    day         TEXT    NOT NULL,
+    server      TEXT    NOT NULL,
+    tool        TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 0,
+    last_at     REAL    NOT NULL,
+    PRIMARY KEY (day, server, tool, kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_memory_rating ON surfacing_feedback(memory_id, rating);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
@@ -70,6 +101,23 @@ CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
 
 _REQUIRED_TABLES = tuple(
     re.findall(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", _SCHEMA)
+)
+
+# Fault kinds accepted by ``record_fault``. Mirrors the degraded-dependency
+# subset of the in-memory observability taxonomy: ``FAULT_SKIP_REASONS``
+# (``memtomem_stm.surfacing.observability``) plus the two error outcomes.
+# Healthy skips (cooldown, thresholds, no-results) stay in-memory only —
+# persisting them would add per-call write traffic for signals that carry
+# no "surfacing is broken" information.
+FAULT_KINDS: frozenset[str] = frozenset(
+    {
+        "error_timeout",
+        "error_other",
+        "circuit_open",
+        "ltm_unavailable",
+        "ltm_call_failed",
+        "ltm_parse_empty",
+    }
 )
 
 
@@ -194,6 +242,9 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         "distinct_tools": 0,
         "total_feedback": 0,
         "rating_distribution": {},
+        "faults": {},
+        "faults_last_at": None,
+        "faults_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
         "error": None,
     }
     if not resolved.exists():
@@ -239,6 +290,33 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             distribution = {row[0]: row[1] for row in rating_rows}
             summary["rating_distribution"] = distribution
             summary["total_feedback"] = sum(distribution.values())
+
+        # Fault counters (durable degraded-dependency signal). Guarded on
+        # table presence like ``surfacing_feedback`` above: a DB last written
+        # by a pre-faults version simply reports empty counters rather than
+        # erroring the whole summary.
+        if "surfacing_faults" in tables:
+            # Filter on the ``day`` column (calendar-day granularity matching
+            # the row aggregation), not a sub-day ``last_at`` cutoff that would
+            # over-count a boundary day's whole bucket. Lower bound is inclusive
+            # of today plus the prior WINDOW-1 days.
+            cutoff_day = time.strftime(
+                "%Y-%m-%d",
+                time.gmtime(time.time() - (_FAULT_SUMMARY_WINDOW_DAYS - 1) * 86400.0),
+            )
+            fault_where = " WHERE day >= ?"
+            fault_params: list[object] = [cutoff_day]
+            if tool is not None:
+                fault_where += " AND tool = ?"
+                fault_params.append(tool)
+            fault_rows = db.execute(
+                "SELECT kind, SUM(count), MAX(last_at) FROM surfacing_faults"
+                f"{fault_where} GROUP BY kind",
+                fault_params,
+            ).fetchall()
+            summary["faults"] = {row[0]: row[1] for row in fault_rows}
+            summary["faults_last_at"] = max((row[2] for row in fault_rows), default=None)
+            summary["faults_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
 
         summary["available"] = True
     except sqlite3.Error as exc:
@@ -322,6 +400,44 @@ class FeedbackStore:
                 ),
             )
             self._db.commit()
+
+    def record_fault(self, server: str, tool: str, kind: str) -> None:
+        """Increment the durable per-day fault counter for (server, tool, kind).
+
+        Unknown *kind* values are dropped (defensively, not raised): the
+        caller sits on the surfacing hot path's failure branches, where a
+        taxonomy drift must degrade to a missing counter, never to a new
+        exception. Day buckets are UTC so counters aggregate stably across
+        processes regardless of host timezone.
+        """
+        if self._db is None or kind not in FAULT_KINDS:
+            return
+        now = time.time()
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
+                "VALUES (?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(day, server, tool, kind) "
+                "DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+                (day, server, tool, kind, now),
+            )
+            self._db.commit()
+
+    def delete_faults_older_than(self, retention_seconds: float) -> int:
+        """Delete day-aggregated fault rows whose ``last_at`` is past the
+        retention window. Returns the number of rows deleted. Rows are one
+        per (day, server, tool, kind), so the table stays tiny even before
+        cleanup — this bound exists for symmetry with the #584 event-row
+        retention, not because the scan cost is material.
+        """
+        if self._db is None or retention_seconds <= 0:
+            return 0
+        cutoff = time.time() - retention_seconds
+        with self._lock:
+            cur = self._db.execute("DELETE FROM surfacing_faults WHERE last_at < ?", (cutoff,))
+            self._db.commit()
+        return cur.rowcount if cur.rowcount is not None and cur.rowcount > 0 else 0
 
     def record_feedback(
         self,
