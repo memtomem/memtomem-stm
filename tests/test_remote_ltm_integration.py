@@ -164,6 +164,52 @@ async def test_lazy_start_from_request_task_then_stop_from_main_task():
 
 
 @pytest.mark.asyncio
+async def test_timed_out_surface_still_warms_ltm_child():
+    """#664 regression: the surfacing timeout (3s default) is below the LTM
+    cold start (~9s ONNX model load). The engine's ``wait_for`` used to
+    cancel the in-flight start, rolling the half-warmed child back — every
+    call re-paid the full cold start and the LTM never warmed. With
+    abandon-mode the first call still times out (original response returned
+    unchanged), but the SAME start finishes in the owner task: the next call
+    meets a warm session and injects memories.
+    """
+    import asyncio
+
+    config = _stdio_config()
+    config = config.model_copy(
+        update={
+            "timeout_seconds": 0.2,
+            "ltm_mcp_args": [str(_FAKE_SERVER), "--startup-delay", "1.0"],
+        }
+    )
+    adapter = McpClientSearchAdapter(config)
+    try:
+        engine = SurfacingEngine(config, mcp_adapter=adapter)
+
+        # Cold call: child spawn (delayed past the budget) → timeout → the
+        # original response comes back untouched, start keeps running.
+        output1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert output1 == LONG_RESPONSE
+
+        # The abandoned start warms the child in the background.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while adapter._session is None:
+            assert asyncio.get_running_loop().time() < deadline, (
+                "abandoned start never warmed the LTM child"
+            )
+            await asyncio.sleep(0.05)
+
+        # Warm call: fits the same tight budget and injects memories.
+        output2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "Relevant Memories" in output2, output2
+        assert "JWT authentication" in output2
+    finally:
+        await adapter.stop()
+
+    assert adapter._session is None
+
+
+@pytest.mark.asyncio
 async def test_format_negotiation_keeps_structured_with_capable_server():
     """When core advertises structured support, negotiation keeps StructuredResultParser."""
     from memtomem_stm.surfacing.mcp_client import StructuredResultParser
