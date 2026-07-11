@@ -23,6 +23,16 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
 
 ### Content handling
 
+- **Untrusted surfaced memories**: Every untrusted field rendered inside the
+  Markdown-compatible `<surfaced-memories>` envelope is flattened to one line
+  and escaped immediately before rendering. Controls (including bidi), HTML
+  delimiters/entities, Markdown delimiters, and compatibility confusables are
+  inert; memory ids are rendered as copyable tokens only when they match the
+  documented conservative id grammar. The pinned preamble tells consumers to
+  treat retrieved memories as data, not instructions. This structural boundary
+  does not eliminate the residual risk that ordinary natural-language text may
+  persuade a model; keep write-tool surfacing disabled and review retrieved
+  context before consequential actions.
 - **Sensitive content auto-detection**: Responses containing patterns that look like secrets (API keys, tokens, private keys) are detected and excluded from the response cache and from being indexed into LTM.
 - **Write-tool skip**: Memory surfacing is automatically disabled for upstream tools that mutate state, reducing the risk of injecting stale context into destructive operations.
 - **CLI output redaction**: `mms status --json` and `mms list --json` mask every `env` and `headers` value (`<REDACTED>`, keys preserved) since that machine-readable output is routinely piped to scripts, CI logs, or issue comments. The human-readable `status`/`list` tables never print `env`/`headers` at all; read the on-disk config directly when a value is genuinely needed.
