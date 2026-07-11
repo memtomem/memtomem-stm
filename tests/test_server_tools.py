@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1769,6 +1770,9 @@ class TestLifespan:
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = True
             mock_cfg.surfacing.feedback_enabled = True
+            # MagicMock attrs are truthy — an implicit warmup_enabled would
+            # create_task() a non-coroutine mock warm_up and blow up.
+            mock_cfg.surfacing.warmup_enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
 
@@ -1905,6 +1909,7 @@ class TestLifespan:
             mock_cfg.surfacing = MagicMock()
             mock_cfg.surfacing.enabled = True
             mock_cfg.surfacing.feedback_enabled = False
+            mock_cfg.surfacing.warmup_enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
 
@@ -1915,6 +1920,61 @@ class TestLifespan:
         # The cleanup block must run even though yield was never reached.
         mock_adapter.stop.assert_awaited_once()
         mock_pm_instance.stop.assert_awaited_once()
+
+    async def _lifespan_with_warmup(self, warmup_enabled: bool) -> MagicMock:
+        """Run app_lifespan with a surfacing-enabled mock config and return
+        the mock adapter, so tests can assert whether warm_up() ran (#664)."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        mock_adapter = MagicMock()
+        mock_adapter.warm_up = AsyncMock()
+        mock_adapter.stop = AsyncMock()
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            patch(
+                "memtomem_stm.surfacing.mcp_client.McpClientSearchAdapter",
+                return_value=mock_adapter,
+            ),
+            patch("memtomem_stm.server.SurfacingEngine", return_value=MagicMock(stop=AsyncMock())),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = True
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.metrics.enabled = False
+            mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.progressive_reads.enabled = False
+            mock_cfg.proxy.selection_telemetry.enabled = False
+            mock_cfg.proxy.cache.enabled = False
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = True
+            mock_cfg.surfacing.feedback_enabled = False
+            mock_cfg.surfacing.warmup_enabled = warmup_enabled
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+
+            async with app_lifespan(mcp) as _ctx:
+                # Give the spawned warm-up task a turn to run.
+                await asyncio.sleep(0)
+        return mock_adapter
+
+    async def test_warmup_task_spawned_when_enabled(self):
+        """#664 PR 2: with warmup_enabled the lifespan kicks the LTM warm-up
+        in a background task — the first surfacing call meets a warm child
+        without the lifespan ever awaiting the ~9s cold start inline."""
+        mock_adapter = await self._lifespan_with_warmup(warmup_enabled=True)
+        mock_adapter.warm_up.assert_awaited_once()
+
+    async def test_warmup_task_not_spawned_when_disabled(self):
+        mock_adapter = await self._lifespan_with_warmup(warmup_enabled=False)
+        mock_adapter.warm_up.assert_not_awaited()
 
     async def test_file_config_loaded_even_when_env_enabled(self, tmp_path, monkeypatch):
         """``MEMTOMEM_STM_PROXY__ENABLED`` used to make app_lifespan skip the
