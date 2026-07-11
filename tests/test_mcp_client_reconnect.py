@@ -1022,6 +1022,229 @@ class _OkSession:
         return _result_with_text(_COMPACT_HIT)
 
 
+class TestGenerationAwareReconnect:
+    def _adapter(self, monkeypatch, record: dict):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: _TrackingTransport(record))
+        monkeypatch.setattr(mod, "ClientSession", lambda *_a, **_k: _OkSession(record))
+        return McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transport_failures_share_one_generation_reconnect(self, monkeypatch):
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+        await adapter.start()
+        assert adapter._generation == 1
+        old_session = adapter._session
+        assert old_session is not None
+
+        both_started = asyncio.Event()
+        release_failures = asyncio.Event()
+        old_calls = 0
+
+        async def fail_old_session(*_args, **_kwargs):
+            nonlocal old_calls
+            old_calls += 1
+            if old_calls == 2:
+                both_started.set()
+            await release_failures.wait()
+            raise ConnectionError("shared generation failed")
+
+        old_session.call_tool = AsyncMock(side_effect=fail_old_session)  # type: ignore[method-assign]
+
+        reconnect_started = asyncio.Event()
+        release_reconnect = asyncio.Event()
+        reconnect_generations: list[int | None] = []
+        real_reconnect = adapter._reconnect
+
+        async def gated_reconnect(expected_generation=None):
+            reconnect_generations.append(expected_generation)
+            reconnect_started.set()
+            await release_reconnect.wait()
+            await real_reconnect(expected_generation)
+
+        adapter._reconnect = gated_reconnect  # type: ignore[method-assign]
+
+        first = asyncio.create_task(adapter.search("first"))
+        second = asyncio.create_task(adapter.search("second"))
+        await asyncio.wait_for(both_started.wait(), timeout=1.0)
+        release_failures.set()
+        await asyncio.wait_for(reconnect_started.wait(), timeout=1.0)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert reconnect_generations == [1]
+
+        release_reconnect.set()
+        outcomes = await asyncio.wait_for(asyncio.gather(first, second), timeout=1.0)
+
+        assert [outcome for _, _, outcome in outcomes] == ["ok", "ok"]
+        assert adapter._generation == 2
+        assert record["enters"] == 2
+        assert old_calls == 2
+        assert record["call_tool_count"] == 2
+        assert record["exited_ids"] == [1]
+
+        await adapter.stop()
+        assert record["exited_ids"] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_does_not_cancel_shared_reconnect(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        adapter._session = AsyncMock()
+        adapter._generation = 1
+        adapter._dirty_generation = 1
+        adapter._needs_reconnect = True
+
+        reconnect_started = asyncio.Event()
+        release_reconnect = asyncio.Event()
+        reconnect_generations: list[int | None] = []
+        fresh_session = AsyncMock()
+
+        async def gated_reconnect(expected_generation=None):
+            reconnect_generations.append(expected_generation)
+            reconnect_started.set()
+            await release_reconnect.wait()
+            adapter._session = fresh_session
+            adapter._generation = 2
+
+        adapter._reconnect = gated_reconnect  # type: ignore[method-assign]
+
+        cancelled_waiter = asyncio.create_task(adapter._shared_reconnect(1))
+        surviving_waiter = asyncio.create_task(adapter._shared_reconnect(1))
+        await asyncio.wait_for(reconnect_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+
+        flight = adapter._reconnect_flights[1]
+        assert not flight.done()
+        assert not flight.cancelled()
+
+        release_reconnect.set()
+        await asyncio.wait_for(surviving_waiter, timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert reconnect_generations == [1]
+        assert adapter._session is fresh_session
+        assert adapter._generation == 2
+        assert adapter._dirty_generation is None
+        assert adapter._needs_reconnect is False
+        assert adapter._reconnect_flights == {}
+
+    @pytest.mark.asyncio
+    async def test_post_reconnect_retry_cancellation_dirties_new_generation(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        old_session = AsyncMock()
+        old_session.call_tool = AsyncMock(side_effect=ConnectionError("old session failed"))
+        adapter._session = old_session
+        adapter._generation = 1
+
+        retry_started = asyncio.Event()
+
+        async def hang_retry(*_args, **_kwargs):
+            retry_started.set()
+            await asyncio.Event().wait()
+
+        retry_session = AsyncMock()
+        retry_session.call_tool = AsyncMock(side_effect=hang_retry)
+        healthy_session = AsyncMock()
+        healthy_session.call_tool = AsyncMock(return_value=_result_with_text(_COMPACT_HIT))
+        reconnect_generations: list[int | None] = []
+
+        async def replace_generation(expected_generation=None):
+            reconnect_generations.append(expected_generation)
+            if expected_generation == 1:
+                adapter._session = retry_session
+                adapter._generation = 2
+            elif expected_generation == 2:
+                adapter._session = healthy_session
+                adapter._generation = 3
+            else:  # pragma: no cover - test invariant guard
+                raise AssertionError(f"unexpected generation: {expected_generation}")
+
+        adapter._reconnect = replace_generation  # type: ignore[method-assign]
+
+        search = asyncio.create_task(adapter.search("q"))
+        await asyncio.wait_for(retry_started.wait(), timeout=1.0)
+        search.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await search
+
+        assert adapter._session is retry_session
+        assert adapter._generation == 2
+        assert adapter._dirty_generation == 2
+        assert adapter._needs_reconnect is True
+
+        results, _, outcome = await asyncio.wait_for(adapter.search("retry"), timeout=1.0)
+
+        assert outcome == "ok"
+        assert len(results) == 1
+        assert adapter._session is healthy_session
+        assert adapter._generation == 3
+        assert reconnect_generations == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_completed_reconnect_flights_are_evicted(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        fail_generation_two = True
+
+        async def reconnect(expected_generation=None):
+            nonlocal fail_generation_two
+            if expected_generation == 2 and fail_generation_two:
+                fail_generation_two = False
+                raise ConnectionError("retryable reconnect failure")
+            adapter._session = AsyncMock()
+            adapter._generation = int(expected_generation) + 1
+
+        adapter._reconnect = reconnect  # type: ignore[method-assign]
+
+        for generation in (1, 2):
+            adapter._dirty_generation = generation
+            adapter._needs_reconnect = True
+            if generation == 2:
+                with pytest.raises(ConnectionError):
+                    await adapter._shared_reconnect(generation)
+            else:
+                await adapter._shared_reconnect(generation)
+            await asyncio.sleep(0)
+            assert adapter._reconnect_flights == {}
+
+        await adapter._shared_reconnect(2)
+        await asyncio.sleep(0)
+        assert adapter._generation == 3
+        assert adapter._reconnect_flights == {}
+
+    @pytest.mark.asyncio
+    async def test_stop_drains_inflight_reconnect_flight(self, monkeypatch):
+        record: dict = {}
+        adapter = self._adapter(monkeypatch, record)
+        await adapter.start()
+        assert adapter._session is not None
+        adapter._mark_dirty(adapter._session, adapter._generation)
+
+        record["init_gate"] = asyncio.Event()
+        search = asyncio.create_task(adapter.search("q"))
+        for _ in range(100):
+            if adapter.warming:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("reconnect never entered its start phase")
+
+        adapter._STOP_TIMEOUT_SECONDS = 0.05  # type: ignore[misc]
+        await asyncio.wait_for(adapter.stop(), timeout=1.0)
+        results, hints, outcome = await asyncio.wait_for(search, timeout=1.0)
+
+        assert (results, hints, outcome) == ([], [], "no_session")
+        assert adapter._owner_task is not None and adapter._owner_task.done()
+        assert adapter._requests.empty()
+        assert adapter._reconnect_flights == {}
+        assert sorted(record["exited_ids"]) == [1, 2]
+
+
 class TestOwnerTaskLifecycle:
     """#663: lifecycle ops must enter AND exit the transport/session contexts
     in one dedicated owner task. Under lazy start the first RPC arrives in a

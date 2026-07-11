@@ -241,6 +241,7 @@ class _OwnerRequest:
     op: Literal["start", "reconnect", "close"]
     fut: asyncio.Future[None]
     cancel_requested: bool = False
+    expected_generation: int | None = None
 
 
 def _discard_future_result(fut: asyncio.Future[None]) -> None:
@@ -278,6 +279,10 @@ class McpClientSearchAdapter:
         # cancellation must propagate), so we mark the session here and let
         # the next caller heal the connection lazily before issuing an RPC.
         self._needs_reconnect = False
+        self._generation = 0
+        self._dirty_generation: int | None = None
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_flights: dict[int, asyncio.Task[None]] = {}
         # Lazy MCP client start: the LTM subprocess used to be spawned
         # eagerly from app_lifespan, but its initialize+version_negotiate
         # round trip blocked the proxy's own MCP startup long enough for
@@ -379,6 +384,7 @@ class McpClientSearchAdapter:
             # concurrently with later callers — publishing earlier would hand
             # them a session that never completed the MCP handshake.
             self._session = session
+            self._generation += 1
         except BaseException:
             # Roll back any contexts we entered (transport subprocess, session
             # streams) so a failed start — common during reconnect storms —
@@ -512,6 +518,10 @@ class McpClientSearchAdapter:
                 req.fut.exception()
             self._stack = None
             self._session = None
+            flights = list(self._reconnect_flights.values())
+            if flights:
+                await asyncio.gather(*flights, return_exceptions=True)
+            self._reconnect_flights.clear()
 
     async def _do_close(self, *, swallow_errors: bool = False) -> None:
         """Exit the transport/session contexts. Owner-task only (#663)."""
@@ -555,12 +565,16 @@ class McpClientSearchAdapter:
             self._owner_task = owner
         return owner
 
-    async def _submit(self, op: Literal["start", "reconnect"]) -> None:
+    async def _submit(
+        self, op: Literal["start", "reconnect"], *, expected_generation: int | None = None
+    ) -> None:
         """Marshal a lifecycle op to the owner task and await its outcome."""
         if self._stopped:
             raise RuntimeError("MCP adapter is stopped")
         self._ensure_owner()
-        req = _OwnerRequest(op, asyncio.get_running_loop().create_future())
+        req = _OwnerRequest(
+            op, asyncio.get_running_loop().create_future(), expected_generation=expected_generation
+        )
         self._requests.put_nowait(req)
         try:
             # ``shield`` so that cancelling the *caller* (SurfacingEngine's
@@ -620,6 +634,8 @@ class McpClientSearchAdapter:
                             # call would run a redundant close+start cycle
                             # against the fresh session just built here.
                             self._needs_reconnect = False
+                            if self._dirty_generation == req.expected_generation:
+                                self._dirty_generation = None
                         if not req.fut.done():
                             req.fut.set_result(None)
                     except asyncio.CancelledError:
@@ -686,7 +702,7 @@ class McpClientSearchAdapter:
         httpx.TransportError,
     )
 
-    async def _reconnect(self) -> None:
+    async def _reconnect(self, expected_generation: int | None = None) -> None:
         """Tear down and re-establish the MCP connection.
 
         Runs close-then-start as one atomic op in the owner task (#663);
@@ -698,8 +714,63 @@ class McpClientSearchAdapter:
             self._config.ltm_mcp_transport,
             self._target_display(),
         )
-        await self._submit("reconnect")
+        await self._submit("reconnect", expected_generation=expected_generation)
         logger.info("MCP adapter reconnected successfully")
+
+    def _mark_dirty(self, session: ClientSession, generation: int) -> None:
+        """Mark only the currently published session generation as dirty."""
+        if self._session is session and self._generation == generation:
+            self._dirty_generation = generation
+            self._needs_reconnect = True
+
+    def _finish_reconnect_flight(self, generation: int, completed: asyncio.Future[None]) -> None:
+        """Observe and evict one completed reconnect flight.
+
+        A failed flight can be replaced for the same generation before its
+        callback runs, so remove the mapping only when it still points at the
+        completed task.
+        """
+        _discard_future_result(completed)
+        if self._reconnect_flights.get(generation) is completed:
+            self._reconnect_flights.pop(generation, None)
+
+    async def _shared_reconnect(self, generation: int) -> None:
+        """Join the single reconnect flight for a dirty generation."""
+        async with self._reconnect_lock:
+            flight = self._reconnect_flights.get(generation)
+            if flight is None or flight.done():
+                flight = asyncio.create_task(
+                    self._reconnect_generation(generation),
+                    name=f"ltm-reconnect-generation-{generation}",
+                )
+
+                def finish(completed: asyncio.Future[None]) -> None:
+                    self._finish_reconnect_flight(generation, completed)
+
+                flight.add_done_callback(finish)
+                self._reconnect_flights[generation] = flight
+        await asyncio.shield(flight)
+
+    async def _reconnect_generation(self, generation: int) -> None:
+        if self._dirty_generation != generation:
+            return
+        await self._reconnect(generation)
+        # Normally the owner clears these atomically with publishing the new
+        # session. Keep this idempotent fallback for injected/test lifecycle
+        # implementations that replace ``_reconnect`` itself.
+        if self._dirty_generation == generation:
+            self._dirty_generation = None
+            self._needs_reconnect = False
+
+    async def _rpc(
+        self, session: ClientSession, generation: int, tool: str, args: dict[str, Any]
+    ) -> Any:
+        """Run one RPC and dirty only the session cancelled mid-call."""
+        try:
+            return await session.call_tool(tool, args)
+        except asyncio.CancelledError:
+            self._mark_dirty(session, generation)
+            raise
 
     async def _heal_if_needed(self) -> bool:
         """Ready the session for the next RPC.
@@ -717,6 +788,24 @@ class McpClientSearchAdapter:
         Returns ``True`` when the session is ready, ``False`` when
         callers should treat the adapter as unavailable.
         """
+        # Heal a dirty generation before considering the session-less lazy
+        # start path. A failed reconnect may have closed the old session; the
+        # dirty marker must remain retryable instead of becoming sticky-off.
+        if self._needs_reconnect and self._dirty_generation is None:
+            # Compatibility for state restored by older callers/tests; all
+            # new dirty writes go through ``_mark_dirty``.
+            self._dirty_generation = self._generation
+        dirty_generation = self._dirty_generation
+        if dirty_generation is not None:
+            try:
+                await self._shared_reconnect(dirty_generation)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Lazy reconnect failed: %s", self._scrub_exc(exc))
+                return False
+            return self._session is not None
+
         if self._session is None:
             async with self._start_lock:
                 # Re-check under lock: another coroutine may have raced
@@ -748,16 +837,6 @@ class McpClientSearchAdapter:
                     )
                     return False
                 return True
-        if not self._needs_reconnect:
-            return True
-        try:
-            await self._reconnect()
-        except Exception as exc:
-            logger.warning(
-                "Lazy reconnect after mid-RPC cancellation failed: %s", self._scrub_exc(exc)
-            )
-            return False
-        self._needs_reconnect = False
         return True
 
     async def search(
@@ -789,6 +868,8 @@ class McpClientSearchAdapter:
         # make that invariant visible to mypy (``self._session`` is typed
         # ``ClientSession | None``).
         assert self._session is not None
+        session = self._session
+        generation = self._generation
 
         args: dict[str, Any] = {"query": query}
         if top_k is not None:
@@ -805,13 +886,26 @@ class McpClientSearchAdapter:
             args["output_format"] = "structured"
 
         try:
-            result = await self._session.call_tool("mem_search", args)
+            result = await self._rpc(session, generation, "mem_search", args)
         except self._TRANSPORT_ERRORS as exc:
             logger.warning("MCP transport error, attempting reconnect: %s", self._scrub_exc(exc))
+            self._mark_dirty(session, generation)
+            retry_session = session
+            retry_generation = generation
             try:
-                await self._reconnect()
+                await self._shared_reconnect(generation)
                 assert self._session is not None
-                result = await self._session.call_tool("mem_search", args)
+                retry_session = self._session
+                retry_generation = self._generation
+                result = await self._rpc(retry_session, retry_generation, "mem_search", args)
+            except asyncio.CancelledError:
+                raise
+            except self._TRANSPORT_ERRORS as retry_exc:
+                self._mark_dirty(retry_session, retry_generation)
+                logger.warning(
+                    "MCP mem_search failed after reconnect: %s", self._scrub_exc(retry_exc)
+                )
+                return [], [], "transport_error"
             except Exception as retry_exc:
                 # Upstream LTM is unreachable; surfacing will return empty.
                 logger.warning(
@@ -823,7 +917,7 @@ class McpClientSearchAdapter:
             # reconnect on the next call (the session's read/write streams
             # are now in a half-read state) and propagate the cancellation
             # so the caller's wait_for can surface its TimeoutError.
-            self._needs_reconnect = True
+            self._mark_dirty(session, generation)
             raise
         except Exception as exc:
             logger.warning("MCP mem_search failed: %s", self._scrub_exc(exc))
@@ -862,6 +956,8 @@ class McpClientSearchAdapter:
         if not await self._heal_if_needed():
             return
         assert self._session is not None  # ``_heal_if_needed`` guarantees live session
+        session = self._session
+        generation = self._generation
 
         call_args: dict[str, Any] = {
             "action": "increment_access",
@@ -871,15 +967,28 @@ class McpClientSearchAdapter:
             call_args["_trace_id"] = trace_id
 
         try:
-            await self._session.call_tool("mem_do", call_args)
+            await self._rpc(session, generation, "mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
             logger.warning(
                 "MCP transport error in increment_access, reconnecting: %s", self._scrub_exc(exc)
             )
+            self._mark_dirty(session, generation)
+            retry_session = session
+            retry_generation = generation
             try:
-                await self._reconnect()
+                await self._shared_reconnect(generation)
                 assert self._session is not None
-                await self._session.call_tool("mem_do", call_args)
+                retry_session = self._session
+                retry_generation = self._generation
+                await self._rpc(retry_session, retry_generation, "mem_do", call_args)
+            except asyncio.CancelledError:
+                raise
+            except self._TRANSPORT_ERRORS as retry_exc:
+                self._mark_dirty(retry_session, retry_generation)
+                logger.debug(
+                    "MCP mem_do(increment_access) failed after reconnect: %s",
+                    self._scrub_exc(retry_exc),
+                )
             except Exception as retry_exc:
                 logger.debug(
                     "MCP mem_do(increment_access) failed after reconnect: %s",
@@ -888,7 +997,7 @@ class McpClientSearchAdapter:
         except asyncio.CancelledError:
             # #290: see search() — mid-RPC cancellation marks the session
             # for lazy reconnect; propagate per the cooperative model.
-            self._needs_reconnect = True
+            self._mark_dirty(session, generation)
             raise
         except Exception as exc:
             logger.debug("MCP mem_do(increment_access) failed: %s", self._scrub_exc(exc))
@@ -909,27 +1018,39 @@ class McpClientSearchAdapter:
         if not await self._heal_if_needed():
             return []
         assert self._session is not None  # ``_heal_if_needed`` guarantees live session
+        session = self._session
+        generation = self._generation
 
         call_args: dict[str, Any] = {"action": "scratch_get", "params": {}}
         if trace_id is not None:
             call_args["_trace_id"] = trace_id
 
         try:
-            result = await self._session.call_tool("mem_do", call_args)
+            result = await self._rpc(session, generation, "mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
             logger.warning(
                 "MCP transport error in scratch_list, reconnecting: %s", self._scrub_exc(exc)
             )
+            self._mark_dirty(session, generation)
+            retry_session = session
+            retry_generation = generation
             try:
-                await self._reconnect()
+                await self._shared_reconnect(generation)
                 assert self._session is not None
-                result = await self._session.call_tool("mem_do", call_args)
+                retry_session = self._session
+                retry_generation = self._generation
+                result = await self._rpc(retry_session, retry_generation, "mem_do", call_args)
+            except asyncio.CancelledError:
+                raise
+            except self._TRANSPORT_ERRORS:
+                self._mark_dirty(retry_session, retry_generation)
+                return []
             except Exception:
                 return []
         except asyncio.CancelledError:
             # #290: see search() — mid-RPC cancellation marks the session
             # for lazy reconnect; propagate per the cooperative model.
-            self._needs_reconnect = True
+            self._mark_dirty(session, generation)
             raise
         except Exception as exc:
             logger.debug("MCP mem_do(scratch_get) failed: %s", self._scrub_exc(exc))
