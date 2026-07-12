@@ -229,33 +229,31 @@ class SurfacingConfig(BaseModel):
         return None
 
     def effective_max_injection_chars(self) -> int:
-        """Scale max_injection_chars by model context window.
+        """Clamp ``max_injection_chars`` for small-context consumer models.
 
-        SLM (≤32K): 1500 chars — minimal, high-density injection
-        Medium (32K-200K): 3000 chars — default
-        LLM (>200K): 5000 chars — richer context from memories
+        The configured value is a hard ceiling — model awareness only ever
+        shrinks it (#676). SLM (≤32K tokens): capped at 1500 chars so the
+        injection stays a small fraction of the window. Anything larger, or
+        an unknown/unset model: the configured value as-is.
+
+        There is deliberately no >200K growth tier: the pre-#676 ``max()``
+        silently exceeded an explicitly configured budget, and its interim
+        hard-capped form made budgets non-monotonic (a >200K model got LESS
+        than a 200K one whenever the configured value sat above the tier cap).
         """
         ctx = self._context_tokens()
-        if ctx is None:
-            return self.max_injection_chars
-        if ctx <= 32000:
+        if ctx is not None and ctx <= 32000:
             return min(self.max_injection_chars, 1500)
-        if ctx > 200000:
-            return min(self.max_injection_chars, 5000)
         return self.max_injection_chars
 
     def effective_max_results(self) -> int:
-        """Scale max_results by model context window.
+        """Clamp ``max_results`` for small-context consumer models.
 
-        SLM (≤32K): 2 results — fit in tight context
-        Medium (32K-200K): 3 results — default
-        LLM (>200K): 5 results — can process more memories
+        Same contract as ``effective_max_injection_chars``: the configured
+        value is a hard ceiling. SLM (≤32K tokens): capped at 2 results;
+        anything larger, or an unknown/unset model: the configured value.
         """
         ctx = self._context_tokens()
-        if ctx is None:
-            return self.max_results
-        if ctx <= 32000:
+        if ctx is not None and ctx <= 32000:
             return min(self.max_results, 2)
-        if ctx > 200000:
-            return min(self.max_results, 5)
         return self.max_results
