@@ -66,98 +66,33 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 
 ## Quick Start
 
-`mms` is the short alias for `memtomem-stm-proxy` — both commands are identical, use whichever you prefer.
-
-### 1. Add an upstream MCP server
-
-For first-time setup, run the guided wizard — it prompts for name/prefix/command, optionally probes the server, and then offers to register STM with Claude Code (or generate `.mcp.json`) in the same flow:
+All three installed commands—`mms`, `memtomem-stm`, and
+`memtomem-stm-proxy`—resolve to the same CLI and MCP server entrypoint. The
+shortest first-success path is:
 
 ```bash
-mms init
+mms init      # add an upstream and optionally register STM with a client
+mms doctor    # exit 0 (WARNs allowed) means the proxy setup is usable
 ```
 
-Or add servers non-interactively:
+Without the wizard, add an upstream and register STM explicitly:
 
 ```bash
 mms add filesystem \
   --command npx \
   --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
   --prefix fs
-```
-
-`--prefix` is required: it's the namespace under which the upstream server's tools will appear (e.g. `fs__read_file`). Repeat for each MCP server you want to proxy.
-
-If you've already configured MCP servers in Claude Desktop, Claude Code, or a project `.mcp.json`, `mms add --import` (alias `--from-clients`) reuses the init wizard to bulk-select them — skipping anything already registered. Moving behind the proxy is reversible: imports capture where each entry came from, and `mms eject NAME` restores it to its host client if you later want to stop proxying it (see [docs/cli.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md#eject)).
-
-```bash
-mms list      # show what you've added
-mms status    # config summary (enabled flag, server count)
-mms health    # check connectivity + surfacing readiness
-mms doctor    # one PASS/WARN/FAIL diagnosis with next actions (exit 0 = setup OK)
-```
-
-### 2. Connect your AI client to STM
-
-`mms init` ends with a 3-way prompt — pick option 1 and it shells out to `claude mcp add` for you. If you skipped that step or want to register with a different client later, run:
-
-```bash
 mms register
+mms doctor
 ```
 
-To register manually, use `claude` directly:
+Your client should now list a proxied tool such as `fs__read_file`. An LTM
+warning is expected when no memtomem server is configured; it disables memory
+surfacing only, not proxying, compression, or caching.
 
-```bash
-claude mcp add mms -s user -- mms
-```
-
-Or add it to a JSON MCP config for Cursor / Windsurf / Claude Desktop / Gemini:
-
-```json
-{
-  "mcpServers": {
-    "mms": {
-      "command": "mms"
-    }
-  }
-}
-```
-
-> **Why `mms` and not `memtomem-stm`?** Either name works (the three
-> entry points are interchangeable), but the MCP client composes proxied
-> tool names as `mcp__<server>__<prefix>__<tool>`. The short alias
-> `mms` (3 chars) saves 9 bytes vs `memtomem-stm` (12 chars), which is
-> exactly enough headroom to keep upstreams with long tool names under
-> the 64-char MCP limit. If you registered under a different name and
-> want the `mms add` overflow check (#261) to match exactly, export
-> `MMS_CLIENT_SERVER_NAME=<name>` in your shell — otherwise the default
-> assumption is conservative and at worst causes a few false-positive
-> warnings on borderline prefixes.
-
-### 3. Verify the setup
-
-Setup is done when **`mms doctor` exits 0** and your client lists a first
-proxied tool (e.g. `fs__read_file`) — not merely when registration
-succeeded. `doctor` runs one read-only pass over the config, each upstream
-connection (naming the stage a failure happened in), the cache policy, and
-the LTM server, printing `PASS`/`WARN`/`FAIL` with a runnable `next:`
-command per problem:
-
-```bash
-mms doctor    # exit 0 (WARNs allowed) = setup OK; exit 1 = fix the FAIL lines
-```
-
-Without a memtomem LTM server an `ltm server` WARN is expected — it only
-means memory surfacing is disabled; the proxy core is unaffected.
-
-### 4. Use the proxied tools
-
-Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, etc.). The CLEAN / COMPRESS / SURFACE stages run automatically — responses are cleaned, compressed, cached, and (when an LTM server is configured) enriched with relevant memories. The INDEX stage (auto_index / extraction) is currently inactive in the standalone server; see [#288](https://github.com/memtomem/memtomem-stm/issues/288).
-
-To inspect connectivity and surfacing readiness in detail, run
-`mms health` (`mms status` shows the static config only — it doesn't probe
-connectivity). If you want the agent to call operator-facing MCP
-tools such as `stm_proxy_stats`, start STM with
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`.
+Continue with the complete
+[Getting Started guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md),
+including manual client registration, imports, verification, and next steps.
 
 ## What STM proxies — and what it doesn't
 
@@ -171,57 +106,45 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 - **Sub-agent built-in calls** — the parent's MCP wiring is inherited, but built-in tool calls inside an `Agent` / `Task` invocation stay client-internal.
 
 `mms hook` is an optional PostToolUse bridge for that client-internal path,
-available for Claude Code, Codex CLI, Cursor, and Kimi Code. This is a
-PostToolUse postprocessor, not a full proxy: native calls do not gain STM cache,
-execution retry, progressive delivery, indexing, or extraction. Claude and
-Codex can receive surfaced LTM context; Cursor and Kimi are metrics-only because
-their post-tool channels cannot reliably inject model-visible context. It appends LTM
-surfacing context for read-like built-ins (`Read`, `Grep`, `Glob`, `Bash`, and
-each host's equivalents) and, on Claude Code only, can compress built-in `Bash`
-stdout through `updatedToolOutput` when explicitly enabled with
-`MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1` (native output replacement ports to
-no other host). Register it per host with `mms hook install --host <name>`
-(dry-run by default; `--apply` to write, backing up any prior config). This is
-separate from the MCP proxy: `Write`, `Edit`, and other mutation tools stay out
-of the surfacing path, and the hook always fails open to the original tool
-output.
+available for Claude Code, Codex CLI, Cursor, and Kimi Code. Claude and Codex
+can receive surfaced LTM context; Cursor and Kimi are metrics-only. Claude can
+also opt into guarded Bash compression. Native calls still do not gain proxy
+caching, retries, progressive reads, extraction, or indexing, and the hook
+always fails open. See the
+[native-hook guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/native-hooks.md)
+for the capability matrix, installation paths, daemon behavior, and privacy.
 
 **STM does NOT write back to LTM at runtime.** The bundled `mms` server constructs the proxy without a `FileIndexer` engine by design, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are library-mode only — callers embedding STM as a library can pass `index_engine=` to `ProxyManager` themselves ([#288](https://github.com/memtomem/memtomem-stm/issues/288) has the history).
 
-To bring file or shell operations under STM, register an MCP server that exposes them (the [filesystem example](#1-add-an-upstream-mcp-server) above is the most common case) and steer the agent toward the proxied alias instead of the built-in. This is the same boundary every MCP proxy lives within — it's not specific to STM.
+To bring file or shell operations under STM, register an MCP server that exposes
+them and steer the agent toward the proxied alias instead of the built-in. This
+is the same boundary every MCP proxy lives within—not one specific to STM.
 
 ## Project-scoped MCPs (`mms project` + `mms import`)
 
-A second tier of management lets you decide *which MCP servers a given project sees*, separately from the STM proxy gateway config. State lives in a new dotdir, `~/.mms/`:
-
-- `mms import --from <host>` — pull existing MCP definitions out of one host's config (`claude-code` → `~/.claude.json` / `<cwd>/.mcp.json`, `cursor` → `~/.cursor/mcp.json`, `codex` → `~/.codex/config.toml`, `claude-desktop` → its config) into `~/.mms/registry.toml` (secrets redacted in `--plan`, written verbatim under `--apply`). `--from all`, the default, scans every host.
-- `mms project init` — create a `<project>/.mms/project.toml` marker (commit-recommended).
-- `mms project enable filesystem github` — declare which MCPs that project wants visible.
-- `mms project list` / `mms project show` — inspect the index and the current project.
-
-`~/.mms/` is intentionally separate from `~/.memtomem/` — STM proxy bootstrap (`stm_proxy.json`) and mms project state (`registry.toml`) are *fully disjoint* in W1: `mms add` writes only `stm_proxy.json`, `mms import --apply` writes only `registry.toml`. See [docs/cli.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) for the full reference.
+A separate registry lets a project select which MCP definitions it wants to
+expose. `~/.mms/registry.toml` and project `.mms/project.toml` files are
+deliberately independent of STM's `~/.memtomem/stm_proxy.json`. Importing a
+definition does not automatically route it through the proxy. See
+[Project-Scoped MCP Management](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/project-scoped-mcps.md).
 
 ## Tutorial notebooks
 
 > **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](notebooks/01_quickstart_proxy_setup.ipynb) registers an upstream MCP server, calls a proxied tool, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
 
-## Key Features
-
-- 🗜️ **Typically 20–80% fewer tokens per tool call** — 10 compression strategies with auto-selection by content type, query-aware budget, and zero-loss progressive delivery → [docs/compression.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md)
-- 🧠 **Your agent remembers** — proactive memory surfacing from prior sessions, gated by relevance threshold, rate limit, dedup, and circuit breaker → [docs/surfacing.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md)
-- 💾 **Repeated calls are free** — response cache with TTL and eviction; surfacing re-applied on cache hit so injected memories stay fresh → [docs/caching.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md)
-- 🛡️ **Production-safe** — circuit breaker, retry with backoff, write-tool skip, query cooldown, dedup, sensitive content auto-detection, Langfuse tracing, horizontal scaling via `PendingStore`
-
 ## Documentation
 
 | Guide | Topic |
 |-------|-------|
+| [Getting started](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md) | Install → register → doctor → first proxied tool |
+| [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/operations.md) | Diagnose setup, upstreams, surfacing, and hooks |
+| [Native hooks](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/native-hooks.md) | Host capabilities, installation, daemon, and metrics |
 | [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | How agents recall prior context automatically |
 | [Compression](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md) | All 10 strategies — pick the right one for your content |
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
-| [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Tune settings without touching code |
+| [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Configuration sources and reference map |
 | [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) | Opt-in JSONL log of tool selection + execution outcomes |
-| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | CLI commands, host sync, hooks, daemon, and MCP tools |
+| [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
 
 STM advertises four model-facing MCP tools by default. Nine observability and
 admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, `stm_index_stats`, etc.)

@@ -11,6 +11,14 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Docs
+
+- Reorganized the public documentation around a shorter first-success path,
+  task-oriented guides, and split CLI/configuration references while keeping
+  the existing documentation URLs compatible. Corrected native-hook host
+  paths, CLI signatures, configuration-source boundaries, and previously
+  undocumented public settings.
+
 ## [0.1.36] — 2026-07-12
 
 ### Upgrade notes

@@ -1,5 +1,9 @@
 # Compression Strategies
 
+For file-backed settings, see the
+[Proxy Configuration Reference](reference/proxy-config.md). For operational
+diagnostics and tuning, see [Operations](guides/operations.md).
+
 memtomem-stm has 10 compression strategies. The CLI's `--compression` flag exposes 5 of them (`auto`, `none`, `truncate`, `selective`, `hybrid`); the remaining five are selected via the config file. The default is `auto`, which lets `auto_select_strategy()` pick per response.
 
 ```mermaid

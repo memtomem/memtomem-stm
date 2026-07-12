@@ -1,5 +1,8 @@
 # Selection Telemetry
 
+For the surrounding proxy schema and configuration-source boundary, see the
+[Proxy Configuration Reference](reference/proxy-config.md).
+
 Append-only JSONL log of tool selection and execution outcomes (#467). The
 proxy sits in the call path, so it can record what an advisory analyzer never
 sees: which tool the client model actually called, out of which advertised

@@ -1,5 +1,8 @@
 # Response Caching & Auto-Indexing
 
+For the file-backed schema and configuration-source boundary, see the
+[Proxy Configuration Reference](reference/proxy-config.md).
+
 ## Response Cache
 
 Proxied tool responses are cached in SQLite to avoid repeated upstream calls:
