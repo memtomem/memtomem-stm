@@ -139,6 +139,22 @@ class TestSurfacingBasic:
         output = await engine.surface("gh", "tool", {}, LONG_RESPONSE)
         assert output == LONG_RESPONSE
 
+    async def test_undisplayable_id_memory_still_surfaces_and_dedups(self):
+        """A memory whose ID fails the formatter's display gate renders as an
+        id-less bullet — it still reached the agent, so the injection must not
+        be dropped and the ID must stay committed to session dedup (the
+        substring-probe manifest treated it as undelivered: block dropped when
+        alone, re-surfaced forever when mixed)."""
+        results = [
+            FakeSearchResult(chunk=FakeChunk(id="!bad id", content="odd-id hit"), score=0.5)
+        ]
+        engine = SurfacingEngine(config=_make_config(), mcp_adapter=_make_mcp_adapter(results))
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "Relevant Memories" in output
+        assert "odd-id hit" in output
+        assert "`!bad id`" not in output  # display gate still applies
+        assert "!bad id" in engine._surfaced_ids  # dedup committed, not popped back
+
 
 class TestExplicitContextQueryKwarg:
     """``surface(context_query=...)`` threads through to the LTM query.

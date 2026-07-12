@@ -712,7 +712,10 @@ class SurfacingEngine:
         )
         delivered_ids = list(manifest.delivered_ids)
         delivered_set = set(delivered_ids)
-        if not delivered_ids:
+        # Gate on rendered bullets, not delivered IDs: a bullet whose ID fails
+        # the formatter's display gate is still delivered content and must not
+        # drop the whole injection (the id-less degradation contract).
+        if manifest.rendered_bullets == 0:
             return response_text
         self._claim_surfaced_ids(delivered_ids)
         if surfacing_id is not None:
@@ -982,7 +985,10 @@ class SurfacingEngine:
         for mid in new_ids:
             if mid not in delivered_set:
                 self._surfaced_ids.pop(mid, None)
-        if not delivered_ids:
+        # Gate on rendered bullets, not delivered IDs: a bullet whose ID fails
+        # the formatter's display gate is still delivered content and must not
+        # drop the whole injection (the id-less degradation contract).
+        if manifest.rendered_bullets == 0:
             return response_text
 
         self._gate.record_surfacing(query)
