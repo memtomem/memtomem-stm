@@ -11,6 +11,18 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+The surfacing/compression hardening below landed as tracking issue #676
+(commits pushed directly to `main`) plus its follow-up PRs #677–#679.
+
+### Added
+
+- The surfacing size gate now measures the **cleaned, pre-compression**
+  upstream response against `min_response_chars`, so compressing a large
+  response before surfacing can no longer drop it under the gate. An
+  agent-supplied `_context_query` is treated as an intentional retrieval and
+  bypasses the size gate entirely; a per-tool `query_template` does not (the
+  gate runs before query extraction). (#676, docs #679)
+
 ### Changed
 
 - Model-context scaling of the surfacing injection/result budgets
@@ -25,16 +37,45 @@ changes inline only. See the deprecation policy in
   configurations set above 5000 chars / 5 results and paired with a >200K-token
   consumer model change — the defaults (3000 chars / 3 results) are
   unaffected. (#678)
+- **Behavior change**: an upstream `isError` tool result is now proxied back as
+  its full `CallToolResult` envelope — non-text content, `structuredContent`,
+  and `_meta` preserved — instead of being collapsed into a text-only FastMCP
+  `ToolError`. (#676)
+- LTM dependency failures during surfacing (upstream `isError`, transport /
+  call errors, and malformed or empty-content responses) now count toward the
+  surfacing circuit breaker, so a persistently broken LTM opens the breaker
+  instead of silently passing responses through untouched; a genuine empty
+  result set is not counted as a failure. (#676)
 
 ### Fixed
 
-- Proactive surfacing no longer loses memories whose id cannot be rendered as a
-  copyable token. Which memories count as delivered — and are therefore
-  committed to session / cross-session dedup and feedback — is now decided by
-  the bullets that survive injection-size truncation, not by scanning the
-  rendered block for each backticked id. Previously a block of only
-  non-displayable-id memories was dropped wholesale, and a mix re-surfaced the
-  non-displayable ones on every subsequent call. (#677)
+- Only memories actually present in the injected block — after the id-display
+  gate and injection-size truncation — are committed to feedback, session /
+  cross-session dedup, and the surfacing webhook. A memory whose id cannot be
+  rendered as a copyable token is now delivered as an id-less bullet and
+  committed once, rather than dropping the whole block (all non-displayable) or
+  re-surfacing on every subsequent call (mixed with displayable ids). (#676,
+  #677)
+- Selective compression keeps single-section documents losslessly retrievable
+  through follow-up reads instead of plain-truncating them, and repeated
+  Markdown headings / colliding dotted JSON paths no longer overwrite each
+  other in the chunk map. (#676)
+- Selective and progressive pending-selection eviction are scoped by format, so
+  one strategy's TTL / size eviction no longer discards the other's entries
+  from the shared store. (#676)
+- A response whose background INDEX / EXTRACT work failed or is still
+  unresolved is not written to the response cache, so a later cache hit (which
+  bypasses those stages) cannot strand the ingestion work — it is retried on
+  the next live call. (#676)
+
+### Security
+
+- Sensitive request context (credentials / PII detected in the extracted query)
+  is replaced with a stable `sha256` digest before it is sent to the remote LTM
+  as a search query, so raw secrets never leave the proxy while cache and
+  cooldown behavior are preserved. (#676)
+- Surfacing feedback now verifies the rated `memory_id` belongs to the cited
+  surfacing event before recording it, rejecting mismatched pairs. (#676)
 
 ## [0.1.34] — 2026-07-12
 
