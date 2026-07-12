@@ -33,6 +33,12 @@ changes inline only. See the deprecation policy in
   previously silent `no_results_score` pattern now emits one warning per
   detected episode and appears in the on-disk stats summary. (#672)
 
+### Docs
+
+- Expanded the optional toolgraph setup guide with a concrete
+  `server_name_map`, an upstream-direct crawl recipe, and accurate
+  `TOOL_NOT_FOUND` troubleshooting guidance. (issue #652)
+
 ## [0.1.35] — 2026-07-12
 
 ### Upgrade notes
