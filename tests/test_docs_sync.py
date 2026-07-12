@@ -1006,7 +1006,7 @@ def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     from memtomem_stm.cli.hook_cmd import hook_command
     from memtomem_stm.cli.hook_hosts import HOOK_HOSTS
 
-    expected = str(HOOK_HOSTS["kimi"].config_path)
+    expected = HOOK_HOSTS["kimi"].config_path.as_posix()
     assert expected == "~/.kimi-code/config.toml"
     for relative in (
         "docs/cli.md",
