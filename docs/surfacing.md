@@ -349,6 +349,13 @@ export MEMTOMEM_STM_SURFACING__USE_DAEMON=true
 mms daemon status
 ```
 
+Surfacing and LTM connection settings are environment/default-only; they are
+not loaded from `stm_proxy.json`. In shared mode, configure
+`LTM_MCP_TRANSPORT`, `LTM_MCP_COMMAND`, `LTM_MCP_ARGS`, `LTM_MCP_URL`, and
+`LTM_MCP_HEADERS` through the `MEMTOMEM_STM_SURFACING__*` environment variables
+so every proxy and its detached daemon derive the same connection and
+fingerprint.
+
 With the default `warmup_enabled=true`, each proxy requests a lock-guarded
 daemon spawn during background warm-up; only one matching daemon builds an LTM
 connection. With warm-up disabled, the first eligible search requests the

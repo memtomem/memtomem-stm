@@ -113,7 +113,7 @@ async def test_daemon_search_round_trip_preserves_structured_fields(tmp_path: Pa
         {
             "content": "remember this",
             "score": 0.0312345,
-            "source": "/notes/a.md",
+            "source": str(Path("/notes/a.md")),
             "namespace": "work",
             "chunk_id": "real-chunk-id",
         }

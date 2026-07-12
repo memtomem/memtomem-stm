@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from memtomem_stm.daemon.discovery import (
     HANDSHAKE_VERSION,
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LtmRequestState = str
+LtmRequestState = Literal["invalid", "missing", "ok", "unavailable"]
 
 
 async def _request(
@@ -173,6 +173,9 @@ async def ltm_request(
     hs = _live_handshake_candidate(config)
     if hs is None:
         return "missing", None
+    # Same-host loopback processes share the OS monotonic-clock epoch, so this
+    # absolute deadline is meaningful across the client/daemon boundary (the
+    # same convention as ``surface()`` above).
     deadline = asyncio.get_running_loop().time() + timeout
     resp = await _request(
         hs,

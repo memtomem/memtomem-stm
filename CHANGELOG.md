@@ -24,6 +24,9 @@ changes inline only. See the deprecation policy in
   and helpful-feedback boosts share one daemon-owned LTM connection per
   matching config, while each proxy keeps its feedback/cache/tuning state.
   Missing or busy daemons fail open without spawning a private child.
+  Daemon admission also converts an unexpected operation exception into a
+  logged `unavailable` response; hook surfacing already catches its own
+  exceptions and continues to fail open.
 
 ### Docs
 
