@@ -2078,8 +2078,8 @@ class TestApplyProxyFileConfig:
         _apply_proxy_file_config(config, {})
 
         assert config.surfacing.consumer_model == "gpt-4.1-mini"
-        # A >200K-context model scales the injection budget up from 3000.
-        assert config.surfacing.effective_max_injection_chars() == 5000
+        # Consumer-model scaling never exceeds the operator's explicit cap.
+        assert config.surfacing.effective_max_injection_chars() == 3000
 
     def test_explicit_surfacing_consumer_model_not_clobbered(self, tmp_path, monkeypatch):
         """Same guard as ``model_post_init``: an explicitly-set surfacing

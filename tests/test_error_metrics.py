@@ -450,14 +450,12 @@ class TestManagerErrorRecording:
         assert s["errors_by_category"]["timeout"] == 1
 
     async def test_upstream_error_records_metric(self):
-        from mcp.server.fastmcp.exceptions import ToolError
-
         mgr = _make_manager()
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
             "Error: not found", is_error=True
         )
-        with pytest.raises(ToolError, match="not found"):
-            await mgr.call_tool("srv", "tool", {})
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result.isError is True
         s = mgr.tracker.get_summary()
         assert s["errors_by_category"]["upstream_error"] == 1
 
@@ -558,28 +556,24 @@ class TestErrorMessagePersistence:
         assert msg is not None and msg.startswith("TimeoutError")
 
     async def test_upstream_error_persists_original_text(self, tmp_path):
-        from mcp.server.fastmcp.exceptions import ToolError
-
         mgr = _make_manager_with_store(tmp_path)
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
             "Error: page slug 'foo' not found", is_error=True
         )
-        with pytest.raises(ToolError):
-            await mgr.call_tool("srv", "tool", {})
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result.isError is True
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "upstream_error"
         assert msg == "Error: page slug 'foo' not found"
 
     async def test_message_truncated_at_cap(self, tmp_path):
-        from mcp.server.fastmcp.exceptions import ToolError
-
         mgr = _make_manager_with_store(tmp_path)
         long_text = "x" * (MAX_ERROR_MESSAGE_CHARS + 250)
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
             long_text, is_error=True
         )
-        with pytest.raises(ToolError):
-            await mgr.call_tool("srv", "tool", {})
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result.isError is True
         _cat, _code, msg = _read_error_row(mgr)
         assert msg is not None
         assert len(msg) == MAX_ERROR_MESSAGE_CHARS

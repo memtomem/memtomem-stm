@@ -21,10 +21,12 @@ def _extract(
 class TestQueryTemplate:
     def test_template_substitution(self):
         cfg_kwargs = {
-            "context_tools": {"read_file": ToolSurfacingConfig(query_template="file {arg.path}")}
+            "context_tools": {
+                "read_file": ToolSurfacingConfig(query_template="file path {arg.path}")
+            }
         }
         result = _extract("read_file", {"path": "/src/main.py"}, **cfg_kwargs)
-        assert result == "file /src/main.py"
+        assert result == "file path /src/main.py"
 
     def test_template_with_server_and_tool(self):
         cfg_kwargs = {
@@ -67,25 +69,25 @@ class TestExplicitContextQueryKwarg:
         result = _extract(
             "any_tool",
             {"_context_query": "loser", "path": "/unrelated.py"},
-            context_query="winner",
+            context_query="winner explicit query",
         )
-        assert result == "winner"
+        assert result == "winner explicit query"
 
     def test_empty_explicit_kwarg_falls_through_to_legacy(self):
         result = _extract(
             "any_tool",
-            {"_context_query": "from arguments", "path": "/x.py"},
+            {"_context_query": "from explicit arguments", "path": "/x.py"},
             context_query="",
         )
-        assert result == "from arguments"
+        assert result == "from explicit arguments"
 
     def test_whitespace_explicit_kwarg_falls_through_to_legacy(self):
         result = _extract(
             "any_tool",
-            {"_context_query": "from arguments", "path": "/x.py"},
+            {"_context_query": "from explicit arguments", "path": "/x.py"},
             context_query="   \n\t  ",
         )
-        assert result == "from arguments"
+        assert result == "from explicit arguments"
 
     def test_none_explicit_kwarg_falls_through_to_heuristic(self):
         result = _extract(
@@ -98,7 +100,9 @@ class TestExplicitContextQueryKwarg:
 
     def test_template_still_wins_over_explicit_kwarg(self):
         cfg_kwargs = {
-            "context_tools": {"read_file": ToolSurfacingConfig(query_template="file {arg.path}")}
+            "context_tools": {
+                "read_file": ToolSurfacingConfig(query_template="file path {arg.path}")
+            }
         }
         result = _extract(
             "read_file",
@@ -106,15 +110,15 @@ class TestExplicitContextQueryKwarg:
             context_query="ignored because template wins",
             **cfg_kwargs,
         )
-        assert result == "file /src/main.py"
+        assert result == "file path /src/main.py"
 
     def test_explicit_kwarg_is_stripped(self):
         result = _extract(
             "any_tool",
             {"path": "/unrelated.py"},
-            context_query="  padded query  ",
+            context_query="  padded explicit query  ",
         )
-        assert result == "padded query"
+        assert result == "padded explicit query"
 
 
 class TestHeuristicExtraction:

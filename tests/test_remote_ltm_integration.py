@@ -35,7 +35,7 @@ from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
 _FAKE_SERVER = Path(__file__).parent / "_fake_memtomem_server.py"
 
 LONG_RESPONSE = "x" * 200
-VALID_ARGS = {"path": "src/auth.py", "_context_query": "JWT authentication"}
+VALID_ARGS = {"path": "src/auth.py", "_context_query": "JWT authentication implementation"}
 
 
 def _stdio_config(*, include_session_context: bool = False) -> SurfacingConfig:
