@@ -182,10 +182,11 @@ class TestAutoIndexStartupWarning:
         assert any("compressed-away content is permanently lost" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_warns_auto_index_enabled_but_no_engine(self, caplog):
+    async def test_warns_auto_index_enabled_but_no_engine(self, caplog, tmp_path):
         """auto_index.enabled=true but index_engine=None → startup warning."""
         config = ProxyConfig(
             enabled=True,
+            config_path=tmp_path / "missing-proxy.json",
             auto_index=AutoIndexConfig(enabled=True),
         )
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
@@ -200,10 +201,11 @@ class TestAutoIndexStartupWarning:
         )
 
     @pytest.mark.asyncio
-    async def test_warns_extraction_enabled_but_no_engine(self, caplog):
+    async def test_warns_extraction_enabled_but_no_engine(self, caplog, tmp_path):
         """extraction.enabled=true but index_engine=None → startup warning (#288)."""
         config = ProxyConfig(
             enabled=True,
+            config_path=tmp_path / "missing-proxy.json",
             extraction=ExtractionConfig(enabled=True),
         )
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
@@ -344,10 +346,11 @@ class TestPrivacyScanStartupWarning:
         )
 
     @pytest.mark.asyncio
-    async def test_warns_llm_extraction_scan_off_external(self, caplog):
+    async def test_warns_llm_extraction_scan_off_external(self, caplog, tmp_path):
         """extraction (LLM, scan off, external) with an index engine → warning."""
         config = ProxyConfig(
             enabled=True,
+            config_path=tmp_path / "missing-proxy.json",
             extraction=ExtractionConfig(
                 enabled=True,
                 strategy=ExtractionStrategy.LLM,
@@ -372,11 +375,12 @@ class TestPrivacyScanStartupWarning:
         )
 
     @pytest.mark.asyncio
-    async def test_no_extraction_warning_without_index_engine(self, caplog):
+    async def test_no_extraction_warning_without_index_engine(self, caplog, tmp_path):
         """Same scan-off external extraction, but no index engine → no leak, no
         warning (extraction never runs in the bundled ``mms`` server)."""
         config = ProxyConfig(
             enabled=True,
+            config_path=tmp_path / "missing-proxy.json",
             extraction=ExtractionConfig(
                 enabled=True,
                 strategy=ExtractionStrategy.LLM,
@@ -393,10 +397,11 @@ class TestPrivacyScanStartupWarning:
         assert not any("LLM extraction enabled" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_no_warning_for_local_ollama_scan_off(self, caplog):
+    async def test_no_warning_for_local_ollama_scan_off(self, caplog, tmp_path):
         """Scan off but destination is local Ollama → no warning (never leaves box)."""
         config = ProxyConfig(
             enabled=True,
+            config_path=tmp_path / "missing-proxy.json",
             extraction=ExtractionConfig(
                 enabled=True,
                 strategy=ExtractionStrategy.LLM,
