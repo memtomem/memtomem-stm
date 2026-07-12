@@ -1028,9 +1028,7 @@ class SurfacingEngine:
                         "tool": tool,
                         "query": query,
                         "memory_ids": delivered_ids,
-                        "scores": [
-                            r.score for r in relevant if str(r.chunk.id) in delivered_set
-                        ],
+                        "scores": [r.score for r in relevant if str(r.chunk.id) in delivered_set],
                         "surfacing_id": surfacing_id,
                     },
                 )
