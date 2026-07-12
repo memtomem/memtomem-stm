@@ -542,6 +542,52 @@ class TestFormatterInjection:
         assert "## 관련 기억" in output
 
 
+class TestRenderManifestDelivery:
+    """Delivery is decided by the truncation loop itself, not by probing the
+    rendered block for backticked id tokens (codex review of the #676 range).
+    The substring probe missed id-less bullets (ID fails the display gate → no
+    token) and could false-positive on an ID echoed inside another kept line."""
+
+    def test_undisplayable_id_still_delivered_and_injected(self):
+        # Leading '!' fails _MEMORY_ID_RE → the bullet renders id-less, but the
+        # memory still reached the agent: it must be in delivered_ids so
+        # dedup/feedback commit it, and rendered_bullets must be non-zero so
+        # the engine does not drop the whole injection.
+        fmt = SurfacingFormatter(SurfacingConfig())
+        manifest = fmt.render(
+            "response", [FakeResult(FakeChunk(id="!bad id", content="visible"), 0.5)], "query"
+        )
+        assert "visible" in manifest.text
+        assert "`!bad id`" not in manifest.text  # display gate still applies
+        assert manifest.delivered_ids == ("!bad id",)
+        assert manifest.omitted_ids == ()
+        assert manifest.rendered_bullets == 1
+        assert manifest.truncated is False
+
+    def test_truncation_prefix_defines_delivery(self):
+        fmt = SurfacingFormatter(SurfacingConfig(max_injection_chars=550))
+        results = [
+            FakeResult(FakeChunk(content="keep this", id="id-keepme-0001"), 0.5),
+            FakeResult(FakeChunk(content="x" * 5000, id="id-dropme-0002"), 0.5),
+        ]
+        manifest = fmt.render("response", results, "query", surfacing_id="sid-xyz")
+        assert manifest.truncated is True
+        assert manifest.delivered_ids == ("id-keepme-0001",)
+        assert manifest.omitted_ids == ("id-dropme-0002",)
+        assert manifest.rendered_bullets == 1
+
+    def test_all_bullets_truncated_reports_zero_rendered(self):
+        # Preamble alone exceeds the cap → zero bullets survive. The manifest
+        # must say so via rendered_bullets, which is what gates injection.
+        fmt = SurfacingFormatter(SurfacingConfig(max_injection_chars=120))
+        results = [FakeResult(FakeChunk(content="x" * 400, id="id-body"), 0.5)]
+        manifest = fmt.render("response", results, "query", surfacing_id="sid-over")
+        assert manifest.truncated is True
+        assert manifest.delivered_ids == ()
+        assert manifest.omitted_ids == ("id-body",)
+        assert manifest.rendered_bullets == 0
+
+
 class TestPreviewMaxCharsKnob:
     """F3 — ``preview_max_chars`` controls the per-result preview slice.
 

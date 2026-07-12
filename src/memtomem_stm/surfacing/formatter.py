@@ -23,12 +23,22 @@ _STRUCTURAL_NORMALIZED = frozenset("<>/&`")
 
 @dataclass(frozen=True)
 class RenderManifest:
-    """Rendered output plus the memory IDs that actually reached the agent."""
+    """Rendered output plus the memory IDs that actually reached the agent.
+
+    ``delivered_ids`` are the IDs of every bullet present in the final block —
+    including bullets whose ID failed the ``_MEMORY_ID_RE`` display gate and
+    therefore carry no visible token. Delivery is about the memory reaching
+    the agent, not about the ID being copyable. ``rendered_bullets`` counts
+    bullets in the final block regardless of whether they have an ID at all,
+    so callers can distinguish "nothing survived truncation" from "survivors
+    have no trackable IDs".
+    """
 
     text: str
     delivered_ids: tuple[str, ...]
     omitted_ids: tuple[str, ...]
     truncated: bool = False
+    rendered_bullets: int = 0
 
 
 class SurfacingFormatter:
@@ -210,9 +220,7 @@ class SurfacingFormatter:
             namespace = getattr(meta, "namespace", None)
             source_file = getattr(meta, "source_file", None)
             ns_badge = self._format_namespace_badge(namespace)
-            source = (
-                self._sanitize(self._format_source(source_file)) if source_file else ""
-            )
+            source = self._sanitize(self._format_source(source_file)) if source_file else ""
 
             ctx = getattr(r, "context", None)
             preview_cap = self._config.preview_max_chars
@@ -274,6 +282,7 @@ class SurfacingFormatter:
         # (default 3000) dwarf the ~300-char preamble.
         max_chars = self._config.effective_max_injection_chars()
         truncated = False
+        rendered_bullets = len(body_ids)
         if max_chars and len(memory_block) > max_chars:
             truncated = True
             marker = "\n... (memory block truncated)"
@@ -292,8 +301,18 @@ class SurfacingFormatter:
             while len(kept) > body_start and kept[-1] in ("", _WORKING_MEMORY_HEADER):
                 kept.pop()
             memory_block = "\n".join(kept) + marker
+            # Bullets are the contiguous prefix of the body (scratch lines
+            # follow), and the structural trim above never pops a bullet, so
+            # the kept body-line count bounds the surviving bullet count.
+            rendered_bullets = min(len(body_ids), len(kept) - body_start)
 
-        delivered = tuple(mid for mid in body_ids if mid and f"`{mid}`" in memory_block)
+        # Delivery is decided by the truncation loop itself — the first
+        # ``rendered_bullets`` body lines are exactly the bullets in the final
+        # block. A substring probe over ``memory_block`` would miss id-less
+        # bullets (ID fails the display gate above → no backticked token) and
+        # could false-positive on an ID echoed inside another kept line (e.g.
+        # a scratch key rendered in backticks).
+        delivered = tuple(mid for mid in body_ids[:rendered_bullets] if mid)
         delivered_set = set(delivered)
         omitted = tuple(mid for mid in body_ids if mid and mid not in delivered_set)
 
@@ -306,4 +325,4 @@ class SurfacingFormatter:
                 text = (
                     f"{response_text}\n\n<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
                 )
-        return RenderManifest(text, delivered, omitted, truncated)
+        return RenderManifest(text, delivered, omitted, truncated, rendered_bullets)
