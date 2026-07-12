@@ -197,9 +197,7 @@ class TestExplicitContextQueryKwarg:
         engine = SurfacingEngine(
             config=_make_config(
                 context_tools={
-                    "read_file": ToolSurfacingConfig(
-                        query_template="file path {arg.path}"
-                    )
+                    "read_file": ToolSurfacingConfig(query_template="file path {arg.path}")
                 }
             ),
             mcp_adapter=adapter,
@@ -222,6 +220,67 @@ class TestSurfacingGating:
         )
         output = await engine.surface("gh", "tool", {}, "short")
         assert output == "short"
+
+    async def test_explicit_context_query_bypasses_short_response_gate(self):
+        """docs/surfacing.md pin (#676): an explicit agent query is an
+        intentional retrieval, so it surfaces even when the response is below
+        ``min_response_chars``. Per-tool templates and heuristics do NOT get
+        this bypass — the gate runs before query extraction."""
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.9)])
+        engine = SurfacingEngine(config=_make_config(min_response_chars=1000), mcp_adapter=adapter)
+        output = await engine.surface(
+            "gh", "tool", {}, "short", context_query="find authentication code"
+        )
+        assert "hit" in output
+        assert adapter.search.await_args.kwargs["query"] == "find authentication code"
+
+    async def test_query_template_does_not_bypass_short_response_gate(self):
+        """The counterpart pin: a per-tool ``query_template`` is resolved during
+        extraction, which runs AFTER the response-size gate, so it cannot rescue
+        a short response the way an explicit ``context_query`` does. The LTM
+        search must never be reached (gate skips first). A regression that moved
+        extraction ahead of the gate would surface here and fail this test.
+
+        The template ``"file path {arg.path}"`` renders to three tokens so it
+        clears ``min_query_tokens`` — the control test below proves it DOES
+        reach ``adapter.search`` on a long response, so the short-response skip
+        here is attributable to the size gate, not to token-floor validation."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        cfg = _make_config(
+            min_response_chars=1000,
+            context_tools={"read_file": ToolSurfacingConfig(query_template="file path {arg.path}")},
+        )
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.9)])
+        engine = SurfacingEngine(config=cfg, mcp_adapter=adapter)
+        output = await engine.surface("gh", "read_file", {"path": "/x.py"}, "short")
+        assert output == "short"
+        adapter.search.assert_not_awaited()
+
+        # Control: the SAME template on a long-enough response DOES reach search,
+        # proving the query is valid and the skip above was the size gate alone.
+        adapter2 = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.9)])
+        engine2 = SurfacingEngine(config=cfg, mcp_adapter=adapter2)
+        output2 = await engine2.surface("gh", "read_file", {"path": "/x.py"}, "x" * 1000)
+        assert "hit" in output2
+        assert adapter2.search.await_args.kwargs["query"] == "file path /x.py"
+
+    async def test_source_response_chars_drives_short_response_gate(self):
+        """docs/surfacing.md pin (#676): the gate measures the pre-compression
+        upstream size when the proxy provides it, not the (possibly heavily
+        compressed) text handed to the engine — in both directions."""
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.9)])
+        engine = SurfacingEngine(config=_make_config(min_response_chars=1000), mcp_adapter=adapter)
+        # Large upstream compressed to a short text → still surfaces.
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, "short", source_response_chars=5000
+        )
+        assert "hit" in output
+        # Small upstream behind a long engine text → still skipped.
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, source_response_chars=5
+        )
+        assert output == LONG_RESPONSE
 
     async def test_write_tool_skipped(self):
         engine = SurfacingEngine(
