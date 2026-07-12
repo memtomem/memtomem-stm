@@ -137,6 +137,7 @@ class HostHookAdapter(ABC):
 
     host_tag: ClassVar[str]
     can_replace_output: ClassVar[bool]
+    can_inject_context: ClassVar[bool]
     native_tool_map: ClassVar[dict[str, str]]
 
     @abstractmethod
@@ -188,6 +189,7 @@ class ClaudeHookAdapter(HostHookAdapter):
 
     host_tag: ClassVar[str] = "claude"
     can_replace_output: ClassVar[bool] = True
+    can_inject_context: ClassVar[bool] = True
     # Claude Code's PascalCase built-in tool names → STM's canonical vocabulary.
     # MultiEdit/Edit both map to ``edit``; tools outside this map (Task,
     # TodoWrite, …) canonicalize to ``""`` and never surface/compress.
@@ -264,6 +266,7 @@ class CodexHookAdapter(HostHookAdapter):
 
     host_tag: ClassVar[str] = "codex"
     can_replace_output: ClassVar[bool] = False
+    can_inject_context: ClassVar[bool] = True
     # Codex's only native (non-MCP) tools that fire PostToolUse. ``apply_patch``
     # is a diff/patch apply → canonical ``edit``; ``Bash`` → ``shell``. No native
     # Read/Grep/Glob/WebFetch (Codex shells out), so they are absent here and
@@ -341,6 +344,10 @@ class CursorHookAdapter(HostHookAdapter):
 
     host_tag: ClassVar[str] = "cursor"
     can_replace_output: ClassVar[bool] = False
+    # Cursor currently accepts the field but discards it for native PostToolUse.
+    # Keep the hook useful for metrics without spending an LTM request whose
+    # result cannot reach the model.
+    can_inject_context: ClassVar[bool] = False
     # Cursor's verified native built-in tool names (capitalized values) → canonical
     # vocabulary. Only Shell/Read are in the read-like surface allowlist; the docs
     # don't enumerate Grep/Glob/WebFetch/Edit equivalents, so they're absent and
@@ -420,7 +427,18 @@ class KimiHookAdapter(HostHookAdapter):
 
     host_tag: ClassVar[str] = "kimi"
     can_replace_output: ClassVar[bool] = False
+    # Current Kimi Code documents PostToolUse as observation-only. The legacy
+    # raw-stdout assumption is therefore not a model-visible delivery channel.
+    can_inject_context: ClassVar[bool] = False
     native_tool_map: ClassVar[dict[str, str]] = {
+        # Current Kimi Code (0.x, ~/.kimi-code).
+        "Bash": "shell",
+        "Read": "read",
+        "Grep": "grep",
+        "Glob": "glob",
+        "Write": "write",
+        "Edit": "edit",
+        # Legacy kimi-cli compatibility (~/.kimi).
         "Shell": "shell",
         "ReadFile": "read",
         "WriteFile": "write",
@@ -547,6 +565,11 @@ def detect_host(payload: Any) -> str:
         return "cursor"
     if "tool_output" in payload and "tool_response" not in payload:
         return "kimi"
+    # ``turn_id`` is a documented Codex-specific extension. Prefer the
+    # least-capable matching adapter instead of treating Codex as Claude and
+    # accidentally attempting Claude-only native output replacement.
+    if isinstance(payload.get("turn_id"), str) and payload.get("turn_id"):
+        return "codex"
     return "claude"
 
 

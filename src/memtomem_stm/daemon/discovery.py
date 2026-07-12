@@ -113,6 +113,8 @@ def config_fingerprint(config: STMConfig) -> str:
         "surfacing": config.surfacing.model_dump(mode="json"),
         "record_feedback_events": config.hook.record_feedback_events,
         "host": config.daemon.host,
+        "idle_timeout_seconds": config.daemon.idle_timeout_seconds,
+        "max_pending_requests": config.daemon.max_pending_requests,
         "surface_tools_env": os.environ.get("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", ""),
         "protocol_version": PROTOCOL_VERSION,
     }

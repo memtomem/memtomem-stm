@@ -1,5 +1,17 @@
 # Changelog
 
+- Harden native-tool PostToolUse integration with explicit host capabilities
+  (Claude surfacing plus safe opt-in Bash replacement, Codex surfacing-only,
+  Cursor/Kimi metrics-only), a 65% minimum-retention compression guard, current
+  Kimi paths/tool names, strict hook ownership recognition, and refusal to
+  overwrite malformed host config structures. Daemon protocol v3 now carries
+  an end-to-end monotonic deadline, bounds admitted requests, and does not idle
+  down while a surface request is active.
+- Upgrade note: reinstall legacy Claude hooks so the generated command includes
+  `--host claude`. Bare legacy `mms hook` registrations now fail safe by disabling
+  native output replacement because auto-detection cannot reliably distinguish
+  Claude from Codex.
+
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 

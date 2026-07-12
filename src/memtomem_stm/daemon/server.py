@@ -163,6 +163,8 @@ class DaemonServer:
         self._last_request = time.monotonic()
         self._shutdown_event = asyncio.Event()
         self._surface_lock = asyncio.Lock()
+        self._pending_slots = asyncio.Semaphore(config.daemon.max_pending_requests)
+        self._active_requests = 0
         self._handshake_written = False
         self._engine: Any = None
         self._adapter: Any = None
@@ -419,11 +421,28 @@ class DaemonServer:
             call = CanonicalHookCall.from_wire(req.get("payload"))
             if call is None:
                 return surface_response({})
+            deadline = req.get("deadline_monotonic")
+            if not isinstance(deadline, (int, float)):
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+            if self._pending_slots.locked():
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+            await self._pending_slots.acquire()
             self._last_request = time.monotonic()
-            # Serialize: one LTM RPC at a time over the shared MCP session.
-            async with self._surface_lock:
-                output = await run_surfacing_hook(call, engine=self._engine)
-            return surface_response(output)
+            self._active_requests += 1
+            try:
+                async with asyncio.timeout_at(float(deadline)):
+                    async with self._surface_lock:
+                        output = await run_surfacing_hook(call, engine=self._engine)
+                return surface_response(output)
+            except asyncio.TimeoutError:
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+            finally:
+                self._active_requests -= 1
+                self._pending_slots.release()
+                self._last_request = time.monotonic()
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
 
     def _ltm_warmth(self) -> str:
@@ -460,7 +479,10 @@ class DaemonServer:
                 pass
             if self._shutdown_event.is_set():
                 return
-            if time.monotonic() - self._last_request >= self._idle_timeout:
+            if (
+                self._active_requests == 0
+                and time.monotonic() - self._last_request >= self._idle_timeout
+            ):
                 logger.info("daemon idle for %.0fs — shutting down", self._idle_timeout)
                 self._shutdown_event.set()
                 return

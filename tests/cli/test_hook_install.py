@@ -31,6 +31,7 @@ from memtomem_stm.cli.hook_cmd import _DEFAULT_SURFACE_TOOLS
 from memtomem_stm.cli.hook_hosts import (
     HOOK_HOSTS,
     HookInstallError,
+    _config_path,
     _is_stm_hook_command,
     apply_change,
     matcher_for,
@@ -77,6 +78,7 @@ def _sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "mms hook --host codex",
         "memtomem-stm-proxy hook",
         "uv run --directory /repo memtomem-stm hook --host kimi",
+        "uv run --directory /repo/memtomem-stm memtomem-stm hook --host claude",
         "/usr/local/bin/memtomem-stm hook --host cursor",  # absolute path basename
     ],
 )
@@ -111,7 +113,7 @@ def test_matcher_for_per_host() -> None:
     # formatted per host: alternation (Claude/Kimi), anchored regex (Codex),
     # none (Cursor's generic post-tool hook).
     assert matcher_for("claude") == "Read|Grep|Glob|Bash"
-    assert matcher_for("kimi") == "Shell|ReadFile"
+    assert matcher_for("kimi") == "Bash|Read|Grep|Glob|Shell|ReadFile"
     assert matcher_for("codex") == "^Bash$"
     assert matcher_for("cursor") is None
 
@@ -343,6 +345,36 @@ def test_plan_install_refuses_non_object_toplevel(redirect) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("[1, 2, 3]", encoding="utf-8")  # valid JSON, wrong shape
     with pytest.raises(HookInstallError, match="not a top-level object"):
+        plan_install("claude", "memtomem-stm hook --host claude")
+
+
+@pytest.mark.parametrize(
+    ("host", "env_name"),
+    [
+        ("claude", "CLAUDE_CONFIG_DIR"),
+        ("codex", "CODEX_HOME"),
+        ("kimi", "KIMI_CODE_HOME"),
+    ],
+)
+def test_config_path_respects_host_home_override(
+    host: str, env_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / host
+    monkeypatch.setenv(env_name, str(home))
+    assert _config_path(HOOK_HOSTS[host]).parent == home
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"hooks": "not-an-object"}, {"hooks": {"PostToolUse": "not-a-list"}}],
+)
+def test_plan_install_refuses_wrong_typed_hook_containers(
+    redirect, payload: dict[str, object]
+) -> None:
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(HookInstallError, match="expected"):
         plan_install("claude", "memtomem-stm hook --host claude")
 
 

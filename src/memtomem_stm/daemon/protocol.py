@@ -47,7 +47,7 @@ import json
 import secrets
 from typing import Any
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
 # built-in tool's output (a large ``Read`` can be hundreds of KB), so this sits
@@ -91,11 +91,19 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
     return obj
 
 
-def build_request(token: str, op: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_request(
+    token: str,
+    op: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
     """Construct a request frame body."""
     req: dict[str, Any] = {"v": PROTOCOL_VERSION, "token": token, "op": op}
     if payload is not None:
         req["payload"] = payload
+    if deadline_monotonic is not None:
+        req["deadline_monotonic"] = deadline_monotonic
     return req
 
 

@@ -68,6 +68,7 @@ import os
 import shlex
 import sys
 from dataclasses import replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TextIO
 
 import click
@@ -136,6 +137,8 @@ _SAFE_DAEMON_BUDGET = 256 * 1024
 # 3000 ms busy timeout. Generous vs. a sub-ms WAL write, tiny vs. host latency.
 _METRICS_BUSY_TIMEOUT_MS = 250
 
+_UNSAFE_SURFACE_TOOLS = frozenset({"write", "edit"})
+
 
 def _surface_tools() -> frozenset[str]:
     """Allowlist of *canonical* tool names to surface for, overridable via env.
@@ -166,6 +169,13 @@ def _surface_tools() -> frozenset[str]:
                 "(use canonical names: %s)",
                 token,
                 ", ".join(sorted(CANONICAL_TOOLS)),
+            )
+            continue
+        if canonical in _UNSAFE_SURFACE_TOOLS:
+            logger.warning(
+                "MEMTOMEM_STM_HOOK_SURFACE_TOOLS: refusing mutating tool %r; "
+                "write/edit inputs are never valid surfacing queries",
+                token,
             )
             continue
         tools.add(canonical)
@@ -260,9 +270,17 @@ def _already_compressed(text: str) -> bool:
     return text.startswith(_COMPRESS_SENTINEL)
 
 
-def maybe_compress_builtin(
+@dataclass(frozen=True, slots=True)
+class BuiltinCompressionOutcome:
+    status: str
+    replacement: dict[str, Any] | None = None
+    original_chars: int = 0
+    compressed_chars: int = 0
+
+
+def compress_builtin(
     call: "CanonicalHookCall", cfg: "HookCompressionConfig"
-) -> dict[str, Any] | None:
+) -> BuiltinCompressionOutcome:
     """Compress a shell tool's ``stdout`` for the PostToolUse ``updatedToolOutput``.
 
     Returns the value to place in ``updatedToolOutput`` — a dict mirroring the
@@ -283,17 +301,27 @@ def maybe_compress_builtin(
     """
     try:
         if not cfg.enabled:
-            return None
+            return BuiltinCompressionOutcome("disabled")
         if call.event_type != "PostToolUse":
-            return None
+            return BuiltinCompressionOutcome("ineligible_event")
         if call.canonical_tool != "shell":
-            return None
+            return BuiltinCompressionOutcome("ineligible_tool")
         extracted = _bash_stdout(call.tool_response)
         if extracted is None:
-            return None
+            return BuiltinCompressionOutcome("unsupported_shape")
         stdout, original = extracted
+        explicit_error = original.get("isError") is True or original.get("is_error") is True
+        interrupted = original.get("interrupted") is True
+        image = original.get("isImage") is True or original.get("is_image") is True
+        exit_code = original.get("exitCode", original.get("exit_code"))
+        nonzero_exit = (
+            isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+        )
+        if explicit_error or interrupted or image or nonzero_exit:
+            return BuiltinCompressionOutcome("unsafe_result", original_chars=len(stdout))
         if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
-            return None
+            status = "already_compressed" if _already_compressed(stdout) else "below_threshold"
+            return BuiltinCompressionOutcome(status, original_chars=len(stdout))
 
         # Lazy import: keep ``mms hook --help`` and the no-op path off the
         # compression module's import cost.
@@ -308,17 +336,36 @@ def maybe_compress_builtin(
             # meaningful replacement — prepending anyway would EXPAND the
             # configured cap many-fold (max_chars=1 → ~18 chars of sentinel).
             # Leave the output unchanged instead.
-            return None
+            return BuiltinCompressionOutcome("budget_too_small", original_chars=len(stdout))
         body_budget = cfg.max_chars - len(prefix)
         compressed = TruncateCompressor().compress(stdout, max_chars=body_budget)
+        replacement_text = prefix + compressed
+        if len(stdout) and len(replacement_text) / len(stdout) < cfg.min_retention:
+            return BuiltinCompressionOutcome(
+                "retention_guard",
+                original_chars=len(stdout),
+                compressed_chars=len(replacement_text),
+            )
         clone = dict(original)
-        clone["stdout"] = prefix + compressed
-        return clone
+        clone["stdout"] = replacement_text
+        return BuiltinCompressionOutcome(
+            "compressed",
+            replacement=clone,
+            original_chars=len(stdout),
+            compressed_chars=len(replacement_text),
+        )
     except Exception:
         logger.debug(
             "builtin output compression failed — leaving tool output unchanged", exc_info=True
         )
-        return None
+        return BuiltinCompressionOutcome("error")
+
+
+def maybe_compress_builtin(
+    call: "CanonicalHookCall", cfg: "HookCompressionConfig"
+) -> dict[str, Any] | None:
+    """Backward-compatible replacement-only wrapper for direct callers."""
+    return compress_builtin(call, cfg).replacement
 
 
 def _bounded_call(call: "CanonicalHookCall") -> "CanonicalHookCall":
@@ -651,7 +698,12 @@ def _record_hook_metrics(
         logger.debug("hook metrics recording failed — no row written", exc_info=True)
 
 
-async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> dict[str, Any]:
+async def _orchestrate(
+    payload: dict[str, Any],
+    adapter: "HostHookAdapter",
+    *,
+    allow_output_replacement: bool | None = None,
+) -> dict[str, Any]:
     """Resolve the full hook output: in-process Bash *compression* merged with
     LTM *surfacing*, as one host-shaped output.
 
@@ -685,20 +737,33 @@ async def _orchestrate(payload: dict[str, Any], adapter: "HostHookAdapter") -> d
     """
     from memtomem_stm.config import STMConfig
 
-    config = STMConfig()
     call = adapter.parse(payload)
     if call is None:  # unusable payload → pass the tool output through untouched
         return {}
-    updated = (
-        maybe_compress_builtin(call, config.hook.compression)
-        if adapter.can_replace_output
-        else None
+    config = STMConfig()
+    replacement_allowed = (
+        adapter.can_replace_output
+        if allow_output_replacement is None
+        else adapter.can_replace_output and allow_output_replacement
     )
+    compression = (
+        compress_builtin(call, config.hook.compression)
+        if replacement_allowed
+        else BuiltinCompressionOutcome("unsupported_host")
+    )
+    logger.debug(
+        "native compression status=%s original_chars=%d compressed_chars=%d",
+        compression.status,
+        compression.original_chars,
+        compression.compressed_chars,
+    )
+    updated = compression.replacement
     surf_out: dict[str, Any] = {}
-    try:
-        surf_out = await _run_hook(call, config=config)
-    except Exception:
-        logger.debug("surfacing failed — keeping the compression half", exc_info=True)
+    if adapter.can_inject_context:
+        try:
+            surf_out = await _run_hook(call, config=config)
+        except Exception:
+            logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
     _record_hook_metrics(call, updated, additional_context, config)
     return adapter.render(updated_tool_output=updated, additional_context=additional_context)
@@ -804,7 +869,16 @@ def hook_command(ctx: click.Context, host: str) -> None:
     if payload is not None:
         try:
             output = asyncio.run(
-                asyncio.wait_for(_orchestrate(payload, adapter), timeout=_hook_budget_seconds())
+                asyncio.wait_for(
+                    _orchestrate(
+                        payload,
+                        adapter,
+                        # Automatic/ambiguous routing must never enable the
+                        # sole destructive capability (native output replace).
+                        allow_output_replacement=host.strip() == "claude",
+                    ),
+                    timeout=_hook_budget_seconds(),
+                )
             )
         except Exception:
             logger.warning("hook processing failed — passing tool output through", exc_info=True)

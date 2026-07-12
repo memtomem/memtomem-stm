@@ -537,7 +537,7 @@ Commands:
 
 Bare `mms hook` (no subcommand) is the **runtime bridge**: it reads a host's
 `PostToolUse` hook payload from stdin and prints a hook response. It adds LTM
-surfacing through `additionalContext` (or, on Kimi, raw stdout) for read-like
+surfacing through `additionalContext` for read-like
 built-ins (`Read`/`Grep`/`Glob`/`Bash` and their per-host equivalents). Bash
 stdout compression is separate, Claude-only, and opt-in via
 `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
@@ -588,11 +588,14 @@ config that exists but does not parse is refused, never overwritten. TOML hosts
 not preserved (JSON has no comments) — the original-preserving `.bak` backup is
 the safety net.
 
-Surfacing is the only capability that ports to non-Claude hosts (native output
+Native hooks are PostToolUse observers, not full MCP proxies: they do not add
+cache, execution retry, progressive delivery, indexing, or extraction.
+Surfacing is the only capability that ports to Codex (native output
 replacement/compression is Claude-only). The command prints each host's runtime
 caveat after planning: Codex requires approving the hook via its `/hooks`
-command; Cursor's `additional_context` is documented but a runtime no-op today;
-Kimi's exit-0 stdout inject is unverified.
+command. Cursor and Kimi are metrics-only. Current Kimi installs use
+`~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`) and current native
+tool names such as `Read`, `Grep`, `Glob`, and `Bash` are recognized.
 
 ## `mms daemon` — warm surfacing process
 

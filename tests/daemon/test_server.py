@@ -191,6 +191,37 @@ async def test_surface_round_trip_injects_memories(tmp_path: Path) -> None:
         await _stop(cfg, task)
 
 
+async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
+    server = DaemonServer(_config(tmp_path))
+    call = _canonical(_READ_PAYLOAD)
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": call.to_wire(),
+            "deadline_monotonic": asyncio.get_running_loop().time() - 1,
+        }
+    )
+    assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+
+
+async def test_surface_rejects_when_pending_queue_is_full(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    cfg.daemon.max_pending_requests = 1
+    server = DaemonServer(cfg)
+    await server._pending_slots.acquire()
+    call = _canonical(_READ_PAYLOAD)
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": call.to_wire(),
+            "deadline_monotonic": asyncio.get_running_loop().time() + 1,
+        }
+    )
+    assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+
+
 async def test_noop_surface_for_non_allowlisted_tool_real_wiring(tmp_path: Path) -> None:
     # Real _build_engine (FeedbackTracker + lazy LTM adapter). A Write tool is
     # not allowlisted, so run_surfacing_hook returns {} without touching LTM.
