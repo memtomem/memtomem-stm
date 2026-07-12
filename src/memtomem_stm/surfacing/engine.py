@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from memtomem_stm.observability.tracing import traced
@@ -29,6 +31,21 @@ _QUERY_HASH_PREFIX = "sha256:"
 hashed-form row without re-reading config and lets ad-hoc DB inspection
 tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
+
+_SCORE_SCALE_WARNING_STREAK = 5
+"""Fresh LTM searches required before warning about a score-scale mismatch.
+
+This is an advisory tripwire rather than a tuning knob: exposing it as config
+would imply that operators should calibrate the detector instead of fixing the
+embedding/search path or intentionally choosing a lower ``min_score``.
+"""
+
+
+@dataclass
+class _ScoreScaleStreak:
+    threshold: float
+    count: int
+    observed_max: float
 
 
 class _DependencyFault(RuntimeError):
@@ -152,6 +169,11 @@ class SurfacingEngine:
         # operators easily miss a counter — symmetric to the #348
         # prepend-on-progressive WARNING-once pattern.
         self._warned_ltm_unavailable: bool = False
+        # Per-upstream-tool score-scale tripwire (#672). Only real LTM
+        # searches update this state; cache hits have no raw scores and are
+        # deliberately neutral. Entries disappear on recovery/reset, so the
+        # map is naturally bounded by the configured upstream tool set.
+        self._score_scale_streaks: dict[tuple[str, str], _ScoreScaleStreak] = {}
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -192,6 +214,77 @@ class SurfacingEngine:
             self._feedback_tracker.record_fault(server, tool, kind)
         except Exception:
             logger.debug("Failed to persist surfacing fault counter", exc_info=True)
+
+    def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
+        """Best-effort durable counter for advisory pipeline diagnostics."""
+        if self._feedback_tracker is None:
+            return
+        try:
+            self._feedback_tracker.record_diagnostic(server, tool, kind)
+        except Exception:
+            logger.debug("Failed to persist surfacing diagnostic counter", exc_info=True)
+
+    def _reset_score_scale_streak(self, server: str, tool: str) -> None:
+        self._score_scale_streaks.pop((server, tool), None)
+
+    def _observe_score_scale(
+        self,
+        server: str,
+        tool: str,
+        results: list[Any],
+        min_score: float,
+    ) -> None:
+        """Warn once per episode when healthy search scores stay below floor.
+
+        Empty results and a candidate at/above the active threshold reset the
+        episode. A threshold change also resets it so evidence gathered under
+        one operator/auto-tuned policy is never combined with another.
+        """
+        key = (server, tool)
+        if not results:
+            self._score_scale_streaks.pop(key, None)
+            return
+
+        scores = [float(r.score) for r in results]
+        if not all(math.isfinite(score) for score in scores):
+            self._score_scale_streaks.pop(key, None)
+            return
+        result_max = max(scores)
+        if result_max >= min_score:
+            self._score_scale_streaks.pop(key, None)
+            return
+
+        previous = self._score_scale_streaks.get(key)
+        if previous is None or previous.threshold != min_score:
+            streak = _ScoreScaleStreak(
+                threshold=min_score,
+                count=1,
+                observed_max=result_max,
+            )
+        else:
+            streak = _ScoreScaleStreak(
+                threshold=min_score,
+                count=min(previous.count + 1, _SCORE_SCALE_WARNING_STREAK),
+                observed_max=max(previous.observed_max, result_max),
+            )
+        self._score_scale_streaks[key] = streak
+
+        if streak.count == _SCORE_SCALE_WARNING_STREAK and (
+            previous is None or previous.count < _SCORE_SCALE_WARNING_STREAK
+        ):
+            logger.warning(
+                "Surfacing score-scale mismatch for %s/%s: %d consecutive "
+                "non-empty LTM searches had max score below active min_score "
+                "(observed ceiling=%.4f, min_score=%.4f). LTM may be running "
+                "single-leg/BM25-only or min_score may be intentionally high; "
+                "check embedding extras and LTM logs. STM did not lower the threshold.",
+                server,
+                tool,
+                _SCORE_SCALE_WARNING_STREAK,
+                streak.observed_max,
+                min_score,
+            )
+            self._persist_diagnostic(server, tool, "score_ceiling_below_min")
 
     def _persistable_query(self, query: str) -> str:
         """Return the form of ``query`` that gets written to
@@ -816,13 +909,20 @@ class SurfacingEngine:
         search_kwargs: dict[str, Any] = {}
         if ctx_win:
             search_kwargs["context_window"] = ctx_win
-        results, hints, outcome = await self._mcp_adapter.search(
-            query=query,
-            top_k=max_results * 2,
-            namespace=namespace,
-            trace_id=trace_id,
-            **search_kwargs,
-        )
+        try:
+            results, hints, outcome = await self._mcp_adapter.search(
+                query=query,
+                top_k=max_results * 2,
+                namespace=namespace,
+                trace_id=trace_id,
+                **search_kwargs,
+            )
+        except asyncio.CancelledError:
+            self._reset_score_scale_streak(server, tool)
+            raise
+        except Exception:
+            self._reset_score_scale_streak(server, tool)
+            raise
 
         # #295: branch on the adapter outcome before doing any further work
         # so the operator-facing skip label distinguishes "LTM unavailable"
@@ -833,6 +933,7 @@ class SurfacingEngine:
         # tuning min_score keep seeing the same signal for the genuine
         # empty-namespace case.
         if outcome in ("no_session", "transport_error"):
+            self._reset_score_scale_streak(server, tool)
             if not self._warned_ltm_unavailable:
                 if self._config.ltm_mcp_transport == "stdio":
                     ltm_target = self._config.ltm_mcp_command
@@ -854,13 +955,17 @@ class SurfacingEngine:
             self._persist_fault(server, tool, "ltm_unavailable")
             raise _DependencyFault(outcome)
         if outcome in ("call_error", "upstream_error"):
+            self._reset_score_scale_streak(server, tool)
             self._observability.record_skip(tool, "ltm_call_failed")
             self._persist_fault(server, tool, "ltm_call_failed")
             raise _DependencyFault(outcome)
         if outcome in ("empty_content", "parse_error"):
+            self._reset_score_scale_streak(server, tool)
             self._observability.record_skip(tool, "ltm_parse_empty")
             self._persist_fault(server, tool, "ltm_parse_empty")
             raise _DependencyFault(outcome)
+
+        self._observe_score_scale(server, tool, results, min_score)
 
         # Parent trust-UX hints (parent PR #231): log at INFO even when results
         # are empty or get filtered out below, since an operator may want to

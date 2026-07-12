@@ -23,6 +23,7 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.surfacing.feedback_store import (
+    DIAGNOSTIC_KINDS,
     FAULT_KINDS,
     FeedbackStore,
     read_surfacing_summary,
@@ -114,6 +115,15 @@ class TestRecordFault:
         # member added without a FAULT_KINDS entry would silently drop its
         # durable counter (record_fault ignores unknown kinds by design).
         assert FAULT_KINDS == FAULT_SKIP_REASONS | {"error_timeout", "error_other"}
+
+    def test_diagnostic_upsert_is_separate_and_unknown_kind_is_dropped(self, tmp_path):
+        store = FeedbackStore(tmp_path / "f.db")
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        store.record_diagnostic("gh", "read_file", "unknown_diagnostic")
+        assert DIAGNOSTIC_KINDS == {"score_ceiling_below_min"}
+        assert _fault_rows(tmp_path / "f.db") == [("gh", "read_file", "score_ceiling_below_min", 2)]
 
     def test_delete_faults_older_than(self, tmp_path):
         store = FeedbackStore(tmp_path / "f.db")
@@ -245,6 +255,21 @@ class TestSummaryFaults:
         summary = read_surfacing_summary(db_path, tool="read_file")
         assert summary["faults"] == {"error_timeout": 1}
 
+    def test_summary_partitions_diagnostics_and_applies_tool_filter(self, tmp_path):
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "error_timeout")
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        store.record_diagnostic("gh", "other_tool", "score_ceiling_below_min")
+        store.close()
+
+        summary = read_surfacing_summary(db_path, tool="read_file")
+        assert summary["faults"] == {"error_timeout": 1}
+        assert summary["diagnostics"] == {"score_ceiling_below_min": 1}
+        assert isinstance(summary["diagnostics_last_at"], float)
+        assert summary["diagnostics_window_days"] == 7
+
     def test_summary_faults_outside_window_excluded(self, tmp_path):
         # The window filter is on the calendar-day bucket, not last_at, so a
         # row whose *day* predates the window is excluded even though its
@@ -306,6 +331,7 @@ class TestSummaryFaults:
         summary = read_surfacing_summary(db_path)
         assert summary["available"] is True
         assert summary["faults"] == {}
+        assert summary["diagnostics"] == {}
 
     def test_render_block_shows_faults_and_warning(self, tmp_path, capsys):
         db_path = tmp_path / "f.db"
@@ -329,3 +355,35 @@ class TestSummaryFaults:
         out = capsys.readouterr().out
         assert "pipeline faults" not in out
         assert "degraded-LTM" not in out
+        assert "score-scale diagnostics" not in out
+
+    def test_render_block_shows_diagnostic_without_fault_guidance(self, tmp_path, capsys):
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        store.close()
+
+        _render_surfacing_block(read_surfacing_summary(db_path))
+        out = capsys.readouterr().out
+        assert "score-scale diagnostics (last 7 UTC days):" in out
+        assert "score_ceiling_below_min" in out
+        assert "single-leg/BM25-only" in out
+        assert "STM did not lower the threshold" in out
+        assert "pipeline faults" not in out
+        assert "degraded-LTM faults" not in out
+
+    def test_render_block_mixed_fault_and_diagnostic_guidance(self, tmp_path, capsys):
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "error_timeout")
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        store.close()
+
+        _render_surfacing_block(read_surfacing_summary(db_path))
+        out = capsys.readouterr().out
+        assert "pipeline faults" in out
+        assert "degraded-LTM faults" in out
+        assert "score-scale diagnostics" in out
+        assert "single-leg/BM25-only" in out

@@ -76,6 +76,9 @@ class FeedbackTracker:
     def record_fault(self, server: str, tool: str, kind: str) -> None:
         self._store.record_fault(server, tool, kind)
 
+    def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
+        self._store.record_diagnostic(server, tool, kind)
+
     def record_feedback(
         self,
         surfacing_id: str,

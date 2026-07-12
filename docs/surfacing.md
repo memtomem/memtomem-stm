@@ -539,9 +539,14 @@ hit:
 - `no_query` — `ContextExtractor` could not synthesize a query
   from the tool arguments and fell below `min_query_tokens`.
 - `no_results_score` — LTM returned results, none above
-  `min_score`. Lower the threshold for that tool via
-  `context_tools.<name>.min_score` if the tool is consistently
-  missed.
+  `min_score`. When five consecutive non-empty searches for the same
+  upstream tool remain below the active floor, STM logs a one-shot
+  score-scale warning and persists `score_ceiling_below_min` for
+  `mms stats`. Check the LTM embedding/search backend first: a
+  single-leg/BM25-only search has a lower score ceiling than the default
+  hybrid scale. If the backend is healthy and the stricter policy is
+  intentional, set `context_tools.<name>.min_score` explicitly. The
+  diagnostic never lowers the threshold automatically.
 - `no_results_dedup` — every result was already surfaced this
   session and dropped by `_surfaced_ids`. Distinct from
   `no_results_score` so an operator can tell whether to lower

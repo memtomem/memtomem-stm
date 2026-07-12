@@ -120,6 +120,13 @@ FAULT_KINDS: frozenset[str] = frozenset(
     }
 )
 
+DIAGNOSTIC_KINDS: frozenset[str] = frozenset({"score_ceiling_below_min"})
+"""Advisory signals stored in ``surfacing_faults`` for schema reuse.
+
+They are partitioned from real degraded-dependency faults at read time so the
+CLI never describes a healthy-but-miscalibrated search as a timeout/failure.
+"""
+
 
 def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
     """Migrate the legacy NOT NULL constraint off ``surfacing_events.query``.
@@ -245,6 +252,9 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         "faults": {},
         "faults_last_at": None,
         "faults_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
+        "diagnostics": {},
+        "diagnostics_last_at": None,
+        "diagnostics_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
         "error": None,
     }
     if not resolved.exists():
@@ -309,14 +319,19 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             if tool is not None:
                 fault_where += " AND tool = ?"
                 fault_params.append(tool)
-            fault_rows = db.execute(
+            signal_rows = db.execute(
                 "SELECT kind, SUM(count), MAX(last_at) FROM surfacing_faults"
                 f"{fault_where} GROUP BY kind",
                 fault_params,
             ).fetchall()
+            fault_rows = [row for row in signal_rows if row[0] in FAULT_KINDS]
+            diagnostic_rows = [row for row in signal_rows if row[0] in DIAGNOSTIC_KINDS]
             summary["faults"] = {row[0]: row[1] for row in fault_rows}
             summary["faults_last_at"] = max((row[2] for row in fault_rows), default=None)
             summary["faults_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
+            summary["diagnostics"] = {row[0]: row[1] for row in diagnostic_rows}
+            summary["diagnostics_last_at"] = max((row[2] for row in diagnostic_rows), default=None)
+            summary["diagnostics_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
 
         summary["available"] = True
     except sqlite3.Error as exc:
@@ -410,7 +425,24 @@ class FeedbackStore:
         exception. Day buckets are UTC so counters aggregate stably across
         processes regardless of host timezone.
         """
-        if self._db is None or kind not in FAULT_KINDS:
+        self._record_signal(server, tool, kind, FAULT_KINDS)
+
+    def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
+        """Increment a durable advisory diagnostic counter.
+
+        Diagnostics share the day-aggregated fault table for bounded storage,
+        but readers partition them so operator guidance remains accurate.
+        """
+        self._record_signal(server, tool, kind, DIAGNOSTIC_KINDS)
+
+    def _record_signal(
+        self,
+        server: str,
+        tool: str,
+        kind: str,
+        allowed_kinds: frozenset[str],
+    ) -> None:
+        if self._db is None or kind not in allowed_kinds:
             return
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))

@@ -499,6 +499,16 @@ Shows proxy compression and surfacing statistics from the persistent databases (
 
 It reads these files read-only (without creating or migrating them) and reports all-time totals. Because the live MCP server keeps additional in-memory counters that a separate CLI process cannot see, the numbers here reflect only what has been successfully flushed/written to disk.
 
+The surfacing block reports degraded-LTM faults separately from score-scale
+diagnostics. After five consecutive non-empty searches for one upstream tool
+whose best candidate remains below its active `min_score`, the proxy records a
+`score_ceiling_below_min` diagnostic. This can indicate a single-leg/BM25-only
+LTM (for example, missing embedding extras) or an intentionally high threshold.
+The warning is advisory: inspect the LTM logs/search backend before lowering a
+pinned threshold. STM never changes `min_score` in response to this diagnostic.
+`--json` exposes the same signal under the additive `surfacing.diagnostics`,
+`diagnostics_last_at`, and `diagnostics_window_days` fields.
+
 ### `tune`
 
 ```

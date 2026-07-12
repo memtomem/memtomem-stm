@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -145,9 +146,7 @@ class TestSurfacingBasic:
         be dropped and the ID must stay committed to session dedup (the
         substring-probe manifest treated it as undelivered: block dropped when
         alone, re-surfaced forever when mixed)."""
-        results = [
-            FakeSearchResult(chunk=FakeChunk(id="!bad id", content="odd-id hit"), score=0.5)
-        ]
+        results = [FakeSearchResult(chunk=FakeChunk(id="!bad id", content="odd-id hit"), score=0.5)]
         engine = SurfacingEngine(config=_make_config(), mcp_adapter=_make_mcp_adapter(results))
         output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "Relevant Memories" in output
@@ -2380,6 +2379,159 @@ class TestPerToolMinScoreOverride:
             assert "[strong]: near tuned floor" not in out
         finally:
             tracker.close()
+
+
+class TestScoreScaleDiagnostic:
+    @staticmethod
+    def _engine(*, score: float = 0.016, tracker=None, min_score: float = 0.03):
+        result = FakeSearchResult(chunk=FakeChunk(content="low-score candidate"), score=score)
+        config = _make_config(
+            min_score=min_score,
+            dedup_ttl_seconds=0,
+            stats_retention_days=0,
+        )
+        return SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter([result]),
+            feedback_tracker=tracker,
+        )
+
+    async def test_fifth_search_warns_and_persists_once(self, caplog):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+
+        with caplog.at_level(logging.WARNING):
+            for i in range(6):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"_context_query": f"distinct low score query {i}"},
+                    LONG_RESPONSE,
+                )
+
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert len(warnings) == 1
+        assert "observed ceiling=0.0160" in warnings[0]
+        assert "min_score=0.0300" in warnings[0]
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+
+    def test_empty_recovery_and_threshold_change_reset_episode(self, caplog):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
+        equal = [FakeSearchResult(chunk=FakeChunk(), score=0.03)]
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(4):
+                engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", [], 0.03)
+            for _ in range(4):
+                engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", equal, 0.03)
+            for _ in range(4):
+                engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", low, 0.04)
+
+        assert not [r for r in caplog.records if "score-scale mismatch" in r.message]
+        tracker.record_diagnostic.assert_not_called()
+        assert engine._score_scale_streaks[("gh", "read_file")].count == 1
+        assert engine._score_scale_streaks[("gh", "read_file")].threshold == 0.04
+
+    def test_streak_isolated_by_server_and_tool_and_rearms(self):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
+        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.03)]
+
+        for _ in range(5):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+        for _ in range(4):
+            engine._observe_score_scale("gitlab", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "search", low, 0.03)
+        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        for _ in range(5):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        assert tracker.record_diagnostic.call_count == 2
+        assert engine._score_scale_streaks[("gitlab", "read_file")].count == 4
+        assert engine._score_scale_streaks[("gh", "search")].count == 4
+
+    def test_non_finite_score_resets_without_warning(self):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
+        invalid = [FakeSearchResult(chunk=FakeChunk(), score=float("nan"))]
+
+        for _ in range(4):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+        engine._observe_score_scale("gh", "read_file", invalid, 0.03)
+
+        assert ("gh", "read_file") not in engine._score_scale_streaks
+        tracker.record_diagnostic.assert_not_called()
+
+    async def test_cache_hit_does_not_advance_streak(self):
+        engine = self._engine()
+        args = {"_context_query": "same low score query"}
+
+        await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+        await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+
+        assert engine._score_scale_streaks[("gh", "read_file")].count == 1
+
+    async def test_dependency_outcome_resets_streak(self):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low_result = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
+        engine._mcp_adapter.search.side_effect = (
+            [(low_result, [], "ok")] * 4
+            + [([], [], "transport_error")]
+            + [(low_result, [], "ok")] * 5
+        )
+
+        for i in range(10):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"_context_query": f"dependency reset query {i}"},
+                LONG_RESPONSE,
+            )
+
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+
+    async def test_without_tracker_still_logs_safely(self, caplog):
+        engine = self._engine()
+        with caplog.at_level(logging.WARNING):
+            for i in range(5):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"_context_query": f"no tracker low query {i}"},
+                    LONG_RESPONSE,
+                )
+        assert sum("score-scale mismatch" in r.message for r in caplog.records) == 1
+
+    async def test_diagnostic_persistence_failure_keeps_passthrough(self):
+        tracker = MagicMock()
+        tracker.record_diagnostic.side_effect = RuntimeError("sqlite unavailable")
+        engine = self._engine(tracker=tracker)
+
+        outputs = []
+        for i in range(5):
+            outputs.append(
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"_context_query": f"persistence failure query {i}"},
+                    LONG_RESPONSE,
+                )
+            )
+
+        assert outputs == [LONG_RESPONSE] * 5
+        tracker.record_diagnostic.assert_called_once()
 
 
 class TestSurfacingEngineObservability:
