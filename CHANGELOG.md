@@ -74,9 +74,11 @@ The surfacing/compression hardening below landed as tracking issue #676
   bypasses those stages) cannot strand the ingestion work — it is retried on
   the next live call. (#676)
 - Auto-tuning no longer re-applies the same `min_score` adjustment on repeated
-  calls when no new feedback has arrived: a durable per-tool feedback watermark
-  short-circuits the tuner, so a tool's threshold no longer drifts toward its
-  bound just from being surfaced again. (#676)
+  calls when no new feedback has arrived: within a process, a per-tool
+  watermark over the durable feedback counts short-circuits the tuner, so a
+  tool's threshold no longer drifts toward its bound just from being surfaced
+  again. (The watermark is in-process, so the first tuner pass after a restart
+  may still apply one adjustment.) (#676)
 - Session-context (scratch) retrieval during surfacing is capped at 0.5s, so a
   stalled scratch dependency can no longer consume the whole surfacing timeout
   and suppress otherwise-valid LTM memories. (#676)
