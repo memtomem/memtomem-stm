@@ -93,6 +93,60 @@ class TestEffectiveMaxResultChars:
         assert cfg.effective_max_result_chars() == 16000
 
 
+# ── surfacing tier budgets ───────────────────────────────────────────────
+
+
+class TestSurfacingTierBudgets:
+    """The configured injection/result budget is a hard ceiling — model
+    awareness only ever shrinks it (#676). Pins the three tiers so the
+    docstring cannot drift from the code again, and pins monotonicity: a
+    bigger context window never yields a smaller effective budget (the
+    interim form capped >200K at 5000/5 while leaving 32K–200K uncapped)."""
+
+    def _cfg(self, model: str, **overrides):
+        from memtomem_stm.surfacing.config import SurfacingConfig
+
+        return SurfacingConfig(consumer_model=model, **overrides)
+
+    def test_small_context_caps_injection_and_results(self, monkeypatch):
+        # No ≤32K model ships in MODEL_CONTEXT_WINDOWS today; register one.
+        monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "tiny-slm", 8000)
+        cfg = self._cfg("tiny-slm", max_injection_chars=8000, max_results=10)
+        assert cfg.effective_max_injection_chars() == 1500
+        assert cfg.effective_max_results() == 2
+
+    def test_small_context_respects_lower_configured_value(self, monkeypatch):
+        monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "tiny-slm", 8000)
+        cfg = self._cfg("tiny-slm", max_injection_chars=1000, max_results=1)
+        assert cfg.effective_max_injection_chars() == 1000
+        assert cfg.effective_max_results() == 1
+
+    def test_medium_and_large_return_configured_value(self):
+        # gpt-4o = 128K (medium), gpt-4.1 = 1M (>200K): both return the
+        # configured budget as-is — no growth beyond it, no tier-only cap.
+        for model in ("gpt-4o", "gpt-4.1"):
+            cfg = self._cfg(model, max_injection_chars=8000, max_results=10)
+            assert cfg.effective_max_injection_chars() == 8000, model
+            assert cfg.effective_max_results() == 10, model
+
+    def test_unknown_or_unset_model_returns_configured_value(self):
+        for model in ("", "unknown-model"):
+            cfg = self._cfg(model, max_injection_chars=8000, max_results=10)
+            assert cfg.effective_max_injection_chars() == 8000, model
+            assert cfg.effective_max_results() == 10, model
+
+    def test_budgets_monotonic_in_context_window(self, monkeypatch):
+        monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "tiny-slm", 8000)
+        budgets = [
+            self._cfg(m, max_injection_chars=8000, max_results=10)
+            for m in ("tiny-slm", "gpt-4o", "claude-sonnet-4", "gpt-4.1")
+        ]
+        chars = [c.effective_max_injection_chars() for c in budgets]
+        results = [c.effective_max_results() for c in budgets]
+        assert chars == sorted(chars), chars
+        assert results == sorted(results), results
+
+
 # ── _resolve_tool_config integration ─────────────────────────────────────
 
 
@@ -115,7 +169,10 @@ class TestResolveToolConfigModelAware:
         )
         mgr = ProxyManager(proxy_cfg, TokenTracker())
         conn = UpstreamConnection(
-            name="srv", config=server_cfg, session=AsyncMock(), tools=[],
+            name="srv",
+            config=server_cfg,
+            session=AsyncMock(),
+            tools=[],
         )
         mgr._connections["srv"] = conn
         return mgr
