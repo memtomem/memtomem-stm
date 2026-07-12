@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import sqlite3
@@ -2276,10 +2277,26 @@ class ProxyManager:
             self._record_surfacing_skip(tool, "upstream_disabled")
             return text
         try:
+            source_response_chars = arguments.get("_stm_source_response_chars")
+            surface_arguments = {
+                k: v for k, v in arguments.items() if k != "_stm_source_response_chars"
+            }
+            if "source_response_chars" in inspect.signature(
+                self._surfacing_engine.surface
+            ).parameters:
+                return await self._surfacing_engine.surface(
+                    server=server,
+                    tool=tool,
+                    arguments=surface_arguments,
+                    response_text=text,
+                    trace_id=trace_id,
+                    context_query=context_query,
+                    source_response_chars=source_response_chars,
+                )
             return await self._surfacing_engine.surface(
                 server=server,
                 tool=tool,
-                arguments=arguments,
+                arguments=surface_arguments,
                 response_text=text,
                 trace_id=trace_id,
                 context_query=context_query,
@@ -2340,14 +2357,31 @@ class ProxyManager:
                 obs.record_skip(tool, "progressive_mode_conflict")
             return text, None, None
         try:
-            surfaced = await self._surfacing_engine.surface(
-                server=server,
-                tool=tool,
-                arguments=arguments,
-                response_text=text,
-                trace_id=trace_id,
-                context_query=context_query,
-            )
+            source_response_chars = arguments.get("_stm_source_response_chars")
+            surface_arguments = {
+                k: v for k, v in arguments.items() if k != "_stm_source_response_chars"
+            }
+            if "source_response_chars" in inspect.signature(
+                self._surfacing_engine.surface
+            ).parameters:
+                surfaced = await self._surfacing_engine.surface(
+                    server=server,
+                    tool=tool,
+                    arguments=surface_arguments,
+                    response_text=text,
+                    trace_id=trace_id,
+                    context_query=context_query,
+                    source_response_chars=source_response_chars,
+                )
+            else:
+                surfaced = await self._surfacing_engine.surface(
+                    server=server,
+                    tool=tool,
+                    arguments=surface_arguments,
+                    response_text=text,
+                    trace_id=trace_id,
+                    context_query=context_query,
+                )
             return surfaced, True, None
         except Exception as exc:
             logger.warning(
@@ -3579,19 +3613,23 @@ class ProxyManager:
         text_parts: list[str] = []
         non_text_content: list = []
         non_text_before_first_text = 0
+        first_text_content = None
         total_chars = 0
         oversize = False
         for content in result.content or []:
             if content.type == "text":
+                if oversize:
+                    continue
                 if not text_parts:
                     # Anchor for the final return shape: the processed text is
                     # reinserted where the upstream's FIRST text block sat, so
                     # non-text blocks keep their relative positions.
                     non_text_before_first_text = len(non_text_content)
+                    first_text_content = content
                 remaining = max_upstream - total_chars
                 if remaining <= 0:
                     oversize = True
-                    break
+                    continue
                 # ``content.text or ""`` tolerates spec-noncompliant upstreams
                 # that return ``None`` for a TextContent's ``text`` field.
                 # MCP spec requires ``text: str`` but mirrors the same gap
@@ -3601,7 +3639,7 @@ class ProxyManager:
                     text_parts.append(text[:remaining])
                     total_chars += remaining
                     oversize = True
-                    break
+                    continue
                 text_parts.append(text)
                 total_chars += len(text)
             else:
@@ -3629,6 +3667,7 @@ class ProxyManager:
             original_text="\n".join(text_parts),
             non_text_content=non_text_content,
             non_text_before_first_text=non_text_before_first_text,
+            first_text_content=first_text_content,
         )
 
     async def _compress_and_surface(
@@ -3731,7 +3770,7 @@ class ProxyManager:
             ) = await self._apply_surfacing_on_progressive(
                 server,
                 tool,
-                upstream_args,
+                {**upstream_args, "_stm_source_response_chars": len(cleaned)},
                 compressed,
                 trace_id=trace_id,
                 context_query=context_query,
@@ -4008,7 +4047,7 @@ class ProxyManager:
                     ) = await self._apply_surfacing_on_progressive(
                         server,
                         tool,
-                        upstream_args,
+                        {**upstream_args, "_stm_source_response_chars": len(cleaned)},
                         compressed,
                         trace_id=trace_id,
                         context_query=context_query,
@@ -4023,7 +4062,7 @@ class ProxyManager:
                     surfaced = await self._apply_surfacing(
                         server,
                         tool,
-                        upstream_args,
+                        {**upstream_args, "_stm_source_response_chars": len(cleaned)},
                         compressed,
                         trace_id=trace_id,
                         context_query=context_query,
@@ -4890,12 +4929,17 @@ class ProxyManager:
         # (``stm_proxy_read_more`` / ``stm_proxy_select_chunks``) return plain
         # text and do not re-carry the envelope.
         if non_text_content:
-            from mcp.types import TextContent
-
             k = shaped.non_text_before_first_text
+            template = shaped.first_text_content
+            if template is not None and hasattr(template, "model_copy"):
+                processed_text = template.model_copy(update={"text": final_result})
+            else:
+                from mcp.types import TextContent
+
+                processed_text = TextContent(type="text", text=final_result)
             content_blocks: list = [
                 *non_text_content[:k],
-                TextContent(type="text", text=final_result),
+                processed_text,
                 *non_text_content[k:],
             ]
             if has_result_envelope:

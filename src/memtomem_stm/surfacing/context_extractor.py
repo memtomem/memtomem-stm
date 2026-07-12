@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.surfacing.config import SurfacingConfig
 
 
@@ -33,20 +34,25 @@ class ContextExtractor:
         # 1. Per-tool template
         tool_cfg = config.context_tools.get(tool)
         if tool_cfg and tool_cfg.query_template:
-            return self._apply_template(tool_cfg.query_template, server, tool, arguments)
+            return self._validate_query(
+                self._apply_template(tool_cfg.query_template, server, tool, arguments),
+                config,
+                server,
+                tool,
+            )
 
         # 2. Explicit context_query parameter (preferred path from the proxy,
         # which extracts ``_context_query`` from upstream args and forwards it
         # via this kwarg without re-inserting it into ``arguments``).
         if isinstance(context_query, str) and context_query.strip():
-            return context_query.strip()
+            return self._validate_query(context_query, config, server, tool)
 
         # 3. Agent-provided context (legacy: kept for direct engine callers
         # and tests that still pass ``_context_query`` inside ``arguments``).
         if "_context_query" in arguments:
             cq = arguments["_context_query"]
             if isinstance(cq, str) and cq.strip():
-                return cq.strip()
+                return self._validate_query(cq, config, server, tool)
 
         # 3. Heuristic extraction — prioritize argument values over tool name.
         # Iterate in sorted key order so two identical calls whose arguments
@@ -92,6 +98,19 @@ class ContextExtractor:
         if len(query.split()) < config.min_query_tokens:
             return None
         return query
+
+    @staticmethod
+    def _validate_query(
+        query: str, config: SurfacingConfig, server: str, tool: str
+    ) -> str | None:
+        normalized = query.strip()
+        # Sensitive queries are transformed to a safe digest by the engine;
+        # preserve the original here so that digest is stable and auditable.
+        if contains_sensitive_content(normalized):
+            return normalized
+        if len(normalized.split()) < config.min_query_tokens:
+            return None
+        return normalized
 
     def _apply_template(
         self,

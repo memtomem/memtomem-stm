@@ -241,7 +241,7 @@ class SurfacingConfig(BaseModel):
         if ctx <= 32000:
             return min(self.max_injection_chars, 1500)
         if ctx > 200000:
-            return max(self.max_injection_chars, 5000)
+            return min(self.max_injection_chars, 5000)
         return self.max_injection_chars
 
     def effective_max_results(self) -> int:
@@ -257,5 +257,5 @@ class SurfacingConfig(BaseModel):
         if ctx <= 32000:
             return min(self.max_results, 2)
         if ctx > 200000:
-            return max(self.max_results, 5)
+            return min(self.max_results, 5)
         return self.max_results

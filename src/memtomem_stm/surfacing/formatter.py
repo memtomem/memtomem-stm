@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any
 
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -18,6 +19,16 @@ _UNTRUSTED_PREAMBLE = (
 _MEMORY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:/@+%=-]{0,255}")
 _MARKDOWN_META = frozenset("\\*_{}[]()|")
 _STRUCTURAL_NORMALIZED = frozenset("<>/&`")
+
+
+@dataclass(frozen=True)
+class RenderManifest:
+    """Rendered output plus the memory IDs that actually reached the agent."""
+
+    text: str
+    delivered_ids: tuple[str, ...]
+    omitted_ids: tuple[str, ...]
+    truncated: bool = False
 
 
 class SurfacingFormatter:
@@ -128,8 +139,27 @@ class SurfacingFormatter:
         ``stm_proxy_read_more``; ``prepend`` would shift offsets and is
         therefore skipped by ``ProxyManager`` on the progressive path.
         """
+        return self.render(
+            response_text,
+            results,
+            query,
+            surfacing_id=surfacing_id,
+            scratch_items=scratch_items,
+            score_floor=score_floor,
+        ).text
+
+    def render(
+        self,
+        response_text: str,
+        results: list[Any],
+        query: str,
+        surfacing_id: str | None = None,
+        scratch_items: list[dict] | None = None,
+        score_floor: float | None = None,
+    ) -> RenderManifest:
+        """Render memories and report only IDs present in the final block."""
         if not results and not scratch_items:
-            return response_text
+            return RenderManifest(response_text, (), ())
 
         # #350: surfacing_id + rating spec live above the bullet list so they
         # survive ``effective_max_injection_chars`` truncation. The previous
@@ -173,12 +203,15 @@ class SurfacingFormatter:
         # it is pinned through truncation below. Bullets/scratch are the body.
         body_start = len(lines)
 
+        body_ids: list[str | None] = []
         for r in results:
             chunk = r.chunk
-            meta = chunk.metadata
-            ns_badge = self._format_namespace_badge(meta.namespace)
+            meta = getattr(chunk, "metadata", None)
+            namespace = getattr(meta, "namespace", None)
+            source_file = getattr(meta, "source_file", None)
+            ns_badge = self._format_namespace_badge(namespace)
             source = (
-                self._sanitize(self._format_source(meta.source_file)) if meta.source_file else ""
+                self._sanitize(self._format_source(source_file)) if source_file else ""
             )
 
             ctx = getattr(r, "context", None)
@@ -217,6 +250,7 @@ class SurfacingFormatter:
             cid_text = str(cid) if cid is not None else ""
             id_token = f" `{cid_text}`" if _MEMORY_ID_RE.fullmatch(cid_text) else ""
             lines.append(f"- **{source}**{ns_badge}{id_token} [{bucket}]: {preview}")
+            body_ids.append(cid_text or None)
 
         if scratch_items:
             lines.append("")
@@ -239,7 +273,9 @@ class SurfacingFormatter:
         # which only happens at the tiny caps tests use; production caps
         # (default 3000) dwarf the ~300-char preamble.
         max_chars = self._config.effective_max_injection_chars()
+        truncated = False
         if max_chars and len(memory_block) > max_chars:
+            truncated = True
             marker = "\n... (memory block truncated)"
             kept = lines[:body_start]
             used = len("\n".join(kept))
@@ -257,12 +293,17 @@ class SurfacingFormatter:
                 kept.pop()
             memory_block = "\n".join(kept) + marker
 
+        delivered = tuple(mid for mid in body_ids if mid and f"`{mid}`" in memory_block)
+        delivered_set = set(delivered)
+        omitted = tuple(mid for mid in body_ids if mid and mid not in delivered_set)
+
         match self._config.injection_mode:
             case "prepend":
-                return (
+                text = (
                     f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>\n\n{response_text}"
                 )
             case "append" | "section" | _:
-                return (
+                text = (
                     f"{response_text}\n\n<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
                 )
+        return RenderManifest(text, delivered, omitted, truncated)

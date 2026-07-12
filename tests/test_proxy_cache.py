@@ -196,11 +196,11 @@ class TestTransientKeyDetector:
         assert "stm_proxy_select_chunks(key=" not in out
         assert response_carries_transient_key(out)
 
-    def test_truncate_fallback_is_not_transient(self):
-        # Tiny budget on unstructured text → plain truncation, no key minted.
+    def test_single_chunk_selective_is_transient_and_retrievable(self):
+        # SELECTIVE remains lossless even for one unstructured chunk.
         out = SelectiveCompressor().compress("x" * 5000, max_chars=200)
-        assert '"selection_key"' not in out
-        assert not response_carries_transient_key(out)
+        assert '"selection_key"' in out
+        assert response_carries_transient_key(out)
 
     def test_selection_key_field_without_toc_shape_is_not_transient(self):
         # A legit upstream JSON merely containing a ``selection_key`` field (but

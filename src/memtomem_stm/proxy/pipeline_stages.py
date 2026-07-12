@@ -57,6 +57,7 @@ class ShapedResponse:
     non_text_content: list[Any]
     passthrough: ShapePassthrough | None = None
     non_text_before_first_text: int = 0
+    first_text_content: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -31,6 +31,10 @@ tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
 
 
+class _DependencyFault(RuntimeError):
+    """Internal signal: return passthrough but count the dependency failure."""
+
+
 class SurfacingEngine:
     """Core proactive memory surfacing engine.
 
@@ -293,6 +297,7 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
         context_query: str | None = None,
+        source_response_chars: int | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -308,7 +313,10 @@ class SurfacingEngine:
 
         self._maybe_cleanup_expired()
 
-        if len(response_text) < self._config.min_response_chars:
+        gate_chars = len(response_text) if source_response_chars is None else source_response_chars
+        # An explicit caller query is an intentional retrieval request and may
+        # override the automatic response-size heuristic.
+        if gate_chars < self._config.min_response_chars and not context_query:
             self._observability.record_skip(tool, "response_too_short")
             return response_text
 
@@ -325,6 +333,10 @@ class SurfacingEngine:
             self._observability.record_skip(tool, "no_query")
             logger.debug("Surfacing skipped: no query extracted for %s/%s", server, tool)
             return response_text
+        if contains_sensitive_content(query):
+            # Never send raw credentials/PII to a remote LTM. A stable digest
+            # preserves cache/cooldown behavior without disclosing the source.
+            query = self._hashed_query(query)
         if not self._gate.should_surface(server, tool, query):
             # Gate has already recorded the specific reason internally. Avoid
             # double-counting by not recording at the engine level here.
@@ -359,6 +371,9 @@ class SurfacingEngine:
             # indefinitely and the breaker never opens.
             self._circuit_breaker.record_failure()
             return response_text
+        except _DependencyFault:
+            self._circuit_breaker.record_failure()
+            return response_text
         except Exception:
             self._observability.record_outcome(tool, "error_other")
             self._persist_fault(server, tool, "error_other")
@@ -390,6 +405,9 @@ class SurfacingEngine:
             return "Feedback tracking is not enabled."
 
         result = self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+
+        if isinstance(result, str) and result.startswith("Error"):
+            return result
 
         if rating in ("not_relevant", "already_known"):
             self._invalidate_cache_for_feedback(surfacing_id, memory_id)
@@ -679,32 +697,45 @@ class SurfacingEngine:
         # concurrent-identical-query contract. Cooldown refresh
         # (record_surfacing) and cross-session mark_surfaced stay miss-only by
         # design.
-        self._claim_surfaced_ids([str(r.chunk.id) for r in cached])
         # See ``_do_surface_miss``: only advertise a feedback ID we actually
         # recorded, so neither a no-tracker path nor the dedup-only daemon path
         # (``record_feedback_events=False``) prompts for an unresolvable ID.
         surfacing_id: str | None = None
         if self._feedback_tracker is not None and self._record_feedback_events:
             surfacing_id = uuid.uuid4().hex[:16]
-            try:
-                self._feedback_tracker.record_surfacing(
-                    surfacing_id=surfacing_id,
-                    server=server,
-                    tool=tool,
-                    query=self._persistable_query(query),
-                    memory_ids=[str(r.chunk.id) for r in cached],
-                    scores=[r.score for r in cached],
-                )
-            except Exception:
-                logger.warning("Failed to record cached surfacing event", exc_info=True)
-                surfacing_id = None
-        return self._formatter.inject(
+        manifest = self._formatter.render(
             response_text,
             cached,
             query,
             surfacing_id=surfacing_id,
             score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
         )
+        delivered_ids = list(manifest.delivered_ids)
+        delivered_set = set(delivered_ids)
+        if not delivered_ids:
+            return response_text
+        self._claim_surfaced_ids(delivered_ids)
+        if surfacing_id is not None:
+            assert self._feedback_tracker is not None
+            try:
+                self._feedback_tracker.record_surfacing(
+                    surfacing_id=surfacing_id,
+                    server=server,
+                    tool=tool,
+                    query=self._persistable_query(query),
+                    memory_ids=delivered_ids,
+                    scores=[r.score for r in cached if str(r.chunk.id) in delivered_set],
+                )
+            except Exception:
+                logger.warning("Failed to record cached surfacing event", exc_info=True)
+                surfacing_id = None
+                manifest = self._formatter.render(
+                    response_text,
+                    cached,
+                    query,
+                    score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
+                )
+        return manifest.text
 
     async def _do_surface(
         self,
@@ -818,15 +849,15 @@ class SurfacingEngine:
                 self._warned_ltm_unavailable = True
             self._observability.record_skip(tool, "ltm_unavailable")
             self._persist_fault(server, tool, "ltm_unavailable")
-            return response_text
-        if outcome == "call_error":
+            raise _DependencyFault(outcome)
+        if outcome in ("call_error", "upstream_error"):
             self._observability.record_skip(tool, "ltm_call_failed")
             self._persist_fault(server, tool, "ltm_call_failed")
-            return response_text
-        if outcome == "empty_content":
+            raise _DependencyFault(outcome)
+        if outcome in ("empty_content", "parse_error"):
             self._observability.record_skip(tool, "ltm_parse_empty")
             self._persist_fault(server, tool, "ltm_parse_empty")
-            return response_text
+            raise _DependencyFault(outcome)
 
         # Parent trust-UX hints (parent PR #231): log at INFO even when results
         # are empty or get filtered out below, since an operator may want to
@@ -904,7 +935,6 @@ class SurfacingEngine:
         new_ids = [str(r.chunk.id) for r in relevant]
         self._claim_surfaced_ids(new_ids)
 
-        self._gate.record_surfacing(query)
         logger.info("Surfacing %d memories for %s/%s", len(relevant), server, tool)
         logger.debug(
             "Surfacing %d memories for %s/%s (query=%s)", len(relevant), server, tool, query[:50]
@@ -917,7 +947,10 @@ class SurfacingEngine:
         scratch_items: list[dict] | None = None
         if self._config.include_session_context:
             try:
-                scratch_items = await self._mcp_adapter.scratch_list(trace_id=trace_id)
+                scratch_items = await asyncio.wait_for(
+                    self._mcp_adapter.scratch_list(trace_id=trace_id),
+                    timeout=max(0.05, min(0.5, self._config.timeout_seconds / 3)),
+                )
             except Exception:
                 logger.debug("Failed to fetch session scratch items", exc_info=True)
                 scratch_items = None
@@ -932,29 +965,9 @@ class SurfacingEngine:
         surfacing_id: str | None = None
         if self._feedback_tracker is not None and self._record_feedback_events:
             surfacing_id = uuid.uuid4().hex[:16]
-            try:
-                self._feedback_tracker.record_surfacing(
-                    surfacing_id=surfacing_id,
-                    server=server,
-                    tool=tool,
-                    query=self._persistable_query(query),
-                    memory_ids=new_ids,
-                    scores=[r.score for r in relevant],
-                )
-            except Exception:
-                logger.warning("Failed to record surfacing event", exc_info=True)
-                surfacing_id = None
-
-        # Persist seen IDs for cross-session dedup (in-memory guard was
-        # claimed above to close the concurrent window).
-        if self._feedback_tracker is not None:
-            try:
-                self._feedback_tracker.store.mark_surfaced(new_ids)
-            except Exception:
-                logger.warning("Failed to persist seen memory IDs", exc_info=True)
 
         # Inject memories into response
-        result = self._formatter.inject(
+        manifest = self._formatter.render(
             response_text,
             relevant,
             query,
@@ -962,6 +975,46 @@ class SurfacingEngine:
             scratch_items=scratch_items,
             score_floor=min_score,
         )
+        delivered_ids = list(manifest.delivered_ids)
+        delivered_set = set(delivered_ids)
+        # Reservations close the concurrent window, but only rendered IDs are
+        # committed to session/cross-session dedup.
+        for mid in new_ids:
+            if mid not in delivered_set:
+                self._surfaced_ids.pop(mid, None)
+        if not delivered_ids:
+            return response_text
+
+        self._gate.record_surfacing(query)
+        if surfacing_id is not None:
+            assert self._feedback_tracker is not None
+            delivered_results = [r for r in relevant if str(r.chunk.id) in delivered_set]
+            try:
+                self._feedback_tracker.record_surfacing(
+                    surfacing_id=surfacing_id,
+                    server=server,
+                    tool=tool,
+                    query=self._persistable_query(query),
+                    memory_ids=delivered_ids,
+                    scores=[r.score for r in delivered_results],
+                )
+            except Exception:
+                logger.warning("Failed to record surfacing event", exc_info=True)
+                # The rendered prompt references an unresolvable event ID. Re-render
+                # without it instead of handing the agent a dead feedback handle.
+                surfacing_id = None
+                manifest = self._formatter.render(
+                    response_text,
+                    relevant,
+                    query,
+                    scratch_items=scratch_items,
+                    score_floor=min_score,
+                )
+        if self._feedback_tracker is not None:
+            try:
+                self._feedback_tracker.store.mark_surfaced(delivered_ids)
+            except Exception:
+                logger.warning("Failed to persist seen memory IDs", exc_info=True)
 
         self._observability.record_outcome(tool, "surfaced_cache_miss")
 
@@ -974,8 +1027,10 @@ class SurfacingEngine:
                         "server": server,
                         "tool": tool,
                         "query": query,
-                        "memory_ids": [str(r.chunk.id) for r in relevant],
-                        "scores": [r.score for r in relevant],
+                        "memory_ids": delivered_ids,
+                        "scores": [
+                            r.score for r in relevant if str(r.chunk.id) in delivered_set
+                        ],
                         "surfacing_id": surfacing_id,
                     },
                 )
@@ -983,7 +1038,7 @@ class SurfacingEngine:
             self._background_tasks.add(task)
             task.add_done_callback(self._on_webhook_done)
 
-        return result
+        return manifest.text
 
     def _on_webhook_done(self, task: asyncio.Task) -> None:
         """Log exceptions from fire-and-forget webhook tasks."""

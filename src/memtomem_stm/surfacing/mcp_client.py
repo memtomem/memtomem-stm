@@ -38,6 +38,8 @@ SearchOutcome = Literal[
     "call_error",
     "empty_content",
     "empty_results",
+    "upstream_error",
+    "parse_error",
 ]
 
 
@@ -216,6 +218,21 @@ class StructuredResultParser(ResultParser):
             results.append(result)
 
         return results, hints
+
+    def parse_checked(
+        self, text: str, *, max_content_chars: int = 500
+    ) -> tuple[list[RemoteSearchResult], list[str], bool]:
+        """Parse while distinguishing malformed JSON from a healthy empty set."""
+        if not text or not text.strip():
+            return [], [], True
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return [], [], False
+        if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+            return [], [], False
+        results, hints = self.parse(text, max_content_chars=max_content_chars)
+        return results, hints, True
 
 
 def get_parser(fmt: str = "compact") -> ResultParser:
@@ -923,6 +940,13 @@ class McpClientSearchAdapter:
             logger.warning("MCP mem_search failed: %s", self._scrub_exc(exc))
             return [], [], "call_error"
 
+        # MagicMock/fake results often omit the optional field and fabricate a
+        # truthy attribute on access. Only the protocol's literal boolean true
+        # is an error envelope.
+        if getattr(result, "isError", False) is True:
+            logger.warning("MCP mem_search returned isError=true")
+            return [], [], "upstream_error"
+
         # Parse text response into results
         # ``result.content or []`` tolerates spec-noncompliant upstreams that
         # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
@@ -937,9 +961,16 @@ class McpClientSearchAdapter:
             return [], [], "empty_content"
 
         text = "\n".join(text_parts)
-        results, hints = self._parser.parse(
-            text, max_content_chars=self._config.result_content_max_chars
-        )
+        if isinstance(self._parser, StructuredResultParser):
+            results, hints, valid = self._parser.parse_checked(
+                text, max_content_chars=self._config.result_content_max_chars
+            )
+            if not valid:
+                return [], [], "parse_error"
+        else:
+            results, hints = self._parser.parse(
+                text, max_content_chars=self._config.result_content_max_chars
+            )
         outcome: SearchOutcome = "ok" if results else "empty_results"
         return results, hints, outcome
 

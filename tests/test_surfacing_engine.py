@@ -170,9 +170,9 @@ class TestExplicitContextQueryKwarg:
             "read_file",
             {"path": "/x.py", "_context_query": "loser"},
             LONG_RESPONSE,
-            context_query="winner",
+            context_query="winner explicit query",
         )
-        assert adapter.search.await_args.kwargs["query"] == "winner"
+        assert adapter.search.await_args.kwargs["query"] == "winner explicit query"
 
     async def test_per_tool_template_still_wins_over_kwarg(self):
         from memtomem_stm.surfacing.config import ToolSurfacingConfig
@@ -180,7 +180,11 @@ class TestExplicitContextQueryKwarg:
         adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.5)])
         engine = SurfacingEngine(
             config=_make_config(
-                context_tools={"read_file": ToolSurfacingConfig(query_template="file {arg.path}")}
+                context_tools={
+                    "read_file": ToolSurfacingConfig(
+                        query_template="file path {arg.path}"
+                    )
+                }
             ),
             mcp_adapter=adapter,
         )
@@ -191,7 +195,7 @@ class TestExplicitContextQueryKwarg:
             LONG_RESPONSE,
             context_query="ignored because template wins",
         )
-        assert adapter.search.await_args.kwargs["query"] == "file /src/main.py"
+        assert adapter.search.await_args.kwargs["query"] == "file path /src/main.py"
 
 
 class TestSurfacingGating:
@@ -503,7 +507,7 @@ class TestRelevanceGateConcurrency:
                 engine.surface(
                     "gh",
                     "read_file",
-                    {"path": f"src/f{i}.py", "_context_query": f"query {i}"},
+                    {"path": f"src/f{i}.py", "_context_query": f"distinct query {i}"},
                     LONG_RESPONSE,
                 )
                 for i in range(5)
@@ -2219,7 +2223,7 @@ class TestPerToolMinScoreOverride:
             await engine.surface(
                 "gh",
                 "list_dir",
-                {"path": "src/", "_context_query": "Flask architecture"},
+                {"path": "src/", "_context_query": "Flask application architecture"},
                 LONG_RESPONSE,
             )
             assert engine._auto_tuner._adjustments.get("list_dir", 0) > 0.02, (

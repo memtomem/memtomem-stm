@@ -872,7 +872,11 @@ class SelectiveCompressor:
         if len(chunks) <= 1:
             chunks = self._decompose_single_chunk(chunks, fmt)
             if len(chunks) <= 1:
-                return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
+                # SELECTIVE promises lossless follow-up retrieval. A plain
+                # truncation here violated that contract for one-section
+                # documents while the manager still exempted SELECTIVE from
+                # its retention fallback.
+                chunks = chunks or {"Content": text}
 
         return self._store_and_build_toc(text, fmt, chunks, context_query, max_chars=max_chars)
 
@@ -1072,9 +1076,12 @@ class SelectiveCompressor:
             full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
             if isinstance(value, dict) and depth < self._json_depth:
                 nested = self._parse_json_dict(value, "", prefix=full_key, depth=depth + 1)
-                chunks.update(nested)
+                for nested_key, nested_value in nested.items():
+                    chunks[self._unique_key(chunks, nested_key)] = nested_value
             else:
-                chunks[full_key] = json.dumps(value, ensure_ascii=False, indent=2)
+                chunks[self._unique_key(chunks, full_key)] = json.dumps(
+                    value, ensure_ascii=False, indent=2
+                )
         return chunks
 
     def _parse_json_array(self, data: list[object]) -> dict[str, str]:
@@ -1095,7 +1102,8 @@ class SelectiveCompressor:
                 if current_heading or current_content:
                     content = "\n".join(current_content).strip()
                     if content:
-                        chunks[current_heading or "Preamble"] = content
+                        key = current_heading or "Preamble"
+                        chunks[self._unique_key(chunks, key)] = content
                 current_heading = heading_match.group(2).strip()
                 current_content = []
             else:
@@ -1104,9 +1112,20 @@ class SelectiveCompressor:
         if current_heading or current_content:
             content = "\n".join(current_content).strip()
             if content:
-                chunks[current_heading or "Preamble"] = content
+                key = current_heading or "Preamble"
+                chunks[self._unique_key(chunks, key)] = content
 
         return chunks
+
+    @staticmethod
+    def _unique_key(chunks: dict[str, str], key: str) -> str:
+        """Keep repeated headings and colliding dotted JSON paths addressable."""
+        if key not in chunks:
+            return key
+        suffix = 2
+        while f"{key}#{suffix}" in chunks:
+            suffix += 1
+        return f"{key}#{suffix}"
 
     def _parse_text(self, text: str) -> dict[str, str]:
         paragraphs = re.split(r"\n\n+", text)

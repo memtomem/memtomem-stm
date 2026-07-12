@@ -449,11 +449,18 @@ class FeedbackStore:
             return False
         with self._lock:
             # Verify surfacing event exists
-            exists = self._db.execute(
-                "SELECT 1 FROM surfacing_events WHERE id = ?", (surfacing_id,)
+            event = self._db.execute(
+                "SELECT memory_ids FROM surfacing_events WHERE id = ?", (surfacing_id,)
             ).fetchone()
-            if not exists:
+            if not event:
                 return False
+            if memory_id is not None:
+                try:
+                    event_memory_ids = json.loads(event[0])
+                except (json.JSONDecodeError, TypeError):
+                    return False
+                if memory_id not in event_memory_ids:
+                    return False
             self._db.execute(
                 "INSERT INTO surfacing_feedback (surfacing_id, memory_id, rating, created_at) "
                 "VALUES (?, ?, ?, ?)",
