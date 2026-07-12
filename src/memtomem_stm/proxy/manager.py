@@ -2281,9 +2281,10 @@ class ProxyManager:
             surface_arguments = {
                 k: v for k, v in arguments.items() if k != "_stm_source_response_chars"
             }
-            if "source_response_chars" in inspect.signature(
-                self._surfacing_engine.surface
-            ).parameters:
+            if (
+                "source_response_chars"
+                in inspect.signature(self._surfacing_engine.surface).parameters
+            ):
                 return await self._surfacing_engine.surface(
                     server=server,
                     tool=tool,
@@ -2361,9 +2362,10 @@ class ProxyManager:
             surface_arguments = {
                 k: v for k, v in arguments.items() if k != "_stm_source_response_chars"
             }
-            if "source_response_chars" in inspect.signature(
-                self._surfacing_engine.surface
-            ).parameters:
+            if (
+                "source_response_chars"
+                in inspect.signature(self._surfacing_engine.surface).parameters
+            ):
                 surfaced = await self._surfacing_engine.surface(
                     server=server,
                     tool=tool,
@@ -2975,9 +2977,7 @@ class ProxyManager:
                 selected_tool,
                 trace_id,
                 started,
-                ok=not (
-                    isinstance(result, mcp_types.CallToolResult) and result.isError is True
-                ),
+                ok=not (isinstance(result, mcp_types.CallToolResult) and result.isError is True),
                 error_type=(
                     "UpstreamToolError"
                     if isinstance(result, mcp_types.CallToolResult) and result.isError is True
@@ -4769,9 +4769,7 @@ class ProxyManager:
                 return result
             content: list[dict[str, Any]] = []
             for block in result.content or []:
-                dumped = (
-                    block.model_dump(by_alias=True) if hasattr(block, "model_dump") else None
-                )
+                dumped = block.model_dump(by_alias=True) if hasattr(block, "model_dump") else None
                 if isinstance(dumped, dict):
                     content.append(dumped)
                 elif getattr(block, "type", None) == "text":

@@ -210,9 +210,7 @@ class SurfacingFormatter:
             namespace = getattr(meta, "namespace", None)
             source_file = getattr(meta, "source_file", None)
             ns_badge = self._format_namespace_badge(namespace)
-            source = (
-                self._sanitize(self._format_source(source_file)) if source_file else ""
-            )
+            source = self._sanitize(self._format_source(source_file)) if source_file else ""
 
             ctx = getattr(r, "context", None)
             preview_cap = self._config.preview_max_chars
