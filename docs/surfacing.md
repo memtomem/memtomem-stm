@@ -1,5 +1,9 @@
 # Proactive Memory Surfacing
 
+For environment naming and configuration-source boundaries, see the
+[Environment Variable Reference](reference/environment-variables.md). For
+runtime diagnosis, see [Operations](guides/operations.md).
+
 When your agent calls a proxied tool, STM automatically:
 
 1. **Gates on response size** — skips before any work when the cleaned
@@ -113,6 +117,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `default_namespace` | `null` | Restrict search to a specific namespace |
 | `exclude_tools` | `[]` | fnmatch patterns to never surface, matched against **both** the bare tool name and `server__tool` — so a server-qualified glob like `["context7__*"]` disables a whole upstream (e.g. `["*debug*", "langfuse-docs__*"]`). See [Scoping surfacing per upstream](#scoping-surfacing-per-upstream). |
 | `write_tool_patterns` | `*write*`, `*create*`, `*delete*`, `*push*`, `*send*`, `*remove*` | Auto-skip write/mutation operations |
+| `context_tools` | `{}` | Per-tool `query_template`, namespace, and fixed `min_score` overrides. An explicit per-tool score wins over auto-tuning. |
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
 | `query_retention_days` | `30` | Days to keep the raw extracted query text in `surfacing_events.query` before the opportunistic cleanup nulls it out; `0` to disable (column keeps whatever `record_surfacing` wrote, indefinitely). This knob only clears the column — the event row itself is deleted by `stats_retention_days` (below), not here. |
@@ -135,6 +140,8 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `auto_tune_enabled` | `true` | Auto-adjust `min_score` from feedback: >60% negative (`not_relevant` + `already_known`) raises it (stricter), >80% strictly `helpful` lowers it (more inclusive); `partially_helpful` is neutral |
 | `auto_tune_min_samples` | `20` | Minimum feedback entries before adjusting per-tool score |
 | `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
+| `auto_tune_score_floor` | `0.005` | Lower bound for auto-tuned `min_score`. When left at its default, the effective floor widens downward to include a lower configured top-level `min_score`. |
+| `auto_tune_score_ceiling` | `0.05` | Upper bound for auto-tuned `min_score`. When left at its default, the effective ceiling widens upward to include a higher configured top-level `min_score`. |
 | `feedback_enabled` | `true` | Enable the feedback recording and `stm_surfacing_feedback` tool |
 | `feedback_demotion_enabled` | `true` | Locally filter memories that accumulated repeated negative feedback (`not_relevant` or `already_known`) before cache/injection |
 | `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
@@ -429,7 +436,12 @@ When auto-tuning is enabled (default), STM adjusts `min_score` per tool based on
 | > 80% strictly `helpful` | Lower `min_score` by -0.002 (surface more) |
 | otherwise | Hold current `min_score` |
 
-Adjustment step is `auto_tune_score_increment` (default `0.002`) and the tuned score is clamped to `[0.005, 0.05]`.
+Adjustment step is `auto_tune_score_increment` (default `0.002`) and the tuned
+score is clamped to the effective
+`[auto_tune_score_floor, auto_tune_score_ceiling]` band. The defaults are
+`[0.005, 0.05]`; when a bound is not explicitly set, construction widens it as
+needed to include the configured top-level `min_score`. Explicit bounds must
+satisfy `floor <= min_score <= ceiling`.
 
 ```mermaid
 flowchart LR

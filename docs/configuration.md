@@ -1,18 +1,39 @@
 # Configuration Reference
 
-memtomem-stm reads configuration from two sources, in order of precedence:
+## Choose a reference
+
+- [Environment variables](reference/environment-variables.md): root,
+  surfacing, hook, daemon, and Langfuse settings
+- [Proxy JSON](reference/proxy-config.md): upstreams, compression, cache,
+  telemetry, exposure, and toolgraph
+- [Surfacing behavior](surfacing.md): retrieval gates, feedback, tuning, and
+  diagnostics
+- [Compression behavior](compression.md): strategy selection and fallback
+
+This page retains the detailed legacy sections and anchors used by existing
+links. The split references above are the faster entrypoints for new readers.
+
+> **Configuration-source boundary:** `stm_proxy.json` is parsed strictly as a
+> `ProxyConfig`. Root, surfacing, hook, daemon, and Langfuse settings are
+> environment/default-only; adding those blocks to the JSON file has no
+> effect. The proxy `consumer_model` propagation into surfacing budget
+> resolution is the documented exception.
+
+memtomem-stm combines two configuration domains:
 
 ```mermaid
 flowchart LR
     Env["env vars<br/>MEMTOMEM_STM_*"] -->|highest| Merge["effective config"]
-    File["~/.memtomem/<br/>stm_proxy.json<br/>(hot-reloaded)"] -->|fallback| Merge
+    File["~/.memtomem/<br/>stm_proxy.json<br/>(ProxyConfig only)"] -->|proxy fields| Merge
     Defaults["pydantic-settings<br/>defaults"] -->|baseline| Merge
     Merge --> STM["STM runtime"]
 ```
 
-1. **Environment variables** — prefix `MEMTOMEM_STM_`, double-underscore (`__`) for nesting
-2. **Config file** — `~/.memtomem/stm_proxy.json` (hot-reloaded; changes take effect on the next tool call without restarting)
-3. **Defaults** — every setting has a sensible default in pydantic-settings, so you can run STM with zero configuration
+1. **Environment variables** — root/process settings and all surfacing, hook,
+   daemon, and Langfuse settings; proxy fields can also be overridden here.
+2. **Config file** — `~/.memtomem/stm_proxy.json`, parsed as `ProxyConfig`
+   only and hot-reloaded for supported fields.
+3. **Defaults** — baseline values for both domains.
 
 For most quick-start scenarios you can ignore the config file entirely and use the [CLI](cli.md) (`mms add ...`) plus a few env vars.
 
@@ -23,6 +44,7 @@ All settings use the `MEMTOMEM_STM_` prefix with `__` for nesting.
 ### General
 
 ```bash
+export MEMTOMEM_STM_DATA_DIR=~/.memtomem  # daemon handshake, locks, logs, and default state paths
 export MEMTOMEM_STM_LOG_LEVEL=WARNING   # DEBUG | INFO | WARNING | ERROR | CRITICAL
 ```
 
@@ -133,6 +155,9 @@ export MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS=5000
 export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3.0         # cold-start escape hatch: raise past the LTM child's model-load time (#664)
 export MEMTOMEM_STM_SURFACING__FEEDBACK_ENABLED=true
 export MEMTOMEM_STM_SURFACING__AUTO_TUNE_ENABLED=true
+export MEMTOMEM_STM_SURFACING__AUTO_TUNE_SCORE_FLOOR=0.005
+export MEMTOMEM_STM_SURFACING__AUTO_TUNE_SCORE_CEILING=0.05
+export MEMTOMEM_STM_SURFACING__CONTEXT_TOOLS='{}'          # per-tool query templates / fixed min_score
 export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=0       # 0=disabled; >0 expands ±N adjacent chunks
 export MEMTOMEM_STM_SURFACING__CONSUMER_MODEL=claude-sonnet-4  # auto-scales max_results + max_injection_chars
 export MEMTOMEM_STM_SURFACING__DEDUP_TTL_SECONDS=604800    # 7 days; 0 to disable cross-session dedup
@@ -167,6 +192,7 @@ export MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS=32    # bounded hook queue
 export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=2.5
 export MEMTOMEM_STM_HOOK__FALLBACK=skip                # skip | cold
 export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
+export MEMTOMEM_STM_HOOK__METRICS_ENABLED=true          # size/timing-only rows; inspect with mms stats --source hook
 export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating prompt by default
 
 # Built-in Bash stdout compression is opt-in, separate from surfacing, and
@@ -233,7 +259,7 @@ Setting `MEMTOMEM_STM_LANGFUSE__ENABLED=true` without first installing the `[lan
 
 ## Config File: `~/.memtomem/stm_proxy.json`
 
-Full example with all options:
+Representative configuration (see the linked reference for omitted fields):
 
 ```json
 {
@@ -273,6 +299,8 @@ Full example with all options:
         "collapse_links": true
       },
       "selective": {
+        "json_depth": 1,
+        "min_section_chars": 50,
         "max_pending": 100,
         "pending_ttl_seconds": 300,
         "pending_store": "memory",
@@ -290,6 +318,7 @@ Full example with all options:
       },
       "tool_overrides": {
         "read_file": {
+          "description_override": "Read a file through the STM proxy",
           "compression": "progressive",
           "retention_floor": 0.5
         },

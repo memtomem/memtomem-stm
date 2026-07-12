@@ -617,10 +617,14 @@ def test_cli_md_commands_index_matches_click_group() -> None:
     from memtomem_stm.cli.proxy import cli as mms_cli
 
     cli_md = _read("docs/cli.md")
-    blocks = re.findall(r"```\n(Usage: mms \[OPTIONS\] COMMAND.*?)```", cli_md, re.DOTALL)
+    blocks = re.findall(
+        r"```\n(Usage: mms \[OPTIONS\] \[COMMAND\] \[ARGS\]\.\.\..*?)```",
+        cli_md,
+        re.DOTALL,
+    )
     if len(blocks) != 1:
         pytest.fail(
-            "Expected exactly one fenced `Usage: mms [OPTIONS] COMMAND` block "
+            "Expected exactly one fenced `Usage: mms [OPTIONS] [COMMAND] [ARGS]...` block "
             f"in docs/cli.md (the top-level help), found {len(blocks)} — the "
             "reference was restructured; update this test alongside it."
         )
@@ -850,7 +854,7 @@ def test_compression_md_llm_section_documents_privacy_scan() -> None:
 
 
 def test_configuration_full_example_documents_all_config_blocks() -> None:
-    """docs/configuration.md's "Full example with all options" must carry the
+    """docs/configuration.md's representative proxy example must carry the
     ``extraction`` and ``toolgraph`` blocks — with keys AND default values that
     match ``ExtractionConfig`` / ``ToolgraphConfig`` exactly — plus the two
     top-level knobs ``default_compression`` / ``max_upstream_chars`` at their
@@ -993,3 +997,90 @@ def test_cli_md_stats_documents_source_filter() -> None:
             "to proxied upstream tools and `hook` to native built-in tools. "
             "Found the flag tokens but not the provenance mapping prose."
         )
+
+
+def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
+    """The hook guide, CLI reference, and live help must agree with host specs."""
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.hook_cmd import hook_command
+    from memtomem_stm.cli.hook_hosts import HOOK_HOSTS
+
+    expected = HOOK_HOSTS["kimi"].config_path.as_posix()
+    assert expected == "~/.kimi-code/config.toml"
+    for relative in (
+        "docs/cli.md",
+        "docs/guides/native-hooks.md",
+        "docs/reference/cli-hooks.md",
+    ):
+        body = _read(relative)
+        assert expected in body, f"{relative} lost the current Kimi config path"
+        assert "~/.kimi/config.toml" not in body, f"{relative} restored the legacy Kimi path"
+        assert "KIMI_CODE_HOME" in body, f"{relative} must document Kimi's home override"
+
+    result = CliRunner().invoke(hook_command, ["install", "--help"], terminal_width=200)
+    assert result.exit_code == 0
+    assert expected in result.output
+    assert "KIMI_CODE_HOME" in result.output
+    assert "~/.kimi/config.toml" not in result.output
+
+
+def test_new_reference_docs_pin_high_risk_public_fields() -> None:
+    """Keep the settings omitted before the v0.1.36 full-doc audit visible."""
+    env_ref = _read("docs/reference/environment-variables.md")
+    for token in (
+        "MEMTOMEM_STM_DATA_DIR",
+        "MEMTOMEM_STM_HOOK__METRICS_ENABLED",
+        "AUTO_TUNE_SCORE_FLOOR",
+        "AUTO_TUNE_SCORE_CEILING",
+        "CONTEXT_TOOLS",
+    ):
+        assert token in env_ref, f"environment reference lost {token}"
+
+    proxy_ref = _read("docs/reference/proxy-config.md")
+    for token in ("json_depth", "min_section_chars", "description_override"):
+        assert token in proxy_ref, f"proxy reference lost {token}"
+
+    config_hub = _read("docs/configuration.md")
+    for phrase in ("ProxyConfig", "environment/default-only", "Representative configuration"):
+        assert phrase in config_hub, f"configuration source boundary lost {phrase!r}"
+
+
+def test_mcp_tool_reference_matches_optional_argument_signatures() -> None:
+    """Pin the optional arguments that were previously documented as required/missing."""
+    import inspect
+
+    from memtomem_stm.server import stm_proxy_read_more, stm_surfacing_stats
+
+    read_more = inspect.signature(stm_proxy_read_more)
+    assert read_more.parameters["offset"].default == 0
+    surfacing = inspect.signature(stm_surfacing_stats)
+    assert surfacing.parameters["since"].default is None
+    assert surfacing.parameters["limit"].default == 10
+
+    mcp_ref = _read("docs/reference/mcp-tools.md")
+    for token in ("offset?=0", "since?", "limit=10"):
+        assert token in mcp_ref, f"MCP tool reference lost {token}"
+
+
+def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
+    """The journey/reference split remains discoverable from stable entrypoints."""
+    readme = _read("README.md")
+    assert "docs/getting-started.md" in readme
+    assert "docs/guides/operations.md" in readme
+
+    cli_hub = _read("docs/cli.md")
+    for target in (
+        "reference/cli-gateway.md",
+        "reference/cli-hooks.md",
+        "reference/cli-projects.md",
+        "reference/mcp-tools.md",
+    ):
+        assert target in cli_hub
+
+    config_hub = _read("docs/configuration.md")
+    for target in (
+        "reference/environment-variables.md",
+        "reference/proxy-config.md",
+    ):
+        assert target in config_hub

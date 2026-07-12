@@ -1,12 +1,14 @@
 # CLI Reference
 
-memtomem-stm ships three console scripts:
+memtomem-stm ships three interchangeable console scripts. All three resolve to
+the same Click group; a TTY invocation prints management help and a piped-stdin
+invocation starts the MCP server:
 
 | Script | Purpose |
 |--------|---------|
-| `memtomem-stm` | The MCP server itself. Add this to your AI client's MCP config. |
-| `memtomem-stm-proxy` | Management CLI for editing `~/.memtomem/stm_proxy.json`. |
-| `mms` | Short alias for `memtomem-stm-proxy` — identical behavior. |
+| `memtomem-stm` | Full product-name entrypoint |
+| `memtomem-stm-proxy` | Compatibility entrypoint |
+| `mms` | Short entrypoint recommended for client registration |
 
 ```mermaid
 flowchart LR
@@ -23,10 +25,23 @@ Bare invocation dispatches on stdin: from a terminal it prints CLI help, while
 piped stdin starts the MCP server. This lets `memtomem-stm`,
 `memtomem-stm-proxy`, and `mms` all work as MCP server commands.
 
+## Choose a reference
+
+- [Gateway commands](reference/cli-gateway.md): setup, registration,
+  diagnostics, statistics, and tuning
+- [Hook and daemon commands](reference/cli-hooks.md): native PostToolUse bridge
+- [Project and host commands](reference/cli-projects.md): registry and
+  project-scoped MCP management
+- [STM MCP tools](reference/mcp-tools.md): default and opt-in tool schemas
+
+This page retains the detailed command sections and legacy anchors used by
+existing links. The split references above are the faster entrypoints for new
+readers.
+
 ## `mms` (= `memtomem-stm-proxy`)
 
 ```
-Usage: mms [OPTIONS] COMMAND [ARGS]...
+Usage: mms [OPTIONS] [COMMAND] [ARGS]...
 
   memtomem-stm proxy gateway management.
 
@@ -57,7 +72,10 @@ Commands:
   version    Show the installed memtomem-stm version.
 ```
 
-All commands accept `--config TEXT` (default `~/.memtomem/stm_proxy.json`).
+Commands that operate on the proxy configuration accept `--config TEXT`
+(default `~/.memtomem/stm_proxy.json`). Registry, project, host, hook, and
+version commands have their own option surfaces; use each command's `--help`
+output as the source of truth.
 
 `mms --version` and `mms version` both print `memtomem-stm X.Y.Z` — the flag is the idiomatic Click form, the subcommand is kept for backwards compatibility.
 
@@ -538,7 +556,7 @@ Unlike `mms stats`, this command opens the stores read-write to run their idempo
 ## `mms hook` — built-in tool bridge + per-host registration
 
 ```
-Usage: mms hook [OPTIONS] COMMAND [ARGS]...
+Usage: mms hook [OPTIONS] [COMMAND] [ARGS]...
 
 Commands:
   install    Register STM's PostToolUse hook in a host's config.
@@ -553,13 +571,16 @@ stdout compression is separate, Claude-only, and opt-in via
 `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
 preserving stderr, exit status, interruption state, and image markers.
 
-`--host [auto|claude|codex|cursor|kimi]` selects the adapter; `auto` (the
-default) infers it from the payload shape and falls back to Claude — but cannot
-tell Codex from Claude (identical payloads), so per-host registration writes an
-explicit `--host`. The hook always exits `0` and emits `{}` (or empty stdout) on
-malformed input, timeout, disabled surfacing, or internal errors so the host
-keeps the original tool output. By default it uses the local daemon path; set
-`MEMTOMEM_STM_HOOK__USE_DAEMON=0` for the legacy cold in-process path.
+Runtime `--host TEXT` selects the adapter; `auto` (the default) infers it from
+the payload shape and falls back to Claude, but cannot tell Codex from Claude.
+An unrecognized or bare value warns and falls back to auto-detection instead of
+exiting with a usage error, because a host treats non-zero hook exits as a
+block. The operator-facing install/uninstall subcommands keep the strict
+`[claude|codex|cursor|kimi]` choice. Per-host registration writes an explicit
+host. The hook always exits `0` and emits `{}` (or empty stdout) on malformed
+input, timeout, disabled surfacing, or internal errors. By default it uses the
+local daemon path; set `MEMTOMEM_STM_HOOK__USE_DAEMON=0` for the legacy cold
+in-process path.
 
 ### `install` / `uninstall` — per-host registration
 
@@ -571,7 +592,7 @@ tool call. `uninstall` removes it.
 | -------- | ------------------------- | ------ |
 | `claude` | `~/.claude/settings.json` | JSON   |
 | `cursor` | `~/.cursor/hooks.json`    | JSON   |
-| `kimi`   | `~/.kimi/config.toml`     | TOML   |
+| `kimi`   | `$KIMI_CODE_HOME/config.toml`, otherwise `~/.kimi-code/config.toml` | TOML |
 | `codex`  | `~/.codex/config.toml`    | TOML   |
 
 ```
@@ -623,6 +644,9 @@ Commands:
            orphans under a stale fingerprint).
   run      Run the long-lived daemon server loop.
 ```
+
+`mms daemon run` accepts `--foreground` and `--detached`; normal users should
+prefer `start`, while service wrappers can choose the explicit run mode.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. The one escape hatch is `stop --all`:
@@ -800,7 +824,7 @@ The four model-facing tools are advertised by default:
 | Tool | Arguments | Description |
 |------|-----------|-------------|
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
-| `stm_proxy_read_more` | `key`, `offset`, `limit?` | Read next chunk from a progressive delivery response |
+| `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Read next chunk from a progressive delivery response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
 | `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
 
@@ -812,7 +836,7 @@ Nine observability/admin tools are hidden unless
 | `stm_proxy_stats` | — | Token savings, compression stats, cache hit/miss ratio |
 | `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, by tool, or by server+tool) |
 | `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
-| `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio (since process start) |
+| `stm_surfacing_stats` | `tool?`, `since?`, `limit=10` | Surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio |
 | `stm_index_stats` | `tool?` | INDEX attempt/outcome counts for extraction and auto-index paths |
 | `stm_selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and hard-filter reject reasons |
 | `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |

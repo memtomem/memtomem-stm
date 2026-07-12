@@ -21,7 +21,7 @@ claude      ``~/.claude/settings.json``      json    ``hooks.PostToolUse`` = lis
 cursor      ``~/.cursor/hooks.json``         json    ``{version:1, hooks:
                                                       {postToolUse:[{command}]}}``
                                                       — no matcher (generic hook)
-kimi        ``~/.kimi/config.toml``          toml    top-level ``[[hooks]]`` array
+kimi        ``~/.kimi-code/config.toml``     toml    top-level ``[[hooks]]`` array
                                                       of ``{event, matcher,
                                                       command}``
 codex       ``~/.codex/config.toml``         toml    ``[[hooks.PostToolUse]]`` +

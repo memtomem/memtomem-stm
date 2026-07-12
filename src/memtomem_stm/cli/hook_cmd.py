@@ -989,7 +989,8 @@ def hook_install_command(host: str, apply_: bool) -> None:
     """Register STM's PostToolUse hook in a host's config (idempotent).
 
     Read-modify-writes the host's hook-config file (``~/.claude/settings.json``,
-    ``~/.cursor/hooks.json``, ``~/.kimi/config.toml``, or ``~/.codex/config.toml``)
+    ``~/.cursor/hooks.json``, ``$KIMI_CODE_HOME/config.toml`` or
+    ``~/.kimi-code/config.toml``, or ``~/.codex/config.toml``)
     so the host fires ``mms hook --host <name>`` after each built-in tool call.
     Re-running updates STM's existing block in place rather than duplicating it.
     Default is a dry-run preview; ``--apply`` writes (backing up any prior file)
