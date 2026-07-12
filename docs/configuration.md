@@ -497,7 +497,7 @@ under `toolgraph_*` reason codes; ranking can never resurrect them.
   "command": "toolgraph",
   "args": ["serve"],
   "agent_id": "stm-proxy",
-  "server_name_map": { "<stm-upstream-key>": "<graph-crawled-name>" },
+  "server_name_map": { "docs-langchain": "langchain-docs" },
   "query_profile": "strict",
   "on_unreachable": "open",
   "on_agent_not_found": "fail_start",
@@ -565,9 +565,25 @@ Set `consult_cache_enabled` to `false` to force a full consult each start.
   (see [Selection telemetry](selection-telemetry.md)). `0` disables the signal.
 
 `server_name_map` translates an STM upstream connection key to the
-tool-graph's *crawled* server name (the two are independent strings); an empty
-map assumes identity and relies on a heuristic warning when an entire
-upstream's tools come back unknown to the graph. The provider runs only when
+tool-graph's *crawled* server name. In the example, `docs-langchain` is the key
+under STM's `upstream_servers`, while `langchain-docs` is the name recorded
+when toolgraph crawled that server. STM consults candidate references as
+`<graph-crawled-name>::<raw-tool-name>`.
+
+Crawl the proxy's **upstream servers directly**, using their raw tool names.
+Do not crawl `memtomem-stm` itself: that records the proxy server name and
+prefixed names such as `langchain__search_docs`, which do not match the
+upstream references STM sends to toolgraph. If the STM connection key differs
+from the name used during the crawl, add the translation to `server_name_map`;
+an empty map assumes identity.
+
+If every candidate from an upstream comes back as `TOOL_NOT_FOUND`, check crawl
+coverage and `server_name_map` before treating the result as a governance
+denial. `stm_proxy_health` confirms that the provider is active and shows the
+graph generation and aggregate enforced rejects; the startup warning `All N
+tool(s) from upstream ... are unknown to the tool-graph` identifies the
+specific unmapped upstream. Under the default `on_tool_not_found: "open"`,
+unresolved candidates remain advertised. The provider runs only when
 `enabled` — a disabled block is fully inert.
 
 ### Token-equivalent budgets (CJK / non-Latin workloads)
