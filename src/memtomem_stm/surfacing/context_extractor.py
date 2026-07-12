@@ -100,9 +100,7 @@ class ContextExtractor:
         return query
 
     @staticmethod
-    def _validate_query(
-        query: str, config: SurfacingConfig, server: str, tool: str
-    ) -> str | None:
+    def _validate_query(query: str, config: SurfacingConfig, server: str, tool: str) -> str | None:
         normalized = query.strip()
         # Sensitive queries are transformed to a safe digest by the engine;
         # preserve the original here so that digest is stable and auditable.
