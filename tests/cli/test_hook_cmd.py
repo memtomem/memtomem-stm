@@ -931,6 +931,12 @@ def test_metrics_only_hosts_skip_surfacing(adapter, monkeypatch: pytest.MonkeyPa
     asyncio.run(_orchestrate(payload, adapter))
     run.assert_not_awaited()
 
+    # Positive control: the identical, surface-eligible payload reaches
+    # surfacing on a host that can inject context. This proves the assertion
+    # above is pinned to the capability gate rather than an ineligible payload.
+    asyncio.run(_orchestrate(payload, ClaudeHookAdapter()))
+    run.assert_awaited_once()
+
 
 def test_orchestrate_keeps_compression_when_surfacing_raises(monkeypatch: pytest.MonkeyPatch):
     # A surfacing failure must NOT discard the already-computed compression half
