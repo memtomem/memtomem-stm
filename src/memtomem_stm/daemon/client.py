@@ -62,9 +62,7 @@ async def _request(
             reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
             writer.write(
                 encode_line(
-                    build_request(
-                        token, op, payload, deadline_monotonic=deadline_monotonic
-                    )
+                    build_request(token, op, payload, deadline_monotonic=deadline_monotonic)
                 )
             )
             await writer.drain()
@@ -143,6 +141,8 @@ async def surface(
     if hs is None:
         return None
     deadline = asyncio.get_running_loop().time() + timeout
+    # This wire value is meaningful because the hook and daemon are same-host
+    # loopback processes and therefore share the OS monotonic-clock epoch.
     resp = await _request(
         hs, OP_SURFACE, call.to_wire(), timeout=timeout, deadline_monotonic=deadline
     )

@@ -479,7 +479,10 @@ class DaemonServer:
                 pass
             if self._shutdown_event.is_set():
                 return
-            if self._active_requests == 0 and time.monotonic() - self._last_request >= self._idle_timeout:
+            if (
+                self._active_requests == 0
+                and time.monotonic() - self._last_request >= self._idle_timeout
+            ):
                 logger.info("daemon idle for %.0fs — shutting down", self._idle_timeout)
                 self._shutdown_event.set()
                 return

@@ -24,7 +24,12 @@ from uuid import uuid4
 import pytest
 from click.testing import CliRunner
 
-from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter, CodexHookAdapter, KimiHookAdapter
+from memtomem_stm.cli.hook_adapter import (
+    ClaudeHookAdapter,
+    CodexHookAdapter,
+    CursorHookAdapter,
+    KimiHookAdapter,
+)
 from memtomem_stm.cli.hook_cmd import (
     _COMPRESS_SENTINEL,
     _SAFE_DAEMON_BUDGET,
@@ -37,6 +42,7 @@ from memtomem_stm.cli.hook_cmd import (
     _resolve_host_tag,
     _run_hook,
     _tool_response_to_text,
+    compress_builtin,
     maybe_compress_builtin,
     run_surfacing_hook,
 )
@@ -642,6 +648,24 @@ def test_compress_noop_when_disabled():
     assert maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), cfg) is None
 
 
+def test_compress_retention_guard_passes_through_large_output():
+    cfg = HookCompressionConfig(enabled=True, max_chars=2000, min_retention=0.65)
+    outcome = compress_builtin(_bash_call({"stdout": _BIG_STDOUT}), cfg)
+    assert outcome.status == "retention_guard"
+    assert outcome.replacement is None
+    assert outcome.compressed_chars < outcome.original_chars * cfg.min_retention
+
+
+@pytest.mark.parametrize(
+    "unsafe_field",
+    [{"exitCode": 1}, {"isError": True}, {"interrupted": True}, {"isImage": True}],
+)
+def test_compress_unsafe_results_pass_through(unsafe_field: dict[str, object]):
+    outcome = compress_builtin(_bash_call({"stdout": _BIG_STDOUT, **unsafe_field}), _CFG)
+    assert outcome.status == "unsafe_result"
+    assert outcome.replacement is None
+
+
 def test_compress_noop_for_non_bash_tool():
     # Read output must never be replaced (a later Edit needs it verbatim).
     assert maybe_compress_builtin(_bash_call({"stdout": _BIG_STDOUT}, tool="Read"), _CFG) is None
@@ -892,6 +916,20 @@ def test_orchestrate_honors_supplied_adapter_capability(monkeypatch: pytest.Monk
     # can_replace_output is False → compression is skipped, output passes through.
     out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT}), CodexHookAdapter()))
     assert out == {}  # no updatedToolOutput — the supplied adapter's capability won
+
+
+@pytest.mark.parametrize("adapter", [CursorHookAdapter(), KimiHookAdapter()])
+def test_metrics_only_hosts_skip_surfacing(adapter, monkeypatch: pytest.MonkeyPatch):
+    run = AsyncMock(return_value={})
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", run)
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "tool_response": {"content": _BIG_STDOUT},
+        "tool_output": {"content": _BIG_STDOUT},
+    }
+    asyncio.run(_orchestrate(payload, adapter))
+    run.assert_not_awaited()
 
 
 def test_orchestrate_keeps_compression_when_surfacing_raises(monkeypatch: pytest.MonkeyPatch):

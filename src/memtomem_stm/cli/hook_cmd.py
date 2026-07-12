@@ -314,7 +314,9 @@ def compress_builtin(
         interrupted = original.get("interrupted") is True
         image = original.get("isImage") is True or original.get("is_image") is True
         exit_code = original.get("exitCode", original.get("exit_code"))
-        nonzero_exit = isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+        nonzero_exit = (
+            isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0
+        )
         if explicit_error or interrupted or image or nonzero_exit:
             return BuiltinCompressionOutcome("unsafe_result", original_chars=len(stdout))
         if len(stdout) <= cfg.max_chars or _already_compressed(stdout):
@@ -748,6 +750,12 @@ async def _orchestrate(
         compress_builtin(call, config.hook.compression)
         if replacement_allowed
         else BuiltinCompressionOutcome("unsupported_host")
+    )
+    logger.debug(
+        "native compression status=%s original_chars=%d compressed_chars=%d",
+        compression.status,
+        compression.original_chars,
+        compression.compressed_chars,
     )
     updated = compression.replacement
     surf_out: dict[str, Any] = {}

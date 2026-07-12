@@ -173,6 +173,10 @@ export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating 
 # Claude Code only — native output replacement ports to no other host. Unsafe
 # or failed results and replacements retaining under 65% of the original are
 # passed through unchanged.
+# With defaults, replacement is therefore possible only while the compressed
+# result is at least 65% of the original: approximately 16,000-24,615 chars.
+# Larger output intentionally passes through because native hooks have no
+# lossless `read_more` retrieval channel.
 export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=false
 export MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=16000
 

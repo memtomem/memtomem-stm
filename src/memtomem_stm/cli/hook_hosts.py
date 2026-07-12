@@ -126,10 +126,7 @@ def _is_stm_hook_command(command: str) -> bool:
         return False
     i = starts[0]
     prefix = tokens[:i]
-    if prefix and not (
-        prefix[:2] == ["uv", "run"]
-        and all(token != "--" for token in prefix)
-    ):
+    if prefix and not (prefix[:2] == ["uv", "run"] and all(token != "--" for token in prefix)):
         return False
     return tokens[i + 1 : i + 2] == ["hook"]
 
