@@ -766,8 +766,6 @@ class TestTtlZeroErrorAndEmptyInvalidation:
     passthrough branch, covered in ``TestTtlZeroNonTextInvalidation``.)"""
 
     async def test_mixed_error_invalidates_prior_text_row(self, build):
-        from mcp.server.fastmcp.exceptions import ToolError
-
         mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
         session = mgr._connections["srv"].session
 
@@ -777,14 +775,12 @@ class TestTtlZeroErrorAndEmptyInvalidation:
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _mixed_error_result("boom")
-        with pytest.raises(ToolError):
-            await mgr.call_tool("srv", "reader", {"q": "a"})
+        result = await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert result.isError is True
 
         assert _get(mgr, cache, "reader", {"q": "a"}) is None  # stale text row gone
 
     async def test_text_only_error_invalidates_prior_text_row(self, build):
-        from mcp.server.fastmcp.exceptions import ToolError
-
         mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
         session = mgr._connections["srv"].session
 
@@ -794,8 +790,8 @@ class TestTtlZeroErrorAndEmptyInvalidation:
 
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _error_result("boom")
-        with pytest.raises(ToolError):
-            await mgr.call_tool("srv", "reader", {"q": "a"})
+        result = await mgr.call_tool("srv", "reader", {"q": "a"})
+        assert result.isError is True
 
         assert _get(mgr, cache, "reader", {"q": "a"}) is None
 
@@ -921,8 +917,6 @@ class TestTtlZeroRaisedFailureInvalidation:
         # backstop must not issue a second DELETE for the same call.
         from unittest.mock import patch as mock_patch
 
-        from mcp.server.fastmcp.exceptions import ToolError
-
         mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
         session = mgr._connections["srv"].session
 
@@ -933,8 +927,8 @@ class TestTtlZeroRaisedFailureInvalidation:
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _error_result("boom")
         with mock_patch.object(cache, "invalidate", wraps=cache.invalidate) as spy:
-            with pytest.raises(ToolError):
-                await mgr.call_tool("srv", "reader", {"q": "a"})
+            result = await mgr.call_tool("srv", "reader", {"q": "a"})
+            assert result.isError is True
 
         assert spy.call_count == 1  # isError site only; backstop skipped via marker
         assert _get(mgr, cache, "reader", {"q": "a"}) is None

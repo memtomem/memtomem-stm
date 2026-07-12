@@ -114,6 +114,7 @@ class AutoTuner:
         # Resume tunings persisted from a previous process — without this
         # every restart silently throws away the AutoTuner's view.
         self._adjustments: dict[str, float] = dict(store.load_adjustments())
+        self._feedback_watermarks: dict[str, tuple[int, int]] = {}
         logger.info(
             "AutoTuner bounds: floor=%.4f, ceiling=%.4f, increment=%.4f, base min_score=%.4f",
             config.auto_tune_score_floor,
@@ -203,6 +204,14 @@ class AutoTuner:
         """
         if not self._config.auto_tune_enabled:
             return None
+
+        watermark = (
+            self._store.get_feedback_count(tool),
+            self._store.get_feedback_count(None),
+        )
+        if self._feedback_watermarks.get(tool) == watermark:
+            return None
+        self._feedback_watermarks[tool] = watermark
 
         min_samples = self._config.auto_tune_min_samples
         neg_ratio = self._store.get_tool_negative_ratio(tool, min_samples=min_samples)

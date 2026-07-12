@@ -483,6 +483,20 @@ class FeedbackStore:
         except (json.JSONDecodeError, TypeError):
             return []
 
+    def get_feedback_count(self, tool: str | None = None) -> int:
+        """Return the durable feedback watermark for auto-tuning."""
+        if self._db is None:
+            return 0
+        if tool is None:
+            row = self._db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()
+        else:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM surfacing_feedback f "
+                "JOIN surfacing_events e ON e.id = f.surfacing_id WHERE e.tool = ?",
+                (tool,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def get_negative_feedback_counts(self, memory_ids: list[str]) -> dict[str, int]:
         """Return durable negative-feedback event counts for memory IDs.
 

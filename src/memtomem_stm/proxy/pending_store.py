@@ -25,8 +25,12 @@ class PendingStore(Protocol):
     def get(self, key: str) -> PendingSelection | None: ...
     def touch(self, key: str) -> None: ...
     def delete(self, key: str) -> None: ...
-    def evict_expired(self, ttl: float) -> None: ...
-    def evict_oldest(self, max_size: int) -> None: ...
+    def evict_expired(
+        self, ttl: float, *, format: str | None = None, exclude_format: str | None = None
+    ) -> None: ...
+    def evict_oldest(
+        self, max_size: int, *, format: str | None = None, exclude_format: str | None = None
+    ) -> None: ...
     def __len__(self) -> int: ...
 
 
@@ -68,20 +72,36 @@ class InMemoryPendingStore:
             if self._data.pop(key, None) is not None:
                 self._order.remove(key)
 
-    def evict_expired(self, ttl: float) -> None:
+    def evict_expired(
+        self, ttl: float, *, format: str | None = None, exclude_format: str | None = None
+    ) -> None:
         with self._lock:
             now = time.monotonic()
-            expired = {k for k, v in self._data.items() if (now - v.created_at) > ttl}
+            expired = {
+                k
+                for k, v in self._data.items()
+                if (now - v.created_at) > ttl
+                and (format is None or v.format == format)
+                and (exclude_format is None or v.format != exclude_format)
+            }
             for k in expired:
                 self._data.pop(k, None)
             if expired:
                 self._order = deque(k for k in self._order if k not in expired)
 
-    def evict_oldest(self, max_size: int) -> None:
+    def evict_oldest(
+        self, max_size: int, *, format: str | None = None, exclude_format: str | None = None
+    ) -> None:
         with self._lock:
-            while len(self._data) > max_size and self._order:
-                oldest = self._order.popleft()
+            scoped = [
+                key
+                for key in self._order
+                if (format is None or self._data[key].format == format)
+                and (exclude_format is None or self._data[key].format != exclude_format)
+            ]
+            for oldest in scoped[: max(0, len(scoped) - max_size)]:
                 self._data.pop(oldest, None)
+                self._order.remove(oldest)
 
     def __len__(self) -> int:
         with self._lock:
@@ -182,18 +202,39 @@ class SQLitePendingStore:
             self._get_db().execute("DELETE FROM pending_selections WHERE key = ?", (key,))
             self._get_db().commit()
 
-    def evict_expired(self, ttl: float) -> None:
+    def evict_expired(
+        self, ttl: float, *, format: str | None = None, exclude_format: str | None = None
+    ) -> None:
         cutoff = time.time() - ttl
+        where = "created_at < ?"
+        params: list[object] = [cutoff]
+        if format is not None:
+            where += " AND format = ?"
+            params.append(format)
+        if exclude_format is not None:
+            where += " AND format != ?"
+            params.append(exclude_format)
         with self._lock:
-            self._get_db().execute("DELETE FROM pending_selections WHERE created_at < ?", (cutoff,))
+            self._get_db().execute(f"DELETE FROM pending_selections WHERE {where}", params)
             self._get_db().commit()
 
-    def evict_oldest(self, max_size: int) -> None:
+    def evict_oldest(
+        self, max_size: int, *, format: str | None = None, exclude_format: str | None = None
+    ) -> None:
+        where = "1=1"
+        params: list[object] = []
+        if format is not None:
+            where += " AND format = ?"
+            params.append(format)
+        if exclude_format is not None:
+            where += " AND format != ?"
+            params.append(exclude_format)
         with self._lock:
             self._get_db().execute(
-                "DELETE FROM pending_selections WHERE key NOT IN "
-                "(SELECT key FROM pending_selections ORDER BY created_at DESC LIMIT ?)",
-                (max_size,),
+                f"DELETE FROM pending_selections WHERE {where} AND key NOT IN "
+                f"(SELECT key FROM pending_selections WHERE {where} "
+                "ORDER BY created_at DESC LIMIT ?)",
+                [*params, *params, max_size],
             )
             self._get_db().commit()
 

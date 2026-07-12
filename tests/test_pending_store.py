@@ -22,10 +22,28 @@ def _make_selection(chunks: dict[str, str] | None = None) -> PendingSelection:
     )
 
 
+def _progressive_selection() -> PendingSelection:
+    return PendingSelection(
+        chunks={"__content__": "body", "__meta__": "{}"},
+        format="progressive",
+        created_at=time.monotonic(),
+        total_chars=4,
+    )
+
+
 # ── InMemoryPendingStore ────────────────────────────────────────────────
 
 
 class TestInMemoryPendingStore:
+    def test_scoped_eviction_does_not_cross_delivery_formats(self):
+        store = InMemoryPendingStore()
+        store.put("selective", _make_selection())
+        store.put("progressive", _progressive_selection())
+
+        store.evict_oldest(0, exclude_format="progressive")
+
+        assert store.get("selective") is None
+        assert store.get("progressive") is not None
     def test_put_and_get(self):
         store = InMemoryPendingStore()
         sel = _make_selection()
@@ -117,6 +135,20 @@ class TestInMemoryPendingStore:
 
 
 class TestSQLitePendingStore:
+    def test_scoped_eviction_does_not_cross_delivery_formats(self, tmp_path):
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        try:
+            store.put("selective", _make_selection())
+            store.put("progressive", _progressive_selection())
+
+            store.evict_oldest(0, exclude_format="progressive")
+
+            assert store.get("selective") is None
+            assert store.get("progressive") is not None
+        finally:
+            store.close()
+
     def _make_store(self, tmp_path: Path) -> SQLitePendingStore:
         store = SQLitePendingStore(tmp_path / "pending.db")
         store.initialize()

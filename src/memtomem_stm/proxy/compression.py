@@ -985,7 +985,7 @@ class SelectiveCompressor:
         return best
 
     def select(self, key: str, sections: list[str]) -> str:
-        self._store.evict_expired(self._ttl)
+        self._store.evict_expired(self._ttl, exclude_format="progressive")
 
         pending = self._store.get(key)
         if pending is None:
@@ -1167,8 +1167,8 @@ class SelectiveCompressor:
         return "paragraph"
 
     def _evict(self) -> None:
-        self._store.evict_expired(self._ttl)
-        self._store.evict_oldest(self._max_pending)
+        self._store.evict_expired(self._ttl, exclude_format="progressive")
+        self._store.evict_oldest(self._max_pending, exclude_format="progressive")
 
 
 class FieldExtractCompressor:

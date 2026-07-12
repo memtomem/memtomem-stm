@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from memtomem_stm.proxy.cache import ProxyCache
@@ -207,37 +206,38 @@ class TestEnvelopePreservation:
 
 
 class TestIsErrorOrdering:
-    async def test_non_text_only_error_raises_instead_of_leaking(self, make_mgr):
-        """The leak this PR fixes: a non-text-only isError result previously
-        took the passthrough early-return and came back as a success list."""
+    async def test_non_text_only_error_preserves_envelope(self, make_mgr):
         mgr, store, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[_image_content()], is_error=True))
-        with pytest.raises(ToolError, match="non-text error content"):
-            await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {})
+        assert result.isError is True
+        assert result.content[0].type == "image"
         err = _latest_error(store)
         assert err is not None
         assert err["is_error"] == 1
         assert err["error_message"] == _NON_TEXT_ERROR_TEXT
 
-    async def test_empty_content_error_raises(self, make_mgr):
+    async def test_empty_content_error_preserves_error_flag(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[], is_error=True))
-        with pytest.raises(ToolError, match="non-text error content"):
-            await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {})
+        assert result.isError is True
+        assert result.content == []
 
-    async def test_error_with_text_and_structured_raises_with_text(self, make_mgr):
-        # Documented limitation: ToolError is text-only, so the errored
-        # result's structuredContent/_meta are dropped.
+    async def test_error_with_text_and_structured_preserves_both(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("boom", is_error=True, structured={"detail": 1}))
-        with pytest.raises(ToolError, match="boom"):
-            await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {})
+        assert result.isError is True
+        assert result.content[0].text == "boom"
+        assert result.structuredContent == {"detail": 1}
 
     async def test_error_never_becomes_success_after_compression(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("x" * 5000, is_error=True))
-        with pytest.raises(ToolError):
-            await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {})
+        assert result.isError is True
+        assert len(result.content[0].text) == 5000
 
 
 # ── cache store bypass for envelope-bearing responses ────────────────────

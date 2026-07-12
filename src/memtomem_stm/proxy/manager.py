@@ -2975,7 +2975,14 @@ class ProxyManager:
                 selected_tool,
                 trace_id,
                 started,
-                ok=True,
+                ok=not (
+                    isinstance(result, mcp_types.CallToolResult) and result.isError is True
+                ),
+                error_type=(
+                    "UpstreamToolError"
+                    if isinstance(result, mcp_types.CallToolResult) and result.isError is True
+                    else None
+                ),
                 ranker_version=ranker_version,
                 cache_hit=cache_hit,
             )
@@ -4505,6 +4512,7 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
         context_query: str | None,
         config_fingerprint: str,
+        postprocess_retry_required: bool = False,
     ) -> None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
@@ -4551,6 +4559,11 @@ class ProxyManager:
         hex and is unreachable by any future lookup (hit rate structurally 0%).
         """
         if self._cache is None:
+            return
+        if postprocess_retry_required:
+            # Cache hits bypass INDEX/EXTRACT. Keep failed sync work and
+            # not-yet-resolved background work retryable on the next call.
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             return
         if non_text_content or has_result_envelope:
             # A non-text / mixed response is never STORED (only its text twin
@@ -4743,26 +4756,34 @@ class ProxyManager:
                     trace_id=trace_id,
                 )
             )
-            # Propagate upstream isError so FastMCP sets isError=true on the
-            # proxied response instead of silently converting to a normal
-            # result. ToolError is text-only: non-text error content and any
-            # structuredContent/_meta on the errored result are dropped
-            # (deferred with structured-result caching).
-            from mcp.server.fastmcp.exceptions import ToolError
-
-            tool_err = ToolError(error_text)
-            _mark_recorded(tool_err)
-            # The error raises before the Stage-5 store, so an error under a
+            # The error returns before the Stage-5 store, so an error under a
             # disabled cache (ttl<=0) would otherwise leave a prior cached
-            # text row for this key live. All error shapes (text-only, mixed,
-            # non-text-only) are invalidated here (#541). Mark the exception
-            # so the raised-failure backstop in ``_call_tool_guarded`` does
-            # not repeat the DELETE.
+            # text row for this key live. Invalidate every error shape.
             self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
             )
-            _mark_cache_invalidated(tool_err)
-            raise tool_err
+            # Preserve the complete MCP error envelope. Raising FastMCP's
+            # ToolError would collapse it to one text block and discard
+            # images/resources, annotations, structuredContent, and _meta.
+            if isinstance(result, mcp_types.CallToolResult):
+                return result
+            content: list[dict[str, Any]] = []
+            for block in result.content or []:
+                dumped = (
+                    block.model_dump(by_alias=True) if hasattr(block, "model_dump") else None
+                )
+                if isinstance(dumped, dict):
+                    content.append(dumped)
+                elif getattr(block, "type", None) == "text":
+                    content.append({"type": "text", "text": getattr(block, "text", "")})
+                else:
+                    content.append(vars(block))
+            return mcp_types.CallToolResult(
+                content=content,
+                structuredContent=structured_content,
+                _meta=result_meta,
+                isError=True,
+            )
 
         if shaped.passthrough is not None:
             # Both passthrough shapes are live upstream calls, so both record the
@@ -4917,6 +4938,24 @@ class ProxyManager:
             cfg_snap=cfg_snap,
             context_query=context_query,
             config_fingerprint=config_fp,
+            postprocess_retry_required=(
+                index_ok is False
+                or extract_ok is False
+                or (
+                    tc.auto_index_enabled
+                    and self._index_engine is not None
+                    and len(cleaned) >= cfg_snap.auto_index.min_chars
+                    and cfg_snap.auto_index.background
+                    and index_ok is None
+                )
+                or (
+                    tc.extraction_enabled
+                    and self._index_engine is not None
+                    and len(cleaned) >= cfg_snap.extraction.min_response_chars
+                    and cfg_snap.extraction.background
+                    and extract_ok is None
+                )
+            ),
         )
 
         # Final return shape. The processed text (single, merged block) is

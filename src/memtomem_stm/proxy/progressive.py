@@ -128,8 +128,8 @@ class ProgressiveStoreAdapter:
         self._store.delete(key)
 
     def evict(self, ttl: float, max_size: int) -> None:
-        self._store.evict_expired(ttl)
-        self._store.evict_oldest(max_size)
+        self._store.evict_expired(ttl, format="progressive")
+        self._store.evict_oldest(max_size, format="progressive")
 
     def close(self) -> None:
         """Release the underlying store's OS resources (SQLite connection).

@@ -523,18 +523,16 @@ class TestUnknownServer:
 
 
 class TestErrorResult:
-    async def test_error_result_raises_tool_error(self):
-        """When upstream returns isError=True, ToolError is raised to propagate the error flag."""
-        from mcp.server.fastmcp.exceptions import ToolError
-
+    async def test_error_result_preserves_error_envelope(self):
         mgr = _make_manager(compression=CompressionStrategy.TRUNCATE, max_result_chars=10)
         session = _get_session(mgr)
         long_error = "Error: " + "x" * 500
         session.call_tool.return_value = _make_result(long_error, is_error=True)
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
-            with pytest.raises(ToolError, match="Error:"):
-                await mgr.call_tool("srv", "tool", {})
+            result = await mgr.call_tool("srv", "tool", {})
+        assert result.isError is True
+        assert result.content[0].text == long_error
 
 
 # ── Empty/non-text response ──────────────────────────────────────────────
@@ -731,10 +729,7 @@ class TestPipelineExceptionMetrics:
         assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
 
     async def test_upstream_iserror_not_double_recorded(self):
-        """A result.isError=True path raises ToolError after recording an
-        UPSTREAM_ERROR row; the outer wrapper must not add INTERNAL_ERROR."""
-        from mcp.server.fastmcp.exceptions import ToolError
-
+        """A returned error envelope records one UPSTREAM_ERROR row."""
         from memtomem_stm.proxy.metrics import ErrorCategory
 
         mgr = _make_manager()
@@ -742,8 +737,8 @@ class TestPipelineExceptionMetrics:
         session.call_tool.return_value = _make_result("oops", is_error=True)
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
-            with pytest.raises(ToolError):
-                await mgr.call_tool("srv", "tool", {})
+            result = await mgr.call_tool("srv", "tool", {})
+        assert result.isError is True
 
         assert mgr.tracker._errors_by_category[ErrorCategory.UPSTREAM_ERROR.value] == 1
         assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
@@ -1560,8 +1555,6 @@ class TestUpstreamCircuitBreaker:
     async def test_is_error_result_counts_as_breaker_success(self):
         """A tool-level ``isError`` result proves the upstream is alive —
         it closes the breaker instead of counting against it."""
-        from mcp.server.fastmcp.exceptions import ToolError
-
         from memtomem_stm.proxy.metrics import ErrorCategory
 
         mgr = _make_manager(max_retries=0, circuit_max_failures=2)
@@ -1574,8 +1567,8 @@ class TestUpstreamCircuitBreaker:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
-            with pytest.raises(ToolError, match="tool blew up"):
-                await mgr.call_tool("srv", "tool", {})
+            result = await mgr.call_tool("srv", "tool", {})
+            assert result.isError is True
 
         breaker = mgr._connections["srv"].breaker
         assert breaker.failure_count == 0

@@ -25,7 +25,22 @@ def _store(*, neg=None, helpful=None, adjustments=None):
     store.get_tool_negative_ratio.return_value = neg
     store.get_tool_helpful_ratio.return_value = helpful
     store.load_adjustments.return_value = dict(adjustments or {})
+    count = iter(range(1, 10_000))
+    store.get_feedback_count.side_effect = lambda _tool=None: next(count)
     return store
+
+
+def test_no_new_feedback_does_not_reapply_adjustment():
+    cfg = SurfacingConfig(auto_tune_enabled=True, min_score=0.03)
+    store = _store(neg=0.9, helpful=0.0)
+    store.get_feedback_count.side_effect = None
+    store.get_feedback_count.return_value = 10
+    tuner = AutoTuner(cfg, store)
+
+    expected = cfg.min_score + cfg.auto_tune_score_increment
+    assert tuner.maybe_adjust("read_file") == pytest.approx(expected)
+    assert tuner.maybe_adjust("read_file") is None
+    assert tuner.get_effective_min_score("read_file") == pytest.approx(expected)
 
 
 class TestConfigurableBounds:

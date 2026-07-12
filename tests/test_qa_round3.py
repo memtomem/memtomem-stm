@@ -185,9 +185,7 @@ class TestDocsToolCount:
 
 class TestIsErrorPropagation:
     @pytest.mark.asyncio
-    async def test_upstream_error_raises_tool_error(self):
-        from mcp.server.fastmcp.exceptions import ToolError
-
+    async def test_upstream_error_preserves_error_result(self):
         from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerConfig
         from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
         from memtomem_stm.proxy.metrics import TokenTracker
@@ -210,8 +208,9 @@ class TestIsErrorPropagation:
             tools=[],
         )
 
-        with pytest.raises(ToolError, match="upstream error message"):
-            await pm.call_tool("test", "some_tool", {})
+        result = await pm.call_tool("test", "some_tool", {})
+        assert result.isError is True
+        assert result.content[0].text == "upstream error message"
 
 
 # ---------------------------------------------------------------------------
