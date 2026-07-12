@@ -150,16 +150,16 @@ class TestToolConfigResolution:
         assert tc.selective.max_pending == 50
 
 
-# ── Auto-index startup warning tests ────────────────────────────────────
-# See also: ``tests/test_docs_sync.py::test_bundled_server_proxy_manager_omits_index_engine``
-# and ``::test_configuration_md_stage4_inert_note_pinned`` — paired docs/code
-# drift guards for the bundled ``mms`` server's engine-less construction (#299).
+# Retired bundled index-surface tests.
+# See also ``tests/test_docs_sync.py`` for the paired docs/code drift guards.
 
 
-class TestInactiveIndexConfigNoStartupWarning:
+class TestRetiredBundledIndexSurface:
+    """Pin quiet bundled config and preserved library-mode Stage 4 behavior."""
+
     @pytest.mark.asyncio
     async def test_no_compression_auto_index_warning(self, caplog):
-        """Compression active + auto_index disabled → startup warning."""
+        """Compression without auto-index emits no retired startup warning."""
         config = ProxyConfig(
             enabled=True,
             auto_index=AutoIndexConfig(enabled=False),
@@ -188,7 +188,7 @@ class TestInactiveIndexConfigNoStartupWarning:
 
     @pytest.mark.asyncio
     async def test_no_global_auto_index_missing_engine_warning(self, caplog, tmp_path):
-        """auto_index.enabled=true but index_engine=None → startup warning."""
+        """Reserved global auto-index config stays quiet without an engine."""
         config = ProxyConfig(
             enabled=True,
             config_path=tmp_path / "missing-proxy.json",
@@ -203,7 +203,7 @@ class TestInactiveIndexConfigNoStartupWarning:
 
     @pytest.mark.asyncio
     async def test_no_global_extraction_missing_engine_warning(self, caplog, tmp_path):
-        """extraction.enabled=true but index_engine=None → startup warning (#288)."""
+        """Reserved global extraction config stays quiet without an engine."""
         config = ProxyConfig(
             enabled=True,
             config_path=tmp_path / "missing-proxy.json",
@@ -218,7 +218,7 @@ class TestInactiveIndexConfigNoStartupWarning:
 
     @pytest.mark.asyncio
     async def test_no_per_server_auto_index_missing_engine_warning(self, caplog):
-        """Per-upstream auto_index=true with no engine → warning names the server (#288)."""
+        """Reserved per-upstream auto-index stays quiet without an engine."""
         config = ProxyConfig(
             enabled=True,
             upstream_servers={
@@ -243,7 +243,7 @@ class TestInactiveIndexConfigNoStartupWarning:
 
     @pytest.mark.asyncio
     async def test_no_per_tool_extraction_missing_engine_warning(self, caplog):
-        """Per-tool-override extraction=true with no engine → warning names server+tool (#288)."""
+        """Reserved per-tool extraction stays quiet without an engine."""
         config = ProxyConfig(
             enabled=True,
             upstream_servers={
@@ -293,6 +293,7 @@ class TestInactiveIndexConfigNoStartupWarning:
 
     @pytest.mark.asyncio
     async def test_injected_engine_runs_index_and_extract_stages(self):
+        """Custom embedders retain both Stage 4 write paths."""
         config = ProxyConfig(
             enabled=True,
             auto_index=AutoIndexConfig(enabled=True, min_chars=1, background=False),

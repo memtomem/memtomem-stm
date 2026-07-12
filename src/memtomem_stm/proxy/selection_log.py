@@ -176,8 +176,8 @@ class SelectionTelemetryLog:
 
         These reflect the running instance only (reset at restart), unlike
         ``aggregate_selection_log`` which reads the persisted history off
-        disk — the same in-memory-vs-store split as ``stm_index_stats`` /
-        ``stm_surfacing_stats``. Read under ``self._lock`` so a concurrent
+        disk — the same in-memory-vs-store split as ``stm_surfacing_stats``.
+        Read under ``self._lock`` so a concurrent
         ``_append`` can't tear a counter.
         """
         with self._lock:

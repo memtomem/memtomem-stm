@@ -1514,8 +1514,7 @@ async def stm_selection_stats(
 
     Surfaces the selection/execution log the proxy writes when
     ``proxy.selection_telemetry.enabled`` is set — the substrate for
-    offline replay/eval (#468). Two views, the same in-memory-vs-store
-    split as ``stm_index_stats``:
+    offline replay/eval (#468). Two views:
 
     - **Live counters** — this process's write-path counters (events
       written / sampled out / redaction drops / write errors), reset at
