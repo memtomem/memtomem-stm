@@ -52,7 +52,7 @@ Options:
 Commands:
   add        Add an upstream MCP server to the proxy configuration.
   config     Inspect and validate the proxy config file.
-  daemon     Manage the local surfacing daemon (warm LTM connection for...
+  daemon     Manage the shared local surfacing daemon.
   doctor     Diagnose the proxy setup end-to-end (read-only).
   eject      Restore imported upstream(s) to their host MCP client, then...
   health     Check upstream server connectivity.
@@ -630,8 +630,9 @@ tool names such as `Read`, `Grep`, `Glob`, and `Bash` are recognized.
 
 ## `mms daemon` — warm surfacing process
 
-`mms daemon` keeps an LTM connection warm for `mms hook`, avoiding a cold LTM
-startup on every built-in tool call.
+`mms daemon` keeps an LTM connection warm for `mms hook` and opt-in standalone
+surfacing (`MEMTOMEM_STM_SURFACING__USE_DAEMON=true`). This lets concurrent
+agents share one LTM child per matching configuration.
 
 ```
 Usage: mms daemon [OPTIONS] COMMAND [ARGS]...

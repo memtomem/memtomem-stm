@@ -114,6 +114,10 @@ always fails open. See the
 [native-hook guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/native-hooks.md)
 for the capability matrix, installation paths, daemon behavior, and privacy.
 
+For multi-agent fleets, standalone surfacing can opt into the same daemon with
+`MEMTOMEM_STM_SURFACING__USE_DAEMON=true`, avoiding one private LTM child per
+agent while keeping proxy feedback, caching, and tuning local.
+
 **STM does NOT write back to LTM at runtime.** The bundled `mms` server constructs the proxy without a `FileIndexer` engine by design, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are library-mode only — callers embedding STM as a library can pass `index_engine=` to `ProxyManager` themselves ([#288](https://github.com/memtomem/memtomem-stm/issues/288) has the history).
 
 To bring file or shell operations under STM, register an MCP server that exposes

@@ -4934,6 +4934,7 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         else redact_url_userinfo(url) or "(empty url)"
     )
     status: dict[str, Any] = {
+        "route": "direct",
         "transport": transport,
         "command": command,
         "args": args,
@@ -5001,6 +5002,47 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     else:
         status.update(probe)
     return status
+
+
+def _ltm_daemon_status(config: Any, timeout: float) -> dict[str, Any]:
+    """Read-only shared-daemon readiness probe; never auto-spawns."""
+    from memtomem_stm.daemon import client as daemon_client
+
+    surfacing = config.surfacing
+    status: dict[str, Any] = {
+        "route": "daemon",
+        "transport": surfacing.ltm_mcp_transport,
+        "command": surfacing.ltm_mcp_command,
+        "args": list(surfacing.ltm_mcp_args),
+        "url": redact_url_userinfo(surfacing.ltm_mcp_url),
+        "display": "mms daemon",
+        "connected": False,
+        "version": None,
+        "error": None,
+        "daemon_reachable": False,
+        "ltm_state": None,
+    }
+    if not surfacing.enabled:
+        status["skipped"] = "surfacing_disabled"
+        return status
+    hs = asyncio.run(daemon_client.ping(config, timeout=max(0.1, float(timeout))))
+    if hs is None:
+        status["error"] = "shared daemon is not reachable; run `mms daemon status`"
+        return status
+    state = str(hs.get("ltm") or "cold")
+    status["daemon_reachable"] = True
+    status["ltm_state"] = state
+    if state == "warm":
+        status["connected"] = True
+    else:
+        status["error"] = f"shared daemon is reachable but LTM is {state}"
+    return status
+
+
+def _ltm_status(config: Any, timeout: float) -> dict[str, Any]:
+    if config.surfacing.use_daemon:
+        return _ltm_daemon_status(config, timeout)
+    return _ltm_mcp_status(config.surfacing, timeout)
 
 
 def _root_cause_exc(exc: BaseException) -> BaseException:
@@ -5107,13 +5149,14 @@ def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
         from memtomem_stm.config import STMConfig
         from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
 
-        surfacing = STMConfig().surfacing
+        config = STMConfig()
+        surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
         return {
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
-            "ltm_server": _ltm_mcp_status(surfacing, timeout),
+            "ltm_server": _ltm_status(config, timeout),
         }
     except Exception as exc:
         logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
@@ -5164,7 +5207,8 @@ def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
             lines.append(f"  ltm server: {_ok('connectable')} ({detail})")
         else:
             err = ltm_server.get("error") or "unknown error"
-            lines.append(f"  ltm server: {_bad('UNREACHABLE')} — {err}")
+            label = "NOT READY" if ltm_server.get("daemon_reachable") else "UNREACHABLE"
+            lines.append(f"  ltm server: {_bad(label)} — {err}")
     return lines
 
 
@@ -5620,8 +5664,12 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
                     "WARN",
                     f"{cause} — only LTM-dependent features (memory surfacing) are "
                     "disabled; the proxy core is unaffected",
-                    "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
-                    "  # see docs/surfacing.md",
+                    (
+                        "mms daemon status"
+                        if isinstance(ltm, dict) and ltm.get("route") == "daemon"
+                        else "export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=<memtomem-server>"
+                        "  # see docs/surfacing.md"
+                    ),
                 )
 
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}

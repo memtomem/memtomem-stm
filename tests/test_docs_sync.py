@@ -1031,6 +1031,7 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
     for token in (
         "MEMTOMEM_STM_DATA_DIR",
         "MEMTOMEM_STM_HOOK__METRICS_ENABLED",
+        "MEMTOMEM_STM_SURFACING__USE_DAEMON",
         "AUTO_TUNE_SCORE_FLOOR",
         "AUTO_TUNE_SCORE_CEILING",
         "CONTEXT_TOOLS",

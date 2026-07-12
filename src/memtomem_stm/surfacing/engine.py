@@ -52,6 +52,10 @@ class _DependencyFault(RuntimeError):
     """Internal signal: return passthrough but count the dependency failure."""
 
 
+class _OperationalSkip(RuntimeError):
+    """Internal signal for daemon startup/load shedding without breaker mutation."""
+
+
 class SurfacingEngine:
     """Core proactive memory surfacing engine.
 
@@ -466,6 +470,8 @@ class SurfacingEngine:
             return response_text
         except _DependencyFault:
             self._circuit_breaker.record_failure()
+            return response_text
+        except _OperationalSkip:
             return response_text
         except Exception:
             self._observability.record_outcome(tool, "error_other")
@@ -932,12 +938,21 @@ class SurfacingEngine:
         # min_score / dedup / ``no_results_score`` path so that operators
         # tuning min_score keep seeing the same signal for the genuine
         # empty-namespace case.
+        if outcome in ("daemon_starting", "daemon_busy"):
+            self._reset_score_scale_streak(server, tool)
+            self._observability.record_skip(tool, outcome)
+            raise _OperationalSkip(outcome)
         if outcome in ("no_session", "transport_error"):
             self._reset_score_scale_streak(server, tool)
             if not self._warned_ltm_unavailable:
-                if self._config.ltm_mcp_transport == "stdio":
+                if self._config.use_daemon:
+                    ltm_transport = "shared daemon"
+                    ltm_target = "mms daemon status"
+                elif self._config.ltm_mcp_transport == "stdio":
+                    ltm_transport = self._config.ltm_mcp_transport
                     ltm_target = self._config.ltm_mcp_command
                 else:
+                    ltm_transport = self._config.ltm_mcp_transport
                     # Display-only: a network URL may carry basic-auth
                     # credentials that must not reach the WARNING line.
                     ltm_target = redact_url_userinfo(self._config.ltm_mcp_url)
@@ -946,7 +961,7 @@ class SurfacingEngine:
                     "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
                     "in stm_surfacing_stats. Run `mms health` to diagnose or "
                     "set `surfacing.enabled=false` to silence.",
-                    self._config.ltm_mcp_transport,
+                    ltm_transport,
                     ltm_target,
                     outcome,
                 )

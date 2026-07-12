@@ -216,6 +216,13 @@ class TestSurfacingWarmupConfig:
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__WARMUP_ENABLED", "false")
         assert STMConfig().surfacing.warmup_enabled is False
 
+    def test_shared_daemon_route_is_explicit_opt_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert SurfacingConfig().use_daemon is False
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "true")
+        assert STMConfig().surfacing.use_daemon is True
+
 
 class TestLLMCompressorApiKey:
     """``provider=openai|anthropic`` with empty ``api_key`` used to send a

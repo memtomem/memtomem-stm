@@ -55,6 +55,11 @@ SkipReason = Literal[
     "ltm_unavailable",
     "ltm_call_failed",
     "ltm_parse_empty",
+    # Shared-daemon operational load shedding. These are healthy skips: the
+    # current tool response passes through and the local circuit breaker must
+    # not treat daemon startup/queue pressure as an LTM dependency failure.
+    "daemon_starting",
+    "daemon_busy",
     # #348: progressive-delivery path skips surfacing when the engine's
     # injection mode would shift character offsets and break the
     # ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant ``stm_proxy_read_more``
@@ -100,6 +105,8 @@ HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
         "no_results_demoted",
         "no_results_invalidated",
         "no_results_empty_cache",
+        "daemon_starting",
+        "daemon_busy",
         "progressive_mode_conflict",
         "upstream_disabled",
     }

@@ -103,6 +103,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Global on/off switch |
+| `use_daemon` | `false` | Opt-in standalone route through the shared local daemon. Keeps feedback/cache/tuning local while sharing one LTM connection per matching config. Never falls back to a private child. |
 | `warmup_enabled` | `true` | Kick a background LTM warm-up right after server/daemon startup, pre-paying the ~9s cold start so the first surfacing call is warm **if** warm-up has finished by then (a call arriving mid-warm-up still times out, then the abandoned start finishes for the next one — see `timeout_seconds`) (#664). Runs in a host-owned task and never blocks the proxy's own MCP initialize handshake. Best-effort: on failure, the lazy start on first use is the retry. Disable when eagerly spawning an LTM child per proxy process is undesirable (e.g. many short-lived proxies). |
 | `min_score` | `0.03` | Minimum search score to include a result |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
@@ -338,7 +339,31 @@ export MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT=streamable_http
 export MEMTOMEM_STM_SURFACING__LTM_MCP_URL=https://ltm.example/mcp
 ```
 
-This makes memtomem reachable over the same MCP protocol boundary STM uses for other upstreams. Unlike a generic proxied upstream, LTM responses bypass the compression / cache pipeline — they are consumed by STM's surfacing engine (via `McpClientSearchAdapter`, see `src/memtomem_stm/surfacing/mcp_client.py`) to compose context for upstream calls, rather than being passed through to the caller. A memtomem crash never takes down STM's other upstream connections.
+### Shared daemon mode for multi-agent fleets
+
+Standalone `mms` processes normally own one LTM connection each. To collapse a
+fleet onto the existing local daemon, opt in before starting the MCP clients:
+
+```bash
+export MEMTOMEM_STM_SURFACING__USE_DAEMON=true
+mms daemon status
+```
+
+With the default `warmup_enabled=true`, each proxy requests a lock-guarded
+daemon spawn during background warm-up; only one matching daemon builds an LTM
+connection. With warm-up disabled, the first eligible search requests the
+spawn and returns the original tool response unchanged. Calls arriving while
+the daemon is starting or busy also pass through unchanged and do not trip the
+proxy's LTM circuit breaker. There is no private-child fallback in this mode.
+
+The proxy still owns its `SurfacingEngine`, feedback IDs, cache, tuning, rate
+limits, and observability. Only search, scratch context, and helpful-feedback
+access boosts cross the authenticated loopback daemon protocol. Sharing is per
+effective daemon fingerprint: different LTM/surfacing configurations or
+protocol versions intentionally use separate daemons. `mms health` probes the
+daemon route without spawning a private LTM process.
+
+This makes memtomem reachable over the same MCP protocol boundary STM uses for other upstreams. Unlike a generic proxied upstream, LTM responses bypass the compression / cache pipeline — they are consumed by STM's dedicated direct or daemon-backed LTM adapter to compose context for upstream calls, rather than being passed through to the caller. A memtomem crash never takes down STM's other upstream connections.
 
 `mms health` includes a Surfacing Bootstrap section that probes this configured
 LTM server without starting the proxy. The probe supports `stdio`, `sse`, and

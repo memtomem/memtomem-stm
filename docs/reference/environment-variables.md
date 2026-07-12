@@ -27,6 +27,7 @@ Important controls include:
 | Setting suffix | Default | Purpose |
 |---|---|---|
 | `ENABLED` | `true` | Global surfacing switch |
+| `USE_DAEMON` | `false` | Route standalone surfacing through the shared local daemon; no private fallback |
 | `MIN_SCORE` | `0.03` | Result threshold |
 | `AUTO_TUNE_SCORE_FLOOR` | `0.005` | Default lower tuning bound |
 | `AUTO_TUNE_SCORE_CEILING` | `0.05` | Default upper tuning bound |
@@ -37,6 +38,8 @@ Important controls include:
 Use the prefix `MEMTOMEM_STM_SURFACING__`. When an explicit `min_score` lies
 outside the default tuning range, validation widens the effective range to
 include that configured value rather than silently clamping it away.
+For example, set `MEMTOMEM_STM_SURFACING__USE_DAEMON=true` to share the local
+daemon across standalone proxy processes.
 
 ## Hook and daemon
 
@@ -48,7 +51,7 @@ include that configured value rather than silently clamping it away.
 | `MEMTOMEM_STM_HOOK__METRICS_ENABLED` | `true` | Record size/timing-only hook rows |
 | `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS` | `false` | Persist hook surfacing feedback events |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | `false` | Enable Claude Bash output replacement |
-| `MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS` | `32` | Bound admitted hook requests |
+| `MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS` | `32` | Bound admitted hook and standalone surfacing requests |
 
 ## Langfuse
 

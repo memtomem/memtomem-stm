@@ -110,7 +110,10 @@ def config_fingerprint(config: STMConfig) -> str:
     version guard; the explicit per-frame ``v`` check is the belt-and-suspenders.
     """
     material = {
-        "surfacing": config.surfacing.model_dump(mode="json"),
+        # ``use_daemon`` chooses the standalone client's route; it does not
+        # change the daemon-owned engine or LTM connection and therefore must
+        # not split discovery identity.
+        "surfacing": config.surfacing.model_dump(mode="json", exclude={"use_daemon"}),
         "record_feedback_events": config.hook.record_feedback_events,
         "host": config.daemon.host,
         "idle_timeout_seconds": config.daemon.idle_timeout_seconds,

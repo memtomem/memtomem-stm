@@ -38,15 +38,19 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from memtomem_stm.cli.hook_adapter import CanonicalHookCall
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
-from memtomem_stm.config import STMConfig
+from memtomem_stm.config import STMConfig, _is_loopback_host
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
+    OP_LTM_INCREMENT_ACCESS,
+    OP_LTM_SCRATCH_LIST,
+    OP_LTM_SEARCH,
     OP_PING,
     OP_SHUTDOWN,
     OP_SURFACE,
@@ -386,7 +390,12 @@ class DaemonServer:
                 return  # never respond to an unauthenticated peer
             resp = await self._dispatch(req)
             if resp is not None:
-                writer.write(encode_line(resp))
+                encoded = encode_line(resp)
+                if len(encoded) > MAX_MESSAGE_BYTES:
+                    encoded = encode_line(
+                        {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+                    )
+                writer.write(encoded)
                 # Timeout → the generic handler below logs it and the finally
                 # block closes the writer, dropping the stuck consumer.
                 await asyncio.wait_for(writer.drain(), timeout=_WRITE_TIMEOUT_SECONDS)
@@ -421,29 +430,136 @@ class DaemonServer:
             call = CanonicalHookCall.from_wire(req.get("payload"))
             if call is None:
                 return surface_response({})
-            deadline = req.get("deadline_monotonic")
-            if not isinstance(deadline, (int, float)):
-                return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
-            remaining = float(deadline) - time.monotonic()
-            if remaining <= 0:
-                return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
-            if self._pending_slots.locked():
-                return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
-            await self._pending_slots.acquire()
-            self._last_request = time.monotonic()
-            self._active_requests += 1
-            try:
-                async with asyncio.timeout_at(float(deadline)):
-                    async with self._surface_lock:
-                        output = await run_surfacing_hook(call, engine=self._engine)
+
+            async def surface_call() -> dict[str, Any]:
+                output = await run_surfacing_hook(call, engine=self._engine)
                 return surface_response(output)
-            except asyncio.TimeoutError:
-                return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
-            finally:
-                self._active_requests -= 1
-                self._pending_slots.release()
-                self._last_request = time.monotonic()
+
+            return await self._run_admitted(req, surface_call)
+        if op in {OP_LTM_SEARCH, OP_LTM_INCREMENT_ACCESS, OP_LTM_SCRATCH_LIST}:
+            # These operations expose raw LTM search/scratch data and are
+            # intentionally stricter than the legacy hook surface operation.
+            if not _is_loopback_host(self._host):
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+            payload = req.get("payload")
+            if not isinstance(payload, dict):
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+            if op == OP_LTM_SEARCH:
+                parsed = self._parse_search_payload(payload)
+                if parsed is None:
+                    return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+                async def search_call() -> dict[str, Any]:
+                    results, hints, outcome = await self._adapter.search(**parsed)
+                    encoded_results = [
+                        {
+                            "content": str(result.chunk.content),
+                            "score": float(result.score),
+                            "source": str(result.chunk.metadata.source_file),
+                            "namespace": str(result.chunk.metadata.namespace),
+                            "chunk_id": str(result.chunk.id),
+                        }
+                        for result in results
+                    ]
+                    return {
+                        "v": PROTOCOL_VERSION,
+                        "ok": True,
+                        "results": encoded_results,
+                        "hints": [str(hint) for hint in hints],
+                        "outcome": outcome,
+                    }
+
+                return await self._run_admitted(req, search_call)
+            if op == OP_LTM_INCREMENT_ACCESS:
+                chunk_ids = payload.get("chunk_ids")
+                trace_id = payload.get("trace_id")
+                if (
+                    not isinstance(chunk_ids, list)
+                    or not all(isinstance(item, str) and item for item in chunk_ids)
+                    or (trace_id is not None and not isinstance(trace_id, str))
+                ):
+                    return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+                async def increment_call() -> dict[str, Any]:
+                    await self._adapter.increment_access(chunk_ids, trace_id=trace_id)
+                    return {"v": PROTOCOL_VERSION, "ok": True}
+
+                return await self._run_admitted(req, increment_call)
+
+            trace_id = payload.get("trace_id")
+            if trace_id is not None and not isinstance(trace_id, str):
+                return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+            async def scratch_call() -> dict[str, Any]:
+                items = await self._adapter.scratch_list(trace_id=trace_id)
+                return {"v": PROTOCOL_VERSION, "ok": True, "items": items}
+
+            return await self._run_admitted(req, scratch_call)
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
+
+    async def _run_admitted(
+        self,
+        req: dict[str, Any],
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Run one LTM operation under the shared queue, deadline, and lock."""
+        deadline = req.get("deadline_monotonic")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+        if float(deadline) <= time.monotonic():
+            return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+        if self._pending_slots.locked():
+            return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+        await self._pending_slots.acquire()
+        self._last_request = time.monotonic()
+        self._active_requests += 1
+        try:
+            async with asyncio.timeout_at(float(deadline)):
+                async with self._surface_lock:
+                    return await operation()
+        except asyncio.TimeoutError:
+            return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+        except Exception:
+            logger.debug("daemon LTM operation failed", exc_info=True)
+            return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+        finally:
+            self._active_requests -= 1
+            self._pending_slots.release()
+            self._last_request = time.monotonic()
+
+    @staticmethod
+    def _parse_search_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+        query = payload.get("query")
+        top_k = payload.get("top_k")
+        namespace = payload.get("namespace")
+        context_window = payload.get("context_window")
+        trace_id = payload.get("trace_id")
+        if not isinstance(query, str) or not query:
+            return None
+        if top_k is not None and (
+            isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0
+        ):
+            return None
+        if isinstance(namespace, list):
+            if not all(isinstance(item, str) for item in namespace):
+                return None
+        elif namespace is not None and not isinstance(namespace, str):
+            return None
+        if context_window is not None and (
+            isinstance(context_window, bool)
+            or not isinstance(context_window, int)
+            or context_window < 0
+        ):
+            return None
+        if trace_id is not None and not isinstance(trace_id, str):
+            return None
+        return {
+            "query": query,
+            "top_k": top_k,
+            "namespace": namespace,
+            "context_window": context_window,
+            "trace_id": trace_id,
+        }
 
     def _ltm_warmth(self) -> str:
         """Best-effort LTM connection state for ``ping`` (status nicety).

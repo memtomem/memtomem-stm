@@ -21,6 +21,9 @@ from memtomem_stm.daemon.discovery import (
 )
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
+    OP_LTM_INCREMENT_ACCESS,
+    OP_LTM_SCRATCH_LIST,
+    OP_LTM_SEARCH,
     OP_PING,
     OP_SHUTDOWN,
     OP_SURFACE,
@@ -35,6 +38,8 @@ if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
 
 logger = logging.getLogger(__name__)
+
+LtmRequestState = str
 
 
 async def _request(
@@ -149,6 +154,34 @@ async def surface(
     if resp is not None and resp.get("ok") and isinstance(resp.get("output"), dict):
         return resp["output"]
     return None
+
+
+async def ltm_request(
+    config: STMConfig,
+    op: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+) -> tuple[LtmRequestState, dict[str, Any] | None]:
+    """Send one deadline-bounded low-level LTM request through the daemon.
+
+    The state distinguishes a missing matching handshake (eligible for
+    auto-spawn) from an endpoint that was discovered but did not answer.
+    """
+    if op not in {OP_LTM_SEARCH, OP_LTM_INCREMENT_ACCESS, OP_LTM_SCRATCH_LIST}:
+        return "invalid", None
+    hs = _live_handshake_candidate(config)
+    if hs is None:
+        return "missing", None
+    deadline = asyncio.get_running_loop().time() + timeout
+    resp = await _request(
+        hs,
+        op,
+        payload,
+        timeout=timeout,
+        deadline_monotonic=deadline,
+    )
+    return ("ok", resp) if resp is not None else ("unavailable", None)
 
 
 async def shutdown(config: STMConfig, *, timeout: float = 5.0) -> bool:
