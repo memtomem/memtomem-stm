@@ -1022,6 +1022,25 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
                 "LTM answers slower than surfacing.timeout_seconds"
             )
         )
+    diagnostics = summary.get("diagnostics") or {}
+    if diagnostics:
+        window_days = summary.get("diagnostics_window_days")
+        click.echo(f"  score-scale diagnostics (last {window_days} UTC days):")
+        for kind, count in sorted(diagnostics.items()):
+            click.echo(f"    {kind:<28} {count}")
+        last_at = summary.get("diagnostics_last_at")
+        if isinstance(last_at, (int, float)):
+            last_str = datetime.fromtimestamp(last_at).strftime("%Y-%m-%d %H:%M")
+            click.echo(f"    last diagnostic: {last_str}")
+        click.echo(
+            "  "
+            + _warn(
+                "LTM candidates repeatedly stayed below active min_score — "
+                "the LTM may be single-leg/BM25-only or min_score may be "
+                "intentionally high; check embedding extras and LTM logs. "
+                "STM did not lower the threshold"
+            )
+        )
 
 
 @cli.command()

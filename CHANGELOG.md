@@ -23,6 +23,16 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- Repeated healthy LTM searches whose candidates all score below the active
+  `min_score` now produce a durable score-scale diagnostic after five
+  consecutive non-empty misses. `mms stats` warns that the LTM may be running
+  single-leg/BM25-only (or that the configured threshold may be intentionally
+  high) without silently lowering the threshold. **Behavior change**: this
+  previously silent `no_results_score` pattern now emits one warning per
+  detected episode and appears in the on-disk stats summary. (#672)
+
 ## [0.1.35] — 2026-07-12
 
 ### Upgrade notes
