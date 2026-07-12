@@ -252,6 +252,12 @@ def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest
     c.hook.record_feedback_events = True
     assert discovery.config_fingerprint(c) != fp
 
+    # Standalone route selection is likewise client-only: the daemon's direct
+    # adapter and engine behave identically regardless of who discovers it.
+    c = STMConfig()
+    c.surfacing.use_daemon = True
+    assert discovery.config_fingerprint(c) == fp
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock re-entrancy semantics")
 def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -741,6 +747,7 @@ class TestDaemonStatusCli:
         assert info["pid"] == 11
         assert info["uptime_seconds"] >= 0.0
         assert "hook_will_use_daemon" in info
+        assert "standalone_will_use_daemon" in info
 
     def test_running_corrupted_created_at_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

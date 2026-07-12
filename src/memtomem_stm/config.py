@@ -172,9 +172,9 @@ class DaemonConfig(BaseModel):
     with no requests, so an abandoned coding session doesn't leak a
     multi-GB process forever. ``0`` disables idle shutdown (pin the process)."""
     max_pending_requests: int = Field(default=32, ge=1, le=1024)
-    """Maximum number of native surfacing requests admitted concurrently.
-    Requests beyond this bound fail open immediately instead of building an
-    unbounded queue behind the daemon's single LTM session."""
+    """Maximum number of hook or standalone surfacing requests admitted
+    concurrently. Requests beyond this bound fail open immediately instead of
+    building an unbounded queue behind the daemon's single LTM session."""
 
     @model_validator(mode="after")
     def _reject_non_loopback_host(self) -> "DaemonConfig":

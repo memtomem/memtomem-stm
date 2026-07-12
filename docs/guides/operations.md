@@ -38,6 +38,13 @@ score scale or an intentionally high threshold. STM never lowers `min_score`
 because of this diagnostic; pin a per-tool threshold only after inspecting the
 score distribution.
 
+When `MEMTOMEM_STM_SURFACING__USE_DAEMON=true`, also run `mms daemon status`.
+`warming` means the shared child/model is still starting; `warm` is ready.
+With warm-up disabled, the first eligible call starts the daemon and passes
+through unchanged, and the immediately following call may still arrive before
+the LTM is warm. Multiple children can be legitimate when configs or protocol
+versions differ; `mms daemon stop --all` removes pinned stale-version daemons.
+
 ### Observability MCP tools are absent
 
 The nine operator tools are hidden by default to save tool-schema tokens. Set

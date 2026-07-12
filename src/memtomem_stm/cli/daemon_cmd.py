@@ -1,7 +1,7 @@
-"""``mms daemon`` — manage the local surfacing daemon (Stage 2).
+"""``mms daemon`` — manage the shared local surfacing daemon (Stage 2).
 
-The daemon keeps one warm LTM connection + ``SurfacingEngine`` so ``mms hook``
-avoids the ~6s cold start on every built-in tool call. Subcommands:
+The daemon keeps one warm LTM connection for ``mms hook`` and opt-in standalone
+proxy surfacing, avoiding one private LTM child per client. Subcommands:
 
 - ``run``     — the actual long-lived server loop (foreground, or the target of
   a detached spawn via ``--detached``).
@@ -172,7 +172,7 @@ def _configure_logging(config: STMConfig, *, detached: bool) -> None:
 
 @click.group(name="daemon")
 def daemon_group() -> None:
-    """Manage the local surfacing daemon (warm LTM connection for ``mms hook``)."""
+    """Manage the shared local surfacing daemon."""
 
 
 @daemon_group.command(name="run")
@@ -377,6 +377,7 @@ def status_cmd(as_json: bool) -> None:
     # surfacing-off means it never will — regardless of the use_daemon knob.
     surfacing_on = config.surfacing.enabled
     use_daemon = config.hook.use_daemon and surfacing_on
+    standalone_use_daemon = config.surfacing.use_daemon and surfacing_on
     hs = asyncio.run(client.ping(config, timeout=2.0))
     if hs is not None:
         uptime = max(0.0, time.time() - _as_float(hs.get("created_at"), time.time()))
@@ -388,6 +389,7 @@ def status_cmd(as_json: bool) -> None:
             "ltm": hs.get("ltm"),
             "uptime_seconds": round(uptime, 1),
             "hook_will_use_daemon": use_daemon,
+            "standalone_will_use_daemon": standalone_use_daemon,
         }
     else:
         raw = read_handshake(handshake_path(config.data_dir, config_fingerprint(config)))
@@ -397,9 +399,14 @@ def status_cmd(as_json: bool) -> None:
                 "pid": raw.get("pid"),
                 "pid_alive": is_pid_alive(_as_int(raw.get("pid", -1))),
                 "hook_will_use_daemon": use_daemon,
+                "standalone_will_use_daemon": standalone_use_daemon,
             }
         else:
-            info = {"state": "stopped", "hook_will_use_daemon": use_daemon}
+            info = {
+                "state": "stopped",
+                "hook_will_use_daemon": use_daemon,
+                "standalone_will_use_daemon": standalone_use_daemon,
+            }
 
     # Orthogonal to the current-config state: daemons orphaned under a different
     # fingerprint (config/protocol drift) are invisible to the keyed paths above,
@@ -435,6 +442,13 @@ def status_cmd(as_json: bool) -> None:
     else:
         hint = "no (opted out via MEMTOMEM_STM_HOOK__USE_DAEMON=0)"
     click.echo(f"hook will use daemon: {hint}")
+    if standalone_use_daemon:
+        standalone_hint = "yes"
+    elif not surfacing_on:
+        standalone_hint = "no (surfacing disabled)"
+    else:
+        standalone_hint = "no (set MEMTOMEM_STM_SURFACING__USE_DAEMON=true to opt in)"
+    click.echo(f"standalone surfacing will use daemon: {standalone_hint}")
 
     if foreign:
         listing = ", ".join(f"pid={d['pid']} fp={d['fingerprint']}" for d in foreign)

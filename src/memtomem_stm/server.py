@@ -124,9 +124,25 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     return result.error
 
 
+def _build_ltm_adapter(config: STMConfig, daemon_config: STMConfig) -> Any:
+    """Select the standalone surfacing route before lifespan warm-up."""
+    if config.surfacing.use_daemon is True:
+        from memtomem_stm.surfacing.daemon_adapter import DaemonLtmAdapter
+
+        return DaemonLtmAdapter(daemon_config)
+    from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+    return McpClientSearchAdapter(config.surfacing)
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     config = STMConfig()
+    # Daemon discovery/spawn must use the same env/default-only basis the
+    # detached daemon loads. The proxy file may later propagate a file-only
+    # consumer_model into surfacing; using that mutated config for discovery
+    # would create a fingerprint the detached process can never publish.
+    daemon_config = config.model_copy(deep=True)
     proxy_env_overrides = collect_proxy_env_overrides()
     proxy_config_error = _apply_proxy_file_config(config, proxy_env_overrides)
 
@@ -139,7 +155,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     selection_log: SelectionTelemetryLog | None = None
     proxy_cache: ProxyCache | None = None
     surfacing_engine: SurfacingEngine | None = None
-    mcp_adapter = None
+    mcp_adapter: Any = None
     feedback_tracker: FeedbackTracker | None = None
     compression_feedback_tracker: CompressionFeedbackTracker | None = None
     progressive_reads_tracker: ProgressiveReadsTracker | None = None
@@ -250,12 +266,12 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             # remains the fallback when warm-up is disabled or fails.
             if config.surfacing.enabled:
                 try:
-                    from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
-
-                    mcp_adapter = McpClientSearchAdapter(config.surfacing)
+                    mcp_adapter = _build_ltm_adapter(config, daemon_config)
                     logger.info(
-                        "Surfacing engine MCP client configured for lazy start: %s",
-                        config.surfacing.ltm_mcp_command,
+                        "Surfacing LTM route configured for lazy start: %s",
+                        "shared daemon"
+                        if config.surfacing.use_daemon is True
+                        else config.surfacing.ltm_mcp_command,
                     )
                 except Exception:
                     logger.warning(

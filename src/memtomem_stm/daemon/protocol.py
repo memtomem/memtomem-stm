@@ -6,18 +6,20 @@ session state). ``json.dumps`` escapes any newline inside string values as
 ``\\n``, so a serialized message is always a single physical line and
 ``StreamReader.readline()`` is a correct frame boundary.
 
-Request  (hook → daemon)::
+Request  (client → daemon)::
 
-    {"v": 2, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
+    {"v": 4, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
 
 Response (daemon → hook)::
 
-    {"v": 2, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
-    {"v": 2, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
+    {"v": 4, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
+    {"v": 4, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
     # ping "ltm" is one of warm | warming | down | cold (#664); clients
     # treat it as an opaque display string.
 
-``op`` is one of :data:`OP_SURFACE`, :data:`OP_PING`, :data:`OP_SHUTDOWN`. The
+``op`` includes hook ``surface``, lifecycle operations, and the narrowly typed
+``ltm_search`` / ``ltm_scratch_list`` / ``ltm_increment_access`` operations
+used by opt-in standalone proxy clients. The
 token gates *use* of the loopback port (any local process can ``connect`` to
 it); it is validated with :func:`secrets.compare_digest` on every request and
 never logged. Messages are capped at :data:`MAX_MESSAGE_BYTES` so a malformed
@@ -34,7 +36,8 @@ frames one side can't parse (the stale daemon idle-times-out under a finite
 ``idle_timeout_seconds``; a pinned ``idle_timeout_seconds=0`` daemon must be
 stopped manually — see #517).
 
-**v2 (this version):** the ``surface`` payload is a serialized
+**v4:** adds typed low-level LTM operations for issue #688. **v3:** adds
+absolute deadlines and bounded admission. **v2:** the ``surface`` payload is a serialized
 :class:`~memtomem_stm.cli.hook_adapter.CanonicalHookCall` (``to_wire``), so the
 daemon consumes a host-agnostic call and needs no host knowledge. **v1** sent
 the host's raw Claude PostToolUse JSON and the daemon parsed it server-side.
@@ -47,7 +50,7 @@ import json
 import secrets
 from typing import Any
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
 # built-in tool's output (a large ``Read`` can be hundreds of KB), so this sits
@@ -56,6 +59,9 @@ PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 
 OP_SURFACE = "surface"
+OP_LTM_SEARCH = "ltm_search"
+OP_LTM_INCREMENT_ACCESS = "ltm_increment_access"
+OP_LTM_SCRATCH_LIST = "ltm_scratch_list"
 OP_PING = "ping"
 OP_SHUTDOWN = "shutdown"
 

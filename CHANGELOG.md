@@ -11,6 +11,23 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- The local daemon protocol is now v4. Finite-idle v3 daemons exit naturally;
+  pinned stale daemons can be removed with `mms daemon stop --all`. A brief
+  one-child-per-version overlap is possible during upgrade.
+
+### Added
+
+- Standalone `mms` surfacing can opt into the shared local daemon with
+  `MEMTOMEM_STM_SURFACING__USE_DAEMON=true` (#688). Search, scratch context,
+  and helpful-feedback boosts share one daemon-owned LTM connection per
+  matching config, while each proxy keeps its feedback/cache/tuning state.
+  Missing or busy daemons fail open without spawning a private child.
+  Daemon admission also converts an unexpected operation exception into a
+  logged `unavailable` response; hook surfacing already catches its own
+  exceptions and continues to fail open.
+
 ### Docs
 
 - Reorganized the public documentation around a shorter first-success path,

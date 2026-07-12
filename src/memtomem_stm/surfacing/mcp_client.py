@@ -10,7 +10,7 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 import httpx
 from mcp import ClientSession
@@ -40,6 +40,8 @@ SearchOutcome = Literal[
     "empty_results",
     "upstream_error",
     "parse_error",
+    "daemon_starting",
+    "daemon_busy",
 ]
 
 
@@ -67,6 +69,31 @@ class RemoteSearchResult:
     def __init__(self, content: str, score: float, source: str = "", namespace: str = "default"):
         self.chunk = self._FakeChunk(content, source, namespace)
         self.score = score
+
+
+class SurfacingLtmAdapter(Protocol):
+    """Structural contract consumed by :class:`SurfacingEngine`."""
+
+    async def warm_up(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | list[str] | None = None,
+        context_window: int | None = None,
+        *,
+        trace_id: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[list[RemoteSearchResult], list[str], SearchOutcome]: ...
+
+    async def increment_access(
+        self, chunk_ids: list[str], *, trace_id: str | None = None
+    ) -> None: ...
+
+    async def scratch_list(self, *, trace_id: str | None = None) -> list[dict]: ...
 
 
 class ResultParser:

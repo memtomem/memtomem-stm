@@ -148,6 +148,7 @@ export MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH=~/.memtomem/stm_feedbac
 
 ```bash
 export MEMTOMEM_STM_SURFACING__ENABLED=true
+export MEMTOMEM_STM_SURFACING__USE_DAEMON=false          # true = share daemon LTM across standalone mms processes
 export MEMTOMEM_STM_SURFACING__WARMUP_ENABLED=true          # background LTM warm-up at startup (#664); false = lazy-only first-use start
 export MEMTOMEM_STM_SURFACING__MIN_SCORE=0.03
 export MEMTOMEM_STM_SURFACING__MAX_RESULTS=3
@@ -188,7 +189,7 @@ It is independent of the MCP proxy path and is configured with
 ```bash
 export MEMTOMEM_STM_HOOK__USE_DAEMON=true              # default: warm daemon path
 export MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION=0.65 # passthrough below 65%
-export MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS=32    # bounded hook queue
+export MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS=32    # bounded shared surfacing queue
 export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=2.5
 export MEMTOMEM_STM_HOOK__FALLBACK=skip                # skip | cold
 export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
@@ -225,7 +226,11 @@ reads.
 
 ### Surfacing Daemon
 
-`mms daemon` keeps a local LTM connection warm for `mms hook`.
+`mms daemon` keeps a local LTM connection warm for `mms hook` and, when
+`MEMTOMEM_STM_SURFACING__USE_DAEMON=true`, standalone proxy surfacing. The
+standalone default remains a private direct adapter. Shared mode auto-spawns a
+missing daemon, passes the current call through unchanged until ready, and
+never falls back to a private LTM child.
 
 ```bash
 export MEMTOMEM_STM_DAEMON__HOST=127.0.0.1

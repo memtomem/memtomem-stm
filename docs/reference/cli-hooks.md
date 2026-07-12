@@ -36,8 +36,10 @@ Current host paths are:
 | `stop` | Gracefully stop; `--all` also handles stale fingerprints |
 | `run` | Run the server loop; supports `--foreground` and `--detached` |
 
-Daemons are keyed by effective configuration and protocol version. Runtime
-files live under `MEMTOMEM_STM_DATA_DIR` (default `~/.memtomem`).
+Daemons are keyed by effective configuration and protocol version. They serve
+native hooks plus standalone surfacing when
+`MEMTOMEM_STM_SURFACING__USE_DAEMON=true`. Runtime files live under
+`MEMTOMEM_STM_DATA_DIR` (default `~/.memtomem`).
 
 See [Native PostToolUse Hooks](../guides/native-hooks.md) for capabilities,
 metrics, privacy, and troubleshooting.

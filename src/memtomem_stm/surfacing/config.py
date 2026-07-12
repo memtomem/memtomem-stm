@@ -31,6 +31,12 @@ class SurfacingConfig(BaseModel):
     """
 
     enabled: bool = True
+    use_daemon: bool = False
+    """When true, standalone ``mms`` keeps its local surfacing engine but
+    delegates LTM RPCs to the shared local daemon. Missing daemons are
+    lock-guardedly auto-spawned and the current call fails open; this mode
+    never falls back to a private LTM child. Env:
+    ``MEMTOMEM_STM_SURFACING__USE_DAEMON``."""
     warmup_enabled: bool = True
     """Kick a background LTM warm-up right after server/daemon startup (#664).
     The warm-up runs in a host-owned task so it never blocks the proxy's own
