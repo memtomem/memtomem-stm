@@ -26,7 +26,7 @@ uv run mypy src
 ## Project Structure
 
 - `src/memtomem_stm/` — Core: MCP server, proxy pipeline, compression, surfacing, caching, observability
-  - `proxy/` — pipeline `CLEAN → COMPRESS → SURFACE → (INDEX)`, privacy scanning. INDEX (`auto_index` / `extraction`) only runs when `ProxyManager` is constructed with an `index_engine`; the standalone `mms` server wires none by design, so that config is inert there and logs a warning at startup (#288).
+  - `proxy/` — bundled pipeline `CLEAN → COMPRESS → SURFACE`, privacy scanning, and an optional library-mode INDEX stage for custom embedders
   - `surfacing/` — Memory surfacing engine and relevance gating
   - `observability/` — Langfuse tracing and metrics
   - `cli/` — `mms` / `memtomem-stm-proxy` / `memtomem-stm` CLI (all three entry points resolve to the same Click group, see #260)

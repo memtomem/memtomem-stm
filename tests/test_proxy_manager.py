@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -153,9 +156,9 @@ class TestToolConfigResolution:
 # drift guards for the bundled ``mms`` server's engine-less construction (#299).
 
 
-class TestAutoIndexStartupWarning:
+class TestInactiveIndexConfigNoStartupWarning:
     @pytest.mark.asyncio
-    async def test_warns_compression_without_auto_index(self, caplog):
+    async def test_no_compression_auto_index_warning(self, caplog):
         """Compression active + auto_index disabled → startup warning."""
         config = ProxyConfig(
             enabled=True,
@@ -179,10 +182,12 @@ class TestAutoIndexStartupWarning:
                 # warning we're asserting fires before that connect failure,
                 # so swallowing both connection-error shapes is safe.
                 pass
-        assert any("compressed-away content is permanently lost" in r.message for r in caplog.records)
+        assert not any(
+            "compressed-away content is permanently lost" in r.message for r in caplog.records
+        )
 
     @pytest.mark.asyncio
-    async def test_warns_auto_index_enabled_but_no_engine(self, caplog, tmp_path):
+    async def test_no_global_auto_index_missing_engine_warning(self, caplog, tmp_path):
         """auto_index.enabled=true but index_engine=None → startup warning."""
         config = ProxyConfig(
             enabled=True,
@@ -192,16 +197,12 @@ class TestAutoIndexStartupWarning:
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             await mgr.start()
-        assert any(
-            "auto_index enabled" in r.message
-            and "auto_index.enabled" in r.message
-            and "no index engine configured" in r.message
-            and "inert" in r.message
-            for r in caplog.records
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
         )
 
     @pytest.mark.asyncio
-    async def test_warns_extraction_enabled_but_no_engine(self, caplog, tmp_path):
+    async def test_no_global_extraction_missing_engine_warning(self, caplog, tmp_path):
         """extraction.enabled=true but index_engine=None → startup warning (#288)."""
         config = ProxyConfig(
             enabled=True,
@@ -211,16 +212,12 @@ class TestAutoIndexStartupWarning:
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             await mgr.start()
-        assert any(
-            "extraction enabled" in r.message
-            and "extraction.enabled" in r.message
-            and "no index engine configured" in r.message
-            and "inert" in r.message
-            for r in caplog.records
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
         )
 
     @pytest.mark.asyncio
-    async def test_warns_per_server_auto_index_without_engine(self, caplog):
+    async def test_no_per_server_auto_index_missing_engine_warning(self, caplog):
         """Per-upstream auto_index=true with no engine → warning names the server (#288)."""
         config = ProxyConfig(
             enabled=True,
@@ -240,15 +237,12 @@ class TestAutoIndexStartupWarning:
                 # "echo" upstream exits before completing the JSON-RPC
                 # handshake; the warning fires before that connect failure.
                 pass
-        assert any(
-            "auto_index enabled" in r.message
-            and "server 'github'" in r.message
-            and "inert" in r.message
-            for r in caplog.records
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
         )
 
     @pytest.mark.asyncio
-    async def test_warns_per_tool_override_extraction_without_engine(self, caplog):
+    async def test_no_per_tool_extraction_missing_engine_warning(self, caplog):
         """Per-tool-override extraction=true with no engine → warning names server+tool (#288)."""
         config = ProxyConfig(
             enabled=True,
@@ -268,12 +262,8 @@ class TestAutoIndexStartupWarning:
                 await mgr.start()
             except (Exception, asyncio.CancelledError):
                 pass
-        assert any(
-            "extraction enabled" in r.message
-            and "server 'github'" in r.message
-            and "tool 'search_code'" in r.message
-            and "inert" in r.message
-            for r in caplog.records
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
         )
 
     @pytest.mark.asyncio
@@ -300,6 +290,52 @@ class TestAutoIndexStartupWarning:
                 # on fires before the connect loop runs.
                 pass
         assert not any("permanently lost" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_injected_engine_runs_index_and_extract_stages(self):
+        config = ProxyConfig(
+            enabled=True,
+            auto_index=AutoIndexConfig(enabled=True, min_chars=1, background=False),
+            extraction=ExtractionConfig(enabled=True, min_response_chars=1, background=False),
+        )
+        engine = object()
+        mgr = ProxyManager(config, TokenTracker(), index_engine=engine)
+        mgr._auto_index_response = AsyncMock(
+            return_value=SimpleNamespace(summary="indexed", ok=True, chunks_indexed=1, error=None)
+        )
+        mgr._extract_and_store = AsyncMock(
+            return_value=SimpleNamespace(ok=True, facts_stored=1, error=None)
+        )
+        tc = replace(
+            _resolve(UpstreamServerConfig(prefix="gh", auto_index=True), "search_code"),
+            extraction_enabled=True,
+        )
+
+        await mgr._run_index_stage(
+            server="github",
+            tool="search_code",
+            upstream_args={},
+            tc=tc,
+            cfg_snap=config,
+            cleaned="payload",
+            original_text="payload",
+            surfaced="summary",
+            compressed_chars_for_metrics=7,
+            context_query=None,
+        )
+        await mgr._run_extract_stage(
+            server="github",
+            tool="search_code",
+            upstream_args={},
+            tc=tc,
+            cfg_snap=config,
+            cleaned="payload",
+            context_query=None,
+        )
+
+        assert mgr.index_engine is engine
+        mgr._auto_index_response.assert_awaited_once()
+        mgr._extract_and_store.assert_awaited_once()
 
 
 # ── Privacy-scan-disabled startup warning tests (#610) ──────────────────

@@ -69,9 +69,9 @@ warning, not a crash.
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # opt in
 ```
 
-When unset or `false`, hides STM's nine observability / admin tools
+When unset or `false`, hides STM's eight observability / admin tools
 (`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
-`stm_surfacing_stats`, `stm_index_stats`, `stm_selection_stats`,
+`stm_surfacing_stats`, `stm_selection_stats`,
 `stm_compression_stats`, `stm_progressive_stats`,
 `stm_tuning_recommendations`) from the MCP
 `tools/list` surface so eager-loading clients (e.g. OpenAI Codex CLI)
@@ -109,25 +109,6 @@ export MEMTOMEM_STM_PROXY__METRICS__DB_PATH=~/.memtomem/proxy_metrics.db
 export MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY=10000
 export MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__ENABLED=true
 export MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH=~/.memtomem/stm_feedback.db
-
-# Auto-indexing (Stage 4 — save large responses to LTM)
-# NOTE: library-mode only, by design. The bundled `mms` server does not
-# wire an LTM write adapter: `ProxyManager` is constructed without an
-# `index_engine`, so in the standalone server `auto_index` and
-# `extraction` are inert and Stage 4 is skipped. This covers every
-# enable-path: the global ENABLED flag below, the per-upstream
-# `auto_index: true` knob on `UpstreamServerConfig`, and the per-tool
-# `auto_index: true` override on `ToolOverrideConfig`. All three are
-# valid config but have no runtime effect in the bundled server; the
-# proxy logs a "config is enabled but inert" warning at startup naming
-# each site (history: #288). These settings take effect only for
-# library callers that construct `ProxyManager(..., index_engine=...)`
-# themselves — the hook the `FileIndexer` Protocol
-# (`proxy/protocols.py`) exists for.
-export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=false
-export MEMTOMEM_STM_PROXY__AUTO_INDEX__MIN_CHARS=2000
-export MEMTOMEM_STM_PROXY__AUTO_INDEX__MEMORY_DIR=~/.memtomem/proxy_index
-export MEMTOMEM_STM_PROXY__AUTO_INDEX__NAMESPACE=proxy-{server}
 
 # Relevance scorer (query-aware compression)
 export MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER=bm25           # "bm25" or "embedding"
@@ -339,7 +320,6 @@ Representative configuration (see the linked reference for omitted fields):
       "env": { "GITHUB_TOKEN": "ghp_xxx" },
       "compression": "auto",
       "max_result_chars": 16000,
-      "auto_index": true,
       "tool_overrides": {
         "search_code": {
           "compression": "selective",
@@ -357,25 +337,6 @@ Representative configuration (see the linked reference for omitted fields):
     "default_ttl_seconds": 3600,
     "max_entries": 10000,
     "tool_annotation_policy": "conservative"
-  },
-  "auto_index": {
-    "enabled": false,
-    "background": false,
-    "min_chars": 2000,
-    "memory_dir": "~/.memtomem/proxy_index",
-    "namespace": "proxy-{server}"
-  },
-  "extraction": {
-    "enabled": false,
-    "strategy": "llm",
-    "llm": null,
-    "max_facts": 10,
-    "min_response_chars": 500,
-    "dedup_threshold": 0.92,
-    "memory_dir": "~/.memtomem/extracted_facts",
-    "namespace": "facts-{server}",
-    "background": true,
-    "max_input_chars": 20000
   },
   "relevance_scorer": {
     "scorer": "bm25",
@@ -437,15 +398,9 @@ Representative configuration (see the linked reference for omitted fields):
 }
 ```
 
-The `auto_index` and `extraction` blocks are **inert in the bundled `mms`
-server** — it constructs `ProxyManager` without an `index_engine`, so Stage 4
-is skipped and the proxy logs a "config is enabled but inert" startup warning
-naming each site (#288). They are valid config and take effect only for library
-callers that wire an `index_engine` themselves (see the auto-indexing note in
-the [env-var section](#environment-variables) above). `extraction.llm` accepts
-the same `LLMCompressorConfig` shape as [LLM compression](compression.md#llm-compression),
-including `privacy_scan_enabled`; leaving it `null` uses the default local
-Ollama extractor.
+The `auto_index` and `extraction` keys are reserved and unsupported by the
+bundled mms server. They remain accepted for compatibility and are meaningful
+only to custom embedders that construct `ProxyManager` with an `index_engine`.
 
 The per-upstream timeout fields form a three-part contract:
 
