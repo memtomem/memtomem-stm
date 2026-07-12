@@ -18,7 +18,9 @@ per-call explicit `_context_query` can.
 flowchart LR
     Tool["proxied tool call"] --> Size{"1. cleaned response<br/>≥ min_response_chars?<br/>(or explicit query)"}
     Size -->|no| Pass["return original<br/>response"]
-    Size -->|yes| Extract["2. extract context<br/>(query)"]
+    Size -->|yes| CB{"circuit<br/>breaker open?"}
+    CB -->|open| Pass
+    CB -->|closed| Extract["2. extract context<br/>(query)"]
     Extract --> Gate{"3. relevance gate"}
     Gate -->|skip| Pass
     Gate -->|pass| Search["4. search LTM<br/>(MCP mem_search)"]
