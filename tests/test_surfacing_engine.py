@@ -218,6 +218,26 @@ class TestSurfacingGating:
         assert "hit" in output
         assert adapter.search.await_args.kwargs["query"] == "find authentication code"
 
+    async def test_query_template_does_not_bypass_short_response_gate(self):
+        """The counterpart pin: a per-tool ``query_template`` is resolved during
+        extraction, which runs AFTER the response-size gate, so it cannot rescue
+        a short response the way an explicit ``context_query`` does. The LTM
+        search must never be reached (gate skips first). A regression that moved
+        extraction ahead of the gate would surface here and fail this test."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        adapter = _make_mcp_adapter([FakeSearchResult(FakeChunk(content="hit"), 0.9)])
+        engine = SurfacingEngine(
+            config=_make_config(
+                min_response_chars=1000,
+                context_tools={"read_file": ToolSurfacingConfig(query_template="file {arg.path}")},
+            ),
+            mcp_adapter=adapter,
+        )
+        output = await engine.surface("gh", "read_file", {"path": "/x.py"}, "short")
+        assert output == "short"
+        adapter.search.assert_not_awaited()
+
     async def test_source_response_chars_drives_short_response_gate(self):
         """docs/surfacing.md pin (#676): the gate measures the pre-compression
         upstream size when the proxy provides it, not the (possibly heavily

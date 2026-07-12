@@ -2,20 +2,29 @@
 
 When your agent calls a proxied tool, STM automatically:
 
-1. **Extracts context** from the tool name and arguments
-2. **Checks relevance** (rate limit, cooldown, write-tool filter)
-3. **Searches LTM** (memtomem) for related memories
-4. **Injects relevant memories** at the configured position in the response
+1. **Gates on response size** — skips before any work when the cleaned
+   upstream response is below `min_response_chars`, unless the agent passed an
+   explicit `_context_query`
+2. **Extracts context** from the tool name and arguments
+3. **Checks relevance** (rate limit, cooldown, write-tool filter)
+4. **Searches LTM** (memtomem) for related memories
+5. **Injects relevant memories** at the configured position in the response
+
+The response-size gate runs *before* context extraction, so a per-tool
+`query_template` (resolved during extraction) cannot bypass it — only the
+per-call explicit `_context_query` can.
 
 ```mermaid
 flowchart LR
-    Tool["proxied tool call"] --> Extract["1. extract context<br/>(query)"]
-    Extract --> Gate{"2. relevance gate"}
-    Gate -->|skip| Pass["return original<br/>response"]
-    Gate -->|pass| Search["3. search LTM<br/>(MCP mem_search)"]
+    Tool["proxied tool call"] --> Size{"1. cleaned response<br/>≥ min_response_chars?<br/>(or explicit query)"}
+    Size -->|no| Pass["return original<br/>response"]
+    Size -->|yes| Extract["2. extract context<br/>(query)"]
+    Extract --> Gate{"3. relevance gate"}
+    Gate -->|skip| Pass
+    Gate -->|pass| Search["4. search LTM<br/>(MCP mem_search)"]
     Search --> Filter{"score ≥ min_score?<br/>not already shown?"}
     Filter -->|no| Pass
-    Filter -->|yes| Inject["4. inject memories<br/>+ working memory"]
+    Filter -->|yes| Inject["5. inject memories<br/>+ working memory"]
     Inject --> Out["enriched response"]
 ```
 
@@ -257,7 +266,11 @@ sequenceDiagram
     participant MCP as McpClientSearchAdapter
     participant Core as memtomem core
 
-    Agent->>STM: tool response (≥ min_response_chars)
+    Agent->>STM: tool response
+    Note over STM: gate on cleaned (pre-compression) size
+    alt response < min_response_chars AND no explicit _context_query
+        STM-->>Agent: original response (response_too_short)
+    else large enough OR explicit query
     STM->>CB: check
     alt circuit open
         STM-->>Agent: original response
@@ -283,6 +296,7 @@ sequenceDiagram
             STM->>STM: format + inject
             STM-->>Agent: enriched response (+ surfacing_id)
         end
+    end
     end
 ```
 

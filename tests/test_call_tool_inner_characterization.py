@@ -435,6 +435,94 @@ class TestSurfacingOnProgressiveMetric:
         assert row["surfacing_on_progressive_ok"] is None
 
 
+# ── source_response_chars forwarding (#676/#679 docs pin) ─────────────────
+
+
+class _CapturingSurfacingEngine:
+    """Records each ``surface(...)`` call. Its signature INCLUDES
+    ``source_response_chars`` so the manager's ``inspect.signature`` capability
+    check forwards the value (a bare AsyncMock/``_FakeSurfacingEngine`` lacks
+    the param and would take the legacy no-forward branch instead)."""
+
+    def __init__(self, mode: str = "append", *, suffix: str = " [mem]"):
+        self.injection_mode = mode
+        self.observability = None
+        self._suffix = suffix
+        self.calls: list[dict] = []
+
+    async def surface(
+        self,
+        *,
+        server: str,
+        tool: str,
+        arguments: dict,
+        response_text: str,
+        trace_id=None,
+        context_query=None,
+        source_response_chars=None,
+    ) -> str:
+        self.calls.append(
+            {
+                "arguments": dict(arguments),
+                "response_text": response_text,
+                "source_response_chars": source_response_chars,
+            }
+        )
+        return response_text + self._suffix
+
+
+@pytest.mark.asyncio
+class TestSourceResponseCharsForwarding:
+    """docs/surfacing.md (#676/#679) claims the proxy threads
+    ``source_response_chars = len(cleaned)`` — the post-CLEAN, PRE-compression
+    size — into surfacing, so a large response compressed below the gate still
+    surfaces. Pin the manager side of that contract on both the compress and
+    progressive paths (the engine side is pinned in test_surfacing_engine.py)."""
+
+    async def test_compress_branch_forwards_len_cleaned(self, make_mgr):
+        mgr, _store, _ = make_mgr(
+            compression=CompressionStrategy.TRUNCATE,
+            max_result_chars=500,
+            min_retention=0.0,
+        )
+        mgr._clean_content = lambda text, cfg: text  # pin cleaned == upstream
+        engine = _CapturingSurfacingEngine()
+        mgr._surfacing_engine = engine
+        text = "word " * 1000  # 5000 chars, TRUNCATEd well below 500
+        mgr._connections["srv"].session.call_tool.return_value = _result(text)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert engine.calls, "surface() was not invoked"
+        call = engine.calls[-1]
+        # Forwarded value is the pre-compression cleaned length, not the tiny
+        # compressed text the engine actually receives.
+        assert call["source_response_chars"] == len(text)
+        assert len(call["response_text"]) < len(text)
+        # The private carrier key is stripped before reaching the engine.
+        assert "_stm_source_response_chars" not in call["arguments"]
+        assert result.endswith(" [mem]")
+
+    async def test_progressive_branch_forwards_len_cleaned(self, make_mgr):
+        mgr, _store, _ = make_mgr(
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=500),
+        )
+        mgr._clean_content = lambda text, cfg: text
+        engine = _CapturingSurfacingEngine()
+        mgr._surfacing_engine = engine
+        text = "content paragraph. " * 200  # 3800 chars, first chunk = 500
+        mgr._connections["srv"].session.call_tool.return_value = _result(text)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert "stm_proxy_read_more" in result  # progressive footer intact
+        assert engine.calls, "surface() was not invoked"
+        call = engine.calls[-1]
+        assert call["source_response_chars"] == len(text)
+        assert "_stm_source_response_chars" not in call["arguments"]
+
+
 # ── R8: early-return metric ownership ────────────────────────────────────
 
 
