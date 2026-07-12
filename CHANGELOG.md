@@ -1,17 +1,5 @@
 # Changelog
 
-- Harden native-tool PostToolUse integration with explicit host capabilities
-  (Claude surfacing plus safe opt-in Bash replacement, Codex surfacing-only,
-  Cursor/Kimi metrics-only), a 65% minimum-retention compression guard, current
-  Kimi paths/tool names, strict hook ownership recognition, and refusal to
-  overwrite malformed host config structures. Daemon protocol v3 now carries
-  an end-to-end monotonic deadline, bounds admitted requests, and does not idle
-  down while a surface request is active.
-- Upgrade note: reinstall legacy Claude hooks so the generated command includes
-  `--host claude`. Bare legacy `mms hook` registrations now fail safe by disabling
-  native output replacement because auto-detection cannot reliably distinguish
-  Claude from Codex.
-
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
@@ -23,6 +11,16 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.36] — 2026-07-12
+
+### Upgrade notes
+
+- Repeated healthy LTM searches whose candidates remain below `min_score` now
+  emit and persist a score-scale diagnostic after five consecutive non-empty
+  misses. STM does not lower `min_score` automatically; check whether the LTM
+  is running without embedding extras or the configured threshold is
+  intentionally high. (#684)
+
 ### Fixed
 
 - Repeated healthy LTM searches whose candidates all score below the active
@@ -31,7 +29,7 @@ changes inline only. See the deprecation policy in
   single-leg/BM25-only (or that the configured threshold may be intentionally
   high) without silently lowering the threshold. **Behavior change**: this
   previously silent `no_results_score` pattern now emits one warning per
-  detected episode and appears in the on-disk stats summary. (#672)
+  detected episode and appears in the on-disk stats summary. (#684, issue #672)
 
 ### Docs
 
@@ -43,6 +41,10 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
+- Reinstall legacy Claude hooks so the generated command includes
+  `--host claude`. Bare legacy `mms hook` registrations now fail safe by
+  disabling native output replacement because auto-detection cannot reliably
+  distinguish Claude from Codex. (#682)
 - Large-context models no longer raise configured surfacing budgets to 5000
   characters / 5 results; `max_injection_chars` and `max_results` are now hard
   ceilings. Increase those settings explicitly to retain the larger budget.
@@ -69,6 +71,13 @@ The surfacing/compression hardening below landed as tracking issue #676
 
 ### Changed
 
+- Hardened native-tool PostToolUse integration with explicit host capabilities
+  (Claude surfacing plus safe opt-in Bash replacement, Codex surfacing-only,
+  Cursor/Kimi metrics-only), a 65% minimum-retention compression guard, current
+  Kimi paths/tool names, strict hook ownership recognition, and refusal to
+  overwrite malformed host config structures. Daemon protocol v3 now carries
+  an end-to-end monotonic deadline, bounds admitted requests, and does not idle
+  down while a surface request is active. (#682)
 - Model-context scaling of the surfacing injection/result budgets
   (`max_injection_chars`, `max_results`) is now a one-directional clamp: the
   configured value is a hard ceiling and only small-context consumer models
