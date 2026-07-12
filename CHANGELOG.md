@@ -11,6 +11,87 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+The surfacing/compression hardening below landed as tracking issue #676
+(commits pushed directly to `main`) plus its follow-up PRs #677–#679.
+
+### Added
+
+- The surfacing size gate now measures the **cleaned, pre-compression**
+  upstream response against `min_response_chars`, so compressing a large
+  response before surfacing can no longer drop it under the gate. An
+  agent-supplied `_context_query` is treated as an intentional retrieval and
+  bypasses the size gate entirely; a per-tool `query_template` does not (the
+  gate runs before query extraction). (#676, docs #679)
+
+### Changed
+
+- Model-context scaling of the surfacing injection/result budgets
+  (`max_injection_chars`, `max_results`) is now a one-directional clamp: the
+  configured value is a hard ceiling and only small-context consumer models
+  (≤32K tokens) shrink it, to 1500 chars / 2 results. Mid- and large-context
+  models receive the configured value unchanged, so budgets are now monotonic
+  in context-window size. **Behavior change**: the previous large-context tier
+  (>200K tokens) returned `max(configured, 5000 chars / 5 results)` — it could
+  raise a small configured budget *up* to 5000/5. It now returns the configured
+  value, so a >200K-token consumer model whose configured budget is at or below
+  5000 chars / 5 results — **including the defaults (3000 chars / 3 results)** —
+  now gets that configured value instead of being bumped to 5000/5. Budgets
+  configured above 5000/5 were already returned unchanged; the ≤32K and
+  32K–200K tiers are unchanged from the previous release. (#678)
+- **Behavior change**: an upstream `isError` tool result is now proxied back as
+  its full `CallToolResult` envelope — non-text content, `structuredContent`,
+  and `_meta` preserved — instead of being collapsed into a text-only FastMCP
+  `ToolError`. (#676)
+- LTM dependency failures during surfacing (upstream `isError`, transport /
+  call errors, and malformed or empty-content responses) now count toward the
+  surfacing circuit breaker, so a persistently broken LTM opens the breaker
+  instead of silently passing responses through untouched; a genuine empty
+  result set is not counted as a failure. (#676)
+- **Behavior change**: an explicit `_context_query` and a per-tool
+  `query_template` are now subject to the `min_query_tokens` floor, the same as
+  heuristic queries — previously they were used verbatim. A query below the
+  floor is skipped (`no_query`) unless it contains sensitive content (which is
+  hashed and still used). (#676)
+
+### Fixed
+
+- Only memories actually present in the injected block — after the id-display
+  gate and injection-size truncation — are committed to feedback, session /
+  cross-session dedup, and the surfacing webhook. A memory whose id cannot be
+  rendered as a copyable token is now delivered as an id-less bullet and
+  committed once, rather than dropping the whole block (all non-displayable) or
+  re-surfacing on every subsequent call (mixed with displayable ids). (#676,
+  #677)
+- Selective compression keeps single-section documents losslessly retrievable
+  through follow-up reads instead of plain-truncating them, and repeated
+  Markdown headings / colliding dotted JSON paths no longer overwrite each
+  other in the chunk map. (#676)
+- Selective and progressive pending-selection eviction are scoped by format, so
+  one strategy's TTL / size eviction no longer discards the other's entries
+  from the shared store. (#676)
+- A response whose background INDEX / EXTRACT work failed or is still
+  unresolved is not written to the response cache, so a later cache hit (which
+  bypasses those stages) cannot strand the ingestion work — it is retried on
+  the next live call. (#676)
+- Auto-tuning no longer re-applies the same `min_score` adjustment on repeated
+  calls when no new feedback has arrived: within a process, a per-tool
+  watermark over the durable feedback counts short-circuits the tuner, so a
+  tool's threshold no longer drifts toward its bound just from being surfaced
+  again. (The watermark is in-process, so the first tuner pass after a restart
+  may still apply one adjustment.) (#676)
+- Session-context (scratch) retrieval during surfacing is capped at 0.5s, so a
+  stalled scratch dependency can no longer consume the whole surfacing timeout
+  and suppress otherwise-valid LTM memories. (#676)
+
+### Security
+
+- Sensitive request context (credentials / PII detected in the extracted query)
+  is replaced with a stable `sha256` digest before it is sent to the remote LTM
+  as a search query, so raw secrets never leave the proxy while cache and
+  cooldown behavior are preserved. (#676)
+- Surfacing feedback now verifies the rated `memory_id` belongs to the cited
+  surfacing event before recording it, rejecting mismatched pairs. (#676)
+
 ## [0.1.34] — 2026-07-12
 
 ### Upgrade notes
