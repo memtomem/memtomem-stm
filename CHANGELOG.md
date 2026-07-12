@@ -23,6 +23,22 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.35] — 2026-07-12
+
+### Upgrade notes
+
+- Large-context models no longer raise configured surfacing budgets to 5000
+  characters / 5 results; `max_injection_chars` and `max_results` are now hard
+  ceilings. Increase those settings explicitly to retain the larger budget.
+  (#678)
+- Upstream `isError` results now retain their complete MCP result envelope
+  instead of becoming text-only `ToolError` responses. Consumers that assumed
+  text-only errors should handle non-text content, `structuredContent`, and
+  `_meta`. (#676)
+- Explicit `_context_query` values and per-tool `query_template` output now
+  obey `min_query_tokens`; raise the query length or lower that setting when a
+  short non-sensitive query must still reach the LTM. (#676)
+
 The surfacing/compression hardening below landed as tracking issue #676
 (commits pushed directly to `main`) plus its follow-up PRs #677–#679.
 
