@@ -38,16 +38,6 @@ flowchart TB
     STM <-.->|surfacing<br/>via MCP| LTM
 ```
 
-> The **INDEX** stage requires a `FileIndexer` engine, and the bundled
-> `mms` server wires none **by design** — `auto_index` and `extraction`
-> config is inert in the default deployment; enabling them logs an
-> `inert` warning at startup but does not write back to LTM. The hooks
-> are library-mode only: pass `index_engine=` when constructing
-> `ProxyManager` yourself (see
-> [docs/configuration.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md)).
-> [#288](https://github.com/memtomem/memtomem-stm/issues/288) has the
-> history.
-
 ## Installation
 
 ```bash
@@ -118,7 +108,8 @@ For multi-agent fleets, standalone surfacing can opt into the same daemon with
 `MEMTOMEM_STM_SURFACING__USE_DAEMON=true`, avoiding one private LTM child per
 agent while keeping proxy feedback, caching, and tuning local.
 
-**STM does NOT write back to LTM at runtime.** The bundled `mms` server constructs the proxy without a `FileIndexer` engine by design, so the INDEX stage (`auto_index`, `extraction`) is inert even when enabled in `stm_proxy.json` — a warning is logged at startup. Surfacing *reads* from LTM via MCP; runtime *writes* are library-mode only — callers embedding STM as a library can pass `index_engine=` to `ProxyManager` themselves ([#288](https://github.com/memtomem/memtomem-stm/issues/288) has the history).
+**STM does NOT write back to LTM at runtime.** Surfacing reads from LTM via MCP;
+the bundled `mms` server has no LTM write adapter.
 
 To bring file or shell operations under STM, register an MCP server that exposes
 them and steer the agent toward the proxied alias instead of the built-in. This
@@ -150,8 +141,8 @@ definition does not automatically route it through the proxy. See
 | [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) | Opt-in JSONL log of tool selection + execution outcomes |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
 
-STM advertises four model-facing MCP tools by default. Nine observability and
-admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, `stm_index_stats`, etc.)
+STM advertises four model-facing MCP tools by default. Eight observability and
+admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, etc.)
 are hidden unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set,
 which keeps eager-loading clients from paying schema tokens for rarely used
 operator tools.

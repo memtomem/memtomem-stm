@@ -2006,6 +2006,9 @@ class TestInit:
         )
         assert result.exit_code == 0, result.output
         assert "Saved to:" in result.output
+        raw = json.loads(config.read_text(encoding="utf-8"))
+        assert "auto_index" not in raw
+        assert "extraction" not in raw
 
         data = json.loads(config.read_text(encoding="utf-8"))
         srv = data["upstream_servers"]["filesystem"]
@@ -6963,7 +6966,7 @@ class TestHealth:
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "observability tools hidden" in result.output
+        assert "8 observability tools hidden" in result.output
         assert "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true" in result.output
 
     def test_health_obs_tools_hint_absent_when_advertised(self, runner, config, monkeypatch):
@@ -6980,7 +6983,7 @@ class TestHealth:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["obs_tools_hidden"] is True
-        assert "observability tools hidden" in data["obs_tools_hint"]
+        assert "8 observability tools hidden" in data["obs_tools_hint"]
 
     def test_health_logging_line_stderr_only(self, runner, config, monkeypatch):
         """#612: health always prints where logs go, so users learn the

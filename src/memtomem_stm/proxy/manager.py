@@ -490,10 +490,9 @@ class ProxyManager:
         self._extractor: FactExtractor | None = None
         self._extractor_lock = asyncio.Lock()
         # In-memory counters for both INDEX-pipeline write paths
-        # (auto_index_response + extract_and_store). Always instantiated —
-        # ``stm_index_stats`` reads ``any_call`` to decide whether to
-        # render anything for zero-traffic deployments. See
-        # ``proxy/index_observability.py`` for the counter contract.
+        # (auto_index_response + extract_and_store). Always instantiated for
+        # library callers that inspect ``index_observability.snapshot()``.
+        # See ``proxy/index_observability.py`` for the counter contract.
         self.index_observability = IndexObservability()
         self._progressive_store: ProgressiveStoreAdapter | None = None
         self._progressive_store_cfg: SelectiveConfig | None = None
@@ -582,46 +581,7 @@ class ProxyManager:
             loaded = ProxyConfig.load_from_file(self._config.config_path, log_warnings=False)
             servers = loaded.upstream_servers if loaded else {}
 
-        # Warn about dangerous config: compression active but auto_index disabled
-        # means compressed-away content is permanently lost (no LTM recovery).
-        ai_cfg = self._config.auto_index
         ext_cfg = self._config.extraction
-        # "Config is enabled but inert" warnings (#288) — when
-        # ``ProxyManager`` is constructed without an ``index_engine`` (the
-        # standalone ``mms`` server today), Stage 4 is silently skipped.
-        # ``auto_index`` and ``extraction`` can be turned on globally,
-        # per-upstream (``UpstreamServerConfig.auto_index``), or per-tool
-        # (``ToolOverrideConfig.auto_index``), so scan all three so operators
-        # see every site they've enabled an inert write path.
-        if self._index_engine is None:
-            ai_paths: list[str] = []
-            ext_paths: list[str] = []
-            if ai_cfg.enabled:
-                ai_paths.append("auto_index.enabled")
-            if ext_cfg.enabled:
-                ext_paths.append("extraction.enabled")
-            for srv_name, srv_cfg in servers.items():
-                if srv_cfg.auto_index is True:
-                    ai_paths.append(f"server '{srv_name}'")
-                if srv_cfg.extraction is True:
-                    ext_paths.append(f"server '{srv_name}'")
-                for tool_name, override in srv_cfg.tool_overrides.items():
-                    if override.auto_index is True:
-                        ai_paths.append(f"server '{srv_name}' tool '{tool_name}'")
-                    if override.extraction is True:
-                        ext_paths.append(f"server '{srv_name}' tool '{tool_name}'")
-            if ai_paths:
-                logger.warning(
-                    "auto_index enabled (%s) but no index engine configured — "
-                    "config is enabled but inert; indexed content will not be stored",
-                    ", ".join(ai_paths),
-                )
-            if ext_paths:
-                logger.warning(
-                    "extraction enabled (%s) but no index engine configured — "
-                    "config is enabled but inert; extracted facts will not be stored",
-                    ", ".join(ext_paths),
-                )
 
         # #610: warn loudly when an LLM path will send raw upstream responses
         # UNSCANNED to an external provider (privacy_scan_enabled=false). The
@@ -693,18 +653,6 @@ class ProxyManager:
                         ", ".join(ext_leak_paths),
                         _describe_llm_destination(ext_llm),
                     )
-
-        for srv_name, srv_cfg in servers.items():
-            if (
-                srv_cfg.compression not in (CompressionStrategy.NONE, CompressionStrategy.AUTO)
-                and not ai_cfg.enabled
-            ):
-                logger.warning(
-                    "Server '%s' uses compression=%s but auto_index is disabled — "
-                    "compressed-away content is permanently lost",
-                    srv_name,
-                    srv_cfg.compression.value,
-                )
 
         # Composed-name uniqueness (prefix uniqueness is validated in
         # ``ProxyConfig._check_unique_upstream_prefixes``; ``model_construct()``
@@ -1604,11 +1552,10 @@ class ProxyManager:
     def index_engine(self) -> "FileIndexer | None":
         """The LTM write engine, or ``None`` when INDEX is unwired (#288).
 
-        Public read accessor for ``stm_index_stats`` — parity with
-        ``selection_log``; ``None`` is the structural-inactive signal the stats
-        tool renders distinctly from "wired but empty". The bundled ``mms``
-        server constructs ``ProxyManager`` without an engine, so Stage 4 is
-        skipped and this reads ``None`` there.
+        Public read accessor for library integrations; ``None`` is the
+        structural-inactive signal. The bundled ``mms`` server constructs
+        ``ProxyManager`` without an engine, so Stage 4 is skipped and this
+        reads ``None`` there.
         """
         return self._index_engine
 

@@ -9,9 +9,8 @@ fire on the same proxy hot path (sequential stages 4 and 4b in
 with the total STM-initiated LTM-write rate rather than a single
 sub-path.
 
-Mirrors ``surfacing/observability.py`` in spirit and shape so
-``stm_index_stats`` and ``stm_surfacing_stats`` stay symmetric at the
-operator surface — but **deliberately omits a quality dimension**.
+Mirrors ``surfacing/observability.py`` in spirit and shape for library
+callers, but **deliberately omits a quality dimension**.
 SURFACE has a quality signal (``surfacing-feedback``) that lets
 operators ask "did the agent find this useful?". INDEX has no
 equivalent. The absence is a design finding, not an oversight: a
@@ -30,8 +29,9 @@ load-bearing addition over ``ExtractOutcome.facts_stored`` and
 ``AutoIndexOutcome.chunks_indexed``, which are per-call only and
 discard as soon as the caller drops the return value.
 
-Snapshot output is a flat dict so ``server.py::stm_index_stats`` formats
-without coupling to internal data structures.
+Snapshot output is a flat dict so library callers can consume it without
+coupling to internal data structures. The bundled server exposes no MCP tool
+for these counters.
 """
 
 from __future__ import annotations
@@ -133,10 +133,9 @@ class IndexObservability:
     def snapshot(self) -> dict:
         """Return a deep-copied point-in-time view of all counters.
 
-        Empty (``any_call=False``) when neither ``extract_and_store``
-        nor ``auto_index_response`` has been invoked — ``stm_index_stats``
-        uses this to short-circuit on zero-traffic deployments,
-        mirroring ``stm_surfacing_stats``.
+        Empty (``any_call=False``) when neither ``extract_and_store`` nor
+        ``auto_index_response`` has been invoked, allowing library callers to
+        distinguish zero traffic from recorded attempts.
         """
         with self._lock:
             return {
@@ -157,9 +156,9 @@ class _NoOpIndexObservability:
     these are module-level singletons used purely as recording sinks, so
     instance dict bloat is unnecessary.
 
-    ``snapshot()`` is intentionally absent — consumers (``stm_index_stats``)
-    short-circuit on ``ProxyManager.index_observability is None`` rather
-    than calling through the no-op.
+    ``snapshot()`` is intentionally absent. Library consumers short-circuit
+    on ``ProxyManager.index_observability is None`` rather than calling
+    through the no-op.
     """
 
     __slots__ = ()

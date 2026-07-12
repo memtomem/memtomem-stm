@@ -19,7 +19,6 @@ from memtomem_stm.server import (
     _should_advertise_obs_tools,
     stm_compression_feedback,
     stm_compression_stats,
-    stm_index_stats,
     stm_progressive_stats,
     stm_proxy_cache_clear,
     stm_proxy_health,
@@ -2156,37 +2155,9 @@ class TestApplyProxyFileConfig:
         assert _apply_proxy_file_config(config2, {}) is None
 
 
-# ── stm_index_stats — structurally inactive vs wired-but-empty (#613) ─────
-
-
-class TestIndexStatsInactive:
-    async def test_no_index_engine_reports_inactive(self):
-        """The bundled ``mms`` server wires no index engine (#288); the tool
-        must say so rather than return the generic "no activity" message that
-        an operator can't distinguish from an engine that hasn't been hit."""
-        pm = _make_proxy_manager()  # constructed without index_engine → None
-        assert pm.index_engine is None
-        ctx = _make_ctx(proxy_manager=pm)
-        result = await stm_index_stats(ctx=ctx)
-        assert "INDEX stage inactive" in result
-        assert "#288" in result
-
-    async def test_wired_but_empty_reports_no_activity(self):
-        """With an engine wired but zero traffic, the distinct
-        "No INDEX activity recorded" message is kept — the two cases must not
-        collapse into one."""
-        cfg = ProxyConfig(config_path="/tmp/p.json", upstream_servers={})
-        pm = ProxyManager(cfg, TokenTracker(), index_engine=MagicMock())
-        assert pm.index_engine is not None
-        ctx = _make_ctx(proxy_manager=pm)
-        result = await stm_index_stats(ctx=ctx)
-        assert "No INDEX activity recorded" in result
-        assert "INDEX stage inactive" not in result
-
-
 # ── advertise_observability_tools flag ──────────────────────────────────
 #
-# The flag hides 9 observability tools from the MCP ``tools/list`` surface
+# The flag hides 8 observability tools from the MCP ``tools/list`` surface
 # while keeping them importable from Python. Registration happens at
 # module import, so the end-to-end assertion uses a subprocess to get a
 # fresh interpreter under the intended env var.
@@ -2206,7 +2177,6 @@ _OBSERVABILITY_TOOLS = {
     "stm_proxy_health",
     "stm_proxy_cache_clear",
     "stm_surfacing_stats",
-    "stm_index_stats",
     "stm_selection_stats",
     "stm_compression_stats",
     "stm_progressive_stats",
@@ -2270,10 +2240,12 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
 
-    def test_flag_true_advertises_all_thirteen(self):
+    def test_flag_true_advertises_all_twelve(self):
         names = set(self._list_registered(env_override="true"))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
-        assert len(names) == 13
+        assert len(_OBSERVABILITY_TOOLS) == 8
+        assert len(names) == 12
+        assert "stm_index_stats" not in names
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))
@@ -2304,7 +2276,8 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         monkeypatch.delenv(_FLAG_ENV, raising=False)
         hint = _hidden_obs_tools_hint()
         assert hint is not None
-        assert hint.startswith(f"{len(_OBSERVABILITY_TOOL_NAMES)} observability tools hidden")
+        assert len(_OBSERVABILITY_TOOL_NAMES) == 8
+        assert hint.startswith("8 observability tools hidden")
 
         monkeypatch.setenv(_FLAG_ENV, "true")
         assert _hidden_obs_tools_hint() is None
@@ -2364,7 +2337,7 @@ class TestAdvertiseOrder:
 
     def test_reorder_skips_missing_stm_tools(self):
         """When ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`` hides
-        the 9 observability tools, ``_tool_manager._tools`` only holds the
+        the 8 observability tools, ``_tool_manager._tools`` only holds the
         4 model-facing STM tools. The reorder helper must not KeyError on
         the absent names — ``.pop(name, None)`` is the contract."""
         from memtomem_stm.server import _move_stm_tools_to_end

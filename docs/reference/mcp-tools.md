@@ -1,6 +1,6 @@
 # STM MCP Tools
 
-STM advertises four model-facing tools by default and hides nine operator tools
+STM advertises four model-facing tools by default and hides eight operator tools
 unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before startup.
 All connected upstream tools are added as `{prefix}__{tool}`.
 
@@ -21,7 +21,6 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 | `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response-cache scope |
 | `stm_proxy_health` | — | Runtime upstream and breaker health |
 | `stm_surfacing_stats` | `tool?`, `since?`, `limit=10` | Surfacing outcomes, faults, and feedback |
-| `stm_index_stats` | `tool?` | Index/extraction outcomes |
 | `stm_selection_stats` | — | Selection telemetry and execution outcomes |
 | `stm_compression_stats` | `tool?` | Compression feedback counts |
 | `stm_progressive_stats` | `tool?` | Follow-up and coverage statistics |

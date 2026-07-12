@@ -249,20 +249,17 @@ def test_bundled_server_proxy_manager_omits_index_engine() -> None:
     """The bundled ``mms`` server's ``ProxyManager(...)`` construction in
     ``app_lifespan`` must not pass ``index_engine=``.
 
-    This is a decision, not a gap (2026-06-11): LTM write hooks are
-    **library-mode only** — the bundled server intentionally wires no
-    index engine, and ``docs/configuration.md`` (Stage 4 NOTE block)
-    says so. The pin is grounded in ``src/memtomem_stm/server.py``'s
-    single ``ProxyManager(...)`` call, which passes only ``config.proxy``
-    and ``tracker`` positionally plus a fixed set of unrelated kwargs
-    (#288/#299, PR #339). Wiring an ``index_engine=`` here means the
-    library-only decision was deliberately reversed — do it WITH a docs
-    update (drop the library-only NOTE), not around it; otherwise the
-    docs keep telling operators the env vars are no-ops while the server
-    writes to LTM.
+    This is the Option B contract (#616): ``auto_index`` and ``extraction``
+    remain reserved schema fields for custom library callers, while the
+    bundled server intentionally wires no index engine. The pin is grounded
+    in ``src/memtomem_stm/server.py``'s single ``ProxyManager(...)`` call,
+    which passes only ``config.proxy`` and ``tracker`` positionally plus a
+    fixed set of unrelated kwargs. Wiring an ``index_engine=`` here reverses
+    that contract and must be coordinated with the configuration docs and
+    their paired contract test.
 
-    Paired with ``test_configuration_md_stage4_inert_note_pinned`` (the
-    inverse direction).
+    Paired with
+    ``test_configuration_md_reserves_unsupported_indexing_blocks``.
     """
     server_src = _read("src/memtomem_stm/server.py")
     tree = ast.parse(server_src)
@@ -278,17 +275,16 @@ def test_bundled_server_proxy_manager_omits_index_engine() -> None:
             f"Could not locate a unique `ProxyManager(...)` construction in "
             f"src/memtomem_stm/server.py (found {len(calls)}). The wiring was "
             "refactored; update this test alongside the refactor before "
-            "assuming Stage 4 is now wired."
+            "assuming bundled indexing support was added."
         )
     call = calls[0]
 
     kwarg_names = {kw.arg for kw in call.keywords if kw.arg is not None}
     if "index_engine" in kwarg_names:
         pytest.fail(
-            "server.py wires `index_engine=` into ProxyManager — Stage 4 is "
-            "no longer inert in the bundled `mms` server. Update "
-            "`docs/configuration.md` to drop the inert NOTE (lines ~73-87) "
-            "and close #299."
+            "server.py wires `index_engine=` into ProxyManager, so the bundled "
+            "`mms` server now provides indexing. Update the reserved/unsupported "
+            "note in `docs/configuration.md` and the paired contract test."
         )
     if len(call.args) != 2:
         pytest.fail(
@@ -296,9 +292,8 @@ def test_bundled_server_proxy_manager_omits_index_engine() -> None:
             f"{len(call.args)} positional args (expected 2: `config.proxy`, "
             "`tracker`). A 3rd positional would smuggle `index_engine` past "
             "the keyword check — `ProxyManager.__init__`'s 3rd parameter is "
-            "`index_engine`. Either update this test alongside the new "
-            "signature, or close #299 and drop the inert NOTE in "
-            "`docs/configuration.md`."
+            "`index_engine`. Update this test and the reserved/unsupported "
+            "note in `docs/configuration.md` alongside that change."
         )
     extras = kwarg_names - _PROXY_MANAGER_EXPECTED_KWARGS
     if extras:
@@ -306,69 +301,63 @@ def test_bundled_server_proxy_manager_omits_index_engine() -> None:
             f"`ProxyManager(...)` construction in server.py has unexpected "
             f"kwarg(s): {sorted(extras)!r}. If you added a new unrelated "
             "kwarg, append it to `_PROXY_MANAGER_EXPECTED_KWARGS` in this "
-            "test. If you wired `index_engine=` (renamed?), also drop the "
-            "inert NOTE in `docs/configuration.md` (lines ~73-87) and close "
-            "#299."
+            "test. If you wired a renamed index engine, update the Option B "
+            "configuration contract and docs at the same time."
         )
 
 
-def test_configuration_md_stage4_inert_note_pinned() -> None:
-    """``docs/configuration.md``'s Stage 4 NOTE block must keep the
-    library-mode-only framing that pairs with ``server.py``'s engine-less
-    ``ProxyManager`` construction.
+def test_configuration_md_reserves_unsupported_indexing_blocks() -> None:
+    """The representative JSON must not advertise unsupported indexing.
 
-    PR #339 (resolving the operator-visible half of #288) added a comment
-    block immediately above the ``AUTO_INDEX__*`` exports explaining that
-    those env vars have no runtime effect in the bundled server; the
-    2026-06-11 write-integration decision upgraded that wording from
-    "currently inert, adapter tracked" to "library-mode only, by design"
-    (the env vars apply to callers constructing
-    ``ProxyManager(..., index_engine=...)`` directly). If the NOTE goes
-    away while the server still has no engine wired
-    (``test_bundled_server_proxy_manager_omits_index_engine``), operators
-    flipping ``AUTO_INDEX__ENABLED=true`` get zero behaviour and zero
-    explanation again — the failure mode #288 originally reported.
+    ``auto_index`` and ``extraction`` remain schema-compatible extension
+    fields, but the bundled ``mms`` server has no ``index_engine``. Keep both
+    blocks out of the representative config and retain one scoped paragraph
+    that points custom ``ProxyManager`` callers at the extension path.
     """
     config_md = _read("docs/configuration.md")
-    # Locate the contiguous ``^#`` comment paragraph immediately
-    # preceding the ``AUTO_INDEX__ENABLED`` export. Paragraph scope (not
-    # a tight line window) so prose tweaks inside the same block don't
-    # false-fail; anchoring to the actual export keeps the check tied
-    # to the operator-facing surface.
-    block_match = re.search(
-        r"((?:^#[^\n]*\n)+)export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=",
+    section_match = re.search(
+        r"##\s+Config File[^\n]*\n(.*?)(?=\n##\s|\Z)",
         config_md,
-        re.MULTILINE,
+        re.DOTALL,
     )
+    if not section_match:
+        pytest.fail(
+            "docs/configuration.md lost its `## Config File` section; update "
+            "this contract alongside any documentation restructure."
+        )
+    section_body = section_match.group(1)
+    block_match = re.search(r"```json\n(.*?)\n```", section_body, re.DOTALL)
     if not block_match:
         pytest.fail(
-            "docs/configuration.md no longer has a `#`-comment paragraph "
-            "directly above `export MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED=` — "
-            "either the export was renamed/removed, or the NOTE was "
-            "moved into prose. Update this test alongside the docs "
-            "restructure or restore the inert NOTE (see #299)."
+            "docs/configuration.md's `## Config File` section must retain a "
+            "representative JSON block."
         )
-    note = block_match.group(1).lower()
+    example = block_match.group(1)
+    advertised = [key for key in ("auto_index", "extraction") if f'"{key}"' in example]
+    if advertised:
+        pytest.fail(
+            "docs/configuration.md's representative JSON advertises reserved, "
+            f"unsupported bundled-server block(s): {advertised!r}."
+        )
 
     required = (
-        "library",
-        "inert",
+        "reserved",
+        "unsupported",
+        "bundled mms",
+        "proxymanager",
         "index_engine",
-        "fileindexer",
-        "bundled",
-        "no runtime effect",
-        "#288",
     )
-    missing = [kw for kw in required if kw.lower() not in note]
-    if missing:
+    paragraphs = re.split(r"\n\s*\n", config_md)
+    matching_notes = []
+    for paragraph in paragraphs:
+        normalized = paragraph.lower().replace("`", "")
+        if all(keyword in normalized for keyword in required):
+            matching_notes.append(paragraph)
+    if not matching_notes:
         pytest.fail(
-            f"docs/configuration.md Stage 4 NOTE is missing keyword(s): "
-            f"{missing!r}. If `mms` now wires `index_engine` (reversing the "
-            "library-only decision), also delete "
-            "`test_bundled_server_proxy_manager_omits_index_engine`. "
-            "Otherwise restore the library-mode NOTE — operators flipping "
-            "`AUTO_INDEX__ENABLED=true` need to know the env var is a no-op "
-            "in the bundled server (PR #339, #288)."
+            "docs/configuration.md must retain one short note containing "
+            "`reserved`, `unsupported`, `bundled mms`, `ProxyManager`, and "
+            "`index_engine` so the custom extension path remains discoverable."
         )
 
 
@@ -853,21 +842,19 @@ def test_compression_md_llm_section_documents_privacy_scan() -> None:
         )
 
 
-def test_configuration_full_example_documents_all_config_blocks() -> None:
+def test_configuration_full_example_documents_supported_config_blocks() -> None:
     """docs/configuration.md's representative proxy example must carry the
-    ``extraction`` and ``toolgraph`` blocks — with keys AND default values that
-    match ``ExtractionConfig`` / ``ToolgraphConfig`` exactly — plus the two
+    supported ``cache`` and ``toolgraph`` blocks, with keys and default values
+    matching ``CacheConfig`` / ``ToolgraphConfig`` exactly, plus the two
     top-level knobs ``default_compression`` / ``max_upstream_chars`` at their
     ProxyConfig defaults.
 
-    ``ExtractionConfig`` and ``ToolgraphConfig``
-    (``src/memtomem_stm/proxy/config.py``) are whole config subtrees the "all
-    options" block omitted while documenting their siblings (``auto_index`` /
-    ``exposure``). Comparing each documented block to ``Model().model_dump(
-    mode="json")`` (rather than just a key-subset check) pins the example to the
-    real defaults — a renamed key, a stray/typo'd key, or a drifted default all
-    fail loudly. Scoped to the ``## Config File`` section so moving a block into
-    prose cannot satisfy the check.
+    Comparing each documented block to ``Model().model_dump(mode="json")``
+    (rather than just a key-subset check) pins the example to the real defaults:
+    a renamed key, a stray/typo'd key, or a drifted default all fail loudly.
+    Scoped to the ``## Config File`` section so moving a block into prose cannot
+    satisfy the check. Reserved ``auto_index`` / ``extraction`` blocks are
+    intentionally covered by the separate unsupported-indexing contract.
 
     ``config_path`` is intentionally excluded: it is a runtime-populated field
     (the path the config was loaded from), not a user-authored config key.
@@ -876,7 +863,6 @@ def test_configuration_full_example_documents_all_config_blocks() -> None:
 
     from memtomem_stm.proxy.config import (
         CacheConfig,
-        ExtractionConfig,
         ProxyConfig,
         ToolgraphConfig,
     )
@@ -923,7 +909,6 @@ def test_configuration_full_example_documents_all_config_blocks() -> None:
         # explicit "strict", but the full example documents what a key-less
         # file resolves to.
         "cache": CacheConfig().model_dump(mode="json"),
-        "extraction": ExtractionConfig().model_dump(mode="json"),
         "toolgraph": ToolgraphConfig().model_dump(mode="json"),
     }
     for name, defaults in expected_blocks.items():

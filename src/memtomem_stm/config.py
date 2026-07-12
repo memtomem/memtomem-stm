@@ -214,7 +214,7 @@ class STMConfig(BaseSettings):
     advertise_observability_tools: bool = False
     """Whether STM's own observability/admin MCP tools (``stm_proxy_stats``,
     ``stm_proxy_health``, ``stm_proxy_cache_clear``, ``stm_surfacing_stats``,
-    ``stm_index_stats``, ``stm_selection_stats``, ``stm_compression_stats``,
+    ``stm_selection_stats``, ``stm_compression_stats``,
     ``stm_progressive_stats``, ``stm_tuning_recommendations``) are
     advertised to MCP clients. When ``False``, these are not registered
     with the MCP server — useful for eager-loading clients (e.g. OpenAI
