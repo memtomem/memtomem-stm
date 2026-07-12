@@ -121,14 +121,22 @@ def _is_stm_hook_command(command: str) -> bool:
         tokens = command.split()
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
         return False
-    starts = [i for i, tok in enumerate(tokens) if Path(tok).name in _STM_EXECUTABLES]
+    # A source checkout directory can itself be named ``memtomem-stm``. Count
+    # only executable-shaped tokens immediately followed by the subcommand, so
+    # ``uv run --directory /repo/memtomem-stm memtomem-stm hook`` has one owner
+    # candidate rather than mistaking the --directory value for an executable.
+    starts = [
+        i
+        for i, tok in enumerate(tokens)
+        if Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
+    ]
     if len(starts) != 1:
         return False
     i = starts[0]
     prefix = tokens[:i]
     if prefix and not (prefix[:2] == ["uv", "run"] and all(token != "--" for token in prefix)):
         return False
-    return tokens[i + 1 : i + 2] == ["hook"]
+    return True
 
 
 def _is_stm_command_handler(handler: Any) -> bool:

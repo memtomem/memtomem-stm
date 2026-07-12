@@ -78,6 +78,7 @@ def _sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "mms hook --host codex",
         "memtomem-stm-proxy hook",
         "uv run --directory /repo memtomem-stm hook --host kimi",
+        "uv run --directory /repo/memtomem-stm memtomem-stm hook --host claude",
         "/usr/local/bin/memtomem-stm hook --host cursor",  # absolute path basename
     ],
 )
