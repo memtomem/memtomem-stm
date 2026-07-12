@@ -37,7 +37,7 @@ changes inline only. See the deprecation policy in
 
 - Expanded the optional toolgraph setup guide with a concrete
   `server_name_map`, an upstream-direct crawl recipe, and accurate
-  `TOOL_NOT_FOUND` troubleshooting guidance. (issue #652)
+  `TOOL_NOT_FOUND` troubleshooting guidance. (#685, issue #652)
 
 ## [0.1.35] — 2026-07-12
 
