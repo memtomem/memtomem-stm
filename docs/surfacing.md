@@ -92,7 +92,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `min_score` | `0.03` | Minimum search score to include a result |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
-| `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Precision/cost gate — **distinct** from the proxy-level `ExtractionConfig.min_response_chars` (`500`); see the tuning note below. |
+| `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Measured on the cleaned upstream response *before* compression; an explicit agent query (`_context_query`) bypasses the gate. Precision/cost gate — **distinct** from the proxy-level `ExtractionConfig.min_response_chars` (`500`); see the tuning note below. |
 | `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). With `warmup_enabled` (default) the child already starts warming at startup, so the first call usually fits this budget. Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if warm-up is disabled and first-call injection matters more than latency. |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
@@ -175,6 +175,21 @@ carry enough context for `ContextExtractor` to synthesize a useful query, so
 surfacing on them would spend an LTM round-trip (and a `max_surfacings_per_minute`
 / `cooldown_seconds` slot) to inject memories that are often noise relative to
 the small response. The gate skips them before that cost is incurred.
+
+Two refinements to the gate (#676):
+
+- **The gate measures the cleaned upstream response, not the compressed
+  text.** When the proxy pipeline compresses a large response before
+  surfacing, the size compared against `min_response_chars` is the
+  pre-compression (post-CLEAN) length — so an upstream response that was
+  large enough to surface on stays large enough after aggressive compression
+  shrinks what the agent actually receives.
+- **An explicit agent query bypasses the gate.** When the agent passes
+  `_context_query` (forwarded by the proxy as the engine's `context_query`),
+  the request is an intentional retrieval and surfacing proceeds regardless
+  of response size. The other gates (`min_query_tokens`, cooldown, rate
+  limit, `min_score`) still apply. Per-tool `query_template` matches do
+  *not* bypass the gate — only the per-call explicit query does.
 
 The default of `5000` is deliberately conservative — it favors **precision and
 cost** over **coverage**:
