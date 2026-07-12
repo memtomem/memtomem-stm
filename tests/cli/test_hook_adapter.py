@@ -655,7 +655,7 @@ def test_kimi_serialize_ignores_updated_output_no_replace_field():
         ("ReadFile", "read"),
         ("WriteFile", "write"),
         ("StrReplaceFile", "edit"),
-        ("Bash", ""),  # Claude's name, not Kimi's → unmapped
+        ("Bash", "shell"),
         ("SomeFutureTool", ""),
     ],
 )
@@ -755,14 +755,13 @@ def test_detect_host_claude_by_tool_response():
     assert detect_host(payload) == "claude"
 
 
-def test_detect_host_codex_payload_resolves_to_claude():
+def test_detect_host_codex_payload_uses_turn_id():
     # Codex's payload is shape-identical to Claude's (snake_case, tool_response,
     # PascalCase PostToolUse) — auto-detect CANNOT distinguish them and must
     # resolve to claude (safe: identical parse + surfacing envelope). Codex users
     # pass --host codex explicitly. This pins the documented ambiguity.
     payload = json.loads((_HOOK_FIXTURES / "codex" / "inbound_bash_posttooluse.json").read_text())
-    assert detect_host(payload) == "claude"
-    assert detect_host(payload) != "codex"
+    assert detect_host(payload) == "codex"
 
 
 @pytest.mark.parametrize("bad", [None, "not a dict", [1, 2, 3], 42, {}])

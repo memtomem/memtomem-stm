@@ -171,7 +171,11 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 - **Sub-agent built-in calls** — the parent's MCP wiring is inherited, but built-in tool calls inside an `Agent` / `Task` invocation stay client-internal.
 
 `mms hook` is an optional PostToolUse bridge for that client-internal path,
-available for Claude Code, Codex CLI, Cursor, and Kimi Code. It appends LTM
+available for Claude Code, Codex CLI, Cursor, and Kimi Code. This is a
+PostToolUse postprocessor, not a full proxy: native calls do not gain STM cache,
+execution retry, progressive delivery, indexing, or extraction. Claude and
+Codex can receive surfaced LTM context; Cursor and Kimi are metrics-only because
+their post-tool channels cannot reliably inject model-visible context. It appends LTM
 surfacing context for read-like built-ins (`Read`, `Grep`, `Glob`, `Bash`, and
 each host's equivalents) and, on Claude Code only, can compress built-in `Bash`
 stdout through `updatedToolOutput` when explicitly enabled with

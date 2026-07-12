@@ -119,10 +119,19 @@ def _is_stm_hook_command(command: str) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         tokens = command.split()
-    return any(
-        Path(tok).name in _STM_EXECUTABLES and tokens[i + 1 : i + 2] == ["hook"]
-        for i, tok in enumerate(tokens)
-    )
+    if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
+        return False
+    starts = [i for i, tok in enumerate(tokens) if Path(tok).name in _STM_EXECUTABLES]
+    if len(starts) != 1:
+        return False
+    i = starts[0]
+    prefix = tokens[:i]
+    if prefix and not (
+        prefix[:2] == ["uv", "run"]
+        and all(token != "--" for token in prefix)
+    ):
+        return False
+    return tokens[i + 1 : i + 2] == ["hook"]
 
 
 def _is_stm_command_handler(handler: Any) -> bool:
@@ -155,20 +164,24 @@ def _entry_has_stm_handler(entry: Any) -> bool:
 
 
 def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
-    """Return ``parent[key]`` as a dict, replacing a wrong-typed value."""
+    """Return ``parent[key]`` as a dict without clobbering malformed config."""
     val = parent.get(key)
-    if not isinstance(val, dict):
+    if val is None:
         val = {}
         parent[key] = val
+    elif not isinstance(val, dict):
+        raise HookInstallError(f"expected {key!r} to be an object")
     return val
 
 
 def _ensure_list(parent: dict[str, Any], key: str) -> list[Any]:
-    """Return ``parent[key]`` as a list, replacing a wrong-typed value."""
+    """Return ``parent[key]`` as a list without clobbering malformed config."""
     val = parent.get(key)
-    if not isinstance(val, list):
+    if val is None:
         val = []
         parent[key] = val
+    elif not isinstance(val, list):
+        raise HookInstallError(f"expected {key!r} to be a list")
     return val
 
 
@@ -383,18 +396,29 @@ HOOK_HOSTS: dict[str, HookHostSpec] = {
     "kimi": HookHostSpec(
         host_tag="kimi",
         label="Kimi Code",
-        config_path=Path("~/.kimi/config.toml"),
+        config_path=Path("~/.kimi-code/config.toml"),
         fmt="toml",
         matcher_style="alternation",
         install_fn=_kimi_install,
         uninstall_fn=_kimi_uninstall,
         notes=(
-            "Surfacing-only via raw stdout on exit 0 (Kimi has no output-replace "
-            "channel). Whether exit-0 stdout is injected verbatim is unverified — "
-            "confirm memories appear before relying on it.",
+            "Metrics-only: Kimi PostToolUse is observational and cannot inject "
+            "context or replace native tool output.",
         ),
     ),
 }
+
+
+def _config_path(spec: HookHostSpec) -> Path:
+    """Resolve host homes without ignoring the host's supported home override."""
+    env_and_name = {
+        "claude": ("CLAUDE_CONFIG_DIR", "settings.json"),
+        "codex": ("CODEX_HOME", "config.toml"),
+        "kimi": ("KIMI_CODE_HOME", "config.toml"),
+    }.get(spec.host_tag)
+    if env_and_name and (home := os.environ.get(env_and_name[0])):
+        return Path(home).expanduser() / env_and_name[1]
+    return spec.config_path.expanduser()
 
 
 def matcher_for(host_tag: str) -> str | None:
@@ -505,7 +529,7 @@ def plan_install(host_tag: str, command: str) -> HookChange:
     result, and reports whether applying it would create / update / no-op. The
     merge is idempotent — an existing STM block is replaced in place."""
     spec = HOOK_HOSTS[host_tag]
-    path = spec.config_path.expanduser()
+    path = _config_path(spec)
     current = _read_current(path, spec.fmt)
     base: dict[str, Any] = current[0] if current else {}
     current_text = current[1] if current else None
@@ -541,7 +565,7 @@ def plan_uninstall(host_tag: str) -> HookChange:
     Removes exactly what :func:`plan_install` adds (recognized by command shape).
     A no-op when the file is absent or holds no STM block."""
     spec = HOOK_HOSTS[host_tag]
-    path = spec.config_path.expanduser()
+    path = _config_path(spec)
     current = _read_current(path, spec.fmt)
     if current is None:
         return HookChange(

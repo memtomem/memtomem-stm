@@ -75,6 +75,11 @@ class HookCompressionConfig(BaseModel):
     compressor's own truncation suffix may still add a small, bounded overage, so
     treat it as a target rather than a hard ceiling. Matches the proxy's
     ``default_max_result_chars`` default."""
+    min_retention: float = Field(default=0.65, ge=0.0, le=1.0)
+    """Minimum fraction of the original stdout that a lossy native replacement
+    may retain. Native PostToolUse hooks have no lossless continuation channel,
+    so a result below this floor is passed through unchanged. Env:
+    ``MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION``."""
 
 
 class HookConfig(BaseModel):
@@ -166,6 +171,10 @@ class DaemonConfig(BaseModel):
     """Shut the daemon (and its warm LTM child) down after this many seconds
     with no requests, so an abandoned coding session doesn't leak a
     multi-GB process forever. ``0`` disables idle shutdown (pin the process)."""
+    max_pending_requests: int = Field(default=32, ge=1, le=1024)
+    """Maximum number of native surfacing requests admitted concurrently.
+    Requests beyond this bound fail open immediately instead of building an
+    unbounded queue behind the daemon's single LTM session."""
 
     @model_validator(mode="after")
     def _reject_non_loopback_host(self) -> "DaemonConfig":

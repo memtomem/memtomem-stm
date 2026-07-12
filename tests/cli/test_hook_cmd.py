@@ -336,7 +336,7 @@ _SURF_DICT = {
 }
 
 
-def test_cli_host_kimi_routes_to_raw_stdout(monkeypatch: pytest.MonkeyPatch):
+def test_cli_host_kimi_is_metrics_only(monkeypatch: pytest.MonkeyPatch):
     # --host kimi resolves the Kimi adapter end-to-end (NO get_adapter monkeypatch),
     # so a surfaced block is emitted as RAW stdout, not a JSON envelope. Only the
     # surfacing core is mocked; the real parse → render → serialize chain runs.
@@ -346,7 +346,7 @@ def test_cli_host_kimi_routes_to_raw_stdout(monkeypatch: pytest.MonkeyPatch):
         cli, ["hook", "--host", "kimi"], input=json.dumps(_KIMI_SHELL_PAYLOAD)
     )
     assert result.exit_code == 0
-    assert result.output == _SURF_BLOCK + "\n"  # raw block + click.echo newline
+    assert result.output == ""
     assert not result.output.startswith("{")  # not the JSON hookSpecificOutput envelope
 
 
@@ -358,7 +358,7 @@ def test_cli_host_auto_detects_kimi_from_payload(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value=_SURF_DICT))
     result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_KIMI_SHELL_PAYLOAD))
     assert result.exit_code == 0
-    assert result.output == _SURF_BLOCK + "\n"
+    assert result.output == ""
 
 
 def test_cli_host_claude_emits_json_envelope(monkeypatch: pytest.MonkeyPatch):
@@ -421,7 +421,7 @@ def test_cli_runtime_invalid_host_falls_back_to_autodetect(monkeypatch: pytest.M
         cli, ["hook", "--host", "bogus"], input=json.dumps(_KIMI_SHELL_PAYLOAD)
     )
     assert result.exit_code == 0
-    assert result.output == _SURF_BLOCK + "\n"  # raw stdout = Kimi adapter via auto-detect
+    assert result.output == ""
 
 
 def test_resolve_host_tag_known_host_is_authoritative():
@@ -557,7 +557,12 @@ def test_daemon_unavailable_cold_fallback(monkeypatch: pytest.MonkeyPatch):
 # ── Bash output compression (P1a — updatedToolOutput) ─────────────────────────
 
 _BIG_STDOUT = "log line %d\n" % 0 + "".join(f"log line {i}\n" for i in range(1, 4000))  # ~50KB
-_CFG = HookCompressionConfig(enabled=True, max_chars=2000)
+_CFG = HookCompressionConfig(enabled=True, max_chars=2000, min_retention=0.0)
+
+
+@pytest.fixture(autouse=True)
+def permissive_retention(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION", "0")
 
 
 def _bash_payload(tool_response, *, tool="Bash", event="PostToolUse"):
@@ -911,7 +916,7 @@ def test_cli_compresses_bash_output_end_to_end(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "0")
     monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", AsyncMock(return_value={}))
     result = CliRunner().invoke(
-        cli, ["hook"], input=json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
+        cli, ["hook", "--host", "claude"], input=json.dumps(_bash_payload({"stdout": _BIG_STDOUT}))
     )
     assert result.exit_code == 0
     hso = json.loads(result.output)["hookSpecificOutput"]

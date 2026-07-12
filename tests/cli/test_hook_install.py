@@ -111,7 +111,7 @@ def test_matcher_for_per_host() -> None:
     # formatted per host: alternation (Claude/Kimi), anchored regex (Codex),
     # none (Cursor's generic post-tool hook).
     assert matcher_for("claude") == "Read|Grep|Glob|Bash"
-    assert matcher_for("kimi") == "Shell|ReadFile"
+    assert matcher_for("kimi") == "Bash|Read|Grep|Glob|Shell|ReadFile"
     assert matcher_for("codex") == "^Bash$"
     assert matcher_for("cursor") is None
 

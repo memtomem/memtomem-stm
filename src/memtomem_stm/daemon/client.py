@@ -38,7 +38,12 @@ logger = logging.getLogger(__name__)
 
 
 async def _request(
-    handshake: dict[str, Any], op: str, payload: dict[str, Any] | None, *, timeout: float
+    handshake: dict[str, Any],
+    op: str,
+    payload: dict[str, Any] | None,
+    *,
+    timeout: float,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any] | None:
     """One connection-per-request round trip. ``None`` on any failure.
 
@@ -55,7 +60,13 @@ async def _request(
     try:
         async with asyncio.timeout(timeout):
             reader, writer = await asyncio.open_connection(host, port, limit=MAX_MESSAGE_BYTES)
-            writer.write(encode_line(build_request(token, op, payload)))
+            writer.write(
+                encode_line(
+                    build_request(
+                        token, op, payload, deadline_monotonic=deadline_monotonic
+                    )
+                )
+            )
             await writer.drain()
             resp = await read_message(reader)
         # Protocol-version guard. A wire-incompatible daemon keys to a different
@@ -131,7 +142,10 @@ async def surface(
     hs = _live_handshake_candidate(config)
     if hs is None:
         return None
-    resp = await _request(hs, OP_SURFACE, call.to_wire(), timeout=timeout)
+    deadline = asyncio.get_running_loop().time() + timeout
+    resp = await _request(
+        hs, OP_SURFACE, call.to_wire(), timeout=timeout, deadline_monotonic=deadline
+    )
     if resp is not None and resp.get("ok") and isinstance(resp.get("output"), dict):
         return resp["output"]
     return None

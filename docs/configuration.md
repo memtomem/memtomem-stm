@@ -162,13 +162,17 @@ It is independent of the MCP proxy path and is configured with
 
 ```bash
 export MEMTOMEM_STM_HOOK__USE_DAEMON=true              # default: warm daemon path
+export MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION=0.65 # passthrough below 65%
+export MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS=32    # bounded hook queue
 export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=2.5
 export MEMTOMEM_STM_HOOK__FALLBACK=skip                # skip | cold
 export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
 export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating prompt by default
 
 # Built-in Bash stdout compression is opt-in, separate from surfacing, and
-# Claude Code only — native output replacement ports to no other host.
+# Claude Code only — native output replacement ports to no other host. Unsafe
+# or failed results and replacements retaining under 65% of the original are
+# passed through unchanged.
 export MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=false
 export MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS=16000
 
