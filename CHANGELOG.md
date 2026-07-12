@@ -11,6 +11,31 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- Model-context scaling of the surfacing injection/result budgets
+  (`max_injection_chars`, `max_results`) is now a one-directional clamp: the
+  configured value is a hard ceiling and only small-context consumer models
+  (≤32K tokens) shrink it, to 1500 chars / 2 results. Mid- and large-context
+  models receive the configured value unchanged. **Behavior change**: the
+  previous large-context tier (>200K tokens) could raise the effective budget
+  *above* the configured value (up to 5000 chars / 5 results) while the mid
+  tier stayed uncapped, so a larger context window could yield a *smaller*
+  budget than a medium one; budgets are now monotonic in context size. Only
+  configurations set above 5000 chars / 5 results and paired with a >200K-token
+  consumer model change — the defaults (3000 chars / 3 results) are
+  unaffected. (#678)
+
+### Fixed
+
+- Proactive surfacing no longer loses memories whose id cannot be rendered as a
+  copyable token. Which memories count as delivered — and are therefore
+  committed to session / cross-session dedup and feedback — is now decided by
+  the bullets that survive injection-size truncation, not by scanning the
+  rendered block for each backticked id. Previously a block of only
+  non-displayable-id memories was dropped wholesale, and a mix re-surfaced the
+  non-displayable ones on every subsequent call. (#677)
+
 ## [0.1.34] — 2026-07-12
 
 ### Upgrade notes
