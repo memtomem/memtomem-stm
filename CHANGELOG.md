@@ -29,14 +29,15 @@ The surfacing/compression hardening below landed as tracking issue #676
   (`max_injection_chars`, `max_results`) is now a one-directional clamp: the
   configured value is a hard ceiling and only small-context consumer models
   (≤32K tokens) shrink it, to 1500 chars / 2 results. Mid- and large-context
-  models receive the configured value unchanged. **Behavior change**: the
-  previous large-context tier (>200K tokens) could raise the effective budget
-  *above* the configured value (up to 5000 chars / 5 results) while the mid
-  tier stayed uncapped, so a larger context window could yield a *smaller*
-  budget than a medium one; budgets are now monotonic in context size. Only
-  configurations set above 5000 chars / 5 results and paired with a >200K-token
-  consumer model change — the defaults (3000 chars / 3 results) are
-  unaffected. (#678)
+  models receive the configured value unchanged, so budgets are now monotonic
+  in context-window size. **Behavior change**: the previous large-context tier
+  (>200K tokens) returned `max(configured, 5000 chars / 5 results)` — it could
+  raise a small configured budget *up* to 5000/5. It now returns the configured
+  value, so a >200K-token consumer model whose configured budget is at or below
+  5000 chars / 5 results — **including the defaults (3000 chars / 3 results)** —
+  now gets that configured value instead of being bumped to 5000/5. Budgets
+  configured above 5000/5 were already returned unchanged; the ≤32K and
+  32K–200K tiers are unchanged from the previous release. (#678)
 - **Behavior change**: an upstream `isError` tool result is now proxied back as
   its full `CallToolResult` envelope — non-text content, `structuredContent`,
   and `_meta` preserved — instead of being collapsed into a text-only FastMCP
@@ -46,6 +47,11 @@ The surfacing/compression hardening below landed as tracking issue #676
   surfacing circuit breaker, so a persistently broken LTM opens the breaker
   instead of silently passing responses through untouched; a genuine empty
   result set is not counted as a failure. (#676)
+- **Behavior change**: an explicit `_context_query` and a per-tool
+  `query_template` are now subject to the `min_query_tokens` floor, the same as
+  heuristic queries — previously they were used verbatim. A query below the
+  floor is skipped (`no_query`) unless it contains sensitive content (which is
+  hashed and still used). (#676)
 
 ### Fixed
 
@@ -67,6 +73,13 @@ The surfacing/compression hardening below landed as tracking issue #676
   unresolved is not written to the response cache, so a later cache hit (which
   bypasses those stages) cannot strand the ingestion work — it is retried on
   the next live call. (#676)
+- Auto-tuning no longer re-applies the same `min_score` adjustment on repeated
+  calls when no new feedback has arrived: a durable per-tool feedback watermark
+  short-circuits the tuner, so a tool's threshold no longer drifts toward its
+  bound just from being surfaced again. (#676)
+- Session-context (scratch) retrieval during surfacing is capped at 0.5s, so a
+  stalled scratch dependency can no longer consume the whole surfacing timeout
+  and suppress otherwise-valid LTM memories. (#676)
 
 ### Security
 
