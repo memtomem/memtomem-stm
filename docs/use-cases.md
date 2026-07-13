@@ -17,15 +17,18 @@ that an agent will request every omitted section.
 
 ## Resume a project with reviewed memory
 
-With a core that advertises `context_compose` schema 2, pre-load or approve a
+With a core that advertises `context_compose` schema 2 or later, pre-load a
 project decision, start a new agent session, and compare surfacing disabled
-versus enabled. Measure the number of tool calls and time to the first correct
-answer, retrieval precision,
+versus enabled. Schema 3 also makes the nearest adjacent context visible.
+Measure the number of tool calls and time to the first correct answer, retrieval precision,
 duplicate re-surfacing, and surfacing latency.
 
 STM retrieves and delivers the memory. The core owns storage, privacy, scope,
 review, and context composition. STM does not automatically turn arbitrary
 tool output into durable memory.
+
+Follow the copy/paste [reviewed project resume guide](guides/reviewed-memory-resume.md)
+for the complete project-local Pinned Context and optional review-first flow.
 
 ## Avoid repeated upstream reads
 

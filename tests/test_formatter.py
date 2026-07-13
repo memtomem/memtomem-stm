@@ -700,6 +700,46 @@ class TestPreviewMaxCharsKnob:
 
         assert _preview_line_after_bucket(output) == "...EAD-xxxx-TAIL | HIT"
 
+    def test_multi_chunk_context_renders_only_nearest_neighbors(self):
+        @dataclass
+        class _FakeWindowChunk:
+            content: str
+
+        @dataclass
+        class _FakeContext:
+            window_before: list
+            window_after: list
+
+        @dataclass
+        class _FakeResultWithCtx:
+            chunk: FakeChunk
+            score: float
+            context: _FakeContext
+
+        result = _FakeResultWithCtx(
+            chunk=FakeChunk(content="HIT"),
+            score=0.5,
+            context=_FakeContext(
+                window_before=[
+                    _FakeWindowChunk(content="BEFORE-FAR"),
+                    _FakeWindowChunk(content="BEFORE-NEAR"),
+                ],
+                window_after=[
+                    _FakeWindowChunk(content="AFTER-NEAR"),
+                    _FakeWindowChunk(content="AFTER-FAR"),
+                ],
+            ),
+        )
+
+        output = SurfacingFormatter(SurfacingConfig(preview_max_chars=100)).inject(
+            "response", [result], "query"
+        )
+        preview = _preview_line_after_bucket(output)
+
+        assert preview == "...BEFORE-NEAR | HIT | AFTER-NEAR..."
+        assert "BEFORE-FAR" not in preview
+        assert "AFTER-FAR" not in preview
+
     def test_window_before_suffix_does_not_split_escape_atom(self):
         assert SurfacingFormatter._sanitize("safe<", max_chars=5, from_end=True) == ""
         assert SurfacingFormatter._sanitize("safe<", max_chars=6, from_end=True) == r"\u003C"

@@ -62,7 +62,7 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
             ],
             env=env,
         )
-        if expected == "enhanced":
+        if expected in {"schema2", "schema3"}:
             _run(
                 [
                     str(mm),
@@ -71,6 +71,28 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                     "compat-policy",
                     "--content",
                     "always preserve compatibility scope",
+                ],
+                env=env,
+            )
+            context_file = memory_dir / "context-window.md"
+            context_file.write_text(
+                "\n\n".join(
+                    [
+                        "## Before\n\n" + "before deployment context " * 40,
+                        "## Match\n\ncompat-window-sentinel " + "matched policy " * 40,
+                        "## After\n\n" + "after deployment context " * 40,
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _run(
+                [
+                    str(mm),
+                    "index",
+                    str(context_file),
+                    "--namespace",
+                    "compat",
+                    "--force",
                 ],
                 env=env,
             )
@@ -96,11 +118,12 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                     assert outcome == "ok"
                     assert any("compatibility sentinel" in item.chunk.content for item in results)
                 else:
-                    assert adapter.capabilities.context_compose_schema >= 2
+                    expected_schema = 2 if expected == "schema2" else 3
+                    assert adapter.capabilities.context_compose_schema == expected_schema
                     bundle = await adapter.context_compose(
-                        "compatibility sentinel",
-                        namespace=None,
-                        context_window=0,
+                        "compat-window-sentinel",
+                        namespace="compat",
+                        context_window=1,
                         top_k=5,
                     )
                     assert bundle is not None
@@ -109,8 +132,19 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                         for item in bundle.pinned
                     )
                     assert any(
-                        "compatibility sentinel" in item.chunk.content for item in bundle.retrieved
+                        "compat-window-sentinel" in item.chunk.content for item in bundle.retrieved
                     )
+                    hit = next(
+                        item
+                        for item in bundle.retrieved
+                        if "compat-window-sentinel" in item.chunk.content
+                    )
+                    if expected == "schema2":
+                        assert hit.context is None
+                    else:
+                        assert hit.context is not None
+                        assert hit.context.window_before
+                        assert hit.context.window_after
             finally:
                 await adapter.stop()
 
@@ -118,7 +152,7 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--core-bin-dir", type=Path, required=True)
-    parser.add_argument("--expect", choices=("legacy", "enhanced"), required=True)
+    parser.add_argument("--expect", choices=("legacy", "schema2", "schema3"), required=True)
     args = parser.parse_args()
     asyncio.run(_smoke(args.core_bin_dir, args.expect))
 

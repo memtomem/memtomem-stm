@@ -8,12 +8,12 @@ session state). ``json.dumps`` escapes any newline inside string values as
 
 Request  (client → daemon)::
 
-    {"v": 4, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
+    {"v": 7, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
 
 Response (daemon → hook)::
 
-    {"v": 4, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
-    {"v": 4, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
+    {"v": 7, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
+    {"v": 7, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
     # ping "ltm" is one of warm | warming | down | cold (#664); clients
     # treat it as an opaque display string.
 
@@ -37,7 +37,8 @@ frames one side can't parse (the stale daemon idle-times-out under a finite
 ``idle_timeout_seconds``; a pinned ``idle_timeout_seconds=0`` daemon must be
 stopped manually — see #517).
 
-**v6:** adds schema-bound context-compose scope fields. **v5:** adds
+**v7:** adds max/selected context-compose schema negotiation and schema 3
+adjacent-context payloads. **v6:** adds schema-bound context-compose scope fields. **v5:** adds
 context-compose and review-candidate LTM operations. **v4:** adds
 typed low-level LTM operations for issue #688. **v3:** adds
 absolute deadlines and bounded admission. **v2:** the ``surface`` payload is a serialized
@@ -53,7 +54,7 @@ import json
 import secrets
 from typing import Any
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
 # built-in tool's output (a large ``Read`` can be hundreds of KB), so this sits

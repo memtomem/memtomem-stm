@@ -1015,6 +1015,8 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
     env_ref = _read("docs/reference/environment-variables.md")
     for token in (
         "MEMTOMEM_STM_DATA_DIR",
+        "MEMTOMEM_STM_PROXY__ENABLED",
+        "MEMTOMEM_STM_PROXY__CONFIG_PATH",
         "MEMTOMEM_STM_HOOK__METRICS_ENABLED",
         "MEMTOMEM_STM_SURFACING__USE_DAEMON",
         "AUTO_TUNE_SCORE_FLOOR",
@@ -1022,6 +1024,8 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
         "CONTEXT_TOOLS",
     ):
         assert token in env_ref, f"environment reference lost {token}"
+    assert "MEMTOMEM_STM_ENABLED" not in env_ref
+    assert "MEMTOMEM_STM_CONFIG_PATH" not in env_ref
 
     proxy_ref = _read("docs/reference/proxy-config.md")
     for token in ("json_depth", "min_section_chars", "description_override"):
@@ -1030,6 +1034,22 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
     config_hub = _read("docs/configuration.md")
     for phrase in ("ProxyConfig", "environment/default-only", "Representative configuration"):
         assert phrase in config_hub, f"configuration source boundary lost {phrase!r}"
+
+
+def test_public_tool_counts_match_runtime_registration_sets() -> None:
+    from memtomem_stm.server import _OBSERVABILITY_TOOL_NAMES
+
+    operations = _read("docs/guides/operations.md")
+    assert "eight observability and admin tools" in operations
+    assert "nine operator tools" not in operations
+    assert "ten operator tools" not in operations
+
+    mcp_ref = _read("docs/reference/mcp-tools.md")
+    for name in _OBSERVABILITY_TOOL_NAMES:
+        assert f"`{name}`" in mcp_ref
+    assert len(_OBSERVABILITY_TOOL_NAMES) == 8
+    assert "four model-facing tools" in mcp_ref
+    assert "`stm_memory_propose`" in mcp_ref
 
 
 def test_mcp_tool_reference_matches_optional_argument_signatures() -> None:

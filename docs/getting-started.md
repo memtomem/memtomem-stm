@@ -87,3 +87,4 @@ some native PostToolUse events, but it is not a replacement for the proxy.
 - [Manage project-scoped MCP definitions](guides/project-scoped-mcps.md)
 - [Choose compression behavior](compression.md)
 - [Configure proactive memory surfacing](surfacing.md)
+- [Resume a project with reviewed memory](guides/reviewed-memory-resume.md)

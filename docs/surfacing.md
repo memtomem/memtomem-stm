@@ -24,11 +24,20 @@ cross-session-deduped, or access-boosted.
 
 Core owns Pinned Context scope selection on this composed path. STM preserves
 its `default_namespace`, per-tool `namespace`, and `context_window_size` for
-the retrieved leg; they are not remapped to core `agent_id` scope. Cores that
-do not advertise schema 2 continue through legacy `mem_search`.
+the retrieved leg; they are not remapped to core `agent_id` scope. Schema 3
+additionally returns adjacent context-window chunks for rendering. Schema 2
+preserves the request controls but does not guarantee those chunks in the
+response. Cores that do not advertise schema 2 continue through legacy
+`mem_search`.
 
-Core 0.3.8 is the tested legacy baseline and 0.3.9 is the first tagged PyPI
-release expected to carry schema 2. The intermediate schema 1 contract was
+When schema 3 context windows are enabled, STM expands the core wire budget to
+`max_injection_chars * (1 + 2 * min(context_window_size, 10))`. This lets whole
+before/after chunks survive composition. The formatter still enforces the
+original `max_injection_chars` model-injection limit; schema 2 and disabled
+windows retain the original request budget.
+
+Core 0.3.8 is the tested legacy baseline, 0.3.9 carries schema 2, and 0.3.10 is
+the first release expected to carry schema 3. The intermediate schema 1 contract was
 never included in a tagged PyPI release, although source-installed builds may
 exist. Capability negotiation, not these version labels, controls runtime
 behavior.
@@ -36,17 +45,14 @@ behavior.
 To force a rollback, configure the actual LTM command rather than installing
 an older core into an unrelated environment:
 
-```json
-{
-  "surfacing": {
-    "ltm_mcp_command": "uvx",
-    "ltm_mcp_args": ["--from", "memtomem==0.3.8", "memtomem-server"]
-  }
-}
+```bash
+export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=uvx
+export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem==0.3.8","memtomem-server"]'
+mms daemon stop --all
 ```
 
-Then run `mms daemon stop --all` (or restart a direct STM process) so the next
-session negotiates against that command.
+Restart a direct STM process as well, if used, so the next session negotiates
+against that command.
 
 ## Review-first formation (experimental)
 
@@ -72,7 +78,7 @@ flowchart LR
     CB -->|closed| Extract["2. extract context<br/>(query)"]
     Extract --> Gate{"3. relevance gate"}
     Gate -->|skip| Pass
-    Gate -->|pass| Search["4. search LTM<br/>(compose schema 2 or mem_search)"]
+    Gate -->|pass| Search["4. search LTM<br/>(compose schema 2+ or mem_search)"]
     Search --> Filter{"score ≥ min_score?<br/>not already shown?"}
     Filter -->|no| Pass
     Filter -->|yes| Inject["5. inject memories<br/>+ working memory"]

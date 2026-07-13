@@ -60,6 +60,26 @@ class LtmTransportError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteContextChunk:
+    """One adjacent chunk carried by context-compose schema 3."""
+
+    id: str
+    content: str
+    source: str
+    namespace: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteContextInfo:
+    """Adjacent chunks associated with one matched result."""
+
+    window_before: tuple[RemoteContextChunk, ...] = ()
+    window_after: tuple[RemoteContextChunk, ...] = ()
+    chunk_position: int = 0
+    total_chunks_in_file: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class ContextComposeResult:
     """Structured pinned-first bundle returned by a compatible core."""
 
@@ -98,10 +118,59 @@ class RemoteSearchResult:
         namespace: str = "default",
         *,
         pinned: bool = False,
+        context: RemoteContextInfo | None = None,
     ):
         self.chunk = self._FakeChunk(content, source, namespace)
         self.score = score
         self.pinned = pinned
+        self.context = context
+
+
+def decode_context_compose_context(
+    raw: Any,
+    *,
+    max_content_chars: int,
+) -> RemoteContextInfo:
+    """Strictly decode the optional schema-3 context object."""
+    if not isinstance(raw, dict):
+        raise ValueError("context compose context must be an object")
+    before = raw.get("before", [])
+    after = raw.get("after", [])
+    if not isinstance(before, list) or not isinstance(after, list):
+        raise ValueError("context compose context windows must be arrays")
+
+    def decode_chunk(item: Any) -> RemoteContextChunk:
+        if not isinstance(item, dict):
+            raise ValueError("context compose adjacent chunk must be an object")
+        if not all(isinstance(item.get(field), str) for field in ("id", "content", "source")):
+            raise ValueError("context compose adjacent chunk has invalid shape")
+        namespace = item.get("namespace", "default")
+        if not isinstance(namespace, str):
+            raise ValueError("context compose adjacent chunk namespace must be a string")
+        return RemoteContextChunk(
+            id=item["id"],
+            content=item["content"][:max_content_chars],
+            source=item["source"],
+            namespace=namespace,
+        )
+
+    chunk_position = raw.get("chunk_position", 0)
+    total_chunks = raw.get("total_chunks_in_file", 0)
+    if (
+        isinstance(chunk_position, bool)
+        or not isinstance(chunk_position, int)
+        or chunk_position < 0
+        or isinstance(total_chunks, bool)
+        or not isinstance(total_chunks, int)
+        or total_chunks < 0
+    ):
+        raise ValueError("context compose chunk positions must be non-negative integers")
+    return RemoteContextInfo(
+        window_before=tuple(decode_chunk(item) for item in before),
+        window_after=tuple(decode_chunk(item) for item in after),
+        chunk_position=chunk_position,
+        total_chunks_in_file=total_chunks,
+    )
 
 
 class SurfacingLtmAdapter(Protocol):
@@ -1207,11 +1276,18 @@ class McpClientSearchAdapter:
         for item in payload.get("retrieved", []):
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("core context_compose retrieved item has invalid shape")
+            context = None
+            if self._capabilities.context_compose_schema >= 3 and "context" in item:
+                context = decode_context_compose_context(
+                    item["context"],
+                    max_content_chars=self._config.result_content_max_chars,
+                )
             entry = RemoteSearchResult(
                 item["content"][: self._config.result_content_max_chars],
                 safe_float(item.get("score"), 0.0),
                 source=str(item.get("source") or "unknown"),
                 namespace=str(item.get("namespace") or "default"),
+                context=context,
             )
             memory_id = item.get("id") or item.get("chunk_id")
             if isinstance(memory_id, str) and memory_id:
