@@ -11,6 +11,8 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.37] — 2026-07-13
+
 ### Upgrade notes
 
 - The local daemon protocol is now v6. Finite-idle older daemons exit naturally;
@@ -18,7 +20,7 @@ changes inline only. See the deprecation policy in
   one-child-per-version overlap is possible during upgrade.
 - The inactive bundled INDEX surface has been retired. `stm_index_stats` is no
   longer advertised and the standalone pipeline is CLEAN → COMPRESS → SURFACE;
-  integrations must use an explicit, capability-negotiated LTM contract.
+  integrations must use an explicit, capability-negotiated LTM contract. (#690)
 
 ### Added
 
@@ -29,7 +31,7 @@ changes inline only. See the deprecation policy in
   Missing or busy daemons fail open without spawning a private child.
   Daemon admission also converts an unexpected operation exception into a
   logged `unavailable` response; hook surfacing already catches its own
-  exceptions and continues to fail open.
+  exceptions and continues to fail open. (#689, issue #688)
 - Capability-negotiated LTM integration now supports pinned-first context
   bundles and opt-in review-candidate submission. Compatible cores advertise
   `context_compose` / `candidate_propose` through `mem_do(action="version")`;
@@ -53,7 +55,7 @@ changes inline only. See the deprecation policy in
   task-oriented guides, and split CLI/configuration references while keeping
   the existing documentation URLs compatible. Corrected native-hook host
   paths, CLI signatures, configuration-source boundaries, and previously
-  undocumented public settings.
+  undocumented public settings. (#687)
 - Corrected the standalone pipeline after #690 retired the inactive bundled
   INDEX surface, qualified the token-reduction claim as workload-dependent,
   and added reproducible use-case boundaries for compression, caching, and
