@@ -35,8 +35,13 @@ changes inline only. See the deprecation policy in
 - Daemon protocol v7 negotiates a client maximum and selected compose schema
   per response. The protocol bump deliberately prevents a stale v6 daemon from
   silently suppressing schema 3 until restart.
+- Schema 3 decoding now retains at most ten adjacent chunks per direction,
+  preserving the nearest chunks and ignoring malformed overflow that STM will
+  never render.
 - Core compatibility advisory now pins 0.3.8 legacy, 0.3.9 schema 2, and 0.3.10
-  schema 3 as separate scheduled cells.
+  schema 3 as separate scheduled cells. Its schema 3 cell also runs the
+  reviewed-project-resume core CLI and candidate-review contract in a temporary
+  Git project.
 
 ## [0.1.37] — 2026-07-13
 

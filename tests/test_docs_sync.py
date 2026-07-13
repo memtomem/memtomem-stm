@@ -1090,3 +1090,37 @@ def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
         "reference/proxy-config.md",
     ):
         assert target in config_hub
+
+
+def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
+    """Keep the copy/paste core CLI flow tied to the released-core advisory."""
+    guide = _read("docs/guides/reviewed-memory-resume.md")
+    for snippet in (
+        "mm init --non-interactive --preset minimal --namespace resume-demo --mcp skip",
+        "mm mem init",
+        "mm pinned set resume-contract",
+        "--scope project_local",
+        '--description "Reviewed project resume contract"',
+        "--priority 10",
+        "mm pinned list --json",
+        'mm pinned compose "blue-green rollback checklist"',
+        "mm index .memtomem/memories.local/resume-demo.md --namespace resume-demo --force",
+        "mm review list",
+        "mm review show CANDIDATE_ID",
+        'mm review approve CANDIDATE_ID --reviewer "$USER"',
+    ):
+        assert snippet in guide, f"reviewed-memory-resume guide lost {snippet!r}"
+
+    smoke = _read("scripts/core_compat_smoke.py")
+    for token in (
+        "_init_schema_three_guide",
+        '"resume-contract"',
+        '"project_local"',
+        '"resume-demo"',
+        '"pinned", "list", "--json"',
+        '"review", "list"',
+        '"review", "show"',
+        '"review",\n            "approve"',
+        '"compat-smoke"',
+    ):
+        assert token in smoke, f"released-core advisory lost guide contract token {token!r}"

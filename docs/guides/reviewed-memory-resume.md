@@ -41,9 +41,13 @@ root = Path(".memtomem/memories.local")
 root.mkdir(parents=True, exist_ok=True)
 sections = []
 for index in range(1, 9):
+    marker = "resume-window-sentinel " if index == 4 else ""
     sections.append(
         f"## Deployment phase {index}\n\n"
-        + (f"Phase {index} uses blue-green verification and a 2% rollback threshold. " * 35)
+        + (
+            f"{marker}Phase {index} uses blue-green verification and a 2% rollback threshold. "
+            * 35
+        )
     )
 (root / "resume-demo.md").write_text("\n\n".join(sections), encoding="utf-8")
 PY
@@ -83,8 +87,9 @@ The returned tool response should retain the original document and append a
 - a matched `resume-demo.md` memory;
 - the nearest before and after snippets around that match.
 
-Schema 3 transports the full budgeted context arrays. STM 0.1.38 renders only
-the nearest chunk on each side in its compact preview.
+Schema 3 transports budgeted context arrays. STM accepts at most ten chunks
+per direction and renders only the nearest chunk on each side in its compact
+preview.
 
 Check durable operational evidence after the call:
 
