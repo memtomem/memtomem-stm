@@ -11,37 +11,39 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.38] — 2026-07-14
+
 ### Upgrade notes
 
 - The local daemon protocol is now v7. Upgrading may briefly leave one v6 and
   one v7 daemon, plus their warm LTM children, running for the same logical
   configuration. With the default 900-second idle timeout the v6 daemon exits
   naturally; pinned daemons (`idle_timeout_seconds=0`) remain until
-  `mms daemon stop --all`.
+  `mms daemon stop --all`. (#694)
 
 ### Added
 
 - Context-compose schema 3 preserves budgeted adjacent chunks from compatible
   cores across direct and shared-daemon routes. Schema 2 remains supported for
-  scoped Pinned Context without a visible context-window guarantee.
+  scoped Pinned Context without a visible context-window guarantee. (#694)
 - Schema 3 window requests receive a larger wire-only retrieval budget while
-  the configured model-injection limit remains unchanged.
+  the configured model-injection limit remains unchanged. (#694)
 - Added a copy/paste reviewed-project-resume guide covering project-local
   Pinned Context, automatic surfacing, nearest-neighbor previews, and the
-  separate review-first proposal boundary.
+  separate review-first proposal boundary. (#694)
 
 ### Changed
 
 - Daemon protocol v7 negotiates a client maximum and selected compose schema
   per response. The protocol bump deliberately prevents a stale v6 daemon from
-  silently suppressing schema 3 until restart.
+  silently suppressing schema 3 until restart. (#694)
 - Schema 3 decoding now retains at most ten adjacent chunks per direction,
   preserving the nearest chunks and ignoring malformed overflow that STM will
-  never render.
+  never render. (#695)
 - Core compatibility advisory now pins 0.3.8 legacy, 0.3.9 schema 2, and 0.3.10
   schema 3 as separate scheduled cells. Its schema 3 cell also runs the
   reviewed-project-resume core CLI and candidate-review contract in a temporary
-  Git project.
+  Git project. (#695)
 
 ## [0.1.37] — 2026-07-13
 
