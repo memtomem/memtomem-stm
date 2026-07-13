@@ -128,6 +128,7 @@ class DaemonLtmAdapter:
                 context = decode_context_compose_context(
                     item["context"],
                     max_content_chars=self._daemon_config.surfacing.result_content_max_chars,
+                    context_window=context_window,
                 )
             result = RemoteSearchResult(
                 item["content"],

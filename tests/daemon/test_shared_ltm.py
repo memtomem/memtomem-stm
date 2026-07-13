@@ -461,13 +461,22 @@ async def test_daemon_adapter_parses_schema_three_context_and_caches_selection(
                         "context": {
                             "before": [
                                 {
-                                    "id": "before",
-                                    "content": "BEFORE",
+                                    "id": f"before-{index}",
+                                    "content": f"BEFORE-{index}",
                                     "source": "memory.md",
                                     "namespace": "work",
                                 }
+                                for index in range(12)
                             ],
-                            "after": [],
+                            "after": [
+                                {
+                                    "id": f"after-{index}",
+                                    "content": f"AFTER-{index}",
+                                    "source": "memory.md",
+                                    "namespace": "work",
+                                }
+                                for index in range(12)
+                            ],
                             "chunk_position": 2,
                             "total_chunks_in_file": 2,
                         },
@@ -479,11 +488,15 @@ async def test_daemon_adapter_parses_schema_three_context_and_caches_selection(
     monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
     adapter = DaemonLtmAdapter(_config(tmp_path))
 
-    bundle = await adapter.context_compose("q", context_window=1)
+    bundle = await adapter.context_compose("q", context_window=20)
 
     assert bundle is not None
-    assert bundle.retrieved[0].context is not None
-    assert bundle.retrieved[0].context.window_before[0].content == "BEFORE"
+    context = bundle.retrieved[0].context
+    assert context is not None
+    assert [chunk.id for chunk in context.window_before] == [
+        f"before-{index}" for index in range(2, 12)
+    ]
+    assert [chunk.id for chunk in context.window_after] == [f"after-{index}" for index in range(10)]
     assert adapter.capabilities.context_compose_schema == 3
     request.assert_awaited_once()
 
