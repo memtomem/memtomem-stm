@@ -5,8 +5,8 @@ Nested settings use Pydantic's double-underscore convention, for example
 
 ## Configuration-source boundary
 
-`~/.memtomem/stm_proxy.json` loads `ProxyConfig` only. Root, surfacing, hook,
-daemon, and Langfuse settings are environment/default-only; placing those
+`~/.memtomem/stm_proxy.json` loads `ProxyConfig` only. Root, surfacing,
+formation, hook, daemon, and Langfuse settings are environment/default-only; placing those
 blocks in `stm_proxy.json` has no effect. The proxy's `consumer_model` is the
 documented propagation exception used by surfacing model-budget resolution.
 
@@ -17,7 +17,14 @@ documented propagation exception used by surfacing model-budget resolution.
 | `MEMTOMEM_STM_DATA_DIR` | `~/.memtomem` | Base directory for config-adjacent runtime state, daemon handshake, locks, and logs |
 | `MEMTOMEM_STM_ENABLED` | `true` | Global process enable switch |
 | `MEMTOMEM_STM_CONFIG_PATH` | `~/.memtomem/stm_proxy.json` | Proxy JSON path |
-| `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | `false` | Expose nine operator MCP tools |
+| `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | `false` | Expose eight operator MCP tools |
+
+## Review-first formation
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEMTOMEM_STM_FORMATION__ENABLED` | `false` | Advertise `stm_memory_propose` and allow pending-candidate submission to a capable core |
+| `MEMTOMEM_STM_FORMATION__MAX_CONTENT_CHARS` | `2000` | Maximum candidate content; values above 2000 are rejected |
 
 ## Surfacing
 

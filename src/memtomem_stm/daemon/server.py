@@ -48,6 +48,8 @@ from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
+    OP_LTM_CANDIDATE_PROPOSE,
+    OP_LTM_CONTEXT_COMPOSE,
     OP_LTM_INCREMENT_ACCESS,
     OP_LTM_SCRATCH_LIST,
     OP_LTM_SEARCH,
@@ -436,7 +438,13 @@ class DaemonServer:
                 return surface_response(output)
 
             return await self._run_admitted(req, surface_call)
-        if op in {OP_LTM_SEARCH, OP_LTM_INCREMENT_ACCESS, OP_LTM_SCRATCH_LIST}:
+        if op in {
+            OP_LTM_SEARCH,
+            OP_LTM_CONTEXT_COMPOSE,
+            OP_LTM_CANDIDATE_PROPOSE,
+            OP_LTM_INCREMENT_ACCESS,
+            OP_LTM_SCRATCH_LIST,
+        }:
             # These operations expose raw LTM search/scratch data and are
             # intentionally stricter than the legacy hook surface operation.
             if not _is_loopback_host(self._host):
@@ -470,6 +478,88 @@ class DaemonServer:
                     }
 
                 return await self._run_admitted(req, search_call)
+            if op == OP_LTM_CONTEXT_COMPOSE:
+                query = payload.get("query")
+                agent_id = payload.get("agent_id")
+                max_chars = payload.get("max_chars")
+                top_k = payload.get("top_k")
+                trace_id = payload.get("trace_id")
+                if (
+                    not isinstance(query, str)
+                    or (agent_id is not None and not isinstance(agent_id, str))
+                    or not isinstance(max_chars, int)
+                    or isinstance(max_chars, bool)
+                    or max_chars <= 0
+                    or not isinstance(top_k, int)
+                    or isinstance(top_k, bool)
+                    or top_k <= 0
+                    or (trace_id is not None and not isinstance(trace_id, str))
+                ):
+                    return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+                async def compose_call() -> dict[str, Any]:
+                    compose = getattr(self._adapter, "context_compose", None)
+                    if not callable(compose):
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
+                    bundle = await compose(
+                        query,
+                        agent_id=agent_id,
+                        max_chars=max_chars,
+                        top_k=top_k,
+                        trace_id=trace_id,
+                    )
+                    if bundle is None:
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
+
+                    def encode_result(result: Any) -> dict[str, Any]:
+                        return {
+                            "content": str(result.chunk.content),
+                            "score": float(result.score),
+                            "source": str(result.chunk.metadata.source_file),
+                            "namespace": str(result.chunk.metadata.namespace),
+                            "chunk_id": str(result.chunk.id),
+                        }
+
+                    return {
+                        "v": PROTOCOL_VERSION,
+                        "ok": True,
+                        "pinned": [encode_result(item) for item in bundle.pinned],
+                        "retrieved": [encode_result(item) for item in bundle.retrieved],
+                        "warnings": list(bundle.warnings),
+                        "omitted_block_ids": list(bundle.omitted_block_ids),
+                    }
+
+                return await self._run_admitted(req, compose_call)
+            if op == OP_LTM_CANDIDATE_PROPOSE:
+                fields = ("content", "source", "source_ref", "idempotency_key")
+                trace_id = payload.get("trace_id")
+                if (
+                    any(not isinstance(payload.get(field), str) for field in fields)
+                    or not payload.get("content", "").strip()
+                    or len(payload.get("content", "")) > 2_000
+                    or len(payload.get("source_ref", "")) > 512
+                    or not payload.get("idempotency_key", "")
+                    or len(payload.get("idempotency_key", "")) > 256
+                    or (trace_id is not None and not isinstance(trace_id, str))
+                ):
+                    return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+                async def propose_call() -> dict[str, Any]:
+                    propose = getattr(self._adapter, "candidate_propose", None)
+                    if not callable(propose):
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
+                    candidate = await propose(
+                        payload["content"],
+                        source=payload["source"],
+                        source_ref=payload["source_ref"],
+                        idempotency_key=payload["idempotency_key"],
+                        trace_id=trace_id,
+                    )
+                    if candidate is None:
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
+                    return {"v": PROTOCOL_VERSION, "ok": True, "candidate": candidate}
+
+                return await self._run_admitted(req, propose_call)
             if op == OP_LTM_INCREMENT_ACCESS:
                 chunk_ids = payload.get("chunk_ids")
                 trace_id = payload.get("trace_id")

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -509,6 +511,21 @@ def _obs_tool(fn):
     return fn
 
 
+def _should_advertise_formation_tool() -> bool:
+    """Formation is opt-in and import-time gated like observability tools."""
+    return os.environ.get("MEMTOMEM_STM_FORMATION__ENABLED", "false").strip().lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+
+
+def _formation_tool(fn):
+    if _should_advertise_formation_tool():
+        return mcp.tool()(fn)
+    return fn
+
+
 # The observability tools gated behind ``@_obs_tool`` — the ones hidden from
 # ``tools/list`` when ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` is off.
 # Source of truth for the "N tools hidden" discoverability hint (#613) so the
@@ -565,7 +582,7 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_compression_stats",
     "stm_progressive_stats",
     "stm_tuning_recommendations",
-)
+) + (("stm_memory_propose",) if _should_advertise_formation_tool() else ())
 
 
 def _move_stm_tools_to_end(server: FastMCP) -> None:
@@ -1014,6 +1031,74 @@ def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:
             f"  feedback tables: missing ({missing}) — surfacing has not initialized this DB"
         )
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_memory_propose (opt-in, review-first)
+# ---------------------------------------------------------------------------
+
+
+@_formation_tool
+async def stm_memory_propose(
+    content: str,
+    source_ref: str = "",
+    idempotency_key: str = "",
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Submit a pending memory candidate to a compatible memtomem core.
+
+    This never writes durable memory. Review the returned candidate with the
+    core's ``mm review`` or candidate-review MCP action; only core-side
+    approval may promote it to long-term or Pinned Context.
+    """
+
+    def response(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    app = _get_ctx(ctx)
+    cfg = app.config.formation
+    if not cfg.enabled:
+        return response({"ok": False, "reason": "formation_disabled"})
+    body = content.strip()
+    if not body:
+        return response({"ok": False, "reason": "content_empty"})
+    if len(body) > cfg.max_content_chars:
+        return response(
+            {
+                "ok": False,
+                "reason": "content_too_large",
+                "max_content_chars": cfg.max_content_chars,
+            }
+        )
+    ref = source_ref.strip()
+    if len(ref) > 512:
+        return response({"ok": False, "reason": "source_ref_too_large"})
+    key = (
+        idempotency_key.strip()
+        or hashlib.sha256(f"memtomem-stm\0{ref}\0{body}".encode()).hexdigest()
+    )
+    if len(key) > 256:
+        return response({"ok": False, "reason": "idempotency_key_too_large"})
+    if app.surfacing_engine is None:
+        return response({"ok": False, "reason": "ltm_unavailable"})
+    try:
+        result = await app.surfacing_engine.propose_candidate(
+            body,
+            source="memtomem-stm",
+            source_ref=ref,
+            idempotency_key=key,
+        )
+    except Exception:
+        logger.warning("Review-first candidate submission failed", exc_info=True)
+        return response({"ok": False, "reason": "candidate_submit_failed"})
+    if result is None:
+        return response({"ok": False, "reason": "formation_unsupported"})
+    allowed = {"candidate_id", "status", "created_at", "duplicate", "review_hint"}
+    payload = {key: value for key, value in result.items() if key in allowed}
+    payload.setdefault("ok", True)
+    payload.setdefault("status", "pending")
+    payload.setdefault("review_hint", "Run `mm review list` and approve or reject the candidate.")
+    return response(payload)
 
 
 # ---------------------------------------------------------------------------

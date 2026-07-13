@@ -229,6 +229,13 @@ class SurfacingFormatter:
             # A naive front-slice of the joined preview can drop the chunk
             # entirely when window_before is large.
             preview = self._sanitize(chunk.content, max_chars=preview_cap)
+            if getattr(r, "pinned", False):
+                lines.append(f"- **Pinned · {source or 'context'}**{ns_badge}: {preview}")
+                # Pinned Context is an operator-owned always-include contract,
+                # not a retrieval hit. It intentionally has no feedback ID or
+                # relevance bucket and never reaches demotion/access-boost.
+                body_ids.append(None)
+                continue
             if ctx and ctx.window_before:
                 budget = min(150, preview_cap - len(preview) - len(" | ") - len("..."))
                 if budget > 0:

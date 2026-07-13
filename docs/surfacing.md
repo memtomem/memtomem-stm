@@ -14,6 +14,29 @@ When your agent calls a proxied tool, STM automatically:
 4. **Searches LTM** (memtomem) for related memories
 5. **Injects relevant memories** at the configured position in the response
 
+When the connected core advertises `context_compose`, step 4 requests one
+structured bundle instead of calling legacy `mem_search` directly. Core owns
+Pinned Context shadowing and budget composition; STM keeps the final injection
+hard cap and treats every returned field as untrusted. Pinned entries are
+rendered without a relevance score or feedback ID and are never demoted,
+cross-session-deduped, or access-boosted.
+
+Core also owns scope selection on this composed path. STM's
+`default_namespace` and per-tool `namespace` settings apply only to the legacy
+`mem_search` fallback; they are not silently remapped to core `agent_id` scope.
+Configure composed Pinned Context and retrieval scope in memtomem core.
+
+## Review-first formation (experimental)
+
+Set `MEMTOMEM_STM_FORMATION__ENABLED=true` to advertise
+`stm_memory_propose`. The tool is usable only when the connected core
+advertises the versioned `candidate_propose` capability. It submits a pending
+candidate (maximum 2,000 characters); it does not write durable memory.
+
+Review candidates in core with `mm review list` and approve or reject them
+there. Unsupported cores return `formation_unsupported`; STM deliberately does
+not weaken the contract by falling back to `mem_add`.
+
 The response-size gate runs *before* context extraction, so a per-tool
 `query_template` (resolved during extraction) cannot bypass it — only the
 per-call explicit `_context_query` can.

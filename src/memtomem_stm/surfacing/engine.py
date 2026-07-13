@@ -17,6 +17,11 @@ from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
+from memtomem_stm.surfacing.mcp_client import (
+    LtmCapabilities,
+    LtmTransportError,
+    SearchOutcome,
+)
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
@@ -187,6 +192,30 @@ class SurfacingEngine:
         engine was constructed with — the internal no-op stand-in used
         for unconditional recording is not exposed here."""
         return self._observability_public
+
+    async def propose_candidate(
+        self,
+        content: str,
+        *,
+        source: str,
+        source_ref: str,
+        idempotency_key: str,
+        trace_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Delegate a pending candidate to core without durable-write fallback."""
+        capabilities = getattr(self._mcp_adapter, "capabilities", None)
+        if not isinstance(capabilities, LtmCapabilities):
+            return None
+        propose = getattr(self._mcp_adapter, "candidate_propose", None)
+        if not callable(propose):
+            return None
+        return await propose(
+            content,
+            source=source,
+            source_ref=source_ref,
+            idempotency_key=idempotency_key,
+            trace_id=trace_id,
+        )
 
     def clear_cache(self) -> int:
         """Flush the in-memory surfacing result cache (operator flush, reached
@@ -746,7 +775,10 @@ class SurfacingEngine:
         if cached and self._invalidated_ids:
             original_count = len(cached)
             cached = [
-                r for r in cached if (server, tool, str(r.chunk.id)) not in self._invalidated_ids
+                r
+                for r in cached
+                if getattr(r, "pinned", False)
+                or (server, tool, str(r.chunk.id)) not in self._invalidated_ids
             ]
             if len(cached) < original_count:
                 logger.debug(
@@ -761,10 +793,16 @@ class SurfacingEngine:
         # dedup-only daemon path and no-tracker engines skip the DB read.
         demoted_all = False
         if cached:
-            demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in cached])
+            demoted_ids = self._feedback_demoted_ids(
+                [str(r.chunk.id) for r in cached if not getattr(r, "pinned", False)]
+            )
             if demoted_ids:
                 original_count = len(cached)
-                cached = [r for r in cached if str(r.chunk.id) not in demoted_ids]
+                cached = [
+                    r
+                    for r in cached
+                    if getattr(r, "pinned", False) or str(r.chunk.id) not in demoted_ids
+                ]
                 demoted_all = not cached
                 logger.debug(
                     "Surfacing cache filter: %s/%s %d→%d (demoted)",
@@ -826,7 +864,11 @@ class SurfacingEngine:
                     tool=tool,
                     query=self._persistable_query(query),
                     memory_ids=delivered_ids,
-                    scores=[r.score for r in cached if str(r.chunk.id) in delivered_set],
+                    scores=[
+                        r.score
+                        for r in cached
+                        if not getattr(r, "pinned", False) and str(r.chunk.id) in delivered_set
+                    ],
                 )
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
@@ -910,19 +952,58 @@ class SurfacingEngine:
             else self._config.default_namespace
         )
 
-        # Search LTM via remote MCP client
+        # Ask a capable core to compose Pinned Context + retrieval under one
+        # budget. Capability absence alone falls back to legacy mem_search;
+        # a declared compose surface that fails is a dependency fault and is
+        # deliberately not hidden by a second legacy request.
         ctx_win = self._config.context_window_size or None
         search_kwargs: dict[str, Any] = {}
         if ctx_win:
             search_kwargs["context_window"] = ctx_win
+        compose_failed = False
+        compose_transport_failed = False
         try:
-            results, hints, outcome = await self._mcp_adapter.search(
-                query=query,
-                top_k=max_results * 2,
-                namespace=namespace,
-                trace_id=trace_id,
-                **search_kwargs,
-            )
+            capabilities = getattr(self._mcp_adapter, "capabilities", None)
+            compose = getattr(self._mcp_adapter, "context_compose", None)
+            bundle = None
+            if isinstance(capabilities, LtmCapabilities) and callable(compose):
+                try:
+                    bundle = await compose(
+                        query,
+                        max_chars=self._config.effective_max_injection_chars(),
+                        top_k=max_results * 2,
+                        trace_id=trace_id,
+                    )
+                except LtmTransportError:
+                    logger.debug("Core context composition transport failed", exc_info=True)
+                    compose_transport_failed = True
+                except (RuntimeError, ValueError):
+                    # A declared compose surface is authoritative: classify
+                    # its failure like a legacy upstream call failure, but do
+                    # not hide it with a second search request.
+                    logger.debug("Core context composition failed", exc_info=True)
+                    compose_failed = True
+            if bundle is not None:
+                results = [*bundle.pinned, *bundle.retrieved]
+                hints = [*bundle.warnings]
+                if bundle.omitted_block_ids:
+                    hints.append(
+                        "Pinned Context omitted by budget: "
+                        + ", ".join(bundle.omitted_block_ids[:5])
+                    )
+                outcome: SearchOutcome = "ok" if results else "empty_results"
+            elif compose_transport_failed:
+                results, hints, outcome = [], [], "transport_error"
+            elif compose_failed:
+                results, hints, outcome = [], [], "call_error"
+            else:
+                results, hints, outcome = await self._mcp_adapter.search(
+                    query=query,
+                    top_k=max_results * 2,
+                    namespace=namespace,
+                    trace_id=trace_id,
+                    **search_kwargs,
+                )
         except asyncio.CancelledError:
             self._reset_score_scale_streak(server, tool)
             raise
@@ -980,7 +1061,8 @@ class SurfacingEngine:
             self._persist_fault(server, tool, "ltm_parse_empty")
             raise _DependencyFault(outcome)
 
-        self._observe_score_scale(server, tool, results, min_score)
+        retrieved_results = [r for r in results if not getattr(r, "pinned", False)]
+        self._observe_score_scale(server, tool, retrieved_results, min_score)
 
         # Parent trust-UX hints (parent PR #231): log at INFO even when results
         # are empty or get filtered out below, since an operator may want to
@@ -1002,7 +1084,8 @@ class SurfacingEngine:
         # not keep reappearing from a cached query after process restart;
         # ``_render_cached`` re-applies it on the hit path for entries whose
         # memories cross the threshold mid-TTL (e.g. via another process).
-        scored = [r for r in results if r.score >= min_score]
+        pinned_results = [r for r in results if getattr(r, "pinned", False)]
+        scored = [r for r in retrieved_results if r.score >= min_score]
         demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in scored])
         if demoted_ids:
             logger.debug(
@@ -1019,15 +1102,19 @@ class SurfacingEngine:
         # (``mcp_client``), so two results with byte-identical content collide on
         # one id and would otherwise render as two identical bullets to the agent
         # (they also share a ``memory_id``, so feedback already treats them as one).
-        relevant = []
-        seen: set[str] = set()
+        relevant = list(pinned_results)
+        # Treat core output as untrusted: a retrieved item reusing a pinned
+        # block ID must not render the same memory twice.
+        seen: set[str] = {str(r.chunk.id) for r in pinned_results}
+        retrieved_count = 0
         for r in scored:
             mid = str(r.chunk.id)
             if mid in demoted_ids or mid in self._surfaced_ids or mid in seen:
                 continue
             relevant.append(r)
             seen.add(mid)
-            if len(relevant) >= max_results:
+            retrieved_count += 1
+            if retrieved_count >= max_results:
                 break
 
         # Cache result (even empty, to avoid repeated searches)
@@ -1055,7 +1142,7 @@ class SurfacingEngine:
         # ``scratch_list`` below opens an interleaving window where both
         # coroutines build ``relevant`` including the same memory and
         # violate the documented session-dedup invariant.
-        new_ids = [str(r.chunk.id) for r in relevant]
+        new_ids = [str(r.chunk.id) for r in relevant if not getattr(r, "pinned", False)]
         self._claim_surfaced_ids(new_ids)
 
         logger.info("Surfacing %d memories for %s/%s", len(relevant), server, tool)
@@ -1114,7 +1201,11 @@ class SurfacingEngine:
         self._gate.record_surfacing(query)
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
-            delivered_results = [r for r in relevant if str(r.chunk.id) in delivered_set]
+            delivered_results = [
+                r
+                for r in relevant
+                if not getattr(r, "pinned", False) and str(r.chunk.id) in delivered_set
+            ]
             try:
                 self._feedback_tracker.record_surfacing(
                     surfacing_id=surfacing_id,

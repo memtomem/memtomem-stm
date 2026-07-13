@@ -21,6 +21,8 @@ from memtomem_stm.daemon.discovery import (
 )
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
+    OP_LTM_CANDIDATE_PROPOSE,
+    OP_LTM_CONTEXT_COMPOSE,
     OP_LTM_INCREMENT_ACCESS,
     OP_LTM_SCRATCH_LIST,
     OP_LTM_SEARCH,
@@ -168,7 +170,13 @@ async def ltm_request(
     The state distinguishes a missing matching handshake (eligible for
     auto-spawn) from an endpoint that was discovered but did not answer.
     """
-    if op not in {OP_LTM_SEARCH, OP_LTM_INCREMENT_ACCESS, OP_LTM_SCRATCH_LIST}:
+    if op not in {
+        OP_LTM_SEARCH,
+        OP_LTM_CONTEXT_COMPOSE,
+        OP_LTM_CANDIDATE_PROPOSE,
+        OP_LTM_INCREMENT_ACCESS,
+        OP_LTM_SCRATCH_LIST,
+    }:
         return "invalid", None
     hs = _live_handshake_candidate(config)
     if hs is None:

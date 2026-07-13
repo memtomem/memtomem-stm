@@ -10,12 +10,16 @@ from typing import Any, cast, get_args
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
 from memtomem_stm.daemon.protocol import (
+    OP_LTM_CANDIDATE_PROPOSE,
+    OP_LTM_CONTEXT_COMPOSE,
     OP_LTM_INCREMENT_ACCESS,
     OP_LTM_SCRATCH_LIST,
     OP_LTM_SEARCH,
 )
 from memtomem_stm.daemon.spawn import request_spawn
 from memtomem_stm.surfacing.mcp_client import (
+    ContextComposeResult,
+    LtmCapabilities,
     RemoteSearchResult,
     SearchOutcome,
 )
@@ -31,6 +35,8 @@ class DaemonLtmAdapter:
     def __init__(self, daemon_config: STMConfig) -> None:
         self._daemon_config = daemon_config
         self._timeout = daemon_config.surfacing.timeout_seconds
+        self._compose_supported: bool | None = None
+        self._candidate_propose_supported: bool | None = None
 
     async def _spawn_best_effort(self) -> None:
         try:
@@ -50,6 +56,115 @@ class DaemonLtmAdapter:
     async def stop(self) -> None:
         # The proxy does not own the shared daemon or its LTM child.
         return None
+
+    @property
+    def capabilities(self) -> LtmCapabilities:
+        # The daemon owns core negotiation; operation responses distinguish a
+        # capable core from an older one without exposing session state.
+        return LtmCapabilities(
+            context_compose_schema=0 if self._compose_supported is False else 1,
+            candidate_propose_schema=0 if self._candidate_propose_supported is False else 1,
+        )
+
+    async def context_compose(
+        self,
+        query: str,
+        *,
+        agent_id: str | None = None,
+        max_chars: int = 3000,
+        top_k: int = 10,
+        trace_id: str | None = None,
+    ) -> ContextComposeResult | None:
+        if self._compose_supported is False:
+            return None
+        state, resp = await client.ltm_request(
+            self._daemon_config,
+            OP_LTM_CONTEXT_COMPOSE,
+            {
+                "query": query,
+                "agent_id": agent_id,
+                "max_chars": max_chars,
+                "top_k": top_k,
+                "trace_id": trace_id,
+            },
+            timeout=self._timeout,
+        )
+        if state == "missing":
+            # The daemon generation is gone. Forget capability verdicts from
+            # that generation so an upgraded replacement is probed again.
+            self._compose_supported = None
+            self._candidate_propose_supported = None
+            await self._spawn_best_effort()
+            return None
+        if state != "ok" or resp is None or not resp.get("ok"):
+            if resp is not None and resp.get("status") == "unsupported":
+                self._compose_supported = False
+                return None
+            raise RuntimeError("daemon context compose unavailable")
+        self._compose_supported = True
+        raw_pinned = resp.get("pinned", [])
+        raw_retrieved = resp.get("retrieved", [])
+        if not isinstance(raw_pinned, list) or not isinstance(raw_retrieved, list):
+            raise ValueError("daemon context compose malformed")
+
+        def decode(item: Any, *, pinned: bool):
+            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+                raise ValueError("daemon context item malformed")
+            result = RemoteSearchResult(
+                item["content"],
+                safe_float(item.get("score"), 1.0 if pinned else 0.0),
+                source=str(item.get("source") or ""),
+                namespace=str(item.get("namespace") or "default"),
+                pinned=pinned,
+            )
+            if isinstance(item.get("chunk_id"), str):
+                result.chunk.id = item["chunk_id"]
+            return result
+
+        pinned_items = tuple(decode(item, pinned=True) for item in raw_pinned)
+        retrieved_items = tuple(decode(item, pinned=False) for item in raw_retrieved)
+        warnings = resp.get("warnings", [])
+        omitted = resp.get("omitted_block_ids", [])
+        return ContextComposeResult(
+            pinned_items,
+            retrieved_items,
+            tuple(v for v in warnings if isinstance(v, str)) if isinstance(warnings, list) else (),
+            tuple(v for v in omitted if isinstance(v, str)) if isinstance(omitted, list) else (),
+        )
+
+    async def candidate_propose(
+        self,
+        content: str,
+        *,
+        source: str,
+        source_ref: str,
+        idempotency_key: str,
+        trace_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if self._candidate_propose_supported is False:
+            return None
+        state, resp = await client.ltm_request(
+            self._daemon_config,
+            OP_LTM_CANDIDATE_PROPOSE,
+            {
+                "content": content,
+                "source": source,
+                "source_ref": source_ref,
+                "idempotency_key": idempotency_key,
+                "trace_id": trace_id,
+            },
+            timeout=self._timeout,
+        )
+        if state != "ok" or resp is None or not resp.get("ok"):
+            if resp is not None and resp.get("status") == "unsupported":
+                self._candidate_propose_supported = False
+                return None
+            raise RuntimeError("daemon candidate proposal unavailable")
+        self._candidate_propose_supported = True
+        payload = resp.get("candidate")
+        if not isinstance(payload, dict):
+            raise ValueError("daemon candidate response malformed")
+        return payload
 
     async def search(
         self,
@@ -72,6 +187,8 @@ class DaemonLtmAdapter:
             self._daemon_config, OP_LTM_SEARCH, payload, timeout=self._timeout
         )
         if state == "missing":
+            self._compose_supported = None
+            self._candidate_propose_supported = None
             await self._spawn_best_effort()
             return [], [], "daemon_starting"
         if state != "ok" or resp is None:
