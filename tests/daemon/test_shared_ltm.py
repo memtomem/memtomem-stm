@@ -24,7 +24,11 @@ from memtomem_stm.daemon.protocol import (
 from memtomem_stm.daemon.discovery import config_fingerprint, handshake_path, write_handshake
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.daemon_adapter import DaemonLtmAdapter
-from memtomem_stm.surfacing.mcp_client import ContextComposeResult, RemoteSearchResult
+from memtomem_stm.surfacing.mcp_client import (
+    ContextComposeResult,
+    LtmCapabilities,
+    RemoteSearchResult,
+)
 from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.observability import SurfacingObservability
@@ -123,22 +127,69 @@ async def test_daemon_search_round_trip_preserves_structured_fields(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_daemon_v5_compose_and_candidate_roundtrip_and_validation(tmp_path: Path) -> None:
+async def test_daemon_v6_compose_and_candidate_roundtrip_and_validation(tmp_path: Path) -> None:
     server = DaemonServer(_config(tmp_path))
     pinned = RemoteSearchResult("policy", 1.0, "/policy.md", "global", pinned=True)
     pinned.chunk.id = "pin-1"
     compose = AsyncMock(return_value=ContextComposeResult((pinned,), (), ("warning",), ()))
     propose = AsyncMock(return_value={"candidate_id": "candidate-1", "status": "pending"})
-    server._adapter = SimpleNamespace(context_compose=compose, candidate_propose=propose)
+    server._adapter = SimpleNamespace(
+        capabilities=LtmCapabilities(context_compose_schema=2, candidate_propose_schema=1),
+        context_compose=compose,
+        candidate_propose=propose,
+    )
 
     composed = await server._dispatch(
+        _request(
+            OP_LTM_CONTEXT_COMPOSE,
+            {
+                "query": "q",
+                "agent_id": None,
+                "max_chars": 100,
+                "top_k": 2,
+                "namespace": ["work"],
+                "context_window": 2,
+                "context_compose_schema": 2,
+            },
+        )
+    )
+    assert composed is not None and composed["ok"] is True
+    assert composed["context_compose_schema"] == 2
+    assert composed["pinned"][0]["chunk_id"] == "pin-1"
+    compose.assert_awaited_once_with(
+        "q",
+        agent_id=None,
+        max_chars=100,
+        top_k=2,
+        namespace=["work"],
+        context_window=2,
+        trace_id=None,
+    )
+
+    missing_schema = await server._dispatch(
         _request(
             OP_LTM_CONTEXT_COMPOSE,
             {"query": "q", "agent_id": None, "max_chars": 100, "top_k": 2},
         )
     )
-    assert composed is not None and composed["ok"] is True
-    assert composed["pinned"][0]["chunk_id"] == "pin-1"
+    assert missing_schema == {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
+
+    server._adapter.capabilities = LtmCapabilities(context_compose_schema=1)
+    old_core = await server._dispatch(
+        _request(
+            OP_LTM_CONTEXT_COMPOSE,
+            {
+                "query": "q",
+                "agent_id": None,
+                "max_chars": 100,
+                "top_k": 2,
+                "namespace": "work",
+                "context_window": 0,
+                "context_compose_schema": 2,
+            },
+        )
+    )
+    assert old_core == {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
 
     proposed = await server._dispatch(
         _request(
@@ -173,6 +224,70 @@ async def test_daemon_v5_compose_and_candidate_roundtrip_and_validation(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_cold_daemon_compose_negotiates_before_capability_verdict(tmp_path: Path) -> None:
+    server = DaemonServer(_config(tmp_path))
+    pinned = RemoteSearchResult("policy", 1.0, "/policy.md", "global", pinned=True)
+    adapter = SimpleNamespace(
+        capabilities=LtmCapabilities(),
+        capabilities_ready=False,
+    )
+
+    async def compose(*args, **kwargs):
+        adapter.capabilities = LtmCapabilities(context_compose_schema=2)
+        adapter.capabilities_ready = True
+        return ContextComposeResult((pinned,), ())
+
+    adapter.context_compose = AsyncMock(side_effect=compose)
+    server._adapter = adapter
+
+    response = await server._dispatch(
+        _request(
+            OP_LTM_CONTEXT_COMPOSE,
+            {
+                "query": "q",
+                "agent_id": None,
+                "max_chars": 100,
+                "top_k": 2,
+                "namespace": "work",
+                "context_window": 1,
+                "context_compose_schema": 2,
+            },
+        )
+    )
+
+    assert response is not None and response["ok"] is True
+    assert response["context_compose_schema"] == 2
+    adapter.context_compose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_cold_negotiation_is_unavailable_not_unsupported(tmp_path: Path) -> None:
+    server = DaemonServer(_config(tmp_path))
+    server._adapter = SimpleNamespace(
+        capabilities=LtmCapabilities(),
+        capabilities_ready=False,
+        context_compose=AsyncMock(return_value=None),
+    )
+
+    response = await server._dispatch(
+        _request(
+            OP_LTM_CONTEXT_COMPOSE,
+            {
+                "query": "q",
+                "agent_id": None,
+                "max_chars": 100,
+                "top_k": 2,
+                "namespace": None,
+                "context_window": None,
+                "context_compose_schema": 2,
+            },
+        )
+    )
+
+    assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+
+
+@pytest.mark.asyncio
 async def test_daemon_adapter_memoizes_unsupported_compose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -190,8 +305,79 @@ async def test_daemon_adapter_memoizes_unsupported_compose(
     request.return_value = ("missing", None)
     monkeypatch.setattr(adapter, "_spawn_best_effort", AsyncMock())
     assert await adapter.search("q") == ([], [], "daemon_starting")
-    assert adapter.capabilities.context_compose_schema == 1
+    assert adapter.capabilities.context_compose_schema == 2
     assert adapter.capabilities.candidate_propose_schema == 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_adapter_does_not_cache_transient_compose_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = AsyncMock(return_value=("ok", {"ok": False, "status": "unavailable"}))
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    with pytest.raises(RuntimeError, match="context compose unavailable"):
+        await adapter.context_compose("q")
+
+    assert adapter.capabilities.context_compose_schema == 2
+    request.return_value = ("ok", {"ok": False, "status": "unsupported"})
+    assert await adapter.context_compose("q") is None
+    assert request.await_count == 2
+    assert adapter.capabilities.context_compose_schema == 0
+
+
+@pytest.mark.asyncio
+async def test_daemon_adapter_requires_schema_two_echo_and_forwards_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = AsyncMock(
+        return_value=(
+            "ok",
+            {
+                "ok": True,
+                "context_compose_schema": 2,
+                "pinned": [],
+                "retrieved": [
+                    {
+                        "content": "decision",
+                        "score": 0.8,
+                        "source": "decision.md",
+                        "namespace": "work",
+                        "chunk_id": "memory-1",
+                    }
+                ],
+            },
+        )
+    )
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    bundle = await adapter.context_compose(
+        "q", namespace=["work"], context_window=2, trace_id="trace-1"
+    )
+
+    assert bundle is not None and bundle.retrieved[0].chunk.metadata.namespace == "work"
+    request.assert_awaited_once_with(
+        adapter._daemon_config,
+        OP_LTM_CONTEXT_COMPOSE,
+        {
+            "query": "q",
+            "agent_id": None,
+            "max_chars": 3000,
+            "top_k": 10,
+            "namespace": ["work"],
+            "context_window": 2,
+            "context_compose_schema": 2,
+            "trace_id": "trace-1",
+        },
+        timeout=adapter._timeout,
+    )
+
+    request.return_value = ("ok", {"ok": True, "pinned": [], "retrieved": []})
+    second = DaemonLtmAdapter(_config(tmp_path))
+    assert await second.context_compose("q") is None
+    assert second.capabilities.context_compose_schema == 0
 
 
 @pytest.mark.asyncio

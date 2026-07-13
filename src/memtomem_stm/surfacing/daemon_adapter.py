@@ -62,7 +62,7 @@ class DaemonLtmAdapter:
         # The daemon owns core negotiation; operation responses distinguish a
         # capable core from an older one without exposing session state.
         return LtmCapabilities(
-            context_compose_schema=0 if self._compose_supported is False else 1,
+            context_compose_schema=0 if self._compose_supported is False else 2,
             candidate_propose_schema=0 if self._candidate_propose_supported is False else 1,
         )
 
@@ -73,6 +73,8 @@ class DaemonLtmAdapter:
         agent_id: str | None = None,
         max_chars: int = 3000,
         top_k: int = 10,
+        namespace: str | list[str] | None = None,
+        context_window: int | None = None,
         trace_id: str | None = None,
     ) -> ContextComposeResult | None:
         if self._compose_supported is False:
@@ -85,6 +87,9 @@ class DaemonLtmAdapter:
                 "agent_id": agent_id,
                 "max_chars": max_chars,
                 "top_k": top_k,
+                "namespace": namespace,
+                "context_window": context_window,
+                "context_compose_schema": 2,
                 "trace_id": trace_id,
             },
             timeout=self._timeout,
@@ -101,6 +106,9 @@ class DaemonLtmAdapter:
                 self._compose_supported = False
                 return None
             raise RuntimeError("daemon context compose unavailable")
+        if resp.get("context_compose_schema") != 2:
+            self._compose_supported = False
+            return None
         self._compose_supported = True
         raw_pinned = resp.get("pinned", [])
         raw_retrieved = resp.get("retrieved", [])

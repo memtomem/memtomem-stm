@@ -13,7 +13,7 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
-- The local daemon protocol is now v5. Finite-idle v4 daemons exit naturally;
+- The local daemon protocol is now v6. Finite-idle older daemons exit naturally;
   pinned stale daemons can be removed with `mms daemon stop --all`. A brief
   one-child-per-version overlap is possible during upgrade.
 - The inactive bundled INDEX surface has been retired. `stm_index_stats` is no
@@ -35,8 +35,17 @@ changes inline only. See the deprecation policy in
   `context_compose` / `candidate_propose` through `mem_do(action="version")`;
   legacy cores retain the existing structured/compact search path. Formation
   is disabled by default and never falls back to a direct durable write (#691).
-- Daemon protocol v5 carries context-compose and candidate-proposal operations
-  without sharing mutable MCP session handles between proxy clients (#691).
+- Daemon protocol v6 carries schema-bound context-compose scope and
+  candidate-proposal operations without sharing mutable MCP session handles
+  between proxy clients (#691).
+
+### Fixed
+
+- Context composition now requires `context_compose` schema 2 and preserves
+  per-tool/default namespace plus context-window settings across direct and
+  shared-daemon routes. Schema 0/1 cores use legacy search; an advertised
+  schema 2 failure remains visible as an LTM dependency fault instead of being
+  hidden by a second search request (#692).
 
 ### Docs
 

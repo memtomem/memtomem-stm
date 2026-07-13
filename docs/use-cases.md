@@ -17,9 +17,10 @@ that an agent will request every omitted section.
 
 ## Resume a project with reviewed memory
 
-With a compatible memtomem core, pre-load or approve a project decision, start
-a new agent session, and compare surfacing disabled versus enabled. Measure the
-number of tool calls and time to the first correct answer, retrieval precision,
+With a core that advertises `context_compose` schema 2, pre-load or approve a
+project decision, start a new agent session, and compare surfacing disabled
+versus enabled. Measure the number of tool calls and time to the first correct
+answer, retrieval precision,
 duplicate re-surfacing, and surfacing latency.
 
 STM retrieves and delivers the memory. The core owns storage, privacy, scope,
