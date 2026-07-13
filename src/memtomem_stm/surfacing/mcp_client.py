@@ -24,6 +24,8 @@ from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 logger = logging.getLogger(__name__)
+# Match core's protocol ceiling while retaining the negotiated context for
+# consumers beyond the compact formatter, which renders only the nearest one.
 _MAX_CONTEXT_WINDOW_CHUNKS = 10
 
 # #295: outcome typing for ``McpClientSearchAdapter.search`` — five

@@ -1111,7 +1111,7 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     ):
         assert snippet in guide, f"reviewed-memory-resume guide lost {snippet!r}"
 
-    smoke = _read("scripts/core_compat_smoke.py")
+    smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (
         "_init_schema_three_guide",
         '"resume-contract"',
@@ -1120,7 +1120,7 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         '"pinned", "list", "--json"',
         '"review", "list"',
         '"review", "show"',
-        '"review",\n            "approve"',
+        '"review", "approve"',
         '"compat-smoke"',
     ):
         assert token in smoke, f"released-core advisory lost guide contract token {token!r}"

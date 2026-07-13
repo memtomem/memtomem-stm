@@ -179,7 +179,7 @@ def _init_schema_three_guide(mm: Path, *, project: Path, env: dict[str, str]) ->
         sentence = (
             f"{marker}Phase {index} uses blue-green verification and a 2% rollback threshold. "
         )
-        sections.append(f"## Deployment phase {index}\n\n" + sentence * 35)
+        sections.append(f"## Deployment phase {index}\n\n" + sentence * 10)
     context_file.write_text("\n\n".join(sections), encoding="utf-8")
     _run(
         [
@@ -319,8 +319,8 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                     )
                     assert hit.chunk.metadata.namespace == "resume-demo"
                     assert hit.context is not None
-                    assert hit.context.window_before
-                    assert hit.context.window_after
+                    assert "Phase 3" in hit.context.window_before[-1].content
+                    assert "Phase 5" in hit.context.window_after[0].content
                     await _assert_schema_three_review_flow(
                         adapter,
                         mm,

@@ -46,7 +46,7 @@ for index in range(1, 9):
         f"## Deployment phase {index}\n\n"
         + (
             f"{marker}Phase {index} uses blue-green verification and a 2% rollback threshold. "
-            * 35
+            * 10
         )
     )
 (root / "resume-demo.md").write_text("\n\n".join(sections), encoding="utf-8")
