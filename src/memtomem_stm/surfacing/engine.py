@@ -17,7 +17,11 @@ from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
-from memtomem_stm.surfacing.mcp_client import LtmCapabilities, SearchOutcome
+from memtomem_stm.surfacing.mcp_client import (
+    LtmCapabilities,
+    LtmTransportError,
+    SearchOutcome,
+)
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
@@ -957,6 +961,7 @@ class SurfacingEngine:
         if ctx_win:
             search_kwargs["context_window"] = ctx_win
         compose_failed = False
+        compose_transport_failed = False
         try:
             capabilities = getattr(self._mcp_adapter, "capabilities", None)
             compose = getattr(self._mcp_adapter, "context_compose", None)
@@ -969,6 +974,9 @@ class SurfacingEngine:
                         top_k=max_results * 2,
                         trace_id=trace_id,
                     )
+                except LtmTransportError:
+                    logger.debug("Core context composition transport failed", exc_info=True)
+                    compose_transport_failed = True
                 except (RuntimeError, ValueError):
                     # A declared compose surface is authoritative: classify
                     # its failure like a legacy upstream call failure, but do
@@ -984,6 +992,8 @@ class SurfacingEngine:
                         + ", ".join(bundle.omitted_block_ids[:5])
                     )
                 outcome: SearchOutcome = "ok" if results else "empty_results"
+            elif compose_transport_failed:
+                results, hints, outcome = [], [], "transport_error"
             elif compose_failed:
                 results, hints, outcome = [], [], "call_error"
             else:

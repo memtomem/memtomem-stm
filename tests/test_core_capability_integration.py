@@ -19,6 +19,7 @@ from memtomem_stm.surfacing.mcp_client import (
     CompactResultParser,
     ContextComposeResult,
     LtmCapabilities,
+    LtmTransportError,
     McpClientSearchAdapter,
     RemoteSearchResult,
 )
@@ -137,6 +138,39 @@ async def test_compose_failure_is_classified_without_legacy_retry() -> None:
         "response"
     )
     assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_call_failed": 1}
+    adapter.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_compose_transport_failure_is_ltm_unavailable_without_legacy_retry() -> None:
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=1)
+
+        def __init__(self) -> None:
+            self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))
+
+        async def context_compose(self, *args, **kwargs):
+            raise LtmTransportError("transport failed")
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    adapter = Adapter()
+    observability = SurfacingObservability()
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+        ),
+        mcp_adapter=adapter,
+        observability=observability,
+    )
+    assert await engine.surface("docs", "read_file", {}, "response", context_query="q") == (
+        "response"
+    )
+    assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
     adapter.search.assert_not_awaited()
 
 

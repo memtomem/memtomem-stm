@@ -48,7 +48,7 @@ changes inline only. See the deprecation policy in
 - Corrected the standalone pipeline after #690 retired the inactive bundled
   INDEX surface, qualified the token-reduction claim as workload-dependent,
   and added reproducible use-case boundaries for compression, caching, and
-  surfacing.
+  surfacing (#691).
 
 ## [0.1.36] — 2026-07-12
 

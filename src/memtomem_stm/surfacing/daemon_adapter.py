@@ -90,6 +90,10 @@ class DaemonLtmAdapter:
             timeout=self._timeout,
         )
         if state == "missing":
+            # The daemon generation is gone. Forget capability verdicts from
+            # that generation so an upgraded replacement is probed again.
+            self._compose_supported = None
+            self._candidate_propose_supported = None
             await self._spawn_best_effort()
             return None
         if state != "ok" or resp is None or not resp.get("ok"):
@@ -183,6 +187,8 @@ class DaemonLtmAdapter:
             self._daemon_config, OP_LTM_SEARCH, payload, timeout=self._timeout
         )
         if state == "missing":
+            self._compose_supported = None
+            self._candidate_propose_supported = None
             await self._spawn_best_effort()
             return [], [], "daemon_starting"
         if state != "ok" or resp is None:

@@ -185,6 +185,14 @@ async def test_daemon_adapter_memoizes_unsupported_compose(
     assert request.await_count == 1
     assert adapter.capabilities.context_compose_schema == 0
 
+    # A missing legacy fallback proves the daemon generation is gone and
+    # resets memoized capability verdicts for its replacement.
+    request.return_value = ("missing", None)
+    monkeypatch.setattr(adapter, "_spawn_best_effort", AsyncMock())
+    assert await adapter.search("q") == ([], [], "daemon_starting")
+    assert adapter.capabilities.context_compose_schema == 1
+    assert adapter.capabilities.candidate_propose_schema == 1
+
 
 @pytest.mark.asyncio
 async def test_daemon_adapter_end_to_end_over_loopback(tmp_path: Path) -> None:

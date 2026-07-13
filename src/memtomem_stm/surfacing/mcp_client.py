@@ -55,6 +55,10 @@ class LtmCapabilities:
     increment_access: bool = False
 
 
+class LtmTransportError(RuntimeError):
+    """A compose RPC still failed after the adapter's reconnect attempt."""
+
+
 @dataclass(frozen=True, slots=True)
 class ContextComposeResult:
     """Structured pinned-first bundle returned by a compatible core."""
@@ -1159,7 +1163,10 @@ class McpClientSearchAdapter:
         }
         if agent_id:
             params["agent_id"] = agent_id
-        result = await self._call_mem_do("context_compose", params, trace_id=trace_id)
+        try:
+            result = await self._call_mem_do("context_compose", params, trace_id=trace_id)
+        except self._TRANSPORT_ERRORS as exc:
+            raise LtmTransportError("core context_compose transport unavailable") from exc
         if getattr(result, "isError", False) is True:
             raise RuntimeError("core context_compose returned isError=true")
         try:
