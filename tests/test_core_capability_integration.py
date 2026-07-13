@@ -22,6 +22,7 @@ from memtomem_stm.surfacing.mcp_client import (
     LtmTransportError,
     McpClientSearchAdapter,
     RemoteSearchResult,
+    decode_context_compose_context,
 )
 from memtomem_stm.surfacing.observability import SurfacingObservability
 
@@ -242,11 +243,17 @@ async def test_direct_schema_three_compose_parses_adjacent_context(
                                         "context": {
                                             "before": [
                                                 {
+                                                    "id": "before-0",
+                                                    "content": "older-context",
+                                                    "source": "memory.md",
+                                                    "namespace": "work",
+                                                },
+                                                {
                                                     "id": "before-1",
                                                     "content": "before-context",
                                                     "source": "memory.md",
                                                     "namespace": "work",
-                                                }
+                                                },
                                             ],
                                             "after": [
                                                 {
@@ -254,7 +261,13 @@ async def test_direct_schema_three_compose_parses_adjacent_context(
                                                     "content": "after-context",
                                                     "source": "memory.md",
                                                     "namespace": "work",
-                                                }
+                                                },
+                                                {
+                                                    "id": "after-2",
+                                                    "content": "farther-context",
+                                                    "source": "memory.md",
+                                                    "namespace": "work",
+                                                },
                                             ],
                                             "chunk_position": 2,
                                             "total_chunks_in_file": 3,
@@ -280,6 +293,65 @@ async def test_direct_schema_three_compose_parses_adjacent_context(
     assert context.window_after[0].content == "after-co"
     assert context.chunk_position == 2
     assert context.total_chunks_in_file == 3
+
+
+def _adjacent_chunk(index: int, *, prefix: str = "chunk") -> dict[str, str]:
+    return {
+        "id": f"{prefix}-{index}",
+        "content": f"content-{index}",
+        "source": "memory.md",
+        "namespace": "work",
+    }
+
+
+@pytest.mark.parametrize(
+    ("context_window", "expected_before", "expected_after"),
+    [
+        (None, list(range(2, 12)), list(range(10))),
+        (2, [10, 11], [0, 1]),
+        (20, list(range(2, 12)), list(range(10))),
+        (0, [], []),
+    ],
+)
+def test_schema_three_context_bounds_count_and_preserves_nearest_order(
+    context_window: int | None,
+    expected_before: list[int],
+    expected_after: list[int],
+) -> None:
+    context = decode_context_compose_context(
+        {
+            "before": [_adjacent_chunk(index, prefix="before") for index in range(12)],
+            "after": [_adjacent_chunk(index, prefix="after") for index in range(12)],
+        },
+        max_content_chars=100,
+        context_window=context_window,
+    )
+
+    assert [chunk.id for chunk in context.window_before] == [
+        f"before-{index}" for index in expected_before
+    ]
+    assert [chunk.id for chunk in context.window_after] == [
+        f"after-{index}" for index in expected_after
+    ]
+
+
+def test_schema_three_context_ignores_malformed_overflow_but_rejects_retained() -> None:
+    valid = [_adjacent_chunk(index) for index in range(10)]
+    malformed = {"id": "bad", "content": 1, "source": "memory.md"}
+
+    context = decode_context_compose_context(
+        {"before": [malformed, *valid], "after": []},
+        max_content_chars=100,
+        context_window=None,
+    )
+    assert len(context.window_before) == 10
+
+    with pytest.raises(ValueError, match="adjacent chunk"):
+        decode_context_compose_context(
+            {"before": [*valid[1:], malformed], "after": []},
+            max_content_chars=100,
+            context_window=None,
+        )
 
 
 @pytest.mark.asyncio

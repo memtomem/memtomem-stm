@@ -24,6 +24,9 @@ from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 logger = logging.getLogger(__name__)
+# Match core's protocol ceiling while retaining the negotiated context for
+# consumers beyond the compact formatter, which renders only the nearest one.
+_MAX_CONTEXT_WINDOW_CHUNKS = 10
 
 # #295: outcome typing for ``McpClientSearchAdapter.search`` — five
 # different failure modes used to collapse to ``([], [])`` and looked
@@ -130,14 +133,26 @@ def decode_context_compose_context(
     raw: Any,
     *,
     max_content_chars: int,
+    context_window: int | None,
 ) -> RemoteContextInfo:
-    """Strictly decode the optional schema-3 context object."""
+    """Strictly decode the bounded portion of a schema-3 context object."""
     if not isinstance(raw, dict):
         raise ValueError("context compose context must be an object")
     before = raw.get("before", [])
     after = raw.get("after", [])
     if not isinstance(before, list) or not isinstance(after, list):
         raise ValueError("context compose context windows must be arrays")
+
+    limit = (
+        _MAX_CONTEXT_WINDOW_CHUNKS
+        if context_window is None
+        else min(max(context_window, 0), _MAX_CONTEXT_WINDOW_CHUNKS)
+    )
+    # Core orders ``before`` from oldest to nearest and ``after`` from
+    # nearest to farthest. Slice before strict decoding so an oversized
+    # response cannot allocate or invalidate context that STM will not use.
+    bounded_before = before[-limit:] if limit else []
+    bounded_after = after[:limit] if limit else []
 
     def decode_chunk(item: Any) -> RemoteContextChunk:
         if not isinstance(item, dict):
@@ -166,8 +181,8 @@ def decode_context_compose_context(
     ):
         raise ValueError("context compose chunk positions must be non-negative integers")
     return RemoteContextInfo(
-        window_before=tuple(decode_chunk(item) for item in before),
-        window_after=tuple(decode_chunk(item) for item in after),
+        window_before=tuple(decode_chunk(item) for item in bounded_before),
+        window_after=tuple(decode_chunk(item) for item in bounded_after),
         chunk_position=chunk_position,
         total_chunks_in_file=total_chunks,
     )
@@ -1281,6 +1296,7 @@ class McpClientSearchAdapter:
                 context = decode_context_compose_context(
                     item["context"],
                     max_content_chars=self._config.result_content_max_chars,
+                    context_window=context_window,
                 )
             entry = RemoteSearchResult(
                 item["content"][: self._config.result_content_max_chars],
