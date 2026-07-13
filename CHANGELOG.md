@@ -11,6 +11,33 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- The local daemon protocol is now v7. Upgrading may briefly leave one v6 and
+  one v7 daemon, plus their warm LTM children, running for the same logical
+  configuration. With the default 900-second idle timeout the v6 daemon exits
+  naturally; pinned daemons (`idle_timeout_seconds=0`) remain until
+  `mms daemon stop --all`.
+
+### Added
+
+- Context-compose schema 3 preserves budgeted adjacent chunks from compatible
+  cores across direct and shared-daemon routes. Schema 2 remains supported for
+  scoped Pinned Context without a visible context-window guarantee.
+- Schema 3 window requests receive a larger wire-only retrieval budget while
+  the configured model-injection limit remains unchanged.
+- Added a copy/paste reviewed-project-resume guide covering project-local
+  Pinned Context, automatic surfacing, nearest-neighbor previews, and the
+  separate review-first proposal boundary.
+
+### Changed
+
+- Daemon protocol v7 negotiates a client maximum and selected compose schema
+  per response. The protocol bump deliberately prevents a stale v6 daemon from
+  silently suppressing schema 3 until restart.
+- Core compatibility advisory now pins 0.3.8 legacy, 0.3.9 schema 2, and 0.3.10
+  schema 3 as separate scheduled cells.
+
 ## [0.1.37] — 2026-07-13
 
 ### Upgrade notes

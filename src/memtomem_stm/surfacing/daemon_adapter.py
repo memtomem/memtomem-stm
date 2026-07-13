@@ -22,6 +22,7 @@ from memtomem_stm.surfacing.mcp_client import (
     LtmCapabilities,
     RemoteSearchResult,
     SearchOutcome,
+    decode_context_compose_context,
 )
 from memtomem_stm.utils.numeric import safe_float
 
@@ -35,7 +36,7 @@ class DaemonLtmAdapter:
     def __init__(self, daemon_config: STMConfig) -> None:
         self._daemon_config = daemon_config
         self._timeout = daemon_config.surfacing.timeout_seconds
-        self._compose_supported: bool | None = None
+        self._compose_schema: int | None = None
         self._candidate_propose_supported: bool | None = None
 
     async def _spawn_best_effort(self) -> None:
@@ -62,7 +63,7 @@ class DaemonLtmAdapter:
         # The daemon owns core negotiation; operation responses distinguish a
         # capable core from an older one without exposing session state.
         return LtmCapabilities(
-            context_compose_schema=0 if self._compose_supported is False else 2,
+            context_compose_schema=3 if self._compose_schema is None else self._compose_schema,
             candidate_propose_schema=0 if self._candidate_propose_supported is False else 1,
         )
 
@@ -77,8 +78,9 @@ class DaemonLtmAdapter:
         context_window: int | None = None,
         trace_id: str | None = None,
     ) -> ContextComposeResult | None:
-        if self._compose_supported is False:
+        if self._compose_schema == 0:
             return None
+        requested_schema = self._compose_schema or 3
         state, resp = await client.ltm_request(
             self._daemon_config,
             OP_LTM_CONTEXT_COMPOSE,
@@ -89,7 +91,7 @@ class DaemonLtmAdapter:
                 "top_k": top_k,
                 "namespace": namespace,
                 "context_window": context_window,
-                "context_compose_schema": 2,
+                "context_compose_max_schema": requested_schema,
                 "trace_id": trace_id,
             },
             timeout=self._timeout,
@@ -97,19 +99,22 @@ class DaemonLtmAdapter:
         if state == "missing":
             # The daemon generation is gone. Forget capability verdicts from
             # that generation so an upgraded replacement is probed again.
-            self._compose_supported = None
+            self._compose_schema = None
             self._candidate_propose_supported = None
             await self._spawn_best_effort()
             return None
         if state != "ok" or resp is None or not resp.get("ok"):
             if resp is not None and resp.get("status") == "unsupported":
-                self._compose_supported = False
+                self._compose_schema = 0
                 return None
             raise RuntimeError("daemon context compose unavailable")
-        if resp.get("context_compose_schema") != 2:
-            self._compose_supported = False
-            return None
-        self._compose_supported = True
+        selected_schema = resp.get("selected_context_compose_schema")
+        if (
+            isinstance(selected_schema, bool)
+            or not isinstance(selected_schema, int)
+            or not 2 <= selected_schema <= requested_schema
+        ):
+            raise ValueError("daemon context compose returned invalid schema selection")
         raw_pinned = resp.get("pinned", [])
         raw_retrieved = resp.get("retrieved", [])
         if not isinstance(raw_pinned, list) or not isinstance(raw_retrieved, list):
@@ -118,12 +123,19 @@ class DaemonLtmAdapter:
         def decode(item: Any, *, pinned: bool):
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("daemon context item malformed")
+            context = None
+            if not pinned and selected_schema >= 3 and "context" in item:
+                context = decode_context_compose_context(
+                    item["context"],
+                    max_content_chars=self._daemon_config.surfacing.result_content_max_chars,
+                )
             result = RemoteSearchResult(
                 item["content"],
                 safe_float(item.get("score"), 1.0 if pinned else 0.0),
                 source=str(item.get("source") or ""),
                 namespace=str(item.get("namespace") or "default"),
                 pinned=pinned,
+                context=context,
             )
             if isinstance(item.get("chunk_id"), str):
                 result.chunk.id = item["chunk_id"]
@@ -133,6 +145,7 @@ class DaemonLtmAdapter:
         retrieved_items = tuple(decode(item, pinned=False) for item in raw_retrieved)
         warnings = resp.get("warnings", [])
         omitted = resp.get("omitted_block_ids", [])
+        self._compose_schema = selected_schema
         return ContextComposeResult(
             pinned_items,
             retrieved_items,
@@ -195,7 +208,7 @@ class DaemonLtmAdapter:
             self._daemon_config, OP_LTM_SEARCH, payload, timeout=self._timeout
         )
         if state == "missing":
-            self._compose_supported = None
+            self._compose_schema = None
             self._candidate_propose_supported = None
             await self._spawn_best_effort()
             return [], [], "daemon_starting"

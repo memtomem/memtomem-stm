@@ -972,9 +972,16 @@ class SurfacingEngine:
                 and callable(compose)
             ):
                 try:
+                    compose_max_chars = self._config.effective_max_injection_chars()
+                    if capabilities.context_compose_schema >= 3 and ctx_win:
+                        # Schema 3 carries whole adjacent chunks on the wire.
+                        # Give each requested before/after distance one base
+                        # budget while the formatter still enforces the
+                        # original injection cap. Core clamps windows at 10.
+                        compose_max_chars *= 1 + 2 * min(ctx_win, 10)
                     bundle = await compose(
                         query,
-                        max_chars=self._config.effective_max_injection_chars(),
+                        max_chars=compose_max_chars,
                         top_k=max_results * 2,
                         namespace=namespace,
                         context_window=ctx_win,

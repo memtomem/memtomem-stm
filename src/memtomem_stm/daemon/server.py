@@ -485,9 +485,13 @@ class DaemonServer:
                 top_k = payload.get("top_k")
                 namespace = payload.get("namespace")
                 context_window = payload.get("context_window")
-                compose_schema = payload.get("context_compose_schema")
+                max_compose_schema = payload.get("context_compose_max_schema")
                 trace_id = payload.get("trace_id")
-                if compose_schema != 2:
+                if (
+                    isinstance(max_compose_schema, bool)
+                    or not isinstance(max_compose_schema, int)
+                    or max_compose_schema < 2
+                ):
                     return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                 if (
                     not isinstance(query, str)
@@ -540,24 +544,48 @@ class DaemonServer:
                     if getattr(self._adapter, "capabilities_ready", True) is False:
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
                     capabilities = getattr(self._adapter, "capabilities", None)
-                    if getattr(capabilities, "context_compose_schema", 0) < 2:
+                    actual_schema = getattr(capabilities, "context_compose_schema", 0)
+                    selected_schema = min(max_compose_schema, 3, actual_schema)
+                    if selected_schema < 2:
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                     if bundle is None:
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
 
                     def encode_result(result: Any) -> dict[str, Any]:
-                        return {
+                        encoded: dict[str, Any] = {
                             "content": str(result.chunk.content),
                             "score": float(result.score),
                             "source": str(result.chunk.metadata.source_file),
                             "namespace": str(result.chunk.metadata.namespace),
                             "chunk_id": str(result.chunk.id),
                         }
+                        context = getattr(result, "context", None)
+                        if selected_schema >= 3 and context is not None:
+
+                            def encode_context_chunk(chunk: Any) -> dict[str, str]:
+                                return {
+                                    "id": str(chunk.id),
+                                    "content": str(chunk.content),
+                                    "source": str(chunk.source),
+                                    "namespace": str(chunk.namespace),
+                                }
+
+                            encoded["context"] = {
+                                "before": [
+                                    encode_context_chunk(chunk) for chunk in context.window_before
+                                ],
+                                "after": [
+                                    encode_context_chunk(chunk) for chunk in context.window_after
+                                ],
+                                "chunk_position": context.chunk_position,
+                                "total_chunks_in_file": context.total_chunks_in_file,
+                            }
+                        return encoded
 
                     return {
                         "v": PROTOCOL_VERSION,
                         "ok": True,
-                        "context_compose_schema": 2,
+                        "selected_context_compose_schema": selected_schema,
                         "pinned": [encode_result(item) for item in bundle.pinned],
                         "retrieved": [encode_result(item) for item in bundle.retrieved],
                         "warnings": list(bundle.warnings),

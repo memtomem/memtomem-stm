@@ -119,6 +119,43 @@ async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> No
 
 
 @pytest.mark.asyncio
+async def test_engine_expands_only_schema_three_wire_budget_for_context() -> None:
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=3)
+
+        def __init__(self) -> None:
+            self.search = AsyncMock(side_effect=AssertionError("legacy search must not run"))
+            self.context_compose = AsyncMock(return_value=ContextComposeResult((), ()))
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    adapter = Adapter()
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+            max_injection_chars=3000,
+            context_window_size=2,
+        ),
+        mcp_adapter=adapter,
+    )
+
+    await engine.surface("docs", "read_file", {}, "response", context_query="deployment")
+
+    adapter.context_compose.assert_awaited_once_with(
+        "deployment",
+        max_chars=15_000,
+        top_k=6,
+        namespace=None,
+        context_window=2,
+        trace_id=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_direct_schema_two_compose_forwards_scope_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -175,6 +212,127 @@ async def test_direct_schema_two_compose_forwards_scope_fields(
 
 
 @pytest.mark.asyncio
+async def test_direct_schema_three_compose_parses_adjacent_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = McpClientSearchAdapter(
+        SurfacingConfig(result_format="structured", result_content_max_chars=8)
+    )
+    adapter._capabilities = LtmCapabilities(context_compose_schema=3)
+    monkeypatch.setattr(adapter, "_heal_if_needed", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        adapter,
+        "_call_mem_do",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                isError=False,
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "pinned": [],
+                                "retrieved": [
+                                    {
+                                        "id": "hit",
+                                        "content": "matched",
+                                        "source": "memory.md",
+                                        "namespace": "work",
+                                        "score": 0.8,
+                                        "context": {
+                                            "before": [
+                                                {
+                                                    "id": "before-1",
+                                                    "content": "before-context",
+                                                    "source": "memory.md",
+                                                    "namespace": "work",
+                                                }
+                                            ],
+                                            "after": [
+                                                {
+                                                    "id": "after-1",
+                                                    "content": "after-context",
+                                                    "source": "memory.md",
+                                                    "namespace": "work",
+                                                }
+                                            ],
+                                            "chunk_position": 2,
+                                            "total_chunks_in_file": 3,
+                                        },
+                                    }
+                                ],
+                            }
+                        ),
+                    )
+                ],
+            )
+        ),
+    )
+
+    bundle = await adapter.context_compose("deployment", context_window=1)
+
+    assert bundle is not None
+    context = bundle.retrieved[0].context
+    assert context is not None
+    assert context.window_before[0].id == "before-1"
+    assert context.window_before[0].content == "before-c"
+    assert context.window_after[0].id == "after-1"
+    assert context.window_after[0].content == "after-co"
+    assert context.chunk_position == 2
+    assert context.total_chunks_in_file == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "context",
+    [
+        "not-an-object",
+        {"before": {}, "after": []},
+        {"before": [{"id": "b", "content": 1, "source": "x"}], "after": []},
+        {"before": [], "after": [], "chunk_position": True},
+    ],
+)
+async def test_direct_schema_three_rejects_malformed_context(
+    monkeypatch: pytest.MonkeyPatch, context: object
+) -> None:
+    adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+    adapter._capabilities = LtmCapabilities(context_compose_schema=3)
+    monkeypatch.setattr(adapter, "_heal_if_needed", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        adapter,
+        "_call_mem_do",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                isError=False,
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "pinned": [],
+                                "retrieved": [
+                                    {
+                                        "id": "hit",
+                                        "content": "matched",
+                                        "source": "memory.md",
+                                        "namespace": "work",
+                                        "score": 0.8,
+                                        "context": context,
+                                    }
+                                ],
+                            }
+                        ),
+                    )
+                ],
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="context compose"):
+        await adapter.context_compose("deployment", context_window=1)
+
+
+@pytest.mark.asyncio
 async def test_schema_one_falls_back_to_legacy_with_scope_fields() -> None:
     class Adapter:
         capabilities = LtmCapabilities(context_compose_schema=1)
@@ -209,7 +367,7 @@ async def test_schema_one_falls_back_to_legacy_with_scope_fields() -> None:
 @pytest.mark.asyncio
 async def test_compose_failure_is_classified_without_legacy_retry() -> None:
     class Adapter:
-        capabilities = LtmCapabilities(context_compose_schema=2)
+        capabilities = LtmCapabilities(context_compose_schema=3)
 
         def __init__(self) -> None:
             self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))

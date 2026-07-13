@@ -656,9 +656,9 @@ key — leaves an old daemon stranded under a now-stale fingerprint (most visibl
 one pinned with `daemon.idle_timeout_seconds=0`, which never self-clears),
 `mms daemon status` reports it and `mms daemon stop --all` SIGTERMs it. `--all`
 is opt-in because a live daemon under another config may be intentional. Foreign
-daemon detection is POSIX-only for now: a foreign daemon can't be pinged (it may
-speak an older protocol) and Windows has no reliable signal-0 liveness check, so
-on Windows these commands report/act on the current config only.
+daemon detection combines process liveness with a protocol-neutral TCP
+connect-probe, so older protocol generations are reported on supported POSIX
+and Windows hosts without sending them an incompatible frame.
 
 ## `mms project` — project-scoped MCP management
 

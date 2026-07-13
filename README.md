@@ -63,12 +63,13 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 | --- | --- |
 | No core | Proxying, compression, and caching remain available; LTM surfacing is disabled |
 | No `context_compose` advertisement, or schema 0/1 | Legacy `mem_search` surfacing |
-| `context_compose` schema 2+ | Optional scoped Pinned Context composition |
+| `context_compose` schema 2 | Optional scoped Pinned Context composition |
+| `context_compose` schema 3+ | Pinned composition plus adjacent context-window chunks |
 | `candidate_propose` schema 1+ | Optional review-first proposal submission |
 
-Core 0.3.8 is the tested legacy baseline; 0.3.9 is the first release expected
-to advertise context-compose schema 2. Runtime behavior always follows the
-advertised capability, not the package version.
+Core 0.3.8 is the tested legacy baseline, 0.3.9 first advertises schema 2, and
+0.3.10 first advertises schema 3. Runtime behavior always follows the advertised
+capability, not the package version.
 
 ## Quick Start
 
@@ -158,6 +159,7 @@ definition does not automatically route it through the proxy. See
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Configuration sources and reference map |
 | [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) | Opt-in JSONL log of tool selection + execution outcomes |
 | [Use cases](https://github.com/memtomem/memtomem-stm/blob/main/docs/use-cases.md) | Reproducible scenarios and honest measurement boundaries |
+| [Reviewed project resume](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/reviewed-memory-resume.md) | Project-local Pinned Context, visible adjacent context, and optional review-first memory |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
 
 STM advertises four model-facing MCP tools by default. Eight observability and

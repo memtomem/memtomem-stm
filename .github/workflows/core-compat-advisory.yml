@@ -20,7 +20,9 @@ jobs:
           - core: "0.3.8"
             expected: legacy
           - core: "0.3.9"
-            expected: enhanced
+            expected: schema2
+          - core: "0.3.10"
+            expected: schema3
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -30,27 +32,12 @@ jobs:
           version: "0.11.16"
       - run: uv sync --frozen
       - name: Install exact core release
-        id: core
         env:
           CORE_VERSION: ${{ matrix.core }}
-          EXPECTED: ${{ matrix.expected }}
         run: |
-          install_log="$RUNNER_TEMP/core-install.log"
-          set +e
           uv venv --python 3.12 "$RUNNER_TEMP/core"
-          uv pip install --python "$RUNNER_TEMP/core/bin/python" "memtomem==$CORE_VERSION" >"$install_log" 2>&1
-          status=$?
-          set -e
-          cat "$install_log"
-          if [ "$status" -ne 0 ] && [ "$EXPECTED" = "enhanced" ] && \
-             grep -Eqi "no version of memtomem==$CORE_VERSION|no matching distribution" "$install_log"; then
-            echo "::notice::memtomem==$CORE_VERSION is not published yet; enhanced advisory skipped"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          exit "$status"
+          uv pip install --python "$RUNNER_TEMP/core/bin/python" "memtomem==$CORE_VERSION"
       - name: Run stdio capability smoke
-        if: steps.core.outputs.available != 'false'
         env:
           EXPECTED: ${{ matrix.expected }}
         run: >-

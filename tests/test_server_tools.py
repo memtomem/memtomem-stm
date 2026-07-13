@@ -2164,6 +2164,7 @@ class TestApplyProxyFileConfig:
 
 
 _FLAG_ENV = "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"
+_FORMATION_ENV = "MEMTOMEM_STM_FORMATION__ENABLED"
 
 _MODEL_FACING_TOOLS = {
     "stm_proxy_read_more",
@@ -2211,15 +2212,17 @@ class TestAdvertiseObservabilityFlagEndToEnd:
     """
 
     @staticmethod
-    def _list_registered(env_override: str | None) -> list[str]:
+    def _list_registered(env_override: str | None, *, formation_enabled: bool = False) -> list[str]:
         import json
         import os
         import subprocess
         import sys
 
-        env = {k: v for k, v in os.environ.items() if k != _FLAG_ENV}
+        env = {k: v for k, v in os.environ.items() if k not in {_FLAG_ENV, _FORMATION_ENV}}
         if env_override is not None:
             env[_FLAG_ENV] = env_override
+        if formation_enabled:
+            env[_FORMATION_ENV] = "true"
         script = (
             "import json\n"
             "from memtomem_stm import server\n"
@@ -2246,6 +2249,14 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert len(_OBSERVABILITY_TOOLS) == 8
         assert len(names) == 12
         assert "stm_index_stats" not in names
+
+    def test_formation_is_an_independent_thirteenth_tool(self):
+        formation_only = set(self._list_registered(env_override="false", formation_enabled=True))
+        all_enabled = set(self._list_registered(env_override="true", formation_enabled=True))
+        assert formation_only == _MODEL_FACING_TOOLS | {"stm_memory_propose"}
+        assert len(formation_only) == 5
+        assert all_enabled == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS | {"stm_memory_propose"}
+        assert len(all_enabled) == 13
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))

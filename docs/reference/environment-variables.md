@@ -15,8 +15,8 @@ documented propagation exception used by surfacing model-budget resolution.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MEMTOMEM_STM_DATA_DIR` | `~/.memtomem` | Base directory for config-adjacent runtime state, daemon handshake, locks, and logs |
-| `MEMTOMEM_STM_ENABLED` | `true` | Global process enable switch |
-| `MEMTOMEM_STM_CONFIG_PATH` | `~/.memtomem/stm_proxy.json` | Proxy JSON path |
+| `MEMTOMEM_STM_PROXY__ENABLED` | `true` | Global proxy enable switch |
+| `MEMTOMEM_STM_PROXY__CONFIG_PATH` | `~/.memtomem/stm_proxy.json` | Proxy JSON path |
 | `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | `false` | Expose eight operator MCP tools |
 
 ## Review-first formation
