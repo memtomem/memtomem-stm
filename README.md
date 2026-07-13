@@ -11,7 +11,12 @@
 
 Spend fewer tokens. Remember more. Ship faster.
 
-memtomem-stm is an MCP proxy that typically **cuts token usage by 20–80%** and gives your agent **memory across sessions** — with no changes to your upstream MCP servers.
+memtomem-stm is an MCP proxy that can substantially reduce the model-visible
+size of large tool responses and gives your agent **memory across sessions** —
+with no changes to your upstream MCP servers. The actual reduction depends on
+response shape, compression strategy, and whether the call travels through
+MCP; verify it against your workload with the repository's deterministic
+`bench_qa` suite.
 
 It sits between your AI agent and its upstream MCP servers, compressing tool responses, caching repeated calls, and automatically surfacing relevant context from prior sessions via a memtomem LTM server.
 
@@ -24,7 +29,7 @@ It sits between your AI agent and its upstream MCP servers, compressing tool res
 flowchart TB
     Agent["Agent<br/>(Claude Code, Cursor, …)"]
     subgraph STM["memtomem-stm (STM)"]
-        Pipe["CLEAN → COMPRESS → SURFACE → (INDEX)"]
+        Pipe["CLEAN → COMPRESS → SURFACE"]
     end
     LTM[("memtomem LTM<br/>(MCP server)")]
     FS["filesystem<br/>MCP server"]
@@ -108,8 +113,10 @@ For multi-agent fleets, standalone surfacing can opt into the same daemon with
 `MEMTOMEM_STM_SURFACING__USE_DAEMON=true`, avoiding one private LTM child per
 agent while keeping proxy feedback, caching, and tuning local.
 
-**STM does NOT write back to LTM at runtime.** Surfacing reads from LTM via MCP;
-the bundled `mms` server has no LTM write adapter.
+**STM does not automatically write tool responses back to LTM.** Surfacing
+reads from LTM via MCP. A future review-first formation integration may submit
+an explicit pending candidate to a compatible core, but it remains opt-in and
+cannot create durable memory before core-side approval.
 
 To bring file or shell operations under STM, register an MCP server that exposes
 them and steer the agent toward the proxied alias instead of the built-in. This
@@ -139,6 +146,7 @@ definition does not automatically route it through the proxy. See
 | [Caching](https://github.com/memtomem/memtomem-stm/blob/main/docs/caching.md) | Skip repeated work with response caching |
 | [Configuration](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md) | Configuration sources and reference map |
 | [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) | Opt-in JSONL log of tool selection + execution outcomes |
+| [Use cases](https://github.com/memtomem/memtomem-stm/blob/main/docs/use-cases.md) | Reproducible scenarios and honest measurement boundaries |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
 
 STM advertises four model-facing MCP tools by default. Eight observability and

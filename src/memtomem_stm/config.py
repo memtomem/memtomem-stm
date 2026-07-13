@@ -48,6 +48,13 @@ class LangfuseConfig(BaseModel):
         return self
 
 
+class FormationConfig(BaseModel):
+    """Review-first candidate submission to a capable memtomem core."""
+
+    enabled: bool = False
+    max_content_chars: int = Field(default=2000, ge=1, le=2000)
+
+
 class HookCompressionConfig(BaseModel):
     """``mms hook`` built-in tool *output compression* settings (P1a — Bash).
 
@@ -206,6 +213,7 @@ class STMConfig(BaseSettings):
     ``expanduser()`` happens at the use site (like ``data_dir``)."""
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
+    formation: FormationConfig = Field(default_factory=FormationConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
     hook: HookConfig = Field(default_factory=HookConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)

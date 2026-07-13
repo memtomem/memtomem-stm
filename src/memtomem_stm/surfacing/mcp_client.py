@@ -45,6 +45,26 @@ SearchOutcome = Literal[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class LtmCapabilities:
+    """Version-negotiated optional memtomem core surfaces."""
+
+    context_compose_schema: int = 0
+    candidate_propose_schema: int = 0
+    structured_scratch: bool = False
+    increment_access: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ContextComposeResult:
+    """Structured pinned-first bundle returned by a compatible core."""
+
+    pinned: tuple[RemoteSearchResult, ...]
+    retrieved: tuple[RemoteSearchResult, ...]
+    warnings: tuple[str, ...] = ()
+    omitted_block_ids: tuple[str, ...] = ()
+
+
 @dataclass
 class RemoteSearchResult:
     """Lightweight search result parsed from mem_search text output."""
@@ -66,9 +86,18 @@ class RemoteSearchResult:
             # ``increment_access`` boost — see ``SurfacingConfig.result_format``.
             self.id = hashlib.sha256(content.encode()).hexdigest()[:16]
 
-    def __init__(self, content: str, score: float, source: str = "", namespace: str = "default"):
+    def __init__(
+        self,
+        content: str,
+        score: float,
+        source: str = "",
+        namespace: str = "default",
+        *,
+        pinned: bool = False,
+    ):
         self.chunk = self._FakeChunk(content, source, namespace)
         self.score = score
+        self.pinned = pinned
 
 
 class SurfacingLtmAdapter(Protocol):
@@ -94,6 +123,29 @@ class SurfacingLtmAdapter(Protocol):
     ) -> None: ...
 
     async def scratch_list(self, *, trace_id: str | None = None) -> list[dict]: ...
+
+    @property
+    def capabilities(self) -> LtmCapabilities: ...
+
+    async def context_compose(
+        self,
+        query: str,
+        *,
+        agent_id: str | None = None,
+        max_chars: int = 3000,
+        top_k: int = 10,
+        trace_id: str | None = None,
+    ) -> ContextComposeResult | None: ...
+
+    async def candidate_propose(
+        self,
+        content: str,
+        *,
+        source: str,
+        source_ref: str,
+        idempotency_key: str,
+        trace_id: str | None = None,
+    ) -> dict[str, Any] | None: ...
 
 
 class ResultParser:
@@ -316,6 +368,7 @@ class McpClientSearchAdapter:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._parser = get_parser(getattr(config, "result_format", "compact"))
+        self._capabilities = LtmCapabilities()
         # #290: SurfacingEngine wraps adapter calls in ``asyncio.wait_for``;
         # an outer-timeout cancellation interrupts ``call_tool`` mid-RPC and
         # leaves the MCP session in a mid-message state. ``_TRANSPORT_ERRORS``
@@ -482,7 +535,7 @@ class McpClientSearchAdapter:
         return redact_exception_text(str(exc), self._config.ltm_mcp_url)
 
     async def _negotiate_format(self, session: ClientSession | None = None) -> None:
-        """Downgrade to compact if core doesn't advertise structured support.
+        """Negotiate additive core capabilities and the search result format.
 
         Called at the end of ``_do_start`` with the not-yet-published session
         (``self._session`` only becomes visible after negotiation succeeds,
@@ -495,23 +548,60 @@ class McpClientSearchAdapter:
         """
         if session is None:
             session = self._session
-        if not isinstance(self._parser, StructuredResultParser) or session is None:
+        if session is None:
+            return
+        if not isinstance(self._parser, StructuredResultParser):
+            # Preserve the legacy compact path's zero-negotiation behavior.
+            # Optional compose/formation features require the default
+            # structured contract.
             return
 
+        data: dict[str, Any] = {}
         try:
             result = await session.call_tool("mem_do", {"action": "version"})
             text_parts = [c.text or "" for c in result.content if c.type == "text"]
             if text_parts:
-                data = json.loads(text_parts[0])
-                formats = data.get("capabilities", {}).get("search_formats", [])
-                if "structured" in formats:
-                    logger.info("Core supports structured format — keeping StructuredResultParser")
-                    return
+                parsed = json.loads(text_parts[0])
+                if isinstance(parsed, dict):
+                    data = parsed
         except Exception as exc:
             logger.debug("Version negotiation failed (older core?): %s", self._scrub_exc(exc))
 
-        logger.info("Core does not advertise structured format — falling back to compact")
-        self._parser = CompactResultParser()
+        raw_caps = data.get("capabilities", {})
+        caps = raw_caps if isinstance(raw_caps, dict) else {}
+
+        def schema_version(name: str) -> int:
+            value = caps.get(name)
+            if value is True:
+                return 1
+            if isinstance(value, int) and not isinstance(value, bool):
+                return max(0, value)
+            if isinstance(value, dict):
+                raw = value.get("schema_version", value.get("schema", 0))
+                return max(0, raw) if isinstance(raw, int) and not isinstance(raw, bool) else 0
+            return 0
+
+        scratch_formats = caps.get("scratch_formats", [])
+        self._capabilities = LtmCapabilities(
+            context_compose_schema=schema_version("context_compose"),
+            candidate_propose_schema=schema_version("candidate_propose"),
+            structured_scratch=(
+                isinstance(scratch_formats, list) and "structured" in scratch_formats
+            ),
+            increment_access=bool(caps.get("increment_access", False)),
+        )
+
+        if isinstance(self._parser, StructuredResultParser):
+            formats = caps.get("search_formats", [])
+            if isinstance(formats, list) and "structured" in formats:
+                logger.info("Core supports structured format — keeping StructuredResultParser")
+            else:
+                logger.info("Core does not advertise structured format — falling back to compact")
+                self._parser = CompactResultParser()
+
+    @property
+    def capabilities(self) -> LtmCapabilities:
+        return self._capabilities
 
     # Bounded join for the owner task at ``stop()``. Generous: a healthy
     # owner only has to finish (or roll back) the current lifecycle op and
@@ -1000,6 +1090,153 @@ class McpClientSearchAdapter:
             )
         outcome: SearchOutcome = "ok" if results else "empty_results"
         return results, hints, outcome
+
+    async def _call_mem_do(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        trace_id: str | None = None,
+    ) -> Any:
+        """Call a negotiated core action with the standard reconnect contract."""
+        if not await self._heal_if_needed():
+            raise RuntimeError("LTM session unavailable")
+        assert self._session is not None
+        session = self._session
+        generation = self._generation
+        args: dict[str, Any] = {"action": action, "params": params}
+        if trace_id is not None:
+            args["_trace_id"] = trace_id
+        try:
+            return await self._rpc(session, generation, "mem_do", args)
+        except self._TRANSPORT_ERRORS:
+            self._mark_dirty(session, generation)
+            await self._shared_reconnect(generation)
+            assert self._session is not None
+            retry_session = self._session
+            retry_generation = self._generation
+            try:
+                return await self._rpc(retry_session, retry_generation, "mem_do", args)
+            except asyncio.CancelledError:
+                self._mark_dirty(retry_session, retry_generation)
+                raise
+            except self._TRANSPORT_ERRORS:
+                self._mark_dirty(retry_session, retry_generation)
+                raise
+        except asyncio.CancelledError:
+            self._mark_dirty(session, generation)
+            raise
+
+    @staticmethod
+    def _result_text(result: Any) -> str:
+        parts = [
+            cast(TextContent, item).text or ""
+            for item in (getattr(result, "content", None) or [])
+            if item.type == "text"
+        ]
+        return "\n".join(parts)
+
+    async def context_compose(
+        self,
+        query: str,
+        *,
+        agent_id: str | None = None,
+        max_chars: int = 3000,
+        top_k: int = 10,
+        trace_id: str | None = None,
+    ) -> ContextComposeResult | None:
+        """Return a pinned-first structured bundle when core advertises it."""
+        if not await self._heal_if_needed():
+            return None
+        if self._capabilities.context_compose_schema < 1:
+            return None
+        params: dict[str, Any] = {
+            "query": query,
+            "max_chars": max_chars,
+            "top_k": top_k,
+        }
+        if agent_id:
+            params["agent_id"] = agent_id
+        result = await self._call_mem_do("context_compose", params, trace_id=trace_id)
+        if getattr(result, "isError", False) is True:
+            raise RuntimeError("core context_compose returned isError=true")
+        try:
+            payload = json.loads(self._result_text(result))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("core context_compose returned malformed JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("core context_compose result is not an object")
+
+        pinned: list[RemoteSearchResult] = []
+        for item in payload.get("pinned", []):
+            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+                raise ValueError("core context_compose pinned item has invalid shape")
+            entry = RemoteSearchResult(
+                item["content"][: self._config.result_content_max_chars],
+                1.0,
+                source=str(item.get("source_path") or item.get("block_id") or "pinned"),
+                namespace=str(item.get("scope") or "default"),
+                pinned=True,
+            )
+            block_id = item.get("block_id") or item.get("id")
+            if isinstance(block_id, str) and block_id:
+                entry.chunk.id = block_id
+            pinned.append(entry)
+
+        retrieved: list[RemoteSearchResult] = []
+        for item in payload.get("retrieved", []):
+            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+                raise ValueError("core context_compose retrieved item has invalid shape")
+            entry = RemoteSearchResult(
+                item["content"][: self._config.result_content_max_chars],
+                safe_float(item.get("score"), 0.0),
+                source=str(item.get("source") or "unknown"),
+                namespace=str(item.get("namespace") or "default"),
+            )
+            memory_id = item.get("id") or item.get("chunk_id")
+            if isinstance(memory_id, str) and memory_id:
+                entry.chunk.id = memory_id
+            retrieved.append(entry)
+
+        raw_warnings = payload.get("warnings", [])
+        raw_omitted = payload.get("omitted_block_ids", [])
+        warnings = tuple(str(v) for v in raw_warnings) if isinstance(raw_warnings, list) else ()
+        omitted = tuple(str(v) for v in raw_omitted) if isinstance(raw_omitted, list) else ()
+        return ContextComposeResult(tuple(pinned), tuple(retrieved), warnings, omitted)
+
+    async def candidate_propose(
+        self,
+        content: str,
+        *,
+        source: str,
+        source_ref: str,
+        idempotency_key: str,
+        trace_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Submit a pending review candidate; never fall back to direct mem_add."""
+        if not await self._heal_if_needed():
+            raise RuntimeError("LTM session unavailable")
+        if self._capabilities.candidate_propose_schema < 1:
+            return None
+        result = await self._call_mem_do(
+            "candidate_propose",
+            {
+                "content": content,
+                "source": source,
+                "source_ref": source_ref,
+                "idempotency_key": idempotency_key,
+            },
+            trace_id=trace_id,
+        )
+        if getattr(result, "isError", False) is True:
+            raise RuntimeError("core candidate_propose returned isError=true")
+        try:
+            payload = json.loads(self._result_text(result))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("core candidate_propose returned malformed JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("core candidate_propose result is not an object")
+        return payload
 
     async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:
         """Boost the access_count of the given chunks via mem_do(increment_access).

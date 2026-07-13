@@ -13,9 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
-- The local daemon protocol is now v4. Finite-idle v3 daemons exit naturally;
+- The local daemon protocol is now v5. Finite-idle v4 daemons exit naturally;
   pinned stale daemons can be removed with `mms daemon stop --all`. A brief
   one-child-per-version overlap is possible during upgrade.
+- The inactive bundled INDEX surface has been retired. `stm_index_stats` is no
+  longer advertised and the standalone pipeline is CLEAN → COMPRESS → SURFACE;
+  integrations must use an explicit, capability-negotiated LTM contract.
 
 ### Added
 
@@ -27,6 +30,13 @@ changes inline only. See the deprecation policy in
   Daemon admission also converts an unexpected operation exception into a
   logged `unavailable` response; hook surfacing already catches its own
   exceptions and continues to fail open.
+- Capability-negotiated LTM integration now supports pinned-first context
+  bundles and opt-in review-candidate submission. Compatible cores advertise
+  `context_compose` / `candidate_propose` through `mem_do(action="version")`;
+  legacy cores retain the existing structured/compact search path. Formation
+  is disabled by default and never falls back to a direct durable write.
+- Daemon protocol v5 carries context-compose and candidate-proposal operations
+  without sharing mutable MCP session handles between proxy clients.
 
 ### Docs
 
@@ -35,6 +45,10 @@ changes inline only. See the deprecation policy in
   the existing documentation URLs compatible. Corrected native-hook host
   paths, CLI signatures, configuration-source boundaries, and previously
   undocumented public settings.
+- Corrected the standalone pipeline after #690 retired the inactive bundled
+  INDEX surface, qualified the token-reduction claim as workload-dependent,
+  and added reproducible use-case boundaries for compression, caching, and
+  surfacing.
 
 ## [0.1.36] — 2026-07-12
 

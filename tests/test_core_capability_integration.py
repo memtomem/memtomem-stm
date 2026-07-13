@@ -1,0 +1,133 @@
+"""Capability-gated memtomem core integration contracts."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from memtomem_stm.config import STMConfig
+from memtomem_stm.proxy.config import ProxyConfig
+from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.server import STMContext, stm_memory_propose
+from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.mcp_client import (
+    ContextComposeResult,
+    LtmCapabilities,
+    McpClientSearchAdapter,
+    RemoteSearchResult,
+)
+
+
+def _ctx(config: STMConfig, engine: object | None):
+    tracker = TokenTracker()
+    app = STMContext(
+        config=config,
+        proxy_manager=ProxyManager(ProxyConfig(upstream_servers={}), tracker),
+        tracker=tracker,
+        surfacing_engine=engine,  # type: ignore[arg-type]
+        feedback_tracker=None,
+        compression_feedback_tracker=None,
+        progressive_reads_tracker=None,
+    )
+    return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+
+
+@pytest.mark.asyncio
+async def test_capability_negotiation_is_additive() -> None:
+    adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+    session = AsyncMock()
+    session.call_tool.return_value = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text=json.dumps(
+                    {
+                        "capabilities": {
+                            "search_formats": ["compact", "structured"],
+                            "context_compose": {"schema_version": 1},
+                            "candidate_propose": 1,
+                            "scratch_formats": ["structured"],
+                            "increment_access": True,
+                        }
+                    }
+                ),
+            )
+        ]
+    )
+    await adapter._negotiate_format(session)
+    assert adapter.capabilities == LtmCapabilities(1, 1, True, True)
+
+
+@pytest.mark.asyncio
+async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> None:
+    pinned = RemoteSearchResult("always follow review policy", 1.0, "policy", pinned=True)
+    pinned.chunk.id = "policy"
+    retrieved = RemoteSearchResult("blue-green deployment", 0.8, "decision.md")
+    retrieved.chunk.id = "memory-1"
+
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=1)
+
+        def __init__(self) -> None:
+            self.search = AsyncMock(side_effect=AssertionError("legacy search must not run"))
+
+        async def context_compose(self, *args, **kwargs):
+            return ContextComposeResult((pinned,), (retrieved,))
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    adapter = Adapter()
+    config = SurfacingConfig(
+        min_response_chars=0,
+        min_query_tokens=1,
+        cooldown_seconds=0,
+        fire_webhook=False,
+    )
+    engine = SurfacingEngine(config, mcp_adapter=adapter)
+    output = await engine.surface(
+        "docs", "read_file", {}, "response", context_query="deployment policy"
+    )
+    assert "Pinned" in output
+    assert "always follow review policy" in output
+    assert "blue-green deployment" in output
+    assert "`policy`" not in output
+    adapter.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_formation_is_opt_in_and_never_direct_writes() -> None:
+    config = STMConfig()
+    disabled = json.loads(
+        await stm_memory_propose("Decision: use blue-green", ctx=_ctx(config, None))
+    )
+    assert disabled == {"ok": False, "reason": "formation_disabled"}
+
+    config.formation.enabled = True
+    engine = AsyncMock()
+    engine.propose_candidate.return_value = {"candidate_id": "candidate-1"}
+    result = json.loads(
+        await stm_memory_propose(
+            "Decision: use blue-green",
+            source_ref="docs/read_file/trace-1",
+            ctx=_ctx(config, engine),
+        )
+    )
+    assert result["candidate_id"] == "candidate-1"
+    assert result["status"] == "pending"
+    engine.propose_candidate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_formation_unsupported_has_no_mem_add_fallback() -> None:
+    config = STMConfig()
+    config.formation.enabled = True
+    engine = AsyncMock()
+    engine.propose_candidate.return_value = None
+    result = json.loads(await stm_memory_propose("Preference: concise", ctx=_ctx(config, engine)))
+    assert result == {"ok": False, "reason": "formation_unsupported"}
