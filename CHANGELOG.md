@@ -25,7 +25,7 @@ changes inline only. See the deprecation policy in
 ### Added
 
 - Standalone `mms` surfacing can opt into the shared local daemon with
-  `MEMTOMEM_STM_SURFACING__USE_DAEMON=true` (#688). Search, scratch context,
+  `MEMTOMEM_STM_SURFACING__USE_DAEMON=true`. Search, scratch context,
   and helpful-feedback boosts share one daemon-owned LTM connection per
   matching config, while each proxy keeps its feedback/cache/tuning state.
   Missing or busy daemons fail open without spawning a private child.
@@ -45,9 +45,9 @@ changes inline only. See the deprecation policy in
 
 - Context composition now requires `context_compose` schema 2 and preserves
   per-tool/default namespace plus context-window settings across direct and
-  shared-daemon routes. Schema 0/1 cores use legacy search; an advertised
-  schema 2 failure remains visible as an LTM dependency fault instead of being
-  hidden by a second search request (#692).
+  shared-daemon routes. **Behavior change**: schema 0/1 cores use legacy search;
+  an advertised schema 2 failure remains visible as an LTM dependency fault
+  instead of being hidden by a second search request (#692).
 
 ### Docs
 
