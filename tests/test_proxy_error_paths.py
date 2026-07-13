@@ -1064,11 +1064,18 @@ class TestCallTimeout:
         session = _get_session(mgr)
 
         captured_timeouts: list[float] = []
-        real_wait_for = asyncio.wait_for
+        fake_now = 100.0
 
         async def spy_wait_for(coro, timeout):
+            nonlocal fake_now
             captured_timeouts.append(timeout)
-            return await real_wait_for(coro, timeout)
+            # Model the attempt consuming exactly its timeout without relying
+            # on Windows timer/scheduler precision.  The production contract
+            # under test is the timeout value selected from the remaining
+            # deadline, not asyncio.wait_for's wall-clock behavior.
+            coro.close()
+            fake_now += timeout
+            raise asyncio.TimeoutError
 
         async def hang_forever(*_a, **_kw):
             await asyncio.sleep(10)
@@ -1081,20 +1088,19 @@ class TestCallTimeout:
                 "memtomem_stm.proxy.manager.asyncio.wait_for",
                 side_effect=spy_wait_for,
             ),
+            patch(
+                "memtomem_stm.proxy.manager._time.monotonic",
+                side_effect=lambda: fake_now,
+            ),
         ):
             with pytest.raises(asyncio.TimeoutError):
                 await mgr.call_tool("srv", "tool", {})
 
-        assert len(captured_timeouts) >= 2, (
-            f"expected at least two attempts within 0.12s budget, saw {len(captured_timeouts)}"
-        )
+        assert len(captured_timeouts) == 2
         # First attempt uses full call_timeout_seconds.
         assert captured_timeouts[0] == pytest.approx(0.1, abs=0.005)
-        # Second attempt must shrink to the remaining deadline (≈0.02s).
-        assert captured_timeouts[1] < 0.1, (
-            f"second attempt used {captured_timeouts[1]:.4f}s but remaining "
-            "deadline was smaller; shrink logic not applied"
-        )
+        # Second attempt must shrink to the exact remaining 0.02s budget.
+        assert captured_timeouts[1] == pytest.approx(0.02, abs=0.001)
 
 
 class TestTimeoutReplayGuard:
