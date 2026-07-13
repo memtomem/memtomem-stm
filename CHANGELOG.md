@@ -45,7 +45,7 @@ changes inline only. See the deprecation policy in
   per-tool/default namespace plus context-window settings across direct and
   shared-daemon routes. Schema 0/1 cores use legacy search; an advertised
   schema 2 failure remains visible as an LTM dependency fault instead of being
-  hidden by a second search request.
+  hidden by a second search request (#692).
 
 ### Docs
 

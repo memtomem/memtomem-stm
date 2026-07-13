@@ -42,8 +42,10 @@ mypy can narrow.
   `memtomem-docs/memtomem-stm/guides-archived/pipeline.md`.
 - **Line length 100**, target `py312` (`tool.ruff`, `tool.mypy`).
 - `.claude/` and `scripts/` are gitignored except for the tracked
-  `scripts/audit-dependencies.sh` release/CI gate — don't commit other files
-  under them, and don't assume contributors have the same local contents.
+  `scripts/audit-dependencies.sh` release/CI gate and
+  `scripts/core_compat_smoke.py` advisory compatibility check — don't commit
+  other files under them, and don't assume contributors have the same local
+  contents.
 
 ## PRs
 

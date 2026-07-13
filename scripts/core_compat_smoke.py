@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
@@ -74,51 +75,44 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                 env=env,
             )
 
-        previous_home = os.environ.get("HOME")
-        previous_runtime = os.environ.get("XDG_RUNTIME_DIR")
-        os.environ["HOME"] = str(home)
-        os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
-        adapter = McpClientSearchAdapter(
-            SurfacingConfig(
-                result_format="structured",
-                ltm_mcp_transport="stdio",
-                ltm_mcp_command=str(server),
-                ltm_mcp_args=[],
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "XDG_RUNTIME_DIR": str(runtime_dir)},
+        ):
+            adapter = McpClientSearchAdapter(
+                SurfacingConfig(
+                    result_format="structured",
+                    ltm_mcp_transport="stdio",
+                    ltm_mcp_command=str(server),
+                    ltm_mcp_args=[],
+                )
             )
-        )
-        try:
-            await adapter.warm_up()
-            if expected == "legacy":
-                assert adapter.capabilities.context_compose_schema < 2
-                assert await adapter.context_compose("compatibility sentinel") is None
-                results, _, outcome = await adapter.search("compatibility sentinel", top_k=5)
-                assert outcome == "ok"
-                assert any("compatibility sentinel" in item.chunk.content for item in results)
-            else:
-                assert adapter.capabilities.context_compose_schema >= 2
-                bundle = await adapter.context_compose(
-                    "compatibility sentinel",
-                    namespace=None,
-                    context_window=0,
-                    top_k=5,
-                )
-                assert bundle is not None
-                assert any(
-                    "preserve compatibility scope" in item.chunk.content for item in bundle.pinned
-                )
-                assert any(
-                    "compatibility sentinel" in item.chunk.content for item in bundle.retrieved
-                )
-        finally:
-            await adapter.stop()
-            if previous_home is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = previous_home
-            if previous_runtime is None:
-                os.environ.pop("XDG_RUNTIME_DIR", None)
-            else:
-                os.environ["XDG_RUNTIME_DIR"] = previous_runtime
+            try:
+                await adapter.warm_up()
+                if expected == "legacy":
+                    assert adapter.capabilities.context_compose_schema < 2
+                    assert await adapter.context_compose("compatibility sentinel") is None
+                    results, _, outcome = await adapter.search("compatibility sentinel", top_k=5)
+                    assert outcome == "ok"
+                    assert any("compatibility sentinel" in item.chunk.content for item in results)
+                else:
+                    assert adapter.capabilities.context_compose_schema >= 2
+                    bundle = await adapter.context_compose(
+                        "compatibility sentinel",
+                        namespace=None,
+                        context_window=0,
+                        top_k=5,
+                    )
+                    assert bundle is not None
+                    assert any(
+                        "preserve compatibility scope" in item.chunk.content
+                        for item in bundle.pinned
+                    )
+                    assert any(
+                        "compatibility sentinel" in item.chunk.content for item in bundle.retrieved
+                    )
+            finally:
+                await adapter.stop()
 
 
 def main() -> None:

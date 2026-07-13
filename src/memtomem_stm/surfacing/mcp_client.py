@@ -611,6 +611,11 @@ class McpClientSearchAdapter:
     def capabilities(self) -> LtmCapabilities:
         return self._capabilities
 
+    @property
+    def capabilities_ready(self) -> bool:
+        """Whether a live session has completed capability negotiation."""
+        return self._session is not None
+
     # Bounded join for the owner task at ``stop()``. Generous: a healthy
     # owner only has to finish (or roll back) the current lifecycle op and
     # aclose the exit stack.

@@ -96,6 +96,8 @@ async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> No
         min_query_tokens=1,
         cooldown_seconds=0,
         fire_webhook=False,
+        default_namespace="work",
+        context_window_size=2,
     )
     engine = SurfacingEngine(config, mcp_adapter=adapter)
     output = await engine.surface(
@@ -109,8 +111,8 @@ async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> No
         "deployment policy",
         max_chars=3000,
         top_k=6,
-        namespace=None,
-        context_window=None,
+        namespace="work",
+        context_window=2,
         trace_id=None,
     )
     adapter.search.assert_not_awaited()

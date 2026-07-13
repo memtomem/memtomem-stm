@@ -487,7 +487,7 @@ class DaemonServer:
                 context_window = payload.get("context_window")
                 compose_schema = payload.get("context_compose_schema")
                 trace_id = payload.get("trace_id")
-                if compose_schema != 2 or isinstance(compose_schema, bool):
+                if compose_schema != 2:
                     return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                 if (
                     not isinstance(query, str)
@@ -520,9 +520,6 @@ class DaemonServer:
                     return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
 
                 async def compose_call() -> dict[str, Any]:
-                    capabilities = getattr(self._adapter, "capabilities", None)
-                    if getattr(capabilities, "context_compose_schema", 0) < 2:
-                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                     compose = getattr(self._adapter, "context_compose", None)
                     if not callable(compose):
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
@@ -535,8 +532,18 @@ class DaemonServer:
                         context_window=context_window,
                         trace_id=trace_id,
                     )
-                    if bundle is None:
+                    # ``McpClientSearchAdapter.context_compose`` heals and
+                    # negotiates before consulting capabilities. Check only
+                    # after that call: reading the default schema 0 while the
+                    # daemon's fire-and-forget warm-up is still running would
+                    # misclassify a capable cold core as unsupported.
+                    if getattr(self._adapter, "capabilities_ready", True) is False:
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+                    capabilities = getattr(self._adapter, "capabilities", None)
+                    if getattr(capabilities, "context_compose_schema", 0) < 2:
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
+                    if bundle is None:
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
 
                     def encode_result(result: Any) -> dict[str, Any]:
                         return {
