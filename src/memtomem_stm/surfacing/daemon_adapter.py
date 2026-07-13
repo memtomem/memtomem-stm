@@ -35,6 +35,8 @@ class DaemonLtmAdapter:
     def __init__(self, daemon_config: STMConfig) -> None:
         self._daemon_config = daemon_config
         self._timeout = daemon_config.surfacing.timeout_seconds
+        self._compose_supported: bool | None = None
+        self._candidate_propose_supported: bool | None = None
 
     async def _spawn_best_effort(self) -> None:
         try:
@@ -59,7 +61,10 @@ class DaemonLtmAdapter:
     def capabilities(self) -> LtmCapabilities:
         # The daemon owns core negotiation; operation responses distinguish a
         # capable core from an older one without exposing session state.
-        return LtmCapabilities(context_compose_schema=1, candidate_propose_schema=1)
+        return LtmCapabilities(
+            context_compose_schema=0 if self._compose_supported is False else 1,
+            candidate_propose_schema=0 if self._candidate_propose_supported is False else 1,
+        )
 
     async def context_compose(
         self,
@@ -70,6 +75,8 @@ class DaemonLtmAdapter:
         top_k: int = 10,
         trace_id: str | None = None,
     ) -> ContextComposeResult | None:
+        if self._compose_supported is False:
+            return None
         state, resp = await client.ltm_request(
             self._daemon_config,
             OP_LTM_CONTEXT_COMPOSE,
@@ -87,8 +94,10 @@ class DaemonLtmAdapter:
             return None
         if state != "ok" or resp is None or not resp.get("ok"):
             if resp is not None and resp.get("status") == "unsupported":
+                self._compose_supported = False
                 return None
             raise RuntimeError("daemon context compose unavailable")
+        self._compose_supported = True
         raw_pinned = resp.get("pinned", [])
         raw_retrieved = resp.get("retrieved", [])
         if not isinstance(raw_pinned, list) or not isinstance(raw_retrieved, list):
@@ -128,6 +137,8 @@ class DaemonLtmAdapter:
         idempotency_key: str,
         trace_id: str | None = None,
     ) -> dict[str, Any] | None:
+        if self._candidate_propose_supported is False:
+            return None
         state, resp = await client.ltm_request(
             self._daemon_config,
             OP_LTM_CANDIDATE_PROPOSE,
@@ -142,8 +153,10 @@ class DaemonLtmAdapter:
         )
         if state != "ok" or resp is None or not resp.get("ok"):
             if resp is not None and resp.get("status") == "unsupported":
+                self._candidate_propose_supported = False
                 return None
             raise RuntimeError("daemon candidate proposal unavailable")
+        self._candidate_propose_supported = True
         payload = resp.get("candidate")
         if not isinstance(payload, dict):
             raise ValueError("daemon candidate response malformed")

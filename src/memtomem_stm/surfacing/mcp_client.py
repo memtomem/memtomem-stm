@@ -546,6 +546,10 @@ class McpClientSearchAdapter:
         versions don't implement this action) — the parser is silently
         downgraded to ``CompactResultParser``.
         """
+        # Capabilities belong to one negotiated session.  Clear them before
+        # every attempt so reconnects cannot retain features from a previous
+        # core (including a structured -> compact downgrade).
+        self._capabilities = LtmCapabilities()
         if session is None:
             session = self._session
         if session is None:
@@ -581,23 +585,21 @@ class McpClientSearchAdapter:
                 return max(0, raw) if isinstance(raw, int) and not isinstance(raw, bool) else 0
             return 0
 
-        scratch_formats = caps.get("scratch_formats", [])
-        self._capabilities = LtmCapabilities(
-            context_compose_schema=schema_version("context_compose"),
-            candidate_propose_schema=schema_version("candidate_propose"),
-            structured_scratch=(
-                isinstance(scratch_formats, list) and "structured" in scratch_formats
-            ),
-            increment_access=bool(caps.get("increment_access", False)),
-        )
-
-        if isinstance(self._parser, StructuredResultParser):
-            formats = caps.get("search_formats", [])
-            if isinstance(formats, list) and "structured" in formats:
-                logger.info("Core supports structured format — keeping StructuredResultParser")
-            else:
-                logger.info("Core does not advertise structured format — falling back to compact")
-                self._parser = CompactResultParser()
+        formats = caps.get("search_formats", [])
+        if isinstance(formats, list) and "structured" in formats:
+            scratch_formats = caps.get("scratch_formats", [])
+            self._capabilities = LtmCapabilities(
+                context_compose_schema=schema_version("context_compose"),
+                candidate_propose_schema=schema_version("candidate_propose"),
+                structured_scratch=(
+                    isinstance(scratch_formats, list) and "structured" in scratch_formats
+                ),
+                increment_access=bool(caps.get("increment_access", False)),
+            )
+            logger.info("Core supports structured format — keeping StructuredResultParser")
+        else:
+            logger.info("Core does not advertise structured format — falling back to compact")
+            self._parser = CompactResultParser()
 
     @property
     def capabilities(self) -> LtmCapabilities:

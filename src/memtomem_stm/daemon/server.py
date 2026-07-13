@@ -533,8 +533,14 @@ class DaemonServer:
             if op == OP_LTM_CANDIDATE_PROPOSE:
                 fields = ("content", "source", "source_ref", "idempotency_key")
                 trace_id = payload.get("trace_id")
-                if any(not isinstance(payload.get(field), str) for field in fields) or (
-                    trace_id is not None and not isinstance(trace_id, str)
+                if (
+                    any(not isinstance(payload.get(field), str) for field in fields)
+                    or not payload.get("content", "").strip()
+                    or len(payload.get("content", "")) > 2_000
+                    or len(payload.get("source_ref", "")) > 512
+                    or not payload.get("idempotency_key", "")
+                    or len(payload.get("idempotency_key", "")) > 256
+                    or (trace_id is not None and not isinstance(trace_id, str))
                 ):
                     return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
 

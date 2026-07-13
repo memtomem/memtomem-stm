@@ -16,11 +16,13 @@ from memtomem_stm.server import STMContext, stm_memory_propose
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.mcp_client import (
+    CompactResultParser,
     ContextComposeResult,
     LtmCapabilities,
     McpClientSearchAdapter,
     RemoteSearchResult,
 )
+from memtomem_stm.surfacing.observability import SurfacingObservability
 
 
 def _ctx(config: STMConfig, engine: object | None):
@@ -62,6 +64,11 @@ async def test_capability_negotiation_is_additive() -> None:
     await adapter._negotiate_format(session)
     assert adapter.capabilities == LtmCapabilities(1, 1, True, True)
 
+    # A reconnect/downgrade must not retain the previous session's features.
+    adapter._parser = CompactResultParser()
+    await adapter._negotiate_format(session)
+    assert adapter.capabilities == LtmCapabilities()
+
 
 @pytest.mark.asyncio
 async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> None:
@@ -101,6 +108,76 @@ async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> No
 
 
 @pytest.mark.asyncio
+async def test_compose_failure_is_classified_without_legacy_retry() -> None:
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=1)
+
+        def __init__(self) -> None:
+            self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))
+
+        async def context_compose(self, *args, **kwargs):
+            raise RuntimeError("core failed")
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    adapter = Adapter()
+    observability = SurfacingObservability()
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+        ),
+        mcp_adapter=adapter,
+        observability=observability,
+    )
+    assert await engine.surface("docs", "read_file", {}, "response", context_query="q") == (
+        "response"
+    )
+    assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_call_failed": 1}
+    adapter.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pinned_id_dedups_retrieved_and_survives_cached_invalidation() -> None:
+    pinned = RemoteSearchResult("policy", 1.0, "policy", pinned=True)
+    pinned.chunk.id = "shared-id"
+    duplicate = RemoteSearchResult("duplicate policy", 0.9, "memory.md")
+    duplicate.chunk.id = "shared-id"
+
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=1)
+
+        async def context_compose(self, *args, **kwargs):
+            return ContextComposeResult((pinned,), (duplicate,))
+
+        async def search(self, *args, **kwargs):
+            raise AssertionError("legacy search must not run")
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+        ),
+        mcp_adapter=Adapter(),
+    )
+    first = await engine.surface("docs", "read_file", {}, "response", context_query="q")
+    assert "policy" in first
+    assert "duplicate policy" not in first
+
+    engine._invalidated_ids[("docs", "read_file", "shared-id")] = None
+    cached = await engine.surface("docs", "read_file", {}, "response", context_query="q")
+    assert "policy" in cached
+
+
+@pytest.mark.asyncio
 async def test_formation_is_opt_in_and_never_direct_writes() -> None:
     config = STMConfig()
     disabled = json.loads(
@@ -131,3 +208,40 @@ async def test_formation_unsupported_has_no_mem_add_fallback() -> None:
     engine.propose_candidate.return_value = None
     result = json.loads(await stm_memory_propose("Preference: concise", ctx=_ctx(config, engine)))
     assert result == {"ok": False, "reason": "formation_unsupported"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "source_ref", "reason"),
+    [
+        ("   ", "", "content_empty"),
+        ("x" * 2_001, "", "content_too_large"),
+        ("valid", "r" * 513, "source_ref_too_large"),
+    ],
+)
+async def test_formation_validation_and_response_whitelist(
+    content: str, source_ref: str, reason: str
+) -> None:
+    config = STMConfig()
+    config.formation.enabled = True
+    engine = AsyncMock()
+    result = json.loads(
+        await stm_memory_propose(content, source_ref=source_ref, ctx=_ctx(config, engine))
+    )
+    assert result["reason"] == reason
+    engine.propose_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_formation_response_drops_untrusted_keys() -> None:
+    config = STMConfig()
+    config.formation.enabled = True
+    engine = AsyncMock()
+    engine.propose_candidate.return_value = {
+        "candidate_id": "candidate-1",
+        "status": "pending",
+        "internal_secret": "must-not-leak",
+    }
+    result = json.loads(await stm_memory_propose("valid", ctx=_ctx(config, engine)))
+    assert result["candidate_id"] == "candidate-1"
+    assert "internal_secret" not in result

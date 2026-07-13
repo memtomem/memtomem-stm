@@ -34,9 +34,9 @@ changes inline only. See the deprecation policy in
   bundles and opt-in review-candidate submission. Compatible cores advertise
   `context_compose` / `candidate_propose` through `mem_do(action="version")`;
   legacy cores retain the existing structured/compact search path. Formation
-  is disabled by default and never falls back to a direct durable write.
+  is disabled by default and never falls back to a direct durable write (#691).
 - Daemon protocol v5 carries context-compose and candidate-proposal operations
-  without sharing mutable MCP session handles between proxy clients.
+  without sharing mutable MCP session handles between proxy clients (#691).
 
 ### Docs
 

@@ -1051,15 +1051,19 @@ async def stm_memory_propose(
     core's ``mm review`` or candidate-review MCP action; only core-side
     approval may promote it to long-term or Pinned Context.
     """
+
+    def response(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
     app = _get_ctx(ctx)
     cfg = app.config.formation
     if not cfg.enabled:
-        return json.dumps({"ok": False, "reason": "formation_disabled"})
+        return response({"ok": False, "reason": "formation_disabled"})
     body = content.strip()
     if not body:
-        return json.dumps({"ok": False, "reason": "content_empty"})
+        return response({"ok": False, "reason": "content_empty"})
     if len(body) > cfg.max_content_chars:
-        return json.dumps(
+        return response(
             {
                 "ok": False,
                 "reason": "content_too_large",
@@ -1068,15 +1072,15 @@ async def stm_memory_propose(
         )
     ref = source_ref.strip()
     if len(ref) > 512:
-        return json.dumps({"ok": False, "reason": "source_ref_too_large"})
+        return response({"ok": False, "reason": "source_ref_too_large"})
     key = (
         idempotency_key.strip()
         or hashlib.sha256(f"memtomem-stm\0{ref}\0{body}".encode()).hexdigest()
     )
     if len(key) > 256:
-        return json.dumps({"ok": False, "reason": "idempotency_key_too_large"})
+        return response({"ok": False, "reason": "idempotency_key_too_large"})
     if app.surfacing_engine is None:
-        return json.dumps({"ok": False, "reason": "ltm_unavailable"})
+        return response({"ok": False, "reason": "ltm_unavailable"})
     try:
         result = await app.surfacing_engine.propose_candidate(
             body,
@@ -1086,14 +1090,15 @@ async def stm_memory_propose(
         )
     except Exception:
         logger.warning("Review-first candidate submission failed", exc_info=True)
-        return json.dumps({"ok": False, "reason": "candidate_submit_failed"})
+        return response({"ok": False, "reason": "candidate_submit_failed"})
     if result is None:
-        return json.dumps({"ok": False, "reason": "formation_unsupported"})
-    payload = dict(result)
+        return response({"ok": False, "reason": "formation_unsupported"})
+    allowed = {"candidate_id", "status", "created_at", "duplicate", "review_hint"}
+    payload = {key: value for key, value in result.items() if key in allowed}
     payload.setdefault("ok", True)
     payload.setdefault("status", "pending")
     payload.setdefault("review_hint", "Run `mm review list` and approve or reject the candidate.")
-    return json.dumps(payload, ensure_ascii=False)
+    return response(payload)
 
 
 # ---------------------------------------------------------------------------

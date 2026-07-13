@@ -13,6 +13,8 @@ import pytest
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
+    OP_LTM_CANDIDATE_PROPOSE,
+    OP_LTM_CONTEXT_COMPOSE,
     OP_LTM_INCREMENT_ACCESS,
     OP_LTM_SCRATCH_LIST,
     OP_LTM_SEARCH,
@@ -22,7 +24,7 @@ from memtomem_stm.daemon.protocol import (
 from memtomem_stm.daemon.discovery import config_fingerprint, handshake_path, write_handshake
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.daemon_adapter import DaemonLtmAdapter
-from memtomem_stm.surfacing.mcp_client import RemoteSearchResult
+from memtomem_stm.surfacing.mcp_client import ContextComposeResult, RemoteSearchResult
 from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.observability import SurfacingObservability
@@ -118,6 +120,70 @@ async def test_daemon_search_round_trip_preserves_structured_fields(tmp_path: Pa
             "chunk_id": "real-chunk-id",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_daemon_v5_compose_and_candidate_roundtrip_and_validation(tmp_path: Path) -> None:
+    server = DaemonServer(_config(tmp_path))
+    pinned = RemoteSearchResult("policy", 1.0, "/policy.md", "global", pinned=True)
+    pinned.chunk.id = "pin-1"
+    compose = AsyncMock(return_value=ContextComposeResult((pinned,), (), ("warning",), ()))
+    propose = AsyncMock(return_value={"candidate_id": "candidate-1", "status": "pending"})
+    server._adapter = SimpleNamespace(context_compose=compose, candidate_propose=propose)
+
+    composed = await server._dispatch(
+        _request(
+            OP_LTM_CONTEXT_COMPOSE,
+            {"query": "q", "agent_id": None, "max_chars": 100, "top_k": 2},
+        )
+    )
+    assert composed is not None and composed["ok"] is True
+    assert composed["pinned"][0]["chunk_id"] == "pin-1"
+
+    proposed = await server._dispatch(
+        _request(
+            OP_LTM_CANDIDATE_PROPOSE,
+            {
+                "content": "remember",
+                "source": "memtomem-stm",
+                "source_ref": "trace",
+                "idempotency_key": "key",
+            },
+        )
+    )
+    assert proposed == {
+        "v": PROTOCOL_VERSION,
+        "ok": True,
+        "candidate": {"candidate_id": "candidate-1", "status": "pending"},
+    }
+
+    for invalid_content in ("", "x" * 2_001):
+        invalid = await server._dispatch(
+            _request(
+                OP_LTM_CANDIDATE_PROPOSE,
+                {
+                    "content": invalid_content,
+                    "source": "memtomem-stm",
+                    "source_ref": "trace",
+                    "idempotency_key": "key",
+                },
+            )
+        )
+        assert invalid == {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_adapter_memoizes_unsupported_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = AsyncMock(return_value=("ok", {"ok": False, "status": "unsupported"}))
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    assert await adapter.context_compose("q") is None
+    assert await adapter.context_compose("q") is None
+    assert request.await_count == 1
+    assert adapter.capabilities.context_compose_schema == 0
 
 
 @pytest.mark.asyncio

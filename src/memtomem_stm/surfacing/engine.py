@@ -956,17 +956,25 @@ class SurfacingEngine:
         search_kwargs: dict[str, Any] = {}
         if ctx_win:
             search_kwargs["context_window"] = ctx_win
+        compose_failed = False
         try:
             capabilities = getattr(self._mcp_adapter, "capabilities", None)
             compose = getattr(self._mcp_adapter, "context_compose", None)
             bundle = None
             if isinstance(capabilities, LtmCapabilities) and callable(compose):
-                bundle = await compose(
-                    query,
-                    max_chars=self._config.effective_max_injection_chars(),
-                    top_k=max_results * 2,
-                    trace_id=trace_id,
-                )
+                try:
+                    bundle = await compose(
+                        query,
+                        max_chars=self._config.effective_max_injection_chars(),
+                        top_k=max_results * 2,
+                        trace_id=trace_id,
+                    )
+                except (RuntimeError, ValueError):
+                    # A declared compose surface is authoritative: classify
+                    # its failure like a legacy upstream call failure, but do
+                    # not hide it with a second search request.
+                    logger.debug("Core context composition failed", exc_info=True)
+                    compose_failed = True
             if bundle is not None:
                 results = [*bundle.pinned, *bundle.retrieved]
                 hints = [*bundle.warnings]
@@ -976,6 +984,8 @@ class SurfacingEngine:
                         + ", ".join(bundle.omitted_block_ids[:5])
                     )
                 outcome: SearchOutcome = "ok" if results else "empty_results"
+            elif compose_failed:
+                results, hints, outcome = [], [], "call_error"
             else:
                 results, hints, outcome = await self._mcp_adapter.search(
                     query=query,
@@ -1083,7 +1093,9 @@ class SurfacingEngine:
         # one id and would otherwise render as two identical bullets to the agent
         # (they also share a ``memory_id``, so feedback already treats them as one).
         relevant = list(pinned_results)
-        seen: set[str] = set()
+        # Treat core output as untrusted: a retrieved item reusing a pinned
+        # block ID must not render the same memory twice.
+        seen: set[str] = {str(r.chunk.id) for r in pinned_results}
         retrieved_count = 0
         for r in scored:
             mid = str(r.chunk.id)
