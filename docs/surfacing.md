@@ -14,17 +14,39 @@ When your agent calls a proxied tool, STM automatically:
 4. **Searches LTM** (memtomem) for related memories
 5. **Injects relevant memories** at the configured position in the response
 
-When the connected core advertises `context_compose`, step 4 requests one
-structured bundle instead of calling legacy `mem_search` directly. Core owns
+When the connected core advertises `context_compose` schema 2 or later, step 4
+requests one structured bundle instead of calling legacy `mem_search`
+directly. Core owns
 Pinned Context shadowing and budget composition; STM keeps the final injection
 hard cap and treats every returned field as untrusted. Pinned entries are
 rendered without a relevance score or feedback ID and are never demoted,
 cross-session-deduped, or access-boosted.
 
-Core also owns scope selection on this composed path. STM's
-`default_namespace` and per-tool `namespace` settings apply only to the legacy
-`mem_search` fallback; they are not silently remapped to core `agent_id` scope.
-Configure composed Pinned Context and retrieval scope in memtomem core.
+Core owns Pinned Context scope selection on this composed path. STM preserves
+its `default_namespace`, per-tool `namespace`, and `context_window_size` for
+the retrieved leg; they are not remapped to core `agent_id` scope. Cores that
+do not advertise schema 2 continue through legacy `mem_search`.
+
+Core 0.3.8 is the tested legacy baseline and 0.3.9 is the first tagged PyPI
+release expected to carry schema 2. The intermediate schema 1 contract was
+never included in a tagged PyPI release, although source-installed builds may
+exist. Capability negotiation, not these version labels, controls runtime
+behavior.
+
+To force a rollback, configure the actual LTM command rather than installing
+an older core into an unrelated environment:
+
+```json
+{
+  "surfacing": {
+    "ltm_mcp_command": "uvx",
+    "ltm_mcp_args": ["--from", "memtomem==0.3.8", "memtomem-server"]
+  }
+}
+```
+
+Then run `mms daemon stop --all` (or restart a direct STM process) so the next
+session negotiates against that command.
 
 ## Review-first formation (experimental)
 
@@ -50,7 +72,7 @@ flowchart LR
     CB -->|closed| Extract["2. extract context<br/>(query)"]
     Extract --> Gate{"3. relevance gate"}
     Gate -->|skip| Pass
-    Gate -->|pass| Search["4. search LTM<br/>(MCP mem_search)"]
+    Gate -->|pass| Search["4. search LTM<br/>(compose schema 2 or mem_search)"]
     Search --> Filter{"score ≥ min_score?<br/>not already shown?"}
     Filter -->|no| Pass
     Filter -->|yes| Inject["5. inject memories<br/>+ working memory"]

@@ -52,7 +52,7 @@ async def test_capability_negotiation_is_additive() -> None:
                     {
                         "capabilities": {
                             "search_formats": ["compact", "structured"],
-                            "context_compose": {"schema_version": 1},
+                            "context_compose": {"schema_version": 2},
                             "candidate_propose": 1,
                             "scratch_formats": ["structured"],
                             "increment_access": True,
@@ -63,7 +63,7 @@ async def test_capability_negotiation_is_additive() -> None:
         ]
     )
     await adapter._negotiate_format(session)
-    assert adapter.capabilities == LtmCapabilities(1, 1, True, True)
+    assert adapter.capabilities == LtmCapabilities(2, 1, True, True)
 
     # A reconnect/downgrade must not retain the previous session's features.
     adapter._parser = CompactResultParser()
@@ -79,13 +79,13 @@ async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> No
     retrieved.chunk.id = "memory-1"
 
     class Adapter:
-        capabilities = LtmCapabilities(context_compose_schema=1)
+        capabilities = LtmCapabilities(context_compose_schema=2)
 
         def __init__(self) -> None:
             self.search = AsyncMock(side_effect=AssertionError("legacy search must not run"))
-
-        async def context_compose(self, *args, **kwargs):
-            return ContextComposeResult((pinned,), (retrieved,))
+            self.context_compose = AsyncMock(
+                return_value=ContextComposeResult((pinned,), (retrieved,))
+            )
 
         async def scratch_list(self, **kwargs):
             return []
@@ -105,13 +105,109 @@ async def test_engine_prefers_compose_and_pinned_bypasses_feedback_shape() -> No
     assert "always follow review policy" in output
     assert "blue-green deployment" in output
     assert "`policy`" not in output
+    adapter.context_compose.assert_awaited_once_with(
+        "deployment policy",
+        max_chars=3000,
+        top_k=6,
+        namespace=None,
+        context_window=None,
+        trace_id=None,
+    )
     adapter.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_schema_two_compose_forwards_scope_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+    adapter._capabilities = LtmCapabilities(context_compose_schema=2)
+    monkeypatch.setattr(adapter, "_heal_if_needed", AsyncMock(return_value=True))
+    call = AsyncMock(
+        return_value=SimpleNamespace(
+            isError=False,
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "pinned": [],
+                            "retrieved": [
+                                {
+                                    "id": "memory-1",
+                                    "content": "decision",
+                                    "source": "decision.md",
+                                    "namespace": "work",
+                                    "score": 0.8,
+                                }
+                            ],
+                        }
+                    ),
+                )
+            ],
+        )
+    )
+    monkeypatch.setattr(adapter, "_call_mem_do", call)
+
+    bundle = await adapter.context_compose(
+        "deployment",
+        max_chars=2000,
+        top_k=6,
+        namespace=["work"],
+        context_window=2,
+        trace_id="trace-1",
+    )
+
+    assert bundle is not None and bundle.retrieved[0].chunk.metadata.namespace == "work"
+    call.assert_awaited_once_with(
+        "context_compose",
+        {
+            "query": "deployment",
+            "max_chars": 2000,
+            "top_k": 6,
+            "namespace": ["work"],
+            "context_window": 2,
+        },
+        trace_id="trace-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_one_falls_back_to_legacy_with_scope_fields() -> None:
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=1)
+        context_compose = AsyncMock(side_effect=AssertionError("schema 1 compose must not run"))
+        search = AsyncMock(return_value=([], [], "empty_results"))
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    adapter = Adapter()
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+            default_namespace="work",
+            context_window_size=2,
+        ),
+        mcp_adapter=adapter,
+    )
+
+    assert await engine.surface("docs", "read_file", {}, "response", context_query="q") == (
+        "response"
+    )
+    adapter.context_compose.assert_not_awaited()
+    adapter.search.assert_awaited_once_with(
+        query="q", top_k=6, namespace="work", context_window=2, trace_id=None
+    )
 
 
 @pytest.mark.asyncio
 async def test_compose_failure_is_classified_without_legacy_retry() -> None:
     class Adapter:
-        capabilities = LtmCapabilities(context_compose_schema=1)
+        capabilities = LtmCapabilities(context_compose_schema=2)
 
         def __init__(self) -> None:
             self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))
@@ -144,7 +240,7 @@ async def test_compose_failure_is_classified_without_legacy_retry() -> None:
 @pytest.mark.asyncio
 async def test_compose_transport_failure_is_ltm_unavailable_without_legacy_retry() -> None:
     class Adapter:
-        capabilities = LtmCapabilities(context_compose_schema=1)
+        capabilities = LtmCapabilities(context_compose_schema=2)
 
         def __init__(self) -> None:
             self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))
@@ -182,7 +278,7 @@ async def test_pinned_id_dedups_retrieved_and_survives_cached_invalidation() -> 
     duplicate.chunk.id = "shared-id"
 
     class Adapter:
-        capabilities = LtmCapabilities(context_compose_schema=1)
+        capabilities = LtmCapabilities(context_compose_schema=2)
 
         async def context_compose(self, *args, **kwargs):
             return ContextComposeResult((pinned,), (duplicate,))

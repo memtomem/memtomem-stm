@@ -138,6 +138,8 @@ class SurfacingLtmAdapter(Protocol):
         agent_id: str | None = None,
         max_chars: int = 3000,
         top_k: int = 10,
+        namespace: str | list[str] | None = None,
+        context_window: int | None = None,
         trace_id: str | None = None,
     ) -> ContextComposeResult | None: ...
 
@@ -1149,17 +1151,21 @@ class McpClientSearchAdapter:
         agent_id: str | None = None,
         max_chars: int = 3000,
         top_k: int = 10,
+        namespace: str | list[str] | None = None,
+        context_window: int | None = None,
         trace_id: str | None = None,
     ) -> ContextComposeResult | None:
         """Return a pinned-first structured bundle when core advertises it."""
         if not await self._heal_if_needed():
             return None
-        if self._capabilities.context_compose_schema < 1:
+        if self._capabilities.context_compose_schema < 2:
             return None
         params: dict[str, Any] = {
             "query": query,
             "max_chars": max_chars,
             "top_k": top_k,
+            "namespace": namespace,
+            "context_window": context_window,
         }
         if agent_id:
             params["agent_id"] = agent_id

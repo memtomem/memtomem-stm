@@ -37,7 +37,8 @@ frames one side can't parse (the stale daemon idle-times-out under a finite
 ``idle_timeout_seconds``; a pinned ``idle_timeout_seconds=0`` daemon must be
 stopped manually — see #517).
 
-**v5:** adds context-compose and review-candidate LTM operations. **v4:** adds
+**v6:** adds schema-bound context-compose scope fields. **v5:** adds
+context-compose and review-candidate LTM operations. **v4:** adds
 typed low-level LTM operations for issue #688. **v3:** adds
 absolute deadlines and bounded admission. **v2:** the ``surface`` payload is a serialized
 :class:`~memtomem_stm.cli.hook_adapter.CanonicalHookCall` (``to_wire``), so the
@@ -52,7 +53,7 @@ import json
 import secrets
 from typing import Any
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
 # built-in tool's output (a large ``Read`` can be hundreds of KB), so this sits

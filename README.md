@@ -59,6 +59,17 @@ uv pip install memtomem-stm      # or install into the active environment
 
 memtomem-stm is **independent**: it has no Python-level dependency on memtomem core. To enable proactive memory surfacing, point STM at a running memtomem MCP server (or any compatible MCP server) — communication happens entirely through the MCP protocol.
 
+| Connected LTM capability | STM behavior |
+| --- | --- |
+| No core | Proxying, compression, and caching remain available; LTM surfacing is disabled |
+| No `context_compose` advertisement, or schema 0/1 | Legacy `mem_search` surfacing |
+| `context_compose` schema 2+ | Optional scoped Pinned Context composition |
+| `candidate_propose` schema 1+ | Optional review-first proposal submission |
+
+Core 0.3.8 is the tested legacy baseline; 0.3.9 is the first release expected
+to advertise context-compose schema 2. Runtime behavior always follows the
+advertised capability, not the package version.
+
 ## Quick Start
 
 All three installed commands—`mms`, `memtomem-stm`, and
@@ -114,9 +125,9 @@ For multi-agent fleets, standalone surfacing can opt into the same daemon with
 agent while keeping proxy feedback, caching, and tuning local.
 
 **STM does not automatically write tool responses back to LTM.** Surfacing
-reads from LTM via MCP. A future review-first formation integration may submit
-an explicit pending candidate to a compatible core, but it remains opt-in and
-cannot create durable memory before core-side approval.
+reads from LTM via MCP. The opt-in review-first formation integration may
+submit an explicit pending candidate to a capable core, but it cannot create
+durable memory before core-side approval.
 
 To bring file or shell operations under STM, register an MCP server that exposes
 them and steer the agent toward the proxied alias instead of the built-in. This

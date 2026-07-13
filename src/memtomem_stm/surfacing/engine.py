@@ -966,12 +966,18 @@ class SurfacingEngine:
             capabilities = getattr(self._mcp_adapter, "capabilities", None)
             compose = getattr(self._mcp_adapter, "context_compose", None)
             bundle = None
-            if isinstance(capabilities, LtmCapabilities) and callable(compose):
+            if (
+                isinstance(capabilities, LtmCapabilities)
+                and capabilities.context_compose_schema >= 2
+                and callable(compose)
+            ):
                 try:
                     bundle = await compose(
                         query,
                         max_chars=self._config.effective_max_injection_chars(),
                         top_k=max_results * 2,
+                        namespace=namespace,
+                        context_window=ctx_win,
                         trace_id=trace_id,
                     )
                 except LtmTransportError:

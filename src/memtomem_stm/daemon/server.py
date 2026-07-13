@@ -483,7 +483,12 @@ class DaemonServer:
                 agent_id = payload.get("agent_id")
                 max_chars = payload.get("max_chars")
                 top_k = payload.get("top_k")
+                namespace = payload.get("namespace")
+                context_window = payload.get("context_window")
+                compose_schema = payload.get("context_compose_schema")
                 trace_id = payload.get("trace_id")
+                if compose_schema != 2 or isinstance(compose_schema, bool):
+                    return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                 if (
                     not isinstance(query, str)
                     or (agent_id is not None and not isinstance(agent_id, str))
@@ -493,11 +498,31 @@ class DaemonServer:
                     or not isinstance(top_k, int)
                     or isinstance(top_k, bool)
                     or top_k <= 0
+                    or (
+                        isinstance(namespace, list)
+                        and not all(isinstance(item, str) for item in namespace)
+                    )
+                    or (
+                        not isinstance(namespace, list)
+                        and namespace is not None
+                        and not isinstance(namespace, str)
+                    )
+                    or (
+                        context_window is not None
+                        and (
+                            isinstance(context_window, bool)
+                            or not isinstance(context_window, int)
+                            or context_window < 0
+                        )
+                    )
                     or (trace_id is not None and not isinstance(trace_id, str))
                 ):
                     return {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
 
                 async def compose_call() -> dict[str, Any]:
+                    capabilities = getattr(self._adapter, "capabilities", None)
+                    if getattr(capabilities, "context_compose_schema", 0) < 2:
+                        return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                     compose = getattr(self._adapter, "context_compose", None)
                     if not callable(compose):
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
@@ -506,6 +531,8 @@ class DaemonServer:
                         agent_id=agent_id,
                         max_chars=max_chars,
                         top_k=top_k,
+                        namespace=namespace,
+                        context_window=context_window,
                         trace_id=trace_id,
                     )
                     if bundle is None:
@@ -523,6 +550,7 @@ class DaemonServer:
                     return {
                         "v": PROTOCOL_VERSION,
                         "ok": True,
+                        "context_compose_schema": 2,
                         "pinned": [encode_result(item) for item in bundle.pinned],
                         "retrieved": [encode_result(item) for item in bundle.retrieved],
                         "warnings": list(bundle.warnings),
