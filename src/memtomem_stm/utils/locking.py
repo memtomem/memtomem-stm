@@ -8,8 +8,8 @@ writers from drifting into subtly different implementations.
 
 from __future__ import annotations
 
-import logging
 import importlib
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,7 @@ def try_lock(fd: int) -> bool:
         except OSError:
             return False
 
-    import fcntl
+    fcntl: Any = importlib.import_module("fcntl")
 
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -62,7 +62,7 @@ def unlock(fd: int) -> None:
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
-            import fcntl
+            fcntl: Any = importlib.import_module("fcntl")
 
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:

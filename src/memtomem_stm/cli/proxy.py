@@ -16,6 +16,7 @@ import sys
 import tomllib
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +131,9 @@ def _shell_join(args: list[str]) -> str:
     return shlex.join(args)
 
 
+_SETUP_RESOLVED_CLIENT: ContextVar[str | None] = ContextVar("setup_resolved_client", default=None)
+
+
 def _setup_json_result(action: str):  # noqa: ANN201
     """Capture a setup command and emit one secret-safe JSON result document."""
 
@@ -140,6 +144,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
             if not as_json:
                 return fn(*args, **kwargs)
 
+            _SETUP_RESOLVED_CLIENT.set(None)
             out = io.StringIO()
             err = io.StringIO()
             exit_code = 0
@@ -148,14 +153,20 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     fn(*args, **kwargs)
                 except SystemExit as exc:
                     exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+                except click.ClickException as exc:
+                    exit_code = exc.exit_code
+                    click.echo(exc.format_message(), err=True)
 
             config_path = (
                 Path(kwargs.get("config_path", str(_DEFAULT_CONFIG))).expanduser().resolve()
             )
             server_names: list[str] = []
+            config_data: dict[str, Any] | None = None
             if config_path.exists():
                 try:
                     data = json.loads(config_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        config_data = data
                     servers = data.get("upstream_servers", {}) if isinstance(data, dict) else {}
                     if isinstance(servers, dict):
                         server_names = sorted(str(name) for name in servers)
@@ -166,10 +177,17 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 "ok": exit_code == 0,
                 "config_path": str(config_path),
                 "servers": server_names,
-                "client": kwargs.get("client_mode") or kwargs.get("mcp_mode"),
+                "client": _SETUP_RESOLVED_CLIENT.get()
+                or kwargs.get("client_mode")
+                or kwargs.get("mcp_mode"),
             }
             if exit_code:
                 payload["error"] = "setup_failed"
+                lines = [line.strip() for line in err.getvalue().splitlines() if line.strip()]
+                message = lines[-1] if lines else "setup command failed"
+                if config_data is not None:
+                    message = sanitize_secrets(message, _all_config_secret_values(config_data))
+                payload["message"] = message[:1000]
             click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
             if exit_code:
                 raise SystemExit(exit_code)
@@ -725,11 +743,13 @@ def _run_mcp_integration(
         else:
             client_mode = "json"
     if client_mode == "skip":
+        _SETUP_RESOLVED_CLIENT.set("skip")
         _emit_skip_hints(config_path)
         return
 
     server_cmd, server_args, server_env = _registration_command(config_path)
     if client_mode == "codex":
+        _SETUP_RESOLVED_CLIENT.set("codex")
         if _codex_registered():
             if not replace_registration:
                 click.echo(f"  {_ok('Kept existing Codex registration.')}")
@@ -745,6 +765,7 @@ def _run_mcp_integration(
         return
 
     if client_mode == "json":
+        _SETUP_RESOLVED_CLIENT.set("json")
         mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
         click.echo(f"  {_ok('Wrote')} {mcp_path}")
         _emit_mcp_paste_hints()
@@ -758,10 +779,12 @@ def _run_mcp_integration(
     click.echo("")
 
     if choice == 3:
+        _SETUP_RESOLVED_CLIENT.set("skip")
         _emit_skip_hints(config_path)
         return
 
     if choice == 1:
+        _SETUP_RESOLVED_CLIENT.set("claude")
         if _check_already_registered():
             click.echo(f"{_warn('Note:')} memtomem-stm is already registered with Claude Code.")
             if replace_registration:
@@ -793,6 +816,7 @@ def _run_mcp_integration(
         click.echo(f"  {_warn(reason_msg)} — falling back to .mcp.json.")
 
     # choice == 2, or choice == 1 fallback
+    _SETUP_RESOLVED_CLIENT.set("json")
     mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
     click.echo(f"  {_ok('Wrote')} {mcp_path}")
     _emit_mcp_paste_hints()
@@ -2928,8 +2952,8 @@ def _prompt_language() -> str:
         "'en' on non-TTY callers."
     ),
 )
+@with_config_write_lock(json_envelope=True)
 @_setup_json_result("init")
-@with_config_write_lock()
 def init(
     config_path: str,
     no_validate: bool,

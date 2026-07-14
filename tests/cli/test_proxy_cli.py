@@ -1599,9 +1599,7 @@ class TestAddPersistence:
         """`mms add` into an existing key-less config must NOT inject the
         strict policy — adopting it is the operator's call (the load-time
         advisory points them at it); add only appends the server entry."""
-        config.write_text(
-            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
-        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(
             cli,
             ["add", "fs", "--prefix", "fs", "--command", "uvx", *_cfg_args(config)],
@@ -1800,8 +1798,16 @@ class TestAddJson:
         result = runner.invoke(
             cli,
             [
-                "add", "gh", "--prefix", "gh", "--command", "npx",
-                "--env", "GITHUB_TOKEN=ghp_supersecret", "--json", *_cfg_args(config),
+                "add",
+                "gh",
+                "--prefix",
+                "gh",
+                "--command",
+                "npx",
+                "--env",
+                "GITHUB_TOKEN=ghp_supersecret",
+                "--json",
+                *_cfg_args(config),
             ],
         )
         assert result.exit_code == 0, result.output
@@ -1844,9 +1850,17 @@ class TestAddJson:
         result = runner.invoke(
             cli,
             [
-                "add", "api", "--prefix", "api", "--transport", "sse",
-                "--url", "https://example.com/sse",
-                "--header", "Authorization=Bearer_ghp_supersecret", "--json",
+                "add",
+                "api",
+                "--prefix",
+                "api",
+                "--transport",
+                "sse",
+                "--url",
+                "https://example.com/sse",
+                "--header",
+                "Authorization=Bearer_ghp_supersecret",
+                "--json",
                 *_cfg_args(config),
             ],
         )
@@ -1865,8 +1879,17 @@ class TestAddJson:
         result = runner.invoke(
             cli,
             [
-                "add", "s", "--prefix", "s", "--transport", "sse",
-                "--url", "https://x", "--header", "=Bearer_ghp_supersecret", "--json",
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--transport",
+                "sse",
+                "--url",
+                "https://x",
+                "--header",
+                "=Bearer_ghp_supersecret",
+                "--json",
                 *_cfg_args(config),
             ],
         )
@@ -1882,8 +1905,16 @@ class TestAddJson:
         result = runner.invoke(
             cli,
             [
-                "add", "s", "--prefix", "s", "--command", "x",
-                "--header", "A=b", "--json", *_cfg_args(config),
+                "add",
+                "s",
+                "--prefix",
+                "s",
+                "--command",
+                "x",
+                "--header",
+                "A=b",
+                "--json",
+                *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
@@ -1926,8 +1957,17 @@ class TestAddJson:
         result = runner.invoke(
             cli,
             [
-                "add", "bad", "--prefix", "bad", "--command", "__nonexistent_cmd_12345__",
-                "--validate", "--timeout", "3", "--json", *_cfg_args(config),
+                "add",
+                "bad",
+                "--prefix",
+                "bad",
+                "--command",
+                "__nonexistent_cmd_12345__",
+                "--validate",
+                "--timeout",
+                "3",
+                "--json",
+                *_cfg_args(config),
             ],
         )
         assert result.exit_code == 1
@@ -1945,11 +1985,23 @@ class TestAddJson:
 
         proc = subprocess.run(
             [
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 "from memtomem_stm.cli.proxy import cli; cli()",
-                "add", "fake", "--prefix", "fk",
-                "--command", sys.executable, "--args", str(_FAKE_SERVER),
-                "--validate", "--timeout", "15", "--json", "--config", str(config),
+                "add",
+                "fake",
+                "--prefix",
+                "fk",
+                "--command",
+                sys.executable,
+                "--args",
+                str(_FAKE_SERVER),
+                "--validate",
+                "--timeout",
+                "15",
+                "--json",
+                "--config",
+                str(config),
             ],
             capture_output=True,
             text=True,
@@ -2062,6 +2114,86 @@ class TestInit:
             "servers": ["demo"],
             "client": "skip",
         }
+
+    @pytest.mark.parametrize(
+        ("freshness", "expected_ttl"),
+        [("live", 0), ("reuse", 86400)],
+    )
+    def test_init_freshness_preset_is_saved(
+        self, runner, config, no_discovery, freshness, expected_ttl
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "init",
+                "--demo",
+                "--client",
+                "skip",
+                "--no-validate",
+                "--lang",
+                "en",
+                "--freshness",
+                freshness,
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert data["cache"]["default_ttl_seconds"] == expected_ttl
+
+    def test_init_resume_preserves_config_and_reenters_registration(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        original = {"enabled": True, "upstream_servers": {"kept": {"prefix": "k"}}}
+        config.write_text(json.dumps(original), encoding="utf-8")
+        calls: list[dict[str, object]] = []
+
+        def fake_integration(*_args, **kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", fake_integration)
+        result = runner.invoke(cli, ["init", "--resume", "--client", "skip", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert json.loads(config.read_text(encoding="utf-8")) == original
+        assert calls == [
+            {
+                "client_mode": "skip",
+                "config_path": config.resolve(),
+                "replace_registration": False,
+            }
+        ]
+
+    def test_init_save_unverified_acknowledgement_keeps_config(
+        self, runner, config, no_discovery, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def failed_probe(servers, timeout):
+            return {
+                name: StagedProbeResult(stage=ProbeStage.CONFIGURED, error="offline")
+                for name in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", failed_probe)
+        result = runner.invoke(
+            cli,
+            [
+                "init",
+                "--demo",
+                "--client",
+                "skip",
+                "--lang",
+                "en",
+                "--save-unverified",
+                *_cfg_args(config),
+            ],
+            input="y\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert config.exists()
+        assert "--save-unverified acknowledged" in result.output
 
     def test_init_custom_config_registration_carries_explicit_path(
         self, runner, config, no_discovery
@@ -3394,9 +3526,7 @@ class TestInitMcpRegistration:
         add_cmd = fake_claude["calls"][1]
         assert add_cmd[:6] == ["claude", "mcp", "add", "memtomem-stm", "-s", "user"]
         assert "-e" in add_cmd
-        assert any(
-            arg.startswith("MEMTOMEM_STM_PROXY__CONFIG_PATH=") for arg in add_cmd
-        )
+        assert any(arg.startswith("MEMTOMEM_STM_PROXY__CONFIG_PATH=") for arg in add_cmd)
         assert "--" in add_cmd
 
     def test_choice_2_writes_mcp_json_without_shelling_out(
@@ -3943,14 +4073,34 @@ class TestRegisterCommand:
             json.dumps({"enabled": True, "upstream_servers": {"demo": {}}}),
             encoding="utf-8",
         )
-        result = runner.invoke(
-            cli, ["register", "--client", "skip", "--json", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["register", "--client", "skip", "--json", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)
         assert payload["action"] == "register"
         assert payload["ok"] is True
         assert payload["servers"] == ["demo"]
+
+    def test_register_json_failure_includes_actionable_message(self, runner, config):
+        result = runner.invoke(cli, ["register", "--client", "skip", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["error"] == "setup_failed"
+        assert "mms init" in payload["message"]
+
+    def test_register_json_reports_auto_resolved_client(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setattr(
+            proxy_mod.shutil, "which", lambda command: "/bin/codex" if command == "codex" else None
+        )
+        monkeypatch.setattr(proxy_mod, "_codex_registered", lambda: False)
+        monkeypatch.setattr(
+            proxy_mod, "_register_with_codex", lambda *_args, **_kwargs: (True, "ok")
+        )
+        result = runner.invoke(cli, ["register", "--client", "auto", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["client"] == "codex"
 
 
 # ── add --from-clients (bulk import) ────────────────────────────────────
@@ -4494,9 +4644,7 @@ class TestAddFromClientsPrune:
         assert "boom" in result.output
         assert "claude mcp remove from-user -s user" in result.output
 
-    def test_prune_flag_without_from_clients_is_usage_error(
-        self, runner, config, monkeypatch
-    ):
+    def test_prune_flag_without_from_clients_is_usage_error(self, runner, config, monkeypatch):
         """`--prune` has no imported-candidate set to act on without
         ``--from-clients``; silently ignoring it would be surprising."""
         self._seed_config(config, {})
@@ -4555,9 +4703,7 @@ class TestAddFromClientsPrune:
         # Hint still shown.
         assert "claude mcp remove from-user -s user" in result.output
 
-    def test_tty_prompt_accept_prunes(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_tty_prompt_accept_prunes(self, runner, config, monkeypatch, fake_claude):
         """On TTY, accepting the prompt prunes exactly like `--prune`. Stubs
         ``_pick_imports`` for the same CliRunner-vs-questionary reason as
         the default-No test above."""
@@ -4616,9 +4762,7 @@ class TestAddFromClientsPrune:
         # Confirm prompt text must NOT appear — no silent auto-prune.
         assert "Remove from source(s)?" not in result.output
 
-    def test_prune_acts_on_duplicate_in_sources_too(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_prune_acts_on_duplicate_in_sources_too(self, runner, config, monkeypatch, fake_claude):
         """A candidate registered in more than one source is listed with
         `duplicate_in`; `--prune` must remove it from every source, not just
         the primary one, otherwise the dual-path survives."""
@@ -4660,9 +4804,7 @@ class TestPruneCommand:
         monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
 
     def _seed_config(self, config: Path, server_names: list[str]) -> None:
-        servers = {
-            n: {"prefix": n, "transport": "stdio", "command": "npx"} for n in server_names
-        }
+        servers = {n: {"prefix": n, "transport": "stdio", "command": "npx"} for n in server_names}
         config.write_text(
             json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
             encoding="utf-8",
@@ -4704,9 +4846,7 @@ class TestPruneCommand:
     def test_missing_config_errors_with_init_hint(self, runner, tmp_path):
         """Pointing at a non-existent config is a cold-start signal — surface
         the init hint rather than failing on _load's generic empty-dict path."""
-        result = runner.invoke(
-            cli, ["prune", "--all", "--config", str(tmp_path / "nope.json")]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--config", str(tmp_path / "nope.json")])
         assert result.exit_code != 0
         assert "config not found" in result.output
         assert "mms init" in result.output
@@ -4726,9 +4866,7 @@ class TestPruneCommand:
         assert result.exit_code == 0
         assert "No dual-registered upstreams found" in result.output
 
-    def test_names_filter_prunes_only_requested(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_names_filter_prunes_only_requested(self, runner, config, monkeypatch, fake_claude):
         """Explicit NAMES must act only on the named subset — unrelated
         dual-reg servers stay put."""
         self._seed_config(config, ["docs-langchain", "langfuse-docs", "other"])
@@ -4747,18 +4885,14 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "docs-langchain", "--yes", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "docs-langchain", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
 
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         names = [c[3] for c in argvs]
         assert names == ["docs-langchain"]
 
-    def test_unknown_name_errors_before_any_write(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_unknown_name_errors_before_any_write(self, runner, config, monkeypatch, fake_claude):
         """Any NAMES entry that isn't dual-registered fails the whole command
         up front — half-applied writes are worse than a rejection."""
         self._seed_config(config, ["docs-langchain"])
@@ -4782,9 +4916,7 @@ class TestPruneCommand:
         # we abort before any prune writes fire.
         assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
 
-    def test_all_prunes_every_dual_registered(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_all_prunes_every_dual_registered(self, runner, config, monkeypatch, fake_claude):
         """``--all`` = every (STM upstream ∩ source client) pair pruned from
         the source that advertises it."""
         self._seed_config(config, ["a", "b"])
@@ -4803,9 +4935,7 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
 
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
@@ -4828,9 +4958,7 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "--all", "--dry-run", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         assert "Dry run" in result.output
         assert "docs-langchain" in result.output
@@ -4874,17 +5002,13 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "--all", *_cfg_args(config)], input="y\n"
-        )
+        result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)], input="y\n")
         assert result.exit_code == 0, result.output
 
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
 
-    def test_tty_prompt_decline_no_writes(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_tty_prompt_decline_no_writes(self, runner, config, monkeypatch, fake_claude):
         """TTY path + No → clean exit, no writes. Default No is load-bearing
         for destructive opt-in semantics."""
         from memtomem_stm.cli import proxy as proxy_mod
@@ -4901,16 +5025,12 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "--all", *_cfg_args(config)], input="n\n"
-        )
+        result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)], input="n\n")
         assert result.exit_code == 0, result.output
         assert "Aborted" in result.output
         assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
 
-    def test_duplicate_in_sources_all_pruned(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_duplicate_in_sources_all_pruned(self, runner, config, monkeypatch, fake_claude):
         """A name registered in multiple sources (``source`` + ``duplicate_in``)
         must be removed from every source or the dual-path survives."""
         self._seed_config(config, ["filesystem"])
@@ -4925,18 +5045,14 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
 
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         pairs = {(c[3], c[5]) for c in argvs}
         assert pairs == {("filesystem", "user"), ("filesystem", "local")}
 
-    def test_divergent_identity_not_dual_registered(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_divergent_identity_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
         """Same name in STM and source client but different command → the
         user has two intentionally distinct servers sharing a name, not a
         dual-reg. Pruning the source entry would clobber unrelated config;
@@ -4975,9 +5091,7 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         assert "No dual-registered upstreams found" in result.output
         assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
@@ -5005,9 +5119,7 @@ class TestPruneCommand:
                 },
             ],
         )
-        result = runner.invoke(
-            cli, ["prune", "a", "--dry-run", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "a", "--dry-run", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         assert "Dry run" in result.output
         # Header should reflect the filtered count, not the full 2.
@@ -5036,9 +5148,7 @@ class TestPruneCommand:
         )
         fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
 
-        result = runner.invoke(
-            cli, ["prune", "--all", "--yes", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
         assert result.exit_code != 0
         assert "could not remove 1 direct registration" in result.output
         assert "boom" in result.output
@@ -5292,9 +5402,7 @@ class TestPruneBackupLog:
 
         # Row landed before the crash...
         log = _read_backup_log(_hermetic_home)
-        assert [(r["name"], r["original"]) for r in log["entries"]] == [
-            ("crashy", desktop_entry)
-        ]
+        assert [(r["name"], r["original"]) for r in log["entries"]] == [("crashy", desktop_entry)]
         # ...and the host entry survived untouched.
         host = json.loads(desktop_path.read_text(encoding="utf-8"))
         assert host["mcpServers"]["crashy"] == desktop_entry
@@ -5715,9 +5823,7 @@ class TestEjectCommand:
 
     # ── schema-loss hard gate ──
 
-    def test_schema_strip_fails_entry_and_keeps_stm(
-        self, runner, config, fake_claude_host
-    ):
+    def test_schema_strip_fails_entry_and_keeps_stm(self, runner, config, fake_claude_host):
         """The claude CLI silently drops unknown fields — a clean add-json
         exit is NOT proof the verbatim contract held. Default: the entry
         stays in STM (dual registration) and eject fails loudly."""
@@ -5733,9 +5839,7 @@ class TestEjectCommand:
         assert "--accept-schema-loss" in result.output
         assert "dual registration" in result.output
 
-    def test_accept_schema_loss_removes_with_warning(
-        self, runner, config, fake_claude_host
-    ):
+    def test_accept_schema_loss_removes_with_warning(self, runner, config, fake_claude_host):
         original = {"type": "stdio", "command": "npx", "hostOnly": True}
         self._seed_config(config, {"demo": _eject_entry(original=original)})
         fake_claude_host["strip_keys"] = ["hostOnly"]
@@ -5898,9 +6002,7 @@ class TestEjectCommand:
 
     # ── secret gate (§7) ──
 
-    def test_secret_gate_non_tty_yes_does_not_bypass(
-        self, runner, config, fake_claude_host
-    ):
+    def test_secret_gate_non_tty_yes_does_not_bypass(self, runner, config, fake_claude_host):
         original = {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_secret"}}
         self._seed_config(config, {"demo": _eject_entry(original=original)})
 
@@ -5966,9 +6068,7 @@ class TestEjectCommand:
         alias = tmp_path / "alias-proj"
         alias.symlink_to(real)
         recorded = str(alias)
-        self._seed_config(
-            config, {"demo": _eject_entry(kind="claude-project", path=recorded)}
-        )
+        self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=recorded)})
 
         result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
 
@@ -6025,9 +6125,7 @@ class TestEjectCommand:
         assert result.exit_code == 1
         assert "--to" in result.output
 
-    def test_origin_less_suggests_backup_log_row(
-        self, runner, config, _hermetic_home
-    ):
+    def test_origin_less_suggests_backup_log_row(self, runner, config, _hermetic_home):
         log = _hermetic_home / ".memtomem" / "pruned_upstreams.json"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(
@@ -6077,7 +6175,12 @@ class TestEjectCommand:
 
         assert result.exit_code == 0, result.output
         written = json.loads(target.read_text(encoding="utf-8"))["mcpServers"]["plain"]
-        assert written == {"type": "stdio", "command": "npx", "args": ["-y", "@p"], "env": {"A": "1"}}
+        assert written == {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@p"],
+            "env": {"A": "1"},
+        }
         assert "reconstructed" in result.output
 
     def test_to_usage_errors(self, runner, config):
@@ -6109,9 +6212,7 @@ class TestEjectCommand:
         assert "modified after import" in result.output
         assert self._claude_user_servers(_hermetic_home)["demo"] == original
 
-    def test_pruned_duplicates_reported_not_restored(
-        self, runner, config, fake_claude_host
-    ):
+    def test_pruned_duplicates_reported_not_restored(self, runner, config, fake_claude_host):
         self._seed_config(
             config,
             {
@@ -6318,7 +6419,12 @@ class TestDenormalizeClientEntry:
                 "surfacing_enabled": False,
             }
         )
-        assert payload == {"type": "stdio", "command": "npx", "args": ["-y", "@p"], "env": {"A": "1"}}
+        assert payload == {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@p"],
+            "env": {"A": "1"},
+        }
         assert any("filtered at import time" in w for w in warnings)
 
     def test_streamable_http_maps_to_host_http_type(self):
@@ -6408,9 +6514,7 @@ class TestConfigWriteLock:
         ],
         ids=["add", "remove", "surfacing-write", "prune", "init", "eject", "tune-apply"],
     )
-    def test_mutators_fail_cleanly_when_lock_held(
-        self, runner, config, argv, _hermetic_home
-    ):
+    def test_mutators_fail_cleanly_when_lock_held(self, runner, config, argv, _hermetic_home):
         self._seed(config)
         if argv == ["init"]:
             # init aborts on an existing config before doing anything; give
@@ -6424,18 +6528,14 @@ class TestConfigWriteLock:
         assert "timed out" in result.output
         assert "mutating the proxy config" in result.output
 
-    def test_lock_timeout_renders_json_envelope_in_json_mode(
-        self, runner, config, _hermetic_home
-    ):
+    def test_lock_timeout_renders_json_envelope_in_json_mode(self, runner, config, _hermetic_home):
         """The lock is acquired before the callback runs, so the commands'
         own --json error handling can never see a timeout — the decorator
         must render the envelope itself (#614, codex #644 R1). Exit code
         stays 1; stdout is exactly one JSON document."""
         self._seed(config)
         with self._hold_lock(_hermetic_home):
-            result = runner.invoke(
-                cli, ["remove", "srv", "--yes", "--json", *_cfg_args(config)]
-            )
+            result = runner.invoke(cli, ["remove", "srv", "--yes", "--json", *_cfg_args(config)])
         assert result.exit_code == 1
         assert result.stdout.lstrip().startswith("{")
         data = json.loads(result.stdout)
@@ -6443,6 +6543,29 @@ class TestConfigWriteLock:
         assert data["error"] == "config_lock_timeout"
         assert "timed out" in data["message"]
         # Human diagnostics still land on stderr.
+        assert "timed out" in result.stderr
+
+    def test_init_lock_timeout_renders_json_envelope(self, runner, config, _hermetic_home):
+        with self._hold_lock(_hermetic_home):
+            result = runner.invoke(
+                cli,
+                [
+                    "init",
+                    "--demo",
+                    "--client",
+                    "skip",
+                    "--no-validate",
+                    "--lang",
+                    "en",
+                    "--json",
+                    *_cfg_args(config),
+                ],
+            )
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["action"] == "init"
+        assert payload["error"] == "config_lock_timeout"
+        assert "timed out" in payload["message"]
         assert "timed out" in result.stderr
 
     def test_lock_timeout_json_envelope_is_opt_in(self, runner, config, _hermetic_home):
@@ -6455,16 +6578,12 @@ class TestConfigWriteLock:
             # --json + --apply is a usage error inside the callback, but the
             # held lock times out first (same precedence as main for every
             # mutator); a non-opted-in command must keep text rendering.
-            result = runner.invoke(
-                cli, ["tune", "--apply", "--yes", "--json", *_cfg_args(config)]
-            )
+            result = runner.invoke(cli, ["tune", "--apply", "--yes", "--json", *_cfg_args(config)])
         assert result.exit_code == 1
         assert result.stdout.strip() == ""
         assert "timed out" in result.output
 
-    def test_read_and_dry_run_paths_skip_lock(
-        self, runner, config, monkeypatch, _hermetic_home
-    ):
+    def test_read_and_dry_run_paths_skip_lock(self, runner, config, monkeypatch, _hermetic_home):
         """`surfacing NAME` (read), `prune --dry-run`, and `tune` without
         --apply never write, so a held lock must not block them — mirrors
         the mms ``--plan`` skip."""
@@ -6615,9 +6734,7 @@ class TestInitPruneOriginals:
 
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
 
-    def test_flag_prunes_scripted_non_tty(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_flag_prunes_scripted_non_tty(self, runner, config, monkeypatch, fake_claude):
         """``--prune-originals`` in a non-TTY scripted run must fire the prune
         unconditionally — this is the exact `mms init --mcp claude
         --prune-originals` path that the bug report called out."""
@@ -6642,9 +6759,7 @@ class TestInitPruneOriginals:
         assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
         assert "Removed from source client(s)" in result.output
 
-    def test_no_flag_non_tty_preserves_hint_only(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_no_flag_non_tty_preserves_hint_only(self, runner, config, monkeypatch, fake_claude):
         """Regression guard: the existing ``mms init`` scripted flow (no flag,
         non-TTY) must not suddenly start pruning. The #203 read-only
         invariant holds by default; only opt-in flips it."""
@@ -6671,9 +6786,7 @@ class TestInitPruneOriginals:
         # And no auto-prompt fired.
         assert "Remove from source(s)?" not in result.output
 
-    def test_tty_prompt_accept_prunes(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_tty_prompt_accept_prunes(self, runner, config, monkeypatch, fake_claude):
         """TTY without flag → prompt fires, ``y`` accepts → prune."""
         from memtomem_stm.cli import proxy as proxy_mod
 
@@ -6703,9 +6816,7 @@ class TestInitPruneOriginals:
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
 
-    def test_tty_prompt_decline_no_prune(
-        self, runner, config, monkeypatch, fake_claude
-    ):
+    def test_tty_prompt_decline_no_prune(self, runner, config, monkeypatch, fake_claude):
         """TTY + decline → no writes, manual hint still shown (same as the
         non-TTY default path so user behavior is consistent across paths)."""
         from memtomem_stm.cli import proxy as proxy_mod
@@ -6994,6 +7105,13 @@ class TestHealth:
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.chdir(project)
+        (project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"memtomem-stm": {"command": "memtomem-stm"}}}),
+            encoding="utf-8",
+        )
 
     def test_health_no_servers(self, runner, config):
         """Empty config → friendly message, no crash."""
@@ -7439,9 +7557,7 @@ class TestHealth:
         assert "ltm server: UNREACHABLE" in proc.stdout
         assert "timeout (1s)" in proc.stdout
 
-    def test_health_ltm_probe_shares_timeout_across_phases(
-        self, config, monkeypatch, tmp_path
-    ):
+    def test_health_ltm_probe_shares_timeout_across_phases(self, config, monkeypatch, tmp_path):
         """A server that handshakes + lists tools fast but stalls on
         ``mem_do(action="version")`` must not extend total probe time past
         ``--timeout``. The probe shares one end-to-end budget across
@@ -7728,9 +7844,7 @@ class TestHealth:
         assert results["up"].stage is ProbeStage.CONFIGURED
 
     @staticmethod
-    def _fake_session_cls(
-        *, init_exc: Exception | None = None, tools_exc: Exception | None = None
-    ):
+    def _fake_session_cls(*, init_exc: Exception | None = None, tools_exc: Exception | None = None):
         """ClientSession stand-in that fails at a chosen probe phase."""
 
         class FakeTool:
@@ -8221,9 +8335,7 @@ class TestDoctor:
     @staticmethod
     def _healthy_config(config, *, strict_cache: bool = True) -> None:
         data = {
-            "upstream_servers": {
-                "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
-            }
+            "upstream_servers": {"fake": {"prefix": "fk", "transport": "stdio", "command": "x"}}
         }
         if strict_cache:
             data["cache"] = {"tool_annotation_policy": "strict"}
@@ -8305,9 +8417,7 @@ class TestDoctor:
 
         async def fake_probe_servers(servers, timeout):
             return {
-                n: StagedProbeResult(
-                    stage=ProbeStage.CONFIGURED, transport="sse", error="no url"
-                )
+                n: StagedProbeResult(stage=ProbeStage.CONFIGURED, transport="sse", error="no url")
                 for n in servers
             }
 
@@ -8368,7 +8478,8 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "failed after 'configured'" in result.output
         assert "stdio child process did not start" in result.output
-        assert "next: command -v __nonexistent_cmd_12345__" in result.output
+        lookup = "where.exe" if os.name == "nt" else "command -v"
+        assert f"next: {lookup} __nonexistent_cmd_12345__" in result.output
 
     def test_cache_policy_unset_warns(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -8715,9 +8826,7 @@ class TestTune:
         finally:
             store.close()
 
-    def test_preview_no_metrics_db_is_noop_and_creates_nothing(
-        self, runner, config, tmp_path
-    ):
+    def test_preview_no_metrics_db_is_noop_and_creates_nothing(self, runner, config, tmp_path):
         metrics_db = tmp_path / "metrics.db"
         self._seed_config(config, metrics_db)
         result = runner.invoke(cli, ["tune", *_cfg_args(config)])
@@ -8787,9 +8896,7 @@ class TestTune:
         assert saved["upstream_servers"]["srv"]["future_server_key"] == "keep me"
         assert ProxyConfig.model_validate(saved).upstream_servers["srv"] is not None
 
-    def test_apply_creates_timestamped_backup_with_original_bytes(
-        self, runner, config, tmp_path
-    ):
+    def test_apply_creates_timestamped_backup_with_original_bytes(self, runner, config, tmp_path):
         metrics_db = tmp_path / "metrics.db"
         self._seed_config(config, metrics_db)
         self._seed_metrics(metrics_db)
@@ -8842,9 +8949,7 @@ class TestTune:
         assert config.read_bytes() == before
         assert list(config.parent.glob("stm_proxy.json.bak-*")) == []
 
-    def test_apply_refuses_env_masked_invalid_raw_file(
-        self, runner, config, tmp_path, monkeypatch
-    ):
+    def test_apply_refuses_env_masked_invalid_raw_file(self, runner, config, tmp_path, monkeypatch):
         """A malformed per-tool entry in the FILE can be masked from the typed
         load by an env override (`_deep_merge` replaces a non-dict file leaf
         with an env-built dict). ``--apply`` edits the file, so it must refuse

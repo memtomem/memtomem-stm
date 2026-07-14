@@ -670,6 +670,7 @@ class TestDaemonStopCli:
         assert not hs.exists()
         assert killed == []
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
     def test_stale_handshake_alive_pid_gets_sigterm(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -899,6 +900,7 @@ class TestDaemonForeignOrphans:
         assert "no running daemon" in result.output
         assert killed == []  # default scope never reaches a different-config daemon
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
     def test_stop_all_sigterms_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         import signal as _signal
 
@@ -918,6 +920,7 @@ class TestDaemonForeignOrphans:
         assert killed == [(98765, _signal.SIGTERM)]
         assert "sent SIGTERM to daemon pid=98765 (fp=foreignfp000000)" in result.output
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
     def test_pinned_fingerprint_change_is_reachable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -979,6 +982,7 @@ class TestDaemonForeignOrphans:
         assert "pid=1001 fp=aaaa000000000000, pid=3003 fp=cccc000000000000" in result.output
         assert "2002" not in result.output
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
     def test_stop_all_skips_dead_and_continues_on_oserror(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -1112,6 +1116,7 @@ class TestDaemonForeignOrphans:
         assert killed == []  # recycled pid never signalled
         assert "no daemons running under a different config" in result.output
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
     def test_stop_all_reprobes_before_kill(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """TOCTOU between enumeration and `os.kill` (#519): a foreign daemon passes
         the enumeration probe, then exits and its pid is recycled before the kill.
