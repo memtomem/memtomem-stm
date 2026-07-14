@@ -592,6 +592,7 @@ class ProxyManager:
                         exc_info=True,
                     )
                 self._toolgraph_cache = None
+        self._reset_toolgraph_session_state()
         self._stack = AsyncExitStack()
 
         servers = self._config.upstream_servers
@@ -895,17 +896,7 @@ class ProxyManager:
         advertised.
         """
         cfg = self._config.toolgraph
-        # Reset the cached snapshot first: start() is a supported re-entry path
-        # (the double-start guard re-runs discovery + compute_health_flags), so
-        # a recovered graph on a second start must not inherit the previous
-        # session's withhold-all / degraded / reject state.
-        self._toolgraph_external_rejects = {}
-        self._toolgraph_risk_penalties = {}
-        self._toolgraph_withhold_all = None
-        self._graph_generation = None
-        self._toolgraph_degraded = False
-        self._toolgraph_degraded_reason = None
-        self._toolgraph_from_cache = False
+        self._reset_toolgraph_verdict_state()
 
         ref_to_keys, refs = self._build_toolgraph_candidates()
         if not refs:
@@ -989,6 +980,27 @@ class ProxyManager:
                 self._graph_generation,
             )
         self._warn_server_name_mismatch(interp.tool_not_found_refs, ref_to_keys)
+
+    def _reset_toolgraph_verdict_state(self) -> None:
+        """Clear the shared stdio/bundle verdict fields before a consult."""
+        self._toolgraph_external_rejects = {}
+        self._toolgraph_risk_penalties = {}
+        self._toolgraph_withhold_all = None
+        self._graph_generation = None
+        self._toolgraph_degraded = False
+        self._toolgraph_degraded_reason = None
+        self._toolgraph_from_cache = False
+
+    def _reset_toolgraph_session_state(self) -> None:
+        """Drop every enforcement snapshot before a new start lifecycle."""
+        self._reset_toolgraph_verdict_state()
+        self._toolgraph_policy_snapshot = None
+        self._toolgraph_bundle_stamp = None
+        self._toolgraph_bundle_digest = None
+        self._graph_instance_id = None
+        self._toolgraph_would_block_calls = 0
+        self._tool_catalog_revision = 0
+        self._toolgraph_bound_catalog_revision = None
 
     def _open_consult_cache(self, cfg: ToolgraphConfig) -> GraphConsultCache | None:
         """Lazily open the #494 consult disk cache; ``None`` when disabled.

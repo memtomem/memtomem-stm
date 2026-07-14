@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from memtomem_stm.proxy.tool_eligibility import (
 
 SCHEMA_VERSION = 1
 KIND = "toolgraph.policy-bundle"
-_SHA256_LENGTH = 64
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 class PolicyBundleError(ValueError):
@@ -101,7 +102,7 @@ def _non_empty_string(value: Any, field: str) -> str:
 
 def _digest(value: Any, field: str) -> str:
     text = _non_empty_string(value, field)
-    if len(text) != _SHA256_LENGTH or any(c not in "0123456789abcdef" for c in text):
+    if _SHA256_RE.fullmatch(text) is None:
         raise PolicyBundleError(f"{field} must be a lowercase SHA-256 digest")
     return text
 

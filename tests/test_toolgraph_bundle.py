@@ -251,6 +251,55 @@ async def test_review_keeps_tool_and_records_would_block(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_explore_bundle_rejection_is_non_enforcing(tmp_path):
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.EXPLORE)
+    _write_bundle(path, _bundle(tool, profile="explore", decision="rejected"))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+    manager._call_tool_guarded = AsyncMock(return_value=("ok", False))
+
+    assert [item.original_name for item in manager.get_proxy_tools()] == ["read"]
+    assert await manager.call_tool("srv", "read", {}) == "ok"
+    assert manager.get_toolgraph_status()["would_block_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_start_drops_stale_bundle_state_when_toolgraph_is_disabled(tmp_path):
+    config = ProxyConfig(config_path=tmp_path / "missing.json", upstream_servers={})
+    manager = ProxyManager(config, TokenTracker())
+    await manager.start()
+    manager._toolgraph_external_rejects = {("old", "tool"): "stale"}
+    manager._toolgraph_risk_penalties = {("old", "tool"): 0.9}
+    manager._toolgraph_withhold_all = "stale"
+    manager._graph_generation = 99
+    manager._toolgraph_degraded = True
+    manager._toolgraph_degraded_reason = "stale"
+    manager._toolgraph_policy_snapshot = object()
+    manager._toolgraph_bundle_stamp = (1, 2, 3)
+    manager._toolgraph_bundle_digest = "a" * 64
+    manager._graph_instance_id = "old-instance"
+    manager._toolgraph_would_block_calls = 7
+    manager._tool_catalog_revision = 4
+    manager._toolgraph_bound_catalog_revision = 4
+
+    await manager.start()
+
+    assert manager._toolgraph_external_rejects == {}
+    assert manager._toolgraph_risk_penalties == {}
+    assert manager._toolgraph_withhold_all is None
+    assert manager._graph_generation is None
+    assert manager._toolgraph_degraded is False
+    assert manager._toolgraph_degraded_reason is None
+    assert manager._toolgraph_policy_snapshot is None
+    assert manager._toolgraph_bundle_stamp is None
+    assert manager._toolgraph_bundle_digest is None
+    assert manager._graph_instance_id is None
+    assert manager._toolgraph_would_block_calls == 0
+    assert manager._tool_catalog_revision == 0
+    assert manager._toolgraph_bound_catalog_revision is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
 async def test_review_rebinds_last_known_good_once_when_catalog_changes(tmp_path, monkeypatch):
     manager, path, tool = _manager(tmp_path, profile=ExposureProfile.REVIEW)
     _write_bundle(path, _bundle(tool, profile="review"))
@@ -343,7 +392,9 @@ def test_gateway_mode_preview_does_not_mutate_loaded_config(monkeypatch):
 def test_gateway_status_and_explain_bundle(tmp_path):
     config = tmp_path / "proxy.json"
     bundle = tmp_path / "bundle.json"
-    _write_bundle(bundle, _bundle(_tool()))
+    document = _bundle(_tool())
+    document["tools"][0]["risk_score"] = None
+    _write_bundle(bundle, document)
     config.write_text(
         json.dumps(
             {
@@ -371,3 +422,10 @@ def test_gateway_status_and_explain_bundle(tmp_path):
     )
     assert explain.exit_code == 0, explain.output
     assert json.loads(explain.output)["decision"] == "eligible"
+
+    plain = runner.invoke(
+        cli,
+        ["gateway", "explain", "graph-srv::read", "--config", str(config)],
+    )
+    assert plain.exit_code == 0, plain.output
+    assert "risk score: n/a" in plain.output

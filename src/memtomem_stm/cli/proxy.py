@@ -1001,7 +1001,8 @@ def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -
         click.echo(f"{tool_key}: {decision.decision}")
         if decision.reason:
             click.echo(f"  reason: {decision.reason}")
-        click.echo(f"  risk score: {decision.risk_score}")
+        risk_score = decision.risk_score if decision.risk_score is not None else "n/a"
+        click.echo(f"  risk score: {risk_score}")
         click.echo(f"  graph generation: {snapshot.generation}")
 
 
