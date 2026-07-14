@@ -9,34 +9,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from memtomem_stm.proxy.tool_eligibility import (
-    REASON_TOOLGRAPH_AMBIGUOUS,
-    REASON_TOOLGRAPH_DENY_GOVERNED,
-    REASON_TOOLGRAPH_DENY_VIOLATION,
-    REASON_TOOLGRAPH_DRIFTED,
-    REASON_TOOLGRAPH_NOT_GRANTED,
-    REASON_TOOLGRAPH_REJECTED,
-    REASON_TOOLGRAPH_TOOL_NOT_FOUND,
-    REASON_TOOLGRAPH_UNMAPPED,
+    toolgraph_reject_code,
 )
 
 SCHEMA_VERSION = 1
 KIND = "toolgraph.policy-bundle"
 _SHA256_LENGTH = 64
-
-_REASON_CODES = {
-    "TOOL_NOT_FOUND": REASON_TOOLGRAPH_TOOL_NOT_FOUND,
-    "AMBIGUOUS_TOOL": REASON_TOOLGRAPH_AMBIGUOUS,
-    "NOT_GRANTED": REASON_TOOLGRAPH_NOT_GRANTED,
-    "DENY_VIOLATION": REASON_TOOLGRAPH_DENY_VIOLATION,
-    "DENY_GOVERNED": REASON_TOOLGRAPH_DENY_GOVERNED,
-    "DRIFTED": REASON_TOOLGRAPH_DRIFTED,
-    "UNMAPPED": REASON_TOOLGRAPH_UNMAPPED,
-}
 
 
 class PolicyBundleError(ValueError):
@@ -55,7 +39,7 @@ class PolicyDecision:
     def reject_code(self) -> str | None:
         if self.decision == "eligible":
             return None
-        return _REASON_CODES.get(self.reason or "", REASON_TOOLGRAPH_REJECTED)
+        return toolgraph_reject_code(self.reason or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,9 +190,7 @@ def parse_policy_bundle(
     )
 
 
-def load_policy_bundle(
-    path: Path, *, expected_agent: str, expected_profile: str
-) -> PolicySnapshot:
+def load_policy_bundle(path: Path, *, expected_agent: str, expected_profile: str) -> PolicySnapshot:
     try:
         payload = path.expanduser().read_bytes()
     except OSError as exc:

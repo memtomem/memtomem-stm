@@ -491,6 +491,11 @@ class ProxyManager:
         self._toolgraph_bundle_digest: str | None = None
         self._graph_instance_id: str | None = None
         self._toolgraph_would_block_calls: int = 0
+        # Monotonic within a start/stop lifecycle. Portable policy decisions
+        # are rebound only when this revision changes, avoiding O(catalog)
+        # contract hashing on every tools/call hot path.
+        self._tool_catalog_revision: int = 0
+        self._toolgraph_bound_catalog_revision: int | None = None
         self._connections: dict[str, UpstreamConnection] = {}
         # Configured servers whose startup connect FAILED (#580). Entries never
         # land in ``_connections`` (created only on a successful connect), so
@@ -560,6 +565,8 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            self._tool_catalog_revision = 0
+            self._toolgraph_bound_catalog_revision = None
             # Drop stale startup-failure records (#580): a manager reused across
             # ``start()`` calls (new config, or a server removed) must not keep
             # reporting a previous session's failed upstream in
@@ -743,7 +750,10 @@ class ProxyManager:
                 # the artifact itself stayed unchanged. Rebind the immutable
                 # decisions so new/mutated tools become UNMAPPED/DRIFTED before
                 # either advertisement or a direct call.
-                if self._toolgraph_policy_snapshot is not None:
+                if (
+                    self._toolgraph_policy_snapshot is not None
+                    and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+                ):
                     self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
                 return
             active_profile = self._config.exposure.profile.value
@@ -770,6 +780,15 @@ class ProxyManager:
                 self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
                 if startup:
                     raise ToolgraphStartupError(f"Invalid Toolgraph policy bundle: {exc}") from exc
+            elif (
+                self._toolgraph_policy_snapshot is not None
+                and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+            ):
+                # Review mode keeps serving the last-known-good policy, but a
+                # changed catalog must still be rebound once so newly added or
+                # drifted tools are counted as would-block instead of escaping
+                # the stale snapshot.
+                self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
             logger.warning("Toolgraph policy bundle reload rejected: %s", exc)
             return
 
@@ -819,6 +838,7 @@ class ProxyManager:
                     penalties[key] = min(decision.risk_score * cfg.risk_penalty_scale, 1.0)
         self._toolgraph_external_rejects = rejects
         self._toolgraph_risk_penalties = penalties
+        self._toolgraph_bound_catalog_revision = self._tool_catalog_revision
 
     def _enforce_toolgraph_call_policy(self, server: str, tool: str) -> None:
         """Apply the same policy snapshot at call time, before cache/upstream."""
@@ -840,9 +860,7 @@ class ProxyManager:
             )
         if self._config.exposure.profile is ExposureProfile.REVIEW:
             self._toolgraph_would_block_calls += 1
-            logger.warning(
-                "Toolgraph review mode would block %s/%s (%s)", server, tool, reason
-            )
+            logger.warning("Toolgraph review mode would block %s/%s (%s)", server, tool, reason)
 
     def _build_toolgraph_candidates(self) -> tuple[dict[str, list[tuple[str, str]]], list[str]]:
         """Map every discovered upstream tool to its graph candidate ref.
@@ -1334,6 +1352,7 @@ class ProxyManager:
             stack=conn_stack,
             breaker=breaker,
         )
+        self._tool_catalog_revision += 1
         # A successful connect clears any prior startup-failure record (#580).
         self._failed_servers.pop(name, None)
         logger.info("Connected to '%s' (%s tools discovered)", name, len(tools))
@@ -1402,6 +1421,7 @@ class ProxyManager:
             conn.session = session
             conn.stack = conn_stack
             conn.tools = tools
+            self._tool_catalog_revision += 1
             conn.config = cfg
             # Any successful reconnect proves the current config connects —
             # clear the config-change damper so detection resumes normally.
@@ -1513,6 +1533,7 @@ class ProxyManager:
         all_names = old_names | new_names
         was_eligible = {t: self._tool_cache_eligible(name, t, cfg_snap=cfg_snap) for t in all_names}
         conn.tools = new_tools
+        self._tool_catalog_revision += 1
         stale = [
             t
             for t in sorted(all_names)
@@ -1642,6 +1663,8 @@ class ProxyManager:
             await self._stack.aclose()
             self._stack = None
         self._connections.clear()
+        self._tool_catalog_revision = 0
+        self._toolgraph_bound_catalog_revision = None
         # Close the lazily-built selective/progressive stores (#583): a restart
         # recovery or a SELECTIVE/HYBRID/progressive call may have opened a
         # SQLite-backed store that ``_connections`` cleanup never touches, so

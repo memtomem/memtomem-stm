@@ -1028,8 +1028,7 @@ def gateway_mode(
         raise click.UsageError("--apply and --dry-run are mutually exclusive")
     path = Path(config_path)
     data = _load(path)
-    exposure = data.setdefault("exposure", {})
-    toolgraph = data.setdefault("toolgraph", {})
+    toolgraph = data.get("toolgraph") or {}
     target_bundle = bundle_path or Path(
         toolgraph.get("bundle_path", "~/.memtomem/toolgraph/policy-bundle.json")
     )
@@ -1044,8 +1043,10 @@ def gateway_mode(
         click.echo(json.dumps(preview, indent=2, ensure_ascii=False))
         click.echo("Preview only. Re-run with --apply to write the config.")
         return
+    exposure = data.setdefault("exposure", {})
+    writable_toolgraph = data.setdefault("toolgraph", {})
     exposure["profile"] = profile
-    toolgraph.update(
+    writable_toolgraph.update(
         {
             "enabled": True,
             "source": "bundle",

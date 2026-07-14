@@ -40,6 +40,10 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_NAME_OVERFLOW,
     REASON_PROFILE_EXCLUDED,
     REASON_SENSITIVE_METADATA,
+    REASON_TOOLGRAPH_AMBIGUOUS,
+    REASON_TOOLGRAPH_DENY_GOVERNED,
+    REASON_TOOLGRAPH_DENY_VIOLATION,
+    REASON_TOOLGRAPH_DRIFTED,
     REASON_TOOLGRAPH_NOT_GRANTED,
     REASON_TOOLGRAPH_REJECTED,
     REASON_TOOLGRAPH_TOOL_NOT_FOUND,
@@ -52,6 +56,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     filter_tools,
     interpret_verdict,
     parse_risk_scores,
+    toolgraph_reject_code,
 )
 from memtomem_stm.proxy.tool_relevance import (
     PENALTY_SOURCE_NONE,
@@ -718,6 +723,23 @@ def _verdict(*, agent_found=True, rejected=None, graph_generation=11):
 
 
 _MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("TOOL_NOT_FOUND", REASON_TOOLGRAPH_TOOL_NOT_FOUND),
+        ("AMBIGUOUS_TOOL", REASON_TOOLGRAPH_AMBIGUOUS),
+        ("NOT_GRANTED", REASON_TOOLGRAPH_NOT_GRANTED),
+        ("DENY_VIOLATION", REASON_TOOLGRAPH_DENY_VIOLATION),
+        ("DENY_GOVERNED", REASON_TOOLGRAPH_DENY_GOVERNED),
+        ("DRIFTED", REASON_TOOLGRAPH_DRIFTED),
+        ("UNMAPPED", REASON_TOOLGRAPH_UNMAPPED),
+        ("FUTURE_REASON", REASON_TOOLGRAPH_REJECTED),
+    ],
+)
+def test_toolgraph_reject_code_is_the_shared_reason_boundary(reason, expected):
+    assert toolgraph_reject_code(reason) == expected
 
 
 class TestInterpretVerdict:
