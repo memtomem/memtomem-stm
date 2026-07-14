@@ -218,6 +218,13 @@ mms hook install --host codex --apply
 확인하고, 재현 가능한 전체 예제는
 [Resume a project with reviewed memory](reviewed-memory-resume.md)를 따라가세요.
 
+## 9. 선택 기능: Toolgraph 정책 gateway
+
+여러 MCP 서버의 권한과 데이터 흐름을 검토한 뒤 STM에서 실제 호출 정책으로
+적용하려면 [Toolgraph Policy Gateway](toolgraph-policy-gateway.md)를 참고하세요.
+처음에는 `review`로 도구를 유지하면서 would-block 판정을 확인하고, 번들과
+upstream 이름이 안정된 뒤 `strict`로 전환하는 흐름을 권장합니다.
+
 ## 문제 해결
 
 | 증상 | 확인할 것 |

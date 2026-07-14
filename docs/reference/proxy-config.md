@@ -75,8 +75,9 @@ toolgraph blocks each have independent enable/retention settings. See
 consult or the portable `bundle` enforcement path. Bundle mode reads
 `toolgraph.bundle_path`, requires its agent and profile to match
 `toolgraph.agent_id` and `exposure.profile`, and rechecks the artifact before
-tool listing and calls. Use `mms gateway status`, `explain`, and `mode` for the
-operator-facing workflow.
+proxy filtering and calls. A new denial gates calls immediately; restart the
+STM MCP session to rebuild the client-visible registered tool list. Use
+`mms gateway status`, `explain`, and `mode` for the operator-facing workflow.
 
 ## Validation and hot reload
 

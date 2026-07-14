@@ -38,6 +38,7 @@ the option source of truth.
 | `mms stats` | Read durable compression/surfacing statistics |
 | `mms tune` | Preview or apply per-tool compression recommendations |
 | `mms selection replay` | Evaluate selection telemetry and the labelled corpus without applying config |
+| `mms version` | Print the installed version |
 
 ## Toolgraph policy gateway
 
@@ -56,7 +57,10 @@ and leaves bundle publication to `toolgraph policy compile`. `status --json`
 validates and identifies the exact artifact; `explain` shows one qualified
 tool decision without calling the upstream. Applying `strict` warns if the
 target bundle is missing because the next server start will fail closed.
-| `mms version` | Print the installed version |
+Bundle changes gate proxied calls immediately; restart STM/the MCP client to
+refresh which tools appear in the external MCP `tools/list`. See the
+[Toolgraph Policy Gateway guide](../guides/toolgraph-policy-gateway.md) for the
+review-first workflow.
 
 `mms --version` and `mms version` are equivalent. `mms stats --source mcp`
 selects proxied calls; `--source hook` selects native-hook metrics.

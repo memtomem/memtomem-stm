@@ -154,10 +154,36 @@ def test_toolgraph_golden_fixtures_pin_cross_repo_bytes_and_digest():
     assert canonical_json_bytes(document) == payload
 
 
+def test_toolgraph_rejected_golden_fixture_pins_reason_paths_and_exact_bytes():
+    root = files("memtomem_stm.data").joinpath("toolgraph-contract-v1")
+    payload = root.joinpath("policy-bundle-v1-rejected.json").read_bytes()
+    expected = root.joinpath("policy-bundle-v1-rejected.sha256").read_text().strip()
+    snapshot = parse_policy_bundle(
+        payload, expected_agent="fixture-agent", expected_profile="strict"
+    )
+    assert snapshot.bundle_digest == expected
+    decision = snapshot.decisions["도구-서버::publish"]
+    assert decision.decision == "rejected"
+    assert decision.reason == "DENY_VIOLATION"
+    assert decision.reject_code == "toolgraph_deny_violation"
+    document = json.loads(payload)
+    assert document["tools"][0]["paths"] == [
+        "(fixture-agent)-[:CAN_CALL]->(도구-서버::publish)-[:WRITES]->"
+        "(file:///demo/drafts)-[:GOVERNED_BY]->(draft-publish-deny)"
+    ]
+    assert canonical_json_bytes(document) == payload
+
+
 def test_vendored_contract_schema_accepts_reference_bundle():
     schema_path = files("memtomem_stm.data").joinpath("policy-bundle.schema.json")
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     Draft202012Validator(schema).validate(_bundle(_tool()))
+    rejected = json.loads(
+        files("memtomem_stm.data")
+        .joinpath("toolgraph-contract-v1", "policy-bundle-v1-rejected.json")
+        .read_text(encoding="utf-8")
+    )
+    Draft202012Validator(schema).validate(rejected)
 
 
 @pytest.mark.parametrize("version", [0, 2, "1", True])
@@ -405,7 +431,8 @@ def test_gateway_mode_preview_does_not_mutate_loaded_config(monkeypatch):
     assert data == {"enabled": True, "upstream_servers": {}}
 
 
-def test_gateway_mode_strict_apply_warns_until_bundle_exists(tmp_path):
+def test_gateway_mode_strict_apply_warns_until_bundle_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = tmp_path / "proxy.json"
     config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
     missing = tmp_path / "not-published.json"

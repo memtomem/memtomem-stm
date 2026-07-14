@@ -103,6 +103,7 @@ some native PostToolUse events, but it is not a replacement for the proxy.
 ## Next steps
 
 - [한국어: Claude Code와 Codex CLI를 위한 시작 가이드](guides/vibe-coding-getting-started-ko.md)
+- [Enforce Toolgraph policy bundles through the STM gateway](guides/toolgraph-policy-gateway.md)
 - [Operate and troubleshoot STM](guides/operations.md)
 - [Bridge supported native-tool events](guides/native-hooks.md)
 - [Manage project-scoped MCP definitions](guides/project-scoped-mcps.md)
