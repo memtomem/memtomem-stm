@@ -149,7 +149,9 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 except SystemExit as exc:
                     exit_code = int(exc.code) if isinstance(exc.code, int) else 1
 
-            config_path = Path(kwargs.get("config_path", str(_DEFAULT_CONFIG))).expanduser().resolve()
+            config_path = (
+                Path(kwargs.get("config_path", str(_DEFAULT_CONFIG))).expanduser().resolve()
+            )
             server_names: list[str] = []
             if config_path.exists():
                 try:
@@ -2981,9 +2983,7 @@ def init(
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not allow_project_configs:
         candidates = [
-            cand
-            for cand in candidates
-            if str(cand.get("source", "")) != ".mcp.json (project)"
+            cand for cand in candidates if str(cand.get("source", "")) != ".mcp.json (project)"
         ]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
@@ -5899,9 +5899,7 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
                         detail += " (stdio child process did not start)"
                         command = servers[n].get("command", "")
                         next_cmd = (
-                            f"where.exe {command}"
-                            if os.name == "nt"
-                            else f"command -v {command}"
+                            f"where.exe {command}" if os.name == "nt" else f"command -v {command}"
                         )
                     elif timed_out:
                         next_cmd = f"mms health --timeout {max(30, timeout)} {cfg_arg}"
