@@ -14,6 +14,7 @@ from click.testing import CliRunner
 from memtomem_stm.cli.proxy import cli
 from memtomem_stm.proxy.selection_eval import (
     SelectionEvaluationError,
+    _recommend_variant,
     builtin_dataset_path,
     evaluate_selection,
     load_selection_dataset,
@@ -86,6 +87,15 @@ def test_builtin_corpus_contract_and_split_isolation() -> None:
         assert group_splits.setdefault(case["group_id"], case["split"]) == case["split"]
 
 
+def test_corpus_identity_is_independent_of_checkout_line_endings(tmp_path: Path) -> None:
+    expected = load_selection_dataset()["_sha256"]
+    crlf = tmp_path / "selection-eval-crlf.json"
+    source = builtin_dataset_path().read_text(encoding="utf-8")
+    crlf.write_bytes(source.replace("\n", "\r\n").encode("utf-8"))
+
+    assert load_selection_dataset(crlf)["_sha256"] == expected
+
+
 def test_canonical_report_matches_exact_golden_hash() -> None:
     golden = json.loads((_FIXTURES / "golden.json").read_text(encoding="utf-8"))
     first = evaluate_selection()
@@ -155,6 +165,21 @@ def test_bad_schema_marks_report_invalid(tmp_path: Path) -> None:
     assert report["data_quality"]["unsupported_schema_records"] == 1
 
 
+def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["ranker_version"] = "v4-learning-to-rank"
+    selection["candidate_features"]["ranked_candidates"][0]["final_score"] = 0.123
+    execution = _execution()
+    execution["ranker_version"] = "v4-learning-to-rank"
+    _write_jsonl(log, [selection, execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "ok"
+    assert report["data_quality"]["parity_mismatches"] == 0
+
+
 def test_dataset_rejects_split_leakage(tmp_path: Path) -> None:
     dataset = load_selection_dataset()
     dataset.pop("_sha256")
@@ -166,6 +191,67 @@ def test_dataset_rejects_split_leakage(tmp_path: Path) -> None:
 
     with pytest.raises(SelectionEvaluationError, match="leaks across splits"):
         load_selection_dataset(path)
+
+
+def test_dataset_requires_a_rankable_case_in_every_split(tmp_path: Path) -> None:
+    dataset = load_selection_dataset()
+    dataset.pop("_sha256")
+    dataset.pop("_split_counts")
+    for case in dataset["cases"]:
+        if case["split"] == "validation":
+            case["abstain_expected"] = True
+    path = tmp_path / "all-abstain-validation.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    with pytest.raises(
+        SelectionEvaluationError, match="validation split needs at least one rankable case"
+    ):
+        load_selection_dataset(path)
+
+
+def test_recommendation_promotes_strict_no_regression_improvement() -> None:
+    def metrics(*, unsafe: float, task1: float, task5: float, ndcg: float, mrr: float) -> dict:
+        return {
+            "policy_exposure_violation_count": 0,
+            "unsafe_top1_rate": {"value": unsafe},
+            "task_success_proxy_at": {
+                "1": {"value": task1},
+                "5": {"value": task5},
+            },
+            "ndcg_at_5": {"value": ndcg},
+            "mrr": {"value": mrr},
+            "hit_at": {"3": {"value": task5}},
+        }
+
+    baseline_metrics = metrics(unsafe=0.2, task1=0.5, task5=0.8, ndcg=0.5, mrr=0.5)
+    improved_metrics = metrics(unsafe=0.1, task1=0.6, task5=0.9, ndcg=0.6, mrr=0.6)
+    variants = [
+        {
+            "id": "review-0.5__graph-1",
+            "parameters": {"review_risk_penalty": 0.5, "risk_penalty_scale": 1.0},
+            "splits": {
+                "train": baseline_metrics,
+                "validation": baseline_metrics,
+                "test": baseline_metrics,
+            },
+        },
+        {
+            "id": "review-0.75__graph-1",
+            "parameters": {"review_risk_penalty": 0.75, "risk_penalty_scale": 1.0},
+            "splits": {
+                "train": baseline_metrics,
+                "validation": improved_metrics,
+                "test": improved_metrics,
+            },
+        },
+    ]
+
+    recommendation = _recommend_variant(variants, 0.5, 1.0)
+
+    assert recommendation["status"] == "promote"
+    assert recommendation["selected_on_validation"] == "review-0.75__graph-1"
+    assert recommendation["recommended_variant"] == "review-0.75__graph-1"
+    assert recommendation["config_patch"]["exposure"]["review_risk_penalty"] == 0.75
 
 
 def test_cli_json_and_output_files_are_private(tmp_path: Path) -> None:

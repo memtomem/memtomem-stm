@@ -29,6 +29,9 @@ from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.proxy.selection_log import SCHEMA_VERSION
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.proxy.tool_relevance import (
+    RANKER_VERSION_BM25,
+    RANKER_VERSION_BM25_GRAPH_RISK,
+    RANKER_VERSION_BM25_RISK,
     ToolRelevanceRanker,
     compose_risk_penalty,
     penalty_source,
@@ -40,6 +43,9 @@ EVALUATOR_VERSION = "v1"
 MAX_LINE_BYTES = 1_048_576
 GRID_REVIEW = (0.0, 0.25, 0.5, 0.75, 1.0)
 GRID_GRAPH = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+PARITY_RANKER_VERSIONS = frozenset(
+    (RANKER_VERSION_BM25, RANKER_VERSION_BM25_RISK, RANKER_VERSION_BM25_GRAPH_RISK)
+)
 
 
 class SelectionEvaluationError(ValueError):
@@ -121,6 +127,7 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
     seen_cases: set[str] = set()
     group_splits: dict[str, str] = {}
     split_counts: Counter[str] = Counter()
+    rankable_counts: Counter[str] = Counter()
     for case in cases:
         if not isinstance(case, dict):
             raise SelectionEvaluationError("each dataset case must be an object")
@@ -191,9 +198,21 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
             seen_candidate_ids.add(candidate_id)
         if not case.get("abstain_expected", False) and success_candidates == 0:
             raise SelectionEvaluationError(f"{case_id}: non-abstain case needs task-success gold")
+        if not case.get("abstain_expected", False):
+            rankable_counts[split] += 1
         seen_cases.add(case_id)
         split_counts[split] += 1
-    data["_sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+    for split in ("train", "validation", "test"):
+        if rankable_counts[split] == 0:
+            raise SelectionEvaluationError(f"{split} split needs at least one rankable case")
+    canonical = json.dumps(
+        data,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    data["_sha256"] = hashlib.sha256(canonical).hexdigest()
     data["_split_counts"] = dict(sorted(split_counts.items()))
     return data
 
@@ -678,7 +697,8 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                     penalty = entry.get("risk_penalty", 0.0)
                     final = entry.get("final_score")
                     if (
-                        isinstance(relevance, (int, float))
+                        ranker in PARITY_RANKER_VERSIONS
+                        and isinstance(relevance, (int, float))
                         and not isinstance(relevance, bool)
                         and isinstance(penalty, (int, float))
                         and not isinstance(penalty, bool)

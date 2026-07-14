@@ -59,15 +59,19 @@ The 35 variants report hit rate, task-success proxy, MRR, nDCG@5, unsafe
 candidate rejection, unnecessary rejection, policy exposure, unsafe top-k,
 and abstention false positives by split. Training first removes variants that
 regress the safety and task@5 gates. Validation selects lexicographically with
-safety before relevance. The held-out test must show a strict improvement with
-no regression; otherwise the report keeps the configured baseline.
+safety before relevance. The held-out test is deliberately used only as a final
+safety confirmation gate: it must show a strict improvement with no regression,
+or the report keeps the configured baseline. The command remains preview-only,
+so this conservative confirmation never rolls out a configuration automatically.
 
 ## CI golden
 
 `tests/fixtures/selection_eval/golden.json` pins the SHA-256 of the complete
 canonical JSON report, along with the corpus split, variant count, and baseline
-recommendation. An intentional ranker, eligibility, metric, corpus, or report
-contract change must be reviewed and then update that golden explicitly.
+recommendation. The corpus identity is computed from canonical parsed JSON, so
+checkout line endings and formatting do not change the report across operating
+systems. An intentional ranker, eligibility, metric, corpus, or report contract
+change must be reviewed and then update that golden explicitly.
 
 For the write-side schema and privacy guarantees, see
 [Selection Telemetry](selection-telemetry.md).

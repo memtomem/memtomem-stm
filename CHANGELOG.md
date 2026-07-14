@@ -13,7 +13,7 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
-- Added `mms selection replay` for issue #468: read-only schema/join/cohort
+- Added `mms selection replay` for issue #468 (#698): read-only schema/join/cohort
   diagnostics over selection JSONL plus deterministic evaluation of the current
   eligibility filter and BM25 ranker on a packaged, sanitized 30-case corpus.
   The report evaluates 35 existing risk-weight combinations with safety-first

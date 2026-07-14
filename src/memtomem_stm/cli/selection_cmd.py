@@ -103,6 +103,9 @@ def replay_command(
         atomic_write_text(target / "report.json", report.to_json(), mode=0o600)
         atomic_write_text(target / "summary.md", summary, mode=0o600)
 
-    click.echo(report.to_json(), nl=False) if as_json else click.echo(summary, nl=False)
+    if as_json:
+        click.echo(report.to_json(), nl=False)
+    else:
+        click.echo(summary, nl=False)
     if report.data["status"] == "invalid":
         raise click.exceptions.Exit(1)
