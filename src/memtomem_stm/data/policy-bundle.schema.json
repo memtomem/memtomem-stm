@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toolgraph.dev/contracts/policy-bundle.schema.json",
+  "title": "toolgraph policy bundle",
+  "description": "Portable advisory policy decisions for one agent and profile. Consumers enforce the decisions; Toolgraph does not proxy calls.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "kind", "created_at", "graph_state", "agent", "agent_found", "profile", "governance_digest", "catalog_digest", "tools"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "toolgraph.policy-bundle"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "graph_state": {"$ref": "#/$defs/graphState"},
+    "agent": {"type": "string", "minLength": 1},
+    "agent_found": {"const": true},
+    "profile": {"enum": ["strict", "review", "explore"]},
+    "governance_digest": {"$ref": "#/$defs/sha256"},
+    "catalog_digest": {"$ref": "#/$defs/sha256"},
+    "tools": {"type": "array", "items": {"$ref": "#/$defs/toolDecision"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "qualifiedToolKey": {"type": "string", "pattern": "^[^:]+::[^:]+$"},
+    "graphState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "generation"],
+      "properties": {
+        "instance_id": {"type": "string", "minLength": 1},
+        "generation": {"type": "integer", "minimum": 0}
+      }
+    },
+    "toolDecision": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["tool_key", "tool_contract_digest", "decision", "risk_score"],
+      "properties": {
+        "tool_key": {"$ref": "#/$defs/qualifiedToolKey"},
+        "tool_contract_digest": {"$ref": "#/$defs/sha256"},
+        "decision": {"enum": ["eligible", "rejected"]},
+        "reason": {"enum": ["TOOL_NOT_FOUND", "AMBIGUOUS_TOOL", "NOT_GRANTED", "DENY_VIOLATION", "DENY_GOVERNED", "DRIFTED", "UNMAPPED"]},
+        "risk_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "paths": {"type": "array", "items": {"type": "string"}}
+      },
+      "allOf": [{"if": {"properties": {"decision": {"const": "rejected"}}}, "then": {"required": ["reason"]}}]
+    }
+  }
+}

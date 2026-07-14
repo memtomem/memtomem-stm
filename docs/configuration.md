@@ -382,6 +382,8 @@ Representative configuration (see the linked reference for omitted fields):
   },
   "toolgraph": {
     "enabled": false,
+    "source": "stdio",
+    "bundle_path": "~/.memtomem/toolgraph/policy-bundle.json",
     "command": "toolgraph",
     "args": ["serve"],
     "env": null,
@@ -474,8 +476,8 @@ reasons land in each selection event's `reject_reasons` when
 
 `toolgraph` (off by default) plugs an **optional external tool-graph
 eligibility provider** into that same hard filter as an additional rule
-source. When `enabled`, STM consults a separate, non-proxied tool-graph MCP
-server once at startup (stdio; default command `toolgraph serve`) for
+source. The default `source: "stdio"` consults a separate, non-proxied
+tool-graph MCP server once at startup (default command `toolgraph serve`) for
 cross-server authorization / data-flow eligibility facts, and feeds its
 per-candidate verdicts into `filter_tools` alongside the native rules. The
 graph is *consulted, never proxied* — its tools never reach the client and STM
@@ -504,7 +506,34 @@ under `toolgraph_*` reason codes; ranking can never resurrect them.
 }
 ```
 
-Enabling the block makes the graph's backend (e.g. Neo4j) a startup
+For the recommended local gateway workflow, publish a portable bundle and let
+STM enforce it without keeping Toolgraph or its graph database in the request
+path:
+
+```bash
+toolgraph policy compile --agent stm-proxy --profile review \
+  --output ~/.memtomem/toolgraph/policy-bundle.json
+mms gateway mode review --apply
+mms gateway status
+mms gateway explain github::create_issue
+```
+
+This sets `source: "bundle"`. STM validates the schema, exact artifact digest,
+agent/profile scope, graph instance/generation, and each live MCP tool contract
+fingerprint before atomically adopting the snapshot. A changed bundle is
+checked before both `tools/list` and `tools/call`; the call gate runs before
+response-cache lookup. In `strict`, rejected, missing, drifted, or invalid
+policy fails closed. In `review`, the same decision is observable as
+would-block while the call remains available. `explore` leaves signal-based
+policy non-enforcing. Bundle mode never starts a Toolgraph subprocess and the
+`on_*` stdio failure knobs do not apply.
+
+Use `review` first for a vibe-coding-friendly rollout, inspect decisions with
+`mms gateway explain`, then switch to `strict` after the catalog and grants are
+stable. `mms gateway mode` previews by default; only `--apply` writes the
+configuration.
+
+With `source: "stdio"`, enabling the block makes the graph's backend a startup
 prerequisite. The four `on_*` knobs choose the posture when the consult
 cannot produce a usable verdict:
 
