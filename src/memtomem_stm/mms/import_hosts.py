@@ -9,11 +9,10 @@ Hosts:
 * ``claude-code`` — ``~/.claude.json`` (user + per-project under
   ``.projects.<cwd>.mcpServers``) + ``<cwd>/.mcp.json``
 * ``cursor`` — ``~/.cursor/mcp.json`` + ``<cwd>/.cursor/mcp.json``
-* ``codex`` — ``~/.codex/config.toml`` (``[mcp_servers.<name>]``)
-* ``claude-desktop`` — macOS only,
-  ``~/Library/Application Support/Claude/claude_desktop_config.json``
+* ``codex`` — ``$CODEX_HOME/config.toml`` plus trusted project config
+* ``claude-desktop`` — native macOS, Windows, or Linux config path
 
-Linux/Windows host paths are out of W1 scope; missing files are
+Missing files are
 treated as "no candidates" (silent), and the ``mms import`` command
 prints which hosts were scanned vs found.
 
@@ -28,6 +27,7 @@ flow re-imports them from here so there is one definition per primitive.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tomllib
@@ -73,8 +73,14 @@ _BLOCKED_IMPORT_NAMES: frozenset[str] = frozenset(
 
 
 def _desktop_config_path() -> Path:
-    """Claude Desktop's macOS config path. Linux/Windows variants out of W1."""
-    return Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser()
+    """Claude Desktop config path for the current platform."""
+    if sys.platform == "darwin":
+        return Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / "Claude" / "claude_desktop_config.json"
+    return Path("~/.config/Claude/claude_desktop_config.json").expanduser()
 
 
 def _read_json_safely(path: Path) -> dict[str, Any] | None:
@@ -325,28 +331,37 @@ def scan_cursor(cwd: Path) -> list[ImportCandidate]:
 
 
 def scan_codex(cwd: Path) -> list[ImportCandidate]:
-    """Scan ``~/.codex/config.toml`` for ``[mcp_servers.<name>]`` entries."""
-    config = _read_toml_safely(Path("~/.codex/config.toml").expanduser())
-    if not config:
-        return []
-    servers = config.get("mcp_servers") or {}
-    if not isinstance(servers, dict):
-        return []
-
+    """Scan CODEX_HOME and the current project's config when it is trusted."""
+    codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    config = _read_toml_safely(codex_home / "config.toml") or {}
     out: list[ImportCandidate] = []
-    for name, raw in servers.items():
-        if not isinstance(raw, dict):
-            continue
-        cand = _wrap(name, raw, "Codex CLI")
-        if cand:
-            out.append(cand)
+
+    def collect(source: dict[str, Any], label: str, *, repo_local: bool = False) -> None:
+        servers = source.get("mcp_servers") or {}
+        if not isinstance(servers, dict):
+            return
+        for name, raw in servers.items():
+            if not isinstance(raw, dict):
+                continue
+            cand = _wrap(name, raw, label, is_repo_local=repo_local)
+            if cand:
+                out.append(cand)
+
+    collect(config, "Codex CLI")
+    projects = config.get("projects") or {}
+    project = projects.get(str(cwd.resolve()), {}) if isinstance(projects, dict) else {}
+    trusted = isinstance(project, dict) and project.get("trust_level") == "trusted"
+    if trusted:
+        collect(
+            _read_toml_safely(cwd / ".codex" / "config.toml") or {},
+            "Codex CLI (project)",
+            repo_local=True,
+        )
     return out
 
 
 def scan_claude_desktop(cwd: Path) -> list[ImportCandidate]:
-    """Scan Claude Desktop's macOS config. Linux/Windows: returns []."""
-    if sys.platform != "darwin":
-        return []
+    """Scan Claude Desktop's platform-native config path."""
     config = _read_json_safely(_desktop_config_path())
     if not config:
         return []

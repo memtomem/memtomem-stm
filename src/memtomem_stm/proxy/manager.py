@@ -1065,7 +1065,12 @@ class ProxyManager:
                 )
             case _:
                 return stdio_client(
-                    StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env)
+                    StdioServerParameters(
+                        command=cfg.command,
+                        args=cfg.args,
+                        env=cfg.env,
+                        cwd=cfg.cwd,
+                    )
                 )
 
     @staticmethod

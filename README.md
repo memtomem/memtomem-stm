@@ -78,7 +78,7 @@ All three installed commands—`mms`, `memtomem-stm`, and
 shortest first-success path is:
 
 ```bash
-mms init      # add an upstream and optionally register STM with a client
+mms init --demo --client auto  # no-network read-only first-success path
 mms doctor    # exit 0 (WARNs allowed) means the proxy setup is usable
 ```
 

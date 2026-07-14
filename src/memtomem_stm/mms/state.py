@@ -22,8 +22,6 @@ sandbox.
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 import tomllib
 from collections.abc import Iterator
@@ -35,13 +33,7 @@ import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from memtomem_stm.utils.fileio import atomic_write_text
-
-# sys.platform (not try/ImportError) so mypy's platform narrowing proves the
-# flock calls below unreachable on win32 — Windows builds lack fcntl.
-if sys.platform != "win32":
-    import fcntl
-else:  # pragma: no cover — exercised on Windows CI only
-    fcntl = None
+from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
 SCHEMA_VERSION = 1
 """Version constant for the three RFC §5.3 files (registry / projects index /
@@ -198,16 +190,15 @@ def write_lock(
     TTY confirmation prompt (releasing around the prompt would re-open the
     stale-load window the lock exists to close).
 
-    ``flock`` is advisory and auto-releases when the holding process exits,
+    The OS advisory lock auto-releases when the holding process exits,
     so a crashed holder cannot wedge later runs — no stale-lock cleanup
     exists or is needed. Acquisition polls non-blocking so a held lock turns
     into :class:`WriteLockTimeout` after ``timeout`` seconds (default
     :data:`WRITE_LOCK_TIMEOUT_SECONDS`) instead of hanging the CLI behind an
     unattended prompt.
 
-    No-ops when ``enabled`` is False (``--plan`` runs read but never write)
-    and on Windows (no ``fcntl``; single-user CLI, the lock is best-effort
-    hardening there, not a correctness guarantee).
+    No-ops when ``enabled`` is False (``--plan`` runs read but never write).
+    POSIX uses ``flock`` and Windows uses ``msvcrt.locking``.
 
     ``lock_path`` / ``holder_hint`` generalize the mechanism beyond the
     ``~/.mms`` registry domain (#475 PR2): the proxy-config CLI serializes
@@ -215,36 +206,32 @@ def write_lock(
     ``~/.memtomem`` lock file with its own timeout attribution. Defaults
     keep the original registry/sidecar behavior.
     """
-    if not enabled or fcntl is None:
+    if not enabled:
         yield
         return
     wait = WRITE_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
     if lock_path is None:
         lock_path = write_lock_path()
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = open_lock_fd(lock_path)
     try:
         deadline = time.monotonic() + wait
         while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if try_lock(fd):
                 break
-            except OSError:
-                # EWOULDBLOCK (held elsewhere) is the expected case; rarer
-                # flock failures (e.g. ENOLCK) retry the same way and
-                # surface as the same timeout — the operator action is
-                # identical either way.
-                if time.monotonic() >= deadline:
-                    if holder_hint is None:
-                        raise WriteLockTimeout(lock_path, wait) from None
-                    raise WriteLockTimeout(lock_path, wait, holder_hint) from None
-                time.sleep(_WRITE_LOCK_POLL_SECONDS)
+            if time.monotonic() >= deadline:
+                if holder_hint is None:
+                    raise WriteLockTimeout(lock_path, wait) from None
+                raise WriteLockTimeout(lock_path, wait, holder_hint) from None
+            time.sleep(_WRITE_LOCK_POLL_SECONDS)
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            release_lock(fd)
+            fd = -1
     finally:
-        os.close(fd)
+        if fd >= 0:
+            release_lock(fd)
 
 
 # ---------------------------------------------------------------------------

@@ -135,19 +135,8 @@ def test_claude_md_pytest_command_matches_ci() -> None:
     )
 
 
-def test_cli_docs_flag_desktop_discovery_is_macos_only() -> None:
-    """``docs/cli.md`` must warn that Claude Desktop discovery is macOS-only.
-
-    ``_desktop_config_path()`` in ``src/memtomem_stm/mms/import_hosts.py``
-    returns only the macOS path (``~/Library/Application Support/Claude/...``);
-    Linux/Windows callers of ``mms add --import`` silently see zero
-    Claude Desktop candidates. If that helper ever learns OS-aware
-    variants, relax this pin and drop the caveat from the docs.
-
-    The helper used to live in ``cli/proxy.py``; W1 PR2 moved it to
-    ``mms/import_hosts.py`` so both ``mms add --from-clients`` and
-    ``mms import`` share a single definition.
-    """
+def test_cli_docs_track_platform_aware_desktop_discovery() -> None:
+    """Claude Desktop discovery and CLI docs must cover all native platforms."""
     helper_src = _read("src/memtomem_stm/mms/import_hosts.py")
 
     func_match = re.search(
@@ -157,36 +146,17 @@ def test_cli_docs_flag_desktop_discovery_is_macos_only() -> None:
     )
     assert func_match, "_desktop_config_path helper not found — update this test"
     desktop_func = func_match.group(0)
-    # Sanity: the helper is still macOS-only (no Windows/Linux paths embedded).
     assert "Library/Application Support/Claude" in desktop_func
-    assert "APPDATA" not in desktop_func
-    assert ".config/Claude" not in desktop_func
+    assert "APPDATA" in desktop_func
+    assert ".config/Claude" in desktop_func
 
     cli_md = _read("docs/cli.md")
-
-    # Split on blank lines (markdown paragraph boundaries) and scope the
-    # caveat check to paragraphs that actually describe ``--from-clients`` /
-    # ``--import``. Checking the whole file would pass even if someone moved
-    # the warning to an unrelated section (install guide, release notes)
-    # while deleting it from where a reader of ``--import`` docs looks.
-    # Paragraph scope rather than a tight ±N-line window so prose
-    # restructuring inside the same paragraph doesn't false-fail.
-    paragraphs = re.split(r"\n\s*\n", cli_md)
-    import_paragraphs = [p for p in paragraphs if "--from-clients" in p or "--import" in p]
-    if not import_paragraphs:
-        pytest.fail(
-            "docs/cli.md no longer mentions `--from-clients` / `--import` — "
-            "the flag was renamed or removed. Update this test alongside "
-            "the docs change."
-        )
-
-    has_caveat = any(re.search(r"macOS[- ]only", p, re.IGNORECASE) for p in import_paragraphs)
-    assert has_caveat, (
-        "docs/cli.md must call out that Claude Desktop discovery is "
-        "macOS-only in a paragraph that mentions `--from-clients` / "
-        "`--import`. Without this caveat, Linux/Windows callers silently "
-        "see zero Claude Desktop candidates from `mms add --import`."
-    )
+    for path in (
+        "Library/Application Support/Claude",
+        "%APPDATA%\\Claude",
+        "~/.config/Claude",
+    ):
+        assert path in cli_md
 
 
 def test_configuration_full_example_documents_upstream_timeouts() -> None:
@@ -1076,10 +1046,7 @@ def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> Non
     getting_started = _read("docs/getting-started.md")
     native_hooks = _read("docs/guides/native-hooks.md")
 
-    registrations = (
-        "claude mcp add memtomem-stm -s user -- memtomem-stm",
-        "codex mcp add memtomem-stm -- memtomem-stm",
-    )
+    registrations = ("mms register --client claude", "mms register --client codex")
     for body in (guide, getting_started):
         for command in registrations:
             assert command in body

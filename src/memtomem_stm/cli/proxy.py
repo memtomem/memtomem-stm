@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import logging
 import os
@@ -14,10 +15,12 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from functools import wraps
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
 from urllib.parse import unquote, urlsplit
 
@@ -119,6 +122,79 @@ def _split_args(args_str: str) -> list[str]:
         lex.escape = ""
         return list(lex)
     return shlex.split(args_str)
+
+
+def _shell_join(args: list[str]) -> str:
+    """Render a copy/paste command for the current native shell family."""
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(args)
+    return shlex.join(args)
+
+
+_SETUP_RESOLVED_CLIENT: ContextVar[str | None] = ContextVar("setup_resolved_client", default=None)
+
+
+def _setup_json_result(action: str):  # noqa: ANN201
+    """Capture a setup command and emit one secret-safe JSON result document."""
+
+    def decorate(fn):  # noqa: ANN001, ANN202
+        @wraps(fn)
+        def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            as_json = bool(kwargs.pop("as_json", False))
+            if not as_json:
+                return fn(*args, **kwargs)
+
+            _SETUP_RESOLVED_CLIENT.set(None)
+            out = io.StringIO()
+            err = io.StringIO()
+            exit_code = 0
+            with redirect_stdout(out), redirect_stderr(err):
+                try:
+                    fn(*args, **kwargs)
+                except SystemExit as exc:
+                    exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+                except click.ClickException as exc:
+                    exit_code = exc.exit_code
+                    click.echo(exc.format_message(), err=True)
+
+            config_path = (
+                Path(kwargs.get("config_path", str(_DEFAULT_CONFIG))).expanduser().resolve()
+            )
+            server_names: list[str] = []
+            config_data: dict[str, Any] | None = None
+            if config_path.exists():
+                try:
+                    data = json.loads(config_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        config_data = data
+                    servers = data.get("upstream_servers", {}) if isinstance(data, dict) else {}
+                    if isinstance(servers, dict):
+                        server_names = sorted(str(name) for name in servers)
+                except (OSError, json.JSONDecodeError, ValueError):
+                    pass
+            payload = {
+                "action": action,
+                "ok": exit_code == 0,
+                "config_path": str(config_path),
+                "servers": server_names,
+                "client": _SETUP_RESOLVED_CLIENT.get()
+                or kwargs.get("client_mode")
+                or kwargs.get("mcp_mode"),
+            }
+            if exit_code:
+                payload["error"] = "setup_failed"
+                lines = [line.strip() for line in err.getvalue().splitlines() if line.strip()]
+                message = lines[-1] if lines else "setup command failed"
+                if config_data is not None:
+                    message = sanitize_secrets(message, _all_config_secret_values(config_data))
+                payload["message"] = message[:1000]
+            click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+            if exit_code:
+                raise SystemExit(exit_code)
+
+        return wrapped
+
+    return decorate
 
 
 def _new_config_cache_block() -> dict[str, Any]:
@@ -294,6 +370,18 @@ def _run_claude_mcp(
     )
 
 
+def _run_codex_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
+    """Invoke the official ``codex mcp`` CLI with Windows-safe decoding."""
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
 # PEP 508 dependency specifier: the distribution name is the leading identifier
 # before any extras (`[...]`), version spec (`==`, `>=`, ...), marker (`;`), or
 # whitespace. Pinning the match to the start anchors the regex so `my-memtomem-stm`
@@ -381,6 +469,16 @@ def _detect_install_type() -> tuple[str, list[str]]:
     return ("memtomem-stm", [])
 
 
+def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, str]]:
+    """Stable cross-platform command and environment for new registrations."""
+    # Keep a virtualenv's python symlink intact. ``Path.resolve()`` follows it
+    # to the base interpreter, which can no longer import the installed STM.
+    command = os.path.abspath(sys.executable)
+    env = {"MEMTOMEM_STM_PROXY__CONFIG_PATH": str(config_path.expanduser().resolve())}
+    env["MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"] = "false"
+    return command, ["-m", "memtomem_stm"], env
+
+
 def _check_already_registered(name: str = "memtomem-stm") -> bool:
     """Return True if Claude Code has *name* registered as an MCP server.
 
@@ -397,7 +495,11 @@ def _check_already_registered(name: str = "memtomem-stm") -> bool:
 
 
 def _register_with_claude_code(
-    server_cmd: str, server_args: list[str], *, name: str = "memtomem-stm"
+    server_cmd: str,
+    server_args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    name: str = "memtomem-stm",
 ) -> tuple[bool, str]:
     """Run ``claude mcp add``; return ``(success, failure_reason)``.
 
@@ -405,7 +507,10 @@ def _register_with_claude_code(
     ``"failed"`` — callers map each to a user-facing message and always
     fall back to ``.mcp.json``.
     """
-    cmd = ["claude", "mcp", "add", name, "-s", "user", "--", server_cmd, *server_args]
+    cmd = ["claude", "mcp", "add", name, "-s", "user"]
+    for key, value in (env or {}).items():
+        cmd.extend(["-e", f"{key}={value}"])
+    cmd.extend(["--", server_cmd, *server_args])
     try:
         result = _run_claude_mcp(cmd)
     except FileNotFoundError:
@@ -425,7 +530,50 @@ def _remove_from_claude_code(name: str = "memtomem-stm") -> None:
         pass
 
 
-def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list[str]) -> Path:
+def _codex_registered(name: str = "memtomem-stm") -> bool:
+    try:
+        return _run_codex_mcp(["codex", "mcp", "get", name]).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _register_with_codex(
+    server_cmd: str,
+    server_args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    name: str = "memtomem-stm",
+) -> tuple[bool, str]:
+    cmd = ["codex", "mcp", "add", name]
+    for key, value in (env or {}).items():
+        cmd.extend(["--env", f"{key}={value}"])
+    cmd.extend(["--", server_cmd, *server_args])
+    try:
+        result = _run_codex_mcp(cmd)
+    except FileNotFoundError:
+        return False, "codex CLI not found"
+    except subprocess.TimeoutExpired:
+        return False, "codex mcp add timed out"
+    except OSError as exc:
+        return False, f"could not run codex: {exc}"
+    if result.returncode == 0:
+        return True, ""
+    return False, (result.stderr or result.stdout or "codex mcp add failed").strip()
+
+
+def _remove_from_codex(name: str = "memtomem-stm") -> bool:
+    try:
+        return _run_codex_mcp(["codex", "mcp", "remove", name]).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _write_mcp_json_for_stm(
+    target_dir: Path,
+    server_cmd: str,
+    server_args: list[str],
+    env: dict[str, str] | None = None,
+) -> Path:
     """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry.
 
     Aborts (``SystemExit(1)``, same convention as ``_load``) when an existing
@@ -436,6 +584,8 @@ def _write_mcp_json_for_stm(target_dir: Path, server_cmd: str, server_args: list
     entry: dict[str, Any] = {"command": server_cmd}
     if server_args:
         entry["args"] = server_args
+    if env:
+        entry["env"] = env
     mcp_path = target_dir / ".mcp.json"
     existing: dict[str, Any]
     if mcp_path.exists():
@@ -524,19 +674,31 @@ def _emit_mcp_paste_hints() -> None:
     click.echo("  (Claude Code picks up ./.mcp.json in this project automatically.)")
 
 
-def _emit_skip_hints() -> None:
+def _emit_skip_hints(config_path: Path = _DEFAULT_CONFIG) -> None:
     """Manual-registration cheat sheet shown on option 3 (skip)."""
-    server_cmd, server_args = _detect_install_type()
-    cmd_str = " ".join([server_cmd, *server_args]) if server_args else server_cmd
+    server_cmd, server_args, server_env = _registration_command(config_path)
     click.echo(f"{_ok('Next:')} connect your MCP client to memtomem-stm.")
     click.echo("")
     click.echo(f"  {_hdr('Claude Code (CLI):')}")
-    click.echo(f"    claude mcp add memtomem-stm -s user -- {cmd_str}")
+    claude_cmd = ["claude", "mcp", "add", "memtomem-stm", "-s", "user"]
+    for key, value in server_env.items():
+        claude_cmd.extend(["-e", f"{key}={value}"])
+    claude_cmd.extend(["--", server_cmd, *server_args])
+    click.echo(f"    {_shell_join(claude_cmd)}")
+    click.echo("")
+    click.echo(f"  {_hdr('Codex (CLI):')}")
+    codex_cmd = ["codex", "mcp", "add", "memtomem-stm"]
+    for key, value in server_env.items():
+        codex_cmd.extend(["--env", f"{key}={value}"])
+    codex_cmd.extend(["--", server_cmd, *server_args])
+    click.echo(f"    {_shell_join(codex_cmd)}")
     click.echo("")
     click.echo(f"  {_hdr('Claude Desktop / JSON MCP config:')}")
     json_args = f', "args": {json.dumps(server_args)}' if server_args else ""
+    json_env = f', "env": {json.dumps(server_env)}'
     click.echo(
-        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": "{server_cmd}"{json_args} }} }} }}'
+        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": "{server_cmd}"'
+        f"{json_args}{json_env} }} }} }}"
     )
     click.echo("")
     click.echo(f"  Or run {_hdr('`mms register`')} later to re-run this wizard.")
@@ -555,7 +717,13 @@ def _prompt_mcp_choice() -> int:
 _MCP_MODE_TO_CHOICE = {"claude": 1, "json": 2, "skip": 3}
 
 
-def _run_mcp_integration(preselected: int | None = None) -> None:
+def _run_mcp_integration(
+    preselected: int | None = None,
+    *,
+    client_mode: str | None = None,
+    config_path: Path = _DEFAULT_CONFIG,
+    replace_registration: bool = False,
+) -> None:
     """Run the 3-way MCP registration flow.
 
     Called by both ``mms init`` (after config save) and ``mms register``
@@ -567,20 +735,61 @@ def _run_mcp_integration(preselected: int | None = None) -> None:
     ``keep`` (non-destructive) rather than prompting, so CI / scripted
     callers don't hit ``click.Abort`` on EOF.
     """
-    interactive = preselected is None
+    if client_mode == "auto":
+        if shutil.which("codex"):
+            client_mode = "codex"
+        elif shutil.which("claude"):
+            client_mode = "claude"
+        else:
+            client_mode = "json"
+    if client_mode == "skip":
+        _SETUP_RESOLVED_CLIENT.set("skip")
+        _emit_skip_hints(config_path)
+        return
+
+    server_cmd, server_args, server_env = _registration_command(config_path)
+    if client_mode == "codex":
+        _SETUP_RESOLVED_CLIENT.set("codex")
+        if _codex_registered():
+            if not replace_registration:
+                click.echo(f"  {_ok('Kept existing Codex registration.')}")
+                return
+            if not _remove_from_codex():
+                click.echo(f"  {_warn('Could not remove the existing Codex registration.')}")
+                return
+        success, reason = _register_with_codex(server_cmd, server_args, env=server_env)
+        if success:
+            click.echo(f"  {_ok('Registered with Codex.')}")
+        else:
+            click.echo(f"  {_warn(reason)}")
+        return
+
+    if client_mode == "json":
+        _SETUP_RESOLVED_CLIENT.set("json")
+        mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
+        click.echo(f"  {_ok('Wrote')} {mcp_path}")
+        _emit_mcp_paste_hints()
+        return
+
+    if client_mode == "claude":
+        preselected = 1
+
+    interactive = preselected is None and client_mode is None
     choice = preselected if preselected is not None else _prompt_mcp_choice()
     click.echo("")
 
     if choice == 3:
-        _emit_skip_hints()
+        _SETUP_RESOLVED_CLIENT.set("skip")
+        _emit_skip_hints(config_path)
         return
 
-    server_cmd, server_args = _detect_install_type()
-
     if choice == 1:
+        _SETUP_RESOLVED_CLIENT.set("claude")
         if _check_already_registered():
             click.echo(f"{_warn('Note:')} memtomem-stm is already registered with Claude Code.")
-            if interactive:
+            if replace_registration:
+                action = 2
+            elif interactive:
                 click.echo("    [1] Keep existing (recommended)")
                 click.echo("    [2] Replace (remove + re-add)")
                 action = click.prompt(
@@ -595,7 +804,7 @@ def _run_mcp_integration(preselected: int | None = None) -> None:
                 return
             _remove_from_claude_code()
 
-        success, reason = _register_with_claude_code(server_cmd, server_args)
+        success, reason = _register_with_claude_code(server_cmd, server_args, env=server_env)
         if success:
             click.echo(f"  {_ok('Registered with Claude Code (user scope).')}")
             return
@@ -607,7 +816,8 @@ def _run_mcp_integration(preselected: int | None = None) -> None:
         click.echo(f"  {_warn(reason_msg)} — falling back to .mcp.json.")
 
     # choice == 2, or choice == 1 fallback
-    mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args)
+    _SETUP_RESOLVED_CLIENT.set("json")
+    mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
     click.echo(f"  {_ok('Wrote')} {mcp_path}")
     _emit_mcp_paste_hints()
 
@@ -2678,6 +2888,46 @@ def _prompt_language() -> str:
     ),
 )
 @click.option(
+    "--client",
+    "client_mode",
+    type=click.Choice(["auto", "claude", "codex", "json", "skip"]),
+    default=None,
+    help="Register with a detected client, Claude Code, Codex, JSON config, or skip.",
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    help="Continue registration when the proxy config already exists.",
+)
+@click.option(
+    "--demo",
+    is_flag=True,
+    help="Configure the bundled deterministic read-only demo server.",
+)
+@click.option(
+    "--freshness",
+    type=click.Choice(["live", "balanced", "reuse"]),
+    default="balanced",
+    show_default=True,
+    help="Response-cache freshness preset.",
+)
+@click.option(
+    "--allow-project-configs",
+    is_flag=True,
+    help="Acknowledge discovery of project-local MCP configurations.",
+)
+@click.option(
+    "--replace-registration",
+    is_flag=True,
+    help="Replace an existing selected-client registration.",
+)
+@click.option(
+    "--save-unverified",
+    is_flag=True,
+    help="Save even if an optional connection probe fails (current compatibility behavior).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output one JSON result document.")
+@click.option(
     "--prune-originals",
     "prune_originals",
     is_flag=True,
@@ -2702,11 +2952,19 @@ def _prompt_language() -> str:
         "'en' on non-TTY callers."
     ),
 )
-@with_config_write_lock()
+@with_config_write_lock(json_envelope=True)
+@_setup_json_result("init")
 def init(
     config_path: str,
     no_validate: bool,
     mcp_mode: str | None,
+    client_mode: str | None,
+    resume: bool,
+    demo: bool,
+    freshness: str,
+    allow_project_configs: bool,
+    replace_registration: bool,
+    save_unverified: bool,
     prune_originals: bool,
     lang: str | None,
 ) -> None:
@@ -2718,7 +2976,20 @@ def init(
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
+    if client_mode is not None and mcp_mode is not None:
+        raise click.UsageError("use either --client or the legacy --mcp flag, not both")
+    selected_client = client_mode or mcp_mode
+
     if resolved.exists():
+        if resume:
+            click.echo(f"{_ok('Resuming setup with:')} {resolved}")
+            _run_mcp_integration(
+                client_mode=selected_client,
+                config_path=resolved,
+                replace_registration=replace_registration,
+            )
+            click.echo(f"Next: mms doctor --config {resolved}")
+            return
         click.echo(f"{_err('Error:')} config already exists at {resolved}.", err=True)
         click.echo("  Use `mms add` to register another server.", err=True)
         click.echo(
@@ -2733,14 +3004,29 @@ def init(
     click.echo(f"Config will be written to: {resolved}")
     click.echo("")
 
-    candidates = _discover_candidates(Path.cwd())
+    candidates = [] if demo else _discover_candidates(Path.cwd())
+    if not allow_project_configs:
+        candidates = [
+            cand for cand in candidates if str(cand.get("source", "")) != ".mcp.json (project)"
+        ]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
     # exact ``(name, source, duplicate_in)`` triples via ``_handle_source_prune``.
     imported_candidates: list[dict[str, Any]] = []
 
-    if candidates:
+    if demo:
+        imported["demo"] = {
+            "prefix": "demo",
+            "transport": "stdio",
+            "command": os.path.abspath(sys.executable),
+            "args": ["-m", "memtomem_stm.demo_server"],
+            "compression": "auto",
+            "max_result_chars": 8000,
+            "cache": True,
+        }
+        click.echo(f"{_ok('Using bundled read-only demo server.')} No network access required.")
+    elif candidates:
         click.echo(_hdr(f"Found {len(candidates)} MCP server(s) in existing client configs:"))
         # TUI renders its own list; this preview exists so duplicate-source
         # notes ("also in: X") stay visible — those don't fit inside a
@@ -2870,11 +3156,19 @@ def init(
                 click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
             else:
                 click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
-                click.echo("  Saving config anyway. Run `mms health` later to retry.", err=True)
+                suffix = " (--save-unverified acknowledged)" if save_unverified else ""
+                click.echo(
+                    f"  Saving config anyway{suffix}. Run `mms health` later to retry.",
+                    err=True,
+                )
+
+    cache_block = _new_config_cache_block()
+    if freshness != "balanced":
+        cache_block["default_ttl_seconds"] = {"live": 0, "reuse": 86400}[freshness]
 
     data: dict[str, Any] = {
         "enabled": True,
-        "cache": _new_config_cache_block(),
+        "cache": cache_block,
         **proxy_fields,
         "upstream_servers": imported,
     }
@@ -2897,21 +3191,18 @@ def init(
         click.echo(f"    mms list --config {resolved}")
         click.echo(f"    mms health --config {resolved}")
         click.echo(f"    mms add --import --config {resolved}")
-        # The MCP client entry registered below carries no --config reference,
-        # so the registered server boots reading the DEFAULT config and would
-        # silently ignore the file this run just built.
-        click.echo("")
         click.echo(
-            _warn(
-                "note: any MCP client entry registered by this run reads the DEFAULT "
-                "config path, not this file — set "
-                f"MEMTOMEM_STM_PROXY__CONFIG_PATH={resolved} in the entry's env "
-                "for the server to use this config."
-            )
+            "    New client registrations carry this config path via "
+            "MEMTOMEM_STM_PROXY__CONFIG_PATH."
         )
 
     click.echo("")
-    _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
+    _run_mcp_integration(
+        _MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None,
+        client_mode=client_mode,
+        config_path=resolved,
+        replace_registration=replace_registration,
+    )
 
     # Post-registration prune of source-client originals, opt-in only.
     # * ``--prune-originals`` → unconditional prune (scripted path).
@@ -2943,7 +3234,26 @@ def init(
         "print manual hints. Omit for the interactive prompt."
     ),
 )
-def register(config_path: str, mcp_mode: str | None) -> None:
+@click.option(
+    "--client",
+    "client_mode",
+    type=click.Choice(["auto", "claude", "codex", "json", "skip"]),
+    default=None,
+    help="Register with a detected client, Claude Code, Codex, JSON config, or skip.",
+)
+@click.option(
+    "--replace-registration",
+    is_flag=True,
+    help="Replace an existing selected-client registration.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output one JSON result document.")
+@_setup_json_result("register")
+def register(
+    config_path: str,
+    mcp_mode: str | None,
+    client_mode: str | None,
+    replace_registration: bool,
+) -> None:
     """Register memtomem-stm with an MCP client.
 
     Post-init re-entry path for the 3-way registration flow from ``mms init``:
@@ -2958,6 +3268,8 @@ def register(config_path: str, mcp_mode: str | None) -> None:
     Claude Code registration and defaults to 'keep' when already registered.
     """
     resolved = Path(config_path).expanduser().resolve()
+    if client_mode is not None and mcp_mode is not None:
+        raise click.UsageError("use either --client or the legacy --mcp flag, not both")
     if not resolved.exists():
         click.echo(
             f"{_err('Error:')} config not found at {resolved}.",
@@ -2965,7 +3277,12 @@ def register(config_path: str, mcp_mode: str | None) -> None:
         )
         click.echo("  Run `mms init` first.", err=True)
         sys.exit(1)
-    _run_mcp_integration(_MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None)
+    _run_mcp_integration(
+        _MCP_MODE_TO_CHOICE.get(mcp_mode) if mcp_mode else None,
+        client_mode=client_mode,
+        config_path=resolved,
+        replace_registration=replace_registration,
+    )
 
 
 def _remove_eject_hint(name: str, entry: Any) -> str | None:
@@ -4721,6 +5038,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                     command=cfg.get("command", ""),
                     args=cfg.get("args", []),
                     env=cfg.get("env"),
+                    cwd=cfg.get("cwd"),
                 )
             )
         elif transport == "sse":
@@ -5603,7 +5921,10 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
                         # Transport-neutral stage names; the child-process
                         # detail is stdio-only rendering, not a stage.
                         detail += " (stdio child process did not start)"
-                        next_cmd = f"command -v {servers[n].get('command', '')}"
+                        command = servers[n].get("command", "")
+                        next_cmd = (
+                            f"where.exe {command}" if os.name == "nt" else f"command -v {command}"
+                        )
                     elif timed_out:
                         next_cmd = f"mms health --timeout {max(30, timeout)} {cfg_arg}"
                     else:
@@ -5616,6 +5937,33 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
                     "WARN",
                     "no upstream servers configured",
                     f"mms add <name> --prefix <prefix> --command <command> {cfg_arg}",
+                )
+
+            # Downstream host registration: config + healthy upstreams are
+            # insufficient if no MCP client launches this gateway.
+            registered_with: list[str] = []
+            if shutil.which("codex") and _codex_registered():
+                registered_with.append("Codex")
+            if shutil.which("claude") and _check_already_registered():
+                registered_with.append("Claude Code")
+            project_mcp = _read_json_safely(Path.cwd() / ".mcp.json") or {}
+            project_servers = project_mcp.get("mcpServers") or {}
+            if isinstance(project_servers, dict) and "memtomem-stm" in project_servers:
+                registered_with.append("project .mcp.json")
+            if registered_with:
+                check(
+                    "host_registration",
+                    "host registration",
+                    "PASS",
+                    ", ".join(registered_with),
+                )
+            else:
+                check(
+                    "host_registration",
+                    "host registration",
+                    "WARN",
+                    "not detected in Codex, Claude Code, or .mcp.json",
+                    f"mms register --client auto {cfg_arg}",
                 )
 
             # 7. cache policy — same condition + shared predicate as

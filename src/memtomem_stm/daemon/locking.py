@@ -33,14 +33,17 @@ the lock (the next probe finds it free and self-heals).
 
 from __future__ import annotations
 
-import logging
 import os
-import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from memtomem_stm.utils.locking import (
+    open_lock_fd as _open_lock_fd,
+    release_lock as _release_lock,
+    try_lock as _try_lock,
+    unlock as _unlock,
+)
 
 # Shares the handshake's ``stm-daemon`` prefix; differs only by extension. The
 # fingerprint is a 16-hex digest, always a filesystem-safe filename component.
@@ -62,8 +65,7 @@ def open_lock_fd(path: Path) -> int:
     """Open (creating) the lock file and return its fd. Caller owns the fd and
     must :func:`release_lock` it. Raises ``OSError`` only if the file can't be
     opened at all (which a caller may treat as "don't run / don't spawn")."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    return _open_lock_fd(path)
 
 
 def try_lock(fd: int) -> bool:
@@ -75,11 +77,7 @@ def release_lock(fd: int) -> None:
     """Best-effort unlock + close of a lock fd. Safe to call even if ``fd`` was
     never locked (a never-acquired retry that timed out) — the unlock is
     swallowed and the fd is always closed."""
-    _unlock(fd)
-    try:
-        os.close(fd)
-    except OSError:
-        logger.debug("failed to close lock fd", exc_info=True)
+    _release_lock(fd)
 
 
 @contextmanager
@@ -90,8 +88,7 @@ def single_owner_lock(path: Path) -> Iterator[bool]:
     process holds it. Never raises on contention — only on an inability to open
     the lock file at all, which the caller may also treat as "don't spawn".
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_lock_fd(path)
     acquired = False
     try:
         acquired = _try_lock(fd)
@@ -100,35 +97,3 @@ def single_owner_lock(path: Path) -> Iterator[bool]:
         if acquired:
             _unlock(fd)
         os.close(fd)
-
-
-def _try_lock(fd: int) -> bool:
-    if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
-        import msvcrt
-
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-    import fcntl
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except (BlockingIOError, OSError):
-        return False
-
-
-def _unlock(fd: int) -> None:
-    try:
-        if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
-            import msvcrt
-
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-        logger.debug("failed to release spawn lock", exc_info=True)

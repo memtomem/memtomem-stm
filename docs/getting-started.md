@@ -18,11 +18,18 @@ command in MCP client registrations.
 
 ## 2. Add an upstream
 
-The guided path prompts for an upstream and can register STM with your client:
+The shortest path uses a bundled read-only server, needs no Node.js or network,
+and can register STM with the detected client:
 
 ```bash
-mms init
+mms init --demo --client auto
+mms doctor
 ```
+
+On Windows 11, run the same commands in PowerShell (`py -m pip install
+memtomem-stm` is an alternative when `pip` is not on PATH). Native Windows and
+WSL2 are separate installations with separate home directories and client
+registrations; choose one environment and keep the client, Python, and STM in it.
 
 For a non-interactive filesystem example:
 
@@ -39,21 +46,15 @@ its own server prefix.
 
 ## 3. Register STM with a client
 
-`mms register` can register Claude Code automatically or generate a generic
-JSON configuration. Claude Code:
+`mms register` supports Claude Code, Codex, automatic detection, or a generic
+JSON configuration. Registrations use the current Python executable's absolute
+path and pass the selected proxy config explicitly, which avoids PATH drift on
+Windows and GUI-launched clients.
 
 ```bash
-mms register --mcp claude
-# Equivalent manual registration:
-claude mcp add memtomem-stm -s user -- memtomem-stm
-```
-
-Codex CLI is not an automatic `mms register` target; register it with Codex's
-MCP command:
-
-```bash
-codex mcp add memtomem-stm -- memtomem-stm
-codex mcp list
+mms register --client claude
+mms register --client codex
+mms register --client auto
 ```
 
 For other JSON-based clients:
@@ -66,8 +67,10 @@ For other JSON-based clients:
 }
 ```
 
-`mms init` does not discover existing Codex MCP definitions. Also,
-`mms import --from codex` populates the separate project registry at
+Codex discovery honors `CODEX_HOME`. A project-local `.codex/config.toml` is
+read only when the project is marked trusted in the user Codex config and the
+caller acknowledges project configs. `mms import --from codex` populates the
+separate project registry at
 `~/.mms/registry.toml`; it does not add an upstream to
 `~/.memtomem/stm_proxy.json`.
 

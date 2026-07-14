@@ -98,6 +98,17 @@ Options:
                             'json' = write .mcp.json, 'skip' = no
                             registration. Omit the flag for the interactive
                             prompt.
+  --client [auto|claude|codex|json|skip]
+                            Select a downstream client. --mcp remains as a
+                            backwards-compatible alias for older scripts.
+  --resume                  Continue registration when config already exists.
+  --demo                    Use the bundled deterministic read-only demo.
+  --freshness [live|balanced|reuse]
+                            Cache freshness preset. [default: balanced]
+  --allow-project-configs  Acknowledge project-local discovery.
+  --replace-registration   Replace an existing selected-client registration.
+  --save-unverified        Explicitly acknowledge saving after a failed probe.
+  --json                   Emit one secret-safe JSON result document.
   --prune-originals         After a successful import + registration, remove
                             the direct registrations from source MCP clients
                             so tools route through STM only. TTY callers get
@@ -129,6 +140,8 @@ mms init --mcp claude             # scripted: auto-register with Claude Code
 mms init --mcp skip               # scripted: write config, print paste hints, exit
 mms init --mcp claude --prune-originals  # scripted: import, register, and remove direct registrations
 mms init --lang ko                # Korean-content preset for token-aware budgets
+mms init --demo --client auto     # shortest native Windows/macOS/Linux path
+mms init --resume --client codex  # continue an existing setup
 ```
 
 ### `register`
@@ -144,6 +157,10 @@ Options:
                             runs: 'claude' = `claude mcp add`, 'json' =
                             write .mcp.json, 'skip' = print manual hints.
                             Omit for the interactive prompt.
+  --client [auto|claude|codex|json|skip]
+                            Select the downstream client explicitly.
+  --replace-registration   Replace an existing selected-client registration.
+  --json                   Emit one secret-safe JSON result document.
 ```
 
 Re-runs the 3-way MCP-client registration prompt from `init` without re-entering the first-time setup wizard. Use this after `mms init` if you initially picked "skip", or when registering the same STM install with a second client.
@@ -787,10 +804,10 @@ Where each host config lives:
 |------|---------|
 | `claude-code` | `~/.claude.json` (user + per-project under `projects.<cwd>.mcpServers`) and `<cwd>/.mcp.json` |
 | `cursor` | `~/.cursor/mcp.json` (user) and `<cwd>/.cursor/mcp.json` (project) |
-| `codex` | `~/.codex/config.toml` under `[mcp_servers.<name>]` |
-| `claude-desktop` | macOS only — `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| `codex` | `$CODEX_HOME/config.toml` plus trusted `<cwd>/.codex/config.toml` |
+| `claude-desktop` | macOS `~/Library/Application Support/Claude/...`; Windows `%APPDATA%\Claude\...`; Linux `~/.config/Claude/...` |
 
-Linux and Windows host paths are out of W1 scope; missing configs are silently treated as "no candidates" so `--from all` always works as long as at least one host has something to import.
+Missing configs are silently treated as "no candidates" so `--from all` works across native Windows, macOS, Linux, and WSL2.
 
 ### Secret classification
 
