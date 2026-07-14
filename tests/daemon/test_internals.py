@@ -720,6 +720,27 @@ class TestDaemonStopCli:
         assert killed == []  # recycled pid never signalled
         assert not hs.exists()
 
+    def test_windows_declines_posix_signal_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
+        )
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        assert result.exit_code == 0, result.output
+        assert "Windows does not provide the POSIX SIGTERM fallback" in result.output
+        assert killed == []
+
 
 class TestDaemonStatusCli:
     def test_running_json_shape(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

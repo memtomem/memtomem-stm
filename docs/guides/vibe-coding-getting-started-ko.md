@@ -28,7 +28,9 @@ flowchart LR
 
 ## 1. 준비하고 설치하기
 
-이 문서의 명령은 macOS, Linux, WSL의 Bash/Zsh를 기준으로 합니다.
+이 문서는 macOS/Linux/WSL의 Bash·Zsh와 Windows 11 PowerShell을 지원합니다.
+Windows와 WSL은 홈 디렉터리와 MCP 등록이 서로 다른 별도 환경입니다.
+클라이언트, Python, STM을 한쪽 환경에 맞춰 설치하세요.
 
 - Python 3.12 이상
 - Claude Code 또는 Codex CLI
@@ -36,10 +38,13 @@ flowchart LR
 - 아래 filesystem 데모를 쓸 경우 Node.js와 `npx`
 
 ```bash
-python3 --version
+python --version
 uv tool install memtomem-stm
 mms --version
 ```
+
+PowerShell에서 `python`이나 `pip`가 보이지 않으면 `py --version`과
+`py -m pip install memtomem-stm`을 사용합니다.
 
 `mms`, `memtomem-stm`, `memtomem-stm-proxy`는 같은 패키지의 진입점입니다.
 사람이 실행하는 관리 명령은 짧은 `mms`를 사용하고, MCP 클라이언트에는
@@ -50,9 +55,16 @@ mms --version
 처음 설정할 때는 원본 MCP 등록을 바로 지우지 마세요. 먼저 STM 경유
 도구가 정상 동작하는지 확인한 뒤 정리하는 편이 안전합니다.
 
+처음에는 네트워크나 Node.js가 필요 없는 내장 읽기 전용 데모로 성공
+경로부터 확인할 수 있습니다.
+
 ```bash
-mms init --lang ko --mcp skip
+mms init --demo --lang ko --client auto
+mms doctor
 ```
+
+실제 upstream을 바로 설정하려면 `mms init --lang ko --client auto`를
+실행합니다.
 
 `--lang ko`는 한국어 콘텐츠에 맞춘 토큰 예산을 기록합니다. 마법사가
 기존 Claude Code MCP를 찾으면 하나를 선택할 수 있습니다. 새 데모를 직접
@@ -70,17 +82,16 @@ mms init --lang ko --mcp skip
 prefix는 공개 도구 이름이 됩니다. 예를 들어 `fs`를 사용하면
 `fs__read_file` 같은 도구가 만들어집니다.
 
-> Codex CLI 주의: `mms init`은 현재 `~/.codex/config.toml`의 기존 MCP를
-> 자동으로 가져오지 않습니다. Codex에 이미 등록된 서버를 프록시하려면
-> 해당 `[mcp_servers.<name>]`의 command와 args를 마법사에 직접 입력하거나
-> `mms add`로 다시 추가하세요. `mms import --from codex`는
+> Codex CLI: `mms import --from codex`는 `CODEX_HOME`(기본 `~/.codex`)의 기존 MCP를 탐색합니다.
+> 신뢰된 프로젝트의 `.codex/config.toml`은 `--allow-project-configs`로
+> 명시적으로 허용할 때만 가져옵니다. `mms import --from codex`는
 > `~/.mms/registry.toml`을 채우는 별도 프로젝트 레지스트리 기능이며,
 > `~/.memtomem/stm_proxy.json`에 upstream을 추가하지 않습니다.
 
-이미 `~/.memtomem/stm_proxy.json`이 있다면 `mms init`을 다시 실행하지
-말고 현재 설정을 확인하거나 서버를 추가합니다.
+이미 `~/.memtomem/stm_proxy.json`이 있다면 다음처럼 등록 단계를 이어갑니다.
 
 ```bash
+mms init --resume --client auto
 mms status
 mms list
 mms add --help
@@ -91,7 +102,7 @@ mms add --help
 초기 설정을 끝낸 뒤 다음 명령으로 STM을 사용자 범위에 등록합니다.
 
 ```bash
-mms register --mcp claude
+mms register --client claude
 claude mcp get memtomem-stm
 ```
 
@@ -106,11 +117,10 @@ Claude Code를 새로 시작하고 `/mcp`를 열어 `memtomem-stm`이 연결됐�
 
 ## 4. Codex CLI에 연결하기
 
-`mms register`의 자동 등록 대상은 Claude Code 또는 JSON 기반 설정입니다.
-Codex CLI는 공식 MCP 명령으로 직접 등록합니다.
+Codex도 같은 등록 명령으로 연결할 수 있습니다.
 
 ```bash
-codex mcp add memtomem-stm -- memtomem-stm
+mms register --client codex
 codex mcp get memtomem-stm
 codex mcp list
 ```

@@ -15,7 +15,6 @@ race testable without subprocesses.
 
 from __future__ import annotations
 
-import os
 import stat
 import sys
 import threading
@@ -29,15 +28,8 @@ from click.testing import CliRunner
 from memtomem_stm.cli.mms_host import host_group
 from memtomem_stm.cli.mms_import import import_command
 from memtomem_stm.mms import state
+from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 from helpers import set_home
-
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="flock is POSIX-only; write_lock is documented as a no-op on Windows",
-)
-
-if sys.platform != "win32":
-    import fcntl
 
 
 @pytest.fixture
@@ -67,12 +59,12 @@ def _hold_lock(home: Path):
     """Hold the write lock through a raw fd, as a foreign process would."""
     lock = home / ".mms" / ".lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = open_lock_fd(lock)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert try_lock(fd)
         yield
     finally:
-        os.close(fd)  # closing the fd releases the flock
+        release_lock(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +78,8 @@ def test_lock_file_lives_under_mms_home_with_0600(sandbox_home):
     lock = sandbox_home / ".mms" / ".lock"
     assert state.write_lock_path() == lock
     assert lock.is_file()
-    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    if sys.platform != "win32":
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
 
 
 def test_held_lock_times_out_with_clean_error(sandbox_home):
@@ -153,7 +146,8 @@ def test_custom_lock_path_creates_that_file_with_0600(sandbox_home):
     with state.write_lock(lock_path=custom):
         pass
     assert custom.is_file()
-    assert stat.S_IMODE(custom.stat().st_mode) == 0o600
+    if sys.platform != "win32":
+        assert stat.S_IMODE(custom.stat().st_mode) == 0o600
     # The default registry lock must not be touched by a custom-path span.
     assert not (sandbox_home / ".mms" / ".lock").exists()
 
@@ -161,16 +155,16 @@ def test_custom_lock_path_creates_that_file_with_0600(sandbox_home):
 def test_custom_holder_hint_lands_in_timeout_message(sandbox_home):
     custom = sandbox_home / ".memtomem" / ".stm_proxy.lock"
     custom.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(custom, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = open_lock_fd(custom)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert try_lock(fd)
         with pytest.raises(state.WriteLockTimeout) as exc_info:
             with state.write_lock(
                 lock_path=custom, holder_hint="a proxy-config writer", timeout=0.1
             ):
                 pytest.fail("acquisition must not succeed while held")
     finally:
-        os.close(fd)
+        release_lock(fd)
     msg = str(exc_info.value)
     assert str(custom) in msg
     assert "a proxy-config writer" in msg

@@ -2038,12 +2038,36 @@ class TestInit:
         assert loaded is not None
         assert loaded.cache.tool_annotation_policy == "strict"
 
-    def test_init_custom_config_warns_registered_entry_reads_default(
+    def test_init_demo_json_is_single_document(self, runner, config, no_discovery):
+        result = runner.invoke(
+            cli,
+            [
+                "init",
+                "--demo",
+                "--client",
+                "skip",
+                "--no-validate",
+                "--lang",
+                "en",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload == {
+            "action": "init",
+            "ok": True,
+            "config_path": str(config.resolve()),
+            "servers": ["demo"],
+            "client": "skip",
+        }
+
+    def test_init_custom_config_registration_carries_explicit_path(
         self, runner, config, no_discovery
     ):
-        # A non-default --config gets the management hints PLUS a note that
-        # any registered MCP client entry boots reading the DEFAULT config —
-        # otherwise the divergence is invisible until tools don't appear.
+        # A non-default --config gets management hints and confirms that new
+        # client registrations carry the explicit path in their environment.
         result = runner.invoke(
             cli,
             ["init", "--no-validate", *_cfg_args(config)],
@@ -2052,7 +2076,7 @@ class TestInit:
         assert result.exit_code == 0, result.output
         assert "Manage this config:" in result.output
         assert "MEMTOMEM_STM_PROXY__CONFIG_PATH" in result.output
-        assert "DEFAULT config path" in result.output
+        assert "carry this config path" in result.output
 
     def test_init_aborts_if_config_exists(self, runner, config):
         """Init is for first-time setup only; `mms add` handles append."""
@@ -3368,7 +3392,12 @@ class TestInitMcpRegistration:
         assert fake_claude["calls"][0][:4] == ["claude", "mcp", "get", "memtomem-stm"]
         # Second call: actual add, with -s user and the server command
         add_cmd = fake_claude["calls"][1]
-        assert add_cmd[:7] == ["claude", "mcp", "add", "memtomem-stm", "-s", "user", "--"]
+        assert add_cmd[:6] == ["claude", "mcp", "add", "memtomem-stm", "-s", "user"]
+        assert "-e" in add_cmd
+        assert any(
+            arg.startswith("MEMTOMEM_STM_PROXY__CONFIG_PATH=") for arg in add_cmd
+        )
+        assert "--" in add_cmd
 
     def test_choice_2_writes_mcp_json_without_shelling_out(
         self, runner, config, no_discovery, fake_claude, tmp_path, monkeypatch
@@ -3875,6 +3904,53 @@ class TestRegisterCommand:
         assert result.exit_code == 0, result.output
         assert "Kept existing registration" in result.output
         assert len(fake_claude["calls"]) == 1
+
+    def test_register_client_claude_is_non_interactive(self, runner, config, fake_claude):
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1),
+            _FakeClaudeResult(returncode=0),
+        ]
+        result = runner.invoke(cli, ["register", "--client", "claude", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "Registered with Claude Code" in result.output
+        assert "Select" not in result.output
+        add_cmd = fake_claude["calls"][1]
+        assert os.path.isabs(add_cmd[add_cmd.index("--") + 1])
+        assert "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false" in add_cmd
+
+    def test_register_client_codex_uses_official_cli(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        calls: list[list[str]] = []
+        script = [_FakeClaudeResult(returncode=1), _FakeClaudeResult(returncode=0)]
+
+        def fake_codex(cmd, timeout=5):
+            calls.append(list(cmd))
+            return script.pop(0)
+
+        monkeypatch.setattr(proxy_mod, "_run_codex_mcp", fake_codex)
+        result = runner.invoke(cli, ["register", "--client", "codex", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "Registered with Codex" in result.output
+        assert calls[0][:4] == ["codex", "mcp", "get", "memtomem-stm"]
+        assert calls[1][:4] == ["codex", "mcp", "add", "memtomem-stm"]
+        assert "--env" in calls[1]
+
+    def test_register_json_is_single_document(self, runner, config, fake_claude):
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {"demo": {}}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(
+            cli, ["register", "--client", "skip", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["action"] == "register"
+        assert payload["ok"] is True
+        assert payload["servers"] == ["demo"]
 
 
 # ── add --from-clients (bulk import) ────────────────────────────────────
@@ -8333,6 +8409,7 @@ class TestDoctor:
             "server_transports",
             "prefixes",
             "upstream:fake",
+            "host_registration",
             "cache_policy",
             "ltm",
         ]

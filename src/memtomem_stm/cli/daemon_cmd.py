@@ -202,6 +202,11 @@ def run_cmd(detached: bool, foreground: bool) -> None:
 _START_MAX_SPAWNS = 3
 
 
+def _can_force_terminate() -> bool:
+    """Whether pid-based POSIX SIGTERM fallback is available."""
+    return os.name != "nt"
+
+
 @daemon_group.command(name="start")
 def start_cmd() -> None:
     """Spawn the daemon detached if one isn't already running for this config.
@@ -308,6 +313,15 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
     # old POSIX-only ``is_pid_alive`` gate, which over-reported on Windows; the
     # probe makes the fallback safe cross-platform (#519).
     if is_pid_alive(pid) and client.probe_listening(raw.get("host"), raw.get("port")):
+        if not _can_force_terminate():
+            click.echo(
+                _warn(
+                    "daemon endpoint is still listening but rejected graceful shutdown; "
+                    "Windows does not provide the POSIX SIGTERM fallback. Close the owning "
+                    "terminal/process, then run `mms daemon status`."
+                )
+            )
+            return
         try:
             os.kill(pid, signal.SIGTERM)
             click.echo(_ok(f"sent SIGTERM to daemon pid={pid}"))
@@ -343,6 +357,15 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     foreign = _live_foreign_daemons(config)
     if not foreign:
         click.echo("no daemons running under a different config")
+        return
+    if not _can_force_terminate():
+        click.echo(
+            _warn(
+                "found daemon(s) under a different config, but Windows cannot safely "
+                "SIGTERM them by pid. Stop the owning processes from Task Manager or "
+                "restart Windows, then run `mms daemon status`."
+            )
+        )
         return
     for d in foreign:
         pid = d["pid"]

@@ -24,6 +24,17 @@ changes inline only. See the deprecation policy in
 - Corrected public configuration, surfacing, MCP-tool, and notebook guidance to
   match the v0.1.38 runtime contracts and keep copy/paste examples executable.
 
+## [0.1.39] — 2026-07-14
+
+### Added
+
+- Added a native Windows first-success path: cross-process state locking,
+  PowerShell diagnostics, safe daemon-stop behavior, platform-aware Claude
+  Desktop discovery, and absolute-Python MCP registrations.
+- Added `mms init --demo --client auto|claude|codex|json|skip`, `--resume`,
+  cache freshness presets, Codex registration, `CODEX_HOME` discovery, trusted
+  project Codex configs, and stdio upstream `cwd` support.
+
 ## [0.1.38] — 2026-07-14
 
 ### Upgrade notes

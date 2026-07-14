@@ -329,6 +329,33 @@ class TestScanCodex:
         (codex_dir / "config.toml").write_text("not [valid toml\n", encoding="utf-8")
         assert ih.scan_codex(tmp_path) == []
 
+    def test_honors_codex_home(self, sandbox_home, tmp_path, monkeypatch):
+        codex_home = tmp_path / "portable-codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            '[mcp_servers.portable]\ncommand = "echo"\n', encoding="utf-8"
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        assert [c.name for c in ih.scan_codex(tmp_path)] == ["portable"]
+
+    def test_trusted_project_config_is_repo_local(self, sandbox_home, tmp_path):
+        codex_dir = sandbox_home / ".codex"
+        codex_dir.mkdir()
+        cwd = tmp_path / "project"
+        project_dir = cwd / ".codex"
+        project_dir.mkdir(parents=True)
+        escaped = str(cwd.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+        (codex_dir / "config.toml").write_text(
+            f'[projects."{escaped}"]\ntrust_level = "trusted"\n', encoding="utf-8"
+        )
+        (project_dir / "config.toml").write_text(
+            '[mcp_servers.local]\ncommand = "echo"\n', encoding="utf-8"
+        )
+        candidates = ih.scan_codex(cwd)
+        assert len(candidates) == 1
+        assert candidates[0].source_label == "Codex CLI (project)"
+        assert candidates[0].is_repo_local is True
+
 
 class TestScanClaudeDesktop:
     @pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only path in W1")
@@ -346,6 +373,18 @@ class TestScanClaudeDesktop:
     def test_non_macos_returns_empty(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "platform", "linux")
         assert ih.scan_claude_desktop(tmp_path) == []
+
+    def test_windows_appdata_path(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("APPDATA", str(tmp_path))
+        config = tmp_path / "Claude" / "claude_desktop_config.json"
+        config.parent.mkdir()
+        config.write_text(
+            json.dumps({"mcpServers": {"win": {"command": "cmd.exe"}}}),
+            encoding="utf-8",
+        )
+        candidates = ih.scan_claude_desktop(tmp_path)
+        assert [c.name for c in candidates] == ["win"]
 
 
 class TestNonDictMcpServers:

@@ -574,6 +574,9 @@ class UpstreamServerConfig(BaseModel):
     command: str = ""
     args: list[str] = []
     env: dict[str, str] | None = None
+    cwd: Path | None = None
+    """Working directory for stdio servers. Useful for project-scoped MCP
+    servers and avoids shell-specific ``cd`` wrappers on Windows."""
     prefix: str
     transport: TransportType = TransportType.STDIO
     url: str = ""
