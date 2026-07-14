@@ -521,8 +521,11 @@ mms gateway explain github::create_issue
 This sets `source: "bundle"`. STM computes and reports the exact byte digest,
 and validates the schema, agent/profile scope, graph instance/generation, and
 each live MCP tool contract fingerprint before atomically adopting the
-snapshot. A changed bundle is checked before both `tools/list` and
-`tools/call`; the call gate runs before response-cache lookup. In `strict`,
+snapshot. A changed bundle is checked whenever the proxy manager rebuilds its
+filtered catalog and before each proxied call; the call gate runs before
+response-cache lookup. FastMCP registers the external MCP tool list at startup, so a running
+session blocks a newly denied call immediately but refreshes client-visible
+tool presence after STM/the client restarts. In `strict`,
 rejected, missing, drifted, or invalid policy fails closed. In `review`, the
 same decision is observable as would-block while the call remains available.
 `explore` leaves signal-based
@@ -709,6 +712,7 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 | `relevance_scorer.*` | Yes | All five fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`). A change in any field rebuilds the scorer instance in place. |
 | `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
 | Per-server `prefix` | **No** (restart) | Part of the tool names registered with the client at startup — the advertisement is session-stable. |
+| Toolgraph bundle decisions | Calls: **Yes**; advertised list: **No** | A changed strict denial gates the next call before cache/upstream access. Restart STM/the MCP client to rebuild the external `tools/list`. |
 | Per-server `circuit_*` breaker thresholds | **No** (restart) | The breaker is built at connect time on the connection object (#608). |
 | Adding / removing upstream servers | **No** (restart) | Transport connections are established once at startup. |
 
