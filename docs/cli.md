@@ -65,6 +65,7 @@ Commands:
   prune      Remove direct registrations for STM upstreams that are...
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
+  selection  Replay and evaluate tool-selection telemetry.
   stats      Show proxy compression and surfacing stats from the...
   status     Show proxy gateway config summary (path, enabled flag,...
   surfacing  Toggle proactive memory surfacing for an upstream server.
@@ -552,6 +553,29 @@ Three modes:
 Before writing, the config is snapshotted to a timestamped backup next to it (`stm_proxy.json.bak-<UTC>`, mode 0600); restore is `cp <backup> <config>`. A running proxy hot-reloads the new overrides without a restart. Recommendations for upstreams that exist only in metrics (env-defined or since-renamed servers) are reported as skipped rather than written.
 
 Unlike `mms stats`, this command opens the stores read-write to run their idempotent schema migrations (the same step the server performs at startup) — but only when the DB files already exist; a preview never creates anything.
+
+## `mms selection replay` — offline selection evaluation
+
+```text
+Usage: mms selection replay [OPTIONS]
+
+Options:
+  --config TEXT          [default: ~/.memtomem/stm_proxy.json]
+  --log FILE             Override selection_telemetry.path.
+  --dataset FILE         Override the packaged labelled v1 corpus.
+  --active-only          Exclude numeric rotated log backups.
+  --no-telemetry         Evaluate the fixed corpus only.
+  --output-dir DIRECTORY Write private report.json and summary.md artifacts.
+  --json                 Output stable JSON for scripting.
+```
+
+This read-only command checks the production JSONL schema, joins selection,
+execution, and feedback records, and reports observational cohorts and outcomes.
+It separately runs the current eligibility filter and BM25 ranker over a
+sanitized 30-case corpus, evaluates all 35 combinations of the two existing
+risk-penalty weights, and emits a safety-first configuration preview. It never
+applies that preview. See [Offline Tool-Selection Evaluation](selection-evaluation.md)
+for metric, split, privacy, and CI-golden details.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

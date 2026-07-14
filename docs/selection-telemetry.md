@@ -220,3 +220,8 @@ it reports two views:
 Rotated backups (`log.1` …) are noted but not parsed — the summary covers the
 active log only. For the full history, or any join against `proxy_metrics.db`,
 stream the JSONL directly (see [Replay joins](#replay-joins)).
+
+For deterministic corpus replay, rotated-log joins, data-quality checks, and
+risk-weight evaluation, use [`mms selection replay`](selection-evaluation.md).
+That evaluator keeps production telemetry observational and uses a separate
+sanitized labelled corpus for counterfactual ranking.

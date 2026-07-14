@@ -37,6 +37,7 @@ the option source of truth.
 | `mms surfacing NAME [on|off]` | Inspect or persist an upstream surfacing toggle |
 | `mms stats` | Read durable compression/surfacing statistics |
 | `mms tune` | Preview or apply per-tool compression recommendations |
+| `mms selection replay` | Evaluate selection telemetry and the labelled corpus without applying config |
 | `mms version` | Print the installed version |
 
 `mms --version` and `mms version` are equivalent. `mms stats --source mcp`
@@ -51,6 +52,11 @@ appear without a behavior-change release.
 
 Mutating commands use a configuration write lock and preserve unknown config
 keys. Preview/apply commands do not write until `--apply` is supplied.
+
+`mms selection replay --json` is a read-only, stable report surface. Production
+logs contribute observational joins and execution diagnostics; counterfactual
+ranking uses the packaged sanitized corpus. See
+[Offline Tool-Selection Evaluation](../selection-evaluation.md).
 
 For workflows and troubleshooting, see [Getting Started](../getting-started.md)
 and [Operations](../guides/operations.md). Run `mms <command> --help` for the

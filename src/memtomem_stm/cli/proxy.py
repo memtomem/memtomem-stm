@@ -33,6 +33,7 @@ from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
 from memtomem_stm.cli.mms_import import import_command as _mms_import_command
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
+from memtomem_stm.cli.selection_cmd import selection_group as _selection_group
 from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
     _desktop_config_path,
@@ -5721,3 +5722,8 @@ cli.add_command(_daemon_group)
 # `mms config ...` — strict config-file linting (#611); lives in
 # src/memtomem_stm/cli/config_cmd.py.
 cli.add_command(_config_group)
+
+# `mms selection replay` — offline selection-log validation + labelled
+# relevance/safety evaluation (#468), deliberately CLI-only (no MCP file-read
+# surface). Lives in its own module like the other nested command families.
+cli.add_command(_selection_group)

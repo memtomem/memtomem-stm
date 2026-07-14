@@ -1,0 +1,12 @@
+{
+  "dataset_id": "selection-eval-v1-synthetic-30",
+  "dataset_split_counts": {
+    "test": 6,
+    "train": 18,
+    "validation": 6
+  },
+  "report_sha256": "892b7c1fa4be22787f11bbf0702790f8b0c22d4b49b37a020252be941ef935fc",
+  "recommended_variant": "review-0.5__graph-1",
+  "status": "keep_baseline",
+  "variant_count": 35
+}
