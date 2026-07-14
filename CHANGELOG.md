@@ -21,6 +21,9 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Failed Codex MCP registration now exits nonzero and reports `ok: false` in
+  JSON setup output, preventing automation from treating an unusable setup as
+  successful (#702).
 - Corrected public configuration, surfacing, MCP-tool, and notebook guidance to
   match the v0.1.38 runtime contracts and keep copy/paste examples executable.
 
