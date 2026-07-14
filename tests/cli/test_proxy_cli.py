@@ -7105,13 +7105,6 @@ class TestHealth:
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
-        project = tmp_path / "project"
-        project.mkdir()
-        monkeypatch.chdir(project)
-        (project / ".mcp.json").write_text(
-            json.dumps({"mcpServers": {"memtomem-stm": {"command": "memtomem-stm"}}}),
-            encoding="utf-8",
-        )
 
     def test_health_no_servers(self, runner, config):
         """Empty config → friendly message, no crash."""
@@ -8331,6 +8324,13 @@ class TestDoctor:
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
+        project = tmp_path / "project"
+        project.mkdir()
+        monkeypatch.chdir(project)
+        (project / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"memtomem-stm": {"command": "memtomem-stm"}}}),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _healthy_config(config, *, strict_cache: bool = True) -> None:
