@@ -22,6 +22,7 @@ from memtomem_stm.proxy.tool_eligibility import (
 SCHEMA_VERSION = 1
 KIND = "toolgraph.policy-bundle"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_TOOL_KEY_RE = re.compile(r"^[^:]+::[^:]+$")
 
 
 class PolicyBundleError(ValueError):
@@ -154,7 +155,7 @@ def parse_policy_bundle(
     for index, value in enumerate(tools):
         item = _object(value, f"tools[{index}]")
         key = _non_empty_string(item.get("tool_key"), f"tools[{index}].tool_key")
-        if key.count("::") != 1 or key.startswith("::") or key.endswith("::"):
+        if _TOOL_KEY_RE.fullmatch(key) is None:
             raise PolicyBundleError(f"tools[{index}].tool_key must be server-qualified")
         if key in decisions:
             raise PolicyBundleError(f"duplicate tool_key {key!r}")

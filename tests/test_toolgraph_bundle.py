@@ -170,6 +170,16 @@ def test_parser_rejects_unknown_schema_versions(version):
         )
 
 
+@pytest.mark.parametrize("tool_key", ["server", "::tool", "server::", "a:b::c", "a::b:c"])
+def test_parser_matches_schema_for_qualified_tool_keys(tool_key):
+    doc = _bundle(_tool())
+    doc["tools"][0]["tool_key"] = tool_key
+    with pytest.raises(PolicyBundleError, match="tool_key must be server-qualified"):
+        parse_policy_bundle(
+            canonical_json_bytes(doc), expected_agent="stm-proxy", expected_profile="strict"
+        )
+
+
 @pytest.mark.asyncio
 async def test_strict_list_and_direct_call_use_same_denial(tmp_path):
     manager, path, tool = _manager(tmp_path)
@@ -186,12 +196,18 @@ async def test_strict_call_gate_runs_before_pipeline_and_reloads_atomically(tmp_
     manager, path, tool = _manager(tmp_path)
     _write_bundle(path, _bundle(tool))
     manager._refresh_toolgraph_bundle(force=True, startup=True)
+    initial_stamp = manager._toolgraph_bundle_stamp
+    initial_digest = manager._toolgraph_bundle_digest
     manager._call_tool_guarded = AsyncMock(return_value=("ok", False))
     assert await manager.call_tool("srv", "read", {}) == "ok"
 
     _write_bundle(path, _bundle(tool, decision="rejected"))
     with pytest.raises(ToolError, match="toolgraph_deny_violation"):
         await manager.call_tool("srv", "read", {})
+    # Runs on Windows CI too: replacement must change the observed stamp and
+    # adopt the new exact-byte digest before the denial reaches the call gate.
+    assert manager._toolgraph_bundle_stamp != initial_stamp
+    assert manager._toolgraph_bundle_digest != initial_digest
     manager._call_tool_guarded.assert_awaited_once()
 
 
@@ -387,6 +403,46 @@ def test_gateway_mode_preview_does_not_mutate_loaded_config(monkeypatch):
 
     assert preview.exit_code == 0, preview.output
     assert data == {"enabled": True, "upstream_servers": {}}
+
+
+def test_gateway_mode_strict_apply_warns_until_bundle_exists(tmp_path):
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+    missing = tmp_path / "not-published.json"
+    runner = CliRunner()
+
+    warned = runner.invoke(
+        cli,
+        [
+            "gateway",
+            "mode",
+            "strict",
+            "--config",
+            str(config),
+            "--bundle",
+            str(missing),
+            "--apply",
+        ],
+    )
+    assert warned.exit_code == 0, warned.output
+    assert "strict mode will refuse to start" in warned.output
+
+    _write_bundle(missing, _bundle(_tool()))
+    ready = runner.invoke(
+        cli,
+        [
+            "gateway",
+            "mode",
+            "strict",
+            "--config",
+            str(config),
+            "--bundle",
+            str(missing),
+            "--apply",
+        ],
+    )
+    assert ready.exit_code == 0, ready.output
+    assert "strict mode will refuse to start" not in ready.output
 
 
 def test_gateway_status_and_explain_bundle(tmp_path):

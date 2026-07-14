@@ -1060,6 +1060,13 @@ def gateway_mode(
         f"{_ok('Applied')} gateway mode {profile!r}; publish a matching bundle to "
         f"{target_bundle.expanduser()}."
     )
+    expanded_bundle = target_bundle.expanduser()
+    if profile == "strict" and not expanded_bundle.is_file():
+        click.echo(
+            f"{_warn('Warning:')} no policy bundle exists at {expanded_bundle}; "
+            "strict mode will refuse to start until one is published.",
+            err=True,
+        )
 
 
 cli.add_command(gateway_group)

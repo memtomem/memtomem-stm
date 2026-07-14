@@ -54,7 +54,8 @@ mms gateway explain server::tool
 `exposure.profile` and `toolgraph.query_profile`, enables `source: "bundle"`,
 and leaves bundle publication to `toolgraph policy compile`. `status --json`
 validates and identifies the exact artifact; `explain` shows one qualified
-tool decision without calling the upstream.
+tool decision without calling the upstream. Applying `strict` warns if the
+target bundle is missing because the next server start will fail closed.
 | `mms version` | Print the installed version |
 
 `mms --version` and `mms version` are equivalent. `mms stats --source mcp`

@@ -744,6 +744,10 @@ class ProxyManager:
             return
         path = cfg.bundle_path.expanduser()
         try:
+            # Deliberate O(1) syscall on every tools/list and tools/call: a
+            # freshly published denial must take effect before advertisement,
+            # cache lookup, or upstream dispatch. Catalog hashing remains
+            # revision-gated, so freshness does not become O(tool count).
             stat = path.stat()
             stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
             if not force and stamp == self._toolgraph_bundle_stamp:

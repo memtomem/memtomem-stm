@@ -518,20 +518,22 @@ mms gateway status
 mms gateway explain github::create_issue
 ```
 
-This sets `source: "bundle"`. STM validates the schema, exact artifact digest,
-agent/profile scope, graph instance/generation, and each live MCP tool contract
-fingerprint before atomically adopting the snapshot. A changed bundle is
-checked before both `tools/list` and `tools/call`; the call gate runs before
-response-cache lookup. In `strict`, rejected, missing, drifted, or invalid
-policy fails closed. In `review`, the same decision is observable as
-would-block while the call remains available. `explore` leaves signal-based
+This sets `source: "bundle"`. STM computes and reports the exact byte digest,
+and validates the schema, agent/profile scope, graph instance/generation, and
+each live MCP tool contract fingerprint before atomically adopting the
+snapshot. A changed bundle is checked before both `tools/list` and
+`tools/call`; the call gate runs before response-cache lookup. In `strict`,
+rejected, missing, drifted, or invalid policy fails closed. In `review`, the
+same decision is observable as would-block while the call remains available.
+`explore` leaves signal-based
 policy non-enforcing. Bundle mode never starts a Toolgraph subprocess and the
 `on_*` stdio failure knobs do not apply.
 
 Use `review` first for a vibe-coding-friendly rollout, inspect decisions with
 `mms gateway explain`, then switch to `strict` after the catalog and grants are
 stable. `mms gateway mode` previews by default; only `--apply` writes the
-configuration.
+configuration. Applying `strict` warns when the target bundle does not exist;
+the next server start will fail closed until Toolgraph publishes it.
 
 With `source: "stdio"`, enabling the block makes the graph's backend a startup
 prerequisite. The four `on_*` knobs choose the posture when the consult
