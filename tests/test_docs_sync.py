@@ -399,9 +399,18 @@ def test_public_proxy_config_examples_match_runtime_schema() -> None:
     assert parsed.upstream_servers["filesystem"].selective.max_pending == 100
 
     for relative in ("docs/configuration.md", "docs/compression.md"):
-        for example in _json_fences(relative):
-            # docs/compression.md also shows one compressed response payload.
-            if "type" in example:
+        examples = _json_fences(relative)
+        response_payloads = [
+            example
+            for example in examples
+            if example.get("type") == "toc"
+            and {"selection_key", "entries", "hint"} <= example.keys()
+        ]
+        expected_payloads = 1 if relative == "docs/compression.md" else 0
+        assert len(response_payloads) == expected_payloads, relative
+
+        for example in examples:
+            if example in response_payloads:
                 continue
             assert find_unknown_keys(ProxyConfig, example) == [], relative
             ProxyConfig.model_validate(example)

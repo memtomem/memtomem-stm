@@ -100,9 +100,12 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
     os.environ["MEMTOMEM_STM_PROXY__CONFIG_PATH"] = str(config_path)
     os.environ["MEMTOMEM_STM_PROXY__CACHE__DB_PATH"] = str(tmp / "proxy_cache.db")
     os.environ["MEMTOMEM_STM_PROXY__METRICS__DB_PATH"] = str(tmp / "proxy_metrics.db")
-    os.environ["MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH"] = str(tmp / "stm_feedback.db")
-    os.environ["MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH"] = str(tmp / "stm_feedback.db")
-    os.environ["MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH"] = str(tmp / "stm_feedback.db")
+    # Mirror production: all three trackers use one shared SQLite file with
+    # separate tables, rather than independent look-alike databases.
+    feedback_db = str(tmp / "stm_feedback.db")
+    os.environ["MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH"] = feedback_db
+    os.environ["MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH"] = feedback_db
+    os.environ["MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH"] = feedback_db
     os.environ["MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"] = "true"
     if not enable_surfacing:
         os.environ["MEMTOMEM_STM_SURFACING__ENABLED"] = "false"
