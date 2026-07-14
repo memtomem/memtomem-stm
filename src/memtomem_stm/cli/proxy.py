@@ -755,13 +755,15 @@ def _run_mcp_integration(
                 click.echo(f"  {_ok('Kept existing Codex registration.')}")
                 return
             if not _remove_from_codex():
-                click.echo(f"  {_warn('Could not remove the existing Codex registration.')}")
-                return
+                raise click.ClickException(
+                    "could not remove the existing Codex registration; "
+                    "the previous registration was left unchanged"
+                )
         success, reason = _register_with_codex(server_cmd, server_args, env=server_env)
         if success:
             click.echo(f"  {_ok('Registered with Codex.')}")
         else:
-            click.echo(f"  {_warn(reason)}")
+            raise click.ClickException(reason or "codex mcp add failed")
         return
 
     if client_mode == "json":

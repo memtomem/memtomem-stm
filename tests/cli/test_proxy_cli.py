@@ -20,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from click.testing import CliRunner
@@ -4067,6 +4068,106 @@ class TestRegisterCommand:
         assert calls[0][:4] == ["codex", "mcp", "get", "memtomem-stm"]
         assert calls[1][:4] == ["codex", "mcp", "add", "memtomem-stm"]
         assert "--env" in calls[1]
+
+    def test_register_client_codex_add_failure_is_nonzero(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        monkeypatch.setattr(proxy_mod, "_codex_registered", lambda: False)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_register_with_codex",
+            lambda *_args, **_kwargs: (False, "codex rejected registration"),
+        )
+
+        result = runner.invoke(cli, ["register", "--client", "codex", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "codex rejected registration" in result.output
+        assert "Registered with Codex" not in result.output
+
+    def test_register_client_codex_add_failure_is_json_failure(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        monkeypatch.setattr(proxy_mod, "_codex_registered", lambda: False)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_register_with_codex",
+            lambda *_args, **_kwargs: (False, "codex rejected registration"),
+        )
+
+        result = runner.invoke(cli, ["register", "--client", "codex", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["error"] == "setup_failed"
+        assert payload["client"] == "codex"
+        assert "codex rejected registration" in payload["message"]
+
+    def test_register_client_codex_replace_remove_failure_stops_before_add(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        register = Mock()
+        monkeypatch.setattr(proxy_mod, "_codex_registered", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_remove_from_codex", lambda: False)
+        monkeypatch.setattr(proxy_mod, "_register_with_codex", register)
+
+        result = runner.invoke(
+            cli,
+            [
+                "register",
+                "--client",
+                "codex",
+                "--replace-registration",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["client"] == "codex"
+        assert "previous registration was left unchanged" in payload["message"]
+        register.assert_not_called()
+
+    def test_init_auto_codex_failure_keeps_config_but_reports_failure(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod.shutil, "which", lambda command: "/bin/codex" if command == "codex" else None
+        )
+        monkeypatch.setattr(proxy_mod, "_codex_registered", lambda: False)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_register_with_codex",
+            lambda *_args, **_kwargs: (False, "codex rejected registration"),
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "init",
+                "--demo",
+                "--no-validate",
+                "--client",
+                "auto",
+                "--lang",
+                "en",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["client"] == "codex"
+        assert payload["servers"] == ["demo"]
+        assert config.exists()
 
     def test_register_json_is_single_document(self, runner, config, fake_claude):
         config.write_text(
