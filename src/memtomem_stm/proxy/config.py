@@ -905,6 +905,12 @@ class ToolgraphConfig(BaseModel):
     """
 
     enabled: bool = False
+    source: Literal["stdio", "bundle"] = "stdio"
+    """Policy source. ``stdio`` preserves the one-shot MCP consult; ``bundle``
+    consumes a portable, atomically published Toolgraph policy artifact and
+    never launches a Toolgraph subprocess."""
+    bundle_path: Path = Path("~/.memtomem/toolgraph/policy-bundle.json")
+    """Portable policy artifact used when ``source`` is ``bundle``."""
     command: str = "toolgraph"
     """Launch command for the stdio tool-graph MCP server. Defaults to the
     graph server's registered console script (mirroring the surfacing

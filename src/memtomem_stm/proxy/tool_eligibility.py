@@ -163,12 +163,14 @@ REASON_TOOLGRAPH_AGENT_NOT_FOUND = "toolgraph_agent_not_found"
 REASON_TOOLGRAPH_PROTOCOL_ERROR = "toolgraph_protocol_error"
 
 # Upstream ``eligible_tools`` reject reason → STM per-candidate code. The graph
-# owns its own reason vocabulary (selector.py); this is the 1:1 translation at
-# the boundary. ``TOOL_NOT_FOUND`` is intentionally absent here — it is gated
-# by the ``on_tool_not_found`` knob, applied by the caller, not unconditionally
-# mapped. An upstream reason missing from this map maps to the generic
-# ``REASON_TOOLGRAPH_REJECTED`` (forward-compatible withhold).
+# owns its own reason vocabulary (selector.py); this is the single 1:1
+# translation boundary shared by stdio verdicts and portable bundles.
+# ``TOOL_NOT_FOUND`` is still gated separately by the stdio caller's
+# ``on_tool_not_found`` knob; mapping it here only centralizes its stable code.
+# An unknown reason maps to the generic ``REASON_TOOLGRAPH_REJECTED``
+# (forward-compatible withhold).
 _TOOLGRAPH_REASON_MAP: dict[str, str] = {
+    "TOOL_NOT_FOUND": REASON_TOOLGRAPH_TOOL_NOT_FOUND,
     "NOT_GRANTED": REASON_TOOLGRAPH_NOT_GRANTED,
     "DENY_VIOLATION": REASON_TOOLGRAPH_DENY_VIOLATION,
     "DENY_GOVERNED": REASON_TOOLGRAPH_DENY_GOVERNED,
@@ -179,6 +181,12 @@ _TOOLGRAPH_REASON_MAP: dict[str, str] = {
 # The upstream reason string for an uncrawled candidate (the graph's blind
 # spot), gated separately by ``on_tool_not_found``.
 _TOOLGRAPH_TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+
+
+def toolgraph_reject_code(reason: str) -> str:
+    """Translate a Toolgraph reason into STM's stable rejection vocabulary."""
+    return _TOOLGRAPH_REASON_MAP.get(reason, REASON_TOOLGRAPH_REJECTED)
+
 
 # Error categories that count against a TOOL's health. Proxy-side failures
 # (programming, internal_error, lock_timeout) are our bugs, not the
@@ -379,11 +387,9 @@ def interpret_verdict(verdict: Mapping[str, Any]) -> InterpretedVerdict:
             )
         if reason == _TOOLGRAPH_TOOL_NOT_FOUND:
             tool_not_found.add(ref)
-            rejects[ref] = REASON_TOOLGRAPH_TOOL_NOT_FOUND
-        else:
-            # Unknown upstream reasons still withhold (fail-safe) under a
-            # generic code rather than silently advertising a blocked tool.
-            rejects[ref] = _TOOLGRAPH_REASON_MAP.get(reason, REASON_TOOLGRAPH_REJECTED)
+        # Unknown upstream reasons still withhold (fail-safe) under a generic
+        # code rather than silently advertising a blocked tool.
+        rejects[ref] = toolgraph_reject_code(reason)
 
     return InterpretedVerdict(
         agent_found=True,

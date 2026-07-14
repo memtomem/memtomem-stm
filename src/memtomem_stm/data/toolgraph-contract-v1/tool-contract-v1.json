@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "server": "도구-서버",
+    "name": "publish",
+    "description": "게시 도구 – 검토 필요",
+    "input_schema": {
+      "required": ["payload"],
+      "properties": {
+        "payload": {"description": "한글", "type": "string"},
+        "dry_run": {"default": false, "type": "boolean"}
+      },
+      "type": "object"
+    },
+    "read_only_hint": false,
+    "destructive_hint": true,
+    "idempotent_hint": null,
+    "open_world_hint": false
+  },
+  "expected_digest": "8a09331af165a465ef525c341685432941fe7b64e260e634cb34ac25eba46ae2"
+}

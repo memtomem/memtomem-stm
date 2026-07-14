@@ -55,6 +55,7 @@ Commands:
   daemon     Manage the shared local surfacing daemon.
   doctor     Diagnose the proxy setup end-to-end (read-only).
   eject      Restore imported upstream(s) to their host MCP client, then...
+  gateway    Inspect and configure Toolgraph-backed gateway policy.
   health     Check upstream server connectivity.
   hook       Bridge a host's built-in tool calls into STM (PostToolUse...
   host       Host-config inspection and sync (RFC §7.3).

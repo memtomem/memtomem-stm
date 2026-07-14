@@ -88,7 +88,9 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
     REASON_PROFILE_EXCLUDED,
     REASON_TOOLGRAPH_AGENT_NOT_FOUND,
+    REASON_TOOLGRAPH_DRIFTED,
     REASON_TOOLGRAPH_PROTOCOL_ERROR,
+    REASON_TOOLGRAPH_UNMAPPED,
     REASON_TOOLGRAPH_UNREACHABLE,
     ExposureCandidate,
     InterpretedVerdict,
@@ -98,6 +100,12 @@ from memtomem_stm.proxy.tool_eligibility import (
     parse_risk_scores,
 )
 from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
+from memtomem_stm.proxy.toolgraph_bundle import (
+    PolicyBundleError,
+    PolicySnapshot,
+    load_policy_bundle,
+    tool_contract_digest,
+)
 from memtomem_stm.proxy.toolgraph_provider import (
     TRANSPORT_ERRORS as TOOLGRAPH_TRANSPORT_ERRORS,
     ToolgraphConsultAdapter,
@@ -475,6 +483,19 @@ class ProxyManager:
         # records whether THIS session's verdict was served from a cache hit.
         self._toolgraph_cache: GraphConsultCache | None = None
         self._toolgraph_from_cache: bool = False
+        # Portable bundle state.  A complete PolicySnapshot is built before
+        # this reference is swapped, so tools/list and tools/call never observe
+        # a half-parsed artifact during an atomic producer update.
+        self._toolgraph_policy_snapshot: PolicySnapshot | None = None
+        self._toolgraph_bundle_stamp: tuple[int, int, int] | None = None
+        self._toolgraph_bundle_digest: str | None = None
+        self._graph_instance_id: str | None = None
+        self._toolgraph_would_block_calls: int = 0
+        # Monotonic within a start/stop lifecycle. Portable policy decisions
+        # are rebound only when this revision changes, avoiding O(catalog)
+        # contract hashing on every tools/call hot path.
+        self._tool_catalog_revision: int = 0
+        self._toolgraph_bound_catalog_revision: int | None = None
         self._connections: dict[str, UpstreamConnection] = {}
         # Configured servers whose startup connect FAILED (#580). Entries never
         # land in ``_connections`` (created only on a successful connect), so
@@ -544,6 +565,8 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
             self._connections.clear()
+            self._tool_catalog_revision = 0
+            self._toolgraph_bound_catalog_revision = None
             # Drop stale startup-failure records (#580): a manager reused across
             # ``start()`` calls (new config, or a server removed) must not keep
             # reporting a previous session's failed upstream in
@@ -569,6 +592,7 @@ class ProxyManager:
                         exc_info=True,
                     )
                 self._toolgraph_cache = None
+        self._reset_toolgraph_session_state()
         self._stack = AsyncExitStack()
 
         servers = self._config.upstream_servers
@@ -708,7 +732,140 @@ class ProxyManager:
         # loud failure (a broken/typo'd provider must not silently disable
         # enforcement).
         if self._config.toolgraph.enabled:
-            await self._consult_toolgraph()
+            if self._config.toolgraph.source == "bundle":
+                self._refresh_toolgraph_bundle(force=True, startup=True)
+            else:
+                await self._consult_toolgraph()
+
+    def _refresh_toolgraph_bundle(self, *, force: bool = False, startup: bool = False) -> None:
+        """Reload a changed portable policy artifact with atomic swap semantics."""
+        cfg = self._config.toolgraph
+        if not cfg.enabled or cfg.source != "bundle":
+            return
+        path = cfg.bundle_path.expanduser()
+        try:
+            # Deliberate O(1) syscall on every tools/list and tools/call: a
+            # freshly published denial must take effect before advertisement,
+            # cache lookup, or upstream dispatch. Catalog hashing remains
+            # revision-gated, so freshness does not become O(tool count).
+            stat = path.stat()
+            stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            if not force and stamp == self._toolgraph_bundle_stamp:
+                # tools/list_changed may have altered the live catalog while
+                # the artifact itself stayed unchanged. Rebind the immutable
+                # decisions so new/mutated tools become UNMAPPED/DRIFTED before
+                # either advertisement or a direct call.
+                if (
+                    self._toolgraph_policy_snapshot is not None
+                    and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+                ):
+                    self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
+                return
+            active_profile = self._config.exposure.profile.value
+            if cfg.query_profile != active_profile:
+                raise PolicyBundleError(
+                    "toolgraph.query_profile must match exposure.profile in bundle mode "
+                    f"({cfg.query_profile!r} != {active_profile!r})"
+                )
+            snapshot = load_policy_bundle(
+                path,
+                expected_agent=cfg.agent_id,
+                expected_profile=active_profile,
+            )
+            # Re-stat after reading. If a non-atomic writer changed the file in
+            # between, do not adopt bytes whose identity we cannot pin.
+            after = path.stat()
+            after_stamp = (after.st_ino, after.st_size, after.st_mtime_ns)
+            if after_stamp != stamp:
+                raise PolicyBundleError("policy bundle changed while it was being read")
+        except (OSError, PolicyBundleError) as exc:
+            self._toolgraph_degraded = True
+            self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
+            if self._config.exposure.profile is ExposureProfile.STRICT:
+                self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
+                if startup:
+                    raise ToolgraphStartupError(f"Invalid Toolgraph policy bundle: {exc}") from exc
+            elif (
+                self._toolgraph_policy_snapshot is not None
+                and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+            ):
+                # Review mode keeps serving the last-known-good policy, but a
+                # changed catalog must still be rebound once so newly added or
+                # drifted tools are counted as would-block instead of escaping
+                # the stale snapshot.
+                self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
+            logger.warning("Toolgraph policy bundle reload rejected: %s", exc)
+            return
+
+        self._toolgraph_policy_snapshot = snapshot
+        self._toolgraph_bundle_stamp = after_stamp
+        self._toolgraph_bundle_digest = snapshot.bundle_digest
+        self._graph_instance_id = snapshot.instance_id
+        self._graph_generation = snapshot.generation
+        self._toolgraph_degraded = False
+        self._toolgraph_degraded_reason = None
+        self._toolgraph_withhold_all = None
+        self._apply_toolgraph_policy_snapshot(snapshot)
+        logger.info(
+            "Toolgraph policy bundle active: instance %s generation %d digest %s",
+            snapshot.instance_id,
+            snapshot.generation,
+            snapshot.bundle_digest[:12],
+        )
+
+    def _apply_toolgraph_policy_snapshot(self, snapshot: PolicySnapshot) -> None:
+        """Bind portable qualified decisions to the current live MCP catalog."""
+        cfg = self._config.toolgraph
+        rejects: dict[tuple[str, str], str] = {}
+        penalties: dict[tuple[str, str], float] = {}
+        for conn in self._connections.values():
+            graph_server = cfg.server_name_map.get(conn.name, conn.name)
+            for tool in conn.tools:
+                key = (conn.name, tool.name)
+                qualified = f"{graph_server}::{tool.name}"
+                decision = snapshot.decisions.get(qualified)
+                if decision is None:
+                    rejects[key] = REASON_TOOLGRAPH_UNMAPPED
+                    continue
+                digest = tool_contract_digest(
+                    server=graph_server,
+                    name=tool.name,
+                    description=tool.description,
+                    input_schema=tool.inputSchema,
+                    annotations=getattr(tool, "annotations", None),
+                )
+                if digest != decision.contract_digest:
+                    rejects[key] = REASON_TOOLGRAPH_DRIFTED
+                    continue
+                if decision.reject_code is not None:
+                    rejects[key] = decision.reject_code
+                if decision.risk_score is not None and decision.risk_score > 0:
+                    penalties[key] = min(decision.risk_score * cfg.risk_penalty_scale, 1.0)
+        self._toolgraph_external_rejects = rejects
+        self._toolgraph_risk_penalties = penalties
+        self._toolgraph_bound_catalog_revision = self._tool_catalog_revision
+
+    def _enforce_toolgraph_call_policy(self, server: str, tool: str) -> None:
+        """Apply the same policy snapshot at call time, before cache/upstream."""
+        cfg = self._config.toolgraph
+        if not cfg.enabled or cfg.source != "bundle":
+            return
+        self._refresh_toolgraph_bundle()
+        reason = self._toolgraph_withhold_all or self._toolgraph_external_rejects.get(
+            (server, tool)
+        )
+        if reason is None:
+            return
+        if self._config.exposure.profile is ExposureProfile.STRICT:
+            from mcp.server.fastmcp.exceptions import ToolError
+
+            raise ToolError(
+                f"Policy denied tool call '{server}/{tool}' ({reason}); "
+                "refresh the Toolgraph policy bundle after review"
+            )
+        if self._config.exposure.profile is ExposureProfile.REVIEW:
+            self._toolgraph_would_block_calls += 1
+            logger.warning("Toolgraph review mode would block %s/%s (%s)", server, tool, reason)
 
     def _build_toolgraph_candidates(self) -> tuple[dict[str, list[tuple[str, str]]], list[str]]:
         """Map every discovered upstream tool to its graph candidate ref.
@@ -743,17 +900,7 @@ class ProxyManager:
         advertised.
         """
         cfg = self._config.toolgraph
-        # Reset the cached snapshot first: start() is a supported re-entry path
-        # (the double-start guard re-runs discovery + compute_health_flags), so
-        # a recovered graph on a second start must not inherit the previous
-        # session's withhold-all / degraded / reject state.
-        self._toolgraph_external_rejects = {}
-        self._toolgraph_risk_penalties = {}
-        self._toolgraph_withhold_all = None
-        self._graph_generation = None
-        self._toolgraph_degraded = False
-        self._toolgraph_degraded_reason = None
-        self._toolgraph_from_cache = False
+        self._reset_toolgraph_verdict_state()
 
         ref_to_keys, refs = self._build_toolgraph_candidates()
         if not refs:
@@ -837,6 +984,27 @@ class ProxyManager:
                 self._graph_generation,
             )
         self._warn_server_name_mismatch(interp.tool_not_found_refs, ref_to_keys)
+
+    def _reset_toolgraph_verdict_state(self) -> None:
+        """Clear the shared stdio/bundle verdict fields before a consult."""
+        self._toolgraph_external_rejects = {}
+        self._toolgraph_risk_penalties = {}
+        self._toolgraph_withhold_all = None
+        self._graph_generation = None
+        self._toolgraph_degraded = False
+        self._toolgraph_degraded_reason = None
+        self._toolgraph_from_cache = False
+
+    def _reset_toolgraph_session_state(self) -> None:
+        """Drop every enforcement snapshot before a new start lifecycle."""
+        self._reset_toolgraph_verdict_state()
+        self._toolgraph_policy_snapshot = None
+        self._toolgraph_bundle_stamp = None
+        self._toolgraph_bundle_digest = None
+        self._graph_instance_id = None
+        self._toolgraph_would_block_calls = 0
+        self._tool_catalog_revision = 0
+        self._toolgraph_bound_catalog_revision = None
 
     def _open_consult_cache(self, cfg: ToolgraphConfig) -> GraphConsultCache | None:
         """Lazily open the #494 consult disk cache; ``None`` when disabled.
@@ -1200,6 +1368,7 @@ class ProxyManager:
             stack=conn_stack,
             breaker=breaker,
         )
+        self._tool_catalog_revision += 1
         # A successful connect clears any prior startup-failure record (#580).
         self._failed_servers.pop(name, None)
         logger.info("Connected to '%s' (%s tools discovered)", name, len(tools))
@@ -1268,6 +1437,7 @@ class ProxyManager:
             conn.session = session
             conn.stack = conn_stack
             conn.tools = tools
+            self._tool_catalog_revision += 1
             conn.config = cfg
             # Any successful reconnect proves the current config connects —
             # clear the config-change damper so detection resumes normally.
@@ -1379,6 +1549,7 @@ class ProxyManager:
         all_names = old_names | new_names
         was_eligible = {t: self._tool_cache_eligible(name, t, cfg_snap=cfg_snap) for t in all_names}
         conn.tools = new_tools
+        self._tool_catalog_revision += 1
         stale = [
             t
             for t in sorted(all_names)
@@ -1508,6 +1679,8 @@ class ProxyManager:
             await self._stack.aclose()
             self._stack = None
         self._connections.clear()
+        self._tool_catalog_revision = 0
+        self._toolgraph_bound_catalog_revision = None
         # Close the lazily-built selective/progressive stores (#583): a restart
         # recovery or a SELECTIVE/HYBRID/progressive call may have opened a
         # SQLite-backed store that ``_connections`` cleanup never touches, so
@@ -1581,6 +1754,7 @@ class ProxyManager:
         alongside the advertisement so selection telemetry (#467) and
         relevance ranking (#466) describe exactly this exposure decision.
         """
+        self._refresh_toolgraph_bundle()
         candidates: list[ExposureCandidate] = []
         global_max_desc = self._config.max_description_chars
         global_strip = self._config.strip_schema_descriptions
@@ -2783,7 +2957,7 @@ class ProxyManager:
         """
         if not self._config.toolgraph.enabled:
             return None
-        return {
+        status = {
             "enabled": True,
             "degraded": self._toolgraph_degraded,
             "degraded_reason": self._toolgraph_degraded_reason,
@@ -2793,6 +2967,21 @@ class ProxyManager:
             "external_reject_count": len(self._toolgraph_external_rejects),
             "risk_penalty_count": len(self._toolgraph_risk_penalties),
         }
+        if self._config.toolgraph.source == "bundle":
+            status.update(
+                {
+                    "source": "bundle",
+                    "graph_instance_id": self._graph_instance_id,
+                    "bundle_digest": self._toolgraph_bundle_digest,
+                    "would_block_calls": self._toolgraph_would_block_calls,
+                    "using_last_known_good": (
+                        self._toolgraph_degraded
+                        and self._toolgraph_policy_snapshot is not None
+                        and self._toolgraph_withhold_all is None
+                    ),
+                }
+            )
+        return status
 
     async def _on_cache_hit(
         self,
@@ -2851,6 +3040,10 @@ class ProxyManager:
         """
         if server not in self._connections:
             raise KeyError(f"Unknown upstream server: '{server}'")
+        # Bundle enforcement is deliberately before selection telemetry,
+        # response-cache lookup, and upstream dispatch. A stale cached result
+        # can never bypass a newly published denial.
+        self._enforce_toolgraph_call_policy(server, tool)
         if trace_id is None:
             trace_id = uuid.uuid4().hex[:16]
         # Selection telemetry (#467): the prefixed name shares the

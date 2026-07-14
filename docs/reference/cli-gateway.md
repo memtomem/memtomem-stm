@@ -38,6 +38,24 @@ the option source of truth.
 | `mms stats` | Read durable compression/surfacing statistics |
 | `mms tune` | Preview or apply per-tool compression recommendations |
 | `mms selection replay` | Evaluate selection telemetry and the labelled corpus without applying config |
+
+## Toolgraph policy gateway
+
+Use the portable bundle path when Toolgraph should remain a control plane and
+STM should be the runtime enforcement gateway:
+
+```bash
+mms gateway mode review --apply
+mms gateway status
+mms gateway explain server::tool
+```
+
+`mode` is preview-only unless `--apply` is present. It aligns
+`exposure.profile` and `toolgraph.query_profile`, enables `source: "bundle"`,
+and leaves bundle publication to `toolgraph policy compile`. `status --json`
+validates and identifies the exact artifact; `explain` shows one qualified
+tool decision without calling the upstream. Applying `strict` warns if the
+target bundle is missing because the next server start will fail closed.
 | `mms version` | Print the installed version |
 
 `mms --version` and `mms version` are equivalent. `mms stats --source mcp`

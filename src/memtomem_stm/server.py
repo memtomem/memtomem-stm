@@ -971,6 +971,11 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
             f"  WITHHOLDING ALL tools — consult failed ({status['withholding_all']}), "
             "knob is 'closed'"
         )
+    elif status["degraded"] and status.get("using_last_known_good"):
+        lines.append(
+            f"  DEGRADED — bundle reload failed ({status['degraded_reason']}); "
+            "last-known-good policy remains active"
+        )
     elif status["degraded"]:
         lines.append(
             f"  DEGRADED — external enforcement NOT active ({status['degraded_reason']}); "
@@ -982,14 +987,21 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
         lines.append("  enabled, not consulted (no upstream tools discovered)")
     else:
         cache_note = ", from cache" if status.get("from_cache") else ""
+        source_note = ", portable bundle" if status.get("source") == "bundle" else ""
         line = (
-            f"  active (graph generation {status['graph_generation']}{cache_note}, "
+            f"  active (graph generation {status['graph_generation']}{cache_note}{source_note}, "
             f"{status['external_reject_count']} tool(s) rejected by the graph"
         )
         risk_count = status.get("risk_penalty_count", 0)
         if risk_count:
             line += f"; {risk_count} carry a graph risk penalty"
         lines.append(line + ")")
+        if status.get("source") == "bundle":
+            lines.append(
+                f"  graph instance: {status.get('graph_instance_id')}; "
+                f"bundle digest: {status.get('bundle_digest')}"
+            )
+            lines.append(f"  review would-block calls: {status.get('would_block_calls', 0)}")
     return lines
 
 

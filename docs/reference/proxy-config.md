@@ -71,6 +71,13 @@ Metrics, progressive-read state, selection telemetry, relevance/exposure, and
 toolgraph blocks each have independent enable/retention settings. See
 [Caching](../caching.md) and [Selection Telemetry](../selection-telemetry.md).
 
+`toolgraph.source` selects either the backwards-compatible one-shot `stdio`
+consult or the portable `bundle` enforcement path. Bundle mode reads
+`toolgraph.bundle_path`, requires its agent and profile to match
+`toolgraph.agent_id` and `exposure.profile`, and rechecks the artifact before
+tool listing and calls. Use `mms gateway status`, `explain`, and `mode` for the
+operator-facing workflow.
+
 ## Validation and hot reload
 
 Run `mms config validate` before restarting or applying a generated change.

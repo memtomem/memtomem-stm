@@ -4,3 +4,7 @@
 # The raw-stdout goldens are *.txt; the JSON goldens are parsed structurally so
 # are EOL-agnostic, but pinning the whole tree keeps future B2 host fixtures safe.
 tests/fixtures/hooks/** text eol=lf
+
+# Toolgraph policy fixtures are a cross-repo byte contract: their SHA-256 is
+# asserted from read_bytes(), so Windows checkouts must preserve canonical LF.
+src/memtomem_stm/data/toolgraph-contract-v1/** text eol=lf

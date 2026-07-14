@@ -881,6 +881,197 @@ def version() -> None:
     click.echo(f"memtomem-stm {pkg_version('memtomem-stm')}")
 
 
+@click.group(name="gateway")
+def gateway_group() -> None:
+    """Inspect and configure Toolgraph-backed gateway policy."""
+
+
+@gateway_group.command(name="status")
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
+def gateway_status(config_path: str, *, as_json: bool = False) -> None:
+    """Show the configured policy source and validate the active bundle."""
+    from pydantic import ValidationError
+
+    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
+
+    path = Path(config_path)
+    try:
+        config = ProxyConfig.model_validate(_load(path))
+    except ValidationError as exc:
+        raise click.ClickException(f"invalid proxy config: {exc.errors()[0]['msg']}") from exc
+    tg = config.toolgraph
+    result: dict[str, Any] = {
+        "enabled": tg.enabled,
+        "source": tg.source,
+        "agent": tg.agent_id,
+        "profile": config.exposure.profile.value,
+    }
+    if tg.enabled and tg.source == "bundle":
+        result["bundle_path"] = str(tg.bundle_path.expanduser())
+        if tg.query_profile != config.exposure.profile.value:
+            result.update(
+                {
+                    "valid": False,
+                    "error": "toolgraph.query_profile must match exposure.profile in bundle mode",
+                }
+            )
+        else:
+            try:
+                snapshot = load_policy_bundle(
+                    tg.bundle_path,
+                    expected_agent=tg.agent_id,
+                    expected_profile=config.exposure.profile.value,
+                )
+            except PolicyBundleError as exc:
+                result.update({"valid": False, "error": str(exc)})
+            else:
+                decisions = list(snapshot.decisions.values())
+                result.update(
+                    {
+                        "valid": True,
+                        "bundle_digest": snapshot.bundle_digest,
+                        "graph_instance_id": snapshot.instance_id,
+                        "graph_generation": snapshot.generation,
+                        "eligible": sum(d.decision == "eligible" for d in decisions),
+                        "rejected": sum(d.decision == "rejected" for d in decisions),
+                    }
+                )
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return
+    click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({tg.source})")
+    click.echo(f"  agent/profile: {tg.agent_id} / {config.exposure.profile.value}")
+    if tg.source == "bundle" and tg.enabled:
+        click.echo(f"  bundle: {result['bundle_path']}")
+        if result.get("valid"):
+            click.echo(
+                f"  active: graph generation {result['graph_generation']}, "
+                f"{result['eligible']} eligible / {result['rejected']} rejected"
+            )
+            click.echo(f"  digest: {result['bundle_digest']}")
+        else:
+            click.echo(f"  {_bad('INVALID')}: {result.get('error')}")
+
+
+@gateway_group.command(name="explain")
+@click.argument("tool_key")
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
+def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -> None:
+    """Explain one qualified ``server::tool`` decision from the bundle."""
+    from pydantic import ValidationError
+
+    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
+
+    try:
+        config = ProxyConfig.model_validate(_load(Path(config_path)))
+        if config.toolgraph.source != "bundle":
+            raise PolicyBundleError("toolgraph.source must be 'bundle' for gateway explain")
+        if config.toolgraph.query_profile != config.exposure.profile.value:
+            raise PolicyBundleError(
+                "toolgraph.query_profile must match exposure.profile in bundle mode"
+            )
+        snapshot = load_policy_bundle(
+            config.toolgraph.bundle_path,
+            expected_agent=config.toolgraph.agent_id,
+            expected_profile=config.exposure.profile.value,
+        )
+    except (ValidationError, PolicyBundleError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    decision = snapshot.decisions.get(tool_key)
+    if decision is None:
+        raise click.ClickException(
+            f"{tool_key!r} is not in the active bundle; strict mode treats it as unmapped"
+        )
+    result = {
+        "tool_key": tool_key,
+        "decision": decision.decision,
+        "reason": decision.reason,
+        "risk_score": decision.risk_score,
+        "tool_contract_digest": decision.contract_digest,
+        "bundle_digest": snapshot.bundle_digest,
+        "graph_generation": snapshot.generation,
+    }
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        click.echo(f"{tool_key}: {decision.decision}")
+        if decision.reason:
+            click.echo(f"  reason: {decision.reason}")
+        risk_score = decision.risk_score if decision.risk_score is not None else "n/a"
+        click.echo(f"  risk score: {risk_score}")
+        click.echo(f"  graph generation: {snapshot.generation}")
+
+
+@gateway_group.command(name="mode")
+@click.argument("profile", type=click.Choice(["strict", "review", "explore"]))
+@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--bundle", "bundle_path", type=click.Path(path_type=Path), default=None)
+@click.option("--apply", "do_apply", is_flag=True, help="Write the configuration.")
+@click.option("--dry-run", is_flag=True, help="Explicitly preview without writing.")
+@with_config_write_lock(skip=lambda kwargs: not kwargs.get("do_apply"))
+def gateway_mode(
+    profile: str,
+    config_path: str,
+    bundle_path: Path | None,
+    do_apply: bool,
+    dry_run: bool,
+) -> None:
+    """Preview or apply the bundle enforcement profile.
+
+    The default is a safe preview. Use ``--apply`` to enable the bundle source
+    and atomically align both Toolgraph query and STM exposure profiles.
+    """
+    if do_apply and dry_run:
+        raise click.UsageError("--apply and --dry-run are mutually exclusive")
+    path = Path(config_path)
+    data = _load(path)
+    toolgraph = data.get("toolgraph") or {}
+    target_bundle = bundle_path or Path(
+        toolgraph.get("bundle_path", "~/.memtomem/toolgraph/policy-bundle.json")
+    )
+    preview = {
+        "enabled": True,
+        "source": "bundle",
+        "profile": profile,
+        "agent": toolgraph.get("agent_id", "stm-proxy"),
+        "bundle_path": str(target_bundle),
+    }
+    if not do_apply:
+        click.echo(json.dumps(preview, indent=2, ensure_ascii=False))
+        click.echo("Preview only. Re-run with --apply to write the config.")
+        return
+    exposure = data.setdefault("exposure", {})
+    writable_toolgraph = data.setdefault("toolgraph", {})
+    exposure["profile"] = profile
+    writable_toolgraph.update(
+        {
+            "enabled": True,
+            "source": "bundle",
+            "bundle_path": str(target_bundle),
+            "query_profile": profile,
+        }
+    )
+    _save(path, data)
+    click.echo(
+        f"{_ok('Applied')} gateway mode {profile!r}; publish a matching bundle to "
+        f"{target_bundle.expanduser()}."
+    )
+    expanded_bundle = target_bundle.expanduser()
+    if profile == "strict" and not expanded_bundle.is_file():
+        click.echo(
+            f"{_warn('Warning:')} no policy bundle exists at {expanded_bundle}; "
+            "strict mode will refuse to start until one is published.",
+            err=True,
+        )
+
+
+cli.add_command(gateway_group)
+
+
 def _mask_mapping_values(mapping: dict[str, Any]) -> dict[str, Any]:
     """Mask every value in an ``env`` / ``headers`` mapping (keys preserved).
 
