@@ -17,7 +17,7 @@ changes inline only. See the deprecation policy in
   including strict/review/explore profiles, list/call gates, contract-drift
   validation, and `mms gateway status`, `explain`, and `mode` operator commands
   (#701). Added a review-first gateway guide and a producer-owned cross-repo
-  smoke contract.
+  smoke contract (#703).
 - Added `mms selection replay` for issue #468 (#698): read-only schema/join/cohort
   diagnostics over selection JSONL plus deterministic evaluation of the current
   eligibility filter and BM25 ranker on a packaged, sanitized 30-case corpus.

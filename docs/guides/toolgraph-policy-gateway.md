@@ -76,6 +76,7 @@ visible under review. Calls are allowed, while `stm_proxy_health` reports the
 review would-block count when the MCP client registration sets
 `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`. Restart the client after
 adding that environment value, then call `stm_proxy_health` from the client.
+The underlying gateway status field is `would_block_calls`.
 
 The counter records policy decisions, not raw arguments or results.
 

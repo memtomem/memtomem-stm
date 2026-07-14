@@ -1261,6 +1261,18 @@ def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
         assert target in config_hub
 
 
+def test_toolgraph_gateway_guide_pins_observability_contract() -> None:
+    """Keep gateway onboarding literals tied to their runtime sources."""
+    guide = _read("docs/guides/toolgraph-policy-gateway.md")
+    server = _read("src/memtomem_stm/server.py")
+    manager = _read("src/memtomem_stm/proxy/manager.py")
+
+    env_flag = "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"
+    counter = "would_block_calls"
+    assert env_flag in guide and env_flag in server
+    assert counter in guide and counter in manager
+
+
 def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     """Keep the copy/paste core CLI flow tied to the released-core advisory."""
     guide = _read("docs/guides/reviewed-memory-resume.md")
