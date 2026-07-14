@@ -1,6 +1,6 @@
 """FastMCP server returning a large structured document.
 
-Used by notebook 02 to demonstrate STM's selective compression: the doc is
+Used by the archived selective-compression scenario: the doc is
 big enough to exceed the default ``max_result_chars`` budget, and it is
 structured (markdown sections) so the selective compressor produces a TOC
 response that the notebook can follow up on via ``stm_proxy_select_chunks``.

@@ -30,6 +30,10 @@ preserves the request controls but does not guarantee those chunks in the
 response. Cores that do not advertise schema 2 continue through legacy
 `mem_search`.
 
+Capability absence is the only fallback trigger. Once a core advertises schema
+2 or later, a compose transport or response failure remains visible as an LTM
+dependency fault; STM does not hide it with a second legacy search.
+
 When schema 3 context windows are enabled, STM expands the core wire budget to
 `max_injection_chars * (1 + 2 * min(context_window_size, 10))`. This lets whole
 before/after chunks survive composition. The formatter still enforces the
@@ -37,7 +41,7 @@ original `max_injection_chars` model-injection limit; schema 2 and disabled
 windows retain the original request budget.
 
 Core 0.3.8 is the tested legacy baseline, 0.3.9 carries schema 2, and 0.3.10 is
-the first release expected to carry schema 3. The intermediate schema 1 contract was
+the first release to carry schema 3. The intermediate schema 1 contract was
 never included in a tagged PyPI release, although source-installed builds may
 exist. Capability negotiation, not these version labels, controls runtime
 behavior.
@@ -159,7 +163,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `min_score` | `0.03` | Minimum search score to include a result |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
-| `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Measured on the cleaned upstream response *before* compression; an explicit agent query (`_context_query`) bypasses the gate. Precision/cost gate — **distinct** from the proxy-level `ExtractionConfig.min_response_chars` (`500`); see the tuning note below. |
+| `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Measured on the cleaned upstream response *before* compression; an explicit agent query (`_context_query`) bypasses the gate. Precision/cost gate — distinct from the library-only extraction threshold described below. |
 | `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). With `warmup_enabled` (default) the child already starts warming at startup, so the first call usually fits this budget. Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if warm-up is disabled and first-call injection matters more than latency. |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
@@ -179,7 +183,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
-| `result_format` | `structured` | `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Pin `compact` only for cores that predate the structured format (its 2-decimal score rendering collapses the score distribution, #560). |
+| `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
 | `ltm_mcp_command` | `memtomem-server` | Command used when `ltm_mcp_transport=stdio` |
@@ -194,7 +198,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
 | `auto_tune_score_floor` | `0.005` | Lower bound for auto-tuned `min_score`. When left at its default, the effective floor widens downward to include a lower configured top-level `min_score`. |
 | `auto_tune_score_ceiling` | `0.05` | Upper bound for auto-tuned `min_score`. When left at its default, the effective ceiling widens upward to include a higher configured top-level `min_score`. |
-| `feedback_enabled` | `true` | Enable the feedback recording and `stm_surfacing_feedback` tool |
+| `feedback_enabled` | `true` | Enable feedback persistence and handling. `stm_surfacing_feedback` remains advertised when this is `false` and reports that tracking is not enabled. |
 | `feedback_demotion_enabled` | `true` | Locally filter memories that accumulated repeated negative feedback (`not_relevant` or `already_known`) before cache/injection |
 | `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
 | `fire_webhook` | `true` | Fire surfacing event webhooks |
@@ -274,40 +278,35 @@ cost** over **coverage**:
   `min_query_tokens`, and `exclude_tools` to widen coverage without losing
   precision.
 
-**Not the same knob as the proxy's extraction gate.** This setting lives on
-`SurfacingConfig` and decides whether to *surface LTM memories alongside* an
-upstream response. It is independent of the proxy-level
-`ExtractionConfig.min_response_chars` (default `500`), which decides whether a
-response is large enough to *extract and index into LTM* (Stage D ingestion).
-They sit on different pipelines (surfacing vs. ingestion), carry different
-defaults (`5000` vs. `500`), and are tuned for different goals — don't
-conflate them.
+**Not the same knob as the library-only extraction gate.** This setting lives
+on `SurfacingConfig` and decides whether to *surface LTM memories alongside* an
+upstream response. `ExtractionConfig.min_response_chars` (default `500`) only
+applies when a custom integrator constructs `ProxyManager(index_engine=...)`.
+The bundled `mms` server supplies no index engine, so its reserved extraction
+settings do not create or index memories.
 
 ## Per-tool Templates
 
-Fine-tune surfacing behavior per tool:
+Fine-tune surfacing behavior per tool through the environment-only surfacing
+domain. Do not place a `surfacing` block in `stm_proxy.json`:
 
-```json
-{
-  "surfacing": {
-    "context_tools": {
-      "read_file": {
-        "enabled": true,
-        "query_template": "file {arg.path}",
-        "namespace": "code-notes",
-        "min_score": 0.1,
-        "max_results": 5
-      },
-      "search_issues": {
-        "min_score": 0.5,
-        "max_results": 2
-      },
-      "get_diff": {
-        "enabled": false
-      }
-    }
+```bash
+export MEMTOMEM_STM_SURFACING__CONTEXT_TOOLS='{
+  "read_file": {
+    "enabled": true,
+    "query_template": "file {arg.path}",
+    "namespace": "code-notes",
+    "min_score": 0.1,
+    "max_results": 5
+  },
+  "search_issues": {
+    "min_score": 0.5,
+    "max_results": 2
+  },
+  "get_diff": {
+    "enabled": false
   }
-}
+}'
 ```
 
 Template variables: `{tool_name}`, `{server}`, `{arg.ARGUMENT_NAME}`
@@ -343,10 +342,16 @@ sequenceDiagram
         alt skip (write tool / cooldown / rate limit)
             STM-->>Agent: original response
         else pass
-            STM->>MCP: search(query, top_k, namespace)
-            MCP->>Core: mem_search (via configured MCP transport)
-            Core-->>MCP: results
-            MCP-->>STM: parsed results
+            alt context_compose schema 2+
+                STM->>MCP: context_compose(query, namespace, context_window)
+                MCP->>Core: context_compose (schema 2 or 3)
+                Core-->>MCP: pinned + retrieved (+ schema 3 context windows)
+            else capability absent / schema 0 or 1
+                STM->>MCP: search(query, top_k, namespace)
+                MCP->>Core: mem_search
+                Core-->>MCP: results
+            end
+            MCP-->>STM: parsed memories
             opt include_session_context
                 STM->>MCP: scratch_list()
                 MCP->>Core: mem_do(action="scratch_get")
@@ -415,8 +420,9 @@ the daemon is starting or busy also pass through unchanged and do not trip the
 proxy's LTM circuit breaker. There is no private-child fallback in this mode.
 
 The proxy still owns its `SurfacingEngine`, feedback IDs, cache, tuning, rate
-limits, and observability. Only search, scratch context, and helpful-feedback
-access boosts cross the authenticated loopback daemon protocol. Sharing is per
+limits, and observability. Search, capability-gated context composition,
+review-first proposals, scratch context, and helpful-feedback access boosts
+cross the authenticated loopback daemon protocol. Sharing is per
 effective daemon fingerprint: different LTM/surfacing configurations or
 protocol versions intentionally use separate daemons. `mms health` probes the
 daemon route without spawning a private LTM process.

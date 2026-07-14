@@ -1,7 +1,8 @@
-"""Shared helpers for memtomem-stm tutorial notebooks.
+"""Shared helpers for the public memtomem-stm tutorial notebook.
 
-All four notebooks import from this module to avoid duplicating the
-isolation setup, MCP client boilerplate, and output formatting.
+The quick-start imports this module for isolation setup and MCP client
+boilerplate. Helpers for archived scenarios remain available for future
+re-promotion without referring readers to notebook numbers that are not public.
 """
 
 from __future__ import annotations
@@ -51,8 +52,9 @@ def fixtures_dir() -> Path:
 def fake_ltm_path() -> Path:
     """Return the path to ``notebooks/_fixtures/fake_ltm.py``.
 
-    Used by notebook 03. See that fixture's module docstring for why we
-    ship a notebook-local fake instead of reusing the tests/ stand-in.
+    Used by the archived surfacing scenario. See that fixture's module
+    docstring for why we ship a notebook-local fake instead of reusing the
+    tests/ stand-in.
     """
     path = (fixtures_dir() / "fake_ltm.py").resolve()
     if not path.exists():
@@ -68,9 +70,9 @@ def fake_ltm_path() -> Path:
 def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False) -> Path:
     """Create an isolated tempdir and point STM's state there via env vars.
 
-    Sets ``MEMTOMEM_STM_PROXY__CONFIG_PATH``, ``...CACHE__DB_PATH``,
-    ``...METRICS__DB_PATH``, ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``,
-    and ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS``
+    Sets ``MEMTOMEM_STM_PROXY__CONFIG_PATH``, the cache, metrics, compression
+    feedback, progressive-read, and surfacing-feedback DB paths, plus
+    ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS``
     so that nothing the notebook does touches the user's real
     ``~/.memtomem/`` directory — including the surfacing feedback store
     that holds cross-session dedup state. Observability tools are enabled only
@@ -83,9 +85,9 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
         Tempdir name prefix.
     enable_surfacing
         By default (``False``), disables surfacing so the notebook does not
-        depend on a running ``memtomem-server``. Notebook 03 passes
-        ``True`` and then calls :func:`configure_fake_ltm` to point surfacing
-        at the in-repo fake MCP server.
+        depend on a running ``memtomem-server``. The archived surfacing
+        scenario passes ``True`` and then calls :func:`configure_fake_ltm` to
+        point surfacing at the in-repo fake MCP server.
 
     Returns
     -------
@@ -98,6 +100,8 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
     os.environ["MEMTOMEM_STM_PROXY__CONFIG_PATH"] = str(config_path)
     os.environ["MEMTOMEM_STM_PROXY__CACHE__DB_PATH"] = str(tmp / "proxy_cache.db")
     os.environ["MEMTOMEM_STM_PROXY__METRICS__DB_PATH"] = str(tmp / "proxy_metrics.db")
+    os.environ["MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH"] = str(tmp / "stm_feedback.db")
+    os.environ["MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH"] = str(tmp / "stm_feedback.db")
     os.environ["MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH"] = str(tmp / "stm_feedback.db")
     os.environ["MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"] = "true"
     if not enable_surfacing:
@@ -105,11 +109,24 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
     return config_path
 
 
+def isolated_cli_env(config_path: Path) -> dict[str, str]:
+    """Environment for state-mutating tutorial CLI calls.
+
+    The proxy config and databases already point into ``config_path.parent``.
+    Override ``HOME`` only for the child CLI so its fixed cross-process config
+    lock also stays in the tutorial temp directory without changing the
+    notebook kernel's home directory.
+    """
+    env = dict(os.environ)
+    env["HOME"] = str(config_path.parent)
+    return env
+
+
 def configure_fake_ltm() -> Path:
     """Point STM's surfacing engine at ``notebooks/_fixtures/fake_ltm.py``.
 
-    Used by notebook 03 so that surfacing can be demonstrated without the
-    user needing a real ``memtomem-server`` on their PATH. The fixture is
+    Used by the archived surfacing scenario so surfacing can be demonstrated
+    without the user needing a real ``memtomem-server`` on their PATH. The fixture is
     a notebook-local fake (distinct from ``tests/_fake_memtomem_server.py``)
     that embeds a fresh UUID in each memory chunk — STM's cross-session
     dedup keys on ``sha256(content)`` so a fixed-content fake would appear
@@ -130,9 +147,7 @@ def configure_fake_ltm() -> Path:
     fake = fake_ltm_path()
     os.environ["MEMTOMEM_STM_SURFACING__ENABLED"] = "true"
     os.environ["MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND"] = "uv"
-    os.environ["MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS"] = json.dumps(
-        ["run", "python", str(fake)]
-    )
+    os.environ["MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS"] = json.dumps(["run", "python", str(fake)])
     # Lower the threshold so notebook-sized responses trigger surfacing.
     # Default is 5000 chars; our fixture tool returns ~200 chars.
     os.environ["MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS"] = "100"

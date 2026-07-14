@@ -123,12 +123,18 @@ Configurable per server:
 
 ```json
 {
-  "hybrid": {
-    "head_chars": 5000,
-    "tail_mode": "toc",
-    "head_ratio": 0.6,
-    "min_toc_budget": 200,
-    "min_head_chars": 100
+  "upstream_servers": {
+    "docs": {
+      "prefix": "docs",
+      "compression": "hybrid",
+      "hybrid": {
+        "head_chars": 5000,
+        "tail_mode": "toc",
+        "head_ratio": 0.6,
+        "min_toc_budget": 200,
+        "min_head_chars": 100
+      }
+    }
   }
 }
 ```
@@ -187,12 +193,17 @@ Each call to `stm_proxy_read_more` resets the TTL. The `ttl` field is omitted on
 
 ```json
 {
-  "compression": "progressive",
-  "progressive": {
-    "chunk_size": 4000,
-    "max_stored": 200,
-    "ttl_seconds": 1800,
-    "include_structure_hint": true
+  "upstream_servers": {
+    "docs": {
+      "prefix": "docs",
+      "compression": "progressive",
+      "progressive": {
+        "chunk_size": 4000,
+        "max_stored": 200,
+        "ttl_seconds": 1800,
+        "include_structure_hint": true
+      }
+    }
   }
 }
 ```
@@ -238,6 +249,7 @@ By default, the retention floor scales dynamically with response size (< 1KB →
 {
   "upstream_servers": {
     "docs": {
+      "prefix": "docs",
       "retention_floor": 0.5,
       "tool_overrides": {
         "get_page": { "retention_floor": 0.4 }
@@ -255,22 +267,28 @@ Routes through an external LLM for intelligent summarization:
 
 ```json
 {
-  "llm": {
-    "provider": "openai",
-    "model": "gpt-4.1-mini",
-    "api_key": "sk-...",
-    "base_url": "",
-    "max_tokens": 500,
-    "llm_timeout_seconds": 60.0,
-    "privacy_scan_enabled": true,
-    "system_prompt": "Summarize concisely, preserving key information. Under {max_chars} chars."
+  "upstream_servers": {
+    "docs": {
+      "prefix": "docs",
+      "compression": "llm_summary",
+      "llm": {
+        "provider": "openai",
+        "model": "gpt-4.1-mini",
+        "api_key": "sk-...",
+        "base_url": "",
+        "max_tokens": 500,
+        "llm_timeout_seconds": 60.0,
+        "privacy_scan_enabled": true,
+        "system_prompt": "Summarize concisely, preserving key information. Under {max_chars} chars."
+      }
+    }
   }
 }
 ```
 
 Providers: `openai`, `anthropic`, `ollama`. `base_url` (default `""`) overrides the provider endpoint — required to point `ollama` at a non-default host, and how OpenAI/Anthropic get aimed at a compatible gateway. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait. On timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and records the strategy as `llm_summary→{timeout,privacy,circuit_breaker,llm_error}_fallback` in `proxy_metrics` for observability. A successful call whose summary still exceeds `max_chars` is clamped by the same truncation and recorded as `llm_summary→llm_overlength_fallback` — the model overshot the length instruction; the endpoint is fine, so the circuit breaker is unaffected.
 
-> **`api_key` is validated eagerly.** Every `llm` block in the config is validated when the config loads — for `provider: openai` / `anthropic`, a missing `api_key` (and missing `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env var) fails the load even if nothing selects the `llm_summary` strategy or the block sits under a disabled `extraction`. This keeps the startup fail-fast for configs that DO use the LLM. Don't leave placeholder `llm` blocks you aren't using — remove them, or point them at `provider: ollama` (no key required).
+> **`api_key` is validated eagerly.** Every `llm` block in the config is validated when the config loads — for `provider: openai` / `anthropic`, a missing `api_key` (and missing `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env var) fails the load even if nothing currently selects the `llm_summary` strategy. The same rule applies to the reserved extraction block used by custom `ProxyManager(index_engine=...)` integrations. This keeps startup fail-fast for configurations that do use an LLM. Don't leave placeholder `llm` blocks you aren't using — remove them, or point them at `provider: ollama` (no key required).
 
 Credential-bearing content (API keys, passwords, provider tokens, JWTs, private keys) is auto-detected and **never** sent to external LLMs — falls back to local truncation. This scan is governed by `privacy_scan_enabled` (default `true`); an operator who flips `compression: llm_summary` gets the protection without remembering a second knob. Email addresses alone do **not** trigger this fallback: they appear in ordinary compressible content (git logs, issue threads, contact pages), and routing on them silently degraded the chosen strategy to truncation. Emails remain protected where storage is at stake — surfacing query persistence hashes any query matching the full sensitive set (credentials *and* emails) before it reaches disk.
 

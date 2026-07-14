@@ -620,7 +620,8 @@ not preserved (JSON has no comments) — the original-preserving `.bak` backup i
 the safety net.
 
 Native hooks are PostToolUse observers, not full MCP proxies: they do not add
-cache, execution retry, progressive delivery, indexing, or extraction.
+proxy response caching, upstream retries, progressive delivery, or general MCP
+routing.
 Surfacing is the only capability that ports to Codex (native output
 replacement/compression is Claude-only). The command prints each host's runtime
 caveat after planning: Codex requires approving the hook via its `/hooks`

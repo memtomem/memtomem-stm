@@ -1,4 +1,4 @@
-# Response Caching & Auto-Indexing
+# Response Caching
 
 For the file-backed schema and configuration-source boundary, see the
 [Proxy Configuration Reference](reference/proxy-config.md).

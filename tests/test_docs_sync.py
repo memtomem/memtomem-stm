@@ -9,6 +9,9 @@ in local testing and only surfaces through user confusion.
 from __future__ import annotations
 
 import ast
+import importlib.util
+import json
+import os
 import re
 from pathlib import Path
 
@@ -19,6 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _read(relative: str) -> str:
     return (REPO_ROOT / relative).read_text(encoding="utf-8")
+
+
+def _json_fences(relative: str) -> list[dict[str, object]]:
+    """Parse every JSON fence in a public Markdown file."""
+    blocks = re.findall(r"```json\n(.*?)\n```", _read(relative), re.DOTALL)
+    return [json.loads(block) for block in blocks]
 
 
 def _fwd_slash(obj: object) -> object:
@@ -359,6 +368,43 @@ def test_configuration_md_reserves_unsupported_indexing_blocks() -> None:
             "`reserved`, `unsupported`, `bundled mms`, `ProxyManager`, and "
             "`index_engine` so the custom extension path remains discoverable."
         )
+
+    assert _read("docs/caching.md").splitlines()[0] == "# Response Caching"
+
+
+def test_public_markdown_json_fences_are_valid() -> None:
+    """Every public JSON fence must remain copy/paste parseable."""
+    public_docs = [REPO_ROOT / "README.md", *(REPO_ROOT / "docs").rglob("*.md")]
+    for path in public_docs:
+        if "reports" in path.relative_to(REPO_ROOT).parts:
+            continue
+        body = path.read_text(encoding="utf-8")
+        for number, block in enumerate(
+            re.findall(r"```json\n(.*?)\n```", body, re.DOTALL), start=1
+        ):
+            try:
+                json.loads(block)
+            except json.JSONDecodeError as exc:
+                pytest.fail(f"{path.relative_to(REPO_ROOT)} JSON fence {number}: {exc}")
+
+
+def test_public_proxy_config_examples_match_runtime_schema() -> None:
+    """Representative config examples use real nesting and known fields."""
+    from memtomem_stm.proxy.config import ProxyConfig, find_unknown_keys
+
+    proxy_reference = _json_fences("docs/reference/proxy-config.md")[0]
+    assert find_unknown_keys(ProxyConfig, proxy_reference) == []
+    parsed = ProxyConfig.model_validate(proxy_reference)
+    assert parsed.cache.tool_annotation_policy == "strict"
+    assert parsed.upstream_servers["filesystem"].selective.max_pending == 100
+
+    for relative in ("docs/configuration.md", "docs/compression.md"):
+        for example in _json_fences(relative):
+            # docs/compression.md also shows one compressed response payload.
+            if "type" in example:
+                continue
+            assert find_unknown_keys(ProxyConfig, example) == [], relative
+            ProxyConfig.model_validate(example)
 
 
 def test_surfacing_md_documents_phase_1_observability_sample() -> None:
@@ -1026,6 +1072,13 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
         assert token in env_ref, f"environment reference lost {token}"
     assert "MEMTOMEM_STM_ENABLED" not in env_ref
     assert "MEMTOMEM_STM_CONFIG_PATH" not in env_ref
+    assert "| `MEMTOMEM_STM_PROXY__ENABLED` | `false` |" in env_ref
+    assert "daemon handshakes" in env_ref
+    assert "default state paths" not in env_ref
+
+    from memtomem_stm.proxy.config import ProxyConfig
+
+    assert ProxyConfig().enabled is False
 
     proxy_ref = _read("docs/reference/proxy-config.md")
     for token in ("json_depth", "min_section_chars", "description_override"):
@@ -1056,7 +1109,13 @@ def test_mcp_tool_reference_matches_optional_argument_signatures() -> None:
     """Pin the optional arguments that were previously documented as required/missing."""
     import inspect
 
-    from memtomem_stm.server import stm_proxy_read_more, stm_surfacing_stats
+    from memtomem_stm.server import (
+        stm_compression_feedback,
+        stm_memory_propose,
+        stm_proxy_read_more,
+        stm_surfacing_feedback,
+        stm_surfacing_stats,
+    )
 
     read_more = inspect.signature(stm_proxy_read_more)
     assert read_more.parameters["offset"].default == 0
@@ -1064,9 +1123,100 @@ def test_mcp_tool_reference_matches_optional_argument_signatures() -> None:
     assert surfacing.parameters["since"].default is None
     assert surfacing.parameters["limit"].default == 10
 
+    feedback = inspect.signature(stm_surfacing_feedback)
+    assert feedback.parameters["rating"].default is None
+    assert feedback.parameters["memory_id"].default is None
+    assert feedback.parameters["ratings"].default is None
+
+    compression = inspect.signature(stm_compression_feedback)
+    assert compression.parameters["kind"].default == "other"
+    assert compression.parameters["trace_id"].default is None
+
+    formation = inspect.signature(stm_memory_propose)
+    assert formation.parameters["source_ref"].default == ""
+    assert formation.parameters["idempotency_key"].default == ""
+
     mcp_ref = _read("docs/reference/mcp-tools.md")
-    for token in ("offset?=0", "since?", "limit=10"):
+    for token in (
+        "offset?=0",
+        "since?",
+        "limit=10",
+        "rating?",
+        "memory_id?",
+        "ratings?",
+        'kind="other"',
+        "trace_id?",
+        'source_ref=""',
+        'idempotency_key=""',
+    ):
         assert token in mcp_ref, f"MCP tool reference lost {token}"
+
+
+def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
+    surfacing = _read("docs/surfacing.md")
+    for phrase in (
+        "context_compose schema 2+",
+        "legacy `mem_search`",
+        "dependency fault",
+        "review-first proposals",
+        "first release to carry schema 3",
+        "ProxyManager(index_engine=...)",
+    ):
+        assert phrase in surfacing, f"surfacing guide lost {phrase!r}"
+    assert "expected to carry schema 3" not in surfacing
+    assert '"surfacing": {' not in surfacing
+
+
+def test_public_notebook_inventory_and_state_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lone public notebook must not reference archived numbered lessons."""
+    public_notebooks = sorted((REPO_ROOT / "notebooks").glob("*.ipynb"))
+    notebook_readme = _read("notebooks/README.md")
+    assert public_notebooks
+    for notebook in public_notebooks:
+        assert notebook.name in notebook_readme
+
+    checked = [
+        *public_notebooks,
+        REPO_ROOT / "notebooks/_helpers.py",
+        REPO_ROOT / "notebooks/_fixtures/doc_mcp.py",
+        REPO_ROOT / "notebooks/_fixtures/fake_ltm.py",
+    ]
+    for path in checked:
+        body = path.read_text(encoding="utf-8").lower()
+        assert "notebook 02" not in body
+        assert "notebook 03" not in body
+
+    helper_path = REPO_ROOT / "notebooks/_helpers.py"
+    spec = importlib.util.spec_from_file_location("public_notebook_helpers", helper_path)
+    assert spec is not None and spec.loader is not None
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    isolated_keys = (
+        "MEMTOMEM_STM_PROXY__CONFIG_PATH",
+        "MEMTOMEM_STM_PROXY__CACHE__DB_PATH",
+        "MEMTOMEM_STM_PROXY__METRICS__DB_PATH",
+        "MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH",
+        "MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH",
+        "MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH",
+    )
+    for key in isolated_keys:
+        monkeypatch.setenv(key, "pre-test")
+    monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "true")
+    kernel_home = os.environ.get("HOME", "")
+
+    config_path = helpers.isolate_stm_state(prefix="docs_sync_")
+    root = config_path.parent
+    assert all(Path(os.environ[key]).parent == root for key in isolated_keys)
+    child_env = helpers.isolated_cli_env(config_path)
+    assert child_env["HOME"] == str(root)
+    assert os.environ.get("HOME", "") == kernel_home
+
+    notebook = json.loads(public_notebooks[0].read_text(encoding="utf-8"))
+    notebook_source = "".join(line for cell in notebook["cells"] for line in cell.get("source", []))
+    assert '"mms", "add"' in notebook_source
+    assert "env=isolated_cli_env(config_path)" in notebook_source
 
 
 def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:

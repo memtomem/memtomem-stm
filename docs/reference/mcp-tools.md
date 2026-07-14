@@ -10,8 +10,8 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 |---|---|---|
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve selected TOC sections |
 | `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Continue a progressive response |
-| `stm_surfacing_feedback` | `surfacing_id`, rating fields | Rate surfaced memories |
-| `stm_compression_feedback` | `server`, `tool`, `missing`, optional metadata | Report missing compressed information |
+| `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories. Use either the legacy `rating`/`memory_id` shape or batched `ratings`, never both. |
+| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind="other"`, `trace_id?` | Report missing compressed information |
 
 ## Optional operator tools
 
@@ -32,7 +32,9 @@ name when the upstream provides an MCP annotation title.
 
 ## Optional review-first tool
 
+| Tool | Arguments | Purpose |
+|---|---|---|
+| `stm_memory_propose` | `content`, `source_ref=""`, `idempotency_key=""` | Submit a pending candidate to a compatible core; never perform a direct durable write |
+
 `stm_memory_propose` is advertised independently when
-`MEMTOMEM_STM_FORMATION__ENABLED=true` is set before startup. It submits a
-pending candidate to a compatible core and never performs a direct durable
-write.
+`MEMTOMEM_STM_FORMATION__ENABLED=true` is set before startup.
