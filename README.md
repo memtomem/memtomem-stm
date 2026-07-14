@@ -116,8 +116,8 @@ STM is an MCP proxy: it sees a tool call only if the client routes that call thr
 available for Claude Code, Codex CLI, Cursor, and Kimi Code. Claude and Codex
 can receive surfaced LTM context; Cursor and Kimi are metrics-only. Claude can
 also opt into guarded Bash compression. Native calls still do not gain proxy
-caching, retries, progressive reads, extraction, or indexing, and the hook
-always fails open. See the
+response caching, upstream retries, progressive reads, or general MCP routing,
+and the hook always fails open. See the
 [native-hook guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/native-hooks.md)
 for the capability matrix, installation paths, daemon behavior, and privacy.
 

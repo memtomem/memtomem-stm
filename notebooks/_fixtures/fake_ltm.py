@@ -1,6 +1,6 @@
-"""Fake memtomem LTM server for notebook 03.
+"""Fake memtomem LTM server for the archived surfacing scenario.
 
-Stands in for a real ``memtomem-server`` so notebook 03 can demonstrate
+Stands in for a real ``memtomem-server`` so the archived scenario can demonstrate
 proactive surfacing without any external dependencies. Exposes the two
 tools STM's ``McpClientSearchAdapter`` actually calls — ``mem_search``
 and ``mem_do`` — both returning canned responses in **core's real

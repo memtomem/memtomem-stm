@@ -11,6 +11,11 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected public configuration, surfacing, MCP-tool, and notebook guidance to
+  match the v0.1.38 runtime contracts and keep copy/paste examples executable.
+
 ## [0.1.38] — 2026-07-14
 
 ### Upgrade notes

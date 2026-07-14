@@ -39,16 +39,20 @@ uv run pytest --nbmake \
 
 The notebook's first code cell calls `isolate_stm_state()` from
 `_helpers.py`, which points STM's proxy config, cache, metrics, and
-surfacing feedback databases at a fresh temp directory via environment
-variables:
+all three feedback/telemetry database families at a fresh temp directory via
+environment variables:
 
 - `MEMTOMEM_STM_PROXY__CONFIG_PATH`
 - `MEMTOMEM_STM_PROXY__CACHE__DB_PATH`
 - `MEMTOMEM_STM_PROXY__METRICS__DB_PATH`
+- `MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH`
+- `MEMTOMEM_STM_PROXY__PROGRESSIVE_READS__DB_PATH`
 - `MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH`
 - `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`
 
-The notebook is hermetic — your real `~/.memtomem/` is untouched.
+The state-mutating `mms add` subprocess also receives a tutorial-only `HOME`,
+so its fixed config lock stays under the same temp directory. The notebook is
+hermetic — your real `~/.memtomem/` is untouched.
 
 ## Files
 

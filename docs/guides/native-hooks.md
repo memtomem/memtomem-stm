@@ -2,7 +2,7 @@
 
 `mms hook` bridges supported host-native PostToolUse events into STM. It is an
 observer/postprocessor, not an MCP proxy: native calls do not gain response
-caching, upstream retries, progressive reads, extraction, or indexing.
+caching, upstream retries, progressive reads, or general MCP routing.
 
 ## Host capabilities
 

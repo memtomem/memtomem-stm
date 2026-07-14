@@ -11,7 +11,9 @@ Langfuse settings; those are covered by the
 ```json
 {
   "enabled": true,
-  "tool_annotation_policy": "strict",
+  "cache": {
+    "tool_annotation_policy": "strict"
+  },
   "upstream_servers": {
     "filesystem": {
       "transport": "stdio",
@@ -19,6 +21,10 @@ Langfuse settings; those are covered by the
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
       "prefix": "fs",
       "compression": "auto",
+      "selective": {
+        "json_depth": 1,
+        "min_section_chars": 50
+      },
       "tool_overrides": {
         "read_file": {
           "description_override": "Read a project file through STM",
@@ -26,10 +32,6 @@ Langfuse settings; those are covered by the
         }
       }
     }
-  },
-  "selective": {
-    "json_depth": 1,
-    "min_section_chars": 50
   }
 }
 ```

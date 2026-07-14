@@ -44,7 +44,7 @@ All settings use the `MEMTOMEM_STM_` prefix with `__` for nesting.
 ### General
 
 ```bash
-export MEMTOMEM_STM_DATA_DIR=~/.memtomem  # daemon handshake, locks, logs, and default state paths
+export MEMTOMEM_STM_DATA_DIR=~/.memtomem  # daemon handshakes, ownership locks, detached log
 export MEMTOMEM_STM_LOG_LEVEL=WARNING   # DEBUG | INFO | WARNING | ERROR | CRITICAL
 ```
 
@@ -239,7 +239,10 @@ export MEMTOMEM_STM_LANGFUSE__HOST=https://cloud.langfuse.com   # or http://loca
 export MEMTOMEM_STM_LANGFUSE__SAMPLING_RATE=1.0                # 0.0–1.0, fraction of calls to trace
 ```
 
-When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse observation with nested sub-spans for each pipeline stage (clean, compress, surface, index).
+When enabled, every proxy tool invocation is wrapped in a `proxy_call` Langfuse
+observation with nested clean, compress, and surface spans. A custom library
+integration that supplies `ProxyManager(index_engine=...)` can additionally emit
+an index span; the bundled `mms` server does not wire that stage.
 
 Setting `MEMTOMEM_STM_LANGFUSE__ENABLED=true` without first installing the `[langfuse]` extra raises a `ValueError` at startup (fail-fast since v0.1.16) — install the extra first, or leave `enabled=false` / unset. The old silent-disable-with-WARNING behavior is gone, so a typo in your config no longer leaves tracing quietly off.
 
@@ -481,21 +484,23 @@ exposure profile ladder (strict rejects / review demotes / explore ignores)
 under `toolgraph_*` reason codes; ranking can never resurrect them.
 
 ```json
-"toolgraph": {
-  "enabled": true,
-  "command": "toolgraph",
-  "args": ["serve"],
-  "agent_id": "stm-proxy",
-  "server_name_map": { "docs-langchain": "langchain-docs" },
-  "query_profile": "strict",
-  "on_unreachable": "open",
-  "on_agent_not_found": "fail_start",
-  "on_protocol_error": "fail_start",
-  "on_tool_not_found": "open",
-  "risk_penalty_scale": 1.0,
-  "timeout_seconds": 5.0,
-  "consult_cache_enabled": true,
-  "consult_cache_path": "~/.memtomem/toolgraph_consult.db"
+{
+  "toolgraph": {
+    "enabled": true,
+    "command": "toolgraph",
+    "args": ["serve"],
+    "agent_id": "stm-proxy",
+    "server_name_map": { "docs-langchain": "langchain-docs" },
+    "query_profile": "strict",
+    "on_unreachable": "open",
+    "on_agent_not_found": "fail_start",
+    "on_protocol_error": "fail_start",
+    "on_tool_not_found": "open",
+    "risk_penalty_scale": 1.0,
+    "timeout_seconds": 5.0,
+    "consult_cache_enabled": true,
+    "consult_cache_path": "~/.memtomem/toolgraph_consult.db"
+  }
 }
 ```
 
@@ -587,15 +592,17 @@ Two opt-in fields make budgets token-aware without breaking existing char-based 
 Example — a Korean-content upstream (e.g. a Korean documentation MCP server):
 
 ```json
-"upstream_servers": {
-  "ko_docs": {
-    "command": "...",
-    "prefix": "kr",
-    "max_result_tokens": 1500,
-    "chars_per_token": 1.85,
-    "tool_overrides": {
-      "summarize": {
-        "max_result_tokens": 500
+{
+  "upstream_servers": {
+    "ko_docs": {
+      "command": "...",
+      "prefix": "kr",
+      "max_result_tokens": 1500,
+      "chars_per_token": 1.85,
+      "tool_overrides": {
+        "summarize": {
+          "max_result_tokens": 500
+        }
       }
     }
   }
