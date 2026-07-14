@@ -100,6 +100,8 @@ surfacing only, not proxying, compression, or caching.
 Continue with the complete
 [Getting Started guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md),
 including manual client registration, imports, verification, and next steps.
+Korean-speaking Claude Code and Codex CLI users can follow the
+[한국어 바이브코딩 시작 가이드](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/vibe-coding-getting-started-ko.md).
 
 ## What STM proxies — and what it doesn't
 
@@ -151,6 +153,7 @@ definition does not automatically route it through the proxy. See
 | Guide | Topic |
 |-------|-------|
 | [Getting started](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md) | Install → register → doctor → first proxied tool |
+| [한국어 바이브코딩 시작 가이드](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/vibe-coding-getting-started-ko.md) | Claude Code·Codex CLI 설치 → 연결 → 첫 proxied tool |
 | [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/operations.md) | Diagnose setup, upstreams, surfacing, and hooks |
 | [Native hooks](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/native-hooks.md) | Host capabilities, installation, daemon, and metrics |
 | [Surfacing](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md) | How agents recall prior context automatically |

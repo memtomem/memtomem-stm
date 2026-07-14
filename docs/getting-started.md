@@ -12,8 +12,9 @@ pip install memtomem-stm
 
 With `uv`, install the global CLI with `uv tool install memtomem-stm` or run it
 without installing with `uvx memtomem-stm --help`. The three console scripts
-`mms`, `memtomem-stm`, and `memtomem-stm-proxy` are interchangeable; this guide
-uses the shortest spelling, `mms`.
+`mms`, `memtomem-stm`, and `memtomem-stm-proxy` are interchangeable. This
+guide uses `mms` for operator commands and the explicit `memtomem-stm` server
+command in MCP client registrations.
 
 ## 2. Add an upstream
 
@@ -38,21 +39,37 @@ its own server prefix.
 
 ## 3. Register STM with a client
 
-Run `mms register`, or register it manually. Claude Code, for example:
+`mms register` can register Claude Code automatically or generate a generic
+JSON configuration. Claude Code:
 
 ```bash
-claude mcp add mms -s user -- mms
+mms register --mcp claude
+# Equivalent manual registration:
+claude mcp add memtomem-stm -s user -- memtomem-stm
 ```
 
-For JSON-based clients:
+Codex CLI is not an automatic `mms register` target; register it with Codex's
+MCP command:
+
+```bash
+codex mcp add memtomem-stm -- memtomem-stm
+codex mcp list
+```
+
+For other JSON-based clients:
 
 ```json
 {
   "mcpServers": {
-    "mms": {"command": "mms"}
+    "memtomem-stm": {"command": "memtomem-stm"}
   }
 }
 ```
+
+`mms init` does not discover existing Codex MCP definitions. Also,
+`mms import --from codex` populates the separate project registry at
+`~/.mms/registry.toml`; it does not add an upstream to
+`~/.memtomem/stm_proxy.json`.
 
 ## 4. Verify the setup
 
@@ -82,6 +99,7 @@ some native PostToolUse events, but it is not a replacement for the proxy.
 
 ## Next steps
 
+- [한국어: Claude Code와 Codex CLI를 위한 시작 가이드](guides/vibe-coding-getting-started-ko.md)
 - [Operate and troubleshoot STM](guides/operations.md)
 - [Bridge supported native-tool events](guides/native-hooks.md)
 - [Manage project-scoped MCP definitions](guides/project-scoped-mcps.md)

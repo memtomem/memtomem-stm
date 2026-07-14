@@ -9,7 +9,7 @@ caching, upstream retries, progressive reads, or general MCP routing.
 | Host | Surfaced context | Output replacement | Metrics |
 |---|---|---|---|
 | Claude Code | Yes | Opt-in Bash compression | Yes |
-| Codex CLI | Yes, after hook approval | No | Yes |
+| Codex CLI | Bash only; verify after hook approval | No | Yes |
 | Cursor | No reliable model-visible channel | No | Yes |
 | Kimi Code | No reliable model-visible channel | No | Yes |
 
@@ -21,7 +21,10 @@ and internal errors leave the original tool output unchanged.
 Preview is the default; `--apply` performs the write and creates a backup.
 
 ```bash
+# Preview, then apply
 mms hook install --host claude
+mms hook install --host claude --apply
+mms hook install --host codex
 mms hook install --host codex --apply
 mms hook uninstall --host codex --apply
 ```
@@ -33,9 +36,13 @@ mms hook uninstall --host codex --apply
 | Cursor | `~/.cursor/hooks.json` |
 | Kimi Code | `$KIMI_CODE_HOME/config.toml`, otherwise `~/.kimi-code/config.toml` |
 
-Codex requires approving the installed hook through `/hooks`. TOML host files
-are re-serialized; use the generated `.bak` file if comments or formatting
-must be restored.
+Codex requires approving the installed hook through `/hooks`. Its adapter
+cannot replace output, and only `Bash` currently reaches the read-like
+surfacing allowlist (`apply_patch` can still be observed for metrics). Codex's
+standalone `additionalContext` injection is not explicitly guaranteed by its
+public hook documentation, so confirm that a memory appears before relying on
+it. TOML host files are re-serialized; use the generated `.bak` file if
+comments or formatting must be restored.
 
 ## Runtime host selection
 
