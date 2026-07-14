@@ -763,6 +763,7 @@ def _run_mcp_integration(
         if success:
             click.echo(f"  {_ok('Registered with Codex.')}")
         else:
+            # Unlike Claude Code, Codex has no local-file registration fallback.
             raise click.ClickException(reason or "codex mcp add failed")
         return
 

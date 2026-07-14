@@ -4079,7 +4079,6 @@ class TestRegisterCommand:
             "_register_with_codex",
             lambda *_args, **_kwargs: (False, "codex rejected registration"),
         )
-
         result = runner.invoke(cli, ["register", "--client", "codex", *_cfg_args(config)])
         assert result.exit_code == 1
         assert "codex rejected registration" in result.output
@@ -4147,6 +4146,8 @@ class TestRegisterCommand:
             "_register_with_codex",
             lambda *_args, **_kwargs: (False, "codex rejected registration"),
         )
+        prune = Mock()
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", prune)
 
         result = runner.invoke(
             cli,
@@ -4168,6 +4169,7 @@ class TestRegisterCommand:
         assert payload["client"] == "codex"
         assert payload["servers"] == ["demo"]
         assert config.exists()
+        prune.assert_not_called()
 
     def test_register_json_is_single_document(self, runner, config, fake_claude):
         config.write_text(
