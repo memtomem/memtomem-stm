@@ -1065,6 +1065,45 @@ def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     assert "~/.kimi/config.toml" not in result.output
 
 
+def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> None:
+    """Keep the Korean first-user journey aligned with live host contracts."""
+    from click import Choice
+
+    from memtomem_stm.cli.hook_adapter import CodexHookAdapter
+    from memtomem_stm.cli.proxy import cli as proxy_cli
+
+    guide = _read("docs/guides/vibe-coding-getting-started-ko.md")
+    getting_started = _read("docs/getting-started.md")
+    native_hooks = _read("docs/guides/native-hooks.md")
+
+    registrations = (
+        "claude mcp add memtomem-stm -s user -- memtomem-stm",
+        "codex mcp add memtomem-stm -- memtomem-stm",
+    )
+    for body in (guide, getting_started):
+        for command in registrations:
+            assert command in body
+        assert "mms import --from codex" in body
+        assert "~/.mms/registry.toml" in body
+        assert "~/.memtomem/stm_proxy.json" in body
+
+    register = proxy_cli.commands["register"]
+    mcp_mode = next(param for param in register.params if param.name == "mcp_mode")
+    assert isinstance(mcp_mode.type, Choice)
+    assert set(mcp_mode.type.choices) == {"claude", "json", "skip"}
+    assert "mms register --mcp codex" not in guide
+
+    assert CodexHookAdapter.native_tool_map == {"Bash": "shell", "apply_patch": "edit"}
+    assert CodexHookAdapter.can_replace_output is False
+    for body in (guide, native_hooks):
+        assert "/hooks" in body
+        assert "Bash" in body
+        for host in ("claude", "codex"):
+            preview = f"mms hook install --host {host}"
+            assert f"\n{preview}\n" in body
+            assert f"\n{preview} --apply\n" in body
+
+
 def test_new_reference_docs_pin_high_risk_public_fields() -> None:
     """Keep the settings omitted before the v0.1.36 full-doc audit visible."""
     env_ref = _read("docs/reference/environment-variables.md")
@@ -1233,6 +1272,10 @@ def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
     readme = _read("README.md")
     assert "docs/getting-started.md" in readme
     assert "docs/guides/operations.md" in readme
+    assert "docs/guides/vibe-coding-getting-started-ko.md" in readme
+
+    getting_started = _read("docs/getting-started.md")
+    assert "guides/vibe-coding-getting-started-ko.md" in getting_started
 
     cli_hub = _read("docs/cli.md")
     for target in (
