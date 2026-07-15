@@ -845,7 +845,7 @@ class ProxyManager:
         )
 
     def _warn_on_bundle_provenance(self, path: Path) -> None:
-        """Advisory: report who besides us could have written the adopted policy.
+        """Advisory: report mode/ownership signs that others could substitute it.
 
         Called only where a bundle is actually adopted, so it costs a handful of
         stats per republish rather than one per tools/call. Latched on the

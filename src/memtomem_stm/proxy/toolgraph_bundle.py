@@ -54,8 +54,9 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     ``group:everyone deny delete``, which is restrictive, so warning on presence
     would fire for every default install. Evaluating ACL entries properly means
     platform-specific principal resolution, i.e. the same class of failure this
-    diagnostic must never introduce. What it finds is real; what it misses is
-    listed here.
+    diagnostic must never introduce. Findings reflect real mode and ownership
+    state, though they can be conservative (see the ``01770`` case below); what
+    they cannot see is listed here.
 
     **Advisory only.** Findings are logged; the bundle is still adopted. Turning
     an insecure bundle into a startup refusal under ``strict`` is a separate
