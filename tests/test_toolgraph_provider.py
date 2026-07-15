@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -750,28 +751,81 @@ def _read_calls(path) -> list[str]:
     return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
+def _consult_row_flags(cache) -> list[tuple[int]]:
+    return cache._db.execute("SELECT had_risk_scores FROM toolgraph_consult").fetchall()
+
+
+def _assert_consult_cached(mgr) -> None:
+    # #714 — preconditions for a cache HIT, so a hit-assert failure names its
+    # cause instead of presenting as a bare `False is True`.
+    assert mgr._toolgraph_cache is not None  # else: the open degraded to no-cache
+    # Exactly one row, risk-eligible — [(0,)] means a transient rank_features
+    # failure was written (ineligible while risk is wanted); [] means the miss
+    # never wrote the row.
+    assert _consult_row_flags(mgr._toolgraph_cache) == [(1,)]
+
+
 class TestToolgraphConsultCache:
     """#494 — disk-cache the startup consult (Model A: cheap generation probe)."""
 
-    async def test_hit_skips_full_consult(self, tmp_path):
+    async def test_hit_skips_full_consult(self, tmp_path, caplog):
         call_log = tmp_path / "calls.txt"
         mgr, _ = _tg_manager(tmp_path, env={"FAKE_TG_CALL_LOG": str(call_log)})
-        # First consult: cold cache → miss → full consult (populates the cache).
-        await mgr._consult_toolgraph()
-        assert mgr._toolgraph_from_cache is False
-        first_rejects = dict(mgr._toolgraph_external_rejects)
-        n_after_first = len(_read_calls(call_log))
+        # finally-stop: a failing diagnostic assert must not leave the sqlite
+        # handle open — Windows tmp_path cleanup would stack a PermissionError
+        # on top of the real failure (#714).
+        try:
+            # No logger= — the degrade warnings span memtomem_stm.proxy.manager
+            # AND memtomem_stm.proxy.toolgraph_cache.
+            with caplog.at_level(logging.WARNING):
+                # First consult: cold cache → miss → full consult (populates the cache).
+                await mgr._consult_toolgraph()
+                assert mgr._toolgraph_from_cache is False
+                _assert_consult_cached(mgr)
+                first_rejects = dict(mgr._toolgraph_external_rejects)
+                n_after_first = len(_read_calls(call_log))
 
-        # Second consult: same generation → cache HIT → only the [] probe runs.
-        await mgr._consult_toolgraph()
-        assert mgr._toolgraph_from_cache is True
-        assert mgr._toolgraph_external_rejects == first_rejects  # identical from cached facts
-        assert mgr._graph_generation == 11
-        second_calls = _read_calls(call_log)[n_after_first:]
-        assert second_calls == [
-            "eligible_tools:0"
-        ]  # only the probe; no full consult / rank_features
-        await mgr.stop()
+                # Second consult: same generation → cache HIT → only the [] probe runs.
+                await mgr._consult_toolgraph()
+            # Any open/read/write/malformed degrade is silent for the hit assert
+            # below but never for the log (#714) — surface it by name.
+            assert [r.message for r in caplog.records if "consult cache" in r.message] == []
+            # Residual failure here ⇒ scope-key/generation drift, by elimination.
+            assert mgr._toolgraph_from_cache is True
+            assert mgr._toolgraph_external_rejects == first_rejects  # identical from cached facts
+            assert mgr._graph_generation == 11
+            second_calls = _read_calls(call_log)[n_after_first:]
+            assert second_calls == [
+                "eligible_tools:0"
+            ]  # only the probe; no full consult / rank_features
+        finally:
+            await mgr.stop()
+
+    async def test_open_failure_degrades_to_no_cache_and_warns(self, tmp_path, caplog, monkeypatch):
+        # #714 — pins the silent half of the hit test above: an unopenable cache
+        # DB degrades to no-cache (consult unaffected, NOT a graph degrade) and
+        # says so at WARNING. Positive control for the "no consult cache
+        # warnings" sweep in the hit tests.
+        def _unopenable(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(GraphConsultCache, "initialize", _unopenable)
+        mgr, _ = _tg_manager(tmp_path)
+        try:
+            with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
+                await mgr._consult_toolgraph()
+            # The consult itself ran live and succeeded.
+            assert mgr._graph_generation == 11
+            assert mgr._toolgraph_external_rejects == {
+                ("srv", "blocked"): REASON_TOOLGRAPH_NOT_GRANTED
+            }
+            assert mgr._toolgraph_degraded is False
+            # The cache silently sat out the session — silent except for the log.
+            assert mgr._toolgraph_cache is None
+            assert mgr._toolgraph_from_cache is False
+            assert any("consult cache could not be opened" in r.message for r in caplog.records)
+        finally:
+            await mgr.stop()
 
     async def test_generation_bump_misses(self, tmp_path):
         gen_file = tmp_path / "gen.txt"
@@ -840,31 +894,41 @@ class TestToolgraphConsultCache:
         assert mgr._toolgraph_from_cache is False
         await mgr.stop()
 
-    async def test_knob_change_remaps_on_hit(self, tmp_path):
+    async def test_knob_change_remaps_on_hit(self, tmp_path, caplog):
         # Populate under on_tool_not_found=open (missing_x kept), then flip to
         # closed on a same-generation restart → the hit re-maps the cached RAW
         # facts under the new knob → missing_x is now rejected.
         mgr, _ = _tg_manager(tmp_path, servers={"srv": ["read_file", "missing_x"]})
-        await mgr._consult_toolgraph()  # on_tool_not_found default open
-        assert mgr._toolgraph_external_rejects == {}
-        mgr._config.toolgraph.on_tool_not_found = "closed"
-        await mgr._consult_toolgraph()
-        assert mgr._toolgraph_from_cache is True
-        assert mgr._toolgraph_external_rejects == {
-            ("srv", "missing_x"): REASON_TOOLGRAPH_TOOL_NOT_FOUND
-        }
-        await mgr.stop()
+        try:
+            with caplog.at_level(logging.WARNING):
+                await mgr._consult_toolgraph()  # on_tool_not_found default open
+                assert mgr._toolgraph_external_rejects == {}
+                _assert_consult_cached(mgr)
+                mgr._config.toolgraph.on_tool_not_found = "closed"
+                await mgr._consult_toolgraph()
+            assert [r.message for r in caplog.records if "consult cache" in r.message] == []
+            assert mgr._toolgraph_from_cache is True
+            assert mgr._toolgraph_external_rejects == {
+                ("srv", "missing_x"): REASON_TOOLGRAPH_TOOL_NOT_FOUND
+            }
+        finally:
+            await mgr.stop()
 
-    async def test_risk_scale_change_rescales_on_hit(self, tmp_path):
+    async def test_risk_scale_change_rescales_on_hit(self, tmp_path, caplog):
         mgr, _ = _tg_manager(tmp_path, servers={"srv": ["risky_tool"]})  # scale default 1.0
-        await mgr._consult_toolgraph()
-        assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.4}
-        mgr._config.toolgraph.risk_penalty_scale = 0.5
-        await mgr._consult_toolgraph()
-        assert mgr._toolgraph_from_cache is True
-        # Re-scaled locally from the cached raw risk_score (0.4 * 0.5).
-        assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.2}
-        await mgr.stop()
+        try:
+            with caplog.at_level(logging.WARNING):
+                await mgr._consult_toolgraph()
+                assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.4}
+                _assert_consult_cached(mgr)
+                mgr._config.toolgraph.risk_penalty_scale = 0.5
+                await mgr._consult_toolgraph()
+            assert [r.message for r in caplog.records if "consult cache" in r.message] == []
+            assert mgr._toolgraph_from_cache is True
+            # Re-scaled locally from the cached raw risk_score (0.4 * 0.5).
+            assert mgr._toolgraph_risk_penalties == {("srv", "risky_tool"): 0.2}
+        finally:
+            await mgr.stop()
 
     async def test_transient_enrichment_failure_not_cached_as_success(self, tmp_path):
         # rank_features fails (agent "rankboom") while eligible_tools succeeds →
