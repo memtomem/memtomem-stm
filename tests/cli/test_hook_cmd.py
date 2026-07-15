@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -67,6 +68,14 @@ def _hermetic_hook_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tup
     set_home(monkeypatch, home)
     monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "daemon"))
     monkeypatch.setenv("MEMTOMEM_STM_PROXY__METRICS__DB_PATH", str(metrics_db))
+    for key in (
+        "MEMTOMEM_STM_HOOK__USE_DAEMON",
+        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__USE_DAEMON",
+        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+    ):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: None)
     return metrics_db, home
 
@@ -411,6 +420,67 @@ def test_cli_runtime_bare_host_flag_fails_open():
     # passes through — closing the missing-value half of the contract (#526; the
     # invalid-value half is test_cli_runtime_invalid_host_fails_open).
     result = CliRunner().invoke(cli, ["hook", "--host"], input="not json")
+    assert result.exit_code == 0
+    assert result.output.strip() == "{}"
+
+
+def test_cli_managed_runtime_flags_are_scoped_and_order_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "false")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS", "77")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS", "88")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT", "true")
+    seen: dict[str, str | None] = {}
+
+    async def capture(*_args, **_kwargs):
+        for key in (
+            "MEMTOMEM_STM_HOOK__USE_DAEMON",
+            "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+            "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+            "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+        ):
+            seen[key] = os.environ.get(key)
+        return {}
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", capture)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "hook",
+            "--host",
+            "claude",
+            "--use-daemon",
+            "--surfacing-timeout-seconds",
+            "12",
+            "--daemon-timeout-seconds",
+            "2",
+            "--no-persist-query-text",
+        ],
+        input=json.dumps(_READ_PAYLOAD),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {
+        "MEMTOMEM_STM_HOOK__USE_DAEMON": "true",
+        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12",
+        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS": "13",
+        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT": "false",
+    }
+    # CliRunner/embedders reuse this process: every ambient value is restored.
+    assert os.environ["MEMTOMEM_STM_HOOK__USE_DAEMON"] == "false"
+    assert os.environ["MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS"] == "77"
+    assert os.environ["MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS"] == "88"
+    assert os.environ["MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"] == "true"
+
+
+def test_cli_invalid_managed_timeout_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value={}))
+    result = CliRunner().invoke(
+        cli,
+        ["hook", "--surfacing-timeout-seconds", "not-a-number"],
+        input=json.dumps(_READ_PAYLOAD),
+    )
     assert result.exit_code == 0
     assert result.output.strip() == "{}"
 

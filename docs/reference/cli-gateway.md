@@ -26,6 +26,11 @@ server, which lets any entrypoint be registered with an MCP client.
 Not every command accepts `--config`; use the command's own `--help` output as
 the option source of truth.
 
+`mms register` writes the proxy path plus managed shared-daemon, surfacing
+timeout, and query-text privacy values into new client registrations. Existing
+registrations are keep-by-default; use `--replace-registration` to refresh
+those managed values explicitly.
+
 ## Diagnostics and control
 
 | Command | Purpose |

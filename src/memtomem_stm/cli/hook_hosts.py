@@ -68,7 +68,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import shlex
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -78,6 +77,7 @@ from typing import Any
 import tomli_w
 
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
+from memtomem_stm.cli.host_runtime import _shell_tokens
 from memtomem_stm.utils.fileio import atomic_write_text
 
 # Executable basenames that mark a command as an STM hook invocation. Mirrors
@@ -115,10 +115,7 @@ def _is_stm_hook_command(command: str) -> bool:
     token anywhere" — is what keeps a compound user command like
     ``echo hook && memtomem-stm status`` from matching: ``status`` is not ``hook``,
     so install/uninstall leave it alone."""
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
+    tokens = _shell_tokens(command)
     if any(tok in {"|", "||", "&&", ";", "&", ">", ">>", "<"} for tok in tokens):
         return False
     # A source checkout directory can itself be named ``memtomem-stm``. Count
@@ -134,6 +131,20 @@ def _is_stm_hook_command(command: str) -> bool:
         return False
     i = starts[0]
     prefix = tokens[:i]
+    # Pre-runtime-flag installs commonly used POSIX ``env`` to pin timeout
+    # values in the host command.  Recognize only a leading env executable
+    # followed exclusively by MEMTOMEM_STM_* assignments; an arbitrary env
+    # wrapper (or flags such as ``env -i``) is not ours to rewrite/remove.
+    if prefix and Path(prefix[0]).name == "env":
+        j = 1
+        while j < len(prefix):
+            key, sep, _value = prefix[j].partition("=")
+            if not sep or not key.startswith("MEMTOMEM_STM_"):
+                break
+            j += 1
+        if j == 1:
+            return False
+        prefix = prefix[j:]
     if prefix and not (prefix[:2] == ["uv", "run"] and all(token != "--" for token in prefix)):
         return False
     return True
@@ -217,8 +228,17 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
         siblings = [h for h in entry["hooks"] if not _is_stm_command_handler(h)]
         if not installed:
             installed = True
+            old_handler = next(h for h in entry["hooks"] if _is_stm_command_handler(h))
+            # A host may attach supported fields such as a timeout or status
+            # message to the handler.  Refresh only STM-owned identity fields.
+            refreshed_handler = {**old_handler, "type": "command", "command": command}
             if not siblings:
-                out.append(block)  # STM-only group → refresh matcher + command
+                # STM-only group: refresh matcher + command, but retain unknown
+                # host fields on both the matcher group and handler.
+                refreshed_entry = {**entry, "hooks": [refreshed_handler]}
+                if matcher is not None:
+                    refreshed_entry["matcher"] = matcher
+                out.append(refreshed_entry)
             else:
                 # Shared group: keep the user's matcher + siblings, swap STM's
                 # handler in place (the first one, dropping any duplicates).
@@ -227,7 +247,7 @@ def _nested_install(data: dict[str, Any], command: str, matcher: str | None) -> 
                 for h in entry["hooks"]:
                     if _is_stm_command_handler(h):
                         if not replaced:
-                            new_inner.append(handler)
+                            new_inner.append(refreshed_handler)
                             replaced = True
                     else:
                         new_inner.append(h)
@@ -278,7 +298,7 @@ def _cursor_install(data: dict[str, Any], command: str, matcher: str | None) -> 
     block = {"command": command}
     for i, entry in enumerate(entries):
         if _is_stm_command_handler(entry):
-            entries[i] = block
+            entries[i] = {**entry, "command": command}
             return data
     entries.append(block)
     return data
@@ -307,7 +327,10 @@ def _kimi_install(data: dict[str, Any], command: str, matcher: str | None) -> di
     block["command"] = command
     for i, entry in enumerate(entries):
         if _is_stm_command_handler(entry):
-            entries[i] = block
+            refreshed = {**entry, "event": "PostToolUse", "command": command}
+            if matcher is not None:
+                refreshed["matcher"] = matcher
+            entries[i] = refreshed
             return data
     entries.append(block)
     return data
@@ -507,6 +530,42 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
             f"{'object' if fmt == 'json' else 'table'}; refusing to modify it."
         )
     return data, raw
+
+
+def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
+    """Return STM hook commands currently serialized for ``host_tag``.
+
+    Used by ``mms hook install`` to migrate the legacy inline-``env`` policy
+    into portable runtime flags without losing an operator-pinned timeout.
+    Parsing and malformed-config refusal deliberately share the exact path used
+    by :func:`plan_install`.
+    """
+    spec = HOOK_HOSTS[host_tag]
+    current = _read_current(_config_path(spec), spec.fmt)
+    if current is None:
+        return ()
+    data = current[0]
+    commands: list[str] = []
+    if host_tag in {"claude", "codex"}:
+        hooks = data.get("hooks")
+        entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                    continue
+                for handler in entry["hooks"]:
+                    if _is_stm_command_handler(handler):
+                        commands.append(handler["command"])
+    elif host_tag == "cursor":
+        hooks = data.get("hooks")
+        entries = hooks.get("postToolUse", []) if isinstance(hooks, dict) else []
+        if isinstance(entries, list):
+            commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
+    else:  # kimi
+        entries = data.get("hooks", [])
+        if isinstance(entries, list):
+            commands.extend(entry["command"] for entry in entries if _is_stm_command_handler(entry))
+    return tuple(commands)
 
 
 def _serialize(fmt: str, data: dict[str, Any]) -> str:

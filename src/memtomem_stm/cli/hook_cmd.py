@@ -67,9 +67,10 @@ import logging
 import os
 import shlex
 import sys
+from contextlib import contextmanager
 from dataclasses import replace
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, Iterator, TextIO
 
 import click
 
@@ -80,6 +81,12 @@ from memtomem_stm.cli.hook_adapter import (
     detect_host,
     get_adapter,
     known_hosts,
+)
+from memtomem_stm.cli.host_runtime import (
+    HostRuntimePolicy,
+    format_seconds,
+    resolve_host_runtime_policy,
+    runtime_env_overrides,
 )
 
 if TYPE_CHECKING:
@@ -798,6 +805,28 @@ def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
     return detect_host(payload)
 
 
+@contextmanager
+def _runtime_registration_env(overrides: dict[str, str]) -> Iterator[None]:
+    """Temporarily apply registration flags through the existing env bindings.
+
+    ``STMConfig`` already has the authoritative parsing and the detached daemon
+    deliberately inherits the hook process environment.  A short-lived overlay
+    therefore keeps both consumers aligned without adding a second config path.
+    Restoring every value matters for ``CliRunner`` and embedders that invoke
+    multiple commands in one Python process.
+    """
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 @click.group(name="hook", invoke_without_command=True)
 @click.option(
     "--host",
@@ -825,8 +854,53 @@ def _resolve_host_tag(host: str, payload: dict[str, Any] | None) -> str:
         "rather than exiting 2. (install/uninstall keep the strict click.Choice.)"
     ),
 )
+@click.option(
+    "--use-daemon",
+    "runtime_use_daemon",
+    flag_value="true",
+    default=None,
+    help="Use the shared warm daemon (serialized by `mms hook install`).",
+)
+@click.option(
+    "--no-daemon",
+    "runtime_use_daemon",
+    flag_value="false",
+    help="Run without the shared daemon.",
+)
+@click.option(
+    "--surfacing-timeout-seconds",
+    default=None,
+    metavar="SECONDS",
+    help="Managed LTM search deadline. Invalid hand-edited values fail open.",
+)
+@click.option(
+    "--daemon-timeout-seconds",
+    default=None,
+    metavar="SECONDS",
+    help="Managed hook-to-daemon deadline. Kept above the surfacing deadline.",
+)
+@click.option(
+    "--persist-query-text",
+    "runtime_persist_query_text",
+    flag_value="true",
+    default=None,
+    help="Allow surfacing query text persistence.",
+)
+@click.option(
+    "--no-persist-query-text",
+    "runtime_persist_query_text",
+    flag_value="false",
+    help="Hash surfacing query text before persistence.",
+)
 @click.pass_context
-def hook_command(ctx: click.Context, host: str) -> None:
+def hook_command(
+    ctx: click.Context,
+    host: str,
+    runtime_use_daemon: str | None,
+    surfacing_timeout_seconds: str | None,
+    daemon_timeout_seconds: str | None,
+    runtime_persist_query_text: str | None,
+) -> None:
     """Bridge a host's built-in tool calls into STM (PostToolUse hook).
 
     Bare ``mms hook`` (no subcommand) is the *runtime* bridge: it reads the hook
@@ -862,28 +936,37 @@ def hook_command(ctx: click.Context, host: str) -> None:
     # byte-identical to the pre-group command.
     if ctx.invoked_subcommand is not None:
         return
-    payload = _read_payload(sys.stdin)
-    host_tag = _resolve_host_tag(host, payload)
-    adapter = get_adapter(host_tag)
-    output: dict[str, Any] = {}
-    if payload is not None:
-        try:
-            output = asyncio.run(
-                asyncio.wait_for(
-                    _orchestrate(
-                        payload,
-                        adapter,
-                        # Automatic/ambiguous routing must never enable the
-                        # sole destructive capability (native output replace).
-                        allow_output_replacement=host.strip() == "claude",
-                    ),
-                    timeout=_hook_budget_seconds(),
+    overrides = runtime_env_overrides(
+        use_daemon=runtime_use_daemon,
+        surfacing_timeout_seconds=surfacing_timeout_seconds,
+        daemon_timeout_seconds=daemon_timeout_seconds,
+        persist_query_text=runtime_persist_query_text,
+    )
+    with _runtime_registration_env(overrides):
+        payload = _read_payload(sys.stdin)
+        host_tag = _resolve_host_tag(host, payload)
+        adapter = get_adapter(host_tag)
+        output: dict[str, Any] = {}
+        if payload is not None:
+            try:
+                output = asyncio.run(
+                    asyncio.wait_for(
+                        _orchestrate(
+                            payload,
+                            adapter,
+                            # Automatic/ambiguous routing must never enable the
+                            # sole destructive capability (native output replace).
+                            allow_output_replacement=host.strip() == "claude",
+                        ),
+                        timeout=_hook_budget_seconds(),
+                    )
                 )
-            )
-        except Exception:
-            logger.warning("hook processing failed — passing tool output through", exc_info=True)
-            output = {}
-    serialized = adapter.serialize(output)
+            except Exception:
+                logger.warning(
+                    "hook processing failed — passing tool output through", exc_info=True
+                )
+                output = {}
+        serialized = adapter.serialize(output)
     # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
     # channel with nothing surfaced). An unconditional ``click.echo`` would still
     # append a newline, making stdout "\n" — non-empty, which Kimi injects into
@@ -894,7 +977,7 @@ def hook_command(ctx: click.Context, host: str) -> None:
     click.echo(serialized, nl=bool(serialized))
 
 
-def _hook_install_command_argv(host: str) -> list[str]:
+def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:
     """The argv a host should fire on PostToolUse: ``<entrypoint> hook --host <host>``.
 
     Reuses the MCP-registration entry-point detection (``_detect_install_type``):
@@ -909,10 +992,15 @@ def _hook_install_command_argv(host: str) -> list[str]:
     from memtomem_stm.cli.proxy import _detect_install_type
 
     server_cmd, server_args = _detect_install_type()
-    return [server_cmd, *server_args, "hook", "--host", host]
+    argv = [server_cmd, *server_args, "hook", "--host", host]
+    if policy is not None:
+        argv.extend(policy.hook_args())
+    return argv
 
 
-def _emit_hook_change(change: Any, *, apply_: bool, backup: Any) -> None:
+def _emit_hook_change(
+    change: Any, *, apply_: bool, backup: Any, apply_hint: str | None = None
+) -> None:
     """Render a planned (or applied) install/uninstall to the terminal.
 
     Pure output: the caller has already applied the change when ``apply_`` and
@@ -966,7 +1054,8 @@ def _emit_hook_change(change: Any, *, apply_: bool, backup: Any) -> None:
     if not apply_:
         click.echo("")
         click.echo(
-            f"  To apply: {_hdr(f'mms hook {change.action} --host {change.host_tag} --apply')}"
+            f"  To apply: "
+            f"{_hdr(apply_hint or f'mms hook {change.action} --host {change.host_tag} --apply')}"
         )
 
 
@@ -985,7 +1074,38 @@ def _emit_hook_change(change: Any, *, apply_: bool, backup: Any) -> None:
     help="Write the change (default: dry-run preview). Backs up any prior file "
     "to <path>.bak (.bak.1, … if one already exists).",
 )
-def hook_install_command(host: str, apply_: bool) -> None:
+@click.option(
+    "--surfacing-timeout",
+    type=click.FloatRange(min=0.0, min_open=True),
+    default=None,
+    metavar="SECONDS",
+    help="Pin the LTM search deadline in the installed hook command.",
+)
+@click.option(
+    "--daemon",
+    "daemon_mode",
+    flag_value=True,
+    default=None,
+    help="Install an explicit shared-daemon route.",
+)
+@click.option(
+    "--no-daemon",
+    "daemon_mode",
+    flag_value=False,
+    help="Install an explicit cold/in-process route instead of the shared daemon.",
+)
+@click.option(
+    "--inherit-runtime-env",
+    is_flag=True,
+    help="Do not serialize daemon, timeout, or query-persistence settings.",
+)
+def hook_install_command(
+    host: str,
+    apply_: bool,
+    surfacing_timeout: float | None,
+    daemon_mode: bool | None,
+    inherit_runtime_env: bool,
+) -> None:
     """Register STM's PostToolUse hook in a host's config (idempotent).
 
     Read-modify-writes the host's hook-config file (``~/.claude/settings.json``,
@@ -1002,14 +1122,42 @@ def hook_install_command(host: str, apply_: bool) -> None:
     from memtomem_stm.cli import hook_hosts
     from memtomem_stm.cli._write_lock import hook_hosts_write_lock
 
-    command = shlex.join(_hook_install_command_argv(host))
+    if inherit_runtime_env and (surfacing_timeout is not None or daemon_mode is not None):
+        raise click.UsageError(
+            "--inherit-runtime-env cannot be combined with --surfacing-timeout, "
+            "--daemon, or --no-daemon"
+        )
     with hook_hosts_write_lock(enabled=apply_):
         try:
+            commands = hook_hosts.installed_stm_hook_commands(host)
+            policy = None
+            if not inherit_runtime_env:
+                policy = resolve_host_runtime_policy(
+                    existing_command=commands[0] if commands else None,
+                    use_daemon=daemon_mode,
+                    surfacing_timeout_seconds=surfacing_timeout,
+                )
+            command = shlex.join(_hook_install_command_argv(host, policy=policy))
             change = hook_hosts.plan_install(host, command)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
             raise click.ClickException(str(exc)) from exc
-        _emit_hook_change(change, apply_=apply_, backup=backup)
+        hint = ["mms", "hook", "install", "--host", host]
+        if surfacing_timeout is not None:
+            hint.extend(["--surfacing-timeout", format_seconds(surfacing_timeout)])
+        if daemon_mode is True:
+            hint.append("--daemon")
+        elif daemon_mode is False:
+            hint.append("--no-daemon")
+        if inherit_runtime_env:
+            hint.append("--inherit-runtime-env")
+        hint.append("--apply")
+        _emit_hook_change(
+            change,
+            apply_=apply_,
+            backup=backup,
+            apply_hint=shlex.join(hint),
+        )
 
 
 @hook_command.command(name="uninstall")

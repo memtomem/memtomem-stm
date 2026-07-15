@@ -33,6 +33,7 @@ from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
 from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
+from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
 from memtomem_stm.cli.mms_import import import_command as _mms_import_command
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
@@ -475,7 +476,11 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
     # to the base interpreter, which can no longer import the installed STM.
     command = os.path.abspath(sys.executable)
     env = {"MEMTOMEM_STM_PROXY__CONFIG_PATH": str(config_path.expanduser().resolve())}
-    env["MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"] = "false"
+    # A newly managed MCP host uses the shared warm daemon.  Serialize the
+    # deadline and privacy policy as well: GUI-launched clients often do not
+    # inherit the shell environment in which `mms register` ran.
+    policy = resolve_host_runtime_policy(use_daemon=True)
+    env.update(policy.mcp_env())
     return command, ["-m", "memtomem_stm"], env
 
 
@@ -740,6 +745,8 @@ def _write_mcp_json_for_stm(
     server_cmd: str,
     server_args: list[str],
     env: dict[str, str] | None = None,
+    *,
+    replace_existing: bool = False,
 ) -> Path:
     """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry.
 
@@ -748,11 +755,6 @@ def _write_mcp_json_for_stm(
     the previous behavior — falling back to ``{}`` — silently discarded every
     registration already in the file. On abort the file is left untouched.
     """
-    entry: dict[str, Any] = {"command": server_cmd}
-    if server_args:
-        entry["args"] = server_args
-    if env:
-        entry["env"] = env
     mcp_path = target_dir / ".mcp.json"
     existing: dict[str, Any]
     if mcp_path.exists():
@@ -801,6 +803,39 @@ def _write_mcp_json_for_stm(
             err=True,
         )
         raise SystemExit(1)
+    current_entry = servers.get("memtomem-stm")
+    if current_entry is not None and not replace_existing:
+        # Existing host registrations are keep-by-default.  Managed daemon /
+        # timeout values are applied only to a new entry or an explicit
+        # `--replace-registration` refresh.
+        return mcp_path
+    if current_entry is not None and not isinstance(current_entry, dict):
+        click.echo(
+            f"{_err('Error:')} {mcp_path} 'memtomem-stm' entry must be an object, got "
+            f"{type(current_entry).__name__}. Registration aborted; the file was not modified.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    # On explicit refresh, retain fields STM does not own and merge environment
+    # values key-by-key.  This preserves host-specific metadata and operator
+    # variables while updating only the command/args and managed STM keys.
+    entry: dict[str, Any] = dict(current_entry or {})
+    entry["command"] = server_cmd
+    if server_args:
+        entry["args"] = server_args
+    else:
+        entry.pop("args", None)
+    if env:
+        current_env = entry.get("env")
+        if current_env is not None and not isinstance(current_env, dict):
+            click.echo(
+                f"{_err('Error:')} {mcp_path} 'memtomem-stm.env' must be an object, got "
+                f"{type(current_env).__name__}. Registration aborted; the file was not modified.",
+                err=True,
+            )
+            raise SystemExit(1)
+        entry["env"] = {**(current_env or {}), **env}
     servers["memtomem-stm"] = entry
     # Atomic like every sibling config writer (_save, _desktop_json_remove_entry):
     # Claude Code re-reads .mcp.json at project load, and a crash/disk-full
@@ -943,6 +978,14 @@ def _run_mcp_integration(
                     "left unchanged. Remove it with `codex mcp remove memtomem-stm` "
                     "and re-run to replace it anyway"
                 )
+            # The replacement owns STM's managed keys, not unrelated operator
+            # variables.  `_codex_restore_plan` has already proved this is a
+            # stdio snapshot with a string-to-string env mapping, so merge it
+            # before remove/add and let the managed values win on collisions.
+            transport = snapshot.get("transport")
+            raw_previous_env = transport.get("env") if isinstance(transport, dict) else None
+            previous_env = raw_previous_env if isinstance(raw_previous_env, dict) else {}
+            server_env = {**previous_env, **server_env}
             if not _remove_from_codex():
                 raise click.ClickException(
                     "could not remove the existing Codex registration; "
@@ -970,7 +1013,13 @@ def _run_mcp_integration(
 
     if client_mode == "json":
         _SETUP_RESOLVED_CLIENT.set("json")
-        mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
+        mcp_path = _write_mcp_json_for_stm(
+            Path.cwd(),
+            server_cmd,
+            server_args,
+            server_env,
+            replace_existing=replace_registration,
+        )
         click.echo(f"  {_ok('Wrote')} {mcp_path}")
         _emit_mcp_paste_hints()
         return
@@ -1021,7 +1070,13 @@ def _run_mcp_integration(
 
     # choice == 2, or choice == 1 fallback
     _SETUP_RESOLVED_CLIENT.set("json")
-    mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
+    mcp_path = _write_mcp_json_for_stm(
+        Path.cwd(),
+        server_cmd,
+        server_args,
+        server_env,
+        replace_existing=replace_registration,
+    )
     click.echo(f"  {_ok('Wrote')} {mcp_path}")
     _emit_mcp_paste_hints()
 

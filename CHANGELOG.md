@@ -26,6 +26,11 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- New MCP and native-hook registrations now pin a shared-daemon runtime policy
+  with ordered surfacing/hook deadlines instead of depending on host environment
+  inheritance. Existing registrations remain keep-by-default; explicit refreshes
+  preserve unrelated environment and host fields, and legacy inline-`env` hook
+  commands migrate to portable runtime flags.
 - Failed Codex MCP registration now exits nonzero and reports `ok: false` in
   JSON setup output, preventing automation from treating an unusable setup as
   successful (#702).

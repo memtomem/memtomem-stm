@@ -56,6 +56,14 @@ def _hermetic_home(monkeypatch, tmp_path: Path) -> Path:
     home = tmp_path / "hermetic-home"
     home.mkdir()
     set_home(monkeypatch, home)
+    for key in (
+        "MEMTOMEM_STM_HOOK__USE_DAEMON",
+        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__USE_DAEMON",
+        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+    ):
+        monkeypatch.delenv(key, raising=False)
     return home
 
 
@@ -1544,6 +1552,73 @@ class TestWriteMcpJsonParseSafety:
         assert data["mcpServers"]["existing"] == {"command": "keep-me"}
         assert data["unknownTopLevel"] == {"custom": True}
         assert data["mcpServers"]["memtomem-stm"] == {"command": "memtomem-stm"}
+
+    def test_existing_stm_entry_is_kept_byte_identical_without_replace(
+        self, tmp_path: Path
+    ) -> None:
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        mcp_path = tmp_path / ".mcp.json"
+        prior = (
+            '{"mcpServers":{"memtomem-stm":{"command":"legacy",'
+            '"env":{"OPERATOR_FLAG":"keep"}}},"custom":true}\n'
+        ).encode()
+        mcp_path.write_bytes(prior)
+
+        _write_mcp_json_for_stm(
+            tmp_path,
+            "/new/python",
+            ["-m", "memtomem_stm"],
+            {"MEMTOMEM_STM_SURFACING__USE_DAEMON": "true"},
+        )
+
+        assert mcp_path.read_bytes() == prior
+
+    def test_explicit_refresh_preserves_unknown_fields_and_unrelated_env(
+        self, tmp_path: Path
+    ) -> None:
+        from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
+
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "memtomem-stm": {
+                            "command": "legacy",
+                            "args": ["old"],
+                            "env": {
+                                "OPERATOR_FLAG": "keep",
+                                "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "2",
+                            },
+                            "hostExtension": {"keep": True},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _write_mcp_json_for_stm(
+            tmp_path,
+            "/new/python",
+            ["-m", "memtomem_stm"],
+            {
+                "MEMTOMEM_STM_SURFACING__USE_DAEMON": "true",
+                "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12",
+            },
+            replace_existing=True,
+        )
+
+        entry = json.loads(mcp_path.read_text())["mcpServers"]["memtomem-stm"]
+        assert entry["command"] == "/new/python"
+        assert entry["args"] == ["-m", "memtomem_stm"]
+        assert entry["hostExtension"] == {"keep": True}
+        assert entry["env"] == {
+            "OPERATOR_FLAG": "keep",
+            "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12",
+            "MEMTOMEM_STM_SURFACING__USE_DAEMON": "true",
+        }
 
 
 class TestAddPersistence:
@@ -4072,6 +4147,8 @@ class TestRegisterCommand:
         add_cmd = fake_claude["calls"][1]
         assert os.path.isabs(add_cmd[add_cmd.index("--") + 1])
         assert "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT=false" in add_cmd
+        assert "MEMTOMEM_STM_SURFACING__USE_DAEMON=true" in add_cmd
+        assert "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3" in add_cmd
 
     def test_register_client_codex_uses_official_cli(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -4091,6 +4168,44 @@ class TestRegisterCommand:
         assert calls[0][:4] == ["codex", "mcp", "get", "memtomem-stm"]
         assert calls[1][:4] == ["codex", "mcp", "add", "memtomem-stm"]
         assert "--env" in calls[1]
+
+    def test_register_json_keeps_existing_until_explicit_replace(
+        self, runner, config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        monkeypatch.chdir(tmp_path)
+        mcp_path = tmp_path / ".mcp.json"
+        legacy = {
+            "mcpServers": {
+                "memtomem-stm": {
+                    "command": "legacy",
+                    "env": {"OPERATOR_FLAG": "keep"},
+                    "hostExtension": True,
+                }
+            }
+        }
+        mcp_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        kept = runner.invoke(cli, ["register", "--client", "json", *_cfg_args(config)])
+        assert kept.exit_code == 0, kept.output
+        assert json.loads(mcp_path.read_text()) == legacy
+
+        refreshed = runner.invoke(
+            cli,
+            [
+                "register",
+                "--client",
+                "json",
+                "--replace-registration",
+                *_cfg_args(config),
+            ],
+        )
+        assert refreshed.exit_code == 0, refreshed.output
+        entry = json.loads(mcp_path.read_text())["mcpServers"]["memtomem-stm"]
+        assert entry["command"] != "legacy"
+        assert entry["hostExtension"] is True
+        assert entry["env"]["OPERATOR_FLAG"] == "keep"
+        assert entry["env"]["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
 
     def test_register_client_codex_add_failure_is_nonzero(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -4161,9 +4276,9 @@ class TestRegisterCommand:
     ):
         """A failed replacement must restore the CAPTURED registration.
 
-        The previous registration deliberately shares no command, argument, or
-        env key with the one being installed, so a rollback that ignored the
-        capture and re-ran the default registration would fail here.
+        The previous registration deliberately shares no command or argument
+        with the one being installed. Its unrelated env is retained by the
+        replacement and the captured command still distinguishes the rollback.
         """
         from memtomem_stm.cli import proxy as proxy_mod
 
@@ -4188,7 +4303,7 @@ class TestRegisterCommand:
             if cmd[:3] == ["codex", "mcp", "remove"]:
                 return _FakeClaudeResult(returncode=0)
             # The replacement add fails; the restore add succeeds.
-            if "LEGACY_FLAG=on" not in cmd:
+            if "/opt/legacy/stm" not in cmd:
                 return _FakeClaudeResult(returncode=1, stderr="codex rejected registration")
             return _FakeClaudeResult(returncode=0)
 
@@ -4200,6 +4315,9 @@ class TestRegisterCommand:
 
         assert result.exit_code == 1
         assert "restored the previous Codex registration" in result.output
+        replacement = calls[-2]
+        assert "LEGACY_FLAG=on" in replacement  # unrelated env survives refresh
+        assert "MEMTOMEM_STM_SURFACING__USE_DAEMON=true" in replacement
         assert calls[-1] == [
             "codex",
             "mcp",
