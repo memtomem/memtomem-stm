@@ -860,7 +860,7 @@ class TestBundleProvenanceAdvisory:
         bundle.write_bytes(b"{}")
         bundle.chmod(mode)
         findings = bundle_provenance_warnings(bundle)
-        assert any("writable by group/other" in f for f in findings)
+        assert any("rename its entries" in f or "writable by group/other" in f for f in findings)
 
     def test_symlink_is_a_finding(self, tmp_path):
         real = tmp_path / "real.json"
@@ -911,15 +911,51 @@ class TestBundleProvenanceAdvisory:
         finally:
             outer.chmod(0o755)
 
-    def test_foreign_owner_is_a_finding(self, tmp_path, monkeypatch):
-        """Another user owning the file can chmod and rewrite it at will."""
+    def test_foreign_owner_is_reported_for_the_file_and_for_ancestors(self, tmp_path, monkeypatch):
+        """Another user owning either can chmod and rewrite the policy at will.
+
+        Both halves are asserted by NAME: pretending to be a foreign euid makes
+        the whole tree foreign, so a generic "some finding says foreign" check
+        would still pass with the file-owner branch deleted.
+        """
         bundle = tmp_path / "policy-bundle.json"
         bundle.write_bytes(b"{}")
         bundle.chmod(0o644)
-        # Pretend we are a different uid than the one that owns the tree.
         monkeypatch.setattr(toolgraph_bundle_mod.os, "geteuid", lambda: 999999)
         findings = bundle_provenance_warnings(bundle)
-        assert any("not by this process or root" in f for f in findings)
+        assert any(str(bundle) in f and "not by this process or root" in f for f in findings)
+        assert any(str(tmp_path) in f and "not by this process or root" in f for f in findings)
+
+    @pytest.mark.parametrize("mode", [0o720, 0o702, 0o622])
+    def test_a_write_bit_without_search_cannot_rename_and_is_silent(self, tmp_path, mode):
+        """Positive control: renaming needs write AND execute on the directory."""
+        home = tmp_path / "toolgraph"
+        home.mkdir()
+        bundle = home / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        home.chmod(mode)
+        try:
+            assert bundle_provenance_warnings(bundle) == []
+        finally:
+            home.chmod(0o755)
+
+    def test_a_relative_path_still_walks_above_the_working_directory(self, tmp_path, monkeypatch):
+        """`bundle_path` may be relative; `Path.parents` would stop at `.`."""
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        bundle = inner / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        inner.chmod(0o755)
+        outer.chmod(0o777)
+        monkeypatch.chdir(inner)
+        try:
+            findings = bundle_provenance_warnings(Path("policy-bundle.json"))
+            assert any(str(outer) in f and "can be replaced" in f for f in findings)
+        finally:
+            outer.chmod(0o755)
 
     def test_a_missing_bundle_is_not_this_diagnostic_s_problem(self, tmp_path):
         assert bundle_provenance_warnings(tmp_path / "absent.json") == []

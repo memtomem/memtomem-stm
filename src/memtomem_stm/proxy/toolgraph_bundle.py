@@ -59,7 +59,11 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     """
     if sys.platform == "win32":
         return []
-    target = path.expanduser()
+    # Absolute and LEXICAL: ``bundle_path`` may be configured relative (nothing
+    # forces otherwise), and ``Path.parents`` of a relative path stops at ``.``
+    # — every directory above the working directory would go unexamined. Not
+    # ``resolve()``: that follows symlinks, and the symlink is itself a finding.
+    target = Path(os.path.abspath(path.expanduser()))
     findings: list[str] = []
     euid = os.geteuid()
     try:
@@ -85,13 +89,31 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     return findings
 
 
+def _entry_renamers(mode: int) -> str:
+    """Which classes besides the owner can rename entries in a dir of *mode*.
+
+    Renaming an entry needs **write and search** on the directory: a ``0720``
+    parent hands group the write bit but no ``x``, so group cannot resolve a
+    name inside it and cannot swap the bundle. Masking on write alone would warn
+    about such a directory, and a diagnostic nobody trusts is worse than none.
+    The sticky bit clears everyone — ``/tmp`` is world-writable precisely so this
+    is safe, and it still lets only an entry's owner rename it.
+    """
+    if mode & stat_module.S_ISVTX:
+        return ""
+    classes = []
+    if mode & 0o020 and mode & 0o010:
+        classes.append("group")
+    if mode & 0o002 and mode & 0o001:
+        classes.append("other")
+    return "/".join(classes)
+
+
 def _replaceable_ancestors(target: Path, euid: int) -> list[str]:
     """Directories above *target* that let a third party substitute the bundle.
 
     Walked to the root, not just the immediate parent: renaming *any* ancestor
-    is enough to put a different file at the same path. The sticky bit is
-    honoured — a world-writable ``/tmp`` with ``S_ISVTX`` still lets only an
-    entry's owner rename it, which is exactly the case the bit exists for.
+    is enough to put a different file at the same path.
     """
     findings: list[str] = []
     for parent in target.parents:
@@ -99,9 +121,10 @@ def _replaceable_ancestors(target: Path, euid: int) -> list[str]:
             info = os.stat(parent)
         except OSError:
             break
-        if info.st_mode & 0o022 and not info.st_mode & stat_module.S_ISVTX:
+        renamers = _entry_renamers(info.st_mode)
+        if renamers:
             findings.append(
-                f"{parent} is writable by group/other "
+                f"{parent} lets {renamers} rename its entries "
                 f"(mode {stat_module.S_IMODE(info.st_mode):04o}), so the bundle can be replaced"
             )
         if info.st_uid not in (euid, 0):
