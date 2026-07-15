@@ -878,6 +878,54 @@ class TestBundleProvenanceAdvisory:
         tmp_path.chmod(0o755)
         assert bundle_provenance_warnings(link) == []
 
+    def test_a_foreign_symlink_in_a_sticky_dir_is_a_finding(self, tmp_path, monkeypatch):
+        """Sticky stops others touching OUR entries -- not an owner touching theirs.
+
+        `/tmp` at 01777 is the case: a link we do not own is its owner's to
+        unlink and recreate at will, while the chain it resolves into stays
+        perfectly secure. Only the link's st_uid is faked -- patching geteuid
+        would make the parent foreign too and fire the check for another reason.
+        """
+        home = tmp_path / "sticky"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o1777)
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **kw):
+            info = real_lstat(p, *a, **kw)
+            if str(p) != str(link):
+                return info
+            fields = list(info)
+            fields[4] = 999999  # st_uid
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "lstat", fake_lstat)
+        try:
+            findings = bundle_provenance_warnings(link)
+            assert any(str(link) in f and "uid 999999" in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
+    def test_our_own_symlink_in_a_sticky_dir_is_silent(self, tmp_path):
+        """Positive control: sticky genuinely protects the entries we own."""
+        home = tmp_path / "sticky"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o1777)
+        try:
+            assert bundle_provenance_warnings(link) == []
+        finally:
+            home.chmod(0o755)
+
     def test_a_symlink_others_can_replace_is_a_finding(self, tmp_path):
         home = tmp_path / "toolgraph"
         home.mkdir()

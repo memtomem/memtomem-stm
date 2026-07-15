@@ -133,6 +133,14 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
         except OSError:
             continue
         who = _substituters(parent_info, euid)
+        if not who and info.st_uid not in (euid, 0):
+            # The sticky exemption protects an entry from everyone *except its
+            # own owner*. A link we do not own, in a directory its owner can
+            # write and search (``/tmp`` at 01777 being the whole point), is
+            # theirs to unlink and recreate whenever they like — and the
+            # resolved chain we analyse can be perfectly secure meanwhile.
+            if _write_search_classes(parent_info.st_mode):
+                who = f"its owner uid {info.st_uid}"
         if who:
             findings.append(
                 f"{current} is a symlink and {current.parent} lets {who} replace it, "
@@ -141,24 +149,34 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
     return findings
 
 
-def _entry_renamers(mode: int) -> str:
-    """Which classes besides the owner can rename entries in a dir of *mode*.
+def _write_search_classes(mode: int) -> str:
+    """Classes that may create and remove entries in a dir of *mode*, sticky aside.
 
-    Renaming an entry needs **write and search** on the directory: a ``0720``
-    parent hands group the write bit but no ``x``, so group cannot resolve a
-    name inside it and cannot swap the bundle. Masking on write alone would warn
+    Renaming an entry needs **write and search** together: a ``0720`` parent
+    hands group the write bit but no ``x``, so group cannot resolve a name
+    inside it and cannot swap the bundle. Masking on write alone would warn
     about such a directory, and a diagnostic nobody trusts is worse than none.
-    The sticky bit clears everyone — ``/tmp`` is world-writable precisely so this
-    is safe, and it still lets only an entry's owner rename it.
     """
-    if mode & stat_module.S_ISVTX:
-        return ""
     classes = []
     if mode & 0o020 and mode & 0o010:
         classes.append("group")
     if mode & 0o002 and mode & 0o001:
         classes.append("other")
     return "/".join(classes)
+
+
+def _entry_renamers(mode: int) -> str:
+    """Which classes can replace *someone else's* entry in a dir of *mode*.
+
+    The sticky bit clears everyone — ``/tmp`` is world-writable precisely so
+    this is safe, because it lets only an entry's own owner remove it. That
+    exemption is about entries we own; a *foreign-owned* entry in a sticky
+    directory is still replaceable by its owner, which
+    :func:`_redirectable_symlinks` handles via :func:`_write_search_classes`.
+    """
+    if mode & stat_module.S_ISVTX:
+        return ""
+    return _write_search_classes(mode)
 
 
 def _replaceable_ancestors(target: Path, euid: int) -> list[str]:
