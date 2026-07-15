@@ -41,6 +41,7 @@ from memtomem_stm.daemon.protocol import (
     build_request,
     encode_line,
     read_message,
+    surface_response,
 )
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -278,6 +279,32 @@ async def test_surface_propagates_remaining_deadline_as_budget(tmp_path: Path) -
     # leaving room to encode and write the response.
     assert 0 < budget <= 1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS
     assert budget == pytest.approx(1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS, abs=0.1)
+
+
+async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path: Path) -> None:
+    # Under a propagated budget the engine handles its own timeout and returns a
+    # well-formed empty result, which is shape-identical to "nothing relevant".
+    # Filed as `success` it would censor the percentiles the timeout
+    # recommendation derives from with a sample the length of the whole budget.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    timeouts = 0
+
+    async def surfaced_but_timed_out() -> dict[str, object]:
+        nonlocal timeouts
+        timeouts += 1  # what engine.surface() records as an error_timeout outcome
+        return surface_response({})
+
+    await server._run_admitted(
+        {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+        surfaced_but_timed_out,
+        latency_kind="surface",
+        timeout_counter=lambda: timeouts,
+    )
+
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["timeout_samples"] == 1
+    assert surface_latency["samples"] == 0
 
 
 async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) -> None:

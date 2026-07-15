@@ -27,7 +27,11 @@ changes inline only. See the deprecation policy in
   LTM now trips the breaker as designed and shows up in
   `mms stats` / `surfacing_faults`. When queue and lock wait have already eaten
   the deadline, the daemon skips the LTM round trip entirely rather than
-  starting one it must cancel mid-RPC.
+  starting one it must cancel mid-RPC. A surfacing call that times out inside
+  the engine is also recorded as a `timeout` latency sample rather than a
+  `success` one roughly the length of the whole budget, keeping the censored
+  duration out of the percentiles `mms daemon status`'s timeout recommendation
+  is derived from. (#719)
 
 ## [0.1.40] — 2026-07-15
 

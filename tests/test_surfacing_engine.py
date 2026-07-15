@@ -453,10 +453,9 @@ class TestSurfacingBudget:
         elapsed = time.monotonic() - started
 
         assert output == LONG_RESPONSE
-        # Absolute bound proves the budget (not the 30s ceiling) drove the abort;
-        # the relative bound keeps it honest on a slow CI box.
+        # The ceiling is 600x the budget, so one absolute bound already tells the
+        # two apart — an abort at the ceiling would take ~30s.
         assert elapsed < 1.0
-        assert elapsed < 30.0 / 2
 
     async def test_budget_abort_still_counts_toward_the_breaker(self):
         # The whole point of propagating the budget instead of cancelling from

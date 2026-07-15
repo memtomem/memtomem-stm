@@ -117,7 +117,10 @@ _LEAK_KILL_ESCALATE_SECONDS = 2.0
 # Reserved out of the client's deadline for encoding + the loopback write/read
 # of the response. The engine's budget is the remainder, so the engine's own
 # timeout fires *before* the client gives up and `_run_admitted`'s
-# `asyncio.timeout_at` backstop cancels it from outside.
+# `asyncio.timeout_at` backstop cancels it from outside. It also has to absorb
+# the engine's pre-timeout work (gate, query extraction, privacy scan — local
+# CPU on short strings) and the time `wait_for` spends awaiting the cancelled
+# adapter, neither of which the budget arithmetic can see.
 _DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
 
 # Below this, an LTM round trip cannot plausibly complete, so starting one only
@@ -470,6 +473,7 @@ class DaemonServer:
                 surface_call,
                 latency_kind="surface",
                 activity_counter=self._surfacing_retrieval_count,
+                timeout_counter=self._surfacing_timeout_count,
             )
         if op in {
             OP_LTM_SEARCH,
@@ -708,8 +712,18 @@ class DaemonServer:
         *,
         latency_kind: LatencyKind | None = None,
         activity_counter: Callable[[], int] | None = None,
+        timeout_counter: Callable[[], int] | None = None,
     ) -> dict[str, Any]:
-        """Run one LTM operation under the shared queue, deadline, and lock."""
+        """Run one LTM operation under the shared queue, deadline, and lock.
+
+        ``timeout_counter`` reports an abort the *operation* handled itself, so
+        it never surfaces as an exception here. Surfacing does exactly that now
+        that it runs under a propagated budget: it returns a well-formed empty
+        result on timeout, which is otherwise indistinguishable from "nothing
+        relevant" and would be filed as a ``success`` sample of roughly the
+        whole budget — censored data in the percentiles the timeout
+        recommendation is derived from.
+        """
         deadline = req.get("deadline_monotonic")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
@@ -722,6 +736,7 @@ class DaemonServer:
         started = time.monotonic()
         warm_at_start = self._ltm_warmth() == "warm"
         activity_before = activity_counter() if activity_counter is not None else None
+        timeouts_before = timeout_counter() if timeout_counter is not None else None
         await self._pending_slots.acquire()
         self._last_request = time.monotonic()
         self._active_requests += 1
@@ -736,8 +751,17 @@ class DaemonServer:
             )
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
+                self_timed_out = (
+                    timeout_counter is not None
+                    and timeouts_before is not None
+                    and timeout_counter() > timeouts_before
+                )
                 if not warm_at_start:
                     outcome: LatencyOutcome = "cold"
+                elif self_timed_out:
+                    # Same precedence as the `asyncio.TimeoutError` branch below,
+                    # which this replaces for surfacing: cold first, then timeout.
+                    outcome = "timeout"
                 elif response.get("ok") is not True or (
                     latency_kind == "retrieval"
                     and response.get("outcome") not in (None, "ok", "empty_results")
@@ -789,6 +813,21 @@ class DaemonServer:
         return sum(int(total_skips.get(key, 0)) for key in retrieval_skips) + sum(
             int(total_outcomes.get(key, 0)) for key in retrieval_outcomes
         )
+
+    def _surfacing_timeout_count(self) -> int:
+        """Engine-internal surfacing timeouts recorded so far.
+
+        Sibling of :meth:`_surfacing_retrieval_count`, read the same way and
+        deterministic for the same reason (the daemon wires a real
+        ``SurfacingObservability`` and serializes surface calls, so a
+        before/after comparison spans exactly one request).
+        """
+        observability = getattr(self._engine, "observability", None)
+        if observability is None:
+            return 0
+        snapshot = observability.snapshot()
+        total_outcomes = snapshot.get("outcomes", {}).get("__total__", {})
+        return int(total_outcomes.get("error_timeout", 0))
 
     @staticmethod
     def _parse_search_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
