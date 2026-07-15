@@ -810,6 +810,10 @@ def _write_mcp_json_for_stm(
             f"{type(current_entry).__name__}. Registration aborted; the file was not modified.",
             err=True,
         )
+        click.echo(
+            "    Remove the 'memtomem-stm' entry manually, then re-run registration.",
+            err=True,
+        )
         raise SystemExit(1)
     if current_entry is not None and not replace_existing:
         # Existing host registrations are keep-by-default.  Managed daemon /

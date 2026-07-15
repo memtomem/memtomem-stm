@@ -1522,7 +1522,9 @@ class TestWriteMcpJsonParseSafety:
 
         assert excinfo.value.code == 1
         assert mcp_path.read_bytes() == prior
-        assert "'memtomem-stm' entry must be an object" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "'memtomem-stm' entry must be an object" in err
+        assert "Remove the 'memtomem-stm' entry manually" in err
 
     def test_unreadable_file_aborts_without_write(
         self,
