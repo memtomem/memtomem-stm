@@ -234,14 +234,34 @@ class TestSchemaParserConformance:
     | extra key in graph_state             | reject | accept |
     | profile outside the enum             | reject | accept |
     | paths wrong type (outer or item)     | reject | accept |
+    | duplicate tool_key, exact-copy rows  | reject | reject |
     | duplicate tool_key, differing rows   | accept | reject |
     | graph_state.generation as 1.0        | accept | reject |
 
-    The accept/reject asymmetries are deliberate on two rows — an unknown reason
-    (forward compatibility, ``tool_eligibility._TOOLGRAPH_REASON_MAP``) and a
-    free-string profile (``ToolgraphConfig.query_profile``) — and undocumented
-    tolerance on the rest. The parser-strict rows are the availability risk: a
-    schema-valid bundle a third-party producer emits is withheld wholesale.
+    Since toolgraph#41 the parser-tolerant rows split three ways:
+
+    - **Contract-blessed** — the schema's MAY-ignore prose now covers tolerating
+      ``created_at`` (any state), an absent ``risk_score``, an unknown reason on
+      a rejected row (generic mapping via
+      ``tool_eligibility._TOOLGRAPH_REASON_MAP``), a non-string reason on an
+      eligible row, and ``paths`` in any state.
+    - **Deliberate local design, not blessed** — a free-string profile
+      (``ToolgraphConfig.query_profile``); the schema enum is unconditional.
+    - **Local leniency, not blessed** — extra ``graph_state`` keys; the schema
+      declares that object closed by design (extending it is a schema_version
+      bump), so this parser is simply more tolerant than the contract asks.
+
+    Duplicate ``tool_key`` is likewise no longer a divergence in substance. The
+    contract now declares such a bundle invalid and says consumers MUST NOT
+    arbitrate between conflicting rows, so rejecting is conforming — the schema
+    simply cannot express the rule for differing rows (``uniqueItems`` compares
+    whole items), which is why the prose carries it and this row still reads
+    accept/reject.
+
+    That leaves ``generation: 1.0`` as the one live availability risk: a
+    schema-valid bundle is still withheld wholesale. Only a lexical rule could
+    close it, so the contract documents the producer's int-literal obligation
+    instead.
 
     Every test asserts BOTH verdicts, so a change on either side of the vendored
     contract flips a test rather than drifting silently.
@@ -304,8 +324,21 @@ class TestSchemaParserConformance:
         assert _schema_rejects(item, validator="type", at=["tools", 0, "paths", 0], names="string")
         assert _parse(item).instance_id == "graph-1"
 
+    def test_exact_duplicate_rows_now_fail_schema_and_parser(self):
+        """The ``uniqueItems`` backstop (toolgraph#41) covers only this case."""
+        doc = _bundle(_tool())
+        doc["tools"].append(dict(doc["tools"][0]))
+        assert _schema_rejects(doc, validator="uniqueItems", at=["tools"], names="non-unique")
+        with pytest.raises(PolicyBundleError, match="duplicate tool_key"):
+            _parse(doc)
+
     def test_duplicate_tool_key_passes_schema_but_parser_rejects(self):
-        """uniqueItems could not catch this either: the rows differ."""
+        """uniqueItems could not catch this either: the rows differ.
+
+        Rejecting is contract-conforming — the bundle is invalid per the
+        ``tools`` prose — but the schema alone cannot say so, which is exactly
+        why the uniqueness rule is normative prose rather than a keyword.
+        """
         doc = _bundle(_tool())
         twin = dict(doc["tools"][0])
         twin["risk_score"] = 0.2
