@@ -25,7 +25,7 @@ from memtomem_stm.surfacing.mcp_client import (
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
-from memtomem_stm.utils.redact import redact_url_userinfo
+from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,11 @@ class SurfacingEngine:
         # operators easily miss a counter — symmetric to the #348
         # prepend-on-progressive WARNING-once pattern.
         self._warned_ltm_unavailable: bool = False
+        # One-shot WARNING when a declared compose surface raises. The
+        # ``ltm_call_failed`` counter already records it, but a compose
+        # contract break (e.g. core renamed a top-level key) is silent to an
+        # operator who is not reading counters — same rationale as #349.
+        self._warned_compose_failed: bool = False
         # Per-upstream-tool score-scale tripwire (#672). Only real LTM
         # searches update this state; cache hits have no raw scores and are
         # deliberately neutral. Entries disappear on recovery/reset, so the
@@ -990,11 +995,21 @@ class SurfacingEngine:
                 except LtmTransportError:
                     logger.debug("Core context composition transport failed", exc_info=True)
                     compose_transport_failed = True
-                except (RuntimeError, ValueError):
+                except (RuntimeError, ValueError) as exc:
                     # A declared compose surface is authoritative: classify
                     # its failure like a legacy upstream call failure, but do
                     # not hide it with a second search request.
                     logger.debug("Core context composition failed", exc_info=True)
+                    if not self._warned_compose_failed:
+                        logger.warning(
+                            "Surfacing degraded: LTM declared context_compose "
+                            "schema %s but the call failed (%s). Subsequent "
+                            "failures counted as 'ltm_call_failed' in "
+                            "stm_surfacing_stats.",
+                            capabilities.context_compose_schema,
+                            redact_exception_text(str(exc), self._config.ltm_mcp_url or ""),
+                        )
+                        self._warned_compose_failed = True
                     compose_failed = True
             if bundle is not None:
                 results = [*bundle.pinned, *bundle.retrieved]
