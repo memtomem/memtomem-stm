@@ -735,14 +735,21 @@ class DaemonServer:
         # including admission-queue and serialization-lock wait time.
         started = time.monotonic()
         warm_at_start = self._ltm_warmth() == "warm"
-        activity_before = activity_counter() if activity_counter is not None else None
-        timeouts_before = timeout_counter() if timeout_counter is not None else None
+        activity_before: int | None = None
+        timeouts_before: int | None = None
         await self._pending_slots.acquire()
         self._last_request = time.monotonic()
         self._active_requests += 1
         try:
             async with asyncio.timeout_at(float(deadline)):
                 async with self._surface_lock:
+                    # Read under the lock, not before the queue: admissions
+                    # overlap (`max_pending_requests` is 32), and the engine's
+                    # counters only move inside a serialized run. Captured
+                    # earlier, a request that merely *waited* while another one
+                    # timed out would see the delta and inherit its outcome.
+                    activity_before = activity_counter() if activity_counter is not None else None
+                    timeouts_before = timeout_counter() if timeout_counter is not None else None
                     response = await operation()
             activity_observed = (
                 activity_counter is None
@@ -791,9 +798,11 @@ class DaemonServer:
         """Number of engine terminal decisions that require an LTM attempt.
 
         Hook allowlist and engine gate skips must not dilute warm-search
-        percentiles with near-zero samples.  The daemon wires a real
+        percentiles with near-zero samples. The daemon wires a real
         ``SurfacingObservability`` and serializes surface calls, so comparing
-        this aggregate before/after one admitted request is deterministic.
+        this aggregate before/after one admitted request is deterministic —
+        provided the "before" read happens under ``_surface_lock`` too, which
+        is why ``_run_admitted`` captures it there rather than at admission.
         """
         observability = getattr(self._engine, "observability", None)
         if observability is None:
@@ -818,9 +827,10 @@ class DaemonServer:
         """Engine-internal surfacing timeouts recorded so far.
 
         Sibling of :meth:`_surfacing_retrieval_count`, read the same way and
-        deterministic for the same reason (the daemon wires a real
-        ``SurfacingObservability`` and serializes surface calls, so a
-        before/after comparison spans exactly one request).
+        deterministic for the same reason: the daemon wires a real
+        ``SurfacingObservability``, and ``_run_admitted`` brackets the
+        before/after reads around ``operation()`` *inside* ``_surface_lock``,
+        so the window spans exactly one request even while others are queued.
         """
         observability = getattr(self._engine, "observability", None)
         if observability is None:

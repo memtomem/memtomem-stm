@@ -307,6 +307,55 @@ async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path:
     assert surface_latency["samples"] == 0
 
 
+async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path: Path) -> None:
+    # Admissions overlap (max_pending_requests=32) even though execution is
+    # serialized. A "before" counter read at admission time would let a request
+    # that only *waited* through someone else's timeout be filed as a timeout —
+    # dropping its real duration from the percentiles, in exactly the scenario
+    # (a slow LTM) where the recommendation matters most.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    timeouts = 0
+    slow_started = asyncio.Event()
+    slow_may_finish = asyncio.Event()
+
+    async def times_out_internally() -> dict[str, object]:
+        nonlocal timeouts
+        slow_started.set()
+        await slow_may_finish.wait()
+        timeouts += 1
+        return surface_response({})
+
+    async def healthy() -> dict[str, object]:
+        return surface_response({})
+
+    deadline = asyncio.get_running_loop().time() + 5.0
+    first = asyncio.create_task(
+        server._run_admitted(
+            {"deadline_monotonic": deadline},
+            times_out_internally,
+            latency_kind="surface",
+            timeout_counter=lambda: timeouts,
+        )
+    )
+    await slow_started.wait()
+    second = asyncio.create_task(
+        server._run_admitted(
+            {"deadline_monotonic": deadline},
+            healthy,
+            latency_kind="surface",
+            timeout_counter=lambda: timeouts,
+        )
+    )
+    await asyncio.sleep(0.05)  # let the second request reach the lock and wait
+    slow_may_finish.set()
+    await asyncio.gather(first, second)
+
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["timeout_samples"] == 1  # only the call that timed out
+    assert surface_latency["samples"] == 1  # the healthy call kept its duration
+
+
 async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) -> None:
     # Admitted (deadline not yet expired) but too little left for a round trip.
     # Starting one would only cancel the adapter mid-RPC and force a stdio child
