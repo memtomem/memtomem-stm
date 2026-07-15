@@ -4421,6 +4421,15 @@ class TestRegisterCommand:
                 {"transport": {**_CODEX_STDIO_TRANSPORT, "proxy_url": "http://p"}},
                 "transport.proxy_url (unrecognised)",
             ),
+            # An unknown field blocks whatever it holds: an explicitly empty
+            # value need not mean what an omitted one means, and the rebuilt
+            # command drops the key either way.
+            ({"sandbox_policy": None}, "sandbox_policy (unrecognised)"),
+            ({"future_list": []}, "future_list (unrecognised)"),
+            (
+                {"transport": {**_CODEX_STDIO_TRANSPORT, "future_map": {}}},
+                "transport.future_map (unrecognised)",
+            ),
             # Wrong-typed but falsey: `or []` would have turned these into a
             # valid-looking empty collection and restored a fiction.
             ({"transport": {**_CODEX_STDIO_TRANSPORT, "args": 0}}, "transport.args"),
@@ -4436,20 +4445,20 @@ class TestRegisterCommand:
         assert plan.command is None
         assert blocker in plan.blockers
 
-    def test_codex_restore_plan_tolerates_empty_unknown_fields(self):
-        """Positive control: a schema growing NULLABLE fields must not block everyone."""
+    def test_codex_restore_plan_accepts_the_verified_0_144_3_schema(self):
+        """Positive control: the refusal is about UNKNOWN keys, not null ones.
+
+        Every nullable field the real ``codex mcp get --json`` emits is present
+        and null here. If the allowlist drifted from the shipped schema this
+        would abort every replacement, so it pins the availability side.
+        """
         from memtomem_stm.cli import proxy as proxy_mod
 
-        plan = proxy_mod._codex_restore_plan(
-            {
-                **_CODEX_STDIO_SNAPSHOT,
-                "future_field": None,
-                "future_list": [],
-                "transport": {**_CODEX_STDIO_TRANSPORT, "future_map": {}},
-            }
-        )
+        plan = proxy_mod._codex_restore_plan(_CODEX_STDIO_SNAPSHOT)
         assert plan.blockers == ()
         assert plan.command is not None
+        assert set(_CODEX_STDIO_SNAPSHOT) <= proxy_mod._CODEX_KNOWN_TOP
+        assert set(_CODEX_STDIO_TRANSPORT) <= proxy_mod._CODEX_KNOWN_STDIO_TRANSPORT
 
     def test_codex_restore_plan_rebuilds_stdio_env_and_args(self):
         """Restorable snapshots round-trip; env values never reach `blockers`."""
