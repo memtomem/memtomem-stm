@@ -535,7 +535,7 @@ async def test_compose_failure_is_classified_without_legacy_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compose_contract_break_warns_once_per_episode(
+async def test_compose_contract_break_warns_once_per_engine(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Adapter:
