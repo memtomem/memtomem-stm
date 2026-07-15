@@ -238,13 +238,18 @@ class TestSchemaParserConformance:
     | duplicate tool_key, differing rows   | accept | reject |
     | graph_state.generation as 1.0        | accept | reject |
 
-    The accept/reject asymmetries are deliberate on two rows — an unknown reason
-    (forward compatibility, ``tool_eligibility._TOOLGRAPH_REASON_MAP``) and a
-    free-string profile (``ToolgraphConfig.query_profile``).
+    Since toolgraph#41 the parser-tolerant rows split three ways:
 
-    The parser-tolerant rows are no longer *undocumented* tolerance: toolgraph#41
-    made the schema state which fields a consumer MAY ignore, so this parser's
-    leniency is now the contract rather than an accident of implementation.
+    - **Contract-blessed** — the schema's MAY-ignore prose now covers tolerating
+      ``created_at`` (any state), an absent ``risk_score``, an unknown reason on
+      a rejected row (generic mapping via
+      ``tool_eligibility._TOOLGRAPH_REASON_MAP``), a non-string reason on an
+      eligible row, and ``paths`` in any state.
+    - **Deliberate local design, not blessed** — a free-string profile
+      (``ToolgraphConfig.query_profile``); the schema enum is unconditional.
+    - **Local leniency, not blessed** — extra ``graph_state`` keys; the schema
+      declares that object closed by design (extending it is a schema_version
+      bump), so this parser is simply more tolerant than the contract asks.
 
     Duplicate ``tool_key`` is likewise no longer a divergence in substance. The
     contract now declares such a bundle invalid and says consumers MUST NOT
