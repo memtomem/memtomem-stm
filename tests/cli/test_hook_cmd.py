@@ -50,18 +50,25 @@ from memtomem_stm.cli.proxy import cli
 from memtomem_stm.config import HookCompressionConfig
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from tests.helpers import set_home
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _hermetic_hook_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """Daemon mode is on by default now (``HookConfig.use_daemon=True``), so any
     ``mms hook`` / ``_run_hook`` call here would otherwise read the real
     ``~/.memtomem`` handshake and fire-and-forget ``Popen`` a detached daemon.
-    Isolate state to a tmp dir and neutralize the spawn so these CLI tests never
-    touch the dev box's daemon or leak a subprocess. (Spawn behavior itself is
-    covered in tests/daemon/test_server.py.)"""
-    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+    Isolate daemon state, HOME, and the independently configured proxy metrics
+    DB, then neutralize the spawn so these CLI tests never touch developer state
+    or leak a subprocess. (Spawn behavior itself is covered in
+    tests/daemon/test_server.py.)"""
+    home = tmp_path / "home"
+    metrics_db = tmp_path / "metrics" / "proxy_metrics.db"
+    set_home(monkeypatch, home)
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path / "daemon"))
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__METRICS__DB_PATH", str(metrics_db))
     monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: None)
+    return metrics_db, home
 
 
 # ── Fakes (mirror tests/test_surfacing_engine.py shapes) ─────────────────────
@@ -765,6 +772,35 @@ def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path:
     assert row["original_chars"] == 4000
     assert row["compressed_chars"] == 4000
     assert row["saved_ratio"] == 0.0
+
+
+def test_orchestrate_writes_metrics_only_to_hermetic_db(
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """The real config path must stay inside the fixture, not ``~/.memtomem``.
+
+    Unlike the unit tests above, this exercises ``STMConfig()`` construction in
+    ``_orchestrate`` so a missing metrics-path override cannot silently write a
+    fixture row into the developer's live metrics history.
+    """
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    metrics_db, home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+
+    out = asyncio.run(_orchestrate(_bash_payload({"stdout": _BIG_STDOUT}), ClaudeHookAdapter()))
+
+    assert out == {}
+    summary = read_compression_summary(metrics_db, source="hook")
+    assert summary["total_calls"] == 1
+    row = summary["by_tool"][0]
+    assert (row["server"], row["tool"]) == ("builtin", "Bash")
+    assert row["original_chars"] == len(_BIG_STDOUT)
+    assert row["compressed_chars"] == len(_BIG_STDOUT)
+    assert not (home / ".memtomem" / "proxy_metrics.db").exists()
 
 
 def test_record_hook_metrics_disabled_writes_nothing(tmp_path: Path):
