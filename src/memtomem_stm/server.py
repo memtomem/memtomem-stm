@@ -1002,6 +1002,55 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
                 f"bundle digest: {status.get('bundle_digest')}"
             )
             lines.append(f"  review would-block calls: {status.get('would_block_calls', 0)}")
+    if not status["withholding_all"]:
+        # Also render under review-mode DEGRADED: the last-known-good snapshot
+        # is still enforcing and still rebinds against a changing catalog, so
+        # an all-bind failure there is live, not history. Fail-closed is the one
+        # state to skip — nothing is withheld for a binding reason (the manager
+        # clears the diagnosis when that supersedes binding, so this is belt and
+        # braces).
+        lines.extend(_toolgraph_bind_failure_lines(status))
+    return lines
+
+
+# Cause → the one thing an operator should go check. A catalog-wide bind
+# failure is almost never N independent problems; naming the likely single
+# cause is the whole point of surfacing this at all.
+_BIND_FAILURE_HINTS: dict[str, str] = {
+    "unmapped": (
+        "the bundle maps none of them — check that toolgraph.server_name_map "
+        "matches the server names Toolgraph crawled"
+    ),
+    "drifted": (
+        "every contract digest disagrees — the bundle is likely built from a "
+        "stale catalog, or its producer's digest algorithm no longer matches "
+        "this STM version"
+    ),
+    "mixed": (
+        "none of them bind — check toolgraph.server_name_map and republish the "
+        "bundle from the current catalog"
+    ),
+}
+
+
+def _toolgraph_bind_failure_lines(status: dict) -> list[str]:
+    """Name the likely cause when policy binding rejected the WHOLE catalog.
+
+    Without this the posture reads as ordinary enforcement: under ``strict``
+    every tool is withheld, and ``external_reject_count`` alone cannot tell a
+    mass misconfiguration from a catalog of deliberate denials.
+    """
+    cause = status.get("all_bind_failure")
+    if not cause:
+        return []
+    stats = status.get("bind_stats") or {}
+    total = stats.get("catalog_total", 0)
+    hint = _BIND_FAILURE_HINTS.get(cause, "check toolgraph.server_name_map and the bundle")
+    lines = [f"  ALL {total} live tool(s) failed to bind: {hint}"]
+    if cause == "mixed":
+        lines.append(
+            f"  ({stats.get('stm_unmapped', 0)} unmapped, {stats.get('stm_drifted', 0)} drifted)"
+        )
     return lines
 
 
