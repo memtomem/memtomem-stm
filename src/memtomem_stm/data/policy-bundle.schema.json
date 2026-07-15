@@ -5,29 +5,57 @@
   "description": "Portable advisory policy decisions for one agent and profile. Consumers enforce the decisions; Toolgraph does not proxy calls.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["schema_version", "kind", "created_at", "graph_state", "agent", "agent_found", "profile", "governance_digest", "catalog_digest", "tools"],
+  "required": [
+    "schema_version",
+    "kind",
+    "created_at",
+    "graph_state",
+    "agent",
+    "agent_found",
+    "profile",
+    "governance_digest",
+    "catalog_digest",
+    "tools"
+  ],
   "properties": {
     "schema_version": {"const": 1},
     "kind": {"const": "toolgraph.policy-bundle"},
-    "created_at": {"type": "string", "format": "date-time"},
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp with a UTC offset. Producer obligation; consumers MAY ignore it."
+    },
     "graph_state": {"$ref": "#/$defs/graphState"},
     "agent": {"type": "string", "minLength": 1},
     "agent_found": {"const": true},
     "profile": {"enum": ["strict", "review", "explore"]},
     "governance_digest": {"$ref": "#/$defs/sha256"},
     "catalog_digest": {"$ref": "#/$defs/sha256"},
-    "tools": {"type": "array", "items": {"$ref": "#/$defs/toolDecision"}}
+    "tools": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/toolDecision"},
+      "uniqueItems": true,
+      "description": "One decision per exposed tool. tool_key values are unique across this array: the producer fails compilation rather than emit a duplicate, and a bundle containing one is invalid — consumers MUST NOT choose between conflicting rows and SHOULD reject the whole bundle. uniqueItems only backstops exact duplicate rows; the tool_key contract is stricter."
+    }
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-    "qualifiedToolKey": {"type": "string", "pattern": "^[^:]+::[^:]+$"},
+    "qualifiedToolKey": {
+      "type": "string",
+      "pattern": "^[^:]+::[^:]+$"
+    },
     "graphState": {
       "type": "object",
       "additionalProperties": false,
       "required": ["instance_id", "generation"],
+      "description": "Collision-safe cache identity. Closed by design (additionalProperties: false): adding any field here is a schema_version-bump event, never an additive change.",
       "properties": {
         "instance_id": {"type": "string", "minLength": 1},
-        "generation": {"type": "integer", "minimum": 0}
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Graph mutation counter. Producers emit a JSON integer literal (7, never 7.0); strict consumers MAY reject an integral-float encoding even though JSON Schema treats it as an integer."
+        }
       }
     },
     "toolDecision": {
@@ -38,11 +66,36 @@
         "tool_key": {"$ref": "#/$defs/qualifiedToolKey"},
         "tool_contract_digest": {"$ref": "#/$defs/sha256"},
         "decision": {"enum": ["eligible", "rejected"]},
-        "reason": {"enum": ["TOOL_NOT_FOUND", "AMBIGUOUS_TOOL", "NOT_GRANTED", "DENY_VIOLATION", "DENY_GOVERNED", "DRIFTED", "UNMAPPED"]},
-        "risk_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "paths": {"type": "array", "items": {"type": "string"}}
+        "reason": {
+          "description": "Producers MUST emit a reason on every rejected decision and never emit one on an eligible decision. Consumers MAY treat an unrecognized reason as a generic rejection rather than fail — the rejection still stands — and MAY drop or normalize a reason found on an eligible decision.",
+          "enum": [
+            "TOOL_NOT_FOUND",
+            "AMBIGUOUS_TOOL",
+            "NOT_GRANTED",
+            "DENY_VIOLATION",
+            "DENY_GOVERNED",
+            "DRIFTED",
+            "UNMAPPED"
+          ]
+        },
+        "risk_score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Required of producers; null when unranked. Advisory: consumers MAY ignore it and MAY normalize an absent value to null."
+        },
+        "paths": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Optional redacted evidence, emitted only for deny-path rejections. Advisory: consumers MAY ignore this field."
+        }
       },
-      "allOf": [{"if": {"properties": {"decision": {"const": "rejected"}}}, "then": {"required": ["reason"]}}]
+      "allOf": [
+        {
+          "if": {"properties": {"decision": {"const": "rejected"}}},
+          "then": {"required": ["reason"]}
+        }
+      ]
     }
   }
 }
