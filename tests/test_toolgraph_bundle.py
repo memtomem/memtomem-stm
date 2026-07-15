@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,8 +28,10 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_DRIFTED,
     REASON_TOOLGRAPH_UNMAPPED,
 )
+from memtomem_stm.proxy import toolgraph_bundle as toolgraph_bundle_mod
 from memtomem_stm.proxy.toolgraph_bundle import (
     PolicyBundleError,
+    bundle_provenance_warnings,
     canonical_json_bytes,
     parse_policy_bundle,
     tool_contract_digest,
@@ -826,3 +829,131 @@ class TestBindFailureHealthRendering:
         )
         assert "DEGRADED" in text
         assert "toolgraph.server_name_map" in text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission semantics")
+class TestBundleProvenanceAdvisory:
+    """The bundle is unsigned enforcement authority: who can replace it matters.
+
+    Every case here is about *write* access, never read access -- a 0644 bundle
+    holds no secrets and must stay silent.
+    """
+
+    def test_a_normal_private_bundle_is_silent(self, tmp_path):
+        """Positive control: the default install must not cry wolf."""
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        tmp_path.chmod(0o755)
+        assert bundle_provenance_warnings(bundle) == []
+
+    def test_world_readable_is_not_a_finding(self, tmp_path):
+        """0644 is fine -- this check is about substitution, not secrecy."""
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        assert bundle_provenance_warnings(bundle) == []
+
+    @pytest.mark.parametrize("mode", [0o666, 0o622, 0o646])
+    def test_group_or_world_writable_file_is_a_finding(self, tmp_path, mode):
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(mode)
+        findings = bundle_provenance_warnings(bundle)
+        assert any("writable by group/other" in f for f in findings)
+
+    def test_symlink_is_a_finding(self, tmp_path):
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = tmp_path / "policy-bundle.json"
+        link.symlink_to(real)
+        findings = bundle_provenance_warnings(link)
+        assert any("symlink" in f for f in findings)
+
+    def test_world_writable_parent_lets_the_bundle_be_replaced(self, tmp_path):
+        home = tmp_path / "toolgraph"
+        home.mkdir()
+        bundle = home / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        home.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any("can be replaced" in f and str(home) in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
+    def test_sticky_world_writable_parent_is_not_a_finding(self, tmp_path):
+        """Positive control: /tmp-style dirs already stop non-owners renaming."""
+        home = tmp_path / "sticky"
+        home.mkdir()
+        bundle = home / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        home.chmod(0o1777)
+        try:
+            assert bundle_provenance_warnings(bundle) == []
+        finally:
+            home.chmod(0o755)
+
+    def test_a_grandparent_is_walked_too(self, tmp_path):
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        bundle = inner / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        outer.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(outer) in f and "can be replaced" in f for f in findings)
+        finally:
+            outer.chmod(0o755)
+
+    def test_foreign_owner_is_a_finding(self, tmp_path, monkeypatch):
+        """Another user owning the file can chmod and rewrite it at will."""
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        # Pretend we are a different uid than the one that owns the tree.
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "geteuid", lambda: 999999)
+        findings = bundle_provenance_warnings(bundle)
+        assert any("not by this process or root" in f for f in findings)
+
+    def test_a_missing_bundle_is_not_this_diagnostic_s_problem(self, tmp_path):
+        assert bundle_provenance_warnings(tmp_path / "absent.json") == []
+
+    def test_windows_is_a_noop(self, tmp_path, monkeypatch):
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o666)
+        assert bundle_provenance_warnings(bundle), "sanity: POSIX would flag this"
+        monkeypatch.setattr(toolgraph_bundle_mod.sys, "platform", "win32")
+        assert bundle_provenance_warnings(bundle) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission semantics")
+class TestBundleProvenanceWiring:
+    def test_adopting_an_exposed_bundle_warns_once_per_finding_set(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        _write_bundle(bundle_path, _bundle(tool))
+        tmp_path.chmod(0o777)
+        try:
+            with caplog.at_level("WARNING"):
+                manager._refresh_toolgraph_bundle(force=True)
+                manager._refresh_toolgraph_bundle(force=True)
+            assert caplog.text.count("not protected from substitution") == 1
+            # Advisory: the bundle is adopted regardless.
+            assert manager._toolgraph_policy_snapshot is not None
+            assert manager._toolgraph_withhold_all is None
+        finally:
+            tmp_path.chmod(0o755)
+
+    def test_a_safe_bundle_stays_silent(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        _write_bundle(bundle_path, _bundle(tool))
+        tmp_path.chmod(0o755)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert "not protected from substitution" not in caplog.text

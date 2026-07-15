@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat as stat_module
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +30,83 @@ _TOOL_KEY_RE = re.compile(r"^[^:]+::[^:]+$")
 
 class PolicyBundleError(ValueError):
     """The artifact cannot be trusted as an enforcement snapshot."""
+
+
+def bundle_provenance_warnings(path: Path) -> list[str]:
+    """Advisory: name the ways *path* could be swapped for someone else's policy.
+
+    The bundle is the gateway's entire enforcement authority and carries no
+    signature — ``bundle_digest`` identifies bytes, it does not authenticate
+    them. Whoever can write the file, or rename any directory above it, decides
+    what this proxy will and will not expose. Nothing else stands in the way.
+
+    This asks only "who can *replace* this?", never "who can read it?". A
+    world-readable ``0644`` bundle is perfectly fine — it holds no secrets. That
+    is why ``config.py``'s ``_permissive_mode`` is deliberately not reused here:
+    it is a secrecy check (it flags any group/world READ bit), so it would both
+    cry wolf over ``0644`` and miss a world-writable parent directory.
+
+    **Advisory only.** Findings are logged; the bundle is still adopted. Turning
+    an insecure bundle into a startup refusal under ``strict`` is a separate
+    decision with its own blast radius — it would fail a proxy closed over a
+    directory mode, which may be an intentional deployment property — so it waits
+    on evidence that this fires on real installs (#707).
+
+    POSIX-only. Windows reports permission bits that do not mean this and a
+    constant ``st_uid``, so every check below would be vacuous or misfire.
+    Returns ``[]`` there, and on any stat failure — a bundle we cannot inspect
+    is the reload path's problem to report, not this diagnostic's.
+    """
+    if sys.platform == "win32":
+        return []
+    target = path.expanduser()
+    findings: list[str] = []
+    euid = os.geteuid()
+    try:
+        link_info = os.lstat(target)
+    except OSError:
+        return []
+    if stat_module.S_ISLNK(link_info.st_mode):
+        # The link's own directory decides where this points: whoever can write
+        # it can aim the gateway at a policy of their choosing without ever
+        # touching the file we validated.
+        findings.append(f"{target} is a symlink; whoever can rewrite it chooses the policy")
+    try:
+        info = os.stat(target)
+    except OSError:
+        return findings
+    if info.st_mode & 0o022:
+        findings.append(
+            f"{target} is writable by group/other (mode {stat_module.S_IMODE(info.st_mode):04o})"
+        )
+    if info.st_uid not in (euid, 0):
+        findings.append(f"{target} is owned by uid {info.st_uid}, not by this process or root")
+    findings.extend(_replaceable_ancestors(target, euid))
+    return findings
+
+
+def _replaceable_ancestors(target: Path, euid: int) -> list[str]:
+    """Directories above *target* that let a third party substitute the bundle.
+
+    Walked to the root, not just the immediate parent: renaming *any* ancestor
+    is enough to put a different file at the same path. The sticky bit is
+    honoured — a world-writable ``/tmp`` with ``S_ISVTX`` still lets only an
+    entry's owner rename it, which is exactly the case the bit exists for.
+    """
+    findings: list[str] = []
+    for parent in target.parents:
+        try:
+            info = os.stat(parent)
+        except OSError:
+            break
+        if info.st_mode & 0o022 and not info.st_mode & stat_module.S_ISVTX:
+            findings.append(
+                f"{parent} is writable by group/other "
+                f"(mode {stat_module.S_IMODE(info.st_mode):04o}), so the bundle can be replaced"
+            )
+        if info.st_uid not in (euid, 0):
+            findings.append(f"{parent} is owned by uid {info.st_uid}, not by this process or root")
+    return findings
 
 
 @dataclass(frozen=True, slots=True)
