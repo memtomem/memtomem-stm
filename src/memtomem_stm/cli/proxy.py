@@ -568,6 +568,173 @@ def _remove_from_codex(name: str = "memtomem-stm") -> bool:
         return False
 
 
+# Fields ``codex mcp get --json`` reports that ``codex mcp add`` has no flag
+# for, mapped to the user-facing name we print when refusing to replace. A
+# registration carrying any of these cannot be rebuilt from the captured
+# snapshot, so replacing it is a one-way destruction (verified against
+# ``codex mcp add --help`` / ``codex mcp get --json``, codex-cli 0.144.3).
+# ``add`` covers only: stdio ``-- command args`` + ``--env KEY=VALUE``, or
+# ``--url`` + ``--bearer-token-env-var``.
+_CODEX_UNREPRODUCIBLE_TOP: dict[str, str] = {
+    "enabled_tools": "enabled_tools",
+    "disabled_tools": "disabled_tools",
+    "startup_timeout_sec": "startup_timeout_sec",
+    "tool_timeout_sec": "tool_timeout_sec",
+}
+_CODEX_UNREPRODUCIBLE_TRANSPORT: dict[str, str] = {
+    "cwd": "transport.cwd",
+    "env_vars": "transport.env_vars",
+}
+# Every key of the 0.144.3 schema we have actually reasoned about. A field
+# outside these sets is one a NEWER codex added: we cannot know whether it
+# carries restorable state, and ignoring it is exactly the lossy-restore
+# failure this preflight exists to prevent. So an unrecognised field blocks the
+# replacement REGARDLESS of its value — an explicitly empty value need not mean
+# the same thing as an omitted one (``[]`` = "deny everything" vs. absent =
+# "inherit the default" is an ordinary way for a config schema to grow), and the
+# rebuilt command omits the key either way. The cost is that a codex release
+# adding any field aborts ``--replace-registration`` until this allowlist is
+# updated; that abort is loud, leaves the registration untouched, and tells the
+# user how to proceed — which is the trade this whole preflight exists to make.
+# ``auth_status`` is reported by ``codex mcp list --json`` but not ``get``; it is
+# derived state, not configuration.
+_CODEX_KNOWN_TOP = frozenset(
+    {
+        "name",
+        "enabled",
+        "disabled_reason",
+        "transport",
+        "auth_status",
+        *_CODEX_UNREPRODUCIBLE_TOP,
+    }
+)
+_CODEX_KNOWN_STDIO_TRANSPORT = frozenset({"type", "command", "args", "env", "env_vars", "cwd"})
+
+
+@dataclass(frozen=True)
+class _CodexRestorePlan:
+    """How (or whether) a captured Codex registration can be rebuilt.
+
+    ``command`` is ``None`` when the snapshot carries settings ``codex mcp
+    add`` cannot express — ``blockers`` then names those fields. The command
+    embeds ``--env KEY=VALUE`` pairs, so it is **never** echoed or logged:
+    only :attr:`blockers` (field names, no values) is user-facing.
+    """
+
+    command: list[str] | None
+    blockers: tuple[str, ...]
+
+
+def _capture_codex_registration(name: str = "memtomem-stm") -> dict[str, Any] | None:
+    """Return the parsed ``codex mcp get --json`` snapshot, or None.
+
+    None means the snapshot is unusable for rollback — the CLI is missing,
+    errored, timed out, or emitted something other than a JSON object. It
+    deliberately does **not** distinguish "not registered", because every
+    such case has the same consequence for the caller: there is nothing it
+    can promise to restore.
+    """
+    try:
+        result = _run_codex_mcp(["codex", "mcp", "get", name, "--json"])
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _unknown_fields(obj: dict[str, Any], known: frozenset[str], prefix: str) -> list[str]:
+    """Name every key of *obj* we have not reasoned about.
+
+    A key outside the allowlist may be configuration a newer codex persists, and
+    the rebuilt ``codex mcp add`` would drop it. The value cannot settle that —
+    an explicitly empty one may still differ from an omitted one — so every
+    unknown key blocks, whatever it holds.
+    """
+    return [f"{prefix}{key} (unrecognised)" for key in obj if key not in known]
+
+
+def _codex_restore_plan(payload: dict[str, Any], name: str = "memtomem-stm") -> _CodexRestorePlan:
+    """Plan an exact ``codex mcp add`` rebuild of a captured registration.
+
+    Conservative by construction: anything not positively recognised as
+    reproducible becomes a blocker. A lossy "restore" would silently hand the
+    user back a *different* registration than the one we removed, which is
+    worse than refusing to touch it.
+    """
+    blockers: list[str] = []
+    for key, label in _CODEX_UNREPRODUCIBLE_TOP.items():
+        if payload.get(key) not in (None, [], {}):
+            blockers.append(label)
+    blockers.extend(_unknown_fields(payload, _CODEX_KNOWN_TOP, ""))
+    # ``add`` always writes an enabled entry; a disabled one cannot come back.
+    if payload.get("enabled") is not True:
+        blockers.append("enabled=false")
+
+    transport = payload.get("transport")
+    if not isinstance(transport, dict):
+        blockers.append("transport")
+        return _CodexRestorePlan(None, tuple(sorted(set(blockers))))
+    for key, label in _CODEX_UNREPRODUCIBLE_TRANSPORT.items():
+        if transport.get(key) not in (None, [], {}):
+            blockers.append(label)
+
+    command: list[str] | None = None
+    kind = transport.get("type")
+    if kind == "stdio":
+        blockers.extend(_unknown_fields(transport, _CODEX_KNOWN_STDIO_TRANSPORT, "transport."))
+        cmd = transport.get("command")
+        # Default ONLY a literal null. `or []` would swallow a wrong-typed
+        # falsey value (``"args": 0``) into a valid-looking empty list and
+        # restore a registration that never existed.
+        args = [] if transport.get("args") is None else transport.get("args")
+        env = {} if transport.get("env") is None else transport.get("env")
+        if not isinstance(cmd, str) or not cmd:
+            blockers.append("transport.command")
+        elif not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            blockers.append("transport.args")
+        elif not isinstance(env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+        ):
+            blockers.append("transport.env")
+        else:
+            command = ["codex", "mcp", "add", name]
+            for key, value in env.items():
+                command.extend(["--env", f"{key}={value}"])
+            command.extend(["--", cmd, *args])
+    elif kind == "streamable_http":
+        # `codex mcp add` accepts --oauth-client-id / --oauth-resource and
+        # persists them to config.toml, but `codex mcp get --json` reports
+        # NEITHER (verified on codex-cli 0.144.3: the fields land under
+        # `[mcp_servers.<n>.oauth]` yet the JSON transport carries only url /
+        # bearer_token_env_var / http_headers / env_http_headers). So the
+        # snapshot cannot tell an OAuth registration from a plain one, and a
+        # "successful" restore would silently drop the OAuth config. Absence
+        # of evidence is not evidence of absence — refuse the whole transport
+        # rather than replace what we cannot prove we can rebuild.
+        blockers.append("transport.type='streamable_http' (OAuth state is not readable)")
+    else:
+        blockers.append(f"transport.type={kind!r}")
+
+    if blockers:
+        return _CodexRestorePlan(None, tuple(sorted(set(blockers))))
+    return _CodexRestorePlan(command, ())
+
+
+def _restore_codex_registration(plan: _CodexRestorePlan) -> bool:
+    """Best-effort rollback of a removed registration; True when restored."""
+    if plan.command is None:
+        return False
+    try:
+        return _run_codex_mcp(plan.command).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _write_mcp_json_for_stm(
     target_dir: Path,
     server_cmd: str,
@@ -750,10 +917,32 @@ def _run_mcp_integration(
     server_cmd, server_args, server_env = _registration_command(config_path)
     if client_mode == "codex":
         _SETUP_RESOLVED_CLIENT.set("codex")
+        restore: _CodexRestorePlan | None = None
         if _codex_registered():
             if not replace_registration:
                 click.echo(f"  {_ok('Kept existing Codex registration.')}")
                 return
+            # Replacing is remove-then-add, and ``add`` can fail. Capture a
+            # rollback FIRST and refuse to remove anything we could not put
+            # back exactly — a failed add would otherwise leave the user with
+            # no registration at all.
+            snapshot = _capture_codex_registration()
+            if snapshot is None:
+                raise click.ClickException(
+                    "could not read the existing Codex registration, so it cannot be "
+                    "restored if the replacement fails; the previous registration was "
+                    "left unchanged. Remove it with `codex mcp remove memtomem-stm` "
+                    "and re-run to replace it anyway"
+                )
+            restore = _codex_restore_plan(snapshot)
+            if restore.command is None:
+                raise click.ClickException(
+                    "the existing Codex registration uses settings `codex mcp add` "
+                    f"cannot reproduce ({', '.join(restore.blockers)}), so it cannot be "
+                    "restored if the replacement fails; the previous registration was "
+                    "left unchanged. Remove it with `codex mcp remove memtomem-stm` "
+                    "and re-run to replace it anyway"
+                )
             if not _remove_from_codex():
                 raise click.ClickException(
                     "could not remove the existing Codex registration; "
@@ -764,7 +953,19 @@ def _run_mcp_integration(
             click.echo(f"  {_ok('Registered with Codex.')}")
         else:
             # Unlike Claude Code, Codex has no local-file registration fallback.
-            raise click.ClickException(reason or "codex mcp add failed")
+            message = reason or "codex mcp add failed"
+            if restore is not None:
+                if _restore_codex_registration(restore):
+                    message += "; restored the previous Codex registration"
+                else:
+                    # The captured command carries --env values, so it is never
+                    # printed — the user re-runs `mms register` instead.
+                    message += (
+                        "; the previous Codex registration was removed and could not "
+                        "be restored — re-run `mms register --client codex` once the "
+                        "failure above is resolved"
+                    )
+            raise click.ClickException(message)
         return
 
     if client_mode == "json":
