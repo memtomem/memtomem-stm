@@ -11,7 +11,13 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
-## [0.1.39] — 2026-07-15
+## [0.1.40] — 2026-07-15
+
+0.1.39 was never published — the version was bumped and a changelog section cut,
+but no tag, GitHub release, or PyPI artifact ever carried it. This release
+supersedes it and contains everything that section described. If you have a
+`0.1.39` wheel from a local build, it predates this release and is not a
+released version.
 
 ### Upgrade notes
 
