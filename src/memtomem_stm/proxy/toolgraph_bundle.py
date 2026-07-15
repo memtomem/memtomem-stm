@@ -175,7 +175,7 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
     components appended, recursively, bounded by ``_MAX_SYMLINK_HOPS``.
     """
     findings: list[str] = []
-    reported: set[Path] = set()
+    reported: set[tuple[int, int]] = set()
     _scan_for_links(configured, euid, findings, reported, [_MAX_SYMLINK_HOPS])
     return findings
 
@@ -184,7 +184,7 @@ def _scan_for_links(
     path: Path,
     euid: int,
     findings: list[str],
-    reported: set[Path],
+    reported: set[tuple[int, int]],
     budget: list[int],
 ) -> None:
     """Resolve *path* one component at a time, reporting re-pointable links."""
@@ -200,9 +200,13 @@ def _scan_for_links(
             continue
         if budget[0] <= 0:
             return
+        # Budget burns per traversal, dedup keys on the entry: one link reached
+        # by two spellings (``link/../link/x``) is one fact to report but two
+        # hops the kernel really walks.
         budget[0] -= 1
-        if current not in reported:
-            reported.add(current)
+        entry = (info.st_dev, info.st_ino)
+        if entry not in reported:
+            reported.add(entry)
             finding = _link_finding(current, info, euid)
             if finding:
                 findings.append(finding)

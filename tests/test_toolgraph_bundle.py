@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 from importlib.resources import files
@@ -1139,9 +1141,15 @@ class TestBundleProvenanceAdvisory:
         )
         if added.returncode != 0:  # pragma: no cover - filesystem without ACLs
             pytest.skip("filesystem does not support ACLs")
-        assert subprocess.run(
-            ["ls", "-le", str(bundle)], capture_output=True, text=True
-        ).stdout.count("everyone allow write"), "fixture: the ACL is really there"
+        # Assert the ACL stuck, NOT how it prints: `ls -le` renders the
+        # principal as `group:everyone` on some macOS hosts and as its
+        # well-known UUID on others, so matching the name passes only where it
+        # happens to be spelled that way.
+        listing = subprocess.run(["ls", "-le", str(bundle)], capture_output=True, text=True).stdout
+        assert re.search(r"^\s*\d+:.*\ballow\b", listing, re.MULTILINE), (
+            f"fixture: the ACL is really there -- got {listing!r}"
+        )
+        assert stat.S_IMODE(bundle.stat().st_mode) == 0o644, "fixture: mode still looks private"
         assert bundle_provenance_warnings(bundle) == [], (
             "mode/uid analysis cannot see ACLs -- if this ever starts failing, the "
             "scope note in bundle_provenance_warnings' docstring is now wrong"
@@ -1185,6 +1193,23 @@ class TestBundleProvenanceAdvisory:
         bundle = a / "policy-bundle.json"
         bundle.symlink_to(b / "link2")
         assert bundle_provenance_warnings(bundle) == []
+
+    def test_one_link_reached_by_two_spellings_reports_once(self, tmp_path):
+        """`link/../link/x` traverses the same entry twice; it is one fact."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        real = sub / "policy-bundle.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (tmp_path / "link").symlink_to(sub)
+        tmp_path.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(
+                tmp_path / "link" / ".." / "link" / "policy-bundle.json"
+            )
+            assert len([f for f in findings if "re-pointed" in f]) == 1
+        finally:
+            tmp_path.chmod(0o755)
 
     def test_a_symlink_cycle_terminates(self, tmp_path):
         """A loop must exhaust the hop budget, not the stack."""
