@@ -1024,8 +1024,7 @@ def _run_mcp_integration(
             click.echo(f"  {_ok('Wrote')} {mcp_path}")
         else:
             click.echo(
-                f"  {_ok('Kept existing registration')} "
-                "(use --replace-registration to refresh)"
+                f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)"
             )
         _emit_mcp_paste_hints()
         return
@@ -1086,10 +1085,7 @@ def _run_mcp_integration(
     if written:
         click.echo(f"  {_ok('Wrote')} {mcp_path}")
     else:
-        click.echo(
-            f"  {_ok('Kept existing registration')} "
-            "(use --replace-registration to refresh)"
-        )
+        click.echo(f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)")
     _emit_mcp_paste_hints()
 
 

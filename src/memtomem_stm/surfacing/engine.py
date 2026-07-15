@@ -299,8 +299,9 @@ class SurfacingEngine:
         result_max = max(scores)
         if result_max >= min_score:
             self._score_scale_streaks.pop(key, None)
-            if key not in self._score_scale_recovery_persisted and self._persist_diagnostic_recovery(
-                server, tool, "score_ceiling_below_min"
+            if (
+                key not in self._score_scale_recovery_persisted
+                and self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
             ):
                 self._score_scale_recovery_persisted.add(key)
             return
