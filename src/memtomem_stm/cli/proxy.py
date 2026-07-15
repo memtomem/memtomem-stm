@@ -572,7 +572,7 @@ def _remove_from_codex(name: str = "memtomem-stm") -> bool:
 # for, mapped to the user-facing name we print when refusing to replace. A
 # registration carrying any of these cannot be rebuilt from the captured
 # snapshot, so replacing it is a one-way destruction (verified against
-# ``codex mcp add --help`` / ``codex mcp get --json``, codex-cli 0.5x).
+# ``codex mcp add --help`` / ``codex mcp get --json``, codex-cli 0.144.3).
 # ``add`` covers only: stdio ``-- command args`` + ``--env KEY=VALUE``, or
 # ``--url`` + ``--bearer-token-env-var``.
 _CODEX_UNREPRODUCIBLE_TOP: dict[str, str] = {
@@ -585,6 +585,25 @@ _CODEX_UNREPRODUCIBLE_TRANSPORT: dict[str, str] = {
     "cwd": "transport.cwd",
     "env_vars": "transport.env_vars",
 }
+# Every key of the 0.144.3 schema we have actually reasoned about. A field
+# outside these sets is one a NEWER codex added: we cannot know whether it
+# carries restorable state, and ignoring it is exactly the lossy-restore
+# failure this preflight exists to prevent. So an unrecognised field with a
+# non-empty value blocks the replacement. Null/empty unknowns carry no state
+# and are ignored, which keeps a schema that merely grows nullable fields from
+# blocking every user. ``auth_status`` is reported by ``codex mcp list --json``
+# but not ``get``; it is derived state, not configuration.
+_CODEX_KNOWN_TOP = frozenset(
+    {
+        "name",
+        "enabled",
+        "disabled_reason",
+        "transport",
+        "auth_status",
+        *_CODEX_UNREPRODUCIBLE_TOP,
+    }
+)
+_CODEX_KNOWN_STDIO_TRANSPORT = frozenset({"type", "command", "args", "env", "env_vars", "cwd"})
 
 
 @dataclass(frozen=True)
@@ -623,6 +642,21 @@ def _capture_codex_registration(name: str = "memtomem-stm") -> dict[str, Any] | 
     return payload if isinstance(payload, dict) else None
 
 
+def _unknown_state_fields(obj: dict[str, Any], known: frozenset[str], prefix: str) -> list[str]:
+    """Name unrecognised keys of *obj* that carry state.
+
+    A key we have never reasoned about may be configuration a newer codex
+    persists, and ``codex mcp add`` would not rebuild it. Empty/null values are
+    ignored: they hold nothing to lose, so a schema that merely grows nullable
+    fields must not block every replacement.
+    """
+    return [
+        f"{prefix}{key} (unrecognised)"
+        for key, value in obj.items()
+        if key not in known and value not in (None, [], {}, "")
+    ]
+
+
 def _codex_restore_plan(payload: dict[str, Any], name: str = "memtomem-stm") -> _CodexRestorePlan:
     """Plan an exact ``codex mcp add`` rebuild of a captured registration.
 
@@ -635,6 +669,7 @@ def _codex_restore_plan(payload: dict[str, Any], name: str = "memtomem-stm") -> 
     for key, label in _CODEX_UNREPRODUCIBLE_TOP.items():
         if payload.get(key) not in (None, [], {}):
             blockers.append(label)
+    blockers.extend(_unknown_state_fields(payload, _CODEX_KNOWN_TOP, ""))
     # ``add`` always writes an enabled entry; a disabled one cannot come back.
     if payload.get("enabled") is not True:
         blockers.append("enabled=false")
@@ -650,9 +685,15 @@ def _codex_restore_plan(payload: dict[str, Any], name: str = "memtomem-stm") -> 
     command: list[str] | None = None
     kind = transport.get("type")
     if kind == "stdio":
+        blockers.extend(
+            _unknown_state_fields(transport, _CODEX_KNOWN_STDIO_TRANSPORT, "transport.")
+        )
         cmd = transport.get("command")
-        args = transport.get("args") or []
-        env = transport.get("env") or {}
+        # Default ONLY a literal null. `or []` would swallow a wrong-typed
+        # falsey value (``"args": 0``) into a valid-looking empty list and
+        # restore a registration that never existed.
+        args = [] if transport.get("args") is None else transport.get("args")
+        env = {} if transport.get("env") is None else transport.get("env")
         if not isinstance(cmd, str) or not cmd:
             blockers.append("transport.command")
         elif not isinstance(args, list) or not all(isinstance(a, str) for a in args):

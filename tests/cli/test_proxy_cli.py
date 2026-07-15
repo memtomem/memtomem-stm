@@ -3267,21 +3267,22 @@ class _FakeClaudeResult:
         self.stderr = stderr
 
 
-# Verbatim shape of ``codex mcp get memtomem-stm --json`` (codex-cli 0.5x).
+# Verbatim shape of ``codex mcp get memtomem-stm --json`` (codex-cli 0.144.3).
 # Every field ``codex mcp add`` cannot express is present and null/empty here,
 # which is what makes this snapshot restorable.
+_CODEX_STDIO_TRANSPORT: dict[str, object] = {
+    "type": "stdio",
+    "command": "memtomem-stm",
+    "args": [],
+    "env": None,
+    "env_vars": [],
+    "cwd": None,
+}
 _CODEX_STDIO_SNAPSHOT: dict[str, object] = {
     "name": "memtomem-stm",
     "enabled": True,
     "disabled_reason": None,
-    "transport": {
-        "type": "stdio",
-        "command": "memtomem-stm",
-        "args": [],
-        "env": None,
-        "env_vars": [],
-        "cwd": None,
-    },
+    "transport": _CODEX_STDIO_TRANSPORT,
     "enabled_tools": None,
     "disabled_tools": None,
     "startup_timeout_sec": None,
@@ -4409,6 +4410,46 @@ class TestRegisterCommand:
         assert result.exit_code == 1
         assert "could not read the existing Codex registration" in result.output
         assert not any(c[:3] == ["codex", "mcp", "remove"] for c in calls)
+
+    @pytest.mark.parametrize(
+        ("snapshot_over", "blocker"),
+        [
+            # A newer codex adding a field we never reasoned about must not be
+            # silently dropped on restore -- that is the very loss this refuses.
+            ({"sandbox_policy": "read-only"}, "sandbox_policy (unrecognised)"),
+            (
+                {"transport": {**_CODEX_STDIO_TRANSPORT, "proxy_url": "http://p"}},
+                "transport.proxy_url (unrecognised)",
+            ),
+            # Wrong-typed but falsey: `or []` would have turned these into a
+            # valid-looking empty collection and restored a fiction.
+            ({"transport": {**_CODEX_STDIO_TRANSPORT, "args": 0}}, "transport.args"),
+            ({"transport": {**_CODEX_STDIO_TRANSPORT, "env": ""}}, "transport.env"),
+        ],
+    )
+    def test_codex_restore_plan_refuses_unrecognised_or_malformed_fields(
+        self, snapshot_over, blocker
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        plan = proxy_mod._codex_restore_plan({**_CODEX_STDIO_SNAPSHOT, **snapshot_over})
+        assert plan.command is None
+        assert blocker in plan.blockers
+
+    def test_codex_restore_plan_tolerates_empty_unknown_fields(self):
+        """Positive control: a schema growing NULLABLE fields must not block everyone."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        plan = proxy_mod._codex_restore_plan(
+            {
+                **_CODEX_STDIO_SNAPSHOT,
+                "future_field": None,
+                "future_list": [],
+                "transport": {**_CODEX_STDIO_TRANSPORT, "future_map": {}},
+            }
+        )
+        assert plan.blockers == ()
+        assert plan.command is not None
 
     def test_codex_restore_plan_rebuilds_stdio_env_and_args(self):
         """Restorable snapshots round-trip; env values never reach `blockers`."""
