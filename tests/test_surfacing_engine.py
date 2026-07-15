@@ -424,16 +424,19 @@ class TestSurfacingTimeout:
         assert call_count == 2
 
 
-class TestSurfacingBudget:
-    """``budget_seconds`` — a deadline-bounded caller shrinking this call's timeout.
+class TestSurfacingDeadline:
+    """``deadline_monotonic`` — a deadline-bounded caller capping this call's abort point.
 
     The daemon's client gives up after ``hook.daemon_timeout_seconds``; without a
-    propagated budget it cancels ``surface()`` from outside, which skips the
-    fault/log/breaker bookkeeping that only the internal TimeoutError path does.
+    propagated deadline it cancels ``surface()`` from outside, which skips the
+    fault/log/breaker bookkeeping that only the internal TimeoutError path does
+    (#719). The deadline is absolute so the engine's own pre-timeout work debits
+    the engine's window, and a lost abort race is booked by the CancelledError
+    path instead of relying on the caller's response margin to prevent it (#720).
     """
 
-    async def test_budget_below_config_shortens_the_attempt(self):
-        # The engine must abort on the caller's budget, not run to the
+    async def test_deadline_below_config_shortens_the_attempt(self):
+        # The engine must abort at the caller's deadline, not run to the
         # (much larger) configured ceiling.
         async def slow_search(*args, **kwargs):
             await asyncio.sleep(10)
@@ -448,17 +451,17 @@ class TestSurfacingBudget:
         )
         started = time.monotonic()
         output = await engine.surface(
-            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=0.05
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 0.05
         )
         elapsed = time.monotonic() - started
 
         assert output == LONG_RESPONSE
-        # The ceiling is 600x the budget, so one absolute bound already tells the
+        # The ceiling is 600x the window, so one absolute bound already tells the
         # two apart — an abort at the ceiling would take ~30s.
         assert elapsed < 1.0
 
-    async def test_budget_abort_still_counts_toward_the_breaker(self):
-        # The whole point of propagating the budget instead of cancelling from
+    async def test_deadline_abort_still_counts_toward_the_breaker(self):
+        # The whole point of propagating the deadline instead of cancelling from
         # outside: the timeout stays *inside* surface(), so #579's bookkeeping
         # (fault + breaker) still runs and the breaker eventually opens.
         async def slow_search(*args, **kwargs):
@@ -472,12 +475,18 @@ class TestSurfacingBudget:
             config=_make_config(timeout_seconds=30.0),
             mcp_adapter=adapter,
         )
-        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=0.05)
+        await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.05,
+        )
         assert engine._circuit_breaker.failure_count == 1
 
-    async def test_budget_never_raises_the_configured_ceiling(self):
-        # An over-generous budget must not extend timeout_seconds — the operator
-        # ceiling stays authoritative.
+    async def test_deadline_never_raises_the_configured_ceiling(self):
+        # An over-generous deadline must not extend timeout_seconds — the
+        # operator ceiling stays authoritative.
         async def slow_search(*args, **kwargs):
             await asyncio.sleep(10)
             return [], [], "empty_results"
@@ -490,28 +499,157 @@ class TestSurfacingBudget:
             mcp_adapter=adapter,
         )
         started = time.monotonic()
-        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=30.0)
+        await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 30.0
+        )
         elapsed = time.monotonic() - started
 
         assert elapsed < 1.0
         assert engine._circuit_breaker.failure_count == 1
 
-    @pytest.mark.parametrize("budget", [None, 0.0, -1.0, float("nan"), float("inf")])
-    async def test_unusable_budget_falls_back_to_the_configured_timeout(self, budget):
-        # A non-positive/non-finite budget must not become an instant timeout:
-        # that would persist a fault and open the breaker on a *healthy* LTM.
-        # "No budget left, don't start" is the caller's call, not the engine's.
+    @pytest.mark.parametrize("deadline", [None, 0.0, -1.0, float("nan"), float("inf")])
+    async def test_unusable_deadline_falls_back_to_the_configured_timeout(self, deadline):
+        # A non-positive/non-finite deadline is a caller bug, not elapsed time
+        # (time.monotonic() readings are positive and finite). It must not
+        # become an instant timeout: that would persist a fault and open the
+        # breaker on a *healthy* LTM.
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=7.0),
             mcp_adapter=_make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(), score=0.5)]),
         )
-        assert engine._effective_timeout(budget) == 7.0
+        assert engine._effective_timeout(deadline) == 7.0
 
         output = await engine.surface(
-            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=budget
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=deadline
         )
         assert "Relevant Memories" in output
         assert engine._circuit_breaker.failure_count == 0
+
+    async def test_lost_abort_race_still_books_the_timeout(self):
+        # #720 acceptance: an adapter whose cancellation outlives the caller's
+        # backstop. The engine's own wait_for fires first, but its TimeoutError
+        # cannot propagate until the adapter finishes unwinding — the caller's
+        # outer timeout wins that race and delivers CancelledError instead.
+        # The fault row and the breaker increment must survive anyway.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def slow_cancel_search(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)  # unwind outlives the outer backstop
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=slow_cancel_search)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.25):  # the daemon's outer backstop
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    VALID_ARGS,
+                    LONG_RESPONSE,
+                    deadline_monotonic=time.monotonic() + 0.1,
+                )
+
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
+
+    async def test_cancellation_before_the_deadline_books_nothing(self):
+        # A cancellation while the deadline is still far away is a real one
+        # (daemon shutdown, client gone) — not a timeout. Booking it would
+        # count breaker failures against a healthy LTM.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=slow_search)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        task = asyncio.create_task(
+            engine.surface(
+                "gh",
+                "read_file",
+                VALID_ARGS,
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() + 30.0,
+            )
+        )
+        await asyncio.sleep(0.05)  # let it reach the adapter await
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert obs.snapshot()["outcomes"] == {}
+        assert engine._circuit_breaker.failure_count == 0
+
+    async def test_pre_timeout_work_debits_the_engines_window(self):
+        # #720 race source 1: the deadline is read *after* the gate, query
+        # extraction, and privacy scan, so pre-timeout work shrinks the LTM
+        # attempt instead of pushing the abort past the caller's margin. A
+        # relative budget captured before the pre-work would abort at
+        # ~pre-work + window (0.35s here); the deadline aborts at ~0.2s.
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = slow_search
+
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+        )
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.15)  # stand-in pre-work
+
+        started = time.monotonic()
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 0.2
+        )
+        elapsed = time.monotonic() - started
+
+        assert output == LONG_RESPONSE
+        assert elapsed < 0.3
+        assert engine._circuit_breaker.failure_count == 1
+
+    async def test_window_fully_consumed_books_without_starting_an_rpc(self):
+        # Pre-work ate the entire window: starting an LTM round trip now would
+        # only cancel the adapter mid-RPC (stdio child respawn, #290/#296).
+        # The abort is still booked as a timeout — real time did pass.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        adapter = _make_mcp_adapter()
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.1)  # stand-in pre-work
+
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=time.monotonic() + 0.05
+        )
+
+        assert output == LONG_RESPONSE
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
 
 
 class TestSessionDedup:

@@ -241,24 +241,27 @@ async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
     assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
 
 
-class _BudgetSpyEngine:
-    """Records the ``budget_seconds`` the daemon hands to the engine."""
+class _DeadlineSpyEngine:
+    """Records the ``deadline_monotonic`` the daemon hands to the engine."""
 
     injection_mode = "append"
 
     def __init__(self) -> None:
         self.calls: list[float | None] = []
 
-    async def surface(self, *args, budget_seconds: float | None = None, **kwargs) -> str:
-        self.calls.append(budget_seconds)
+    async def surface(self, *args, deadline_monotonic: float | None = None, **kwargs) -> str:
+        self.calls.append(deadline_monotonic)
         return args[3] if len(args) > 3 else ""
 
 
-async def test_surface_propagates_remaining_deadline_as_budget(tmp_path: Path) -> None:
+async def test_surface_propagates_deadline_minus_response_margin(tmp_path: Path) -> None:
     # Without this, the client's deadline cancels surface() from OUTSIDE, which
     # skips the engine's fault/log/breaker bookkeeping (#579) — so the breaker
     # never opens and every call re-pays the timeout and respawns the LTM child.
-    engine = _BudgetSpyEngine()
+    # It is an absolute deadline (#720): the engine re-reads the clock right
+    # before its LTM attempt, so its own pre-work debits its window, not the
+    # response margin — which is also why the value is exact, not approximate.
+    engine = _DeadlineSpyEngine()
     server = DaemonServer(_config(tmp_path))
     server._engine = engine
     deadline = asyncio.get_running_loop().time() + 1.0
@@ -273,12 +276,11 @@ async def test_surface_propagates_remaining_deadline_as_budget(tmp_path: Path) -
 
     assert response["ok"] is True
     assert len(engine.calls) == 1
-    budget = engine.calls[0]
-    assert budget is not None
-    # Strictly inside the client's remaining time: the engine must abort first,
-    # leaving room to encode and write the response.
-    assert 0 < budget <= 1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS
-    assert budget == pytest.approx(1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS, abs=0.1)
+    # Strictly ahead of the client's give-up point: the engine must abort
+    # first, leaving room to encode and write the response.
+    assert engine.calls[0] == pytest.approx(
+        deadline - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS, abs=1e-6
+    )
 
 
 async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path: Path) -> None:
@@ -360,7 +362,7 @@ async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) 
     # Admitted (deadline not yet expired) but too little left for a round trip.
     # Starting one would only cancel the adapter mid-RPC and force a stdio child
     # respawn on the next call, so the engine must not be touched at all.
-    engine = _BudgetSpyEngine()
+    engine = _DeadlineSpyEngine()
     server = DaemonServer(_config(tmp_path))
     server._engine = engine
     starved = (

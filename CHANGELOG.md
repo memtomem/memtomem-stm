@@ -13,8 +13,20 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- The daemon now hands the surfacing engine the time left in the client's
-  deadline instead of letting that deadline cancel the engine from outside.
+- Closed the race #719 left between the surfacing engine's own timeout and the
+  daemon's outer deadline backstop. The engine now receives the client's
+  deadline as an absolute monotonic point rather than a relative budget, and
+  reads the clock right before its LTM attempt — so its pre-timeout work (gate,
+  query extraction, privacy scan) debits its own window instead of silently
+  eating the fixed response margin. If the backstop still wins the abort — the
+  cancelled LTM adapter is slow to unwind, or the event loop stalls past both
+  timers — the engine books the cancellation as a surfacing timeout
+  (`error_timeout` fault row, warning log, circuit-breaker increment) before
+  re-raising, instead of skipping that bookkeeping exactly as in the silent
+  failure mode #719 removed. A cancellation arriving *before* the deadline
+  (daemon shutdown, client gone) still books nothing, and a window fully
+  consumed by pre-work is booked without starting an LTM round trip that would
+  be cancelled mid-RPC. (#721)
   `hook.daemon_timeout_seconds` (2.5s) is smaller than
   `surfacing.timeout_seconds` (3.0s), so on the daemon path every slow LTM
   search was aborted by the transport before the engine's own timeout could

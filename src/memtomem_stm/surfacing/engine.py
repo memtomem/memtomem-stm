@@ -279,21 +279,32 @@ class SurfacingEngine:
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
 
-    def _effective_timeout(self, budget_seconds: float | None) -> float:
-        """This call's LTM budget: the configured ceiling, lowered to a
-        deadline-bounded caller's remaining time.
+    def _effective_timeout(self, deadline_monotonic: float | None) -> float:
+        """This call's LTM window: the configured ceiling, lowered to what is
+        left of a deadline-bounded caller's absolute deadline.
 
-        ``budget_seconds`` only ever shrinks the window — an operator's
-        ``timeout_seconds`` stays the upper bound. Non-finite or non-positive
-        budgets are ignored rather than turned into an instant timeout: the
-        caller owns the "no budget left, don't start" decision (starting an LTM
-        round trip we cannot finish is what cancels the adapter mid-RPC), and a
-        bad value must not silently open the breaker on a healthy LTM.
+        Reading the clock *here* — after the gate, query extraction, and
+        privacy scan — makes the engine's own pre-timeout work debit its own
+        window instead of the caller's response margin (#720); a relative
+        budget captured before that work silently spent the margin. The
+        deadline only ever shrinks the window — an operator's
+        ``timeout_seconds`` stays the upper bound. ``None``, non-finite, or
+        non-positive values (a ``time.monotonic()`` reading is always
+        positive, so those are caller bugs, not elapsed time) are ignored
+        rather than turned into an instant timeout: a bad value must not
+        silently open the breaker on a healthy LTM. A *plausible* deadline
+        that pre-work has already consumed returns a non-positive remainder —
+        real time did pass, so :meth:`surface` books the timeout without
+        starting an LTM round trip it would have to cancel mid-RPC.
         """
         ceiling = self._config.timeout_seconds
-        if budget_seconds is None or not math.isfinite(budget_seconds) or budget_seconds <= 0:
+        if (
+            deadline_monotonic is None
+            or not math.isfinite(deadline_monotonic)
+            or deadline_monotonic <= 0
+        ):
             return ceiling
-        return min(ceiling, budget_seconds)
+        return min(ceiling, deadline_monotonic - time.monotonic())
 
     def _observe_score_scale(
         self,
@@ -465,7 +476,7 @@ class SurfacingEngine:
         trace_id: str | None = None,
         context_query: str | None = None,
         source_response_chars: int | None = None,
-        budget_seconds: float | None = None,
+        deadline_monotonic: float | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -475,15 +486,19 @@ class SurfacingEngine:
         - relevance gate rejects the call
         - timeout exceeded
 
-        ``budget_seconds`` lets a caller that is itself deadline-bounded (the
-        daemon, whose client gives up after ``hook.daemon_timeout_seconds``)
-        shrink this call's timeout below ``timeout_seconds``. It never *raises*
-        the configured ceiling. Passing it keeps the abort inside :meth:`surface`
-        instead of letting the caller cancel it from outside: only the
+        ``deadline_monotonic`` — an absolute ``time.monotonic()`` point — lets
+        a caller that is itself deadline-bounded (the daemon, whose client
+        gives up after ``hook.daemon_timeout_seconds``) shrink this call's
+        timeout below ``timeout_seconds``. It never *raises* the configured
+        ceiling. Passing it keeps the abort inside :meth:`surface` instead of
+        letting the caller cancel it from outside: only the
         :class:`asyncio.TimeoutError` path below records the fault, logs, and
         counts the failure toward the breaker (#579) — an external cancellation
         skips all three, so the breaker never opens and every subsequent call
-        pays the full timeout and respawns the LTM child again.
+        pays the full timeout and respawns the LTM child again. If the caller's
+        backstop nevertheless wins the abort race (#720), the
+        :class:`asyncio.CancelledError` path books the same timeout before
+        re-raising.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -526,8 +541,15 @@ class SurfacingEngine:
             )
             return response_text
 
-        effective_timeout = self._effective_timeout(budget_seconds)
+        effective_timeout = self._effective_timeout(deadline_monotonic)
         try:
+            if effective_timeout <= 0:
+                # Pre-timeout work (gate, query extraction, privacy scan)
+                # consumed the caller's whole window (#720). Book the abort
+                # through the branch below without starting an LTM round trip
+                # that would be cancelled mid-RPC and force a stdio child
+                # respawn on the next call (#290/#296).
+                raise asyncio.TimeoutError
             result = await asyncio.wait_for(
                 self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
                 timeout=effective_timeout,
@@ -550,6 +572,30 @@ class SurfacingEngine:
             # indefinitely and the breaker never opens.
             self._circuit_breaker.record_failure()
             return response_text
+        except asyncio.CancelledError:
+            # Lost the abort race to the caller's own backstop (#720):
+            # ``wait_for`` only raises ``TimeoutError`` once the cancelled
+            # adapter has finished unwinding, and the caller's outer deadline
+            # (`_run_admitted`'s ``asyncio.timeout_at``) can fire inside that
+            # window — slow cancellation or event-loop starvation. Past the
+            # deadline, the cancellation *is* a surfacing timeout, and this is
+            # the only site that owns the fault/log/breaker bookkeeping; an
+            # unbooked pass-through recreates the silent loop #719 removed. A
+            # cancellation *before* the deadline is a real one (shutdown,
+            # client gone) and books nothing. Always re-raise: the caller's
+            # timeout scope needs the cancellation to resolve itself.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                self._observability.record_outcome(tool, "error_timeout")
+                self._persist_fault(server, tool, "error_timeout")
+                logger.warning(
+                    "Surfacing cancelled past its deadline for %s/%s (%.1fs limit) — "
+                    "booking as timeout",
+                    server,
+                    tool,
+                    effective_timeout,
+                )
+                self._circuit_breaker.record_failure()
+            raise
         except _DependencyFault:
             self._circuit_breaker.record_failure()
             return response_text

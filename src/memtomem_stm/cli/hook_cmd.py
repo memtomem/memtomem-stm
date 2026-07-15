@@ -421,7 +421,7 @@ async def run_surfacing_hook(
     call: "CanonicalHookCall",
     *,
     engine: Any | None = None,
-    budget_seconds: float | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Core hook logic. Returns the hook-output dict (``{}`` means no-op).
 
@@ -430,23 +430,30 @@ async def run_surfacing_hook(
     host-native ``tool_name`` for query extraction. **Never raises** — every
     failure path (disabled surfacing, LTM error/timeout, internal bug) degrades
     to ``{}`` so any caller (the CLI, the daemon) can emit it and let the tool
-    output pass through. ``engine`` is a test seam: when provided it is used
-    as-is (caller owns its lifecycle); when ``None``, an engine + LTM adapter are
-    built from :class:`STMConfig` and torn down before returning.
+    output pass through. The one thing that still propagates is
+    :class:`asyncio.CancelledError` (it is not an ``Exception``): the engine
+    books a past-deadline cancellation as a timeout first (#720), and the
+    caller's timeout scope needs the cancellation to resolve itself. ``engine``
+    is a test seam: when provided it is used as-is (caller owns its lifecycle);
+    when ``None``, an engine + LTM adapter are built from :class:`STMConfig`
+    and torn down before returning.
 
-    ``budget_seconds`` caps this call's LTM attempt for a caller that is itself
-    deadline-bounded (the daemon). ``None`` (the cold in-process path, which owns
-    its whole process) keeps the configured ``surfacing.timeout_seconds``.
+    ``deadline_monotonic`` — an absolute ``time.monotonic()`` point — bounds
+    this call's LTM attempt for a caller that is itself deadline-bounded (the
+    daemon). ``None`` (the cold in-process path, which owns its whole process)
+    keeps the configured ``surfacing.timeout_seconds``.
     """
     try:
-        return await _run_surfacing_hook_inner(call, engine=engine, budget_seconds=budget_seconds)
+        return await _run_surfacing_hook_inner(
+            call, engine=engine, deadline_monotonic=deadline_monotonic
+        )
     except Exception:
         logger.warning("hook surfacing failed — passing tool output through", exc_info=True)
         return {}
 
 
 async def _run_surfacing_hook_inner(
-    call: "CanonicalHookCall", *, engine: Any | None, budget_seconds: float | None = None
+    call: "CanonicalHookCall", *, engine: Any | None, deadline_monotonic: float | None = None
 ) -> dict[str, Any]:
     if call.event_type != "PostToolUse":
         return {}
@@ -458,7 +465,7 @@ async def _run_surfacing_hook_inner(
 
     if engine is not None:
         injected = await engine.surface(
-            "builtin", tool_name, tool_input, response_text, budget_seconds=budget_seconds
+            "builtin", tool_name, tool_input, response_text, deadline_monotonic=deadline_monotonic
         )
         return _build_output(response_text, injected, engine.injection_mode)
 
@@ -487,7 +494,7 @@ async def _run_surfacing_hook_inner(
     )
     try:
         injected = await built.surface(
-            "builtin", tool_name, tool_input, response_text, budget_seconds=budget_seconds
+            "builtin", tool_name, tool_input, response_text, deadline_monotonic=deadline_monotonic
         )
     finally:
         await _quiet_async(built.stop(), "surfacing engine stop")
