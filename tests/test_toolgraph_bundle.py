@@ -89,6 +89,32 @@ def _bundle(tool: SimpleNamespace, *, profile: str = "strict", decision: str = "
     }
 
 
+def _schema_errors(doc: dict) -> list:
+    schema = json.loads(
+        files("memtomem_stm.data").joinpath("policy-bundle.schema.json").read_text(encoding="utf-8")
+    )
+    return list(Draft202012Validator(schema).iter_errors(doc))
+
+
+def _schema_rejects(doc: dict, *, validator: str, at: list, names: str) -> bool:
+    """True when the schema rejects ``doc`` for exactly the intended reason.
+
+    Pinning the keyword, the location, AND the field named in the message keeps a
+    conformance assertion from passing on some unrelated error that happens to
+    share a validator keyword.
+    """
+    return any(
+        error.validator == validator and list(error.absolute_path) == at and names in error.message
+        for error in _schema_errors(doc)
+    )
+
+
+def _parse(doc: dict, *, profile: str = "strict"):
+    return parse_policy_bundle(
+        canonical_json_bytes(doc), expected_agent="stm-proxy", expected_profile=profile
+    )
+
+
 def _write_bundle(path: Path, doc: dict) -> None:
     temporary = path.with_suffix(".next")
     temporary.write_bytes(canonical_json_bytes(doc))
@@ -182,15 +208,119 @@ def test_toolgraph_rejected_golden_fixture_pins_reason_paths_and_exact_bytes():
 
 
 def test_vendored_contract_schema_accepts_reference_bundle():
-    schema_path = files("memtomem_stm.data").joinpath("policy-bundle.schema.json")
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    Draft202012Validator(schema).validate(_bundle(_tool()))
+    assert _schema_errors(_bundle(_tool())) == []
     rejected = json.loads(
         files("memtomem_stm.data")
         .joinpath("toolgraph-contract-v1", "policy-bundle-v1-rejected.json")
         .read_text(encoding="utf-8")
     )
-    Draft202012Validator(schema).validate(rejected)
+    assert _schema_errors(rejected) == []
+
+
+class TestSchemaParserConformance:
+    """The vendored schema and the hand-written parser deliberately diverge.
+
+    Equivalence relation: this matrix covers DOCUMENT-INTRINSIC constraints only.
+    The parser also rejects an ``agent``/``profile`` that does not match the
+    caller's ``expected_*`` — that is caller-context binding the schema cannot
+    express, not a divergence, so it is out of scope here.
+
+    | mutation                            | schema | parser |
+    |-------------------------------------|--------|--------|
+    | created_at missing / wrong type      | reject | accept |
+    | risk_score key absent                | reject | accept |
+    | unknown reason on a rejected row     | reject | accept |
+    | non-string reason on an eligible row | reject | accept |
+    | extra key in graph_state             | reject | accept |
+    | profile outside the enum             | reject | accept |
+    | paths wrong type (outer or item)     | reject | accept |
+    | duplicate tool_key, differing rows   | accept | reject |
+    | graph_state.generation as 1.0        | accept | reject |
+
+    The accept/reject asymmetries are deliberate on two rows — an unknown reason
+    (forward compatibility, ``tool_eligibility._TOOLGRAPH_REASON_MAP``) and a
+    free-string profile (``ToolgraphConfig.query_profile``) — and undocumented
+    tolerance on the rest. The parser-strict rows are the availability risk: a
+    schema-valid bundle a third-party producer emits is withheld wholesale.
+
+    Every test asserts BOTH verdicts, so a change on either side of the vendored
+    contract flips a test rather than drifting silently.
+    """
+
+    def test_created_at_violations_fail_schema_but_parse(self):
+        missing = _bundle(_tool())
+        del missing["created_at"]
+        assert _schema_rejects(missing, validator="required", at=[], names="created_at")
+        assert _parse(missing).instance_id == "graph-1"
+
+        mistyped = _bundle(_tool())
+        mistyped["created_at"] = 123
+        assert _schema_rejects(mistyped, validator="type", at=["created_at"], names="string")
+        assert _parse(mistyped).instance_id == "graph-1"
+
+    def test_absent_risk_score_fails_schema_but_parses_as_none(self):
+        doc = _bundle(_tool())
+        del doc["tools"][0]["risk_score"]
+        assert _schema_rejects(doc, validator="required", at=["tools", 0], names="risk_score")
+        assert _parse(doc).decisions["graph-srv::read"].risk_score is None
+
+    def test_unknown_reject_reason_fails_schema_but_maps_to_generic_code(self):
+        doc = _bundle(_tool(), decision="rejected")
+        doc["tools"][0]["reason"] = "SOME_FUTURE_REASON"
+        assert _schema_rejects(
+            doc, validator="enum", at=["tools", 0, "reason"], names="SOME_FUTURE_REASON"
+        )
+        decision = _parse(doc).decisions["graph-srv::read"]
+        assert decision.reason == "SOME_FUTURE_REASON"
+        assert decision.reject_code == "toolgraph_rejected"
+
+    def test_non_string_reason_on_eligible_row_fails_schema_but_normalizes_to_none(self):
+        doc = _bundle(_tool())
+        doc["tools"][0]["reason"] = 123
+        assert _schema_rejects(doc, validator="enum", at=["tools", 0, "reason"], names="123")
+        assert _parse(doc).decisions["graph-srv::read"].reason is None
+
+    def test_extra_graph_state_key_fails_schema_but_parses(self):
+        doc = _bundle(_tool())
+        doc["graph_state"]["region"] = "kr"
+        assert _schema_rejects(
+            doc, validator="additionalProperties", at=["graph_state"], names="region"
+        )
+        assert _parse(doc).generation == 7
+
+    def test_out_of_enum_profile_fails_schema_but_parses_when_expected(self):
+        doc = _bundle(_tool(), profile="custom")
+        assert _schema_rejects(doc, validator="enum", at=["profile"], names="custom")
+        assert _parse(doc, profile="custom").profile == "custom"
+
+    def test_paths_type_violations_fail_schema_but_parse(self):
+        outer = _bundle(_tool())
+        outer["tools"][0]["paths"] = 42
+        assert _schema_rejects(outer, validator="type", at=["tools", 0, "paths"], names="array")
+        assert _parse(outer).instance_id == "graph-1"
+
+        item = _bundle(_tool())
+        item["tools"][0]["paths"] = [123]
+        assert _schema_rejects(item, validator="type", at=["tools", 0, "paths", 0], names="string")
+        assert _parse(item).instance_id == "graph-1"
+
+    def test_duplicate_tool_key_passes_schema_but_parser_rejects(self):
+        """uniqueItems could not catch this either: the rows differ."""
+        doc = _bundle(_tool())
+        twin = dict(doc["tools"][0])
+        twin["risk_score"] = 0.2
+        doc["tools"].append(twin)
+        assert _schema_errors(doc) == []
+        with pytest.raises(PolicyBundleError, match="duplicate tool_key"):
+            _parse(doc)
+
+    def test_float_generation_passes_schema_but_parser_rejects(self):
+        """Draft 2020-12 reads a mathematically integral 1.0 as an integer."""
+        doc = _bundle(_tool())
+        doc["graph_state"]["generation"] = 1.0
+        assert _schema_errors(doc) == []
+        with pytest.raises(PolicyBundleError, match="generation"):
+            _parse(doc)
 
 
 @pytest.mark.parametrize("version", [0, 2, "1", True])
