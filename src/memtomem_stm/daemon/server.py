@@ -114,6 +114,20 @@ def _direct_child_pids() -> set[int]:
 # the escalation timeout mcp's own stdio shutdown sequence uses.
 _LEAK_KILL_ESCALATE_SECONDS = 2.0
 
+# Reserved out of the client's deadline for encoding + the loopback write/read
+# of the response. The engine's budget is the remainder, so the engine's own
+# timeout fires *before* the client gives up and `_run_admitted`'s
+# `asyncio.timeout_at` backstop cancels it from outside. It also has to absorb
+# the engine's pre-timeout work (gate, query extraction, privacy scan — local
+# CPU on short strings) and the time `wait_for` spends awaiting the cancelled
+# adapter, neither of which the budget arithmetic can see.
+_DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
+
+# Below this, an LTM round trip cannot plausibly complete, so starting one only
+# cancels the adapter mid-RPC — which forces a stdio child respawn on the next
+# call (#290/#296) and buys nothing. Skip instead.
+_MIN_SURFACE_BUDGET_SECONDS = 0.25
+
 
 def _signal_pid(pid: int, sig: int) -> None:
     """Best-effort signal to *pid*'s process group, or *pid* alone when it
@@ -444,7 +458,14 @@ class DaemonServer:
                 return surface_response({})
 
             async def surface_call() -> dict[str, Any]:
-                output = await run_surfacing_hook(call, engine=self._engine)
+                # Computed here, not at admission: the admission queue and the
+                # serialization lock have already eaten part of the client's
+                # deadline by the time we run.
+                budget = self._remaining_budget(req)
+                if budget is None:
+                    logger.debug("surface skipped: no budget left in the client deadline")
+                    return surface_response({})
+                output = await run_surfacing_hook(call, engine=self._engine, budget_seconds=budget)
                 return surface_response(output)
 
             return await self._run_admitted(
@@ -452,6 +473,7 @@ class DaemonServer:
                 surface_call,
                 latency_kind="surface",
                 activity_counter=self._surfacing_retrieval_count,
+                timeout_counter=self._surfacing_timeout_count,
             )
         if op in {
             OP_LTM_SEARCH,
@@ -665,6 +687,24 @@ class DaemonServer:
             return await self._run_admitted(req, scratch_call)
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
 
+    def _remaining_budget(self, req: dict[str, Any]) -> float | None:
+        """Seconds of the client's deadline still usable for an LTM attempt.
+
+        ``None`` means "don't start one". The margin keeps the engine's own
+        timeout ahead of the client's give-up point, so the abort is the
+        engine's (fault row + log + breaker count, #579) rather than a silent
+        outside cancellation. ``_run_admitted`` already rejected a missing or
+        expired deadline; this re-reads it because queue/lock wait may have
+        consumed the rest since admission.
+        """
+        deadline = req.get("deadline_monotonic")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return None
+        remaining = float(deadline) - time.monotonic() - _DEADLINE_RESPONSE_MARGIN_SECONDS
+        if remaining < _MIN_SURFACE_BUDGET_SECONDS:
+            return None
+        return remaining
+
     async def _run_admitted(
         self,
         req: dict[str, Any],
@@ -672,8 +712,18 @@ class DaemonServer:
         *,
         latency_kind: LatencyKind | None = None,
         activity_counter: Callable[[], int] | None = None,
+        timeout_counter: Callable[[], int] | None = None,
     ) -> dict[str, Any]:
-        """Run one LTM operation under the shared queue, deadline, and lock."""
+        """Run one LTM operation under the shared queue, deadline, and lock.
+
+        ``timeout_counter`` reports an abort the *operation* handled itself, so
+        it never surfaces as an exception here. Surfacing does exactly that now
+        that it runs under a propagated budget: it returns a well-formed empty
+        result on timeout, which is otherwise indistinguishable from "nothing
+        relevant" and would be filed as a ``success`` sample of roughly the
+        whole budget — censored data in the percentiles the timeout
+        recommendation is derived from.
+        """
         deadline = req.get("deadline_monotonic")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
@@ -685,13 +735,21 @@ class DaemonServer:
         # including admission-queue and serialization-lock wait time.
         started = time.monotonic()
         warm_at_start = self._ltm_warmth() == "warm"
-        activity_before = activity_counter() if activity_counter is not None else None
+        activity_before: int | None = None
+        timeouts_before: int | None = None
         await self._pending_slots.acquire()
         self._last_request = time.monotonic()
         self._active_requests += 1
         try:
             async with asyncio.timeout_at(float(deadline)):
                 async with self._surface_lock:
+                    # Read under the lock, not before the queue: admissions
+                    # overlap (`max_pending_requests` is 32), and the engine's
+                    # counters only move inside a serialized run. Captured
+                    # earlier, a request that merely *waited* while another one
+                    # timed out would see the delta and inherit its outcome.
+                    activity_before = activity_counter() if activity_counter is not None else None
+                    timeouts_before = timeout_counter() if timeout_counter is not None else None
                     response = await operation()
             activity_observed = (
                 activity_counter is None
@@ -700,8 +758,17 @@ class DaemonServer:
             )
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
+                self_timed_out = (
+                    timeout_counter is not None
+                    and timeouts_before is not None
+                    and timeout_counter() > timeouts_before
+                )
                 if not warm_at_start:
                     outcome: LatencyOutcome = "cold"
+                elif self_timed_out:
+                    # Same precedence as the `asyncio.TimeoutError` branch below,
+                    # which this replaces for surfacing: cold first, then timeout.
+                    outcome = "timeout"
                 elif response.get("ok") is not True or (
                     latency_kind == "retrieval"
                     and response.get("outcome") not in (None, "ok", "empty_results")
@@ -731,9 +798,11 @@ class DaemonServer:
         """Number of engine terminal decisions that require an LTM attempt.
 
         Hook allowlist and engine gate skips must not dilute warm-search
-        percentiles with near-zero samples.  The daemon wires a real
+        percentiles with near-zero samples. The daemon wires a real
         ``SurfacingObservability`` and serializes surface calls, so comparing
-        this aggregate before/after one admitted request is deterministic.
+        this aggregate before/after one admitted request is deterministic —
+        provided the "before" read happens under ``_surface_lock`` too, which
+        is why ``_run_admitted`` captures it there rather than at admission.
         """
         observability = getattr(self._engine, "observability", None)
         if observability is None:
@@ -753,6 +822,22 @@ class DaemonServer:
         return sum(int(total_skips.get(key, 0)) for key in retrieval_skips) + sum(
             int(total_outcomes.get(key, 0)) for key in retrieval_outcomes
         )
+
+    def _surfacing_timeout_count(self) -> int:
+        """Engine-internal surfacing timeouts recorded so far.
+
+        Sibling of :meth:`_surfacing_retrieval_count`, read the same way and
+        deterministic for the same reason: the daemon wires a real
+        ``SurfacingObservability``, and ``_run_admitted`` brackets the
+        before/after reads around ``operation()`` *inside* ``_surface_lock``,
+        so the window spans exactly one request even while others are queued.
+        """
+        observability = getattr(self._engine, "observability", None)
+        if observability is None:
+            return 0
+        snapshot = observability.snapshot()
+        total_outcomes = snapshot.get("outcomes", {}).get("__total__", {})
+        return int(total_outcomes.get("error_timeout", 0))
 
     @staticmethod
     def _parse_search_payload(payload: dict[str, Any]) -> dict[str, Any] | None:

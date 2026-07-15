@@ -41,6 +41,7 @@ from memtomem_stm.daemon.protocol import (
     build_request,
     encode_line,
     read_message,
+    surface_response,
 )
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -238,6 +239,148 @@ async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
         }
     )
     assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+
+
+class _BudgetSpyEngine:
+    """Records the ``budget_seconds`` the daemon hands to the engine."""
+
+    injection_mode = "append"
+
+    def __init__(self) -> None:
+        self.calls: list[float | None] = []
+
+    async def surface(self, *args, budget_seconds: float | None = None, **kwargs) -> str:
+        self.calls.append(budget_seconds)
+        return args[3] if len(args) > 3 else ""
+
+
+async def test_surface_propagates_remaining_deadline_as_budget(tmp_path: Path) -> None:
+    # Without this, the client's deadline cancels surface() from OUTSIDE, which
+    # skips the engine's fault/log/breaker bookkeeping (#579) — so the breaker
+    # never opens and every call re-pays the timeout and respawns the LTM child.
+    engine = _BudgetSpyEngine()
+    server = DaemonServer(_config(tmp_path))
+    server._engine = engine
+    deadline = asyncio.get_running_loop().time() + 1.0
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": _canonical(_READ_PAYLOAD).to_wire(),
+            "deadline_monotonic": deadline,
+        }
+    )
+
+    assert response["ok"] is True
+    assert len(engine.calls) == 1
+    budget = engine.calls[0]
+    assert budget is not None
+    # Strictly inside the client's remaining time: the engine must abort first,
+    # leaving room to encode and write the response.
+    assert 0 < budget <= 1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS
+    assert budget == pytest.approx(1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS, abs=0.1)
+
+
+async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path: Path) -> None:
+    # Under a propagated budget the engine handles its own timeout and returns a
+    # well-formed empty result, which is shape-identical to "nothing relevant".
+    # Filed as `success` it would censor the percentiles the timeout
+    # recommendation derives from with a sample the length of the whole budget.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    timeouts = 0
+
+    async def surfaced_but_timed_out() -> dict[str, object]:
+        nonlocal timeouts
+        timeouts += 1  # what engine.surface() records as an error_timeout outcome
+        return surface_response({})
+
+    await server._run_admitted(
+        {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+        surfaced_but_timed_out,
+        latency_kind="surface",
+        timeout_counter=lambda: timeouts,
+    )
+
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["timeout_samples"] == 1
+    assert surface_latency["samples"] == 0
+
+
+async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path: Path) -> None:
+    # Admissions overlap (max_pending_requests=32) even though execution is
+    # serialized. A "before" counter read at admission time would let a request
+    # that only *waited* through someone else's timeout be filed as a timeout —
+    # dropping its real duration from the percentiles, in exactly the scenario
+    # (a slow LTM) where the recommendation matters most.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    timeouts = 0
+    slow_started = asyncio.Event()
+    slow_may_finish = asyncio.Event()
+
+    async def times_out_internally() -> dict[str, object]:
+        nonlocal timeouts
+        slow_started.set()
+        await slow_may_finish.wait()
+        timeouts += 1
+        return surface_response({})
+
+    async def healthy() -> dict[str, object]:
+        return surface_response({})
+
+    deadline = asyncio.get_running_loop().time() + 5.0
+    first = asyncio.create_task(
+        server._run_admitted(
+            {"deadline_monotonic": deadline},
+            times_out_internally,
+            latency_kind="surface",
+            timeout_counter=lambda: timeouts,
+        )
+    )
+    await slow_started.wait()
+    second = asyncio.create_task(
+        server._run_admitted(
+            {"deadline_monotonic": deadline},
+            healthy,
+            latency_kind="surface",
+            timeout_counter=lambda: timeouts,
+        )
+    )
+    await asyncio.sleep(0.05)  # let the second request reach the lock and wait
+    slow_may_finish.set()
+    await asyncio.gather(first, second)
+
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["timeout_samples"] == 1  # only the call that timed out
+    assert surface_latency["samples"] == 1  # the healthy call kept its duration
+
+
+async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) -> None:
+    # Admitted (deadline not yet expired) but too little left for a round trip.
+    # Starting one would only cancel the adapter mid-RPC and force a stdio child
+    # respawn on the next call, so the engine must not be touched at all.
+    engine = _BudgetSpyEngine()
+    server = DaemonServer(_config(tmp_path))
+    server._engine = engine
+    starved = (
+        daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS
+        + daemon_server._MIN_SURFACE_BUDGET_SECONDS
+        - 0.05
+    )
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": _canonical(_READ_PAYLOAD).to_wire(),
+            "deadline_monotonic": asyncio.get_running_loop().time() + starved,
+        }
+    )
+
+    # Fail-open: a well-formed empty output, not an error the hook must interpret.
+    assert response["ok"] is True
+    assert response["output"] == {}
+    assert engine.calls == []
 
 
 async def test_surface_rejects_when_pending_queue_is_full(tmp_path: Path) -> None:

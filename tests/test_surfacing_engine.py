@@ -424,6 +424,96 @@ class TestSurfacingTimeout:
         assert call_count == 2
 
 
+class TestSurfacingBudget:
+    """``budget_seconds`` — a deadline-bounded caller shrinking this call's timeout.
+
+    The daemon's client gives up after ``hook.daemon_timeout_seconds``; without a
+    propagated budget it cancels ``surface()`` from outside, which skips the
+    fault/log/breaker bookkeeping that only the internal TimeoutError path does.
+    """
+
+    async def test_budget_below_config_shortens_the_attempt(self):
+        # The engine must abort on the caller's budget, not run to the
+        # (much larger) configured ceiling.
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = slow_search
+
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+        )
+        started = time.monotonic()
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=0.05
+        )
+        elapsed = time.monotonic() - started
+
+        assert output == LONG_RESPONSE
+        # The ceiling is 600x the budget, so one absolute bound already tells the
+        # two apart — an abort at the ceiling would take ~30s.
+        assert elapsed < 1.0
+
+    async def test_budget_abort_still_counts_toward_the_breaker(self):
+        # The whole point of propagating the budget instead of cancelling from
+        # outside: the timeout stays *inside* surface(), so #579's bookkeeping
+        # (fault + breaker) still runs and the breaker eventually opens.
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = slow_search
+
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+        )
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=0.05)
+        assert engine._circuit_breaker.failure_count == 1
+
+    async def test_budget_never_raises_the_configured_ceiling(self):
+        # An over-generous budget must not extend timeout_seconds — the operator
+        # ceiling stays authoritative.
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = slow_search
+
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+        )
+        started = time.monotonic()
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=30.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        assert engine._circuit_breaker.failure_count == 1
+
+    @pytest.mark.parametrize("budget", [None, 0.0, -1.0, float("nan"), float("inf")])
+    async def test_unusable_budget_falls_back_to_the_configured_timeout(self, budget):
+        # A non-positive/non-finite budget must not become an instant timeout:
+        # that would persist a fault and open the breaker on a *healthy* LTM.
+        # "No budget left, don't start" is the caller's call, not the engine's.
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=7.0),
+            mcp_adapter=_make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(), score=0.5)]),
+        )
+        assert engine._effective_timeout(budget) == 7.0
+
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=budget
+        )
+        assert "Relevant Memories" in output
+        assert engine._circuit_breaker.failure_count == 0
+
+
 class TestSessionDedup:
     """Verify same memory isn't surfaced twice in one session."""
 

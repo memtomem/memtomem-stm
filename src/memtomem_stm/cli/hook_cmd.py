@@ -418,7 +418,10 @@ def _extract_surfaced_block(original: str, injected: str, injection_mode: str) -
 
 
 async def run_surfacing_hook(
-    call: "CanonicalHookCall", *, engine: Any | None = None
+    call: "CanonicalHookCall",
+    *,
+    engine: Any | None = None,
+    budget_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Core hook logic. Returns the hook-output dict (``{}`` means no-op).
 
@@ -430,16 +433,20 @@ async def run_surfacing_hook(
     output pass through. ``engine`` is a test seam: when provided it is used
     as-is (caller owns its lifecycle); when ``None``, an engine + LTM adapter are
     built from :class:`STMConfig` and torn down before returning.
+
+    ``budget_seconds`` caps this call's LTM attempt for a caller that is itself
+    deadline-bounded (the daemon). ``None`` (the cold in-process path, which owns
+    its whole process) keeps the configured ``surfacing.timeout_seconds``.
     """
     try:
-        return await _run_surfacing_hook_inner(call, engine=engine)
+        return await _run_surfacing_hook_inner(call, engine=engine, budget_seconds=budget_seconds)
     except Exception:
         logger.warning("hook surfacing failed — passing tool output through", exc_info=True)
         return {}
 
 
 async def _run_surfacing_hook_inner(
-    call: "CanonicalHookCall", *, engine: Any | None
+    call: "CanonicalHookCall", *, engine: Any | None, budget_seconds: float | None = None
 ) -> dict[str, Any]:
     if call.event_type != "PostToolUse":
         return {}
@@ -450,7 +457,9 @@ async def _run_surfacing_hook_inner(
     response_text = call.tool_response_text
 
     if engine is not None:
-        injected = await engine.surface("builtin", tool_name, tool_input, response_text)
+        injected = await engine.surface(
+            "builtin", tool_name, tool_input, response_text, budget_seconds=budget_seconds
+        )
         return _build_output(response_text, injected, engine.injection_mode)
 
     # Lazy imports: keep ``mms hook --help`` and unrelated CLI paths off the
@@ -477,7 +486,9 @@ async def _run_surfacing_hook_inner(
         observability=SurfacingObservability(),
     )
     try:
-        injected = await built.surface("builtin", tool_name, tool_input, response_text)
+        injected = await built.surface(
+            "builtin", tool_name, tool_input, response_text, budget_seconds=budget_seconds
+        )
     finally:
         await _quiet_async(built.stop(), "surfacing engine stop")
         await _quiet_async(adapter.stop(), "LTM adapter stop")

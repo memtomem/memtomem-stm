@@ -279,6 +279,22 @@ class SurfacingEngine:
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
 
+    def _effective_timeout(self, budget_seconds: float | None) -> float:
+        """This call's LTM budget: the configured ceiling, lowered to a
+        deadline-bounded caller's remaining time.
+
+        ``budget_seconds`` only ever shrinks the window — an operator's
+        ``timeout_seconds`` stays the upper bound. Non-finite or non-positive
+        budgets are ignored rather than turned into an instant timeout: the
+        caller owns the "no budget left, don't start" decision (starting an LTM
+        round trip we cannot finish is what cancels the adapter mid-RPC), and a
+        bad value must not silently open the breaker on a healthy LTM.
+        """
+        ceiling = self._config.timeout_seconds
+        if budget_seconds is None or not math.isfinite(budget_seconds) or budget_seconds <= 0:
+            return ceiling
+        return min(ceiling, budget_seconds)
+
     def _observe_score_scale(
         self,
         server: str,
@@ -449,6 +465,7 @@ class SurfacingEngine:
         trace_id: str | None = None,
         context_query: str | None = None,
         source_response_chars: int | None = None,
+        budget_seconds: float | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -457,6 +474,16 @@ class SurfacingEngine:
         - circuit breaker is open
         - relevance gate rejects the call
         - timeout exceeded
+
+        ``budget_seconds`` lets a caller that is itself deadline-bounded (the
+        daemon, whose client gives up after ``hook.daemon_timeout_seconds``)
+        shrink this call's timeout below ``timeout_seconds``. It never *raises*
+        the configured ceiling. Passing it keeps the abort inside :meth:`surface`
+        instead of letting the caller cancel it from outside: only the
+        :class:`asyncio.TimeoutError` path below records the fault, logs, and
+        counts the failure toward the breaker (#579) — an external cancellation
+        skips all three, so the breaker never opens and every subsequent call
+        pays the full timeout and respawns the LTM child again.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -499,10 +526,11 @@ class SurfacingEngine:
             )
             return response_text
 
+        effective_timeout = self._effective_timeout(budget_seconds)
         try:
             result = await asyncio.wait_for(
                 self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
-                timeout=self._config.timeout_seconds,
+                timeout=effective_timeout,
             )
             self._circuit_breaker.record_success()
             return result
@@ -513,7 +541,7 @@ class SurfacingEngine:
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
                 tool,
-                self._config.timeout_seconds,
+                effective_timeout,
             )
             # A hung LTM must open the breaker like an erroring one (#579): a
             # timeout is a degraded dependency, and it also cancels the adapter
