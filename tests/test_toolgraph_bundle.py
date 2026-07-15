@@ -1237,6 +1237,39 @@ class TestBundleProvenanceAdvisory:
         finally:
             exposed.chmod(0o755)
 
+    def test_an_unstattable_parent_skips_the_report_not_the_rest_of_the_scan(
+        self, tmp_path, monkeypatch
+    ):
+        """Judging one entry needs its parent; the hops beyond it do not."""
+        first, exposed = tmp_path / "first", tmp_path / "exposed"
+        first.mkdir()
+        exposed.mkdir()
+        real = exposed / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (exposed / "hop2").symlink_to(real)
+        bundle = first / "policy-bundle.json"
+        bundle.symlink_to(exposed / "hop2")
+        tmp_path.chmod(0o755)
+        first.chmod(0o755)
+        exposed.chmod(0o777)
+        real_stat = os.stat
+
+        def fake_stat(p, *a, **kw):
+            # Only the FIRST link's parent is unstattable (a race, in practice).
+            if str(p) == str(first):
+                raise PermissionError("simulated race")
+            return real_stat(p, *a, **kw)
+
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "stat", fake_stat)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(exposed / "hop2") in f and "re-pointed" in f for f in findings), (
+                "the downstream hop must still be reported"
+            )
+        finally:
+            exposed.chmod(0o755)
+
     def test_a_symlink_cycle_terminates(self, tmp_path):
         """A loop must exhaust the hop budget, not the stack."""
         first = tmp_path / "first"

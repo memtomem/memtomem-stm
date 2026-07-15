@@ -202,21 +202,26 @@ def _scan_for_links(
         # by two spellings (``link/../link/x``) is one fact to report but two
         # hops the kernel really walks.
         budget[0] -= 1
+        parent_info: os.stat_result | None
         try:
             parent_info = os.stat(current.parent)
         except OSError:
-            return
-        # Identity is the DIRECTORY ENTRY — parent dir plus name — not the
-        # inode: symlinks can be hard-linked, so two entries under parents with
-        # different permissions share one inode, and keying on it would let a
-        # secure sighting suppress the exposed twin. Stat'ing the parent also
-        # collapses spellings (``sub/..`` and ``.``) onto one identity.
-        entry = (parent_info.st_dev, parent_info.st_ino, current.name)
-        if entry not in reported:
-            reported.add(entry)
-            finding = _link_finding(current, info, parent_info, euid)
-            if finding:
-                findings.append(finding)
+            # Judging THIS entry needs its parent, but the hops beyond it do
+            # not: keep following the link rather than abandoning the scan.
+            parent_info = None
+        if parent_info is not None:
+            # Identity is the DIRECTORY ENTRY — parent dir plus name — not the
+            # inode: symlinks can be hard-linked, so two entries under parents
+            # with different permissions share one inode, and keying on it
+            # would let a secure sighting suppress the exposed twin. Stat'ing
+            # the parent also collapses spellings (``sub/..`` and ``.``) onto
+            # one identity.
+            entry = (parent_info.st_dev, parent_info.st_ino, current.name)
+            if entry not in reported:
+                reported.add(entry)
+                finding = _link_finding(current, info, parent_info, euid)
+                if finding:
+                    findings.append(finding)
         try:
             target = Path(os.readlink(current))
         except OSError:
