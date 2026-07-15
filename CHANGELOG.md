@@ -11,6 +11,29 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.40] — 2026-07-15
+
+0.1.39 was never published — the version was bumped and a changelog section cut,
+but no tag, GitHub release, or PyPI artifact ever carried it. This release
+supersedes it and contains everything that section described. If you have a
+`0.1.39` wheel from a local build, it predates this release and is not a
+released version.
+
+### Upgrade notes
+
+- `mms doctor` now exits nonzero on a dense-to-BM25 LTM degradation that
+  previously only warned. Automation that gates on `mms doctor`'s exit status
+  will start failing against a core whose configured dense retrieval has
+  degraded — the diagnosis is the point, but the exit status is new. An
+  intentional BM25-only configuration still exits zero with a warning. (#709)
+- A `context_compose` response missing its negotiated top-level keys is now a
+  fault rather than an empty result. A core that conforms to the negotiated
+  schema is unaffected; against one that renamed or retyped a key, surfacing now
+  reports `ltm_call_failed` and warns, where it previously reported
+  `empty_results` and stayed silent. The warning fires once per surfacing engine
+  and does not re-arm, so a later independent compose regression is counted but
+  not re-warned. (#710)
+
 ### Added
 
 - Added portable Toolgraph policy-bundle enforcement for the STM MCP gateway,
@@ -26,6 +49,29 @@ changes inline only. See the deprecation policy in
 - Added `mms doctor --measure-ltm` warm-daemon search sampling and runtime-profile
   checks for missing ONNX/Korean extras and configured-versus-effective retrieval
   mode, with measured timeout recommendations (#709).
+- Added a native Windows first-success path: cross-process state locking,
+  PowerShell diagnostics, safe daemon-stop behavior, platform-aware Claude
+  Desktop discovery, and absolute-Python MCP registrations. (#700)
+- Added `mms init --demo --client auto|claude|codex|json|skip`, `--resume`,
+  cache freshness presets, Codex registration, `CODEX_HOME` discovery, trusted
+  project Codex configs, and stdio upstream `cwd` support. (#700)
+- A catalog-wide policy-bundle bind failure now warns once per episode, naming
+  the likely cause — a `tool_contract_digest` algorithm or stale-catalog drift
+  versus a `toolgraph.server_name_map` mismatch — instead of silently withholding
+  every tool under `strict`. `stm_proxy_health` reports the same diagnosis, with
+  the unmapped/drifted split when the cause is mixed. Only STM-computed
+  rejections count toward the diagnosis: a `DRIFTED`/`UNMAPPED` reason the
+  producer declared in the bundle maps to the same reject code, so counting
+  final codes would false-alarm on a catalog of deliberate denials. (#706)
+- The gateway now warns once at adoption when the policy bundle looks substitutable,
+  naming what an unprotected bundle exposes. The bundle is the gateway's only
+  enforcement authority and is unsigned, so anyone able to write it — or rename any
+  directory above it — decides what the proxy exposes. Scope: POSIX owner and mode
+  bits only. It is a no-op on Windows, and extended ACLs are not evaluated, so a
+  `0644` file carrying `everyone allow write` reads as clean — **silence is not an
+  assurance of protection**. Advisory only: findings are logged and the bundle is
+  still adopted. (#708)
+- Added a Korean vibe-coding quickstart guide. (#699)
 
 ### Changed
 
@@ -33,9 +79,34 @@ changes inline only. See the deprecation policy in
   degraded from configured dense retrieval to BM25-only, while an intentional
   BM25-only configuration remains a warning and older cores without a runtime
   profile remain warning-only (#709).
+- The packaged `policy-bundle.schema.json` is re-vendored byte-identical to the
+  producer's copy, which now carries the contract as normative prose: `tool_key`
+  uniqueness across `tools` (with `uniqueItems: true` backstopping exact
+  duplicates only), consumer MAY-ignore notes for `created_at`, `risk_score`,
+  `reason` on an eligible row, and `paths`, `graph_state` documented
+  closed-by-design, and the producer's int-literal obligation for `generation`.
+  Enforcement is unchanged — the runtime parser never read the schema. (#712)
 
 ### Fixed
 
+- **Behavior change**: a `context_compose` response whose negotiated top-level
+  `pinned`/`retrieved` keys are missing or not arrays is now a fault naming the
+  schema version, on both the direct and shared-daemon routes. Previously each
+  route defaulted to an empty list, so a core that renamed a key silently
+  produced an empty bundle that surfacing classified as `empty_results` — a
+  degradation indistinguishable from an empty namespace, past every fault
+  counter. It is now classified `ltm_call_failed` and warned once per surfacing
+  engine (the latch is per-instance and does not re-arm after a healthy
+  compose). (#710)
+- `mms register --client codex --replace-registration` no longer removes the
+  existing registration before knowing it can be rebuilt. It captures
+  `codex mcp get --json` first and refuses to remove a registration
+  `codex mcp add` cannot reproduce exactly; when the replacement add fails it
+  attempts to restore the previous one and reports whether that restore
+  succeeded. Codex has no `.mcp.json` fallback, so the previous remove-then-add
+  could leave no registration at all. Rollback is an attempt, not a guarantee:
+  a restore can itself fail, and the command says so rather than implying the
+  old registration survived. (#705)
 - New MCP and native-hook registrations now pin a shared-daemon runtime policy
   with ordered surfacing/hook deadlines instead of depending on host environment
   inheritance. Existing registrations remain keep-by-default; explicit refreshes
@@ -52,17 +123,7 @@ changes inline only. See the deprecation policy in
   successful (#702).
 - Corrected public configuration, surfacing, MCP-tool, and notebook guidance to
   match the v0.1.38 runtime contracts and keep copy/paste examples executable.
-
-## [0.1.39] — 2026-07-14
-
-### Added
-
-- Added a native Windows first-success path: cross-process state locking,
-  PowerShell diagnostics, safe daemon-stop behavior, platform-aware Claude
-  Desktop discovery, and absolute-Python MCP registrations.
-- Added `mms init --demo --client auto|claude|codex|json|skip`, `--resume`,
-  cache freshness presets, Codex registration, `CODEX_HOME` discovery, trusted
-  project Codex configs, and stdio upstream `cwd` support.
+  (#697)
 
 ## [0.1.38] — 2026-07-14
 
