@@ -34,8 +34,8 @@ transport / dead ports only (#637).
 - **Line length 100**, target `py312`.
 - **`.claude/` and `scripts/` are gitignored** except the tracked
   `scripts/audit-dependencies.sh` (release/CI gate) and
-  `scripts/core_compat_smoke.py` (advisory compat check). Stage by path — a
-  `git add -A` here commits local-only files.
+  `scripts/core_compat_smoke.py` (advisory compat check). Don't commit other
+  files under them, and don't assume contributors share your local contents.
 - **One focused change per PR**, branched from `main`, with tests for new
   behavior and a commit message explaining the "why". Full checklist:
   `CONTRIBUTING.md`.
