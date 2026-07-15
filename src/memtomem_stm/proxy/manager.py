@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from mcp.types import CallToolResult
 
     from memtomem_stm.proxy.cache import ProxyCache
@@ -103,6 +105,7 @@ from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
 from memtomem_stm.proxy.toolgraph_bundle import (
     PolicyBundleError,
     PolicySnapshot,
+    bundle_provenance_warnings,
     load_policy_bundle,
     tool_contract_digest,
 )
@@ -506,6 +509,10 @@ class ProxyManager:
         # recurrence warns again.
         self._toolgraph_all_fail_cause: str | None = None
         self._toolgraph_all_fail_warned: bool = False
+        # Findings of the last provenance advisory, so republishing into the
+        # same insecure directory doesn't re-warn. ``None`` = never checked,
+        # which is distinct from ``()`` = checked and clean.
+        self._toolgraph_provenance_warned: tuple[str, ...] | None = None
         # Monotonic within a start/stop lifecycle. Portable policy decisions
         # are rebound only when this revision changes, avoiding O(catalog)
         # contract hashing on every tools/call hot path.
@@ -829,11 +836,33 @@ class ProxyManager:
         self._toolgraph_degraded_reason = None
         self._toolgraph_withhold_all = None
         self._apply_toolgraph_policy_snapshot(snapshot)
+        self._warn_on_bundle_provenance(path)
         logger.info(
             "Toolgraph policy bundle active: instance %s generation %d digest %s",
             snapshot.instance_id,
             snapshot.generation,
             snapshot.bundle_digest[:12],
+        )
+
+    def _warn_on_bundle_provenance(self, path: Path) -> None:
+        """Advisory: report mode/ownership signs that others could substitute it.
+
+        Called only where a bundle is actually adopted, so it costs a handful of
+        stats per republish rather than one per tools/call. Latched on the
+        findings themselves: republishing into the same insecure directory is
+        the same unfixed problem, not news, but a newly-introduced one is.
+        """
+        findings = bundle_provenance_warnings(path)
+        if tuple(findings) == self._toolgraph_provenance_warned:
+            return
+        self._toolgraph_provenance_warned = tuple(findings)
+        if not findings:
+            return
+        logger.warning(
+            "Toolgraph policy bundle is not protected from substitution — it is the "
+            "gateway's only enforcement authority and is unsigned, so anyone who can "
+            "write it decides what this proxy exposes: %s",
+            "; ".join(findings),
         )
 
     def _apply_toolgraph_policy_snapshot(self, snapshot: PolicySnapshot) -> None:
@@ -1099,6 +1128,8 @@ class ProxyManager:
         self._toolgraph_bind_stats = {}
         self._toolgraph_all_fail_cause = None
         self._toolgraph_all_fail_warned = False
+        # A new lifecycle may point at a different bundle_path; re-advise there.
+        self._toolgraph_provenance_warned = None
 
     def _open_consult_cache(self, cfg: ToolgraphConfig) -> GraphConsultCache | None:
         """Lazily open the #494 consult disk cache; ``None`` when disabled.

@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import stat
+import subprocess
+import sys
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,8 +32,10 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_DRIFTED,
     REASON_TOOLGRAPH_UNMAPPED,
 )
+from memtomem_stm.proxy import toolgraph_bundle as toolgraph_bundle_mod
 from memtomem_stm.proxy.toolgraph_bundle import (
     PolicyBundleError,
+    bundle_provenance_warnings,
     canonical_json_bytes,
     parse_policy_bundle,
     tool_contract_digest,
@@ -826,3 +833,505 @@ class TestBindFailureHealthRendering:
         )
         assert "DEGRADED" in text
         assert "toolgraph.server_name_map" in text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission semantics")
+class TestBundleProvenanceAdvisory:
+    """The bundle is unsigned enforcement authority: who can replace it matters.
+
+    Every case here is about *write* access, never read access -- a 0644 bundle
+    holds no secrets and must stay silent.
+    """
+
+    def test_a_normal_private_bundle_is_silent(self, tmp_path):
+        """Positive control: the default install must not cry wolf."""
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        tmp_path.chmod(0o755)
+        assert bundle_provenance_warnings(bundle) == []
+
+    def test_world_readable_is_not_a_finding(self, tmp_path):
+        """0644 is fine -- this check is about substitution, not secrecy."""
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        assert bundle_provenance_warnings(bundle) == []
+
+    @pytest.mark.parametrize("mode", [0o666, 0o622, 0o646])
+    def test_group_or_world_writable_file_is_a_finding(self, tmp_path, mode):
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(mode)
+        findings = bundle_provenance_warnings(bundle)
+        assert any("rename its entries" in f or "writable by group/other" in f for f in findings)
+
+    def test_a_symlink_we_alone_can_replace_is_silent(self, tmp_path):
+        """Positive control: a link is only a vector if someone can re-point it.
+
+        POSIX has no way to edit a link's target in place -- replacing it needs
+        write and search on the directory holding it. A link in a directory only
+        we can write redirects nothing.
+        """
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = tmp_path / "policy-bundle.json"
+        link.symlink_to(real)
+        tmp_path.chmod(0o755)
+        assert bundle_provenance_warnings(link) == []
+
+    def test_a_foreign_symlink_in_a_sticky_dir_is_a_finding(self, tmp_path, monkeypatch):
+        """Sticky stops others touching OUR entries -- not an owner touching theirs.
+
+        `/tmp` at 01777 is the case: a link we do not own is its owner's to
+        unlink and recreate at will, while the chain it resolves into stays
+        perfectly secure. Only the link's st_uid is faked -- patching geteuid
+        would make the parent foreign too and fire the check for another reason.
+        """
+        home = tmp_path / "sticky"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o1777)
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **kw):
+            info = real_lstat(p, *a, **kw)
+            if str(p) != str(link):
+                return info
+            fields = list(info)
+            fields[4] = 999999  # st_uid
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "lstat", fake_lstat)
+        try:
+            findings = bundle_provenance_warnings(link)
+            assert any(str(link) in f and "uid 999999" in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
+    def test_a_foreign_symlink_in_a_group_only_sticky_dir_warns_conservatively(
+        self, tmp_path, monkeypatch
+    ):
+        """A 01770 dir warns even though we cannot prove the owner is in its group.
+
+        A deliberate false positive: resolving a foreign uid's groups means
+        pwd/grp lookups that fail or stall exactly where it matters (LDAP,
+        containers, no local passwd entry). When membership cannot be
+        established, warn and let a human judge.
+        """
+        home = tmp_path / "groupsticky"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o1770)
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **kw):
+            info = real_lstat(p, *a, **kw)
+            if str(p) != str(link):
+                return info
+            fields = list(info)
+            fields[4] = 999999  # st_uid
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "lstat", fake_lstat)
+        try:
+            findings = bundle_provenance_warnings(link)
+            assert any(str(link) in f and "uid 999999" in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
+    def test_our_own_symlink_in_a_sticky_dir_is_silent(self, tmp_path):
+        """Positive control: sticky genuinely protects the entries we own."""
+        home = tmp_path / "sticky"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o1777)
+        try:
+            assert bundle_provenance_warnings(link) == []
+        finally:
+            home.chmod(0o755)
+
+    def test_a_symlink_others_can_replace_is_a_finding(self, tmp_path):
+        home = tmp_path / "toolgraph"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(link)
+            assert any(str(link) in f and "re-pointed" in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
+    def test_world_writable_parent_lets_the_bundle_be_replaced(self, tmp_path):
+        home = tmp_path / "toolgraph"
+        home.mkdir()
+        bundle = home / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        home.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any("can be replaced" in f and str(home) in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
+    def test_sticky_world_writable_parent_is_not_a_finding(self, tmp_path):
+        """Positive control: /tmp-style dirs already stop non-owners renaming."""
+        home = tmp_path / "sticky"
+        home.mkdir()
+        bundle = home / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        home.chmod(0o1777)
+        try:
+            assert bundle_provenance_warnings(bundle) == []
+        finally:
+            home.chmod(0o755)
+
+    def test_a_grandparent_is_walked_too(self, tmp_path):
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        bundle = inner / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        outer.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(outer) in f and "can be replaced" in f for f in findings)
+        finally:
+            outer.chmod(0o755)
+
+    def test_foreign_owner_is_reported_for_the_file_and_for_ancestors(self, tmp_path, monkeypatch):
+        """Another user owning either can chmod and rewrite the policy at will.
+
+        Both halves are asserted by NAME: pretending to be a foreign euid makes
+        the whole tree foreign, so a generic "some finding says foreign" check
+        would still pass with the file-owner branch deleted.
+        """
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "geteuid", lambda: 999999)
+        findings = bundle_provenance_warnings(bundle)
+        # Exact prefixes: `str(tmp_path)` is a substring of `str(bundle)`, so a
+        # loose `in` check would let the file's finding satisfy both assertions.
+        assert any(f.startswith(f"{bundle} is owned by uid ") for f in findings)
+        assert any(f.startswith(f"{tmp_path} is owned by uid ") for f in findings)
+
+    @pytest.mark.parametrize("mode", [0o722, 0o702])
+    def test_a_write_bit_without_search_cannot_rename_and_is_silent(self, tmp_path, mode):
+        """Positive control: renaming needs write AND execute on the directory."""
+        home = tmp_path / "toolgraph"
+        home.mkdir()
+        bundle = home / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        home.chmod(mode)
+        try:
+            assert bundle_provenance_warnings(bundle) == []
+        finally:
+            home.chmod(0o755)
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            (0o755, ""),  # the normal case
+            (0o777, "group/other"),
+            (0o775, "group"),
+            (0o757, "other"),
+            (0o722, ""),  # write, no search: names inside cannot be resolved
+            (0o702, ""),
+            (0o622, ""),  # not reachable via lstat either, but pin the rule
+            (0o1777, ""),  # sticky: only an entry's owner may rename it
+        ],
+    )
+    def test_entry_renamers_needs_write_and_search_in_the_same_class(self, mode, expected):
+        """The permission rule itself, independent of any reachable fixture."""
+        assert toolgraph_bundle_mod._entry_renamers(mode) == expected
+
+    def test_a_symlinked_component_followed_by_dotdot_inspects_what_loads(
+        self, tmp_path, monkeypatch
+    ):
+        """`link/..` resolves against the link's TARGET, not the text before it.
+
+        A lexical abspath would inspect `<cwd>/bundle` while the loader opens
+        `<target parent>/bundle` -- reporting all-clear about a file nothing
+        enforces.
+        """
+        exposed = tmp_path / "exposed"
+        real = exposed / "real"
+        work = tmp_path / "work"
+        real.mkdir(parents=True)
+        work.mkdir()
+        bundle = exposed / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        (work / "link").symlink_to(real)
+        # A decoy at the path a lexical `..` collapse would land on.
+        decoy = work / "policy-bundle.json"
+        decoy.write_bytes(b"{}")
+        decoy.chmod(0o644)
+        work.chmod(0o755)
+        exposed.chmod(0o777)
+        monkeypatch.chdir(work)
+        try:
+            configured = Path("link/../policy-bundle.json")
+            assert os.path.realpath(configured) == str(bundle), "fixture: the loader opens `bundle`"
+            findings = bundle_provenance_warnings(configured)
+            # The exposed directory is on the RESOLVED chain; a lexical `..`
+            # collapse would have landed on `work` and reported all-clear.
+            assert any(str(exposed) in f and "can be replaced" in f for f in findings)
+            assert not any(str(decoy) in f for f in findings), "the decoy is not what loads"
+            # `work` holds the link but only we can write it, so the link itself
+            # redirects nothing -- both rules compose.
+            assert not any("re-pointed" in f for f in findings)
+        finally:
+            exposed.chmod(0o755)
+
+    def test_a_relative_path_still_walks_above_the_working_directory(self, tmp_path, monkeypatch):
+        """`bundle_path` may be relative; `Path.parents` would stop at `.`."""
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        bundle = inner / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        inner.chmod(0o755)
+        outer.chmod(0o777)
+        monkeypatch.chdir(inner)
+        try:
+            findings = bundle_provenance_warnings(Path("policy-bundle.json"))
+            assert any(str(outer) in f and "can be replaced" in f for f in findings)
+        finally:
+            outer.chmod(0o755)
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS chmod +a ACL syntax")
+    def test_an_acl_granting_write_is_a_documented_blind_spot(self, tmp_path):
+        """Pins the SCOPE claim: mode/uid only, so an ACL reads as clean.
+
+        Not a wish -- `everyone allow write` on a 0644 file really is invisible
+        here. The docstring says so; this makes the limit fail loudly if anyone
+        later believes silence is an assurance.
+        """
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        tmp_path.chmod(0o755)
+        added = subprocess.run(
+            ["chmod", "+a", "everyone allow write,delete", str(bundle)],
+            capture_output=True,
+        )
+        if added.returncode != 0:  # pragma: no cover - filesystem without ACLs
+            pytest.skip("filesystem does not support ACLs")
+        # Assert the ACL stuck, NOT how it prints: `ls -le` renders the
+        # principal as `group:everyone` on some macOS hosts and as its
+        # well-known UUID on others, so matching the name passes only where it
+        # happens to be spelled that way.
+        listing = subprocess.run(["ls", "-le", str(bundle)], capture_output=True, text=True).stdout
+        # `allow` AND `write` on the same ACE: an unrelated `allow read` would
+        # make this pass while proving nothing about the blind spot.
+        assert re.search(r"^\s*\d+:.*\ballow\b[^\n]*\bwrite\b", listing, re.MULTILINE), (
+            f"fixture: a write-granting ACL is really there -- got {listing!r}"
+        )
+        assert stat.S_IMODE(bundle.stat().st_mode) == 0o644, "fixture: mode still looks private"
+        assert bundle_provenance_warnings(bundle) == [], (
+            "mode/uid analysis cannot see ACLs -- if this ever starts failing, the "
+            "scope note in bundle_provenance_warnings' docstring is now wrong"
+        )
+
+    def test_a_chained_symlink_hop_in_an_exposed_dir_is_a_finding(self, tmp_path):
+        """`a/bundle -> b/link2 -> c/real`: the middle hop is on neither walk.
+
+        The ancestor analysis follows the resolved chain (`c`), and stopping at
+        the configured path's first link never reaches `b`. Anyone with
+        write+search on `b` re-points what the loader opens.
+        """
+        a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+        for d in (a, b, c):
+            d.mkdir()
+        real = c / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (b / "link2").symlink_to(real)
+        bundle = a / "policy-bundle.json"
+        bundle.symlink_to(b / "link2")
+        a.chmod(0o755)
+        c.chmod(0o755)
+        b.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(b / "link2") in f and "re-pointed" in f for f in findings)
+        finally:
+            b.chmod(0o755)
+
+    def test_a_chained_symlink_through_secure_dirs_is_silent(self, tmp_path):
+        """Positive control: chasing hops must not invent findings."""
+        a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+        for d in (a, b, c):
+            d.mkdir()
+            d.chmod(0o755)
+        real = c / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (b / "link2").symlink_to(real)
+        bundle = a / "policy-bundle.json"
+        bundle.symlink_to(b / "link2")
+        assert bundle_provenance_warnings(bundle) == []
+
+    def test_one_link_reached_by_two_spellings_reports_once(self, tmp_path):
+        """`link/../link/x` traverses the same entry twice; it is one fact."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        real = sub / "policy-bundle.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (tmp_path / "link").symlink_to(sub)
+        tmp_path.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(
+                tmp_path / "link" / ".." / "link" / "policy-bundle.json"
+            )
+            assert len([f for f in findings if "re-pointed" in f]) == 1
+        finally:
+            tmp_path.chmod(0o755)
+
+    def test_a_hard_linked_twin_is_judged_on_its_own_parent(self, tmp_path):
+        """Identity is the directory ENTRY, not the inode.
+
+        Symlinks can be hard-linked, so two entries under parents with
+        different permissions share one inode. Keying dedup on the inode let a
+        secure sighting suppress the exposed twin traversed right after it.
+        """
+        secure, exposed = tmp_path / "secure", tmp_path / "exposed"
+        secure.mkdir()
+        exposed.mkdir()
+        # One inode, two entries; the content routes through the other parent,
+        # so a single scan meets the secure entry first and the exposed second.
+        (secure / "link").symlink_to("../exposed/link")
+        os.link(secure / "link", exposed / "link", follow_symlinks=False)
+        assert os.lstat(secure / "link").st_ino == os.lstat(exposed / "link").st_ino
+        tmp_path.chmod(0o755)
+        secure.chmod(0o755)
+        exposed.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(secure / "link")
+            assert any("exposed" in f and "re-pointed" in f for f in findings)
+        finally:
+            exposed.chmod(0o755)
+
+    def test_an_unstattable_parent_skips_the_report_not_the_rest_of_the_scan(
+        self, tmp_path, monkeypatch
+    ):
+        """Judging one entry needs its parent; the hops beyond it do not."""
+        first, exposed = tmp_path / "first", tmp_path / "exposed"
+        first.mkdir()
+        exposed.mkdir()
+        real = exposed / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (exposed / "hop2").symlink_to(real)
+        bundle = first / "policy-bundle.json"
+        bundle.symlink_to(exposed / "hop2")
+        tmp_path.chmod(0o755)
+        first.chmod(0o755)
+        exposed.chmod(0o777)
+        real_stat = os.stat
+
+        def fake_stat(p, *a, **kw):
+            # Only the FIRST link's parent is unstattable (a race, in practice).
+            if str(p) == str(first):
+                raise PermissionError("simulated race")
+            return real_stat(p, *a, **kw)
+
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "stat", fake_stat)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(exposed / "hop2") in f and "re-pointed" in f for f in findings), (
+                "the downstream hop must still be reported"
+            )
+        finally:
+            exposed.chmod(0o755)
+
+    def test_a_symlink_cycle_terminates(self, tmp_path):
+        """A loop must exhaust the hop budget, not the stack."""
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        assert bundle_provenance_warnings(first) == []
+
+    def test_a_relative_link_target_resolves_against_the_links_own_dir(self, tmp_path):
+        exposed = tmp_path / "exposed"
+        exposed.mkdir()
+        real = exposed / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (exposed / "link2").symlink_to("real.json")  # relative target
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.symlink_to(exposed / "link2")
+        tmp_path.chmod(0o755)
+        exposed.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(exposed / "link2") in f and "re-pointed" in f for f in findings)
+        finally:
+            exposed.chmod(0o755)
+
+    def test_an_unresolvable_home_is_not_this_diagnostic_s_problem(self):
+        """`expanduser` raises RuntimeError, not OSError, for `~nosuchuser`."""
+        assert bundle_provenance_warnings(Path("~nosuchuser/policy-bundle.json")) == []
+
+    def test_a_missing_bundle_is_not_this_diagnostic_s_problem(self, tmp_path):
+        assert bundle_provenance_warnings(tmp_path / "absent.json") == []
+
+    def test_windows_is_a_noop(self, tmp_path, monkeypatch):
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o666)
+        assert bundle_provenance_warnings(bundle), "sanity: POSIX would flag this"
+        monkeypatch.setattr(toolgraph_bundle_mod.sys, "platform", "win32")
+        assert bundle_provenance_warnings(bundle) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission semantics")
+class TestBundleProvenanceWiring:
+    def test_adopting_an_exposed_bundle_warns_once_per_finding_set(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        _write_bundle(bundle_path, _bundle(tool))
+        tmp_path.chmod(0o777)
+        try:
+            with caplog.at_level("WARNING"):
+                manager._refresh_toolgraph_bundle(force=True)
+                manager._refresh_toolgraph_bundle(force=True)
+            assert caplog.text.count("not protected from substitution") == 1
+            # Advisory: the bundle is adopted regardless.
+            assert manager._toolgraph_policy_snapshot is not None
+            assert manager._toolgraph_withhold_all is None
+        finally:
+            tmp_path.chmod(0o755)
+
+    def test_a_safe_bundle_stays_silent(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        _write_bundle(bundle_path, _bundle(tool))
+        tmp_path.chmod(0o755)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert "not protected from substitution" not in caplog.text
