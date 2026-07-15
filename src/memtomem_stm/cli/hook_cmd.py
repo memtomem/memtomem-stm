@@ -427,16 +427,16 @@ async def run_surfacing_hook(
 
     Consumes a normalized :class:`CanonicalHookCall` (host-agnostic): the
     allowlist gates on ``canonical_tool`` while the surfacing engine receives the
-    host-native ``tool_name`` for query extraction. **Never raises** — every
-    failure path (disabled surfacing, LTM error/timeout, internal bug) degrades
-    to ``{}`` so any caller (the CLI, the daemon) can emit it and let the tool
-    output pass through. The one thing that still propagates is
-    :class:`asyncio.CancelledError` (it is not an ``Exception``): the engine
-    books a past-deadline cancellation as a timeout first (#720), and the
-    caller's timeout scope needs the cancellation to resolve itself. ``engine``
-    is a test seam: when provided it is used as-is (caller owns its lifecycle);
-    when ``None``, an engine + LTM adapter are built from :class:`STMConfig`
-    and torn down before returning.
+    host-native ``tool_name`` for query extraction. **Never raises an ordinary
+    failure** — disabled surfacing, LTM error/timeout, an internal bug all
+    degrade to ``{}`` so any caller (the CLI, the daemon) can emit it and let
+    the tool output pass through. Cooperative cancellation still propagates:
+    :class:`asyncio.CancelledError` is not an ``Exception``, the engine books
+    it as a timeout first when the LTM window had already elapsed (#720), and
+    the canceller's scope needs it to resolve itself. ``engine`` is a test
+    seam: when provided it is used as-is (caller owns its lifecycle); when
+    ``None``, an engine + LTM adapter are built from :class:`STMConfig` and
+    torn down before returning.
 
     ``deadline_monotonic`` — an absolute ``time.monotonic()`` point — bounds
     this call's LTM attempt for a caller that is itself deadline-bounded (the

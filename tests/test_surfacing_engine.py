@@ -525,6 +525,27 @@ class TestSurfacingDeadline:
         assert "Relevant Memories" in output
         assert engine._circuit_breaker.failure_count == 0
 
+    @staticmethod
+    def _hangs_unwinding(cancel_started: asyncio.Event):
+        """Adapter whose cancellation outlives whoever cancelled it.
+
+        ``cancel_started`` fires the instant the adapter is cancelled, which is
+        what makes the lost-race tests deterministic: waiting on it proves the
+        engine's *own* ``wait_for`` initiated the cancellation before any outer
+        timer could, so a test that then books a timeout cannot be passing
+        because something else cancelled the engine outright.
+        """
+
+        async def search(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancel_started.set()
+                await asyncio.sleep(10)  # unwind outlives the canceller
+                raise
+
+        return search
+
     async def test_lost_abort_race_still_books_the_timeout(self):
         # #720 acceptance: an adapter whose cancellation outlives the caller's
         # backstop. The engine's own wait_for fires first, but its TimeoutError
@@ -533,15 +554,9 @@ class TestSurfacingDeadline:
         # The fault row and the breaker increment must survive anyway.
         from memtomem_stm.surfacing.observability import SurfacingObservability
 
-        async def slow_cancel_search(*args, **kwargs):
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                await asyncio.sleep(10)  # unwind outlives the outer backstop
-                raise
-
+        cancel_started = asyncio.Event()
         adapter = _make_mcp_adapter()
-        adapter.search = AsyncMock(side_effect=slow_cancel_search)
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(cancel_started))
         obs = SurfacingObservability()
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=30.0),
@@ -549,21 +564,62 @@ class TestSurfacingDeadline:
             observability=obs,
         )
 
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.25):  # the daemon's outer backstop
-                await engine.surface(
-                    "gh",
-                    "read_file",
-                    VALID_ARGS,
-                    LONG_RESPONSE,
-                    deadline_monotonic=time.monotonic() + 0.1,
-                )
+        async def surface_then_hold() -> None:
+            await engine.surface(
+                "gh",
+                "read_file",
+                VALID_ARGS,
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() + 0.05,
+            )
+
+        task = asyncio.create_task(surface_then_hold())
+        # The engine's own wait_for — not the backstop — must own the first
+        # cancellation, or this is not the race the issue describes.
+        await asyncio.wait_for(cancel_started.wait(), timeout=5.0)
+        assert engine._circuit_breaker.failure_count == 0  # unwind still in flight
+
+        task.cancel()  # the caller's backstop, landing mid-unwind
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
         assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
         assert engine._circuit_breaker.failure_count == 1
 
-    async def test_cancellation_before_the_deadline_books_nothing(self):
-        # A cancellation while the deadline is still far away is a real one
+    async def test_lost_race_under_the_config_ceiling_still_books(self):
+        # The window can end at the configured ceiling rather than the caller's
+        # deadline. A cancellation landing after the ceiling but *before* the
+        # deadline is still a real timeout — the LTM blew the window it was
+        # given. Keying the booking off the deadline would miss it. ``None``
+        # covers the cold in-process path, which has no deadline at all.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        for deadline in (None, time.monotonic() + 30.0):
+            cancel_started = asyncio.Event()
+            adapter = _make_mcp_adapter()
+            adapter.search = AsyncMock(side_effect=self._hangs_unwinding(cancel_started))
+            obs = SurfacingObservability()
+            engine = SurfacingEngine(
+                config=_make_config(timeout_seconds=0.05),  # ceiling binds, not the deadline
+                mcp_adapter=adapter,
+                observability=obs,
+            )
+
+            task = asyncio.create_task(
+                engine.surface(
+                    "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=deadline
+                )
+            )
+            await asyncio.wait_for(cancel_started.wait(), timeout=5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}, deadline
+            assert engine._circuit_breaker.failure_count == 1, deadline
+
+    async def test_cancellation_inside_the_window_books_nothing(self):
+        # A cancellation while the LTM is still inside its window is a real one
         # (daemon shutdown, client gone) — not a timeout. Booking it would
         # count breaker failures against a healthy LTM.
         from memtomem_stm.surfacing.observability import SurfacingObservability
@@ -598,34 +654,41 @@ class TestSurfacingDeadline:
         assert obs.snapshot()["outcomes"] == {}
         assert engine._circuit_breaker.failure_count == 0
 
-    async def test_pre_timeout_work_debits_the_engines_window(self):
-        # #720 race source 1: the deadline is read *after* the gate, query
+    async def test_pre_timeout_work_debits_the_engines_window(self, monkeypatch):
+        # #720 race source 1: the window is derived *after* the gate, query
         # extraction, and privacy scan, so pre-timeout work shrinks the LTM
-        # attempt instead of pushing the abort past the caller's margin. A
-        # relative budget captured before the pre-work would abort at
-        # ~pre-work + window (0.35s here); the deadline aborts at ~0.2s.
-        async def slow_search(*args, **kwargs):
-            await asyncio.sleep(10)
-            return [], [], "empty_results"
+        # attempt instead of pushing the abort past the caller's margin. Assert
+        # on the timeout actually handed to wait_for rather than on elapsed
+        # wall clock: a relative budget captured before the pre-work would hand
+        # over the full 0.5s, the absolute deadline hands over what is left.
+        captured: list[float] = []
+        real_wait_for = asyncio.wait_for
 
-        adapter = AsyncMock()
-        adapter.search = slow_search
+        async def spy_wait_for(aw, timeout):
+            captured.append(timeout)
+            return await real_wait_for(aw, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", spy_wait_for)
 
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=30.0),
-            mcp_adapter=adapter,
+            mcp_adapter=_make_mcp_adapter(),
         )
-        engine._maybe_cleanup_expired = lambda: time.sleep(0.15)  # stand-in pre-work
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.2)  # stand-in pre-work
 
-        started = time.monotonic()
-        output = await engine.surface(
-            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 0.2
+        await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.5,
         )
-        elapsed = time.monotonic() - started
 
-        assert output == LONG_RESPONSE
-        assert elapsed < 0.3
-        assert engine._circuit_breaker.failure_count == 1
+        assert len(captured) == 1
+        # ~0.3s (0.5 window − 0.2 pre-work). The 0.4 bound only trips if the
+        # pre-work were not debited at all (0.5) — it holds for any pre-work
+        # overrun, which can only shrink the number further.
+        assert 0 < captured[0] < 0.4
 
     async def test_window_fully_consumed_books_without_starting_an_rpc(self):
         # Pre-work ate the entire window: starting an LTM round trip now would

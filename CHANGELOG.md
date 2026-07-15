@@ -13,20 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- Closed the race #719 left between the surfacing engine's own timeout and the
-  daemon's outer deadline backstop. The engine now receives the client's
-  deadline as an absolute monotonic point rather than a relative budget, and
-  reads the clock right before its LTM attempt — so its pre-timeout work (gate,
-  query extraction, privacy scan) debits its own window instead of silently
-  eating the fixed response margin. If the backstop still wins the abort — the
-  cancelled LTM adapter is slow to unwind, or the event loop stalls past both
-  timers — the engine books the cancellation as a surfacing timeout
-  (`error_timeout` fault row, warning log, circuit-breaker increment) before
-  re-raising, instead of skipping that bookkeeping exactly as in the silent
-  failure mode #719 removed. A cancellation arriving *before* the deadline
-  (daemon shutdown, client gone) still books nothing, and a window fully
-  consumed by pre-work is booked without starting an LTM round trip that would
-  be cancelled mid-RPC. (#721)
+- The daemon now hands the surfacing engine the time left in the client's
+  deadline instead of letting that deadline cancel the engine from outside.
   `hook.daemon_timeout_seconds` (2.5s) is smaller than
   `surfacing.timeout_seconds` (3.0s), so on the daemon path every slow LTM
   search was aborted by the transport before the engine's own timeout could
@@ -44,6 +32,24 @@ changes inline only. See the deprecation policy in
   `success` one roughly the length of the whole budget, keeping the censored
   duration out of the percentiles `mms daemon status`'s timeout recommendation
   is derived from. (#719)
+- Closed the race #719 left between the surfacing engine's own timeout and the
+  daemon's outer deadline backstop. The engine now receives the client's
+  deadline as an absolute monotonic point rather than a relative budget, and
+  derives its window right before the LTM attempt — so its pre-timeout work
+  (gate, query extraction, privacy scan) debits that window instead of silently
+  eating the fixed response margin. If something cancels the call from outside
+  anyway — the backstop winning the abort race against a slow-to-unwind LTM
+  adapter, or an event loop stalled past both timers — the engine books it as a
+  surfacing timeout (`error_timeout` fault row, warning log, circuit-breaker
+  increment) before re-raising, instead of skipping that bookkeeping exactly as
+  in the silent failure mode #719 removed. The booking test is whether the
+  window granted to the LTM has elapsed, not which timer fired: a cancellation
+  arriving while the LTM is still inside its window (daemon shutdown, client
+  gone) books nothing and never charges a healthy LTM, and one arriving after a
+  window that ended at the configured `surfacing.timeout_seconds` ceiling —
+  earlier than the caller's deadline — is booked rather than missed. A window
+  fully consumed by pre-work is booked without starting an LTM round trip that
+  would be cancelled mid-RPC. (#721)
 
 ## [0.1.40] — 2026-07-15
 

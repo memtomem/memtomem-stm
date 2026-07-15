@@ -495,10 +495,12 @@ class SurfacingEngine:
         :class:`asyncio.TimeoutError` path below records the fault, logs, and
         counts the failure toward the breaker (#579) — an external cancellation
         skips all three, so the breaker never opens and every subsequent call
-        pays the full timeout and respawns the LTM child again. If the caller's
-        backstop nevertheless wins the abort race (#720), the
+        pays the full timeout and respawns the LTM child again. If something
+        cancels this call from outside anyway (#720) — the caller's backstop
+        winning the abort race, a shutdown, a stalled loop — the
         :class:`asyncio.CancelledError` path books the same timeout before
-        re-raising.
+        re-raising, but only once this call's own LTM window has elapsed; a
+        cancellation inside the window is a real one and books nothing.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -542,6 +544,12 @@ class SurfacingEngine:
             return response_text
 
         effective_timeout = self._effective_timeout(deadline_monotonic)
+        # When this call's LTM window runs out. Captured here rather than
+        # re-derived from ``deadline_monotonic`` in the handler below because
+        # the two are not the same instant: with a configured ceiling shorter
+        # than the caller's deadline, the window ends at the ceiling, and a
+        # deadline-derived test would then miss a real timeout (#720).
+        attempt_deadline = time.monotonic() + effective_timeout
         try:
             if effective_timeout <= 0:
                 # Pre-timeout work (gate, query extraction, privacy scan)
@@ -563,7 +571,9 @@ class SurfacingEngine:
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
                 tool,
-                effective_timeout,
+                # Clamped: the pre-work branch above reaches here with a
+                # window already spent, and a negative "limit" reads as a bug.
+                max(effective_timeout, 0.0),
             )
             # A hung LTM must open the breaker like an erroring one (#579): a
             # timeout is a degraded dependency, and it also cancels the adapter
@@ -573,26 +583,32 @@ class SurfacingEngine:
             self._circuit_breaker.record_failure()
             return response_text
         except asyncio.CancelledError:
-            # Lost the abort race to the caller's own backstop (#720):
+            # Lost the abort race to a cancellation from outside (#720):
             # ``wait_for`` only raises ``TimeoutError`` once the cancelled
-            # adapter has finished unwinding, and the caller's outer deadline
-            # (`_run_admitted`'s ``asyncio.timeout_at``) can fire inside that
-            # window — slow cancellation or event-loop starvation. Past the
-            # deadline, the cancellation *is* a surfacing timeout, and this is
-            # the only site that owns the fault/log/breaker bookkeeping; an
-            # unbooked pass-through recreates the silent loop #719 removed. A
-            # cancellation *before* the deadline is a real one (shutdown,
-            # client gone) and books nothing. Always re-raise: the caller's
-            # timeout scope needs the cancellation to resolve itself.
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            # adapter has finished unwinding, and anything that cancels this
+            # task can fire inside that window — the daemon's own backstop
+            # (`_run_admitted`'s ``asyncio.timeout_at``), a shutdown, or a
+            # stalled event loop overrunning both timers. This is the only
+            # site that owns the fault/log/breaker bookkeeping, so an unbooked
+            # pass-through recreates the silent loop #719 removed.
+            #
+            # The test is not "who cancelled me" — that is unknowable here —
+            # but "has the window I granted the LTM provably elapsed". Past
+            # ``attempt_deadline`` it has, so the LTM demonstrably failed to
+            # answer in time and a timeout is the accurate booking whatever
+            # delivered the cancellation. Before it, the LTM was still inside
+            # its window: that is a real external cancellation (shutdown,
+            # client gone) and books nothing, so a healthy LTM is never
+            # charged a breaker failure. Always re-raise: the canceller's
+            # scope needs the cancellation to resolve itself.
+            if time.monotonic() >= attempt_deadline:
                 self._observability.record_outcome(tool, "error_timeout")
                 self._persist_fault(server, tool, "error_timeout")
                 logger.warning(
-                    "Surfacing cancelled past its deadline for %s/%s (%.1fs limit) — "
-                    "booking as timeout",
+                    "Surfacing cancelled past its %.1fs window for %s/%s — booking as timeout",
+                    effective_timeout,
                     server,
                     tool,
-                    effective_timeout,
                 )
                 self._circuit_breaker.record_failure()
             raise
