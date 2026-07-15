@@ -491,6 +491,17 @@ class ProxyManager:
         self._toolgraph_bundle_digest: str | None = None
         self._graph_instance_id: str | None = None
         self._toolgraph_would_block_calls: int = 0
+        # Bundle-binding outcome split by ORIGIN, which the final reject codes
+        # cannot express: the producer may itself declare ``DRIFTED`` /
+        # ``UNMAPPED`` in the bundle, and ``_TOOLGRAPH_REASON_MAP`` collapses
+        # those onto the very same codes STM emits when it computes a digest
+        # mismatch or finds no decision. Counting the codes would therefore
+        # blame the producer's own verdicts on a contract mismatch. Only the
+        # STM-computed branches feed the all-fail diagnostic below.
+        self._toolgraph_bind_stats: dict[str, int] = {}
+        # Latched so an all-fail episode warns ONCE, not per tools/list. Reset
+        # on any healthy rebind, so a recurrence warns again.
+        self._toolgraph_all_fail_warned: str | None = None
         # Monotonic within a start/stop lifecycle. Portable policy decisions
         # are rebound only when this revision changes, avoiding O(catalog)
         # contract hashing on every tools/call hot path.
@@ -567,6 +578,10 @@ class ProxyManager:
             self._connections.clear()
             self._tool_catalog_revision = 0
             self._toolgraph_bound_catalog_revision = None
+            # The binding diagnostic describes a catalog that no longer exists;
+            # a reused manager must not report the previous session's outcome.
+            self._toolgraph_bind_stats = {}
+            self._toolgraph_all_fail_warned = None
             # Drop stale startup-failure records (#580): a manager reused across
             # ``start()`` calls (new config, or a server removed) must not keep
             # reporting a previous session's failed upstream in
@@ -818,14 +833,19 @@ class ProxyManager:
         cfg = self._config.toolgraph
         rejects: dict[tuple[str, str], str] = {}
         penalties: dict[tuple[str, str], float] = {}
+        catalog_total = 0
+        stm_unmapped = 0
+        stm_drifted = 0
         for conn in self._connections.values():
             graph_server = cfg.server_name_map.get(conn.name, conn.name)
             for tool in conn.tools:
+                catalog_total += 1
                 key = (conn.name, tool.name)
                 qualified = f"{graph_server}::{tool.name}"
                 decision = snapshot.decisions.get(qualified)
                 if decision is None:
                     rejects[key] = REASON_TOOLGRAPH_UNMAPPED
+                    stm_unmapped += 1
                     continue
                 digest = tool_contract_digest(
                     server=graph_server,
@@ -836,6 +856,7 @@ class ProxyManager:
                 )
                 if digest != decision.contract_digest:
                     rejects[key] = REASON_TOOLGRAPH_DRIFTED
+                    stm_drifted += 1
                     continue
                 if decision.reject_code is not None:
                     rejects[key] = decision.reject_code
@@ -843,7 +864,66 @@ class ProxyManager:
                     penalties[key] = min(decision.risk_score * cfg.risk_penalty_scale, 1.0)
         self._toolgraph_external_rejects = rejects
         self._toolgraph_risk_penalties = penalties
+        self._toolgraph_bind_stats = {
+            "catalog_total": catalog_total,
+            "stm_unmapped": stm_unmapped,
+            "stm_drifted": stm_drifted,
+        }
+        self._warn_on_total_bind_failure(catalog_total, stm_unmapped, stm_drifted)
         self._toolgraph_bound_catalog_revision = self._tool_catalog_revision
+
+    def _warn_on_total_bind_failure(self, total: int, unmapped: int, drifted: int) -> None:
+        """Name the likely cause when binding rejects the WHOLE live catalog.
+
+        A catalog-wide bind failure is nearly always one misconfiguration, not
+        N independent ones: either the producer's ``tool_contract_digest``
+        algorithm no longer agrees with ours (every tool drifts), or
+        ``server_name_map`` does not match the crawl (nothing maps). Under
+        ``strict`` both withhold every tool, and the reject codes alone give an
+        operator no way to tell a mass mismatch from a deliberate deny. A
+        partial failure is deliberately NOT warned: some drift is normal and
+        routine noise would train operators to ignore this line.
+        """
+        if total == 0:
+            self._toolgraph_all_fail_warned = None
+            return
+        cause: str | None = None
+        if unmapped == total:
+            cause = "unmapped"
+        elif drifted == total:
+            cause = "drifted"
+        elif unmapped + drifted == total:
+            cause = "mixed"
+        if cause is None:
+            self._toolgraph_all_fail_warned = None
+            return
+        if self._toolgraph_all_fail_warned == cause:
+            return
+        self._toolgraph_all_fail_warned = cause
+        if cause == "unmapped":
+            logger.warning(
+                "Toolgraph policy bundle maps none of the %d live tools — check that "
+                "toolgraph.server_name_map matches the server names Toolgraph crawled "
+                "(every tool is withheld under the strict profile)",
+                total,
+            )
+        elif cause == "drifted":
+            logger.warning(
+                "Toolgraph contract digests disagree for all %d live tools — the bundle "
+                "is likely built from a stale catalog, or its producer's digest algorithm "
+                "no longer matches this STM version (every tool is withheld under the "
+                "strict profile)",
+                total,
+            )
+        else:
+            logger.warning(
+                "Toolgraph policy bundle binds none of the %d live tools (%d unmapped, "
+                "%d drifted) — check toolgraph.server_name_map and republish the bundle "
+                "from the current catalog (every tool is withheld under the strict profile)",
+                total,
+                unmapped,
+                drifted,
+            )
 
     def _enforce_toolgraph_call_policy(self, server: str, tool: str) -> None:
         """Apply the same policy snapshot at call time, before cache/upstream."""
@@ -2957,7 +3037,7 @@ class ProxyManager:
         """
         if not self._config.toolgraph.enabled:
             return None
-        status = {
+        status: dict[str, Any] = {
             "enabled": True,
             "degraded": self._toolgraph_degraded,
             "degraded_reason": self._toolgraph_degraded_reason,
@@ -2979,6 +3059,11 @@ class ProxyManager:
                         and self._toolgraph_policy_snapshot is not None
                         and self._toolgraph_withhold_all is None
                     ),
+                    # STM-computed binding outcome only — a producer-declared
+                    # DRIFTED/UNMAPPED verdict shares the final reject code but
+                    # is NOT a contract mismatch, so it must not inflate these.
+                    "bind_stats": dict(self._toolgraph_bind_stats),
+                    "all_bind_failure": self._toolgraph_all_fail_warned,
                 }
             )
         return status

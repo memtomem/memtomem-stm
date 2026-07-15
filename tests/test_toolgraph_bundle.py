@@ -512,3 +512,138 @@ def test_gateway_status_and_explain_bundle(tmp_path):
     )
     assert plain.exit_code == 0, plain.output
     assert "risk score: n/a" in plain.output
+
+
+class TestBindFailureDiagnostics:
+    """A catalog-wide bind failure names its likely cause exactly once.
+
+    The reject codes cannot carry this: ``_TOOLGRAPH_REASON_MAP`` maps a
+    producer-declared ``DRIFTED``/``UNMAPPED`` reason onto the same code STM
+    emits for a computed digest mismatch or a missing decision, so only the
+    STM-computed branches may drive the diagnostic.
+    """
+
+    def test_all_unmapped_blames_server_name_map(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        _write_bundle(bundle_path, _bundle(tool))
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert "server_name_map" in caplog.text
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] == "unmapped"
+        assert status["bind_stats"] == {
+            "catalog_total": 1,
+            "stm_unmapped": 1,
+            "stm_drifted": 0,
+        }
+
+    def test_all_drifted_blames_digest_or_stale_catalog(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        doc = _bundle(tool)
+        doc["tools"][0]["tool_contract_digest"] = "c" * 64
+        _write_bundle(bundle_path, doc)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert "digest algorithm" in caplog.text
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] == "drifted"
+        assert status["bind_stats"]["stm_drifted"] == 1
+
+    def test_producer_declared_drift_is_not_an_stm_bind_failure(self, tmp_path, caplog):
+        """Positive control: the SAME final reject code, no false warning."""
+        manager, bundle_path, tool = _manager(tmp_path)
+        doc = _bundle(tool, decision="rejected")
+        doc["tools"][0]["reason"] = "DRIFTED"
+        _write_bundle(bundle_path, doc)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        # The tool IS rejected, with the same code an STM-computed drift emits...
+        assert manager._toolgraph_external_rejects[("srv", "read")] == REASON_TOOLGRAPH_DRIFTED
+        # ...yet this is the producer's own verdict, so nothing is diagnosed.
+        assert "digest algorithm" not in caplog.text
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] is None
+        assert status["bind_stats"] == {
+            "catalog_total": 1,
+            "stm_unmapped": 0,
+            "stm_drifted": 0,
+        }
+
+    def test_producer_declared_unmapped_is_not_an_stm_bind_failure(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        doc = _bundle(tool, decision="rejected")
+        doc["tools"][0]["reason"] = "UNMAPPED"
+        _write_bundle(bundle_path, doc)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        assert manager._toolgraph_external_rejects[("srv", "read")] == REASON_TOOLGRAPH_UNMAPPED
+        assert "server_name_map" not in caplog.text
+        assert manager.get_toolgraph_status()["all_bind_failure"] is None
+
+    def test_partial_failure_is_not_warned(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        other = _tool(name="write", description="Write data")
+        manager._connections["srv"].tools = [tool, other]
+        _write_bundle(bundle_path, _bundle(tool))  # only `read` is in the bundle
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        assert manager._toolgraph_external_rejects[("srv", "write")] == REASON_TOOLGRAPH_UNMAPPED
+        assert "server_name_map" not in caplog.text
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] is None
+        assert status["bind_stats"] == {
+            "catalog_total": 2,
+            "stm_unmapped": 1,
+            "stm_drifted": 0,
+        }
+
+    def test_mixed_total_failure_reports_both_counts(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        other = _tool(name="write", description="Write data")
+        manager._connections["srv"].tools = [tool, other]
+        doc = _bundle(tool)
+        doc["tools"][0]["tool_contract_digest"] = "c" * 64  # read drifts, write unmapped
+        _write_bundle(bundle_path, doc)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        assert "1 unmapped" in caplog.text and "1 drifted" in caplog.text
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] == "mixed"
+
+    def test_empty_catalog_is_not_a_bind_failure(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        manager._connections.clear()
+        _write_bundle(bundle_path, _bundle(tool))
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] is None
+        assert status["bind_stats"]["catalog_total"] == 0
+
+    def test_warning_is_once_per_episode_and_rearms_after_recovery(self, tmp_path, caplog):
+        manager, bundle_path, tool = _manager(tmp_path)
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        _write_bundle(bundle_path, _bundle(tool))
+
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+            manager._refresh_toolgraph_bundle(force=True)
+        assert caplog.text.count("server_name_map") == 1, "an episode must warn once"
+
+        # Recover, then regress: the operator must hear about it again.
+        caplog.clear()
+        manager._config.toolgraph.server_name_map = {"srv": "graph-srv"}
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert manager.get_toolgraph_status()["all_bind_failure"] is None
+
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert caplog.text.count("server_name_map") == 1, "a recurrence must warn again"
