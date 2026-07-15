@@ -647,3 +647,116 @@ class TestBindFailureDiagnostics:
         with caplog.at_level("WARNING"):
             manager._refresh_toolgraph_bundle(force=True)
         assert caplog.text.count("server_name_map") == 1, "a recurrence must warn again"
+
+    def test_cause_shift_within_an_episode_does_not_rewarn(self, tmp_path, caplog):
+        """The episode is "the whole catalog is failing", not a given cause."""
+        manager, bundle_path, tool = _manager(tmp_path)
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        _write_bundle(bundle_path, _bundle(tool))
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert manager.get_toolgraph_status()["all_bind_failure"] == "unmapped"
+
+        # Still totally failing, but now partly by drift: same episode.
+        caplog.clear()
+        manager._config.toolgraph.server_name_map = {"srv": "graph-srv"}
+        other = _tool(name="write", description="Write data")
+        manager._connections["srv"].tools = [tool, other]
+        doc = _bundle(tool)
+        doc["tools"][0]["tool_contract_digest"] = "c" * 64
+        _write_bundle(bundle_path, doc)
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] == "mixed", "the reported cause still tracks reality"
+        assert "Toolgraph" not in caplog.text, "but the same episode must not warn twice"
+
+    @pytest.mark.asyncio
+    async def test_restart_drops_the_previous_catalogs_diagnostic(self, tmp_path, caplog):
+        """stop() → start() bypasses the double-start guard; state must still reset."""
+        manager, bundle_path, tool = _manager(tmp_path)
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        _write_bundle(bundle_path, _bundle(tool))
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert manager.get_toolgraph_status()["all_bind_failure"] == "unmapped"
+
+        # A restart whose bundle is invalid degrades before binding anything:
+        # reporting the dead catalog's stats would misdirect the operator.
+        manager._config.exposure.profile = ExposureProfile.REVIEW
+        manager._config.toolgraph.query_profile = "review"
+        manager._config.upstream_servers = {}
+        bundle_path.write_bytes(b"{ not json")
+        with caplog.at_level("WARNING"):
+            await manager.start()
+
+        status = manager.get_toolgraph_status()
+        assert status["all_bind_failure"] is None
+        assert status["bind_stats"] == {}
+
+
+class TestBindFailureHealthRendering:
+    """`stm_proxy_health` must actually carry the diagnostic to the operator."""
+
+    def _status(self, **over):
+        status = {
+            "enabled": True,
+            "degraded": False,
+            "degraded_reason": None,
+            "withholding_all": None,
+            "graph_generation": 7,
+            "from_cache": False,
+            "external_reject_count": 2,
+            "risk_penalty_count": 0,
+            "source": "bundle",
+            "graph_instance_id": "graph-1",
+            "bundle_digest": "d" * 64,
+            "would_block_calls": 0,
+            "using_last_known_good": False,
+            "bind_stats": {"catalog_total": 2, "stm_unmapped": 2, "stm_drifted": 0},
+            "all_bind_failure": "unmapped",
+        }
+        status.update(over)
+        return status
+
+    def test_all_unmapped_names_server_name_map(self):
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(_toolgraph_health_lines(self._status()))
+        assert "ALL 2 live tool(s) failed to bind" in text
+        assert "toolgraph.server_name_map" in text
+
+    def test_all_drifted_names_the_digest_mismatch(self):
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(
+            _toolgraph_health_lines(
+                self._status(
+                    all_bind_failure="drifted",
+                    bind_stats={"catalog_total": 2, "stm_unmapped": 0, "stm_drifted": 2},
+                )
+            )
+        )
+        assert "digest algorithm" in text
+
+    def test_mixed_failure_reports_both_counts(self):
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(
+            _toolgraph_health_lines(
+                self._status(
+                    all_bind_failure="mixed",
+                    bind_stats={"catalog_total": 3, "stm_unmapped": 1, "stm_drifted": 2},
+                )
+            )
+        )
+        assert "1 unmapped, 2 drifted" in text
+
+    def test_healthy_binding_renders_no_diagnostic(self):
+        """Positive control: the line appears only for an all-fail episode."""
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(_toolgraph_health_lines(self._status(all_bind_failure=None)))
+        assert "failed to bind" not in text
+        assert "active (graph generation 7" in text

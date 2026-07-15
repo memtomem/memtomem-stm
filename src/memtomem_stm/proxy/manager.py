@@ -499,9 +499,13 @@ class ProxyManager:
         # blame the producer's own verdicts on a contract mismatch. Only the
         # STM-computed branches feed the all-fail diagnostic below.
         self._toolgraph_bind_stats: dict[str, int] = {}
-        # Latched so an all-fail episode warns ONCE, not per tools/list. Reset
-        # on any healthy rebind, so a recurrence warns again.
-        self._toolgraph_all_fail_warned: str | None = None
+        # The diagnosed cause of an ongoing all-fail episode, and a latch kept
+        # SEPARATE from it: the episode is "the whole catalog is failing", so a
+        # cause that shifts (unmapped → mixed as the catalog changes) is the
+        # same episode and must not re-warn. Both clear on a healthy bind, so a
+        # recurrence warns again.
+        self._toolgraph_all_fail_cause: str | None = None
+        self._toolgraph_all_fail_warned: bool = False
         # Monotonic within a start/stop lifecycle. Portable policy decisions
         # are rebound only when this revision changes, avoiding O(catalog)
         # contract hashing on every tools/call hot path.
@@ -578,10 +582,6 @@ class ProxyManager:
             self._connections.clear()
             self._tool_catalog_revision = 0
             self._toolgraph_bound_catalog_revision = None
-            # The binding diagnostic describes a catalog that no longer exists;
-            # a reused manager must not report the previous session's outcome.
-            self._toolgraph_bind_stats = {}
-            self._toolgraph_all_fail_warned = None
             # Drop stale startup-failure records (#580): a manager reused across
             # ``start()`` calls (new config, or a server removed) must not keep
             # reporting a previous session's failed upstream in
@@ -884,22 +884,21 @@ class ProxyManager:
         partial failure is deliberately NOT warned: some drift is normal and
         routine noise would train operators to ignore this line.
         """
-        if total == 0:
-            self._toolgraph_all_fail_warned = None
-            return
         cause: str | None = None
-        if unmapped == total:
-            cause = "unmapped"
-        elif drifted == total:
-            cause = "drifted"
-        elif unmapped + drifted == total:
-            cause = "mixed"
+        if total > 0:
+            if unmapped == total:
+                cause = "unmapped"
+            elif drifted == total:
+                cause = "drifted"
+            elif unmapped + drifted == total:
+                cause = "mixed"
+        self._toolgraph_all_fail_cause = cause
         if cause is None:
-            self._toolgraph_all_fail_warned = None
+            self._toolgraph_all_fail_warned = False
             return
-        if self._toolgraph_all_fail_warned == cause:
+        if self._toolgraph_all_fail_warned:
             return
-        self._toolgraph_all_fail_warned = cause
+        self._toolgraph_all_fail_warned = True
         if cause == "unmapped":
             logger.warning(
                 "Toolgraph policy bundle maps none of the %d live tools — check that "
@@ -1085,6 +1084,13 @@ class ProxyManager:
         self._toolgraph_would_block_calls = 0
         self._tool_catalog_revision = 0
         self._toolgraph_bound_catalog_revision = None
+        # The binding diagnostic describes a catalog this lifecycle destroyed.
+        # Reset here, not in the double-start guard: the guard only fires when
+        # a stack is still open, so a stop() → start() would otherwise carry a
+        # dead catalog's stats into a startup that degrades before binding.
+        self._toolgraph_bind_stats = {}
+        self._toolgraph_all_fail_cause = None
+        self._toolgraph_all_fail_warned = False
 
     def _open_consult_cache(self, cfg: ToolgraphConfig) -> GraphConsultCache | None:
         """Lazily open the #494 consult disk cache; ``None`` when disabled.
@@ -3063,7 +3069,7 @@ class ProxyManager:
                     # DRIFTED/UNMAPPED verdict shares the final reject code but
                     # is NOT a contract mismatch, so it must not inflate these.
                     "bind_stats": dict(self._toolgraph_bind_stats),
-                    "all_bind_failure": self._toolgraph_all_fail_warned,
+                    "all_bind_failure": self._toolgraph_all_fail_cause,
                 }
             )
         return status
