@@ -747,7 +747,7 @@ def _write_mcp_json_for_stm(
     env: dict[str, str] | None = None,
     *,
     replace_existing: bool = False,
-) -> Path:
+) -> tuple[Path, bool]:
     """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry.
 
     Aborts (``SystemExit(1)``, same convention as ``_load``) when an existing
@@ -804,11 +804,6 @@ def _write_mcp_json_for_stm(
         )
         raise SystemExit(1)
     current_entry = servers.get("memtomem-stm")
-    if current_entry is not None and not replace_existing:
-        # Existing host registrations are keep-by-default.  Managed daemon /
-        # timeout values are applied only to a new entry or an explicit
-        # `--replace-registration` refresh.
-        return mcp_path
     if current_entry is not None and not isinstance(current_entry, dict):
         click.echo(
             f"{_err('Error:')} {mcp_path} 'memtomem-stm' entry must be an object, got "
@@ -816,6 +811,11 @@ def _write_mcp_json_for_stm(
             err=True,
         )
         raise SystemExit(1)
+    if current_entry is not None and not replace_existing:
+        # Existing host registrations are keep-by-default.  Managed daemon /
+        # timeout values are applied only to a new entry or an explicit
+        # `--replace-registration` refresh.
+        return mcp_path, False
 
     # On explicit refresh, retain fields STM does not own and merge environment
     # values key-by-key.  This preserves host-specific metadata and operator
@@ -849,7 +849,7 @@ def _write_mcp_json_for_stm(
     except OSError:
         file_mode = 0o644
     atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode, durable=True)
-    return mcp_path
+    return mcp_path, True
 
 
 def _claude_desktop_config_hint() -> str:
@@ -1013,14 +1013,20 @@ def _run_mcp_integration(
 
     if client_mode == "json":
         _SETUP_RESOLVED_CLIENT.set("json")
-        mcp_path = _write_mcp_json_for_stm(
+        mcp_path, written = _write_mcp_json_for_stm(
             Path.cwd(),
             server_cmd,
             server_args,
             server_env,
             replace_existing=replace_registration,
         )
-        click.echo(f"  {_ok('Wrote')} {mcp_path}")
+        if written:
+            click.echo(f"  {_ok('Wrote')} {mcp_path}")
+        else:
+            click.echo(
+                f"  {_ok('Kept existing registration')} "
+                "(use --replace-registration to refresh)"
+            )
         _emit_mcp_paste_hints()
         return
 
@@ -1070,14 +1076,20 @@ def _run_mcp_integration(
 
     # choice == 2, or choice == 1 fallback
     _SETUP_RESOLVED_CLIENT.set("json")
-    mcp_path = _write_mcp_json_for_stm(
+    mcp_path, written = _write_mcp_json_for_stm(
         Path.cwd(),
         server_cmd,
         server_args,
         server_env,
         replace_existing=replace_registration,
     )
-    click.echo(f"  {_ok('Wrote')} {mcp_path}")
+    if written:
+        click.echo(f"  {_ok('Wrote')} {mcp_path}")
+    else:
+        click.echo(
+            f"  {_ok('Kept existing registration')} "
+            "(use --replace-registration to refresh)"
+        )
     _emit_mcp_paste_hints()
 
 
@@ -6396,19 +6408,44 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
         )
 
     search = profile.get("search")
-    mode = search.get("configured_mode") if isinstance(search, dict) else None
-    if mode in {"bm25_only", "disabled"}:
+    configured_mode = search.get("configured_mode") if isinstance(search, dict) else None
+    effective_mode = (
+        search.get("effective_mode", configured_mode) if isinstance(search, dict) else None
+    )
+    if effective_mode == "disabled":
         checks.append(
             (
                 "ltm_retrieval_mode",
                 "ltm retrieval mode",
                 "FAIL",
-                f"effective retrieval mode is {mode}",
+                "effective retrieval mode is disabled",
                 "enable a working dense embedding provider, then re-index vectors",
             )
         )
-    elif mode in {"hybrid", "dense_only"}:
-        checks.append(("ltm_retrieval_mode", "ltm retrieval mode", "PASS", str(mode), None))
+    elif effective_mode == "bm25_only" and configured_mode != "bm25_only":
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "FAIL",
+                f"configured mode {configured_mode} degraded to effective mode bm25_only",
+                "restore the configured dense embedding provider, then re-index vectors",
+            )
+        )
+    elif effective_mode == "bm25_only":
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "WARN",
+                "intentional BM25-only configuration; semantic surfacing is unavailable",
+                "enable a dense embedding provider and re-index vectors for semantic retrieval",
+            )
+        )
+    elif effective_mode in {"hybrid", "dense_only"}:
+        checks.append(
+            ("ltm_retrieval_mode", "ltm retrieval mode", "PASS", str(effective_mode), None)
+        )
     else:
         checks.append(
             (
@@ -6767,7 +6804,11 @@ def doctor(
             # optional measurement above is the only path that executes a
             # synthetic search.  These are WARN-only operational checks: an
             # undersized budget degrades surfacing but never breaks proxying.
-            if measure_ltm and (not isinstance(ltm, dict) or ltm.get("route") != "daemon"):
+            if measure_ltm and (
+                not isinstance(ltm, dict)
+                or ltm.get("route") != "daemon"
+                or ltm.get("daemon_reachable") is False
+            ):
                 check(
                     "ltm_measurement",
                     "ltm measurement",

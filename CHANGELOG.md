@@ -23,6 +23,16 @@ changes inline only. See the deprecation policy in
   eligibility filter and BM25 ranker on a packaged, sanitized 30-case corpus.
   The report evaluates 35 existing risk-weight combinations with safety-first
   train/validation/test gates and emits a config preview without applying it.
+- Added `mms doctor --measure-ltm` warm-daemon search sampling and runtime-profile
+  checks for missing ONNX/Korean extras and configured-versus-effective retrieval
+  mode, with measured timeout recommendations (#709).
+
+### Changed
+
+- **Behavior change**: `mms doctor` now exits nonzero when a connected LTM has
+  degraded from configured dense retrieval to BM25-only, while an intentional
+  BM25-only configuration remains a warning and older cores without a runtime
+  profile remain warning-only (#709).
 
 ### Fixed
 
@@ -30,7 +40,13 @@ changes inline only. See the deprecation policy in
   with ordered surfacing/hook deadlines instead of depending on host environment
   inheritance. Existing registrations remain keep-by-default; explicit refreshes
   preserve unrelated environment and host fields, and legacy inline-`env` hook
-  commands migrate to portable runtime flags.
+  commands migrate to portable runtime flags (#709).
+- Score-scale recovery persistence now writes once per healthy transition instead
+  of committing on every healthy search, while retaining restart recovery and
+  re-arming after a below-threshold observation (#709).
+- Short-lived MCP sessions now keep task groups owned by the serving task and
+  close reconnect owners before shutdown, eliminating Python 3.13 AnyIO
+  cancel-scope warnings without changing long-lived daemon behavior (#709).
 - Failed Codex MCP registration now exits nonzero and reports `ok: false` in
   JSON setup output, preventing automation from treating an unusable setup as
   successful (#702).

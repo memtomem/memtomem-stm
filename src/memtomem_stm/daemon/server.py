@@ -681,6 +681,8 @@ class DaemonServer:
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         if self._pending_slots.locked():
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+        # Advice is based on user-observed end-to-end latency, intentionally
+        # including admission-queue and serialization-lock wait time.
         started = time.monotonic()
         warm_at_start = self._ltm_warmth() == "warm"
         activity_before = activity_counter() if activity_counter is not None else None

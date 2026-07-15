@@ -51,7 +51,7 @@ from memtomem_stm.cli.proxy import cli
 from memtomem_stm.config import HookCompressionConfig
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
-from tests.helpers import set_home
+from helpers import set_home
 
 
 @pytest.fixture(autouse=True)

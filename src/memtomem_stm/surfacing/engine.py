@@ -183,6 +183,10 @@ class SurfacingEngine:
         # deliberately neutral. Entries disappear on recovery/reset, so the
         # map is naturally bounded by the configured upstream tool set.
         self._score_scale_streaks: dict[tuple[str, str], _ScoreScaleStreak] = {}
+        # A healthy observation closes at most one persisted episode per key.
+        # Re-arm only after a subsequent below-threshold observation so the
+        # healthy hot path does not UPDATE+commit on every search.
+        self._score_scale_recovery_persisted: set[tuple[str, str]] = set()
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -257,13 +261,15 @@ class SurfacingEngine:
         except Exception:
             logger.debug("Failed to persist surfacing diagnostic counter", exc_info=True)
 
-    def _persist_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
+    def _persist_diagnostic_recovery(self, server: str, tool: str, kind: str) -> bool:
         if self._feedback_tracker is None:
-            return
+            return False
         try:
             self._feedback_tracker.record_diagnostic_recovery(server, tool, kind)
+            return True
         except Exception:
             logger.debug("Failed to persist surfacing diagnostic recovery", exc_info=True)
+            return False
 
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
@@ -293,9 +299,13 @@ class SurfacingEngine:
         result_max = max(scores)
         if result_max >= min_score:
             self._score_scale_streaks.pop(key, None)
-            self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
+            if key not in self._score_scale_recovery_persisted and self._persist_diagnostic_recovery(
+                server, tool, "score_ceiling_below_min"
+            ):
+                self._score_scale_recovery_persisted.add(key)
             return
 
+        self._score_scale_recovery_persisted.discard(key)
         previous = self._score_scale_streaks.get(key)
         if previous is None or previous.threshold != min_score:
             streak = _ScoreScaleStreak(

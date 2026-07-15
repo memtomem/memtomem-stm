@@ -1447,7 +1447,7 @@ class TestWriteMcpJsonParseSafety:
     def _write(target_dir: Path) -> Path:
         from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
 
-        return _write_mcp_json_for_stm(target_dir, "memtomem-stm", [])
+        return _write_mcp_json_for_stm(target_dir, "memtomem-stm", [])[0]
 
     def test_corrupt_json_aborts_and_leaves_bytes_untouched(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1509,6 +1509,20 @@ class TestWriteMcpJsonParseSafety:
         assert excinfo.value.code == 1
         assert mcp_path.read_bytes() == prior
         assert "'mcpServers' must be an object" in capsys.readouterr().err
+
+    def test_existing_stm_entry_non_dict_aborts_even_without_replace(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        prior = b'{"mcpServers":{"memtomem-stm":"invalid"}}'
+        mcp_path.write_bytes(prior)
+
+        with pytest.raises(SystemExit) as excinfo:
+            self._write(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert mcp_path.read_bytes() == prior
+        assert "'memtomem-stm' entry must be an object" in capsys.readouterr().err
 
     def test_unreadable_file_aborts_without_write(
         self,
@@ -4188,6 +4202,9 @@ class TestRegisterCommand:
 
         kept = runner.invoke(cli, ["register", "--client", "json", *_cfg_args(config)])
         assert kept.exit_code == 0, kept.output
+        assert "Kept existing registration" in kept.output
+        assert "use --replace-registration to refresh" in kept.output
+        assert "Wrote" not in kept.output
         assert json.loads(mcp_path.read_text()) == legacy
 
         refreshed = runner.invoke(
@@ -9245,12 +9262,34 @@ class TestDoctor:
                     }
                 },
                 "missing_extras": ["onnx"],
-                "search": {"configured_mode": "bm25_only"},
+                "search": {
+                    "configured_mode": "hybrid",
+                    "effective_mode": "bm25_only",
+                },
             }
         )
         by_id = {item[0]: item[2] for item in checks}
         assert by_id["ltm_dependencies"] == "FAIL"
         assert by_id["ltm_retrieval_mode"] == "FAIL"
+
+    def test_runtime_profile_intentional_bm25_only_is_warn(self):
+        from memtomem_stm.cli.proxy import _runtime_profile_doctor_checks
+
+        checks = _runtime_profile_doctor_checks(
+            {
+                "schema_version": 1,
+                "config_state": "ok",
+                "dependencies": {},
+                "missing_extras": [],
+                "search": {
+                    "configured_mode": "bm25_only",
+                    "effective_mode": "bm25_only",
+                },
+            }
+        )
+        by_id = {item[0]: item[2] for item in checks}
+        assert by_id["ltm_dependencies"] == "PASS"
+        assert by_id["ltm_retrieval_mode"] == "WARN"
 
     def test_runtime_profile_old_core_is_warn_only(self):
         from memtomem_stm.cli.proxy import _runtime_profile_doctor_checks
