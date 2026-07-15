@@ -59,22 +59,23 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     """
     if sys.platform == "win32":
         return []
-    # Absolute and LEXICAL: ``bundle_path`` may be configured relative (nothing
-    # forces otherwise), and ``Path.parents`` of a relative path stops at ``.``
-    # — every directory above the working directory would go unexamined. Not
-    # ``resolve()``: that follows symlinks, and the symlink is itself a finding.
-    target = Path(os.path.abspath(path.expanduser()))
-    findings: list[str] = []
     euid = os.geteuid()
     try:
-        link_info = os.lstat(target)
+        expanded = path.expanduser()
+        # Absolute but NOT lexically normalised. ``bundle_path`` may be relative
+        # (nothing forces otherwise) and ``Path.parents`` of a relative path
+        # stops at ``.``, so it must be anchored — but ``os.path.abspath`` would
+        # collapse ``..`` textually, and the kernel does not: in ``link/..`` the
+        # ``..`` applies to the link's TARGET. Keeping the components lets the
+        # lstat walk resolve each prefix the way the loader will.
+        configured = expanded if expanded.is_absolute() else Path.cwd() / expanded
+        # Analyse what is actually opened. Inspecting a path the loader does not
+        # read is worse than not looking: it reports all-clear about a file
+        # nothing enforces.
+        target = Path(os.path.realpath(configured))
     except OSError:
         return []
-    if stat_module.S_ISLNK(link_info.st_mode):
-        # The link's own directory decides where this points: whoever can write
-        # it can aim the gateway at a policy of their choosing without ever
-        # touching the file we validated.
-        findings.append(f"{target} is a symlink; whoever can rewrite it chooses the policy")
+    findings: list[str] = _symlink_components(configured)
     try:
         info = os.stat(target)
     except OSError:
@@ -86,6 +87,29 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     if info.st_uid not in (euid, 0):
         findings.append(f"{target} is owned by uid {info.st_uid}, not by this process or root")
     findings.extend(_replaceable_ancestors(target, euid))
+    return findings
+
+
+def _symlink_components(configured: Path) -> list[str]:
+    """Every symlink on the way to the bundle, named individually.
+
+    A link is its own substitution vector: whoever can rewrite it aims the
+    gateway at a policy of their choosing without touching the file we
+    validated. Walked prefix by prefix rather than by inspecting the final path
+    alone, so an intermediate ``.../link/policy.json`` is caught too — and each
+    ``lstat`` lets the kernel resolve the prefix, which is what makes a ``..``
+    component behave here exactly as it will at load time.
+    """
+    findings: list[str] = []
+    current = Path(configured.anchor)
+    for part in configured.relative_to(configured.anchor).parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError:
+            break
+        if stat_module.S_ISLNK(info.st_mode):
+            findings.append(f"{current} is a symlink; whoever can rewrite it chooses the policy")
     return findings
 
 

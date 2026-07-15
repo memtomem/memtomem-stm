@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from importlib.resources import files
 from pathlib import Path
@@ -923,10 +924,12 @@ class TestBundleProvenanceAdvisory:
         bundle.chmod(0o644)
         monkeypatch.setattr(toolgraph_bundle_mod.os, "geteuid", lambda: 999999)
         findings = bundle_provenance_warnings(bundle)
-        assert any(str(bundle) in f and "not by this process or root" in f for f in findings)
-        assert any(str(tmp_path) in f and "not by this process or root" in f for f in findings)
+        # Exact prefixes: `str(tmp_path)` is a substring of `str(bundle)`, so a
+        # loose `in` check would let the file's finding satisfy both assertions.
+        assert any(f.startswith(f"{bundle} is owned by uid ") for f in findings)
+        assert any(f.startswith(f"{tmp_path} is owned by uid ") for f in findings)
 
-    @pytest.mark.parametrize("mode", [0o720, 0o702, 0o622])
+    @pytest.mark.parametrize("mode", [0o722, 0o702])
     def test_a_write_bit_without_search_cannot_rename_and_is_silent(self, tmp_path, mode):
         """Positive control: renaming needs write AND execute on the directory."""
         home = tmp_path / "toolgraph"
@@ -939,6 +942,57 @@ class TestBundleProvenanceAdvisory:
             assert bundle_provenance_warnings(bundle) == []
         finally:
             home.chmod(0o755)
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            (0o755, ""),  # the normal case
+            (0o777, "group/other"),
+            (0o775, "group"),
+            (0o757, "other"),
+            (0o722, ""),  # write, no search: names inside cannot be resolved
+            (0o702, ""),
+            (0o622, ""),  # not reachable via lstat either, but pin the rule
+            (0o1777, ""),  # sticky: only an entry's owner may rename it
+        ],
+    )
+    def test_entry_renamers_needs_write_and_search_in_the_same_class(self, mode, expected):
+        """The permission rule itself, independent of any reachable fixture."""
+        assert toolgraph_bundle_mod._entry_renamers(mode) == expected
+
+    def test_a_symlinked_component_followed_by_dotdot_inspects_what_loads(
+        self, tmp_path, monkeypatch
+    ):
+        """`link/..` resolves against the link's TARGET, not the text before it.
+
+        A lexical abspath would inspect `<cwd>/bundle` while the loader opens
+        `<target parent>/bundle` -- reporting all-clear about a file nothing
+        enforces.
+        """
+        exposed = tmp_path / "exposed"
+        real = exposed / "real"
+        work = tmp_path / "work"
+        real.mkdir(parents=True)
+        work.mkdir()
+        bundle = exposed / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        (work / "link").symlink_to(real)
+        # A decoy at the path a lexical `..` collapse would land on.
+        decoy = work / "policy-bundle.json"
+        decoy.write_bytes(b"{}")
+        decoy.chmod(0o644)
+        work.chmod(0o755)
+        exposed.chmod(0o777)
+        monkeypatch.chdir(work)
+        try:
+            configured = Path("link/../policy-bundle.json")
+            assert os.path.realpath(configured) == str(bundle), "fixture: the loader opens `bundle`"
+            findings = bundle_provenance_warnings(configured)
+            assert any(str(exposed) in f and "can be replaced" in f for f in findings)
+            assert any(str(work / "link") in f and "symlink" in f for f in findings)
+        finally:
+            exposed.chmod(0o755)
 
     def test_a_relative_path_still_walks_above_the_working_directory(self, tmp_path, monkeypatch):
         """`bundle_path` may be relative; `Path.parents` would stop at `.`."""
