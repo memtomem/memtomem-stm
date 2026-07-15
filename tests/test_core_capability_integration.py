@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -210,6 +211,70 @@ async def test_direct_schema_two_compose_forwards_scope_fields(
         },
         trace_id="trace-1",
     )
+
+
+def _compose_adapter(monkeypatch: pytest.MonkeyPatch, payload: object, *, schema: int = 2):
+    adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+    adapter._capabilities = LtmCapabilities(context_compose_schema=schema)
+    monkeypatch.setattr(adapter, "_heal_if_needed", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        adapter,
+        "_call_mem_do",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                isError=False,
+                content=[SimpleNamespace(type="text", text=json.dumps(payload))],
+            )
+        ),
+    )
+    return adapter
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        # A renamed top-level key used to read back as ``[]`` and reach the
+        # engine as a healthy empty bundle instead of a diagnosable fault.
+        ({"blocks": [], "retrieved": []}, "missing required key\\(s\\): pinned"),
+        ({"pinned": []}, "missing required key\\(s\\): retrieved"),
+        ({"hits": []}, "missing required key\\(s\\): pinned, retrieved"),
+        ({"pinned": {}, "retrieved": []}, "key 'pinned' is not an array"),
+        ({"pinned": [], "retrieved": "none"}, "key 'retrieved' is not an array"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_direct_compose_rejects_missing_or_malformed_top_level_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+    expected: str,
+) -> None:
+    adapter = _compose_adapter(monkeypatch, payload, schema=3)
+
+    with pytest.raises(ValueError, match=expected):
+        await adapter.context_compose("deployment")
+
+
+@pytest.mark.asyncio
+async def test_direct_compose_error_names_the_negotiated_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _compose_adapter(monkeypatch, {"retrieved": []}, schema=2)
+
+    with pytest.raises(ValueError, match=r"core context_compose \(schema 2\)"):
+        await adapter.context_compose("deployment")
+
+
+@pytest.mark.asyncio
+async def test_direct_compose_accepts_present_but_empty_required_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control: a genuinely empty bundle stays a bundle, not an error."""
+    adapter = _compose_adapter(monkeypatch, {"pinned": [], "retrieved": []})
+
+    bundle = await adapter.context_compose("deployment")
+
+    assert bundle is not None
+    assert bundle.pinned == () and bundle.retrieved == ()
 
 
 @pytest.mark.asyncio
@@ -467,6 +532,77 @@ async def test_compose_failure_is_classified_without_legacy_retry() -> None:
     )
     assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_call_failed": 1}
     adapter.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_compose_contract_break_warns_once_per_episode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=3)
+
+        def __init__(self) -> None:
+            self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))
+
+        async def context_compose(self, *args, **kwargs):
+            raise ValueError("core context_compose (schema 3) is missing required key(s): pinned")
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    observability = SurfacingObservability()
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+        ),
+        mcp_adapter=Adapter(),
+        observability=observability,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.surfacing.engine"):
+        for _ in range(2):
+            await engine.surface("docs", "read_file", {}, "response", context_query="q")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    # The operator needs the schema and the offending key, not just a counter.
+    assert "missing required key(s): pinned" in warnings[0].getMessage()
+    assert "schema 3" in warnings[0].getMessage()
+    assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_call_failed": 2}
+
+
+@pytest.mark.asyncio
+async def test_healthy_compose_logs_no_degraded_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Positive control for the warn-once latch: no fault, no WARNING."""
+
+    class Adapter:
+        capabilities = LtmCapabilities(context_compose_schema=2)
+
+        async def context_compose(self, *args, **kwargs):
+            return ContextComposeResult((), (RemoteSearchResult("hit", 0.9, "memory.md"),))
+
+        async def scratch_list(self, **kwargs):
+            return []
+
+    engine = SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+        ),
+        mcp_adapter=Adapter(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.surfacing.engine"):
+        await engine.surface("docs", "read_file", {}, "response", context_query="q")
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 @pytest.mark.asyncio

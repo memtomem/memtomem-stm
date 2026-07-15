@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 # Match core's protocol ceiling while retaining the negotiated context for
 # consumers beyond the compact formatter, which renders only the nearest one.
 _MAX_CONTEXT_WINDOW_CHUNKS = 10
+# Top-level arrays every negotiated ``context_compose`` schema (>= 2) carries.
+_REQUIRED_COMPOSE_KEYS = ("pinned", "retrieved")
 
 # #295: outcome typing for ``McpClientSearchAdapter.search`` — five
 # different failure modes used to collapse to ``([], [])`` and looked
@@ -127,6 +129,31 @@ class RemoteSearchResult:
         self.score = score
         self.pinned = pinned
         self.context = context
+
+
+def require_context_compose_lists(
+    payload: dict[str, Any],
+    *,
+    origin: str,
+    schema: int,
+) -> tuple[list[Any], list[Any]]:
+    """Return the required top-level compose arrays, or raise ``ValueError``.
+
+    Both compose consumers used to read these keys with a ``[]`` default, so a
+    core that renamed a top-level key produced an empty bundle that the engine
+    could not tell apart from an empty namespace. Absence is a contract
+    violation, not an empty result: name the negotiated schema in the error so
+    the operator-facing WARNING says which side drifted.
+    """
+    missing = [key for key in _REQUIRED_COMPOSE_KEYS if key not in payload]
+    if missing:
+        raise ValueError(
+            f"{origin} (schema {schema}) is missing required key(s): {', '.join(missing)}"
+        )
+    for key in _REQUIRED_COMPOSE_KEYS:
+        if not isinstance(payload[key], list):
+            raise ValueError(f"{origin} (schema {schema}) key {key!r} is not an array")
+    return payload["pinned"], payload["retrieved"]
 
 
 def decode_context_compose_context(
@@ -1270,9 +1297,14 @@ class McpClientSearchAdapter:
             raise ValueError("core context_compose returned malformed JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("core context_compose result is not an object")
+        raw_pinned, raw_retrieved = require_context_compose_lists(
+            payload,
+            origin="core context_compose",
+            schema=self._capabilities.context_compose_schema,
+        )
 
         pinned: list[RemoteSearchResult] = []
-        for item in payload.get("pinned", []):
+        for item in raw_pinned:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("core context_compose pinned item has invalid shape")
             entry = RemoteSearchResult(
@@ -1288,7 +1320,7 @@ class McpClientSearchAdapter:
             pinned.append(entry)
 
         retrieved: list[RemoteSearchResult] = []
-        for item in payload.get("retrieved", []):
+        for item in raw_retrieved:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("core context_compose retrieved item has invalid shape")
             context = None
