@@ -544,12 +544,13 @@ class SurfacingEngine:
             return response_text
 
         effective_timeout = self._effective_timeout(deadline_monotonic)
-        # When this call's LTM window runs out. Captured here rather than
-        # re-derived from ``deadline_monotonic`` in the handler below because
-        # the two are not the same instant: with a configured ceiling shorter
-        # than the caller's deadline, the window ends at the ceiling, and a
-        # deadline-derived test would then miss a real timeout (#720).
-        attempt_deadline = time.monotonic() + effective_timeout
+        # ``asyncio.timeout`` rather than the equivalent ``wait_for`` so the
+        # handlers below can ask ``window.expired()`` — did *this* call's timer
+        # fire? — instead of inferring it from the clock (#720). Elapsed time
+        # cannot answer it: a stalled loop can resume past the window with an
+        # unrelated cancellation (shutdown, client gone) already pending and
+        # deliver it before the timer callback ever runs.
+        window: asyncio.Timeout | None = None
         try:
             if effective_timeout <= 0:
                 # Pre-timeout work (gate, query extraction, privacy scan)
@@ -558,10 +559,10 @@ class SurfacingEngine:
                 # that would be cancelled mid-RPC and force a stdio child
                 # respawn on the next call (#290/#296).
                 raise asyncio.TimeoutError
-            result = await asyncio.wait_for(
-                self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
-                timeout=effective_timeout,
-            )
+            async with asyncio.timeout(effective_timeout) as window:
+                result = await self._do_surface(
+                    server, tool, arguments, response_text, query, trace_id=trace_id
+                )
             self._circuit_breaker.record_success()
             return result
         except asyncio.TimeoutError:
@@ -583,25 +584,23 @@ class SurfacingEngine:
             self._circuit_breaker.record_failure()
             return response_text
         except asyncio.CancelledError:
-            # Lost the abort race to a cancellation from outside (#720):
-            # ``wait_for`` only raises ``TimeoutError`` once the cancelled
-            # adapter has finished unwinding, and anything that cancels this
-            # task can fire inside that window — the daemon's own backstop
-            # (`_run_admitted`'s ``asyncio.timeout_at``), a shutdown, or a
-            # stalled event loop overrunning both timers. This is the only
-            # site that owns the fault/log/breaker bookkeeping, so an unbooked
-            # pass-through recreates the silent loop #719 removed.
+            # Lost the abort race to a cancellation from outside (#720): the
+            # timeout above only *raises* once the cancelled adapter has
+            # finished unwinding, and anything that cancels this task can land
+            # inside that window — the daemon's backstop (`_run_admitted`'s
+            # ``asyncio.timeout_at``), a shutdown, a stalled loop. This is the
+            # only site that owns the fault/log/breaker bookkeeping, so an
+            # unbooked pass-through recreates the silent loop #719 removed.
             #
-            # The test is not "who cancelled me" — that is unknowable here —
-            # but "has the window I granted the LTM provably elapsed". Past
-            # ``attempt_deadline`` it has, so the LTM demonstrably failed to
-            # answer in time and a timeout is the accurate booking whatever
-            # delivered the cancellation. Before it, the LTM was still inside
-            # its window: that is a real external cancellation (shutdown,
-            # client gone) and books nothing, so a healthy LTM is never
-            # charged a breaker failure. Always re-raise: the canceller's
-            # scope needs the cancellation to resolve itself.
-            if time.monotonic() >= attempt_deadline:
+            # ``expired()`` is the whole point: this call's own timer fired and
+            # started the abort, so the attempt overran the window it was
+            # given and a timeout is the right booking no matter who delivered
+            # the final cancellation. If it did not fire, the attempt was still
+            # within its window — a genuine external cancellation, which books
+            # nothing, so a healthy LTM is never charged a breaker failure.
+            # Always re-raise: the canceller's scope needs the cancellation to
+            # resolve itself.
+            if window is not None and window.expired():
                 self._observability.record_outcome(tool, "error_timeout")
                 self._persist_fault(server, tool, "error_timeout")
                 logger.warning(

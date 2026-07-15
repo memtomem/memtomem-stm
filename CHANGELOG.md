@@ -42,14 +42,15 @@ changes inline only. See the deprecation policy in
   adapter, or an event loop stalled past both timers — the engine books it as a
   surfacing timeout (`error_timeout` fault row, warning log, circuit-breaker
   increment) before re-raising, instead of skipping that bookkeeping exactly as
-  in the silent failure mode #719 removed. The booking test is whether the
-  window granted to the LTM has elapsed, not which timer fired: a cancellation
-  arriving while the LTM is still inside its window (daemon shutdown, client
-  gone) books nothing and never charges a healthy LTM, and one arriving after a
-  window that ended at the configured `surfacing.timeout_seconds` ceiling —
-  earlier than the caller's deadline — is booked rather than missed. A window
-  fully consumed by pre-work is booked without starting an LTM round trip that
-  would be cancelled mid-RPC. (#721)
+  in the silent failure mode #719 removed. The booking asks the call's own
+  timeout whether it fired, rather than reading elapsed time off the clock: a
+  cancellation that lands while the attempt is still inside its window (daemon
+  shutdown, client gone) books nothing and never charges a healthy LTM — not
+  even when a stalled loop delivers it after the window would have closed —
+  while a window that ended at the configured `surfacing.timeout_seconds`
+  ceiling, earlier than the caller's deadline, is booked rather than missed. A
+  window fully consumed by pre-work is booked without starting an LTM round
+  trip that would be cancelled mid-RPC. (#721)
 
 ## [0.1.40] — 2026-07-15
 
