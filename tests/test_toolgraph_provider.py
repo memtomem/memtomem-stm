@@ -806,11 +806,10 @@ class TestToolgraphConsultCache:
         # DB degrades to no-cache (consult unaffected, NOT a graph degrade) and
         # says so at WARNING. Positive control for the "no consult cache
         # warnings" sweep in the hit tests.
-        monkeypatch.setattr(
-            GraphConsultCache,
-            "initialize",
-            lambda self: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")),
-        )
+        def _unopenable(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(GraphConsultCache, "initialize", _unopenable)
         mgr, _ = _tg_manager(tmp_path)
         try:
             with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
