@@ -1,9 +1,8 @@
 # Claude Code notes — memtomem-stm
 
-Short-term memory MCP proxy. For what it does see `README.md`; for setup and
-project layout see `CONTRIBUTING.md`; for architecture see `docs/`. This file
-only captures the few things Claude Code needs in context that aren't obvious
-from those docs.
+Short-term memory MCP proxy. What it does → `README.md`; setup and layout →
+`CONTRIBUTING.md`; architecture → `docs/`. This file holds only what must be
+known *before* reading those — everything else is a pointer, not a copy.
 
 ## Commands
 
@@ -16,39 +15,27 @@ uv run ruff check src && uv run ruff format --check src    # lint (required)
 uv run mypy src                                            # typecheck (required)
 ```
 
-The filter excludes only the `bench_qa_*` markers CI runs in separate jobs;
-live-Ollama tests are out of scope — Ollama code paths are tested with mocked
-transport / dead ports only (#637). `ruff`, `mypy`, and tests must pass to
-merge. mypy must be clean on Windows too — CI typechecks both platforms, so
-POSIX-only stdlib usage (`fcntl`, `os.killpg`, …) needs a `sys.platform` guard
-mypy can narrow.
+`ruff`, `mypy`, and tests gate merge — on **Windows too**, so POSIX-only stdlib
+(`fcntl`, `os.killpg`, …) needs a `sys.platform` guard mypy can narrow.
+Live-Ollama tests are out of scope: Ollama paths are tested with mocked
+transport / dead ports only (#637).
 
 ## Invariants when editing
 
-- **No Python-level dependency on `memtomem` core.** STM talks to the LTM
-  server only through the MCP protocol. Don't `import memtomem` from `src/`.
-- **`mms` ≡ `memtomem-stm-proxy` ≡ `memtomem-stm`.** All three
-  `[project.scripts]` entry points in `pyproject.toml` resolve to
-  `memtomem_stm.cli.proxy:cli` (#260). The Click group's
-  `invoke_without_command=True` callback dispatches bare invocations on
-  `sys.stdin.isatty()`: TTY → help, non-TTY → `server.main` (the MCP stdio
-  server). Don't diverge behavior between the three names — registering
-  any of them as an MCP client's `command` must work identically.
-- **Pipeline order is CLEAN → COMPRESS → SURFACE, with optional library INDEX.**
-  `ProxyManager` runs INDEX only when a custom embedder supplies an
-  `index_engine`; the bundled `mms` server pipeline ends after SURFACE.
-  Comments in `src/memtomem_stm/proxy/` remain the source of truth for the
-  per-stage contracts; full architecture write-up lives in the private
-  `memtomem-docs/memtomem-stm/guides-archived/pipeline.md`.
-- **Line length 100**, target `py312` (`tool.ruff`, `tool.mypy`).
-- `.claude/` and `scripts/` are gitignored except for the tracked
-  `scripts/audit-dependencies.sh` release/CI gate and
-  `scripts/core_compat_smoke.py` advisory compatibility check — don't commit
-  other files under them, and don't assume contributors have the same local
-  contents.
-
-## PRs
-
-Branch from `main`, one focused change per PR, add tests for new behavior, and
-write commit messages that explain the "why". See `CONTRIBUTING.md` for the
-full checklist.
+- **No Python-level dependency on `memtomem` core.** Don't `import memtomem`
+  from `src/` — STM reaches LTM only over MCP.
+- **`mms` ≡ `memtomem-stm-proxy` ≡ `memtomem-stm`.** Three entry points, one
+  Click group; registering any of them as an MCP client's `command` must work
+  identically. Dispatch rules: the `cli` group docstring in
+  `src/memtomem_stm/cli/proxy.py` (#260).
+- **Pipeline order is CLEAN → COMPRESS → SURFACE**, plus an optional INDEX
+  stage for custom embedders. Per-stage contracts: comments in
+  `src/memtomem_stm/proxy/` — authoritative, don't restate them here.
+- **Line length 100**, target `py312`.
+- **`.claude/` and `scripts/` are gitignored** except the tracked
+  `scripts/audit-dependencies.sh` (release/CI gate) and
+  `scripts/core_compat_smoke.py` (advisory compat check). Stage by path — a
+  `git add -A` here commits local-only files.
+- **One focused change per PR**, branched from `main`, with tests for new
+  behavior and a commit message explaining the "why". Full checklist:
+  `CONTRIBUTING.md`.
