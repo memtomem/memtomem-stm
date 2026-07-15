@@ -440,6 +440,46 @@ async def test_daemon_adapter_accepts_selected_schema_and_forwards_scope(
     assert second.capabilities.context_compose_schema == 3
 
 
+@pytest.mark.parametrize(
+    ("resp_extra", "expected"),
+    [
+        # Silent-empty regression: a renamed key must not read back as ``[]``.
+        ({"blocks": [], "retrieved": []}, r"missing required key\(s\): pinned"),
+        ({"pinned": []}, r"missing required key\(s\): retrieved"),
+        ({"pinned": [], "retrieved": {}}, "key 'retrieved' is not an array"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_daemon_adapter_rejects_missing_or_malformed_top_level_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resp_extra: dict[str, object],
+    expected: str,
+) -> None:
+    request = AsyncMock(
+        return_value=("ok", {"ok": True, "selected_context_compose_schema": 2, **resp_extra})
+    )
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    with pytest.raises(ValueError, match=expected):
+        await adapter.context_compose("q")
+
+
+@pytest.mark.asyncio
+async def test_daemon_compose_key_error_names_the_selected_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = AsyncMock(
+        return_value=("ok", {"ok": True, "selected_context_compose_schema": 2, "pinned": []})
+    )
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    with pytest.raises(ValueError, match=r"daemon context compose \(schema 2\)"):
+        await adapter.context_compose("q")
+
+
 @pytest.mark.asyncio
 async def test_daemon_adapter_parses_schema_three_context_and_caches_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

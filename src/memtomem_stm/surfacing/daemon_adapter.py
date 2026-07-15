@@ -23,6 +23,7 @@ from memtomem_stm.surfacing.mcp_client import (
     RemoteSearchResult,
     SearchOutcome,
     decode_context_compose_context,
+    require_context_compose_lists,
 )
 from memtomem_stm.utils.numeric import safe_float
 
@@ -115,10 +116,11 @@ class DaemonLtmAdapter:
             or not 2 <= selected_schema <= requested_schema
         ):
             raise ValueError("daemon context compose returned invalid schema selection")
-        raw_pinned = resp.get("pinned", [])
-        raw_retrieved = resp.get("retrieved", [])
-        if not isinstance(raw_pinned, list) or not isinstance(raw_retrieved, list):
-            raise ValueError("daemon context compose malformed")
+        raw_pinned, raw_retrieved = require_context_compose_lists(
+            resp,
+            origin="daemon context compose",
+            schema=selected_schema,
+        )
 
         def decode(item: Any, *, pinned: bool):
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
