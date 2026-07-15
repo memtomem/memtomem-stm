@@ -30,9 +30,9 @@ released version.
   fault rather than an empty result. A core that conforms to the negotiated
   schema is unaffected; against one that renamed or retyped a key, surfacing now
   reports `ltm_call_failed` and warns, where it previously reported
-  `empty_results` and stayed silent. The warning fires once per process and does
-  not re-arm, so a later independent compose regression is counted but not
-  re-warned. (#710)
+  `empty_results` and stayed silent. The warning fires once per surfacing engine
+  and does not re-arm, so a later independent compose regression is counted but
+  not re-warned. (#710)
 
 ### Added
 
@@ -95,8 +95,9 @@ released version.
   route defaulted to an empty list, so a core that renamed a key silently
   produced an empty bundle that surfacing classified as `empty_results` — a
   degradation indistinguishable from an empty namespace, past every fault
-  counter. It is now classified `ltm_call_failed` and warned once per process
-  (the latch does not re-arm after a healthy compose). (#710)
+  counter. It is now classified `ltm_call_failed` and warned once per surfacing
+  engine (the latch is per-instance and does not re-arm after a healthy
+  compose). (#710)
 - `mms register --client codex --replace-registration` no longer removes the
   existing registration before knowing it can be rebuilt. It captures
   `codex mcp get --json` first and refuses to remove a registration
