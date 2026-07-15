@@ -49,7 +49,11 @@ its own server prefix.
 `mms register` supports Claude Code, Codex, automatic detection, or a generic
 JSON configuration. Registrations use the current Python executable's absolute
 path and pass the selected proxy config explicitly, which avoids PATH drift on
-Windows and GUI-launched clients.
+Windows and GUI-launched clients. New registrations also pin shared-daemon use,
+the effective surfacing timeout, and non-persistent query text in the host
+environment. Existing registrations are kept unchanged unless
+`--replace-registration` is explicit; a JSON/Codex refresh preserves unrelated
+environment values, and JSON refreshes preserve unknown host fields.
 
 ```bash
 mms register --client claude

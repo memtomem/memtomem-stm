@@ -34,6 +34,7 @@ from memtomem_stm.cli.hook_hosts import (
     _config_path,
     _is_stm_hook_command,
     apply_change,
+    installed_stm_hook_commands,
     matcher_for,
     plan_install,
     plan_uninstall,
@@ -65,6 +66,14 @@ def _sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     this module touches the real one."""
     home = tmp_path / "home"
     set_home(monkeypatch, home)
+    for key in (
+        "MEMTOMEM_STM_HOOK__USE_DAEMON",
+        "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__USE_DAEMON",
+        "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS",
+        "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT",
+    ):
+        monkeypatch.delenv(key, raising=False)
     return home
 
 
@@ -80,6 +89,12 @@ def _sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "uv run --directory /repo memtomem-stm hook --host kimi",
         "uv run --directory /repo/memtomem-stm memtomem-stm hook --host claude",
         "/usr/local/bin/memtomem-stm hook --host cursor",  # absolute path basename
+        ("env MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 memtomem-stm hook --host claude"),
+        (
+            "/usr/bin/env MEMTOMEM_STM_HOOK__USE_DAEMON=true "
+            "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 uv run --directory /repo "
+            "memtomem-stm hook --host claude"
+        ),
     ],
 )
 def test_is_stm_hook_command_recognizes_our_invocations(command: str) -> None:
@@ -98,6 +113,9 @@ def test_is_stm_hook_command_recognizes_our_invocations(command: str) -> None:
         # so install/uninstall must leave this user command alone (#529).
         "echo hook && memtomem-stm status",
         "memtomem-stm",  # bare exe, no trailing subcommand at all (no IndexError)
+        "env FOO=bar memtomem-stm hook --host claude",  # arbitrary wrapper is not ours
+        "env -i MEMTOMEM_STM_X=1 memtomem-stm hook --host claude",  # env flags refused
+        "env MEMTOMEM_STM_X=1; memtomem-stm hook --host claude",  # compound shell
         "",
     ],
 )
@@ -182,6 +200,42 @@ def test_plan_install_update_replaces_in_place(redirect) -> None:
     # Replaced in place — exactly one STM matcher-group, not appended/duplicated.
     assert len(entries) == 1
     assert entries[0]["matcher"] == "Read|Grep|Glob|Bash"
+
+
+def test_plan_install_refresh_preserves_unknown_host_fields(redirect) -> None:
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read",
+                            "customGroupField": {"keep": True},
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "mms hook --host claude",
+                                    "timeout": 30,
+                                    "statusMessage": "Searching memory",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    change = plan_install("claude", "memtomem-stm hook --host claude --use-daemon")
+    entry = json.loads(change.new_text)["hooks"]["PostToolUse"][0]
+    assert entry["customGroupField"] == {"keep": True}
+    handler = entry["hooks"][0]
+    assert handler["timeout"] == 30
+    assert handler["statusMessage"] == "Searching memory"
+    assert handler["command"].endswith("--use-daemon")
 
 
 def test_plan_install_preserves_sibling_content(redirect) -> None:
@@ -493,6 +547,98 @@ def test_cli_install_apply_then_uninstall(redirect) -> None:
     assert res3.exit_code == 0
     assert "Removed" in res3.output
     assert json.loads(path.read_text()) == {}
+
+
+def test_cli_install_serializes_managed_runtime_policy(redirect) -> None:
+    path = redirect("claude")
+    result = CliRunner().invoke(
+        cli,
+        [
+            "hook",
+            "install",
+            "--host",
+            "claude",
+            "--surfacing-timeout",
+            "12",
+            "--apply",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    command = installed_stm_hook_commands("claude")[0]
+    assert " --use-daemon " in command
+    assert "--surfacing-timeout-seconds 12" in command
+    assert "--daemon-timeout-seconds 13" in command
+    assert command.endswith("--no-persist-query-text")
+    assert not command.startswith("env ")
+    assert path.exists()
+
+
+def test_cli_install_migrates_legacy_inline_env_and_preserves_timeout(redirect) -> None:
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "env MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=12 "
+                                        "memtomem-stm hook --host claude"
+                                    ),
+                                    "timeout": 30,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude", "--apply"])
+    assert result.exit_code == 0, result.output
+    command = installed_stm_hook_commands("claude")[0]
+    assert not command.startswith("env ")
+    assert "--surfacing-timeout-seconds 12" in command
+    assert "--daemon-timeout-seconds 13" in command
+    handler = json.loads(path.read_text())["hooks"]["PostToolUse"][0]["hooks"][0]
+    assert handler["timeout"] == 30
+
+
+def test_cli_install_can_inherit_runtime_environment(redirect) -> None:
+    redirect("cursor")
+    result = CliRunner().invoke(
+        cli,
+        ["hook", "install", "--host", "cursor", "--inherit-runtime-env", "--apply"],
+    )
+    assert result.exit_code == 0, result.output
+    command = installed_stm_hook_commands("cursor")[0]
+    assert command.endswith("hook --host cursor")
+    assert "timeout-seconds" not in command
+    assert "persist-query-text" not in command
+
+
+def test_cli_install_rejects_conflicting_runtime_options(redirect) -> None:
+    redirect("claude")
+    result = CliRunner().invoke(
+        cli,
+        [
+            "hook",
+            "install",
+            "--host",
+            "claude",
+            "--inherit-runtime-env",
+            "--no-daemon",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
 
 
 def test_cli_install_toml_host_warns_about_rewrite(redirect) -> None:

@@ -2034,8 +2034,8 @@ def main() -> None:
         # outside any task group; the ExceptionGroup shape is what anyio's
         # strict task groups actually deliver on stdio EOF (#410 follow-up).
         if is_clean_cancel_scope_shutdown(e):
-            logger.warning(
-                "STM MCP server shut down with AnyIO cancel scope warning (ignored): %s", e
+            logger.debug(
+                "STM MCP server ignored a known AnyIO cancel-scope cleanup condition: %s", e
             )
             return
         logger.exception("STM MCP server terminated with an unhandled exception")

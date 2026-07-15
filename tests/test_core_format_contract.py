@@ -641,16 +641,17 @@ class TestFormatNegotiation:
         assert isinstance(adapter._parser, CompactResultParser)
 
     @pytest.mark.asyncio
-    async def test_skips_negotiation_for_compact(self):
+    async def test_compact_still_negotiates_additive_runtime_profile(self):
         from unittest.mock import AsyncMock
 
         from memtomem_stm.surfacing.mcp_client import CompactResultParser, McpClientSearchAdapter
 
         adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
         mock_session = AsyncMock()
+        mock_session.call_tool.return_value.content = []
         adapter._session = mock_session
 
         await adapter._negotiate_format()
 
         assert isinstance(adapter._parser, CompactResultParser)
-        mock_session.call_tool.assert_not_called()
+        mock_session.call_tool.assert_awaited_once_with("mem_do", {"action": "version"})

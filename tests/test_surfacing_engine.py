@@ -2458,6 +2458,22 @@ class TestScoreScaleDiagnostic:
         assert engine._score_scale_streaks[("gitlab", "read_file")].count == 4
         assert engine._score_scale_streaks[("gh", "search")].count == 4
 
+    def test_healthy_recovery_persists_once_until_below_min_rearms(self):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.03)]
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
+
+        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        tracker.record_diagnostic_recovery.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        assert tracker.record_diagnostic_recovery.call_count == 2
+
     def test_non_finite_score_resets_without_warning(self):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)

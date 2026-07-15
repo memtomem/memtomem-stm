@@ -232,6 +232,47 @@ class TestEngineFaultPersistence:
 
 
 class TestSummaryFaults:
+    def test_score_diagnostic_recovery_is_persisted_and_reactivates(self, tmp_path, monkeypatch):
+        # Windows can return the same time.time() value for adjacent writes.
+        # A new diagnostic must re-arm explicitly rather than depend on `>`
+        # between timestamps having different resolution.
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        assert read_surfacing_summary(db_path)["active_diagnostics"] == {
+            "score_ceiling_below_min": 1
+        }
+
+        store.record_diagnostic_recovery("gh", "read_file", "score_ceiling_below_min")
+        assert read_surfacing_summary(db_path)["active_diagnostics"] == {}
+
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        assert read_surfacing_summary(db_path)["active_diagnostics"] == {
+            "score_ceiling_below_min": 2
+        }
+        store.close()
+
+    def test_initialize_migrates_legacy_fault_recovery_column(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store._db.execute("ALTER TABLE surfacing_faults DROP COLUMN last_recovered_at")
+        store._db.commit()
+        store.close()
+
+        legacy = read_surfacing_summary(db_path)
+        assert legacy["diagnostics_recovery_supported"] is False
+        store = FeedbackStore(db_path)
+        store.initialize()
+        columns = {row[1] for row in store._db.execute("PRAGMA table_info('surfacing_faults')")}
+        assert "last_recovered_at" in columns
+        store.close()
+
     def test_summary_includes_recent_faults(self, tmp_path):
         db_path = tmp_path / "f.db"
         store = FeedbackStore(db_path)

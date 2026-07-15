@@ -106,8 +106,10 @@ class HookConfig(BaseModel):
     path."""
     daemon_timeout_seconds: float = Field(default=2.5, gt=0.0)
     """Per-request wall-clock budget for the hook→daemon round trip. Small and
-    independent of the cold-path ``_hook_budget_seconds()`` backstop — a warm
-    LTM search is sub-second, so this only needs to cover connect + RTT."""
+    independent of the cold-path ``_hook_budget_seconds()`` backstop. It must
+    still exceed ``surfacing.timeout_seconds`` plus loopback/queue overhead if
+    the operator wants the inner LTM attempt to consume its full budget; use
+    ``mms doctor`` telemetry instead of assuming a warm search is sub-second."""
     fallback: Literal["skip", "cold"] = "skip"
     """What ``mms hook`` does when the daemon is unreachable. ``skip`` (default)
     degrades to ``{}`` immediately — the daemon exists precisely to avoid the

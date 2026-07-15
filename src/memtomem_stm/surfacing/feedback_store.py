@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS surfacing_faults (
     kind        TEXT    NOT NULL,
     count       INTEGER NOT NULL DEFAULT 0,
     last_at     REAL    NOT NULL,
+    last_recovered_at REAL,
     PRIMARY KEY (day, server, tool, kind)
 );
 
@@ -180,6 +181,16 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
     logger.info("Migrated surfacing_events: relaxed NOT NULL on query column (#352 part 2)")
 
 
+def _add_fault_recovery_column(db: sqlite3.Connection) -> None:
+    """Add the episode recovery marker to databases created by older STM versions."""
+    columns = {
+        str(row[1]) for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
+    }
+    if columns and "last_recovered_at" not in columns:
+        db.execute("ALTER TABLE surfacing_faults ADD COLUMN last_recovered_at REAL")
+        db.commit()
+
+
 class FeedbackDbStatus(TypedDict):
     """Read-only schema snapshot returned by :func:`inspect_feedback_db`."""
 
@@ -254,6 +265,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         "faults_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
         "diagnostics": {},
         "diagnostics_last_at": None,
+        "active_diagnostics": {},
+        "diagnostics_recovery_supported": True,
         "diagnostics_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
         "error": None,
     }
@@ -332,6 +345,22 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             summary["diagnostics"] = {row[0]: row[1] for row in diagnostic_rows}
             summary["diagnostics_last_at"] = max((row[2] for row in diagnostic_rows), default=None)
             summary["diagnostics_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
+            fault_columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
+            }
+            if "last_recovered_at" in fault_columns:
+                active_where = fault_where + " AND kind = 'score_ceiling_below_min'"
+                active_rows = db.execute(
+                    "SELECT kind, SUM(count), MAX(last_at), MAX(last_recovered_at) "
+                    "FROM surfacing_faults"
+                    f"{active_where} GROUP BY kind "
+                    "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)",
+                    fault_params,
+                ).fetchall()
+                summary["active_diagnostics"] = {row[0]: row[1] for row in active_rows}
+            else:
+                summary["diagnostics_recovery_supported"] = False
 
         summary["available"] = True
     except sqlite3.Error as exc:
@@ -379,6 +408,7 @@ class FeedbackStore:
             tune_connection(db)
             db.executescript(_SCHEMA)
             _relax_surfacing_events_query_notnull(db)
+            _add_fault_recovery_column(db)
         except Exception:
             db.close()
             raise
@@ -433,7 +463,26 @@ class FeedbackStore:
         Diagnostics share the day-aggregated fault table for bounded storage,
         but readers partition them so operator guidance remains accurate.
         """
-        self._record_signal(server, tool, kind, DIAGNOSTIC_KINDS)
+        self._record_signal(
+            server,
+            tool,
+            kind,
+            DIAGNOSTIC_KINDS,
+            reset_recovery=True,
+        )
+
+    def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
+        """Mark all existing rows for one diagnostic episode as recovered."""
+        if self._db is None or kind not in DIAGNOSTIC_KINDS:
+            return
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "UPDATE surfacing_faults SET last_recovered_at = ? "
+                "WHERE server = ? AND tool = ? AND kind = ? AND last_at <= ?",
+                (now, server, tool, kind, now),
+            )
+            self._db.commit()
 
     def _record_signal(
         self,
@@ -441,17 +490,20 @@ class FeedbackStore:
         tool: str,
         kind: str,
         allowed_kinds: frozenset[str],
+        *,
+        reset_recovery: bool = False,
     ) -> None:
         if self._db is None or kind not in allowed_kinds:
             return
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        recovery_update = ", last_recovered_at = NULL" if reset_recovery else ""
         with self._lock:
             self._db.execute(
                 "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
                 "VALUES (?, ?, ?, ?, 1, ?) "
                 "ON CONFLICT(day, server, tool, kind) "
-                "DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+                "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
                 (day, server, tool, kind, now),
             )
             self._db.commit()

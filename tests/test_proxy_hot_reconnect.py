@@ -676,8 +676,9 @@ class TestLiveStdioReconnect:
     calling task, closing the old stack afterward is a same-task
     out-of-order scope exit and the old stdio transport's close CANCELS the
     calling task — the CancelledError escapes every except-Exception guard
-    and kills the tool call that triggered the reconnect. The fix opens the
-    replacement in a child task."""
+    and kills the tool call that triggered the reconnect. Each physical
+    connection now has a long-lived owner task that both enters and exits its
+    contexts; reconnect prepares a new owner before stopping the old one."""
 
     async def test_config_change_live_reconnect_same_task(self, tmp_path):
         import sys
@@ -705,7 +706,7 @@ class TestLiveStdioReconnect:
 
             _reseed(mgr, tmp_path, {"echo": cfg_b})
 
-            # Same task as the connect: before the child-task fix this call
+            # Same task as the connect: before lifecycle ownership this call
             # died with CancelledError while closing the old stack.
             r2 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
             assert "hello from beta/v2" in r2.content[0].text
@@ -722,3 +723,78 @@ class TestLiveStdioReconnect:
             assert mgr._connections["echo"].reconnect_generation == 2
         finally:
             await mgr.stop()
+
+    def test_short_lived_manager_reconnect_exits_without_anyio_warning(self, tmp_path):
+        """Owner-managed real stdio contexts are clean at interpreter exit."""
+        import os
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[1]
+        fake_server = Path(__file__).with_name("_fake_memtomem_server.py")
+        isolated = tmp_path / "isolated-runtime"
+        env = os.environ.copy()
+        for key in tuple(env):
+            if key.startswith("MEMTOMEM_STM_"):
+                env.pop(key)
+        for key, dirname in (
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_CACHE_HOME", "xdg-cache"),
+            ("MEMTOMEM_STM_DATA_DIR", "stm-data"),
+        ):
+            path = isolated / dirname
+            path.mkdir(parents=True)
+            env[key] = str(path)
+        env["FAKE_MEMTOMEM_SERVER"] = str(fake_server)
+        env["PYTHONWARNINGS"] = "default"
+
+        script = """
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerConfig
+from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.proxy.metrics import TokenTracker
+
+
+async def main():
+    upstream = UpstreamServerConfig(
+        prefix="fake",
+        command=sys.executable,
+        args=[os.environ["FAKE_MEMTOMEM_SERVER"]],
+        connect_timeout_seconds=10.0,
+    )
+    config = ProxyConfig(
+        config_path=Path(os.environ["HOME"]) / "stm_proxy.json",
+        upstream_servers={"fake": upstream},
+    )
+    manager = ProxyManager(config, TokenTracker())
+    await manager.start()
+    try:
+        assert "fake" in manager._connections, manager._failed_servers
+        await manager._reconnect_server("fake")
+        assert manager._connections["fake"].reconnect_generation == 1
+    finally:
+        await manager.stop()
+
+
+asyncio.run(main())
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        stderr = proc.stderr
+        assert "AnyIO cancel scope" not in stderr
+        assert "Attempted to exit" not in stderr
+        assert "Exception ignored in" not in stderr
+        assert "traceback" not in stderr.lower()

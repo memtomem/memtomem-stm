@@ -2,16 +2,10 @@
 
 AnyIO cancel scopes are task-affine: exiting one from a different task than
 entered it raises a ``RuntimeError`` whose message is the only stable way to
-recognize it. Two paths in STM hit that error by construction and must treat
-it as a known shape rather than a crash:
-
-* ``server.main()`` — on stdio EOF the MCP server's own task-group unwind
-  raises it, wrapped in an ``ExceptionGroup`` by anyio >= 4 strict task
-  groups (#209/#410).
-* ``daemon.server.DaemonServer._teardown()`` — the LTM adapter lazy-starts
-  inside a connection-handler task, so stopping it from the serve task exits
-  the stdio transport's scopes cross-task (E-3); the daemon then sweeps for
-  a leaked LTM child.
+recognize it. STM-owned MCP client contexts now use dedicated lifecycle owner
+tasks, so this is no longer an expected construction. The exact-match helper
+remains a narrow shutdown barrier for an upstream SDK unwind or a legacy
+injected adapter; mixed exception groups are never classified as clean.
 """
 
 from __future__ import annotations

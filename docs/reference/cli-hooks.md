@@ -11,13 +11,17 @@ Bare `mms hook` is the runtime PostToolUse bridge. `--host TEXT` defaults to
 host action is never blocked by a usage error.
 
 ```text
-mms hook install --host [claude|codex|cursor|kimi] [--apply]
+mms hook install --host [claude|codex|cursor|kimi]
+  [--surfacing-timeout SECONDS] [--daemon|--no-daemon]
+  [--inherit-runtime-env] [--apply]
 mms hook uninstall --host [claude|codex|cursor|kimi] [--apply]
 ```
 
 Install and uninstall require a strict host choice. They preview by default,
 write only with `--apply`, create a non-clobbering backup, and refuse malformed
-host configuration.
+host configuration. Install serializes shared-daemon, deadline, and query-text
+privacy settings into portable runtime flags. `--inherit-runtime-env` omits
+those flags and cannot be combined with the explicit daemon/deadline options.
 
 Current host paths are:
 

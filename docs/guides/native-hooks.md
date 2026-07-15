@@ -29,6 +29,24 @@ mms hook install --host codex --apply
 mms hook uninstall --host codex --apply
 ```
 
+New installs serialize the shared-daemon route, the effective surfacing
+deadline, a hook-to-daemon deadline at least one second larger, and
+non-persistent query text directly in the hook command. This avoids relying on
+environment inheritance from a terminal into a GUI host. Pin a larger search
+budget, opt out of the daemon, or retain the legacy ambient-environment model
+with:
+
+```bash
+mms hook install --host claude --surfacing-timeout 12 --apply
+mms hook install --host claude --no-daemon --apply
+mms hook install --host claude --inherit-runtime-env --apply
+```
+
+Reinstalling recognizes and migrates older POSIX commands that began with
+`env MEMTOMEM_STM_...`; the replacement uses cross-platform runtime flags and
+retains the existing managed timeout. Unknown host-specific fields on the hook
+entry are preserved.
+
 | Host | Config file |
 |---|---|
 | Claude Code | `~/.claude/settings.json` |
@@ -62,12 +80,15 @@ use. Configure the behavior with:
 ```bash
 export MEMTOMEM_STM_HOOK__USE_DAEMON=true
 export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
-export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=2.5
+export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3
+export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=4
 export MEMTOMEM_STM_HOOK__FALLBACK=skip  # skip | cold
 ```
 
 `skip` returns immediately when the daemon is unavailable. `cold` runs the
 legacy in-process path and may pay the LTM startup cost inside the hook call.
+Keep the hook-to-daemon deadline above the surfacing deadline; managed installs
+enforce a one-second margin automatically.
 
 ## Metrics and privacy
 

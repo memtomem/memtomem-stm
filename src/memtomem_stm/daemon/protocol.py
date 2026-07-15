@@ -13,7 +13,8 @@ Request  (client → daemon)::
 Response (daemon → hook)::
 
     {"v": 7, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
-    {"v": 7, "ok": true, "status": "ready", "ltm": "warm"}                 # ping
+    {"v": 7, "ok": true, "status": "ready", "ltm": "warm",
+     "latency": {<bounded numeric telemetry>}}                               # ping
     # ping "ltm" is one of warm | warming | down | cold (#664); clients
     # treat it as an opaque display string.
 

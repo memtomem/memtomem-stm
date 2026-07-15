@@ -3,8 +3,9 @@
 Holds a single long-lived :class:`SurfacingEngine` and a single LTM
 ``McpClientSearchAdapter`` for the process lifetime — warmed at startup by a
 background task when ``surfacing.warmup_enabled`` (#664), lazily started on
-first use otherwise — so each ``mms hook`` call is a sub-second round trip
-instead of a ~6s cold start. Requests are
+first use otherwise — so each ``mms hook`` call reuses the warm connection
+instead of paying connection startup again. Actual latency is exposed through
+the additive ping telemetry rather than assumed to be sub-second. Requests are
 token-authenticated and dispatched over the newline-JSON
 :mod:`~memtomem_stm.daemon.protocol`.
 
@@ -45,6 +46,7 @@ from memtomem_stm.cli.hook_adapter import CanonicalHookCall
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig, _is_loopback_host
 from memtomem_stm.daemon import discovery, locking
+from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
@@ -171,6 +173,7 @@ class DaemonServer:
         self._surface_lock = asyncio.Lock()
         self._pending_slots = asyncio.Semaphore(config.daemon.max_pending_requests)
         self._active_requests = 0
+        self._latency = DaemonLatencyTracker()
         self._handshake_written = False
         self._engine: Any = None
         self._adapter: Any = None
@@ -365,8 +368,8 @@ class DaemonServer:
             await self._adapter.stop()
         except Exception as exc:
             if is_clean_cancel_scope_shutdown(exc):
-                logger.warning(
-                    "LTM adapter stop hit the cross-task cancel-scope error — "
+                logger.debug(
+                    "LTM adapter stop hit a known AnyIO cancel-scope cleanup condition — "
                     "sweeping for a leaked LTM child"
                 )
             else:
@@ -420,7 +423,14 @@ class DaemonServer:
             return {"v": PROTOCOL_VERSION, "ok": False, "error": "unsupported protocol version"}
         op = req.get("op")
         if op == OP_PING:
-            return {"v": PROTOCOL_VERSION, "ok": True, "status": "ready", "ltm": self._ltm_warmth()}
+            return {
+                "v": PROTOCOL_VERSION,
+                "ok": True,
+                "status": "ready",
+                "ltm": self._ltm_warmth(),
+                "latency": self._latency.snapshot(),
+                "core": {"runtime_profile": getattr(self._adapter, "runtime_profile", None)},
+            }
         if op == OP_SHUTDOWN:
             logger.info("daemon received shutdown request")
             self._shutdown_event.set()
@@ -437,7 +447,12 @@ class DaemonServer:
                 output = await run_surfacing_hook(call, engine=self._engine)
                 return surface_response(output)
 
-            return await self._run_admitted(req, surface_call)
+            return await self._run_admitted(
+                req,
+                surface_call,
+                latency_kind="surface",
+                activity_counter=self._surfacing_retrieval_count,
+            )
         if op in {
             OP_LTM_SEARCH,
             OP_LTM_CONTEXT_COMPOSE,
@@ -477,7 +492,7 @@ class DaemonServer:
                         "outcome": outcome,
                     }
 
-                return await self._run_admitted(req, search_call)
+                return await self._run_admitted(req, search_call, latency_kind="retrieval")
             if op == OP_LTM_CONTEXT_COMPOSE:
                 query = payload.get("query")
                 agent_id = payload.get("agent_id")
@@ -592,7 +607,7 @@ class DaemonServer:
                         "omitted_block_ids": list(bundle.omitted_block_ids),
                     }
 
-                return await self._run_admitted(req, compose_call)
+                return await self._run_admitted(req, compose_call, latency_kind="retrieval")
             if op == OP_LTM_CANDIDATE_PROPOSE:
                 fields = ("content", "source", "source_ref", "idempotency_key")
                 trace_id = payload.get("trace_id")
@@ -654,6 +669,9 @@ class DaemonServer:
         self,
         req: dict[str, Any],
         operation: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        latency_kind: LatencyKind | None = None,
+        activity_counter: Callable[[], int] | None = None,
     ) -> dict[str, Any]:
         """Run one LTM operation under the shared queue, deadline, and lock."""
         deadline = req.get("deadline_monotonic")
@@ -663,22 +681,78 @@ class DaemonServer:
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         if self._pending_slots.locked():
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+        # Advice is based on user-observed end-to-end latency, intentionally
+        # including admission-queue and serialization-lock wait time.
+        started = time.monotonic()
+        warm_at_start = self._ltm_warmth() == "warm"
+        activity_before = activity_counter() if activity_counter is not None else None
         await self._pending_slots.acquire()
         self._last_request = time.monotonic()
         self._active_requests += 1
         try:
             async with asyncio.timeout_at(float(deadline)):
                 async with self._surface_lock:
-                    return await operation()
+                    response = await operation()
+            activity_observed = (
+                activity_counter is None
+                or activity_before is None
+                or activity_counter() > activity_before
+            )
+            if latency_kind is not None and activity_observed:
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                if not warm_at_start:
+                    outcome: LatencyOutcome = "cold"
+                elif response.get("ok") is not True or (
+                    latency_kind == "retrieval"
+                    and response.get("outcome") not in (None, "ok", "empty_results")
+                ):
+                    outcome = "error"
+                else:
+                    outcome = "success"
+                self._latency.record(latency_kind, elapsed_ms, outcome)
+            return response
         except asyncio.TimeoutError:
+            if latency_kind is not None:
+                outcome = "timeout" if warm_at_start else "cold"
+                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, outcome)
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         except Exception:
+            if latency_kind is not None:
+                outcome = "error" if warm_at_start else "cold"
+                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, outcome)
             logger.debug("daemon LTM operation failed", exc_info=True)
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
         finally:
             self._active_requests -= 1
             self._pending_slots.release()
             self._last_request = time.monotonic()
+
+    def _surfacing_retrieval_count(self) -> int:
+        """Number of engine terminal decisions that require an LTM attempt.
+
+        Hook allowlist and engine gate skips must not dilute warm-search
+        percentiles with near-zero samples.  The daemon wires a real
+        ``SurfacingObservability`` and serializes surface calls, so comparing
+        this aggregate before/after one admitted request is deterministic.
+        """
+        observability = getattr(self._engine, "observability", None)
+        if observability is None:
+            return 0
+        snapshot = observability.snapshot()
+        total_skips = snapshot.get("skip_reasons", {}).get("__total__", {})
+        total_outcomes = snapshot.get("outcomes", {}).get("__total__", {})
+        retrieval_skips = {
+            "no_results_score",
+            "no_results_dedup",
+            "no_results_demoted",
+            "ltm_unavailable",
+            "ltm_call_failed",
+            "ltm_parse_empty",
+        }
+        retrieval_outcomes = {"surfaced_cache_miss", "error_timeout", "error_other"}
+        return sum(int(total_skips.get(key, 0)) for key in retrieval_skips) + sum(
+            int(total_outcomes.get(key, 0)) for key in retrieval_outcomes
+        )
 
     @staticmethod
     def _parse_search_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -798,7 +872,7 @@ def run(config: STMConfig | None = None) -> int:
         # A clean anyio cancel-scope teardown on shutdown is not a crash — the
         # main server's barrier ignores the same shape (#410 follow-up).
         if is_clean_cancel_scope_shutdown(e):
-            logger.warning("daemon shut down with an AnyIO cancel scope warning (ignored): %s", e)
+            logger.debug("daemon ignored a known AnyIO cancel-scope cleanup condition: %s", e)
             return 0
         logger.exception("daemon terminated with an unhandled exception")
         raise

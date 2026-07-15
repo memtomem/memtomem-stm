@@ -486,6 +486,7 @@ class McpClientSearchAdapter:
         self._session: ClientSession | None = None
         self._parser = get_parser(getattr(config, "result_format", "compact"))
         self._capabilities = LtmCapabilities()
+        self._runtime_profile: dict[str, Any] | None = None
         # #290: SurfacingEngine wraps adapter calls in ``asyncio.wait_for``;
         # an outer-timeout cancellation interrupts ``call_tool`` mid-RPC and
         # leaves the MCP session in a mid-message state. ``_TRANSPORT_ERRORS``
@@ -667,16 +668,11 @@ class McpClientSearchAdapter:
         # every attempt so reconnects cannot retain features from a previous
         # core (including a structured -> compact downgrade).
         self._capabilities = LtmCapabilities()
+        self._runtime_profile = None
         if session is None:
             session = self._session
         if session is None:
             return
-        if not isinstance(self._parser, StructuredResultParser):
-            # Preserve the legacy compact path's zero-negotiation behavior.
-            # Optional compose/formation features require the default
-            # structured contract.
-            return
-
         data: dict[str, Any] = {}
         try:
             result = await session.call_tool("mem_do", {"action": "version"})
@@ -690,6 +686,9 @@ class McpClientSearchAdapter:
 
         raw_caps = data.get("capabilities", {})
         caps = raw_caps if isinstance(raw_caps, dict) else {}
+        profile = data.get("runtime_profile")
+        if isinstance(profile, dict) and profile.get("schema_version") == 1:
+            self._runtime_profile = profile
 
         def schema_version(name: str) -> int:
             value = caps.get(name)
@@ -703,6 +702,8 @@ class McpClientSearchAdapter:
             return 0
 
         formats = caps.get("search_formats", [])
+        if not isinstance(self._parser, StructuredResultParser):
+            return
         if isinstance(formats, list) and "structured" in formats:
             scratch_formats = caps.get("scratch_formats", [])
             self._capabilities = LtmCapabilities(
@@ -726,6 +727,10 @@ class McpClientSearchAdapter:
     def capabilities_ready(self) -> bool:
         """Whether a live session has completed capability negotiation."""
         return self._session is not None
+
+    @property
+    def runtime_profile(self) -> dict[str, Any] | None:
+        return self._runtime_profile
 
     # Bounded join for the owner task at ``stop()``. Generous: a healthy
     # owner only has to finish (or roll back) the current lifecycle op and

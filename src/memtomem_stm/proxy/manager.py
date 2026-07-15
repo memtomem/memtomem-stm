@@ -329,12 +329,44 @@ def compression_fingerprint(
 
 
 @dataclass
+class _UpstreamConnectionOwner:
+    """Own one upstream transport/session context stack in one task.
+
+    AnyIO cancel scopes are task-affine.  A connection may be used by many
+    request tasks, but the MCP SDK transport and ``ClientSession`` async
+    contexts must be entered and exited by the same long-lived task.  The
+    owner publishes a fully initialized session through ``ready``, then parks
+    until ``close_requested`` is set.  Callers never close ``stack`` directly.
+    """
+
+    ready: asyncio.Future[tuple[ClientSession, list[Any]]]
+    close_requested: asyncio.Event
+    task: asyncio.Task[None] | None = None
+    cleanup_error: BaseException | None = None
+
+    async def close(self) -> None:
+        """Ask the owner to unwind its contexts and surface cleanup failure."""
+        self.close_requested.set()
+        if self.task is not None:
+            # A caller cancellation must not strand the owner half-closed.
+            # The task keeps running its in-task unwind; the cancellation is
+            # still delivered to the caller by ``shield``.
+            await asyncio.shield(self.task)
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
+
+
+@dataclass
 class UpstreamConnection:
     name: str
     config: UpstreamServerConfig
     session: ClientSession
     tools: list[Any]
     stack: AsyncExitStack | None = None
+    # Real MCP connections are lifecycle-owned by a dedicated task. ``stack``
+    # remains for injected/legacy connections used by library callers and
+    # tests; exactly one of ``owner`` and ``stack`` should be populated.
+    owner: _UpstreamConnectionOwner | None = None
     # Serialize concurrent ``_reconnect_server`` calls for this server (#586).
     # Four unserialized retry-loop sites can reconnect the same connection at
     # once; without this, two interleaving reconnects each build a fresh
@@ -569,14 +601,15 @@ class ProxyManager:
         # Guard against double start — close previous stack to avoid leaking connections
         if self._stack is not None:
             for conn in self._connections.values():
-                if conn.stack is not None:
+                if conn.owner is not None or conn.stack is not None:
                     try:
-                        await conn.stack.aclose()
+                        await self._close_connection_resources(conn.owner, conn.stack)
                     except Exception as cleanup_exc:
-                        # Redact + no exc_info (#605): this stack wraps a transport
-                        # opened with the credentialed ``conn.config.url``, so a
-                        # close failure's traceback tail could leak the token even
-                        # at DEBUG. Route through the #593 choke point.
+                        # Redact + no exc_info (#605): these resources wrap a
+                        # transport opened with the credentialed
+                        # ``conn.config.url``, so a close failure's traceback
+                        # tail could leak the token even at DEBUG. Route
+                        # through the #593 choke point.
                         logger.debug(
                             "Failed to close connection stack for '%s' in double-start guard: %s",
                             conn.name,
@@ -1377,59 +1410,112 @@ class ProxyManager:
         """
         return redact_exception_text(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_MESSAGE_CHARS]
 
+    async def _run_connection_owner(
+        self,
+        name: str,
+        cfg: UpstreamServerConfig,
+        owner: _UpstreamConnectionOwner,
+    ) -> None:
+        """Enter, hold, and exit one MCP connection in this task.
+
+        The single ``timeout_at`` scope preserves the end-to-end connection
+        deadline without ``asyncio.wait_for`` moving a context ``__aenter__``
+        into a child task on Python 3.12.  Once discovery succeeds, request
+        tasks may call the published ``ClientSession``; only async-context
+        lifecycle operations stay affine to this owner task.
+        """
+        stack = AsyncExitStack()
+        try:
+            deadline = asyncio.get_running_loop().time() + cfg.connect_timeout_seconds
+            async with asyncio.timeout_at(deadline):
+                streams = await stack.enter_async_context(self._open_transport(cfg))
+                session = await stack.enter_async_context(
+                    ClientSession(
+                        streams[0], streams[1], message_handler=self._make_message_handler(name)
+                    )
+                )
+                await session.initialize()
+                result = await session.list_tools()
+
+            owner.ready.set_result((session, list(result.tools)))
+            await owner.close_requested.wait()
+        except asyncio.CancelledError:
+            if not owner.ready.done():
+                owner.ready.cancel()
+            raise
+        except BaseException as exc:
+            # Setup errors travel through ``ready`` to the caller while this
+            # task continues into its own in-task rollback below.
+            if not owner.ready.done():
+                owner.ready.set_exception(exc)
+        finally:
+            try:
+                await stack.aclose()
+            except BaseException as cleanup_exc:
+                # Store, rather than log, so the caller can redact against the
+                # exact config whose transport is being closed.
+                owner.cleanup_error = cleanup_exc
+
     async def _establish_connection(
         self, name: str, cfg: UpstreamServerConfig
-    ) -> tuple[ClientSession, AsyncExitStack, list[Any]]:
-        """Open transport + session and discover tools under ONE end-to-end
-        ``connect_timeout_seconds`` deadline.
+    ) -> tuple[ClientSession, _UpstreamConnectionOwner, list[Any]]:
+        """Prepare a fully discovered owner-managed upstream connection.
 
-        Transport entry, ``initialize()``, and ``tools/list`` each get
-        ``deadline - now`` — a slow phase cannot grant later phases a fresh
-        budget (same contract as the CLI probe's ``_probe_one``). The session
-        ``__aenter__`` is not wrapped: it is an in-process task-group start
-        with no I/O, and it still sits inside the wall-clock deadline. On any
-        failure the partial stack is rolled back (redacted log — the transport
-        was opened with the credentialed ``cfg.url``) and the exception
-        re-raised; the caller sees either a fully-discovered connection or
-        nothing.
+        The owner task remains alive after this method returns so it can later
+        exit the MCP transport and session contexts in the same task that
+        entered them.  Cancellation or setup failure drains the owner before
+        propagating, leaving the caller's existing connection untouched.
         """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + cfg.connect_timeout_seconds
-
-        def remaining() -> float:
-            # Clamp like _probe_one: a deadline that expired between phases
-            # still surfaces as asyncio.TimeoutError, not ValueError.
-            return max(1e-3, deadline - loop.time())
-
-        conn_stack = AsyncExitStack()
+        owner = _UpstreamConnectionOwner(
+            ready=loop.create_future(),
+            close_requested=asyncio.Event(),
+        )
+        owner.task = asyncio.create_task(
+            self._run_connection_owner(name, cfg, owner),
+            name=f"proxy-upstream-{name}-owner",
+        )
         try:
-            streams = await asyncio.wait_for(
-                conn_stack.enter_async_context(self._open_transport(cfg)), timeout=remaining()
-            )
-            session = await conn_stack.enter_async_context(
-                ClientSession(
-                    streams[0], streams[1], message_handler=self._make_message_handler(name)
-                )
-            )
-            await asyncio.wait_for(session.initialize(), timeout=remaining())
-            result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
-        except BaseException:
-            # Roll back any contexts we entered (transport subprocess, session
-            # streams) — including on cancellation, so a timed-out phase can't
-            # leak file descriptors or child processes.
+            session, tools = await asyncio.shield(owner.ready)
+        except asyncio.CancelledError:
+            # The replacement was not published, so cancellation must tear it
+            # down.  The task itself performs the context unwind in-task.
+            owner.task.cancel()
             try:
-                await conn_stack.aclose()
-            except Exception as cleanup_exc:
-                # Redact + no exc_info (#580): the transport was opened with
-                # the credentialed ``cfg.url``, so a cleanup failure's
-                # traceback tail could otherwise leak the token even at DEBUG.
+                await owner.task
+            except asyncio.CancelledError:
+                pass
+            if owner.cleanup_error is not None:
                 logger.debug(
                     "Error during connection cleanup for '%s': %s",
                     name,
-                    self._redacted_error(cleanup_exc, cfg.url),
+                    self._redacted_error(owner.cleanup_error, cfg.url),
                 )
             raise
-        return session, conn_stack, list(result.tools)
+        except BaseException:
+            # ``ready`` is resolved before the owner's finally block finishes;
+            # join it so partial transport/session contexts are fully rolled
+            # back before the setup failure escapes.
+            await owner.task
+            if owner.cleanup_error is not None:
+                logger.debug(
+                    "Error during connection cleanup for '%s': %s",
+                    name,
+                    self._redacted_error(owner.cleanup_error, cfg.url),
+                )
+            raise
+        return session, owner, tools
+
+    @staticmethod
+    async def _close_connection_resources(
+        owner: _UpstreamConnectionOwner | None,
+        stack: AsyncExitStack | None,
+    ) -> None:
+        """Close owner-managed or legacy/injected connection resources."""
+        if owner is not None:
+            await owner.close()
+        elif stack is not None:
+            await stack.aclose()
 
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
@@ -1448,7 +1534,7 @@ class ProxyManager:
             )
             return
 
-        session, conn_stack, tools = await self._establish_connection(name, cfg)
+        session, owner, tools = await self._establish_connection(name, cfg)
 
         # #261 operator guidance, logged at discovery where the config
         # context is at hand. The tool itself stays in ``conn.tools``: the
@@ -1490,7 +1576,7 @@ class ProxyManager:
             config=cfg,
             session=session,
             tools=tools,
-            stack=conn_stack,
+            owner=owner,
             breaker=breaker,
         )
         self._tool_catalog_revision += 1
@@ -1533,34 +1619,21 @@ class ProxyManager:
             # failure-triggered reconnect the caller's raise/skip semantics are
             # unchanged.
             #
-            # The establish runs in a CHILD task so the new transport's anyio
-            # cancel scopes never land on THIS task's scope stack. With them
-            # here, the old-stack aclose() below would be a same-task
-            # out-of-order scope exit, and a real stdio transport's close
-            # (which cancels its task group) then cancels THIS task — the
-            # CancelledError escapes every except-Exception guard and kills
-            # the tool call that triggered the reconnect. In the child, the
-            # scopes die with the task and the later close of this stack is a
-            # cross-task exit — the mode every reconnect-opened stack already
-            # exercises in production (opened in a since-finished request
-            # task) and the cleanup guards already swallow.
-            establish = asyncio.create_task(self._establish_connection(name, cfg))
-            try:
-                session, conn_stack, tools = await establish
-            except asyncio.CancelledError:
-                # Our caller was cancelled while we waited: don't orphan the
-                # child — its own BaseException handler rolls back the
-                # partial stack once the cancel lands.
-                establish.cancel()
-                raise
+            # ``_establish_connection`` prepares a replacement in its own
+            # long-lived lifecycle owner.  That owner remains alive after the
+            # swap and later unwinds its contexts itself; no completed request
+            # task leaves an AnyIO cancel scope for another task to close.
+            session, owner, tools = await self._establish_connection(name, cfg)
 
+            old_owner = conn.owner
             old_stack = conn.stack
             # The old stack wraps a transport opened with the OLD credentialed
             # url — capture it before the swap so the cleanup log redacts the
             # right token.
             old_url = conn.config.url
             conn.session = session
-            conn.stack = conn_stack
+            conn.owner = owner
+            conn.stack = None
             conn.tools = tools
             self._tool_catalog_revision += 1
             conn.config = cfg
@@ -1572,9 +1645,9 @@ class ProxyManager:
             # caller retries rather than silently skipping.
             conn.reconnect_generation += 1
 
-            if old_stack is not None:
+            if old_owner is not None or old_stack is not None:
                 try:
-                    await old_stack.aclose()
+                    await self._close_connection_resources(old_owner, old_stack)
                 except Exception as cleanup_exc:
                     # Redact + no exc_info (#605): a close failure's traceback
                     # tail could leak the token at DEBUG.
@@ -1788,13 +1861,14 @@ class ProxyManager:
                 logger.debug("Failed to close tool-graph consult cache", exc_info=True)
             self._toolgraph_cache = None
         for conn in self._connections.values():
-            if conn.stack is not None:
+            if conn.owner is not None or conn.stack is not None:
                 try:
-                    await conn.stack.aclose()
+                    await self._close_connection_resources(conn.owner, conn.stack)
                 except Exception as cleanup_exc:
-                    # Redact + no exc_info (#605): this stack wraps a transport
-                    # opened with the credentialed ``conn.config.url``, so a close
-                    # failure's traceback tail could leak the token at DEBUG.
+                    # Redact + no exc_info (#605): these resources wrap a
+                    # transport opened with the credentialed
+                    # ``conn.config.url``, so a close failure's traceback tail
+                    # could leak the token at DEBUG.
                     logger.debug(
                         "Failed to close connection stack for '%s': %s",
                         conn.name,

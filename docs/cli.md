@@ -53,7 +53,7 @@ Commands:
   add        Add an upstream MCP server to the proxy configuration.
   config     Inspect and validate the proxy config file.
   daemon     Manage the shared local surfacing daemon.
-  doctor     Diagnose the proxy setup end-to-end (read-only).
+  doctor     Diagnose the proxy setup end-to-end (passive unless measuring LTM).
   eject      Restore imported upstream(s) to their host MCP client, then...
   gateway    Inspect and configure Toolgraph-backed gateway policy.
   health     Check upstream server connectivity.

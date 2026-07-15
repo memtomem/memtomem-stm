@@ -33,6 +33,7 @@ from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
 from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
+from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
 from memtomem_stm.cli.mms_host import host_group as _mms_host_group
 from memtomem_stm.cli.mms_import import import_command as _mms_import_command
 from memtomem_stm.cli.mms_project import project_group as _mms_project_group
@@ -475,7 +476,11 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
     # to the base interpreter, which can no longer import the installed STM.
     command = os.path.abspath(sys.executable)
     env = {"MEMTOMEM_STM_PROXY__CONFIG_PATH": str(config_path.expanduser().resolve())}
-    env["MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT"] = "false"
+    # A newly managed MCP host uses the shared warm daemon.  Serialize the
+    # deadline and privacy policy as well: GUI-launched clients often do not
+    # inherit the shell environment in which `mms register` ran.
+    policy = resolve_host_runtime_policy(use_daemon=True)
+    env.update(policy.mcp_env())
     return command, ["-m", "memtomem_stm"], env
 
 
@@ -740,7 +745,9 @@ def _write_mcp_json_for_stm(
     server_cmd: str,
     server_args: list[str],
     env: dict[str, str] | None = None,
-) -> Path:
+    *,
+    replace_existing: bool = False,
+) -> tuple[Path, bool]:
     """Write or merge ``<target_dir>/.mcp.json`` with the memtomem-stm entry.
 
     Aborts (``SystemExit(1)``, same convention as ``_load``) when an existing
@@ -748,11 +755,6 @@ def _write_mcp_json_for_stm(
     the previous behavior — falling back to ``{}`` — silently discarded every
     registration already in the file. On abort the file is left untouched.
     """
-    entry: dict[str, Any] = {"command": server_cmd}
-    if server_args:
-        entry["args"] = server_args
-    if env:
-        entry["env"] = env
     mcp_path = target_dir / ".mcp.json"
     existing: dict[str, Any]
     if mcp_path.exists():
@@ -801,6 +803,43 @@ def _write_mcp_json_for_stm(
             err=True,
         )
         raise SystemExit(1)
+    current_entry = servers.get("memtomem-stm")
+    if current_entry is not None and not isinstance(current_entry, dict):
+        click.echo(
+            f"{_err('Error:')} {mcp_path} 'memtomem-stm' entry must be an object, got "
+            f"{type(current_entry).__name__}. Registration aborted; the file was not modified.",
+            err=True,
+        )
+        click.echo(
+            "    Remove the 'memtomem-stm' entry manually, then re-run registration.",
+            err=True,
+        )
+        raise SystemExit(1)
+    if current_entry is not None and not replace_existing:
+        # Existing host registrations are keep-by-default.  Managed daemon /
+        # timeout values are applied only to a new entry or an explicit
+        # `--replace-registration` refresh.
+        return mcp_path, False
+
+    # On explicit refresh, retain fields STM does not own and merge environment
+    # values key-by-key.  This preserves host-specific metadata and operator
+    # variables while updating only the command/args and managed STM keys.
+    entry: dict[str, Any] = dict(current_entry or {})
+    entry["command"] = server_cmd
+    if server_args:
+        entry["args"] = server_args
+    else:
+        entry.pop("args", None)
+    if env:
+        current_env = entry.get("env")
+        if current_env is not None and not isinstance(current_env, dict):
+            click.echo(
+                f"{_err('Error:')} {mcp_path} 'memtomem-stm.env' must be an object, got "
+                f"{type(current_env).__name__}. Registration aborted; the file was not modified.",
+                err=True,
+            )
+            raise SystemExit(1)
+        entry["env"] = {**(current_env or {}), **env}
     servers["memtomem-stm"] = entry
     # Atomic like every sibling config writer (_save, _desktop_json_remove_entry):
     # Claude Code re-reads .mcp.json at project load, and a crash/disk-full
@@ -814,7 +853,7 @@ def _write_mcp_json_for_stm(
     except OSError:
         file_mode = 0o644
     atomic_write_text(mcp_path, json.dumps(existing, indent=2) + "\n", mode=file_mode, durable=True)
-    return mcp_path
+    return mcp_path, True
 
 
 def _claude_desktop_config_hint() -> str:
@@ -943,6 +982,14 @@ def _run_mcp_integration(
                     "left unchanged. Remove it with `codex mcp remove memtomem-stm` "
                     "and re-run to replace it anyway"
                 )
+            # The replacement owns STM's managed keys, not unrelated operator
+            # variables.  `_codex_restore_plan` has already proved this is a
+            # stdio snapshot with a string-to-string env mapping, so merge it
+            # before remove/add and let the managed values win on collisions.
+            transport = snapshot.get("transport")
+            raw_previous_env = transport.get("env") if isinstance(transport, dict) else None
+            previous_env = raw_previous_env if isinstance(raw_previous_env, dict) else {}
+            server_env = {**previous_env, **server_env}
             if not _remove_from_codex():
                 raise click.ClickException(
                     "could not remove the existing Codex registration; "
@@ -970,8 +1017,19 @@ def _run_mcp_integration(
 
     if client_mode == "json":
         _SETUP_RESOLVED_CLIENT.set("json")
-        mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
-        click.echo(f"  {_ok('Wrote')} {mcp_path}")
+        mcp_path, written = _write_mcp_json_for_stm(
+            Path.cwd(),
+            server_cmd,
+            server_args,
+            server_env,
+            replace_existing=replace_registration,
+        )
+        if written:
+            click.echo(f"  {_ok('Wrote')} {mcp_path}")
+        else:
+            click.echo(
+                f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)"
+            )
         _emit_mcp_paste_hints()
         return
 
@@ -1021,8 +1079,17 @@ def _run_mcp_integration(
 
     # choice == 2, or choice == 1 fallback
     _SETUP_RESOLVED_CLIENT.set("json")
-    mcp_path = _write_mcp_json_for_stm(Path.cwd(), server_cmd, server_args, server_env)
-    click.echo(f"  {_ok('Wrote')} {mcp_path}")
+    mcp_path, written = _write_mcp_json_for_stm(
+        Path.cwd(),
+        server_cmd,
+        server_args,
+        server_env,
+        replace_existing=replace_registration,
+    )
+    if written:
+        click.echo(f"  {_ok('Wrote')} {mcp_path}")
+    else:
+        click.echo(f"  {_ok('Kept existing registration')} (use --replace-registration to refresh)")
     _emit_mcp_paste_hints()
 
 
@@ -5394,8 +5461,8 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     """Probe a single upstream server: connect, initialize, list tools.
 
     *timeout* is an **end-to-end** budget shared across transport connect +
-    ``initialize()`` + ``list_tools()`` — each ``wait_for`` gets
-    ``deadline - now`` so a stall in any phase can't push the probe past the
+    ``initialize()`` + ``list_tools()`` — each phase gets ``deadline - now``
+    so a stall in any phase can't push the probe past the
     ``mms health --timeout`` / ``mms add --validate --timeout`` ceiling.
     Mirrors ``_probe_ltm_mcp_server``'s deadline pattern; previously only
     ``initialize()`` was bounded, so a network upstream hanging on TCP
@@ -5417,9 +5484,10 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     deadline = asyncio.get_running_loop().time() + timeout
 
     def remaining() -> float:
-        # ``asyncio.wait_for`` treats <=0 as "fire immediately"; clamp to a
-        # tiny positive so we always raise ``TimeoutError`` rather than
-        # returning a bogus result on an exhausted budget.
+        # The operation-phase ``wait_for`` calls treat <=0 as "fire
+        # immediately"; clamp to a tiny positive so we always raise
+        # ``TimeoutError`` rather than returning a bogus result on an
+        # exhausted budget.
         return max(1e-3, deadline - asyncio.get_running_loop().time())
 
     transport = str(cfg.get("transport", "stdio"))
@@ -5454,7 +5522,12 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
             )
 
         async with AsyncExitStack() as stack:
-            streams = await asyncio.wait_for(stack.enter_async_context(ctx), timeout=remaining())
+            # ``wait_for(context.__aenter__())`` runs the enter in a child task
+            # on Python 3.12, then this task exits it — invalid for AnyIO's
+            # task-affine cancel scopes. ``timeout_at`` keeps both lifecycle
+            # operations in this probe task while preserving the deadline.
+            async with asyncio.timeout_at(deadline):
+                streams = await stack.enter_async_context(ctx)
             stage = ProbeStage.TRANSPORT_CONNECTED
             async with ClientSession(streams[0], streams[1]) as session:
                 await asyncio.wait_for(session.initialize(), timeout=remaining())
@@ -5508,16 +5581,25 @@ def _text_parts_from_tool_result(result: Any) -> list[str]:
     ]
 
 
-def _version_from_tool_result(result: Any) -> str | None:
+def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
     text_parts = _text_parts_from_tool_result(result)
     if not text_parts:
-        return None
+        return {"version": None, "runtime_profile": None}
     try:
         data = json.loads(text_parts[0])
     except json.JSONDecodeError:
-        return None
+        return {"version": None, "runtime_profile": None}
+    if not isinstance(data, dict):
+        return {"version": None, "runtime_profile": None}
     version = data.get("version")
-    return str(version) if version else None
+    profile = data.get("runtime_profile")
+    if not isinstance(profile, dict) or profile.get("schema_version") != 1:
+        profile = None
+    return {"version": str(version) if version else None, "runtime_profile": profile}
+
+
+def _version_from_tool_result(result: Any) -> str | None:
+    return _ltm_metadata_from_tool_result(result)["version"]
 
 
 async def _probe_ltm_mcp_server(
@@ -5585,7 +5667,11 @@ async def _probe_ltm_mcp_server(
         ctx = stdio_client(params, errlog=errlog)
 
     async with AsyncExitStack() as stack:
-        streams = await asyncio.wait_for(stack.enter_async_context(ctx), timeout=remaining())
+        # Keep transport enter/exit in this task.  On Python 3.12,
+        # ``wait_for(context.__aenter__())`` would enter in a child task and
+        # make this stack's later exit violate AnyIO cancel-scope affinity.
+        async with asyncio.timeout_at(deadline):
+            streams = await stack.enter_async_context(ctx)
         async with ClientSession(streams[0], streams[1]) as session:
             await asyncio.wait_for(session.initialize(), timeout=remaining())
             tools_result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
@@ -5601,6 +5687,7 @@ async def _probe_ltm_mcp_server(
                     ),
                 }
             version: str | None = None
+            runtime_profile: dict[str, Any] | None = None
             # ``mem_search`` connectivity is already proven — don't burn what
             # remains of the budget on the optional version probe if it'd
             # push us past the deadline. The threshold is small enough to
@@ -5614,14 +5701,21 @@ async def _probe_ltm_mcp_server(
                         session.call_tool("mem_do", {"action": "version"}),
                         timeout=remaining(),
                     )
-                    version = _version_from_tool_result(result)
+                    metadata = _ltm_metadata_from_tool_result(result)
+                    version = metadata["version"]
+                    runtime_profile = metadata["runtime_profile"]
                 except Exception:
                     logger.debug(
                         "LTM mem_do(version) probe failed or timed out within "
                         "the shared budget; treating as unsupported.",
                         exc_info=True,
                     )
-            return {"connected": True, "version": version, "error": None}
+            return {
+                "connected": True,
+                "version": version,
+                "runtime_profile": runtime_profile,
+                "error": None,
+            }
 
 
 def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
@@ -5656,6 +5750,7 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         "display": display,
         "connected": None,
         "version": None,
+        "runtime_profile": None,
         "error": None,
     }
 
@@ -5718,8 +5813,89 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     return status
 
 
-def _ltm_daemon_status(config: Any, timeout: float) -> dict[str, Any]:
-    """Read-only shared-daemon readiness probe; never auto-spawns."""
+_LTM_MEASURE_SAMPLES = 5
+_LTM_MEASURE_MAX_TIMEOUT_SECONDS = 30.0
+
+
+async def _measure_warm_daemon_ltm(
+    config: Any, *, initial_state: str, timeout: float
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Run an explicitly requested, content-discarding warm-LTM measurement.
+
+    A cold daemon gets one uncounted priming search.  Five unique synthetic
+    searches then exercise the real daemon admission + LTM path.  The server
+    owns the numeric rolling telemetry; this helper returns only run counters
+    and a refreshed ping snapshot.  It never starts a missing daemon and never
+    writes configuration or LTM content.
+    """
+    from memtomem_stm.daemon import client as daemon_client
+    from memtomem_stm.daemon.protocol import OP_LTM_SEARCH
+
+    surfacing = config.surfacing
+    sample_timeout = min(
+        _LTM_MEASURE_MAX_TIMEOUT_SECONDS,
+        max(10.0, float(timeout), 2.0 * float(surfacing.timeout_seconds)),
+    )
+    payload_base: dict[str, Any] = {
+        "top_k": int(surfacing.max_results),
+        "namespace": surfacing.default_namespace,
+        "context_window": int(surfacing.context_window_size),
+    }
+
+    async def one(label: str) -> tuple[str, dict[str, Any] | None]:
+        payload = dict(payload_base)
+        # Unique, synthetic text avoids a result-cache hit without exposing any
+        # operator data.  Search is read-only and returned content is discarded.
+        payload["query"] = f"memtomem stm latency probe {label} {asyncio.get_running_loop().time()}"
+        return await daemon_client.ltm_request(
+            config, OP_LTM_SEARCH, payload, timeout=sample_timeout
+        )
+
+    primed = initial_state != "warm"
+    if primed:
+        await one("prime")
+
+    completed = 0
+    timed_out = 0
+    errors = 0
+    attempted = 0
+    for index in range(_LTM_MEASURE_SAMPLES):
+        attempted += 1
+        state, response = await one(f"sample-{index}")
+        if state == "ok" and isinstance(response, dict):
+            if response.get("status") == "expired":
+                timed_out += 1
+            elif response.get("ok") is True and response.get("outcome") in (
+                "ok",
+                "empty_results",
+            ):
+                completed += 1
+            else:
+                errors += 1
+        elif state == "unavailable":
+            timed_out += 1
+        else:
+            errors += 1
+        if timed_out >= 2:
+            break
+
+    refreshed = await daemon_client.ping(config, timeout=max(2.0, min(sample_timeout, 5.0)))
+    return (
+        {
+            "requested_samples": _LTM_MEASURE_SAMPLES,
+            "attempted_samples": attempted,
+            "completed_samples": completed,
+            "timeout_samples": timed_out,
+            "error_samples": errors,
+            "primed": primed,
+            "sample_timeout_seconds": sample_timeout,
+        },
+        refreshed,
+    )
+
+
+def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False) -> dict[str, Any]:
+    """Shared-daemon readiness and telemetry; active only with ``measure_ltm``."""
     from memtomem_stm.daemon import client as daemon_client
 
     surfacing = config.surfacing
@@ -5732,9 +5908,12 @@ def _ltm_daemon_status(config: Any, timeout: float) -> dict[str, Any]:
         "display": "mms daemon",
         "connected": False,
         "version": None,
+        "runtime_profile": None,
         "error": None,
         "daemon_reachable": False,
         "ltm_state": None,
+        "latency": None,
+        "measurement": None,
     }
     if not surfacing.enabled:
         status["skipped"] = "surfacing_disabled"
@@ -5744,6 +5923,22 @@ def _ltm_daemon_status(config: Any, timeout: float) -> dict[str, Any]:
         status["error"] = "shared daemon is not reachable; run `mms daemon status`"
         return status
     state = str(hs.get("ltm") or "cold")
+    if isinstance(hs.get("latency"), dict):
+        status["latency"] = hs["latency"]
+    core = hs.get("core")
+    if isinstance(core, dict):
+        profile = core.get("runtime_profile")
+        if isinstance(profile, dict) and profile.get("schema_version") == 1:
+            status["runtime_profile"] = profile
+    if measure_ltm:
+        measurement, refreshed = asyncio.run(
+            _measure_warm_daemon_ltm(config, initial_state=state, timeout=timeout)
+        )
+        status["measurement"] = measurement
+        if isinstance(refreshed, dict):
+            state = str(refreshed.get("ltm") or state)
+            if isinstance(refreshed.get("latency"), dict):
+                status["latency"] = refreshed["latency"]
     status["daemon_reachable"] = True
     status["ltm_state"] = state
     if state == "warm":
@@ -5753,9 +5948,18 @@ def _ltm_daemon_status(config: Any, timeout: float) -> dict[str, Any]:
     return status
 
 
-def _ltm_status(config: Any, timeout: float) -> dict[str, Any]:
-    if config.surfacing.use_daemon:
-        return _ltm_daemon_status(config, timeout)
+def _ltm_status(
+    config: Any,
+    timeout: float,
+    *,
+    measure_ltm: bool = False,
+    prefer_hook_daemon: bool = False,
+) -> dict[str, Any]:
+    # Standalone proxy surfacing and native hooks have independent routing
+    # knobs. Health keeps describing the standalone route; doctor opts into
+    # the hook daemon because its timeout advice governs hook→daemon traffic.
+    if config.surfacing.use_daemon or (prefer_hook_daemon and config.hook.use_daemon):
+        return _ltm_daemon_status(config, timeout, measure_ltm=measure_ltm)
     return _ltm_mcp_status(config.surfacing, timeout)
 
 
@@ -5853,7 +6057,12 @@ def _all_config_secret_values(data: dict[str, Any]) -> list[str]:
     return values
 
 
-def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
+def _surfacing_bootstrap_status(
+    timeout: float,
+    *,
+    measure_ltm: bool = False,
+    prefer_hook_daemon: bool = False,
+) -> dict[str, Any]:
     """Return surfacing bootstrap readiness without starting the proxy.
 
     *timeout* is the ``mms health --timeout`` value, forwarded into the LTM
@@ -5861,7 +6070,10 @@ def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
     """
     try:
         from memtomem_stm.config import STMConfig
-        from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
+        from memtomem_stm.surfacing.feedback_store import (
+            inspect_feedback_db,
+            read_surfacing_summary,
+        )
 
         config = STMConfig()
         surfacing = config.surfacing
@@ -5870,7 +6082,17 @@ def _surfacing_bootstrap_status(timeout: float) -> dict[str, Any]:
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
-            "ltm_server": _ltm_status(config, timeout),
+            "feedback_summary": read_surfacing_summary(surfacing.feedback_db_path),
+            "ltm_server": _ltm_status(
+                config,
+                timeout,
+                measure_ltm=measure_ltm,
+                prefer_hook_daemon=prefer_hook_daemon,
+            ),
+            "timeouts": {
+                "surfacing_seconds": float(surfacing.timeout_seconds),
+                "hook_daemon_seconds": float(config.hook.daemon_timeout_seconds),
+            },
         }
     except Exception as exc:
         logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
@@ -6124,6 +6346,119 @@ def health(
 _DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
 
 
+def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, str, str | None]]:
+    """Translate the additive core runtime profile into stable doctor checks."""
+    if not isinstance(profile, dict):
+        return [
+            (
+                "ltm_runtime_profile",
+                "ltm runtime profile",
+                "WARN",
+                "connected core does not expose runtime_profile schema 1",
+                "upgrade memtomem core, then restart the LTM/daemon",
+            )
+        ]
+    if profile.get("config_state") != "ok":
+        return [
+            (
+                "ltm_runtime_profile",
+                "ltm runtime profile",
+                "FAIL",
+                "core could not read its effective configuration",
+                "run `mm status` in the LTM environment and repair its config",
+            )
+        ]
+
+    checks: list[tuple[str, str, str, str, str | None]] = []
+    dependencies = profile.get("dependencies")
+    dependencies = dependencies if isinstance(dependencies, dict) else {}
+    fastembed = dependencies.get("fastembed")
+    kiwi = dependencies.get("kiwipiepy")
+    missing = profile.get("missing_extras")
+    missing = missing if isinstance(missing, list) else []
+    if "onnx" in missing or (
+        isinstance(fastembed, dict)
+        and fastembed.get("required_for")
+        and not fastembed.get("available")
+    ):
+        checks.append(
+            (
+                "ltm_dependencies",
+                "ltm dependencies",
+                "FAIL",
+                "fastembed is required by the active embedding/rerank config but is not installed",
+                "install `memtomem[onnx]` in the LTM server environment and restart it",
+            )
+        )
+    elif "korean" in missing or (
+        isinstance(kiwi, dict) and kiwi.get("required_for") and not kiwi.get("available")
+    ):
+        checks.append(
+            (
+                "ltm_dependencies",
+                "ltm dependencies",
+                "WARN",
+                "kiwipiepy tokenizer is configured but its extra is not installed",
+                "install `memtomem[korean]` in the LTM server environment",
+            )
+        )
+    else:
+        checks.append(
+            ("ltm_dependencies", "ltm dependencies", "PASS", "required extras available", None)
+        )
+
+    search = profile.get("search")
+    configured_mode = search.get("configured_mode") if isinstance(search, dict) else None
+    effective_mode = (
+        search.get("effective_mode", configured_mode) if isinstance(search, dict) else None
+    )
+    if effective_mode == "disabled":
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "FAIL",
+                "effective retrieval mode is disabled",
+                "enable a working dense embedding provider, then re-index vectors",
+            )
+        )
+    elif effective_mode == "bm25_only" and configured_mode != "bm25_only":
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "FAIL",
+                f"configured mode {configured_mode} degraded to effective mode bm25_only",
+                "restore the configured dense embedding provider, then re-index vectors",
+            )
+        )
+    elif effective_mode == "bm25_only":
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "WARN",
+                "intentional BM25-only configuration; semantic surfacing is unavailable",
+                "enable a dense embedding provider and re-index vectors for semantic retrieval",
+            )
+        )
+    elif effective_mode in {"hybrid", "dense_only"}:
+        checks.append(
+            ("ltm_retrieval_mode", "ltm retrieval mode", "PASS", str(effective_mode), None)
+        )
+    else:
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "WARN",
+                "runtime profile did not report a recognized retrieval mode",
+                None,
+            )
+        )
+    return checks
+
+
 @cli.command()
 @click.option(
     "--config",
@@ -6144,15 +6479,31 @@ _DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
     type=click.IntRange(min=1),
     help="Per-server connection timeout in seconds.",
 )
-def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> None:
-    """Diagnose the proxy setup end-to-end (read-only).
+@click.option(
+    "--measure-ltm",
+    is_flag=True,
+    help=(
+        "Actively run five synthetic searches against an existing shared daemon "
+        "to refresh warm-LTM latency advice. Never starts a missing daemon."
+    ),
+)
+def doctor(
+    config_path: str,
+    *,
+    as_json: bool = False,
+    timeout: int = 10,
+    measure_ltm: bool = False,
+) -> None:
+    """Diagnose the proxy setup end-to-end (passive unless measuring LTM).
 
     Runs the existing status/health/config checks as one PASS/WARN/FAIL
     report with a copy-paste next action per failing check. Exit code is 1
     when any check FAILs; WARN-only runs exit 0 — `mms doctor` passing is
     the quickstart success gate, so it must be scriptable. `health` stays
     the always-exit-0 inspection command; strict config linting stays in
-    `mms config validate`. Never modifies the config or any other state.
+    `mms config validate`. The default never modifies state or runs a search.
+    ``--measure-ltm`` explicitly authorizes read-only synthetic searches against
+    an already running daemon; it still never edits configuration or LTM data.
     """
     path = Path(config_path)
     resolved = path.expanduser().resolve()
@@ -6388,13 +6739,46 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
             # or unconfigured LTM only disables surfacing, not the proxy
             # core. A FAIL here would break the exit-code gate on every
             # fresh install without a memtomem server.
-            surfacing_status = _surfacing_bootstrap_status(float(timeout))
+            surfacing_status = _surfacing_bootstrap_status(
+                float(timeout),
+                measure_ltm=measure_ltm,
+                prefer_hook_daemon=True,
+            )
             ltm = surfacing_status.get("ltm_server")
             if isinstance(ltm, dict) and ltm.get("connected"):
                 detail = str(ltm.get("display") or ltm.get("command") or "")
                 if ltm.get("version"):
                     detail = f"{detail}, version {ltm['version']}"
                 check("ltm", "ltm server", "PASS", f"connectable ({detail})")
+                for runtime_check in _runtime_profile_doctor_checks(ltm.get("runtime_profile")):
+                    check(*runtime_check)
+
+                feedback_summary = surfacing_status.get("feedback_summary")
+                if isinstance(feedback_summary, dict):
+                    active = feedback_summary.get("active_diagnostics")
+                    supported = feedback_summary.get("diagnostics_recovery_supported", True)
+                    if isinstance(active, dict) and active.get("score_ceiling_below_min"):
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "FAIL",
+                            "unrecovered score_ceiling_below_min episode in the last 7 UTC days",
+                            "verify dense embeddings and min_score, then run a successful warm search",
+                        )
+                    elif not supported:
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "WARN",
+                            "feedback DB predates recovery tracking; daemon initialization will migrate it",
+                        )
+                    else:
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "PASS",
+                            "no active mismatch episode",
+                        )
             else:
                 if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
                     cause = "surfacing disabled"
@@ -6415,6 +6799,142 @@ def doctor(config_path: str, *, as_json: bool = False, timeout: int = 10) -> Non
                         "  # see docs/surfacing.md"
                     ),
                 )
+
+            # 9. Warm-daemon timeout advice.  Ping telemetry is passive; the
+            # optional measurement above is the only path that executes a
+            # synthetic search.  These are WARN-only operational checks: an
+            # undersized budget degrades surfacing but never breaks proxying.
+            if measure_ltm and (
+                not isinstance(ltm, dict)
+                or ltm.get("route") != "daemon"
+                or ltm.get("daemon_reachable") is False
+            ):
+                check(
+                    "ltm_measurement",
+                    "ltm measurement",
+                    "WARN",
+                    "--measure-ltm requires surfacing.use_daemon=true and a running daemon",
+                    "export MEMTOMEM_STM_SURFACING__USE_DAEMON=true; mms daemon start",
+                )
+            elif isinstance(ltm, dict) and ltm.get("route") == "daemon":
+                measurement = ltm.get("measurement")
+                if isinstance(measurement, dict):
+                    completed = int(measurement.get("completed_samples", 0) or 0)
+                    attempted = int(measurement.get("attempted_samples", 0) or 0)
+                    measurement_status = "PASS" if completed else "WARN"
+                    check(
+                        "ltm_measurement",
+                        "ltm measurement",
+                        measurement_status,
+                        f"{completed}/{attempted} warm sample(s) completed",
+                        None if completed else "mms doctor --measure-ltm --timeout 30",
+                    )
+
+                latency = ltm.get("latency")
+                timeout_cfg = surfacing_status.get("timeouts")
+                if isinstance(latency, dict) and isinstance(timeout_cfg, dict):
+                    surface_summary = latency.get("surface")
+                    retrieval_summary = latency.get("retrieval")
+
+                    def recommendation(summary: Any) -> dict[str, Any] | None:
+                        if not isinstance(summary, dict):
+                            return None
+                        value = summary.get("recommendation")
+                        return value if isinstance(value, dict) else None
+
+                    surface_rec = recommendation(surface_summary)
+                    retrieval_rec = recommendation(retrieval_summary)
+                    # Hook traffic populates ``surface``; explicit low-level
+                    # measurement populates ``retrieval``. Prefer the former
+                    # when ready, otherwise use the fresh retrieval estimate.
+                    chosen_rec = (
+                        surface_rec
+                        if isinstance(surface_rec, dict)
+                        and isinstance(surface_rec.get("seconds"), (int, float))
+                        else retrieval_rec
+                    )
+                    surfacing_current = float(timeout_cfg.get("surfacing_seconds", 0.0))
+                    recommended = (
+                        float(chosen_rec["seconds"])
+                        if isinstance(chosen_rec, dict)
+                        and isinstance(chosen_rec.get("seconds"), (int, float))
+                        else None
+                    )
+                    recommendation_status = (
+                        str(chosen_rec.get("status", "unknown"))
+                        if isinstance(chosen_rec, dict)
+                        else "unknown"
+                    )
+                    if isinstance(chosen_rec, dict) and chosen_rec.get("status") == "too_slow":
+                        check(
+                            "surfacing_timeout",
+                            "surfacing timeout",
+                            "WARN",
+                            "warm LTM requires more than the 30s operational ceiling; "
+                            "fix LTM performance before increasing timeout",
+                            "mms doctor --measure-ltm --timeout 30",
+                        )
+                    elif recommended is None:
+                        samples = max(
+                            int((surface_summary or {}).get("samples", 0) or 0)
+                            if isinstance(surface_summary, dict)
+                            else 0,
+                            int((retrieval_summary or {}).get("samples", 0) or 0)
+                            if isinstance(retrieval_summary, dict)
+                            else 0,
+                        )
+                        check(
+                            "surfacing_timeout",
+                            "surfacing timeout",
+                            "PASS",
+                            f"collecting telemetry ({samples}/5 successful warm samples)",
+                            "mms doctor --measure-ltm" if samples < 5 else None,
+                        )
+                    elif surfacing_current < recommended:
+                        check(
+                            "surfacing_timeout",
+                            "surfacing timeout",
+                            "WARN",
+                            f"configured {surfacing_current:g}s; warm-daemon telemetry "
+                            f"recommends {recommended:g}s ({recommendation_status})",
+                            f"export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS={recommended:g}",
+                        )
+                    else:
+                        check(
+                            "surfacing_timeout",
+                            "surfacing timeout",
+                            "PASS",
+                            f"configured {surfacing_current:g}s >= observed recommendation "
+                            f"{recommended:g}s",
+                        )
+
+                    from memtomem_stm.daemon.latency import hook_timeout_recommendation
+
+                    effective_surfacing = max(surfacing_current, recommended or 0.0)
+                    hook_recommended = hook_timeout_recommendation(
+                        surfacing_timeout_seconds=effective_surfacing,
+                        surface_summary=(
+                            surface_summary if isinstance(surface_summary, dict) else None
+                        ),
+                    )
+                    hook_current = float(timeout_cfg.get("hook_daemon_seconds", 0.0))
+                    if hook_current < hook_recommended:
+                        check(
+                            "hook_daemon_timeout",
+                            "hook daemon timeout",
+                            "WARN",
+                            f"configured {hook_current:g}s; outer hook deadline truncates the "
+                            f"inner surfacing budget (need >= {hook_recommended:g}s)",
+                            "export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS="
+                            f"{hook_recommended:g}",
+                        )
+                    else:
+                        check(
+                            "hook_daemon_timeout",
+                            "hook daemon timeout",
+                            "PASS",
+                            f"configured {hook_current:g}s >= required {hook_recommended:g}s",
+                        )
 
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
     overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")
