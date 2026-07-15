@@ -85,7 +85,11 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
         # read is worse than not looking: it reports all-clear about a file
         # nothing enforces.
         target = Path(os.path.realpath(configured))
-    except OSError:
+    except (OSError, RuntimeError):
+        # RuntimeError: expanduser() raises it, not OSError, when a home cannot
+        # be resolved (``~nosuchuser/bundle.json``). This function promises to
+        # never be the reason anything breaks, so the promise cannot be
+        # conditional on which exception type a stdlib call happens to pick.
         return []
     findings: list[str] = _redirectable_symlinks(configured, euid)
     try:
@@ -112,8 +116,8 @@ def _substituters(info: os.stat_result, euid: int) -> str:
     return ""
 
 
-def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
-    """Symlinks on the way to the bundle that someone else could re-point.
+def _link_finding(link: Path, info: os.stat_result, euid: int) -> str | None:
+    """Report *link* when someone else can replace that directory entry.
 
     A link redirects the gateway to a policy of someone's choosing without ever
     touching the file we validated — but only if they can *replace the link*.
@@ -121,52 +125,99 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
     and recreated, which needs write and search on the directory holding it. So
     a link in a directory only we can write is not a vector, and reporting one
     would be exactly the noise this check cannot afford.
+    """
+    try:
+        parent_info = os.stat(link.parent)
+    except OSError:
+        return None
+    who = _substituters(parent_info, euid)
+    if not who and info.st_uid not in (euid, 0):
+        # The sticky exemption protects an entry from everyone *except its own
+        # owner*. A link we do not own, in a directory its owner can write and
+        # search (``/tmp`` at 01777 being the whole point), is theirs to unlink
+        # and recreate whenever they like — and the resolved chain we analyse
+        # can be perfectly secure meanwhile.
+        #
+        # Deliberately conservative for a group-only directory (``01770``):
+        # proving the owner is in that group would mean resolving a foreign uid
+        # through pwd/grp, which fails or stalls exactly where it would matter
+        # (LDAP, containers, a uid with no local passwd entry) — a new failure
+        # mode for a diagnostic that must never be the reason anything breaks.
+        # So this accepts a false positive when current membership cannot be
+        # established, and lets a human judge.
+        if _write_search_classes(parent_info.st_mode):
+            who = f"its owner uid {info.st_uid}"
+    if not who:
+        return None
+    return (
+        f"{link} is a symlink and {link.parent} lets {who} replace it, "
+        f"so the policy this proxy loads can be re-pointed"
+    )
 
-    That containing directory is also why this walk exists at all: the ancestor
-    analysis follows the *resolved* chain, which need not contain the link.
 
-    Walked prefix by prefix rather than inspecting the final path alone, so an
-    intermediate ``.../link/policy.json`` is caught too — and each ``lstat``
-    lets the kernel resolve the prefix, which is what makes a ``..`` component
-    behave here exactly as it will at load time.
+# The kernel gives up after ~40 links (ELOOP); matching it bounds a symlink
+# cycle without inventing a limit of our own.
+_MAX_SYMLINK_HOPS = 40
+
+
+def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
+    """Every symlink the loader traverses that someone else could re-point.
+
+    This walk exists because the two obvious ones both miss hops: the ancestor
+    analysis follows the *resolved* chain, which need not contain any link at
+    all, and walking only the configured components stops at the first one —
+    ``a/bundle -> b/link2 -> c/real`` puts ``b/link2`` on neither, so an
+    exposed ``b`` would go unreported while anyone there redirects what loads.
+
+    So each link is followed the way the kernel follows it: prefix by prefix
+    (an ``lstat`` per step, which is what makes a ``..`` component behave here
+    exactly as at load time), then into the link's target with any remaining
+    components appended, recursively, bounded by ``_MAX_SYMLINK_HOPS``.
     """
     findings: list[str] = []
-    current = Path(configured.anchor)
-    for part in configured.relative_to(configured.anchor).parts:
+    reported: set[Path] = set()
+    _scan_for_links(configured, euid, findings, reported, [_MAX_SYMLINK_HOPS])
+    return findings
+
+
+def _scan_for_links(
+    path: Path,
+    euid: int,
+    findings: list[str],
+    reported: set[Path],
+    budget: list[int],
+) -> None:
+    """Resolve *path* one component at a time, reporting re-pointable links."""
+    current = Path(path.anchor)
+    parts = list(path.relative_to(path.anchor).parts)
+    for index, part in enumerate(parts):
         current = current / part
         try:
             info = os.lstat(current)
         except OSError:
-            break
+            return
         if not stat_module.S_ISLNK(info.st_mode):
             continue
+        if budget[0] <= 0:
+            return
+        budget[0] -= 1
+        if current not in reported:
+            reported.add(current)
+            finding = _link_finding(current, info, euid)
+            if finding:
+                findings.append(finding)
         try:
-            parent_info = os.stat(current.parent)
+            target = Path(os.readlink(current))
         except OSError:
-            continue
-        who = _substituters(parent_info, euid)
-        if not who and info.st_uid not in (euid, 0):
-            # The sticky exemption protects an entry from everyone *except its
-            # own owner*. A link we do not own, in a directory its owner can
-            # write and search (``/tmp`` at 01777 being the whole point), is
-            # theirs to unlink and recreate whenever they like — and the
-            # resolved chain we analyse can be perfectly secure meanwhile.
-            #
-            # Deliberately conservative for a group-only directory (``01770``):
-            # proving the owner is in that group would mean resolving a foreign
-            # uid through pwd/grp, which fails or stalls exactly where it would
-            # matter (LDAP, containers, a uid with no local passwd entry) — a new
-            # failure mode for a diagnostic that must never be the reason
-            # anything breaks. So this accepts a false positive when current
-            # membership cannot be established, and lets a human judge.
-            if _write_search_classes(parent_info.st_mode):
-                who = f"its owner uid {info.st_uid}"
-        if who:
-            findings.append(
-                f"{current} is a symlink and {current.parent} lets {who} replace it, "
-                f"so the policy this proxy loads can be re-pointed"
-            )
-    return findings
+            return
+        if not target.is_absolute():
+            # A relative target resolves against the link's own directory.
+            target = current.parent / target
+        # Whatever followed the link resolves through the target, so hand the
+        # rest over and let the same walk apply to the hop.
+        rest = parts[index + 1 :]
+        _scan_for_links(target.joinpath(*rest), euid, findings, reported, budget)
+        return
 
 
 def _write_search_classes(mode: int) -> str:

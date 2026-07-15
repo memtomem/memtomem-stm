@@ -1147,6 +1147,74 @@ class TestBundleProvenanceAdvisory:
             "scope note in bundle_provenance_warnings' docstring is now wrong"
         )
 
+    def test_a_chained_symlink_hop_in_an_exposed_dir_is_a_finding(self, tmp_path):
+        """`a/bundle -> b/link2 -> c/real`: the middle hop is on neither walk.
+
+        The ancestor analysis follows the resolved chain (`c`), and stopping at
+        the configured path's first link never reaches `b`. Anyone with
+        write+search on `b` re-points what the loader opens.
+        """
+        a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+        for d in (a, b, c):
+            d.mkdir()
+        real = c / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (b / "link2").symlink_to(real)
+        bundle = a / "policy-bundle.json"
+        bundle.symlink_to(b / "link2")
+        a.chmod(0o755)
+        c.chmod(0o755)
+        b.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(b / "link2") in f and "re-pointed" in f for f in findings)
+        finally:
+            b.chmod(0o755)
+
+    def test_a_chained_symlink_through_secure_dirs_is_silent(self, tmp_path):
+        """Positive control: chasing hops must not invent findings."""
+        a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+        for d in (a, b, c):
+            d.mkdir()
+            d.chmod(0o755)
+        real = c / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (b / "link2").symlink_to(real)
+        bundle = a / "policy-bundle.json"
+        bundle.symlink_to(b / "link2")
+        assert bundle_provenance_warnings(bundle) == []
+
+    def test_a_symlink_cycle_terminates(self, tmp_path):
+        """A loop must exhaust the hop budget, not the stack."""
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        assert bundle_provenance_warnings(first) == []
+
+    def test_a_relative_link_target_resolves_against_the_links_own_dir(self, tmp_path):
+        exposed = tmp_path / "exposed"
+        exposed.mkdir()
+        real = exposed / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        (exposed / "link2").symlink_to("real.json")  # relative target
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.symlink_to(exposed / "link2")
+        tmp_path.chmod(0o755)
+        exposed.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(bundle)
+            assert any(str(exposed / "link2") in f and "re-pointed" in f for f in findings)
+        finally:
+            exposed.chmod(0o755)
+
+    def test_an_unresolvable_home_is_not_this_diagnostic_s_problem(self):
+        """`expanduser` raises RuntimeError, not OSError, for `~nosuchuser`."""
+        assert bundle_provenance_warnings(Path("~nosuchuser/policy-bundle.json")) == []
+
     def test_a_missing_bundle_is_not_this_diagnostic_s_problem(self, tmp_path):
         assert bundle_provenance_warnings(tmp_path / "absent.json") == []
 
