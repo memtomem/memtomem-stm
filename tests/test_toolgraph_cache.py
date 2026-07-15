@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from types import SimpleNamespace
 
@@ -184,12 +185,18 @@ class TestCorruptRow:
     raise during startup (the caller subscripts the raw-fact keys) and is dropped
     so the next consult re-mints a fresh row."""
 
-    def test_malformed_dict_row_is_dropped_as_miss(self, cache):
+    def test_malformed_dict_row_is_dropped_as_miss(self, cache, caplog):
         _put(cache)  # valid row at scope (gen 11, hashA)
         cache._db.execute("UPDATE toolgraph_consult SET verdict_json = ?", ('{"rejects":"oops"}',))
         cache._db.commit()
-        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.toolgraph_cache"):
+            assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
         assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+        # "consult cache" is load-bearing: the #716 hit-test sweep filters on exactly
+        # this substring, so rewording it out of the WARNING would silently drop the
+        # malformed-row path from the sweep (#717). Representative pin — every
+        # corrupt-row variant funnels into this one warning call.
+        assert any("consult cache" in r.message for r in caplog.records)
 
     def test_missing_keys_row_is_dropped_as_miss(self, cache):
         _put(cache)
@@ -272,16 +279,25 @@ class TestSqliteFaultIsBestEffort:
     above: those cover a successful read of malformed data; these cover ``execute``
     itself raising (database locked / disk I/O error / page-level corruption)."""
 
-    def test_get_returns_miss_when_execute_raises(self, cache):
+    def test_get_returns_miss_when_execute_raises(self, cache, caplog):
         _put(cache)  # real DB write while the handle is still live
         cache._db = _RaisingConn(sqlite3.OperationalError("database is locked"))
-        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.toolgraph_cache"):
+            assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        # "consult cache" is load-bearing for the #716 hit-test sweep (#717); exc_info
+        # is what surfaces the sqlite traceback in pytest's captured-log section.
+        degrades = [r for r in caplog.records if "consult cache" in r.message]
+        assert degrades and degrades[0].exc_info
 
-    def test_put_no_ops_when_execute_raises(self, cache):
+    def test_put_no_ops_when_execute_raises(self, cache, caplog):
         conn = _RaisingConn(sqlite3.OperationalError("disk I/O error"))
         cache._db = conn
         # Must not raise; the consult simply goes uncached.
-        _put(cache)
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.toolgraph_cache"):
+            _put(cache)
         # A fault mid-write must roll back any possibly-open transaction so the
         # connection does not retain the write lock.
         assert conn.rolled_back is True
+        # Same load-bearing-substring pin as the get() test above (#716 sweep / #717).
+        degrades = [r for r in caplog.records if "consult cache" in r.message]
+        assert degrades and degrades[0].exc_info
