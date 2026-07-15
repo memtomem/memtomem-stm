@@ -257,6 +257,14 @@ class SurfacingEngine:
         except Exception:
             logger.debug("Failed to persist surfacing diagnostic counter", exc_info=True)
 
+    def _persist_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
+        if self._feedback_tracker is None:
+            return
+        try:
+            self._feedback_tracker.record_diagnostic_recovery(server, tool, kind)
+        except Exception:
+            logger.debug("Failed to persist surfacing diagnostic recovery", exc_info=True)
+
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
 
@@ -285,6 +293,7 @@ class SurfacingEngine:
         result_max = max(scores)
         if result_max >= min_score:
             self._score_scale_streaks.pop(key, None)
+            self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
             return
 
         previous = self._score_scale_streaks.get(key)

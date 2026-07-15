@@ -79,6 +79,9 @@ class FeedbackTracker:
     def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
         self._store.record_diagnostic(server, tool, kind)
 
+    def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
+        self._store.record_diagnostic_recovery(server, tool, kind)
+
     def record_feedback(
         self,
         surfacing_id: str,

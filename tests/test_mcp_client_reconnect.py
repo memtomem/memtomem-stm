@@ -1082,7 +1082,9 @@ class TestGenerationAwareReconnect:
         assert adapter._generation == 2
         assert record["enters"] == 2
         assert old_calls == 2
-        assert record["call_tool_count"] == 2
+        # Two successful search retries plus one additive runtime-profile
+        # negotiation for each connection generation.
+        assert record["call_tool_count"] == 4
         assert record["exited_ids"] == [1]
 
         await adapter.stop()

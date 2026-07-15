@@ -5569,16 +5569,25 @@ def _text_parts_from_tool_result(result: Any) -> list[str]:
     ]
 
 
-def _version_from_tool_result(result: Any) -> str | None:
+def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
     text_parts = _text_parts_from_tool_result(result)
     if not text_parts:
-        return None
+        return {"version": None, "runtime_profile": None}
     try:
         data = json.loads(text_parts[0])
     except json.JSONDecodeError:
-        return None
+        return {"version": None, "runtime_profile": None}
+    if not isinstance(data, dict):
+        return {"version": None, "runtime_profile": None}
     version = data.get("version")
-    return str(version) if version else None
+    profile = data.get("runtime_profile")
+    if not isinstance(profile, dict) or profile.get("schema_version") != 1:
+        profile = None
+    return {"version": str(version) if version else None, "runtime_profile": profile}
+
+
+def _version_from_tool_result(result: Any) -> str | None:
+    return _ltm_metadata_from_tool_result(result)["version"]
 
 
 async def _probe_ltm_mcp_server(
@@ -5666,6 +5675,7 @@ async def _probe_ltm_mcp_server(
                     ),
                 }
             version: str | None = None
+            runtime_profile: dict[str, Any] | None = None
             # ``mem_search`` connectivity is already proven — don't burn what
             # remains of the budget on the optional version probe if it'd
             # push us past the deadline. The threshold is small enough to
@@ -5679,14 +5689,21 @@ async def _probe_ltm_mcp_server(
                         session.call_tool("mem_do", {"action": "version"}),
                         timeout=remaining(),
                     )
-                    version = _version_from_tool_result(result)
+                    metadata = _ltm_metadata_from_tool_result(result)
+                    version = metadata["version"]
+                    runtime_profile = metadata["runtime_profile"]
                 except Exception:
                     logger.debug(
                         "LTM mem_do(version) probe failed or timed out within "
                         "the shared budget; treating as unsupported.",
                         exc_info=True,
                     )
-            return {"connected": True, "version": version, "error": None}
+            return {
+                "connected": True,
+                "version": version,
+                "runtime_profile": runtime_profile,
+                "error": None,
+            }
 
 
 def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
@@ -5721,6 +5738,7 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         "display": display,
         "connected": None,
         "version": None,
+        "runtime_profile": None,
         "error": None,
     }
 
@@ -5878,6 +5896,7 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         "display": "mms daemon",
         "connected": False,
         "version": None,
+        "runtime_profile": None,
         "error": None,
         "daemon_reachable": False,
         "ltm_state": None,
@@ -5894,6 +5913,11 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
     state = str(hs.get("ltm") or "cold")
     if isinstance(hs.get("latency"), dict):
         status["latency"] = hs["latency"]
+    core = hs.get("core")
+    if isinstance(core, dict):
+        profile = core.get("runtime_profile")
+        if isinstance(profile, dict) and profile.get("schema_version") == 1:
+            status["runtime_profile"] = profile
     if measure_ltm:
         measurement, refreshed = asyncio.run(
             _measure_warm_daemon_ltm(config, initial_state=state, timeout=timeout)
@@ -6034,7 +6058,10 @@ def _surfacing_bootstrap_status(
     """
     try:
         from memtomem_stm.config import STMConfig
-        from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
+        from memtomem_stm.surfacing.feedback_store import (
+            inspect_feedback_db,
+            read_surfacing_summary,
+        )
 
         config = STMConfig()
         surfacing = config.surfacing
@@ -6043,6 +6070,7 @@ def _surfacing_bootstrap_status(
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
+            "feedback_summary": read_surfacing_summary(surfacing.feedback_db_path),
             "ltm_server": _ltm_status(
                 config,
                 timeout,
@@ -6304,6 +6332,94 @@ def health(
 
 
 _DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
+
+
+def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, str, str | None]]:
+    """Translate the additive core runtime profile into stable doctor checks."""
+    if not isinstance(profile, dict):
+        return [
+            (
+                "ltm_runtime_profile",
+                "ltm runtime profile",
+                "WARN",
+                "connected core does not expose runtime_profile schema 1",
+                "upgrade memtomem core, then restart the LTM/daemon",
+            )
+        ]
+    if profile.get("config_state") != "ok":
+        return [
+            (
+                "ltm_runtime_profile",
+                "ltm runtime profile",
+                "FAIL",
+                "core could not read its effective configuration",
+                "run `mm status` in the LTM environment and repair its config",
+            )
+        ]
+
+    checks: list[tuple[str, str, str, str, str | None]] = []
+    dependencies = profile.get("dependencies")
+    dependencies = dependencies if isinstance(dependencies, dict) else {}
+    fastembed = dependencies.get("fastembed")
+    kiwi = dependencies.get("kiwipiepy")
+    missing = profile.get("missing_extras")
+    missing = missing if isinstance(missing, list) else []
+    if "onnx" in missing or (
+        isinstance(fastembed, dict)
+        and fastembed.get("required_for")
+        and not fastembed.get("available")
+    ):
+        checks.append(
+            (
+                "ltm_dependencies",
+                "ltm dependencies",
+                "FAIL",
+                "fastembed is required by the active embedding/rerank config but is not installed",
+                "install `memtomem[onnx]` in the LTM server environment and restart it",
+            )
+        )
+    elif "korean" in missing or (
+        isinstance(kiwi, dict) and kiwi.get("required_for") and not kiwi.get("available")
+    ):
+        checks.append(
+            (
+                "ltm_dependencies",
+                "ltm dependencies",
+                "WARN",
+                "kiwipiepy tokenizer is configured but its extra is not installed",
+                "install `memtomem[korean]` in the LTM server environment",
+            )
+        )
+    else:
+        checks.append(
+            ("ltm_dependencies", "ltm dependencies", "PASS", "required extras available", None)
+        )
+
+    search = profile.get("search")
+    mode = search.get("configured_mode") if isinstance(search, dict) else None
+    if mode in {"bm25_only", "disabled"}:
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "FAIL",
+                f"effective retrieval mode is {mode}",
+                "enable a working dense embedding provider, then re-index vectors",
+            )
+        )
+    elif mode in {"hybrid", "dense_only"}:
+        checks.append(("ltm_retrieval_mode", "ltm retrieval mode", "PASS", str(mode), None))
+    else:
+        checks.append(
+            (
+                "ltm_retrieval_mode",
+                "ltm retrieval mode",
+                "WARN",
+                "runtime profile did not report a recognized retrieval mode",
+                None,
+            )
+        )
+    return checks
 
 
 @cli.command()
@@ -6597,6 +6713,35 @@ def doctor(
                 if ltm.get("version"):
                     detail = f"{detail}, version {ltm['version']}"
                 check("ltm", "ltm server", "PASS", f"connectable ({detail})")
+                for runtime_check in _runtime_profile_doctor_checks(ltm.get("runtime_profile")):
+                    check(*runtime_check)
+
+                feedback_summary = surfacing_status.get("feedback_summary")
+                if isinstance(feedback_summary, dict):
+                    active = feedback_summary.get("active_diagnostics")
+                    supported = feedback_summary.get("diagnostics_recovery_supported", True)
+                    if isinstance(active, dict) and active.get("score_ceiling_below_min"):
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "FAIL",
+                            "unrecovered score_ceiling_below_min episode in the last 7 UTC days",
+                            "verify dense embeddings and min_score, then run a successful warm search",
+                        )
+                    elif not supported:
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "WARN",
+                            "feedback DB predates recovery tracking; daemon initialization will migrate it",
+                        )
+                    else:
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "PASS",
+                            "no active mismatch episode",
+                        )
             else:
                 if isinstance(ltm, dict) and ltm.get("skipped") == "surfacing_disabled":
                     cause = "surfacing disabled"
