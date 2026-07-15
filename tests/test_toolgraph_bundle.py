@@ -96,6 +96,19 @@ def _schema_errors(doc: dict) -> list:
     return list(Draft202012Validator(schema).iter_errors(doc))
 
 
+def _schema_rejects(doc: dict, *, validator: str, at: list, names: str) -> bool:
+    """True when the schema rejects ``doc`` for exactly the intended reason.
+
+    Pinning the keyword, the location, AND the field named in the message keeps a
+    conformance assertion from passing on some unrelated error that happens to
+    share a validator keyword.
+    """
+    return any(
+        error.validator == validator and list(error.absolute_path) == at and names in error.message
+        for error in _schema_errors(doc)
+    )
+
+
 def _parse(doc: dict, *, profile: str = "strict"):
     return parse_policy_bundle(
         canonical_json_bytes(doc), expected_agent="stm-proxy", expected_profile=profile
@@ -237,24 +250,26 @@ class TestSchemaParserConformance:
     def test_created_at_violations_fail_schema_but_parse(self):
         missing = _bundle(_tool())
         del missing["created_at"]
-        assert any(error.validator == "required" for error in _schema_errors(missing))
+        assert _schema_rejects(missing, validator="required", at=[], names="created_at")
         assert _parse(missing).instance_id == "graph-1"
 
         mistyped = _bundle(_tool())
         mistyped["created_at"] = 123
-        assert any(error.validator == "type" for error in _schema_errors(mistyped))
+        assert _schema_rejects(mistyped, validator="type", at=["created_at"], names="string")
         assert _parse(mistyped).instance_id == "graph-1"
 
     def test_absent_risk_score_fails_schema_but_parses_as_none(self):
         doc = _bundle(_tool())
         del doc["tools"][0]["risk_score"]
-        assert any(error.validator == "required" for error in _schema_errors(doc))
+        assert _schema_rejects(doc, validator="required", at=["tools", 0], names="risk_score")
         assert _parse(doc).decisions["graph-srv::read"].risk_score is None
 
     def test_unknown_reject_reason_fails_schema_but_maps_to_generic_code(self):
         doc = _bundle(_tool(), decision="rejected")
         doc["tools"][0]["reason"] = "SOME_FUTURE_REASON"
-        assert any(error.validator == "enum" for error in _schema_errors(doc))
+        assert _schema_rejects(
+            doc, validator="enum", at=["tools", 0, "reason"], names="SOME_FUTURE_REASON"
+        )
         decision = _parse(doc).decisions["graph-srv::read"]
         assert decision.reason == "SOME_FUTURE_REASON"
         assert decision.reject_code == "toolgraph_rejected"
@@ -262,32 +277,31 @@ class TestSchemaParserConformance:
     def test_non_string_reason_on_eligible_row_fails_schema_but_normalizes_to_none(self):
         doc = _bundle(_tool())
         doc["tools"][0]["reason"] = 123
-        assert any(error.validator == "enum" for error in _schema_errors(doc))
+        assert _schema_rejects(doc, validator="enum", at=["tools", 0, "reason"], names="123")
         assert _parse(doc).decisions["graph-srv::read"].reason is None
 
     def test_extra_graph_state_key_fails_schema_but_parses(self):
         doc = _bundle(_tool())
         doc["graph_state"]["region"] = "kr"
-        assert any(error.validator == "additionalProperties" for error in _schema_errors(doc))
+        assert _schema_rejects(
+            doc, validator="additionalProperties", at=["graph_state"], names="region"
+        )
         assert _parse(doc).generation == 7
 
     def test_out_of_enum_profile_fails_schema_but_parses_when_expected(self):
         doc = _bundle(_tool(), profile="custom")
-        assert any(error.validator == "enum" for error in _schema_errors(doc))
+        assert _schema_rejects(doc, validator="enum", at=["profile"], names="custom")
         assert _parse(doc, profile="custom").profile == "custom"
 
     def test_paths_type_violations_fail_schema_but_parse(self):
         outer = _bundle(_tool())
         outer["tools"][0]["paths"] = 42
-        assert any(error.validator == "type" for error in _schema_errors(outer))
+        assert _schema_rejects(outer, validator="type", at=["tools", 0, "paths"], names="array")
         assert _parse(outer).instance_id == "graph-1"
 
         item = _bundle(_tool())
         item["tools"][0]["paths"] = [123]
-        assert any(
-            error.validator == "type" and list(error.absolute_path) == ["tools", 0, "paths", 0]
-            for error in _schema_errors(item)
-        )
+        assert _schema_rejects(item, validator="type", at=["tools", 0, "paths", 0], names="string")
         assert _parse(item).instance_id == "graph-1"
 
     def test_duplicate_tool_key_passes_schema_but_parser_rejects(self):
