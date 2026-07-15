@@ -46,6 +46,17 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     it is a secrecy check (it flags any group/world READ bit), so it would both
     cry wolf over ``0644`` and miss a world-writable parent directory.
 
+    **Scope: traditional Unix owner and mode bits only. Silence is not an
+    assurance.** Extended ACLs are not evaluated, so a ``0644`` file carrying
+    ``everyone allow write`` reads as clean here. That is a deliberate limit, not
+    an oversight: the stdlib cannot see ACLs on macOS at all (no ``os.listxattr``
+    there), and mere ACL *presence* is not a signal — a stock macOS home carries
+    ``group:everyone deny delete``, which is restrictive, so warning on presence
+    would fire for every default install. Evaluating ACL entries properly means
+    platform-specific principal resolution, i.e. the same class of failure this
+    diagnostic must never introduce. What it finds is real; what it misses is
+    listed here.
+
     **Advisory only.** Findings are logged; the bundle is still adopted. Turning
     an insecure bundle into a startup refusal under ``strict`` is a separate
     decision with its own blast radius — it would fail a proxy closed over a
@@ -145,8 +156,8 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
             # uid through pwd/grp, which fails or stalls exactly where it would
             # matter (LDAP, containers, a uid with no local passwd entry) — a new
             # failure mode for a diagnostic that must never be the reason
-            # anything breaks. The link's existence is already evidence its owner
-            # could create entries here, so warn and let a human judge.
+            # anything breaks. So this accepts a false positive when current
+            # membership cannot be established, and lets a human judge.
             if _write_search_classes(parent_info.st_mode):
                 who = f"its owner uid {info.st_uid}"
         if who:

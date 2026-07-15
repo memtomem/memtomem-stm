@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from importlib.resources import files
 from pathlib import Path
@@ -916,10 +917,10 @@ class TestBundleProvenanceAdvisory:
     ):
         """A 01770 dir warns even though we cannot prove the owner is in its group.
 
-        Deliberate: resolving a foreign uid's groups means pwd/grp lookups that
-        fail or stall exactly where it matters (LDAP, containers, no local
-        passwd entry). The link existing here is already evidence its owner
-        could create entries, so the advisory says so and a human judges.
+        A deliberate false positive: resolving a foreign uid's groups means
+        pwd/grp lookups that fail or stall exactly where it matters (LDAP,
+        containers, no local passwd entry). When membership cannot be
+        established, warn and let a human judge.
         """
         home = tmp_path / "groupsticky"
         home.mkdir()
@@ -1119,6 +1120,32 @@ class TestBundleProvenanceAdvisory:
             assert any(str(outer) in f and "can be replaced" in f for f in findings)
         finally:
             outer.chmod(0o755)
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS chmod +a ACL syntax")
+    def test_an_acl_granting_write_is_a_documented_blind_spot(self, tmp_path):
+        """Pins the SCOPE claim: mode/uid only, so an ACL reads as clean.
+
+        Not a wish -- `everyone allow write` on a 0644 file really is invisible
+        here. The docstring says so; this makes the limit fail loudly if anyone
+        later believes silence is an assurance.
+        """
+        bundle = tmp_path / "policy-bundle.json"
+        bundle.write_bytes(b"{}")
+        bundle.chmod(0o644)
+        tmp_path.chmod(0o755)
+        added = subprocess.run(
+            ["chmod", "+a", "everyone allow write,delete", str(bundle)],
+            capture_output=True,
+        )
+        if added.returncode != 0:  # pragma: no cover - filesystem without ACLs
+            pytest.skip("filesystem does not support ACLs")
+        assert subprocess.run(
+            ["ls", "-le", str(bundle)], capture_output=True, text=True
+        ).stdout.count("everyone allow write"), "fixture: the ACL is really there"
+        assert bundle_provenance_warnings(bundle) == [], (
+            "mode/uid analysis cannot see ACLs -- if this ever starts failing, the "
+            "scope note in bundle_provenance_warnings' docstring is now wrong"
+        )
 
     def test_a_missing_bundle_is_not_this_diagnostic_s_problem(self, tmp_path):
         assert bundle_provenance_warnings(tmp_path / "absent.json") == []
