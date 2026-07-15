@@ -863,14 +863,35 @@ class TestBundleProvenanceAdvisory:
         findings = bundle_provenance_warnings(bundle)
         assert any("rename its entries" in f or "writable by group/other" in f for f in findings)
 
-    def test_symlink_is_a_finding(self, tmp_path):
+    def test_a_symlink_we_alone_can_replace_is_silent(self, tmp_path):
+        """Positive control: a link is only a vector if someone can re-point it.
+
+        POSIX has no way to edit a link's target in place -- replacing it needs
+        write and search on the directory holding it. A link in a directory only
+        we can write redirects nothing.
+        """
         real = tmp_path / "real.json"
         real.write_bytes(b"{}")
         real.chmod(0o644)
         link = tmp_path / "policy-bundle.json"
         link.symlink_to(real)
-        findings = bundle_provenance_warnings(link)
-        assert any("symlink" in f for f in findings)
+        tmp_path.chmod(0o755)
+        assert bundle_provenance_warnings(link) == []
+
+    def test_a_symlink_others_can_replace_is_a_finding(self, tmp_path):
+        home = tmp_path / "toolgraph"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(link)
+            assert any(str(link) in f and "re-pointed" in f for f in findings)
+        finally:
+            home.chmod(0o755)
 
     def test_world_writable_parent_lets_the_bundle_be_replaced(self, tmp_path):
         home = tmp_path / "toolgraph"
@@ -989,8 +1010,13 @@ class TestBundleProvenanceAdvisory:
             configured = Path("link/../policy-bundle.json")
             assert os.path.realpath(configured) == str(bundle), "fixture: the loader opens `bundle`"
             findings = bundle_provenance_warnings(configured)
+            # The exposed directory is on the RESOLVED chain; a lexical `..`
+            # collapse would have landed on `work` and reported all-clear.
             assert any(str(exposed) in f and "can be replaced" in f for f in findings)
-            assert any(str(work / "link") in f and "symlink" in f for f in findings)
+            assert not any(str(decoy) in f for f in findings), "the decoy is not what loads"
+            # `work` holds the link but only we can write it, so the link itself
+            # redirects nothing -- both rules compose.
+            assert not any("re-pointed" in f for f in findings)
         finally:
             exposed.chmod(0o755)
 

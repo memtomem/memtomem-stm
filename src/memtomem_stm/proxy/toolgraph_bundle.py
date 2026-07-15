@@ -75,7 +75,7 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
         target = Path(os.path.realpath(configured))
     except OSError:
         return []
-    findings: list[str] = _symlink_components(configured)
+    findings: list[str] = _redirectable_symlinks(configured, euid)
     try:
         info = os.stat(target)
     except OSError:
@@ -90,15 +90,33 @@ def bundle_provenance_warnings(path: Path) -> list[str]:
     return findings
 
 
-def _symlink_components(configured: Path) -> list[str]:
-    """Every symlink on the way to the bundle, named individually.
+def _substituters(info: os.stat_result, euid: int) -> str:
+    """Who besides us can swap the entries of a directory with this stat."""
+    renamers = _entry_renamers(info.st_mode)
+    if renamers:
+        return renamers
+    if info.st_uid not in (euid, 0):
+        return f"uid {info.st_uid}"
+    return ""
 
-    A link is its own substitution vector: whoever can rewrite it aims the
-    gateway at a policy of their choosing without touching the file we
-    validated. Walked prefix by prefix rather than by inspecting the final path
-    alone, so an intermediate ``.../link/policy.json`` is caught too — and each
-    ``lstat`` lets the kernel resolve the prefix, which is what makes a ``..``
-    component behave here exactly as it will at load time.
+
+def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
+    """Symlinks on the way to the bundle that someone else could re-point.
+
+    A link redirects the gateway to a policy of someone's choosing without ever
+    touching the file we validated — but only if they can *replace the link*.
+    POSIX gives no way to edit a symlink's target in place; it must be unlinked
+    and recreated, which needs write and search on the directory holding it. So
+    a link in a directory only we can write is not a vector, and reporting one
+    would be exactly the noise this check cannot afford.
+
+    That containing directory is also why this walk exists at all: the ancestor
+    analysis follows the *resolved* chain, which need not contain the link.
+
+    Walked prefix by prefix rather than inspecting the final path alone, so an
+    intermediate ``.../link/policy.json`` is caught too — and each ``lstat``
+    lets the kernel resolve the prefix, which is what makes a ``..`` component
+    behave here exactly as it will at load time.
     """
     findings: list[str] = []
     current = Path(configured.anchor)
@@ -108,8 +126,18 @@ def _symlink_components(configured: Path) -> list[str]:
             info = os.lstat(current)
         except OSError:
             break
-        if stat_module.S_ISLNK(info.st_mode):
-            findings.append(f"{current} is a symlink; whoever can rewrite it chooses the policy")
+        if not stat_module.S_ISLNK(info.st_mode):
+            continue
+        try:
+            parent_info = os.stat(current.parent)
+        except OSError:
+            continue
+        who = _substituters(parent_info, euid)
+        if who:
+            findings.append(
+                f"{current} is a symlink and {current.parent} lets {who} replace it, "
+                f"so the policy this proxy loads can be re-pointed"
+            )
     return findings
 
 
