@@ -23,8 +23,10 @@ changes inline only. See the deprecation policy in
 - A `context_compose` response missing its negotiated top-level keys is now a
   fault rather than an empty result. A core that conforms to the negotiated
   schema is unaffected; against one that renamed or retyped a key, surfacing now
-  reports `ltm_call_failed` and warns once, where it previously reported
-  `empty_results` and stayed silent. (#710)
+  reports `ltm_call_failed` and warns, where it previously reported
+  `empty_results` and stayed silent. The warning fires once per process and does
+  not re-arm, so a later independent compose regression is counted but not
+  re-warned. (#710)
 
 ### Added
 
@@ -55,11 +57,14 @@ changes inline only. See the deprecation policy in
   rejections count toward the diagnosis: a `DRIFTED`/`UNMAPPED` reason the
   producer declared in the bundle maps to the same reject code, so counting
   final codes would false-alarm on a catalog of deliberate denials. (#706)
-- The gateway now warns once at adoption when the policy bundle is not protected
-  from substitution, naming what an unprotected bundle exposes. The bundle is the
-  gateway's only enforcement authority and is unsigned, so anyone able to write
-  it — or rename any directory above it — decides what the proxy exposes. This is
-  advisory: it never blocks adoption. (#708)
+- The gateway now warns once at adoption when the policy bundle looks substitutable,
+  naming what an unprotected bundle exposes. The bundle is the gateway's only
+  enforcement authority and is unsigned, so anyone able to write it — or rename any
+  directory above it — decides what the proxy exposes. Scope: POSIX owner and mode
+  bits only. It is a no-op on Windows, and extended ACLs are not evaluated, so a
+  `0644` file carrying `everyone allow write` reads as clean — **silence is not an
+  assurance of protection**. Advisory only: findings are logged and the bundle is
+  still adopted. (#708)
 - Added a Korean vibe-coding quickstart guide. (#699)
 
 ### Changed
@@ -84,14 +89,17 @@ changes inline only. See the deprecation policy in
   route defaulted to an empty list, so a core that renamed a key silently
   produced an empty bundle that surfacing classified as `empty_results` — a
   degradation indistinguishable from an empty namespace, past every fault
-  counter. It is now classified `ltm_call_failed` and warned once per episode.
-  (#710)
-- `mms register --client codex --replace-registration` no longer destroys the
-  existing registration when the replacement fails. It captures
-  `codex mcp get --json` before removing anything and refuses to remove a
-  registration `codex mcp add` cannot rebuild exactly; on a failed add it
-  restores the previous registration. Codex has no `.mcp.json` fallback, so the
-  previous remove-then-add left the user with no registration at all. (#705)
+  counter. It is now classified `ltm_call_failed` and warned once per process
+  (the latch does not re-arm after a healthy compose). (#710)
+- `mms register --client codex --replace-registration` no longer removes the
+  existing registration before knowing it can be rebuilt. It captures
+  `codex mcp get --json` first and refuses to remove a registration
+  `codex mcp add` cannot reproduce exactly; when the replacement add fails it
+  attempts to restore the previous one and reports whether that restore
+  succeeded. Codex has no `.mcp.json` fallback, so the previous remove-then-add
+  could leave no registration at all. Rollback is an attempt, not a guarantee:
+  a restore can itself fail, and the command says so rather than implying the
+  old registration survived. (#705)
 - New MCP and native-hook registrations now pin a shared-daemon runtime policy
   with ordered surfacing/hook deadlines instead of depending on host environment
   inheritance. Existing registrations remain keep-by-default; explicit refreshes
