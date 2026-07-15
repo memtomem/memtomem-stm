@@ -584,8 +584,6 @@ _CODEX_UNREPRODUCIBLE_TOP: dict[str, str] = {
 _CODEX_UNREPRODUCIBLE_TRANSPORT: dict[str, str] = {
     "cwd": "transport.cwd",
     "env_vars": "transport.env_vars",
-    "http_headers": "transport.http_headers",
-    "env_http_headers": "transport.env_http_headers",
 }
 
 
@@ -669,14 +667,16 @@ def _codex_restore_plan(payload: dict[str, Any], name: str = "memtomem-stm") -> 
                 command.extend(["--env", f"{key}={value}"])
             command.extend(["--", cmd, *args])
     elif kind == "streamable_http":
-        url = transport.get("url")
-        bearer = transport.get("bearer_token_env_var")
-        if not isinstance(url, str) or not url:
-            blockers.append("transport.url")
-        else:
-            command = ["codex", "mcp", "add", name, "--url", url]
-            if isinstance(bearer, str) and bearer:
-                command.extend(["--bearer-token-env-var", bearer])
+        # `codex mcp add` accepts --oauth-client-id / --oauth-resource and
+        # persists them to config.toml, but `codex mcp get --json` reports
+        # NEITHER (verified on codex-cli 0.144.3: the fields land under
+        # `[mcp_servers.<n>.oauth]` yet the JSON transport carries only url /
+        # bearer_token_env_var / http_headers / env_http_headers). So the
+        # snapshot cannot tell an OAuth registration from a plain one, and a
+        # "successful" restore would silently drop the OAuth config. Absence
+        # of evidence is not evidence of absence — refuse the whole transport
+        # rather than replace what we cannot prove we can rebuild.
+        blockers.append("transport.type='streamable_http' (OAuth state is not readable)")
     else:
         blockers.append(f"transport.type={kind!r}")
 

@@ -4158,20 +4158,36 @@ class TestRegisterCommand:
     def test_register_codex_replace_restores_previous_on_add_failure(
         self, runner, config, monkeypatch
     ):
-        """A failed replacement must not leave the user with no registration."""
+        """A failed replacement must restore the CAPTURED registration.
+
+        The previous registration deliberately shares no command, argument, or
+        env key with the one being installed, so a rollback that ignored the
+        capture and re-ran the default registration would fail here.
+        """
         from memtomem_stm.cli import proxy as proxy_mod
 
         config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        snapshot = {
+            **_CODEX_STDIO_SNAPSHOT,
+            "transport": {
+                "type": "stdio",
+                "command": "/opt/legacy/stm",
+                "args": ["--serve", "--port=1"],
+                "env": {"LEGACY_FLAG": "on"},
+                "env_vars": [],
+                "cwd": None,
+            },
+        }
         calls: list[list[str]] = []
 
         def fake_codex(cmd, timeout=5):
             calls.append(list(cmd))
             if cmd[:3] == ["codex", "mcp", "get"]:
-                return _FakeClaudeResult(returncode=0, stdout=json.dumps(_CODEX_STDIO_SNAPSHOT))
+                return _FakeClaudeResult(returncode=0, stdout=json.dumps(snapshot))
             if cmd[:3] == ["codex", "mcp", "remove"]:
                 return _FakeClaudeResult(returncode=0)
             # The replacement add fails; the restore add succeeds.
-            if "--env" in cmd:
+            if "LEGACY_FLAG=on" not in cmd:
                 return _FakeClaudeResult(returncode=1, stderr="codex rejected registration")
             return _FakeClaudeResult(returncode=0)
 
@@ -4183,9 +4199,97 @@ class TestRegisterCommand:
 
         assert result.exit_code == 1
         assert "restored the previous Codex registration" in result.output
-        restore = calls[-1]
-        assert restore[:4] == ["codex", "mcp", "add", "memtomem-stm"]
-        assert restore[-1] == "memtomem-stm"
+        assert calls[-1] == [
+            "codex",
+            "mcp",
+            "add",
+            "memtomem-stm",
+            "--env",
+            "LEGACY_FLAG=on",
+            "--",
+            "/opt/legacy/stm",
+            "--serve",
+            "--port=1",
+        ]
+
+    def test_register_codex_replace_restore_reported_in_json_mode(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+
+        def fake_codex(cmd, timeout=5):
+            if cmd[:3] == ["codex", "mcp", "get"]:
+                return _FakeClaudeResult(returncode=0, stdout=json.dumps(_CODEX_STDIO_SNAPSHOT))
+            if cmd[:3] == ["codex", "mcp", "remove"]:
+                return _FakeClaudeResult(returncode=0)
+            if "--env" in cmd:
+                return _FakeClaudeResult(returncode=1, stderr="codex rejected registration")
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_codex_mcp", fake_codex)
+        result = runner.invoke(
+            cli,
+            [
+                "register",
+                "--client",
+                "codex",
+                "--replace-registration",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["client"] == "codex"
+        assert "restored the previous Codex registration" in payload["message"]
+
+    def test_register_codex_replace_refuses_http_transport_oauth_blind_spot(
+        self, runner, config, monkeypatch
+    ):
+        """`codex mcp get --json` cannot report OAuth state, so it cannot be rebuilt.
+
+        Positive control: the same snapshot with a stdio transport IS accepted,
+        proving the refusal comes from the transport and not some other blocker.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        http = {
+            **_CODEX_STDIO_SNAPSHOT,
+            "transport": {
+                "type": "streamable_http",
+                "url": "https://example.test/mcp",
+                "bearer_token_env_var": None,
+                "http_headers": None,
+                "env_http_headers": None,
+            },
+        }
+        plan = proxy_mod._codex_restore_plan(http)
+        assert plan.command is None
+        assert any("streamable_http" in b for b in plan.blockers)
+        assert proxy_mod._codex_restore_plan(_CODEX_STDIO_SNAPSHOT).command is not None
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}))
+        calls: list[list[str]] = []
+
+        def fake_codex(cmd, timeout=5):
+            calls.append(list(cmd))
+            if cmd[:3] == ["codex", "mcp", "get"]:
+                return _FakeClaudeResult(returncode=0, stdout=json.dumps(http))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_codex_mcp", fake_codex)
+        result = runner.invoke(
+            cli,
+            ["register", "--client", "codex", "--replace-registration", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 1
+        assert "left unchanged" in result.output
+        assert not any(c[:3] == ["codex", "mcp", "remove"] for c in calls)
 
     def test_register_codex_replace_reports_unrestorable_removal(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -4254,18 +4358,7 @@ class TestRegisterCommand:
                 {"type": "stdio", "command": "x", "args": [], "env_vars": ["SECRET"]},
                 "transport.env_vars",
             ),
-            (
-                {"type": "streamable_http", "url": "https://x", "http_headers": {"A": "b"}},
-                "transport.http_headers",
-            ),
-            (
-                {
-                    "type": "streamable_http",
-                    "url": "https://x",
-                    "env_http_headers": {"A": "B"},
-                },
-                "transport.env_http_headers",
-            ),
+            ({"type": "sse", "url": "https://x"}, "transport.type='sse'"),
         ],
     )
     def test_register_codex_replace_aborts_on_unreproducible_transport(
@@ -4317,7 +4410,7 @@ class TestRegisterCommand:
         assert "could not read the existing Codex registration" in result.output
         assert not any(c[:3] == ["codex", "mcp", "remove"] for c in calls)
 
-    def test_codex_restore_plan_rebuilds_env_and_http_transports(self):
+    def test_codex_restore_plan_rebuilds_stdio_env_and_args(self):
         """Restorable snapshots round-trip; env values never reach `blockers`."""
         from memtomem_stm.cli import proxy as proxy_mod
 
@@ -4344,29 +4437,6 @@ class TestRegisterCommand:
             "--",
             "memtomem-stm",
             "--flag",
-        ]
-
-        http = {
-            **_CODEX_STDIO_SNAPSHOT,
-            "transport": {
-                "type": "streamable_http",
-                "url": "https://example.test/mcp",
-                "bearer_token_env_var": "TOK",
-                "http_headers": None,
-                "env_http_headers": None,
-            },
-        }
-        http_plan = proxy_mod._codex_restore_plan(http)
-        assert http_plan.blockers == ()
-        assert http_plan.command == [
-            "codex",
-            "mcp",
-            "add",
-            "memtomem-stm",
-            "--url",
-            "https://example.test/mcp",
-            "--bearer-token-env-var",
-            "TOK",
         ]
 
     def test_codex_replace_failure_message_redacts_env_values(self, runner, config, monkeypatch):
