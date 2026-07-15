@@ -911,6 +911,41 @@ class TestBundleProvenanceAdvisory:
         finally:
             home.chmod(0o755)
 
+    def test_a_foreign_symlink_in_a_group_only_sticky_dir_warns_conservatively(
+        self, tmp_path, monkeypatch
+    ):
+        """A 01770 dir warns even though we cannot prove the owner is in its group.
+
+        Deliberate: resolving a foreign uid's groups means pwd/grp lookups that
+        fail or stall exactly where it matters (LDAP, containers, no local
+        passwd entry). The link existing here is already evidence its owner
+        could create entries, so the advisory says so and a human judges.
+        """
+        home = tmp_path / "groupsticky"
+        home.mkdir()
+        real = tmp_path / "real.json"
+        real.write_bytes(b"{}")
+        real.chmod(0o644)
+        link = home / "policy-bundle.json"
+        link.symlink_to(real)
+        home.chmod(0o1770)
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **kw):
+            info = real_lstat(p, *a, **kw)
+            if str(p) != str(link):
+                return info
+            fields = list(info)
+            fields[4] = 999999  # st_uid
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(toolgraph_bundle_mod.os, "lstat", fake_lstat)
+        try:
+            findings = bundle_provenance_warnings(link)
+            assert any(str(link) in f and "uid 999999" in f for f in findings)
+        finally:
+            home.chmod(0o755)
+
     def test_our_own_symlink_in_a_sticky_dir_is_silent(self, tmp_path):
         """Positive control: sticky genuinely protects the entries we own."""
         home = tmp_path / "sticky"

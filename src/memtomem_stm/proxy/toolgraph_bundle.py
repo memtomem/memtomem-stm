@@ -139,6 +139,14 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
             # write and search (``/tmp`` at 01777 being the whole point), is
             # theirs to unlink and recreate whenever they like — and the
             # resolved chain we analyse can be perfectly secure meanwhile.
+            #
+            # Deliberately conservative for a group-only directory (``01770``):
+            # proving the owner is in that group would mean resolving a foreign
+            # uid through pwd/grp, which fails or stalls exactly where it would
+            # matter (LDAP, containers, a uid with no local passwd entry) — a new
+            # failure mode for a diagnostic that must never be the reason
+            # anything breaks. The link's existence is already evidence its owner
+            # could create entries here, so warn and let a human judge.
             if _write_search_classes(parent_info.st_mode):
                 who = f"its owner uid {info.st_uid}"
         if who:
