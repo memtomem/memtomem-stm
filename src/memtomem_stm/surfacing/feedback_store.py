@@ -463,7 +463,13 @@ class FeedbackStore:
         Diagnostics share the day-aggregated fault table for bounded storage,
         but readers partition them so operator guidance remains accurate.
         """
-        self._record_signal(server, tool, kind, DIAGNOSTIC_KINDS)
+        self._record_signal(
+            server,
+            tool,
+            kind,
+            DIAGNOSTIC_KINDS,
+            reset_recovery=True,
+        )
 
     def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
         """Mark all existing rows for one diagnostic episode as recovered."""
@@ -484,17 +490,20 @@ class FeedbackStore:
         tool: str,
         kind: str,
         allowed_kinds: frozenset[str],
+        *,
+        reset_recovery: bool = False,
     ) -> None:
         if self._db is None or kind not in allowed_kinds:
             return
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        recovery_update = ", last_recovered_at = NULL" if reset_recovery else ""
         with self._lock:
             self._db.execute(
                 "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
                 "VALUES (?, ?, ?, ?, 1, ?) "
                 "ON CONFLICT(day, server, tool, kind) "
-                "DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+                "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
                 (day, server, tool, kind, now),
             )
             self._db.commit()

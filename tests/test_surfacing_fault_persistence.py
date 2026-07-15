@@ -232,7 +232,14 @@ class TestEngineFaultPersistence:
 
 
 class TestSummaryFaults:
-    def test_score_diagnostic_recovery_is_persisted_and_reactivates(self, tmp_path):
+    def test_score_diagnostic_recovery_is_persisted_and_reactivates(self, tmp_path, monkeypatch):
+        # Windows can return the same time.time() value for adjacent writes.
+        # A new diagnostic must re-arm explicitly rather than depend on `>`
+        # between timestamps having different resolution.
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
         db_path = tmp_path / "f.db"
         store = FeedbackStore(db_path)
         store.initialize()
