@@ -9231,6 +9231,33 @@ class TestDoctor:
         assert "ltm measurement" not in passive.output
         assert "5/5 warm sample(s) completed" in measured.output
 
+    def test_runtime_profile_marks_missing_fastembed_and_bm25_only_as_fail(self):
+        from memtomem_stm.cli.proxy import _runtime_profile_doctor_checks
+
+        checks = _runtime_profile_doctor_checks(
+            {
+                "schema_version": 1,
+                "config_state": "ok",
+                "dependencies": {
+                    "fastembed": {
+                        "available": False,
+                        "required_for": ["embedding"],
+                    }
+                },
+                "missing_extras": ["onnx"],
+                "search": {"configured_mode": "bm25_only"},
+            }
+        )
+        by_id = {item[0]: item[2] for item in checks}
+        assert by_id["ltm_dependencies"] == "FAIL"
+        assert by_id["ltm_retrieval_mode"] == "FAIL"
+
+    def test_runtime_profile_old_core_is_warn_only(self):
+        from memtomem_stm.cli.proxy import _runtime_profile_doctor_checks
+
+        checks = _runtime_profile_doctor_checks(None)
+        assert [(item[0], item[2]) for item in checks] == [("ltm_runtime_profile", "WARN")]
+
     @pytest.mark.asyncio
     async def test_measure_ltm_primes_cold_daemon_then_collects_five_synthetic_samples(
         self, monkeypatch
