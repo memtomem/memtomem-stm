@@ -116,7 +116,9 @@ def _substituters(info: os.stat_result, euid: int) -> str:
     return ""
 
 
-def _link_finding(link: Path, info: os.stat_result, euid: int) -> str | None:
+def _link_finding(
+    link: Path, info: os.stat_result, parent_info: os.stat_result, euid: int
+) -> str | None:
     """Report *link* when someone else can replace that directory entry.
 
     A link redirects the gateway to a policy of someone's choosing without ever
@@ -126,10 +128,6 @@ def _link_finding(link: Path, info: os.stat_result, euid: int) -> str | None:
     a link in a directory only we can write is not a vector, and reporting one
     would be exactly the noise this check cannot afford.
     """
-    try:
-        parent_info = os.stat(link.parent)
-    except OSError:
-        return None
     who = _substituters(parent_info, euid)
     if not who and info.st_uid not in (euid, 0):
         # The sticky exemption protects an entry from everyone *except its own
@@ -175,7 +173,7 @@ def _redirectable_symlinks(configured: Path, euid: int) -> list[str]:
     components appended, recursively, bounded by ``_MAX_SYMLINK_HOPS``.
     """
     findings: list[str] = []
-    reported: set[tuple[int, int]] = set()
+    reported: set[tuple[int, int, str]] = set()
     _scan_for_links(configured, euid, findings, reported, [_MAX_SYMLINK_HOPS])
     return findings
 
@@ -184,7 +182,7 @@ def _scan_for_links(
     path: Path,
     euid: int,
     findings: list[str],
-    reported: set[tuple[int, int]],
+    reported: set[tuple[int, int, str]],
     budget: list[int],
 ) -> None:
     """Resolve *path* one component at a time, reporting re-pointable links."""
@@ -204,10 +202,19 @@ def _scan_for_links(
         # by two spellings (``link/../link/x``) is one fact to report but two
         # hops the kernel really walks.
         budget[0] -= 1
-        entry = (info.st_dev, info.st_ino)
+        try:
+            parent_info = os.stat(current.parent)
+        except OSError:
+            return
+        # Identity is the DIRECTORY ENTRY — parent dir plus name — not the
+        # inode: symlinks can be hard-linked, so two entries under parents with
+        # different permissions share one inode, and keying on it would let a
+        # secure sighting suppress the exposed twin. Stat'ing the parent also
+        # collapses spellings (``sub/..`` and ``.``) onto one identity.
+        entry = (parent_info.st_dev, parent_info.st_ino, current.name)
         if entry not in reported:
             reported.add(entry)
-            finding = _link_finding(current, info, euid)
+            finding = _link_finding(current, info, parent_info, euid)
             if finding:
                 findings.append(finding)
         try:

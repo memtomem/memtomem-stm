@@ -1146,8 +1146,10 @@ class TestBundleProvenanceAdvisory:
         # well-known UUID on others, so matching the name passes only where it
         # happens to be spelled that way.
         listing = subprocess.run(["ls", "-le", str(bundle)], capture_output=True, text=True).stdout
-        assert re.search(r"^\s*\d+:.*\ballow\b", listing, re.MULTILINE), (
-            f"fixture: the ACL is really there -- got {listing!r}"
+        # `allow` AND `write` on the same ACE: an unrelated `allow read` would
+        # make this pass while proving nothing about the blind spot.
+        assert re.search(r"^\s*\d+:.*\ballow\b[^\n]*\bwrite\b", listing, re.MULTILINE), (
+            f"fixture: a write-granting ACL is really there -- got {listing!r}"
         )
         assert stat.S_IMODE(bundle.stat().st_mode) == 0o644, "fixture: mode still looks private"
         assert bundle_provenance_warnings(bundle) == [], (
@@ -1210,6 +1212,30 @@ class TestBundleProvenanceAdvisory:
             assert len([f for f in findings if "re-pointed" in f]) == 1
         finally:
             tmp_path.chmod(0o755)
+
+    def test_a_hard_linked_twin_is_judged_on_its_own_parent(self, tmp_path):
+        """Identity is the directory ENTRY, not the inode.
+
+        Symlinks can be hard-linked, so two entries under parents with
+        different permissions share one inode. Keying dedup on the inode let a
+        secure sighting suppress the exposed twin traversed right after it.
+        """
+        secure, exposed = tmp_path / "secure", tmp_path / "exposed"
+        secure.mkdir()
+        exposed.mkdir()
+        # One inode, two entries; the content routes through the other parent,
+        # so a single scan meets the secure entry first and the exposed second.
+        (secure / "link").symlink_to("../exposed/link")
+        os.link(secure / "link", exposed / "link", follow_symlinks=False)
+        assert os.lstat(secure / "link").st_ino == os.lstat(exposed / "link").st_ino
+        tmp_path.chmod(0o755)
+        secure.chmod(0o755)
+        exposed.chmod(0o777)
+        try:
+            findings = bundle_provenance_warnings(secure / "link")
+            assert any("exposed" in f and "re-pointed" in f for f in findings)
+        finally:
+            exposed.chmod(0o755)
 
     def test_a_symlink_cycle_terminates(self, tmp_path):
         """A loop must exhaust the hop budget, not the stack."""
