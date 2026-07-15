@@ -349,5 +349,5 @@ class TestSessionWiring:
         for method in (ProxyManager._connect_server, ProxyManager._reconnect_server):
             src = inspect.getsource(method)
             assert "self._establish_connection(name, cfg)" in src, method.__name__
-        helper_src = inspect.getsource(ProxyManager._establish_connection)
-        assert "message_handler=self._make_message_handler(name)" in helper_src
+        owner_src = inspect.getsource(ProxyManager._run_connection_owner)
+        assert "message_handler=self._make_message_handler(name)" in owner_src

@@ -7917,6 +7917,144 @@ class TestHealth:
         assert captured["timeout"] == pytest.approx(0.1, rel=0.1)
         assert captured["sse_read_timeout"] == pytest.approx(0.1, rel=0.1)
 
+    @pytest.mark.parametrize("probe_kind", ["upstream", "ltm"])
+    def test_probe_contexts_enter_and_exit_in_caller_task(self, monkeypatch, probe_kind):
+        """Transport contexts never cross the Python 3.12 wait_for task boundary.
+
+        The local ``wait_for`` stand-in deliberately creates a child task,
+        matching Python 3.12's behavior.  Operation RPCs may run there, but
+        MCP transport/session context enter+exit must remain in the probe task.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        record: dict = {}
+
+        class TrackingTransport:
+            async def __aenter__(self):
+                record["transport_enter_task"] = asyncio.current_task()
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                record["transport_exit_task"] = asyncio.current_task()
+
+        class TrackingSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                record["session_enter_task"] = asyncio.current_task()
+                return self
+
+            async def __aexit__(self, *_args):
+                record["session_exit_task"] = asyncio.current_task()
+
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                names = ["mem_search"] if probe_kind == "ltm" else ["tool"]
+                return SimpleNamespace(tools=[SimpleNamespace(name=name) for name in names])
+
+        real_wait_for = asyncio.wait_for
+
+        async def task_spawning_wait_for(awaitable, timeout):
+            return await real_wait_for(asyncio.create_task(awaitable), timeout)
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda *_a, **_k: TrackingTransport())
+        monkeypatch.setattr("mcp.ClientSession", TrackingSession)
+        monkeypatch.setattr(proxy_mod.asyncio, "wait_for", task_spawning_wait_for)
+
+        async def run_probe():
+            caller = asyncio.current_task()
+            if probe_kind == "ltm":
+                result = await proxy_mod._probe_ltm_mcp_server(
+                    "sse", "", [], "https://ltm.example/sse", None, 2.0, sys.stderr
+                )
+                assert result["connected"] is True
+            else:
+                result = await proxy_mod._probe_one(
+                    {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"},
+                    2.0,
+                )
+                assert result.connected is True
+            return caller
+
+        caller_task = asyncio.run(run_probe())
+        assert record["transport_enter_task"] is caller_task
+        assert record["transport_exit_task"] is caller_task
+        assert record["session_enter_task"] is caller_task
+        assert record["session_exit_task"] is caller_task
+
+    @pytest.mark.parametrize("probe_kind", ["upstream", "ltm"])
+    def test_short_lived_stdio_probe_exits_without_anyio_warning(self, tmp_path, probe_kind):
+        """A real short-lived MCP session shuts down without unraisable noise."""
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parents[2]
+        isolated = tmp_path / probe_kind
+        env = os.environ.copy()
+        for key in tuple(env):
+            if key.startswith("MEMTOMEM_STM_"):
+                env.pop(key)
+        for key, dirname in (
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_CACHE_HOME", "xdg-cache"),
+            ("MEMTOMEM_STM_DATA_DIR", "stm-data"),
+        ):
+            path = isolated / dirname
+            path.mkdir(parents=True)
+            env[key] = str(path)
+        env["FAKE_MEMTOMEM_SERVER"] = str(_FAKE_SERVER)
+        env["PROBE_KIND"] = probe_kind
+        env["PYTHONWARNINGS"] = "default"
+
+        script = """
+import asyncio
+import os
+import sys
+
+from memtomem_stm.cli.proxy import _probe_ltm_mcp_server, _probe_one
+
+
+async def main():
+    server = os.environ["FAKE_MEMTOMEM_SERVER"]
+    if os.environ["PROBE_KIND"] == "ltm":
+        result = await _probe_ltm_mcp_server(
+            "stdio", sys.executable, [server], "", None, 10.0, sys.stderr
+        )
+        assert result["connected"] is True, result
+    else:
+        result = await _probe_one(
+            {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": [server],
+                "prefix": "fake",
+            },
+            10.0,
+        )
+        assert result.connected is True, result
+
+
+asyncio.run(main())
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        stderr = proc.stderr
+        assert "AnyIO cancel scope" not in stderr
+        assert "Attempted to exit" not in stderr
+        assert "Exception ignored in" not in stderr
+        assert "traceback" not in stderr.lower()
+
     def test_health_reports_connectable_ltm_server(self, config, monkeypatch):
         """Probe a live MCP child via real subprocess.
 
@@ -8873,6 +9011,147 @@ class TestDoctor:
         assert "FAIL" not in ltm_line
         assert "surfacing" in result.output
         assert "proxy core is unaffected" in result.output
+
+    def test_daemon_telemetry_warns_for_both_undersized_timeouts(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 3.0, "hook_daemon_seconds": 2.5},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 5,
+                            "recommendation": {
+                                "status": "provisional",
+                                "seconds": 9.5,
+                            },
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "warm-daemon telemetry recommends 9.5s" in result.output
+        assert "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=9.5" in result.output
+        assert "outer hook deadline truncates" in result.output
+        assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10" in result.output
+
+    def test_measure_ltm_is_explicitly_forwarded_but_default_is_passive(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        calls: list[bool] = []
+
+        def fake_bootstrap(_timeout, *, measure_ltm=False, prefer_hook_daemon=False):
+            assert prefer_hook_daemon is True
+            calls.append(measure_ltm)
+            return {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 12.0, "hook_daemon_seconds": 12.5},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": (
+                        {
+                            "attempted_samples": 5,
+                            "completed_samples": 5,
+                        }
+                        if measure_ltm
+                        else None
+                    ),
+                },
+            }
+
+        monkeypatch.setattr(proxy_mod, "_surfacing_bootstrap_status", fake_bootstrap)
+
+        passive = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        measured = runner.invoke(cli, ["doctor", "--measure-ltm", *_cfg_args(config)])
+        assert passive.exit_code == measured.exit_code == 0
+        assert calls == [False, True]
+        assert "ltm measurement" not in passive.output
+        assert "5/5 warm sample(s) completed" in measured.output
+
+    @pytest.mark.asyncio
+    async def test_measure_ltm_primes_cold_daemon_then_collects_five_synthetic_samples(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.daemon import client as daemon_client
+
+        config = SimpleNamespace(
+            surfacing=SimpleNamespace(
+                timeout_seconds=3.0,
+                max_results=3,
+                default_namespace=None,
+                context_window_size=0,
+            )
+        )
+        payloads = []
+
+        async def fake_request(config, op, payload, *, timeout):
+            payloads.append(payload)
+            return "ok", {"ok": True, "outcome": "empty_results"}
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {"ltm": "warm", "latency": {"retrieval": {"samples": 5}}}
+
+        monkeypatch.setattr(daemon_client, "ltm_request", fake_request)
+        monkeypatch.setattr(daemon_client, "ping", fake_ping)
+
+        measurement, refreshed = await proxy_mod._measure_warm_daemon_ltm(
+            config, initial_state="cold", timeout=4.0
+        )
+        assert measurement["primed"] is True
+        assert measurement["completed_samples"] == 5
+        assert measurement["attempted_samples"] == 5
+        assert len(payloads) == 6  # one uncounted prime + five measured samples
+        assert len({payload["query"] for payload in payloads}) == 6
+        assert all(payload["top_k"] == 3 for payload in payloads)
+        assert refreshed is not None and refreshed["ltm"] == "warm"
 
     def test_missing_config_fails_and_short_circuits(self, runner, tmp_path):
         missing = tmp_path / "nope.json"

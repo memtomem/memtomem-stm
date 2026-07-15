@@ -2468,6 +2468,99 @@ class TestMainExceptionBarrier:
             f"clean exit should not emit ERROR logs; got: {[r.getMessage() for r in error_records]}"
         )
 
+    def test_short_lived_full_mcp_proxy_session_has_clean_stderr(self, tmp_path):
+        """Real outer MCP EOF plus a real proxied stdio child unwind cleanly."""
+        import json
+        import os
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[1]
+        fake_server = Path(__file__).with_name("_fake_memtomem_server.py")
+        isolated = tmp_path / "isolated"
+        env = os.environ.copy()
+        for key in tuple(env):
+            if key.startswith("MEMTOMEM_STM_"):
+                env.pop(key)
+        for key, dirname in (
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_CACHE_HOME", "xdg-cache"),
+            ("MEMTOMEM_STM_DATA_DIR", "stm-data"),
+        ):
+            path = isolated / dirname
+            path.mkdir(parents=True)
+            env[key] = str(path)
+
+        config_path = isolated / "stm_proxy.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"enabled": False},
+                    "metrics": {"enabled": False},
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fake",
+                            "transport": "stdio",
+                            "command": sys.executable,
+                            "args": [str(fake_server)],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        env.update(
+            {
+                "MEMTOMEM_STM_PROXY__ENABLED": "true",
+                "MEMTOMEM_STM_PROXY__CONFIG_PATH": str(config_path),
+                "MEMTOMEM_STM_SURFACING__ENABLED": "false",
+                "MEMTOMEM_STM_LOG_LEVEL": "ERROR",
+                "PYTHONWARNINGS": "default",
+            }
+        )
+
+        script = """
+import asyncio
+import os
+import sys
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+async def main():
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-c", "from memtomem_stm.server import main; main()"],
+        env=dict(os.environ),
+    )
+    async with stdio_client(params, errlog=sys.stderr) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            names = [tool.name for tool in result.tools]
+            assert any("mem_search" in name for name in names), names
+
+
+asyncio.run(main())
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        stderr = proc.stderr
+        assert "AnyIO cancel scope" not in stderr
+        assert "Attempted to exit" not in stderr
+        assert "Exception ignored in" not in stderr
+        assert "traceback" not in stderr.lower()
+
     def test_anyio_cancel_scope_shutdown_error_exits_cleanly(self, caplog):
         import logging
 
@@ -2486,15 +2579,19 @@ class TestMainExceptionBarrier:
         for err in errors:
             caplog.clear()
             with (
-                caplog.at_level(logging.WARNING, logger="memtomem_stm.server"),
+                caplog.at_level(logging.DEBUG, logger="memtomem_stm.server"),
                 patch.object(server.mcp, "run", side_effect=err),
             ):
                 server.main()
 
             error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
             warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
             assert not error_records
-            assert any("AnyIO cancel scope warning" in r.getMessage() for r in warning_records)
+            assert not warning_records
+            assert any(
+                "AnyIO cancel-scope cleanup condition" in r.getMessage() for r in debug_records
+            )
 
     def test_exception_group_wrapped_cancel_scope_error_exits_cleanly(self, caplog):
         """anyio >= 4 strict task groups wrap the cancel-scope RuntimeError in
@@ -2520,18 +2617,22 @@ class TestMainExceptionBarrier:
         for group in shapes:
             caplog.clear()
             with (
-                caplog.at_level(logging.WARNING, logger="memtomem_stm.server"),
+                caplog.at_level(logging.DEBUG, logger="memtomem_stm.server"),
                 patch.object(server.mcp, "run", side_effect=group),
             ):
                 server.main()
 
             error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
             warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
             assert not error_records, (
                 f"wrapped cancel-scope shutdown must not hit the barrier; "
                 f"got: {[r.getMessage() for r in error_records]}"
             )
-            assert any("AnyIO cancel scope warning" in r.getMessage() for r in warning_records)
+            assert not warning_records
+            assert any(
+                "AnyIO cancel-scope cleanup condition" in r.getMessage() for r in debug_records
+            )
 
     def test_exception_group_with_real_failure_hits_barrier(self, caplog):
         """A group mixing the cancel-scope error with any other failure is NOT

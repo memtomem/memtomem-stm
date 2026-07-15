@@ -172,8 +172,43 @@ async def test_ping_reports_ready_and_cold_ltm(tmp_path: Path) -> None:
         hs = await client.ping(cfg, timeout=2.0)
         assert hs is not None
         assert hs["ltm"] == "cold"  # injected engine: adapter never started
+        assert hs["latency"]["retrieval"]["samples"] == 0
+        assert hs["latency"]["surface"]["samples"] == 0
     finally:
         await _stop(cfg, task)
+
+
+async def test_ping_reports_bounded_warm_latency_and_separates_timeouts(tmp_path: Path) -> None:
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+
+    async def success() -> dict[str, object]:
+        return {"v": PROTOCOL_VERSION, "ok": True, "outcome": "empty_results"}
+
+    for _ in range(5):
+        await server._run_admitted(
+            {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+            success,
+            latency_kind="retrieval",
+        )
+
+    async def hangs() -> dict[str, object]:
+        await asyncio.sleep(1.0)
+        return {"v": PROTOCOL_VERSION, "ok": True}
+
+    expired = await server._run_admitted(
+        {"deadline_monotonic": asyncio.get_running_loop().time() + 0.01},
+        hangs,
+        latency_kind="retrieval",
+    )
+    assert expired["status"] == "expired"
+
+    ping = await server._dispatch({"v": PROTOCOL_VERSION, "op": OP_PING})
+    assert ping is not None
+    retrieval = ping["latency"]["retrieval"]
+    assert retrieval["samples"] == 5
+    assert retrieval["timeout_samples"] == 1
+    assert retrieval["recommendation"]["status"] == "provisional"
 
 
 async def test_surface_round_trip_injects_memories(tmp_path: Path) -> None:
@@ -630,21 +665,20 @@ async def test_teardown_kills_leaked_child_on_cancel_scope_error(
     caplog: pytest.LogCaptureFixture,
     exc: BaseException,
 ) -> None:
-    # The known E-3 shape: the adapter's stdio scopes were entered in a
-    # connection-handler task, stop() from the serve task raises the
-    # cross-task cancel-scope error (bare, or group-wrapped by anyio >= 4)
-    # — teardown must warn and terminate the surviving LTM child.
+    # Legacy/injected adapter shape: the narrow fallback must still sweep the
+    # child, but the classified cleanup condition itself is DEBUG noise; the
+    # actual leaked-child termination remains an operator-visible warning.
     server = DaemonServer(_config(tmp_path))
     server._adapter = _StopRaisingAdapter(exc)
     child = _sleeping_child()
     try:
         monkeypatch.setattr(daemon_server, "_direct_child_pids", lambda: {child.pid})
         monkeypatch.setattr(daemon_server, "_LEAK_KILL_ESCALATE_SECONDS", 0.2)
-        with caplog.at_level(logging.WARNING, logger="memtomem_stm.daemon.server"):
+        with caplog.at_level(logging.DEBUG, logger="memtomem_stm.daemon.server"):
             await server._teardown()
         assert child.wait(timeout=5.0) == -signal.SIGTERM
         messages = [r.getMessage() for r in caplog.records]
-        assert any("cross-task cancel-scope" in m for m in messages)
+        assert any("known AnyIO cancel-scope cleanup condition" in m for m in messages)
         assert any("leaked LTM child" in m for m in messages)
     finally:
         if child.poll() is None:

@@ -132,6 +132,8 @@ async def ping(config: STMConfig, *, timeout: float = 2.0) -> dict[str, Any] | N
         # callers like ``mms daemon status`` can render it without a 2nd trip.
         merged = dict(hs)
         merged["ltm"] = resp.get("ltm")
+        if isinstance(resp.get("latency"), dict):
+            merged["latency"] = resp["latency"]
         return merged
     return None
 

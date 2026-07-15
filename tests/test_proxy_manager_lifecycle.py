@@ -568,21 +568,11 @@ class TestConnectDeadlineEndToEnd:
         mock_transport.__aexit__.assert_awaited_once()
 
     async def test_deadline_is_shared_across_phases(self):
-        """The budget is one deadline, not per-phase: after transport entry
-        consumes real time, ``initialize()`` must be offered only the
-        remainder — a regression back to a fresh ``connect_timeout_seconds``
-        per phase would record the full budget again."""
+        """The budget is one deadline, not a fresh timeout per phase."""
         cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=0.5)
         mgr = _make_manager(servers={"srv": cfg})
         with patch.object(mgr, "_connect_server", new_callable=AsyncMock):
             await mgr.start()
-
-        recorded: list[float] = []
-        real_wait_for = asyncio.wait_for
-
-        async def spy_wait_for(awaitable, timeout=None):
-            recorded.append(timeout)
-            return await real_wait_for(awaitable, timeout)
 
         mock_session, mock_transport = self._mocks()
 
@@ -590,30 +580,27 @@ class TestConnectDeadlineEndToEnd:
             await asyncio.sleep(0.3)
             return (AsyncMock(), AsyncMock())
 
+        async def _consuming_initialize():
+            await asyncio.sleep(0.3)
+
         mock_transport.__aenter__ = AsyncMock(side_effect=_consuming_enter)
+        mock_session.initialize = AsyncMock(side_effect=_consuming_initialize)
+
+        import pytest as _pt
 
         with (
             patch.object(mgr, "_open_transport", return_value=mock_transport),
             patch("memtomem_stm.proxy.manager.ClientSession", return_value=mock_session),
-            patch("memtomem_stm.proxy.manager.asyncio.wait_for", spy_wait_for),
         ):
-            await mgr._connect_server("srv", cfg)
+            with _pt.raises(asyncio.TimeoutError):
+                await mgr._connect_server("srv", cfg)
 
-        assert "srv" in mgr._connections
-        # Three bounded phases: transport entry, initialize, list_tools.
-        assert len(recorded) == 3
-        # Phase 1 gets (approximately) the full budget…
-        assert 0.4 < recorded[0] <= 0.5
-        # …and the sleep(0.3) inside transport entry means initialize is offered
-        # only the REMAINDER (~0.2s), not a fresh 0.5s budget. Asserted both
-        # relatively (strictly below phase 1's grant by more than the timer
-        # jitter) and with a loose absolute ceiling, so Windows' coarse sleep
-        # granularity can't flake it while a fresh-budget regression (initialize
-        # offered ~0.5 again) still fails both checks.
-        assert recorded[1] < recorded[0] - 0.1
-        assert recorded[1] < 0.4
-        # list_tools gets whatever remains after initialize.
-        assert recorded[2] <= recorded[1]
+        # Each phase is individually below 0.5s, but their sum is not. A
+        # per-phase reset would connect successfully; one shared deadline
+        # times out during initialize and rolls the partial connection back.
+        assert "srv" not in mgr._connections
+        mock_session.__aexit__.assert_awaited_once()
+        mock_transport.__aexit__.assert_awaited_once()
 
     async def test_connect_server_closes_partial_stack_when_list_tools_fails(self):
         """Failed initial connection must not leave transport/session cleanup
@@ -746,6 +733,134 @@ class TestConcurrentReconnect:
         assert mgr._connections["srv"].reconnect_generation == 1
         old_stack.aclose.assert_awaited_once()
         assert mgr._connections["srv"].session is mock_session
+
+
+class TestOwnedUpstreamLifecycle:
+    """MCP async contexts stay task-affine across connect/reconnect/stop."""
+
+    async def test_contexts_enter_and_exit_in_each_connection_owner(self):
+        from contextlib import AsyncExitStack
+
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = AsyncExitStack()
+        records: list[dict] = []
+        events: list[tuple[str, int]] = []
+
+        class TrackingTransport:
+            def __init__(self, record, connection_id):
+                self.record = record
+                self.connection_id = connection_id
+
+            async def __aenter__(self):
+                self.record["transport_enter_task"] = asyncio.current_task()
+                events.append(("transport_enter", self.connection_id))
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                self.record["transport_exit_task"] = asyncio.current_task()
+                events.append(("transport_exit", self.connection_id))
+
+        class TrackingSession:
+            def __init__(self, record, connection_id):
+                self.record = record
+                self.connection_id = connection_id
+
+            async def __aenter__(self):
+                self.record["session_enter_task"] = asyncio.current_task()
+                events.append(("session_enter", self.connection_id))
+                return self
+
+            async def __aexit__(self, *_args):
+                self.record["session_exit_task"] = asyncio.current_task()
+                events.append(("session_exit", self.connection_id))
+
+            async def initialize(self):
+                events.append(("initialize", self.connection_id))
+
+            async def list_tools(self):
+                events.append(("list_tools", self.connection_id))
+                return SimpleNamespace(tools=[])
+
+        def open_transport(_cfg):
+            record: dict = {}
+            records.append(record)
+            return TrackingTransport(record, len(records))
+
+        def make_session(*_args, **_kwargs):
+            return TrackingSession(records[-1], len(records))
+
+        caller_task = asyncio.current_task()
+        with (
+            patch.object(mgr, "_open_transport", side_effect=open_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", side_effect=make_session),
+        ):
+            await mgr._connect_server("srv", cfg)
+            first_owner = mgr._connections["srv"].owner
+            assert first_owner is not None
+            assert records[0]["transport_enter_task"] is first_owner.task
+            assert records[0]["session_enter_task"] is first_owner.task
+            assert first_owner.task is not caller_task
+
+            await mgr._reconnect_server("srv")
+            second_owner = mgr._connections["srv"].owner
+            assert second_owner is not None and second_owner is not first_owner
+
+            # Prepare-first remains intact: the replacement discovers its
+            # tools before the old owner begins unwinding.
+            assert events.index(("list_tools", 2)) < events.index(("session_exit", 1))
+            assert records[0]["session_exit_task"] is records[0]["session_enter_task"]
+            assert records[0]["transport_exit_task"] is records[0]["transport_enter_task"]
+
+            stop_task = asyncio.create_task(mgr.stop())
+            await stop_task
+
+        assert records[1]["session_exit_task"] is records[1]["session_enter_task"]
+        assert records[1]["transport_exit_task"] is records[1]["transport_enter_task"]
+        assert records[1]["transport_exit_task"] is not stop_task
+
+    async def test_failed_setup_rolls_back_in_owner_task(self):
+        from contextlib import AsyncExitStack
+
+        cfg = UpstreamServerConfig(prefix="bad", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"bad": cfg})
+        mgr._stack = AsyncExitStack()
+        record: dict = {}
+
+        class TrackingTransport:
+            async def __aenter__(self):
+                record["transport_enter_task"] = asyncio.current_task()
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                record["transport_exit_task"] = asyncio.current_task()
+
+        class FailingSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                record["session_enter_task"] = asyncio.current_task()
+                return self
+
+            async def __aexit__(self, *_args):
+                record["session_exit_task"] = asyncio.current_task()
+
+            async def initialize(self):
+                raise ConnectionError("initialize failed")
+
+        import pytest as _pt
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=TrackingTransport()),
+            patch("memtomem_stm.proxy.manager.ClientSession", FailingSession),
+        ):
+            with _pt.raises(ConnectionError, match="initialize failed"):
+                await mgr._connect_server("bad", cfg)
+
+        assert record["session_exit_task"] is record["session_enter_task"]
+        assert record["transport_exit_task"] is record["transport_enter_task"]
+        assert "bad" not in mgr._connections
 
 
 # ── tool name overflow (#261 → exposure-time enforcement via #465) ──────
