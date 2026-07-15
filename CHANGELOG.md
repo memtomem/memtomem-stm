@@ -11,6 +11,24 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- The daemon now hands the surfacing engine the time left in the client's
+  deadline instead of letting that deadline cancel the engine from outside.
+  `hook.daemon_timeout_seconds` (2.5s) is smaller than
+  `surfacing.timeout_seconds` (3.0s), so on the daemon path every slow LTM
+  search was aborted by the transport before the engine's own timeout could
+  fire. That abort raised `CancelledError`, which bypasses the engine's
+  `asyncio.TimeoutError` handler — the one place that records the
+  `error_timeout` fault, logs the warning, and counts the failure toward the
+  circuit breaker (#579). The result was an invisible failure loop: no fault
+  rows, no log line, and a breaker that could never open, so every eligible
+  hook call re-paid the full timeout and respawned the LTM stdio child. A slow
+  LTM now trips the breaker as designed and shows up in
+  `mms stats` / `surfacing_faults`. When queue and lock wait have already eaten
+  the deadline, the daemon skips the LTM round trip entirely rather than
+  starting one it must cancel mid-RPC.
+
 ## [0.1.40] — 2026-07-15
 
 0.1.39 was never published — the version was bumped and a changelog section cut,

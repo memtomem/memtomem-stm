@@ -240,6 +240,73 @@ async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
     assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
 
 
+class _BudgetSpyEngine:
+    """Records the ``budget_seconds`` the daemon hands to the engine."""
+
+    injection_mode = "append"
+
+    def __init__(self) -> None:
+        self.calls: list[float | None] = []
+
+    async def surface(self, *args, budget_seconds: float | None = None, **kwargs) -> str:
+        self.calls.append(budget_seconds)
+        return args[3] if len(args) > 3 else ""
+
+
+async def test_surface_propagates_remaining_deadline_as_budget(tmp_path: Path) -> None:
+    # Without this, the client's deadline cancels surface() from OUTSIDE, which
+    # skips the engine's fault/log/breaker bookkeeping (#579) — so the breaker
+    # never opens and every call re-pays the timeout and respawns the LTM child.
+    engine = _BudgetSpyEngine()
+    server = DaemonServer(_config(tmp_path))
+    server._engine = engine
+    deadline = asyncio.get_running_loop().time() + 1.0
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": _canonical(_READ_PAYLOAD).to_wire(),
+            "deadline_monotonic": deadline,
+        }
+    )
+
+    assert response["ok"] is True
+    assert len(engine.calls) == 1
+    budget = engine.calls[0]
+    assert budget is not None
+    # Strictly inside the client's remaining time: the engine must abort first,
+    # leaving room to encode and write the response.
+    assert 0 < budget <= 1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS
+    assert budget == pytest.approx(1.0 - daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS, abs=0.1)
+
+
+async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) -> None:
+    # Admitted (deadline not yet expired) but too little left for a round trip.
+    # Starting one would only cancel the adapter mid-RPC and force a stdio child
+    # respawn on the next call, so the engine must not be touched at all.
+    engine = _BudgetSpyEngine()
+    server = DaemonServer(_config(tmp_path))
+    server._engine = engine
+    starved = (
+        daemon_server._DEADLINE_RESPONSE_MARGIN_SECONDS
+        + daemon_server._MIN_SURFACE_BUDGET_SECONDS
+        - 0.05
+    )
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": _canonical(_READ_PAYLOAD).to_wire(),
+            "deadline_monotonic": asyncio.get_running_loop().time() + starved,
+        }
+    )
+
+    # Fail-open: a well-formed empty output, not an error the hook must interpret.
+    assert response["ok"] is True
+    assert response["output"] == {}
+    assert engine.calls == []
+
+
 async def test_surface_rejects_when_pending_queue_is_full(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     cfg.daemon.max_pending_requests = 1

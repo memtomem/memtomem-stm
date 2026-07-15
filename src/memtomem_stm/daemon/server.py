@@ -114,6 +114,17 @@ def _direct_child_pids() -> set[int]:
 # the escalation timeout mcp's own stdio shutdown sequence uses.
 _LEAK_KILL_ESCALATE_SECONDS = 2.0
 
+# Reserved out of the client's deadline for encoding + the loopback write/read
+# of the response. The engine's budget is the remainder, so the engine's own
+# timeout fires *before* the client gives up and `_run_admitted`'s
+# `asyncio.timeout_at` backstop cancels it from outside.
+_DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
+
+# Below this, an LTM round trip cannot plausibly complete, so starting one only
+# cancels the adapter mid-RPC — which forces a stdio child respawn on the next
+# call (#290/#296) and buys nothing. Skip instead.
+_MIN_SURFACE_BUDGET_SECONDS = 0.25
+
 
 def _signal_pid(pid: int, sig: int) -> None:
     """Best-effort signal to *pid*'s process group, or *pid* alone when it
@@ -444,7 +455,14 @@ class DaemonServer:
                 return surface_response({})
 
             async def surface_call() -> dict[str, Any]:
-                output = await run_surfacing_hook(call, engine=self._engine)
+                # Computed here, not at admission: the admission queue and the
+                # serialization lock have already eaten part of the client's
+                # deadline by the time we run.
+                budget = self._remaining_budget(req)
+                if budget is None:
+                    logger.debug("surface skipped: no budget left in the client deadline")
+                    return surface_response({})
+                output = await run_surfacing_hook(call, engine=self._engine, budget_seconds=budget)
                 return surface_response(output)
 
             return await self._run_admitted(
@@ -664,6 +682,24 @@ class DaemonServer:
 
             return await self._run_admitted(req, scratch_call)
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
+
+    def _remaining_budget(self, req: dict[str, Any]) -> float | None:
+        """Seconds of the client's deadline still usable for an LTM attempt.
+
+        ``None`` means "don't start one". The margin keeps the engine's own
+        timeout ahead of the client's give-up point, so the abort is the
+        engine's (fault row + log + breaker count, #579) rather than a silent
+        outside cancellation. ``_run_admitted`` already rejected a missing or
+        expired deadline; this re-reads it because queue/lock wait may have
+        consumed the rest since admission.
+        """
+        deadline = req.get("deadline_monotonic")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return None
+        remaining = float(deadline) - time.monotonic() - _DEADLINE_RESPONSE_MARGIN_SECONDS
+        if remaining < _MIN_SURFACE_BUDGET_SECONDS:
+            return None
+        return remaining
 
     async def _run_admitted(
         self,

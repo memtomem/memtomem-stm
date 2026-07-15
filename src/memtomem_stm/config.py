@@ -105,11 +105,20 @@ class HookConfig(BaseModel):
     ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to opt out to the legacy cold in-process
     path."""
     daemon_timeout_seconds: float = Field(default=2.5, gt=0.0)
-    """Per-request wall-clock budget for the hook→daemon round trip. Small and
-    independent of the cold-path ``_hook_budget_seconds()`` backstop. It must
-    still exceed ``surfacing.timeout_seconds`` plus loopback/queue overhead if
-    the operator wants the inner LTM attempt to consume its full budget; use
-    ``mms doctor`` telemetry instead of assuming a warm search is sub-second."""
+    """Per-request wall-clock budget for the hook→daemon round trip, and the
+    effective ceiling on the LTM attempt inside it. Small and independent of the
+    cold-path ``_hook_budget_seconds()`` backstop.
+
+    The daemon subtracts queue/lock wait plus a response margin from this
+    deadline and hands the remainder to the surfacing engine as its timeout, so
+    a value **below** ``surfacing.timeout_seconds`` silently shortens every LTM
+    attempt rather than letting it run its configured course. That is the
+    intended precedence — the host is waiting on this hook — but it means
+    ``surfacing.timeout_seconds`` is only reachable when this budget exceeds it
+    plus overhead. If searches abort here, the fix is a faster LTM (or a
+    deliberately larger budget, paid in host latency), not a larger
+    ``timeout_seconds``: use ``mms doctor`` telemetry and the ``error_timeout``
+    fault counters rather than assuming a warm search is sub-second."""
     fallback: Literal["skip", "cold"] = "skip"
     """What ``mms hook`` does when the daemon is unreachable. ``skip`` (default)
     degrades to ``{}`` immediately — the daemon exists precisely to avoid the
