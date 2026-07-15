@@ -798,6 +798,14 @@ class ProxyManager:
             self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
             if self._config.exposure.profile is ExposureProfile.STRICT:
                 self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
+                # Fail-closed supersedes binding: nothing is withheld *because*
+                # it failed to bind any more, it is withheld because the bundle
+                # is unreadable. Keeping the old snapshot's diagnosis would pair
+                # a live protocol error with a stale mapping/digest cause and
+                # send the operator after the wrong thing.
+                self._toolgraph_bind_stats = {}
+                self._toolgraph_all_fail_cause = None
+                self._toolgraph_all_fail_warned = False
                 if startup:
                     raise ToolgraphStartupError(f"Invalid Toolgraph policy bundle: {exc}") from exc
             elif (

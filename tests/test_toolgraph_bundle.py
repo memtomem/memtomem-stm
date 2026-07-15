@@ -760,3 +760,69 @@ class TestBindFailureHealthRendering:
         text = "\n".join(_toolgraph_health_lines(self._status(all_bind_failure=None)))
         assert "failed to bind" not in text
         assert "active (graph generation 7" in text
+
+    def test_strict_reload_failure_drops_the_stale_bind_diagnosis(self, tmp_path, caplog):
+        """Fail-closed supersedes binding; the old cause must not survive it."""
+        manager, bundle_path, tool = _manager(tmp_path)
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        _write_bundle(bundle_path, _bundle(tool))
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+        assert manager.get_toolgraph_status()["all_bind_failure"] == "unmapped"
+
+        bundle_path.write_bytes(b"{ corrupt")
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        status = manager.get_toolgraph_status()
+        assert status["withholding_all"] == "toolgraph_protocol_error"
+        assert status["all_bind_failure"] is None, "a protocol error is not a mapping failure"
+        assert status["bind_stats"] == {}
+
+    def test_review_mode_last_known_good_keeps_reporting_its_bind_failure(self, tmp_path, caplog):
+        """The LKG snapshot still enforces, so its diagnosis is still live."""
+        manager, bundle_path, tool = _manager(tmp_path, profile=ExposureProfile.REVIEW)
+        manager._config.toolgraph.server_name_map = {"srv": "wrong-name"}
+        _write_bundle(bundle_path, _bundle(tool, profile="review"))
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        bundle_path.write_bytes(b"{ corrupt")
+        with caplog.at_level("WARNING"):
+            manager._refresh_toolgraph_bundle(force=True)
+
+        status = manager.get_toolgraph_status()
+        assert status["using_last_known_good"] is True
+        assert status["all_bind_failure"] == "unmapped"
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(_toolgraph_health_lines(status))
+        assert "DEGRADED" in text
+        assert "toolgraph.server_name_map" in text, "the hint must survive degradation"
+
+    def test_fail_closed_hides_the_bind_diagnostic(self):
+        """Nothing is withheld for a binding reason when a knob fired closed."""
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(
+            _toolgraph_health_lines(
+                self._status(withholding_all="toolgraph_protocol_error", degraded=True)
+            )
+        )
+        assert "WITHHOLDING ALL" in text
+        assert "failed to bind" not in text
+
+    def test_degraded_last_known_good_still_shows_the_diagnostic(self):
+        from memtomem_stm.server import _toolgraph_health_lines
+
+        text = "\n".join(
+            _toolgraph_health_lines(
+                self._status(
+                    degraded=True,
+                    degraded_reason="toolgraph_protocol_error",
+                    using_last_known_good=True,
+                )
+            )
+        )
+        assert "DEGRADED" in text
+        assert "toolgraph.server_name_map" in text

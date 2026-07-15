@@ -1002,7 +1002,14 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
                 f"bundle digest: {status.get('bundle_digest')}"
             )
             lines.append(f"  review would-block calls: {status.get('would_block_calls', 0)}")
-            lines.extend(_toolgraph_bind_failure_lines(status))
+    if not status["withholding_all"]:
+        # Also render under review-mode DEGRADED: the last-known-good snapshot
+        # is still enforcing and still rebinds against a changing catalog, so
+        # an all-bind failure there is live, not history. Fail-closed is the one
+        # state to skip — nothing is withheld for a binding reason (the manager
+        # clears the diagnosis when that supersedes binding, so this is belt and
+        # braces).
+        lines.extend(_toolgraph_bind_failure_lines(status))
     return lines
 
 
