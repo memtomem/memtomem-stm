@@ -61,6 +61,13 @@ changes inline only. See the deprecation policy in
   failure. A window fully consumed by pre-work is booked without starting an
   LTM round trip that would be cancelled mid-RPC, and gives its rate-limit
   slot back the same way a refusal does. (#721)
+- The daemon's admission check now rejects a `deadline_monotonic` it cannot
+  actually enforce, answering `expired` instead of admitting the request:
+  `NaN` compared `False` against the expiry check and reached
+  `asyncio.timeout_at(NaN)`, `+inf` admitted with a backstop that can never
+  fire, and an int too large for a float made the dispatch raise instead of
+  respond. #721 fixed the same family in `_surface_deadline`; both sites now
+  share one validation helper. (#722)
 
 ## [0.1.40] — 2026-07-15
 
