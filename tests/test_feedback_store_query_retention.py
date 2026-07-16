@@ -285,6 +285,67 @@ class TestLegacyNotNullMigration:
             store.close()
 
 
+class TestScoreScaleColumn:
+    """The #1781 ``score_scale`` column: additive migration (ordered AFTER
+    the relax-NOT-NULL table swap, which would otherwise drop it) and the
+    record/read paths."""
+
+    def test_score_scale_column_added_to_legacy_db(self, tmp_path: Path) -> None:
+        """Pre-#352 DB: the relax migration recreates the table from a
+        hardcoded column list, so the score_scale ALTER must land after it
+        — this pins both the column's existence and the ordering."""
+        path = tmp_path / "fb.db"
+        TestLegacyNotNullMigration._seed_legacy_db(path)
+
+        store = FeedbackStore(path)
+        store.initialize()
+        try:
+            assert store._db is not None
+            columns = {
+                row[1]
+                for row in store._db.execute("PRAGMA table_info('surfacing_events')").fetchall()
+            }
+            assert "score_scale" in columns
+            # Legacy row reads NULL; a new row records its label.
+            (legacy_scale,) = store._db.execute(
+                "SELECT score_scale FROM surfacing_events WHERE id = 'legacy-1'"
+            ).fetchone()
+            assert legacy_scale is None
+            store.record_surfacing(
+                "new-1", "s", "read_file", "q", ["m1"], [0.5], score_scale="rerank"
+            )
+            (new_scale,) = store._db.execute(
+                "SELECT score_scale FROM surfacing_events WHERE id = 'new-1'"
+            ).fetchone()
+            assert new_scale == "rerank"
+        finally:
+            store.close()
+
+    def test_get_stats_exposes_scale_distribution_and_recent(self, tmp_path: Path) -> None:
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+        try:
+            store.record_surfacing("e1", "s", "read_file", "q1", ["m1"], [0.5], score_scale="rrf")
+            store.record_surfacing(
+                "e2", "s", "read_file", "q2", ["m2"], [-0.2], score_scale="rerank"
+            )
+            store.record_surfacing("e3", "s", "read_file", "q3", ["m3"], [0.4])
+            stats = store.get_stats(limit=5)
+            assert stats["score_scale_distribution"] == {"rrf": 1, "rerank": 1, "unknown": 1}
+            by_id = {row["query_preview"]: row["score_scale"] for row in stats["recent"]}
+            assert by_id == {"q1": "rrf", "q2": "rerank", "q3": None}
+        finally:
+            store.close()
+
+    def test_empty_stats_shape_includes_scale_distribution(self, tmp_path: Path) -> None:
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+        try:
+            assert store.get_stats()["score_scale_distribution"] == {}
+        finally:
+            store.close()
+
+
 class TestDeleteEventsOlderThan:
     """#584 — row-level retention deletes aged-out events (and their
     feedback), bounding the table get_stats scans."""

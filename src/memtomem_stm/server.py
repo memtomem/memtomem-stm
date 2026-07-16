@@ -1399,6 +1399,14 @@ async def stm_surfacing_stats(
                 f"\nMin score:       {snap['default']:.3f} "
                 f"(auto-tune {auto_state}, min {min_samples_required} samples)"
             )
+            scale_info = snap.get("score_scale") or {}
+            last_reported = scale_info.get("last_reported")
+            if last_reported:
+                reranker_id = scale_info.get("reranker")
+                reranker_note = f"; reranker: {reranker_id}" if reranker_id else ""
+                lines.append(f"Score scale:     {last_reported} (core-reported{reranker_note})")
+            else:
+                lines.append("Score scale:     unknown (core did not report one)")
             visible_adjusted = (
                 {t: s for t, s in adjusted_scores.items() if t == tool}
                 if tool is not None

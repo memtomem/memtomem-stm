@@ -432,6 +432,100 @@ class TestStructuredEmptyResults:
             assert results == []
             assert hints == []
 
+
+# Core PR #1781 (closes #1767): structured payloads gain optional top-level
+# ``score_scale`` + ``reranker`` keys naming the scale ``score`` values are
+# on. Omitted when results are empty; labels name the BASE scale. STM reads
+# them with the same opportunistic contract as ``hints`` and stamps them
+# per result so cache entries and the daemon wire carry the scale for free.
+
+STRUCTURED_TWO_RESULTS_WITH_SCALE = (
+    '{"score_scale": "rerank", "reranker": "BAAI/bge-reranker-v2-m3", "results": ['
+    '  {"rank": 1, "score": 2.08, "source": "auth.md", "hierarchy": "Authentication",'
+    '   "namespace": "default", "chunk_id": "abc123", "content": "JWT authentication..."},'
+    '  {"rank": 2, "score": -0.17, "source": "api.md", "hierarchy": "Rate Limiting",'
+    '   "namespace": "default", "chunk_id": "def456", "content": "Rate limit headers..."}'
+    "]}"
+)
+
+
+class TestStructuredScoreScale:
+    """StructuredResultParser stamps core-reported score_scale/reranker
+    (#1781) onto every result, degrading to ``None`` for pre-#1781 shapes."""
+
+    def test_structured_parser_stamps_score_scale_and_reranker(self):
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        results, _ = StructuredResultParser().parse(STRUCTURED_TWO_RESULTS_WITH_SCALE)
+        assert len(results) == 2
+        assert all(r.score_scale == "rerank" for r in results)
+        assert all(r.reranker == "BAAI/bge-reranker-v2-m3" for r in results)
+        # Logit-scale scores survive parsing untouched (negative included).
+        assert results[1].score == pytest.approx(-0.17)
+
+    def test_structured_parser_scale_absent_is_none(self):
+        """Old-core pin: the pre-#1781 payload shape yields ``None`` stamps."""
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        results, _ = StructuredResultParser().parse(STRUCTURED_TWO_RESULTS)
+        assert all(r.score_scale is None for r in results)
+        assert all(r.reranker is None for r in results)
+
+    def test_structured_parser_ignores_non_string_scale(self):
+        """Alpha tolerance: non-string/empty values degrade to ``None``."""
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        base = (
+            '{{"score_scale": {scale}, "reranker": {reranker}, "results": ['
+            '{{"rank": 1, "score": 0.9, "source": "a.md", "namespace": "default",'
+            ' "content": "body"}}]}}'
+        )
+        for scale, reranker in (("3", "7"), ("null", "null"), ('""', '""'), ("[]", "{}")):
+            results, _ = StructuredResultParser().parse(base.format(scale=scale, reranker=reranker))
+            assert results[0].score_scale is None
+            assert results[0].reranker is None
+
+    def test_structured_parser_preserves_unknown_scale_label(self):
+        """A renamed core label must reach telemetry verbatim, not as None."""
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        payload = (
+            '{"score_scale": "rrf2", "results": ['
+            '{"rank": 1, "score": 0.9, "source": "a.md", "namespace": "default",'
+            ' "content": "body"}]}'
+        )
+        results, _ = StructuredResultParser().parse(payload)
+        assert results[0].score_scale == "rrf2"
+
+    def test_compact_parser_never_stamps_scale(self):
+        from memtomem_stm.surfacing.mcp_client import CompactResultParser
+
+        results, _ = CompactResultParser().parse("[1] 0.92 | auth.md > Auth\nJWT rotation\n")
+        assert results[0].score_scale is None
+        assert results[0].reranker is None
+
+    @pytest.mark.asyncio
+    async def test_search_stamps_scale_end_to_end(self):
+        """Adapter-level: the stamp survives the real search() path."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from memtomem_stm.surfacing.config import SurfacingConfig
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=False,
+            content=[SimpleNamespace(type="text", text=STRUCTURED_TWO_RESULTS_WITH_SCALE)],
+        )
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        adapter._session = session
+        adapter._start_attempted = True
+        results, _, outcome = await adapter.search("deployment", top_k=6)
+        assert outcome == "ok"
+        assert [r.score_scale for r in results] == ["rerank", "rerank"]
+        assert results[0].reranker == "BAAI/bge-reranker-v2-m3"
+
     def test_structured_parser_hints_with_results(self):
         """Hints can accompany non-empty results too (e.g. "3 filtered")."""
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser

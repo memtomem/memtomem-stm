@@ -533,16 +533,26 @@ class DaemonServer:
 
                 async def search_call() -> dict[str, Any]:
                     results, hints, outcome = await self._adapter.search(**parsed)
-                    encoded_results = [
-                        {
+                    encoded_results = []
+                    for result in results:
+                        entry: dict[str, Any] = {
                             "content": str(result.chunk.content),
                             "score": float(result.score),
                             "source": str(result.chunk.metadata.source_file),
                             "namespace": str(result.chunk.metadata.namespace),
                             "chunk_id": str(result.chunk.id),
                         }
-                        for result in results
-                    ]
+                        # Core-reported score scale (#1781): additive keys,
+                        # omitted when the core did not name one, so older
+                        # clients and older daemons interoperate without a
+                        # PROTOCOL_VERSION bump (readers use .get()).
+                        scale = getattr(result, "score_scale", None)
+                        if isinstance(scale, str) and scale:
+                            entry["score_scale"] = scale
+                        reranker = getattr(result, "reranker", None)
+                        if isinstance(reranker, str) and reranker:
+                            entry["reranker"] = reranker
+                        encoded_results.append(entry)
                     return {
                         "v": PROTOCOL_VERSION,
                         "ok": True,

@@ -45,6 +45,10 @@ class FakeSearchResult:
     chunk: FakeChunk
     score: float
     rank: int = 1
+    # Core-reported scale stamp (#1781). Defaults mirror the unstamped paths
+    # (compact format, compose bundles, pre-#1781 cores).
+    score_scale: str | None = None
+    reranker: str | None = None
 
 
 def _make_config(**overrides) -> SurfacingConfig:
@@ -3448,6 +3452,190 @@ class TestScoreScaleDiagnostic:
 
         assert outputs == [LONG_RESPONSE] * 5
         tracker.record_diagnostic.assert_called_once()
+
+
+class TestReportedScoreScale:
+    """Core-reported ``score_scale`` (#1781): definitive mismatch diagnostic,
+    telemetry threading, and the stats snapshot. Observability only — the
+    min_score filter itself stays scale-blind in this change."""
+
+    @staticmethod
+    def _low(scale: str | None, *, reranker: str | None = None, score: float = -0.17):
+        return [
+            FakeSearchResult(chunk=FakeChunk(), score=score, score_scale=scale, reranker=reranker)
+        ]
+
+    @staticmethod
+    def _engine(tracker=None, results=None):
+        config = _make_config(min_score=0.03, dedup_ttl_seconds=0, stats_retention_days=0)
+        return SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(results or []),
+            feedback_tracker=tracker,
+        )
+
+    def test_known_non_rrf_scale_fires_mismatch_immediately(self, caplog):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = self._low("rerank", reranker="BAAI/bge-reranker-v2-m3")
+
+        with caplog.at_level(logging.WARNING):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert len(warnings) == 1  # once per episode, no streak of 5 needed
+        assert "score_scale='rerank'" in warnings[0]
+        assert "reranker=BAAI/bge-reranker-v2-m3" in warnings[0]
+        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+        # The named scale supersedes streak evidence entirely.
+        assert ("gh", "read_file") not in engine._score_scale_streaks
+
+    def test_all_non_rrf_labels_fire_definitively(self):
+        for scale in ("rerank", "bm25", "dense", "none"):
+            tracker = MagicMock()
+            engine = self._engine(tracker=tracker)
+            engine._observe_score_scale("gh", "read_file", self._low(scale), 0.03)
+            tracker.record_diagnostic.assert_called_once_with(
+                "gh", "read_file", "score_scale_mismatch"
+            )
+
+    def test_rrf_confirmed_scale_keeps_streak_of_five(self, caplog):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = self._low("rrf", score=0.016)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(4):
+                engine._observe_score_scale("gh", "read_file", low, 0.03)
+            tracker.record_diagnostic.assert_not_called()
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert "Core confirms score_scale=rrf" in warnings[0]
+
+    def test_unrecognized_label_stays_on_heuristic_tier(self, caplog):
+        """A renamed core label must not fire the definitive diagnostic."""
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = self._low("rrf2", score=0.016)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert "may be running single-leg/BM25-only" in warnings[0]
+
+    def test_mismatch_recovers_on_healthy_observation_and_rearms(self):
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = self._low("rerank")
+        healthy = self._low("rerank", score=0.5)
+
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        # The healthy branch also books the (no-op) ceiling-kind recovery —
+        # pre-existing behavior pinned elsewhere; here we only require the
+        # mismatch episode to close exactly once.
+        tracker.record_diagnostic_recovery.assert_any_call(
+            "gh", "read_file", "score_scale_mismatch"
+        )
+        mismatch_recoveries = [
+            c
+            for c in tracker.record_diagnostic_recovery.call_args_list
+            if c.args[2] == "score_scale_mismatch"
+        ]
+        assert len(mismatch_recoveries) == 1
+        # Re-arm: a fresh below-threshold observation opens a new episode.
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        assert tracker.record_diagnostic.call_count == 2
+
+    def test_mismatch_latch_survives_empty_results(self):
+        """Alternating empty/below-threshold searches must not re-fire."""
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker)
+        low = self._low("rerank")
+
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        engine._observe_score_scale("gh", "read_file", [], 0.03)
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        tracker.record_diagnostic.assert_called_once()
+
+    async def test_record_surfacing_carries_score_scale_on_miss_and_cache_hit(self):
+        tracker = MagicMock()
+        surfaced = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="stamped memory"),
+                score=0.5,
+                score_scale="rerank",
+                reranker="fake-rr",
+            )
+        ]
+        engine = self._engine(tracker=tracker, results=surfaced)
+        args = {"_context_query": "stamped score scale query"}
+
+        await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+        assert tracker.record_surfacing.call_args.kwargs["score_scale"] == "rerank"
+
+        # Second identical query is a cache hit; the stamp rode the cache.
+        await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+        assert tracker.record_surfacing.call_count == 2
+        assert tracker.record_surfacing.call_args.kwargs["score_scale"] == "rerank"
+
+    async def test_snapshot_exposes_last_reported_scale(self):
+        surfaced = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="stamped memory"),
+                score=0.5,
+                score_scale="rerank",
+                reranker="fake-rr",
+            )
+        ]
+        engine = self._engine(results=surfaced)
+        snap = engine.get_min_score_snapshot()
+        assert snap["score_scale"] == {"last_reported": None, "reranker": None}
+
+        await engine.surface(
+            "gh", "read_file", {"_context_query": "snapshot scale query"}, LONG_RESPONSE
+        )
+        snap = engine.get_min_score_snapshot()
+        assert snap["score_scale"] == {"last_reported": "rerank", "reranker": "fake-rr"}
+
+    async def test_unstamped_search_keeps_last_reported_scale(self):
+        """Compose/compact traffic (no stamp) must not flip the line to unknown."""
+        tracker = MagicMock()
+        surfaced = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="stamped memory"), score=0.5, score_scale="rrf"
+            )
+        ]
+        engine = self._engine(tracker=tracker, results=surfaced)
+        await engine.surface(
+            "gh", "read_file", {"_context_query": "first stamped query"}, LONG_RESPONSE
+        )
+
+        engine._mcp_adapter.search = AsyncMock(
+            return_value=(
+                [FakeSearchResult(chunk=FakeChunk(content="unstamped memory"), score=0.5)],
+                [],
+                "ok",
+            )
+        )
+        await engine.surface(
+            "gh", "read_file", {"_context_query": "second unstamped query"}, LONG_RESPONSE
+        )
+        snap = engine.get_min_score_snapshot()
+        assert snap["score_scale"]["last_reported"] == "rrf"
+        # The unstamped row still records honestly: its own scale is unknown.
+        assert tracker.record_surfacing.call_args.kwargs["score_scale"] is None
 
 
 class TestSurfacingEngineObservability:

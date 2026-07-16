@@ -122,7 +122,7 @@ class TestRecordFault:
         store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
         store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
         store.record_diagnostic("gh", "read_file", "unknown_diagnostic")
-        assert DIAGNOSTIC_KINDS == {"score_ceiling_below_min"}
+        assert DIAGNOSTIC_KINDS == {"score_ceiling_below_min", "score_scale_mismatch"}
         assert _fault_rows(tmp_path / "f.db") == [("gh", "read_file", "score_ceiling_below_min", 2)]
 
     def test_delete_faults_older_than(self, tmp_path):
@@ -254,6 +254,37 @@ class TestSummaryFaults:
         store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
         assert read_surfacing_summary(db_path)["active_diagnostics"] == {
             "score_ceiling_below_min": 2
+        }
+        store.close()
+
+    def test_scale_mismatch_partitions_records_and_recovers(self, tmp_path, monkeypatch):
+        """The #1781 definitive kind flows through the same diagnostics
+        partition, active-episode filter, and recovery UPDATE as the
+        streak heuristic — and the two kinds recover independently."""
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        store.record_diagnostic("gh", "other_tool", "score_ceiling_below_min")
+
+        summary = read_surfacing_summary(db_path)
+        assert summary["diagnostics"] == {
+            "score_scale_mismatch": 1,
+            "score_ceiling_below_min": 1,
+        }
+        assert summary["faults"] == {}
+        assert summary["active_diagnostics"] == {
+            "score_scale_mismatch": 1,
+            "score_ceiling_below_min": 1,
+        }
+
+        store.record_diagnostic_recovery("gh", "read_file", "score_scale_mismatch")
+        assert read_surfacing_summary(db_path)["active_diagnostics"] == {
+            "score_ceiling_below_min": 1
         }
         store.close()
 

@@ -50,7 +50,11 @@ CREATE TABLE IF NOT EXISTS surfacing_events (
     query       TEXT,
     memory_ids  TEXT    NOT NULL,
     scores      TEXT    NOT NULL,
-    created_at  REAL    NOT NULL
+    created_at  REAL    NOT NULL,
+    -- Core-reported scale of the ``scores`` values (#1781): 'rrf', 'bm25',
+    -- 'dense', 'none', 'rerank', or NULL when the core did not name one
+    -- (pre-#1781 cores, compact format, compose bundles).
+    score_scale TEXT
 );
 
 CREATE TABLE IF NOT EXISTS surfacing_feedback (
@@ -122,11 +126,22 @@ FAULT_KINDS: frozenset[str] = frozenset(
     }
 )
 
-DIAGNOSTIC_KINDS: frozenset[str] = frozenset({"score_ceiling_below_min"})
+DIAGNOSTIC_KINDS: frozenset[str] = frozenset(
+    {
+        "score_ceiling_below_min",
+        "score_scale_mismatch",
+    }
+)
 """Advisory signals stored in ``surfacing_faults`` for schema reuse.
 
 They are partitioned from real degraded-dependency faults at read time so the
 CLI never describes a healthy-but-miscalibrated search as a timeout/failure.
+
+``score_ceiling_below_min`` is the streak heuristic (five consecutive
+non-empty searches under the threshold, scale unknown);
+``score_scale_mismatch`` is its definitive tier — the core NAMED a non-RRF
+``score_scale`` (#1781) while the ceiling sat below the RRF-calibrated
+``min_score``, so it fires on first observation without streak evidence.
 """
 
 
@@ -189,6 +204,23 @@ def _add_fault_recovery_column(db: sqlite3.Connection) -> None:
     }
     if columns and "last_recovered_at" not in columns:
         db.execute("ALTER TABLE surfacing_faults ADD COLUMN last_recovered_at REAL")
+        db.commit()
+
+
+def _add_events_score_scale_column(db: sqlite3.Connection) -> None:
+    """Add the core-reported score-scale label (#1781) to pre-existing databases.
+
+    Ordering is load-bearing: this must run AFTER
+    :func:`_relax_surfacing_events_query_notnull` in ``initialize()`` — that
+    migration recreates ``surfacing_events`` from a hardcoded pre-#352 column
+    list, so a column added before it would be silently dropped on legacy
+    NOT-NULL databases.
+    """
+    columns = {
+        str(row[1]) for row in db.execute("PRAGMA table_info('surfacing_events')").fetchall()
+    }
+    if columns and "score_scale" not in columns:
+        db.execute("ALTER TABLE surfacing_events ADD COLUMN score_scale TEXT")
         db.commit()
 
 
@@ -351,13 +383,14 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
                 for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
             }
             if "last_recovered_at" in fault_columns:
-                active_where = fault_where + " AND kind = 'score_ceiling_below_min'"
+                kind_placeholders = ", ".join("?" for _ in DIAGNOSTIC_KINDS)
+                active_where = fault_where + f" AND kind IN ({kind_placeholders})"
                 active_rows = db.execute(
                     "SELECT kind, SUM(count), MAX(last_at), MAX(last_recovered_at) "
                     "FROM surfacing_faults"
                     f"{active_where} GROUP BY kind "
                     "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)",
-                    fault_params,
+                    [*fault_params, *sorted(DIAGNOSTIC_KINDS)],
                 ).fetchall()
                 summary["active_diagnostics"] = {row[0]: row[1] for row in active_rows}
             else:
@@ -410,6 +443,8 @@ class FeedbackStore:
             db.executescript(_SCHEMA)
             _relax_surfacing_events_query_notnull(db)
             _add_fault_recovery_column(db)
+            # Must stay after the relax migration — see its docstring.
+            _add_events_score_scale_column(db)
         except Exception:
             db.close()
             raise
@@ -428,13 +463,15 @@ class FeedbackStore:
         query: str,
         memory_ids: list[str],
         scores: list[float],
+        score_scale: str | None = None,
     ) -> None:
         if self._db is None:
             return
         with self._lock:
             self._db.execute(
-                "INSERT OR IGNORE INTO surfacing_events (id, server, tool, query, memory_ids, scores, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO surfacing_events "
+                "(id, server, tool, query, memory_ids, scores, created_at, score_scale) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     surfacing_id,
                     server,
@@ -443,6 +480,7 @@ class FeedbackStore:
                     json.dumps(memory_ids),
                     json.dumps(scores),
                     time.time(),
+                    score_scale,
                 ),
             )
             self._db.commit()
@@ -713,6 +751,7 @@ class FeedbackStore:
             "total_feedback": 0,
             "recent": [],
             "score_distribution": {"count": 0, "min": None, "max": None},
+            "score_scale_distribution": {},
         }
         if self._db is None:
             return empty
@@ -755,13 +794,20 @@ class FeedbackStore:
         # ranking information. min/max is O(1) memory and is exactly the
         # "all scores equal" predicate — no need to hold the value set.
         rows = self._db.execute(
-            f"SELECT tool, memory_ids, scores FROM surfacing_events{where_sql}", event_params
+            f"SELECT tool, memory_ids, scores, score_scale FROM surfacing_events{where_sql}",
+            event_params,
         ).fetchall()
         per_tool: dict[str, dict[str, float]] = {}
         score_count = 0
         score_min: float | None = None
         score_max: float | None = None
-        for tool_name, memory_ids_json, scores_json in rows:
+        # Per-event count of the core-reported scale label (#1781). NULL rows
+        # (pre-#1781 cores, compose bundles, legacy events) bucket under
+        # "unknown" so the distribution always sums to events_total.
+        score_scale_distribution: dict[str, int] = {}
+        for tool_name, memory_ids_json, scores_json, score_scale in rows:
+            scale_key = score_scale if isinstance(score_scale, str) and score_scale else "unknown"
+            score_scale_distribution[scale_key] = score_scale_distribution.get(scale_key, 0) + 1
             try:
                 ids = json.loads(memory_ids_json)
                 n = len(ids) if isinstance(ids, list) else 0
@@ -838,12 +884,12 @@ class FeedbackStore:
         recent: list[dict] = []
         if limit > 0:
             recent_rows = self._db.execute(
-                f"SELECT created_at, tool, query, memory_ids, scores "
+                f"SELECT created_at, tool, query, memory_ids, scores, score_scale "
                 f"FROM surfacing_events{where_sql} "
                 "ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 [*event_params, limit],
             ).fetchall()
-            for ts, tool_name, query, memory_ids_json, scores_json in recent_rows:
+            for ts, tool_name, query, memory_ids_json, scores_json, score_scale in recent_rows:
                 try:
                     memory_ids = json.loads(memory_ids_json)
                 except (json.JSONDecodeError, TypeError):
@@ -880,6 +926,7 @@ class FeedbackStore:
                         "query_preview": preview,
                         "memory_ids": memory_ids,
                         "scores": scores,
+                        "score_scale": score_scale,
                     }
                 )
 
@@ -892,6 +939,7 @@ class FeedbackStore:
             "total_feedback": total_feedback,
             "recent": recent,
             "score_distribution": {"count": score_count, "min": score_min, "max": score_max},
+            "score_scale_distribution": score_scale_distribution,
         }
 
     # ── Cross-session dedup ────────────────────────────────────────────

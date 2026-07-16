@@ -18,6 +18,7 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.mcp_client import (
+    KNOWN_SCORE_SCALES,
     LtmCapabilities,
     LtmTransportError,
     SearchOutcome,
@@ -258,6 +259,20 @@ class SurfacingEngine:
         # Re-arm only after a subsequent below-threshold observation so the
         # healthy hot path does not UPDATE+commit on every search.
         self._score_scale_recovery_persisted: set[tuple[str, str]] = set()
+        # Keys with an open ``score_scale_mismatch`` episode (#1781): the core
+        # NAMED a non-RRF scale while the ceiling sat below min_score, so the
+        # diagnostic fired without streak evidence. Fires once per episode;
+        # cleared when a healthy (at-or-above-threshold) observation persists
+        # the recovery. Deliberately NOT cleared on empty results — alternating
+        # empty/below-threshold searches must not re-fire the WARNING.
+        self._score_scale_mismatch_active: set[tuple[str, str]] = set()
+        # Last core-reported score scale / reranker model ID (#1781), fed to
+        # ``get_min_score_snapshot`` for stm_surfacing_stats. ``None`` until a
+        # capable core names one this process; kept at the last REPORTED value
+        # across unstamped paths (compose bundles, compact format) so a mixed
+        # compose/search flow doesn't flip the stats line to "unknown".
+        self._last_score_scale: str | None = None
+        self._last_reranker: str | None = None
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -344,6 +359,28 @@ class SurfacingEngine:
 
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
+
+    @staticmethod
+    def _result_score_scale(results: list[Any]) -> tuple[str | None, str | None]:
+        """Return the core-reported ``(score_scale, reranker)`` stamped on *results*.
+
+        Reads the first non-pinned result via ``getattr`` — engine tests use
+        lightweight result stubs (same precedent as the ``pinned`` reads).
+        Compose bundles, compact parses, and pre-#1781 cores stamp nothing,
+        so those paths structurally yield ``(None, None)``. Core labels one
+        scale per response; a hypothetical mixed payload reads as its first
+        retrieved element.
+        """
+        for r in results:
+            if getattr(r, "pinned", False):
+                continue
+            scale = getattr(r, "score_scale", None)
+            reranker = getattr(r, "reranker", None)
+            return (
+                scale if isinstance(scale, str) and scale else None,
+                reranker if isinstance(reranker, str) and reranker else None,
+            )
+        return None, None
 
     async def _run_within(self, coro: Any, timeout: float) -> Any:
         """Run *coro* under *timeout*, turning an abort *this* call's timer
@@ -465,6 +502,14 @@ class SurfacingEngine:
         Empty results and a candidate at/above the active threshold reset the
         episode. A threshold change also resets it so evidence gathered under
         one operator/auto-tuned policy is never combined with another.
+
+        Two evidence tiers share this tripwire (#1781): when the core NAMES a
+        non-RRF scale on the results, a below-threshold ceiling is a definitive
+        calibration mismatch — ``min_score`` is calibrated against RRF — and
+        the ``score_scale_mismatch`` diagnostic fires on first observation.
+        Without a reported scale (compose bundles, compact format, pre-#1781
+        cores) the streak-of-``_SCORE_SCALE_WARNING_STREAK`` heuristic and its
+        ``score_ceiling_below_min`` diagnostic behave exactly as before.
         """
         key = (server, tool)
         if not results:
@@ -483,9 +528,42 @@ class SurfacingEngine:
                 and self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
             ):
                 self._score_scale_recovery_persisted.add(key)
+            if key in self._score_scale_mismatch_active and self._persist_diagnostic_recovery(
+                server, tool, "score_scale_mismatch"
+            ):
+                self._score_scale_mismatch_active.discard(key)
             return
 
         self._score_scale_recovery_persisted.discard(key)
+
+        scale, reranker = self._result_score_scale(results)
+        if scale is not None and scale in KNOWN_SCORE_SCALES and scale != "rrf":
+            # Definitive tier: no streak needed — the core itself says the
+            # scores are not on the scale min_score was calibrated against.
+            # Unrecognized labels stay on the heuristic tier: a renamed core
+            # label must not fire a diagnostic whose wording it may not match.
+            if key not in self._score_scale_mismatch_active:
+                logger.warning(
+                    "Surfacing score-scale mismatch for %s/%s: core reports "
+                    "score_scale=%r%s but min_score=%.4f is calibrated for the "
+                    "RRF scale (observed ceiling=%.4f). Every result is being "
+                    "filtered out; upgrade core past v0.3.11 so STM's rerank "
+                    "bypass applies, or pin a scale-appropriate per-tool "
+                    "min_score. STM did not change the threshold.",
+                    server,
+                    tool,
+                    scale,
+                    f" (reranker={reranker})" if reranker else "",
+                    min_score,
+                    result_max,
+                )
+                self._persist_diagnostic(server, tool, "score_scale_mismatch")
+                self._score_scale_mismatch_active.add(key)
+            # The named scale supersedes streak evidence: keep the heuristic
+            # counter out of a window the definitive diagnostic already covers.
+            self._score_scale_streaks.pop(key, None)
+            return
+
         previous = self._score_scale_streaks.get(key)
         if previous is None or previous.threshold != min_score:
             streak = _ScoreScaleStreak(
@@ -504,17 +582,31 @@ class SurfacingEngine:
         if streak.count == _SCORE_SCALE_WARNING_STREAK and (
             previous is None or previous.count < _SCORE_SCALE_WARNING_STREAK
         ):
+            if scale == "rrf":
+                # Core confirmed the scale, so the wide "may be running
+                # single-leg/BM25-only" hedge collapses to the two causes
+                # that survive on a confirmed RRF scale.
+                cause = (
+                    "Core confirms score_scale=rrf, so the fusion is running "
+                    "single-leg (one retriever contributing) or min_score is "
+                    "intentionally high; check embedding extras and LTM logs"
+                )
+            else:
+                cause = (
+                    "LTM may be running single-leg/BM25-only or min_score may "
+                    "be intentionally high; check embedding extras and LTM logs"
+                )
             logger.warning(
                 "Surfacing score-scale mismatch for %s/%s: %d consecutive "
                 "non-empty LTM searches had max score below active min_score "
-                "(observed ceiling=%.4f, min_score=%.4f). LTM may be running "
-                "single-leg/BM25-only or min_score may be intentionally high; "
-                "check embedding extras and LTM logs. STM did not lower the threshold.",
+                "(observed ceiling=%.4f, min_score=%.4f). %s. "
+                "STM did not lower the threshold.",
                 server,
                 tool,
                 _SCORE_SCALE_WARNING_STREAK,
                 streak.observed_max,
                 min_score,
+                cause,
             )
             self._persist_diagnostic(server, tool, "score_ceiling_below_min")
 
@@ -611,6 +703,13 @@ class SurfacingEngine:
             "auto_tune_min_samples": self._config.auto_tune_min_samples,
             "adjusted": adjusted,
             "overrides": overrides,
+            # Last core-REPORTED scale (#1781): ``None`` means no structured
+            # search this process carried the key (pre-#1781 core, compact
+            # format, or compose-only traffic) — not that scores are RRF.
+            "score_scale": {
+                "last_reported": self._last_score_scale,
+                "reranker": self._last_reranker,
+            },
         }
 
     async def surface(
@@ -1101,6 +1200,9 @@ class SurfacingEngine:
                         for r in cached
                         if not getattr(r, "pinned", False) and str(r.chunk.id) in delivered_set
                     ],
+                    # Cached entries keep the scale they were stamped with at
+                    # miss time, so the hit-path row carries it too.
+                    score_scale=self._result_score_scale(cached)[0],
                 )
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
@@ -1388,6 +1490,10 @@ class SurfacingEngine:
 
         retrieved_results = [r for r in results if not getattr(r, "pinned", False)]
         self._observe_score_scale(server, tool, retrieved_results, min_score)
+        score_scale, reranker_id = self._result_score_scale(retrieved_results)
+        if score_scale is not None:
+            self._last_score_scale = score_scale
+            self._last_reranker = reranker_id
 
         # Parent trust-UX hints (parent PR #231): log at INFO even when results
         # are empty or get filtered out below, since an operator may want to
@@ -1543,6 +1649,7 @@ class SurfacingEngine:
                     query=self._persistable_query(query),
                     memory_ids=delivered_ids,
                     scores=[r.score for r in delivered_results],
+                    score_scale=score_scale,
                 )
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
@@ -1581,6 +1688,7 @@ class SurfacingEngine:
                         "query": query,
                         "memory_ids": delivered_ids,
                         "scores": [r.score for r in relevant if str(r.chunk.id) in delivered_set],
+                        "score_scale": score_scale,
                         "surfacing_id": surfacing_id,
                     },
                 )

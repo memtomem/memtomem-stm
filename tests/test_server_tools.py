@@ -995,6 +995,43 @@ class TestSurfacingStats:
         # Negative ratio rendered where feedback exists.
         assert "negative 73.3%" in result  # tuned: 22/30
         assert "negative 20.0%" in result  # ready: 5/25
+        # Snapshot without a score_scale entry (older engine mock) renders
+        # the honest fallback line rather than crashing or omitting it.
+        assert "Score scale:     unknown (core did not report one)" in result
+
+    async def test_score_scale_line_renders_core_reported_scale(self):
+        """#1781: the snapshot's last core-reported scale (and reranker
+        model ID, when present) lands in the stats output."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [],
+            "rating_distribution": {},
+            "total_feedback": 0,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {}
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        snapshot = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+            "score_scale": {"last_reported": "rerank", "reranker": "fake-rr"},
+        }
+        mock_engine.get_min_score_snapshot.return_value = snapshot
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "Score scale:     rerank (core-reported; reranker: fake-rr)" in result
+
+        snapshot["score_scale"] = {"last_reported": "rrf", "reranker": None}
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "Score scale:     rrf (core-reported)" in result
 
     async def test_need_more_uses_global_gap_when_pool_also_below_threshold(self):
         """When *both* the tool's own and the global pool are below

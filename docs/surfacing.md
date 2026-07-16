@@ -655,6 +655,21 @@ hit:
   hybrid scale. If the backend is healthy and the stricter policy is
   intentional, set `context_tools.<name>.min_score` explicitly. The
   diagnostic never lowers the threshold automatically.
+
+  Cores newer than v0.3.11 name the scale their scores are on
+  (`score_scale`: `rrf` / `bm25` / `dense` / `none` / `rerank`, core
+  #1781) in structured `mem_search` output, and STM stamps it onto every
+  parsed result. When the core names a **non-RRF** scale while the
+  ceiling sits below `min_score`, the mismatch is definitive — the
+  threshold is calibrated against RRF — so STM fires the warning on the
+  **first** observation (no five-call streak) and persists
+  `score_scale_mismatch` instead. `stm_surfacing_stats` shows the last
+  core-reported scale as a `Score scale:` line, the reranker model ID
+  when one is active, and each event row records its scale in
+  `stm_feedback.db`. Compose bundles and the compact format carry no
+  scale today (compose is tracked in core memtomem#1791), so those paths
+  keep the streak heuristic. In this release the scale is
+  observability-only: `min_score` filtering itself is unchanged.
 - `no_results_dedup` — every result was already surfaced this
   session and dropped by `_surfaced_ids`. Distinct from
   `no_results_score` so an operator can tell whether to lower

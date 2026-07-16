@@ -241,11 +241,15 @@ class DaemonLtmAdapter:
             score = safe_float(item.get("score"), float("nan"))
             if not math.isfinite(score):
                 continue
+            raw_scale = item.get("score_scale")
+            raw_reranker = item.get("reranker")
             result = RemoteSearchResult(
                 content=item["content"],
                 score=score,
                 source=str(item.get("source") or ""),
                 namespace=str(item.get("namespace") or "default"),
+                score_scale=raw_scale if isinstance(raw_scale, str) and raw_scale else None,
+                reranker=raw_reranker if isinstance(raw_reranker, str) and raw_reranker else None,
             )
             chunk_id = item.get("chunk_id")
             if isinstance(chunk_id, str) and chunk_id:

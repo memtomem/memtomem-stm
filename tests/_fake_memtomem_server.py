@@ -49,6 +49,13 @@ mcp = FastMCP("fake-memtomem")
 # constant after that — ``mem_search`` branches on ``is not None``.
 _SEEDS: list[dict] | None = None
 
+# Populated once at startup when ``--score-scale`` / ``--reranker-id`` are
+# passed. The default (None) keeps the structured payload byte-compatible
+# with cores older than #1781 — no top-level ``score_scale``/``reranker``
+# keys — so existing tests keep pinning the old-core degradation path.
+_SCORE_SCALE: str | None = None
+_RERANKER_ID: str | None = None
+
 
 def _load_seeds(path: str) -> list[dict]:
     """Load bench_qa seed array from *path*.
@@ -87,6 +94,10 @@ def _emit_structured(items: list[dict]) -> str:
     ``chunk_id`` key is emitted unless the seed carries one, so the
     adapter falls back to its ``sha256(content)[:16]`` surrogate and
     bench_qa's pre-computed IDs keep lining up across both formats.
+
+    When ``--score-scale`` is set, the top-level ``score_scale`` (and
+    ``reranker``, if ``--reranker-id`` is set) keys are added — but only
+    for non-empty results, mirroring core #1781's omission rule.
     """
     results = []
     for item in items:
@@ -101,7 +112,12 @@ def _emit_structured(items: list[dict]) -> str:
         if "chunk_id" in item:
             entry["chunk_id"] = item["chunk_id"]
         results.append(entry)
-    return json.dumps({"results": results})
+    payload: dict = {"results": results}
+    if results and _SCORE_SCALE is not None:
+        payload["score_scale"] = _SCORE_SCALE
+        if _RERANKER_ID is not None:
+            payload["reranker"] = _RERANKER_ID
+    return json.dumps(payload)
 
 
 async def mem_search(
@@ -246,9 +262,26 @@ if __name__ == "__main__":
             "(core #1766); the default registration stands in for older cores."
         ),
     )
+    parser.add_argument(
+        "--score-scale",
+        choices=sorted(("rrf", "bm25", "dense", "none", "rerank")),
+        default=None,
+        help=(
+            "Emit the top-level score_scale key in structured mem_search output "
+            "(core #1781); the default omits it, standing in for older cores."
+        ),
+    )
+    parser.add_argument(
+        "--reranker-id",
+        metavar="ID",
+        default=None,
+        help="Emit the top-level reranker model-ID key alongside --score-scale.",
+    )
     args = parser.parse_args()
     if args.seeds is not None:
         _SEEDS = _load_seeds(args.seeds)
+    _SCORE_SCALE = args.score_scale
+    _RERANKER_ID = args.reranker_id
     if args.rerank_capable:
         mcp.tool(name="mem_search")(mem_search_rerank_capable)
     else:
