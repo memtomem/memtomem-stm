@@ -7,6 +7,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -746,6 +747,37 @@ class TestSurfacingDeadline:
         assert output == LONG_RESPONSE  # the engine's own timeout won, and fail-open
         assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
         assert engine._circuit_breaker.failure_count == 1
+
+    async def test_a_finished_operation_is_not_booked_by_a_timer_in_the_same_batch(
+        self, monkeypatch
+    ):
+        # A shield resolves its wrapper from a queued callback, so there is one
+        # loop batch where the operation is done but the wrapper is not. A timer
+        # firing in exactly that batch must not book: the LTM answered inside
+        # its window, and charging it would open the breaker on a healthy one.
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=_make_mcp_adapter(),
+        )
+        loop = asyncio.get_running_loop()
+        fire: dict[str, Any] = {}
+        real_call_later = loop.call_later
+
+        def spy_call_later(delay, callback, *args):
+            fire["callback"] = callback
+            return real_call_later(delay, callback, *args)
+
+        monkeypatch.setattr(loop, "call_later", spy_call_later)
+
+        async def answers() -> str:
+            return "answered in time"
+
+        task = asyncio.create_task(engine._run_within(answers(), 30.0))
+        await asyncio.sleep(0)  # arm the timer, suspend on the shield
+        await asyncio.sleep(0)  # the operation finishes; the wrapper is only queued to resolve
+        fire["callback"]()  # the timer, landing in exactly that batch
+
+        assert await task == "answered in time"
 
     async def test_stop_is_not_held_open_by_a_cancellation_resistant_unwind(self, monkeypatch):
         # `_run_within` abandons the LTM operation precisely because its unwind

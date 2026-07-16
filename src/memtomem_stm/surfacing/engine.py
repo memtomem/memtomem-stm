@@ -329,10 +329,16 @@ class SurfacingEngine:
 
         def _fire() -> None:
             nonlocal timed_out
-            if not shielded.done():
-                timed_out = True
-                # Only the wrapper: ``op`` keeps unwinding on its own time.
-                shielded.cancel()
+            # ``op`` first: a shield resolves its wrapper from a queued
+            # callback, so there is one loop batch where the operation has
+            # finished but ``shielded`` has not caught up. Firing on the
+            # wrapper alone would charge an LTM that answered inside its
+            # window.
+            if op.done() or shielded.done():
+                return
+            timed_out = True
+            # Only the wrapper: ``op`` keeps unwinding on its own time.
+            shielded.cancel()
 
         handle = asyncio.get_running_loop().call_later(timeout, _fire)
         try:
