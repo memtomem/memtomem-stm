@@ -297,8 +297,12 @@ class SurfacingEngine:
         self._score_scale_streaks.pop((server, tool), None)
 
     async def _run_within(self, coro: Any, timeout: float) -> Any:
-        """Run *coro* under *timeout*, raising :class:`asyncio.TimeoutError` if
-        and only if *this* call's timer started the abort (#720).
+        """Run *coro* under *timeout*, turning an abort *this* call's timer
+        started into :class:`asyncio.TimeoutError` (#720).
+
+        (A :class:`asyncio.TimeoutError` raised by *coro* itself also reaches
+        the caller, and :meth:`surface` books it the same way. That predates
+        this and is not what the machinery below is about.)
 
         Telling that apart from a cancellation of the call itself is the whole
         job here, because only the timeout books the fault, the log, and the
