@@ -67,7 +67,13 @@ changes inline only. See the deprecation policy in
   `asyncio.timeout_at(NaN)`, `+inf` admitted with a backstop that can never
   fire, and an int too large for a float made the dispatch raise instead of
   respond. #721 fixed the same family in `_surface_deadline`; both sites now
-  share one validation helper. (#722)
+  share one validation helper. The one configuration that could legitimately
+  produce an infinite deadline is closed at the source:
+  `hook.daemon_timeout_seconds` must now be finite (it becomes the client
+  deadline as `now + budget`, so `+inf` is not a big budget but a deadline
+  the daemon can never enforce — and would have every request rejected).
+  **Behavior change**: `daemon_timeout_seconds=inf`/`nan` is a config
+  `ValidationError` instead of an accepted value. (#722)
 
 ## [0.1.40] — 2026-07-15
 
