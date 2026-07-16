@@ -847,7 +847,7 @@ class TestSurfacingDeadline:
         # first attempt's per-key lock and be cancelled there, never reaching
         # the adapter — so it would never leave an operation behind and the
         # pile-up this guards against would not appear.
-        for i in range(engine_module._MAX_OUTSTANDING_LTM_OPS + 3):
+        for i in range(engine_module._MAX_ABANDONED_OPS + 3):
             await engine.surface(
                 "gh",
                 "read_file",
@@ -859,21 +859,23 @@ class TestSurfacingDeadline:
                 deadline_monotonic=None,
             )
 
-        assert len(engine._abandoned_ops) == engine_module._MAX_OUTSTANDING_LTM_OPS
+        assert len(engine._abandoned_ops) == engine_module._MAX_ABANDONED_OPS
         outcomes = obs.snapshot()
         assert outcomes["skip_reasons"]["read_file"]["ltm_draining"] == 3
         # The declined calls are not charged as LTM timeouts.
         assert (
-            outcomes["outcomes"]["read_file"]["error_timeout"]
-            == engine_module._MAX_OUTSTANDING_LTM_OPS
+            outcomes["outcomes"]["read_file"]["error_timeout"] == engine_module._MAX_ABANDONED_OPS
         )
 
-    async def test_concurrent_calls_cannot_all_pass_the_admission_bound(self):
-        # The daemon serializes surfacing, but ProxyManager does not, and the
-        # engine supports concurrent distinct keys. A check-then-admit gate
-        # reading a count of already-abandoned operations lets every concurrent
-        # caller observe zero and start anyway — the bound then holds only for
-        # sequential traffic, which is not a bound.
+    async def test_a_burst_overshoots_but_nothing_starts_after_it(self):
+        # The bound counts operations known to be stuck, so a burst already in
+        # flight when the LTM wedges can exceed it — every one of them read the
+        # count before any had timed out. What must hold is that the pile stops
+        # growing: once they land, further attempts are refused. Reserving per
+        # attempt instead would cap this hard, but nothing at admission knows
+        # which attempts get stuck, so it would cap healthy concurrency too.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
         async def never_lets_go(*args, **kwargs):
             try:
                 await asyncio.sleep(10)
@@ -883,32 +885,104 @@ class TestSurfacingDeadline:
 
         adapter = _make_mcp_adapter()
         adapter.search = AsyncMock(side_effect=never_lets_go)
+        obs = SurfacingObservability()
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
             mcp_adapter=adapter,
+            observability=obs,
         )
 
-        # All in flight before any of them times out, each on its own key so no
-        # per-key lock serializes them into a queue.
-        attempts = engine_module._MAX_OUTSTANDING_LTM_OPS + 4
+        burst = engine_module._MAX_ABANDONED_OPS + 4
         await asyncio.gather(
             *(
                 engine.surface(
                     "gh",
                     "read_file",
-                    {
-                        "path": f"src/app{i}.py",
-                        "_context_query": f"distinct Flask routing architecture {i}",
-                    },
+                    {"path": f"src/app{i}.py", "_context_query": f"burst Flask routing query {i}"},
                     LONG_RESPONSE,
                     deadline_monotonic=None,
                 )
-                for i in range(attempts)
+                for i in range(burst)
             )
         )
+        assert len(engine._abandoned_ops) == burst  # the overshoot, acknowledged
+        assert obs.snapshot()["skip_reasons"].get("read_file", {}).get("ltm_draining") is None
 
-        assert len(engine._abandoned_ops) == engine_module._MAX_OUTSTANDING_LTM_OPS
-        assert engine._ltm_ops_outstanding == engine_module._MAX_OUTSTANDING_LTM_OPS
+        # Nothing new starts while they are stuck.
+        adapter.search.reset_mock()
+        for i in range(3):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/late{i}.py", "_context_query": f"later Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        assert len(engine._abandoned_ops) == burst  # no growth
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["skip_reasons"]["read_file"]["ltm_draining"] == 3
+
+    async def test_a_refusal_does_not_spend_a_rate_limit_slot(self):
+        # The cap counts *attempts* because an attempt has already spent LTM
+        # resources — the gate's own contract. A call turned away before
+        # starting any work has not made an attempt, so keeping its eagerly
+        # claimed slot would let a run of refusals exhaust the budget and go on
+        # blocking surfacing after the LTM recovers.
+        release = asyncio.Event()
+
+        async def wedges_until_released(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        adapter = _make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.9)])
+        wedged = AsyncMock(side_effect=wedges_until_released)
+        healthy = adapter.search
+        adapter.search = wedged
+        # 4 wedged attempts + 3 refusals + 1 recovered call = 8 without the
+        # release, but only 5 real attempts with it.
+        engine = SurfacingEngine(
+            config=_make_config(
+                timeout_seconds=0.05, circuit_max_failures=1000, max_surfacings_per_minute=6
+            ),
+            mcp_adapter=adapter,
+        )
+
+        for i in range(engine_module._MAX_ABANDONED_OPS):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/w{i}.py", "_context_query": f"wedge Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        for i in range(3):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/r{i}.py", "_context_query": f"refused Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        assert len(engine._abandoned_ops) == engine_module._MAX_ABANDONED_OPS
+
+        # Let the stuck unwinds finish, so admission reopens.
+        release.set()
+        await asyncio.wait(set(engine._abandoned_ops), timeout=5.0)
+        assert not engine._abandoned_ops
+
+        adapter.search = healthy
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "src/ok.py", "_context_query": "recovered Flask routing query"},
+            LONG_RESPONSE,
+            deadline_monotonic=None,
+        )
+        # The refusals gave their slots back, so the budget still has room.
+        assert "Relevant Memories" in out
 
     async def test_draining_does_not_refuse_cache_hits(self):
         # The gate belongs on the path that starts LTM work, not at the top of
@@ -946,7 +1020,7 @@ class TestSurfacingDeadline:
 
         # Now wedge it and burn the whole admission budget on other keys.
         wedge["armed"] = True
-        for i in range(engine_module._MAX_OUTSTANDING_LTM_OPS):
+        for i in range(engine_module._MAX_ABANDONED_OPS):
             await engine.surface(
                 "gh",
                 "read_file",
@@ -957,7 +1031,6 @@ class TestSurfacingDeadline:
                 LONG_RESPONSE,
                 deadline_monotonic=None,
             )
-        assert engine._ltm_ops_outstanding == engine_module._MAX_OUTSTANDING_LTM_OPS
 
         # The cached key still surfaces: it never touches the LTM.
         assert "Relevant Memories" in await engine.surface(

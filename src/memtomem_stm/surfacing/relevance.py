@@ -111,6 +111,25 @@ class RelevanceGate:
         self._surfacing_timestamps.append(now)
         return True
 
+    def release_claim(self) -> None:
+        """Give back the rate-limit slot :meth:`should_surface` claimed, for a
+        caller that ends up starting no LTM work at all.
+
+        The eager claim above is deliberate and its docstring says why: the cap
+        counts *attempts*, because an attempt has already spent LTM/MCP
+        resources. A caller that is turned away before spending any has not
+        made an attempt by that definition, so keeping its slot would let a
+        burst of refusals exhaust ``max_surfacings_per_minute`` and go on
+        blocking surfacing after the condition that caused them cleared.
+
+        Drops the newest timestamp rather than hunting for this caller's own:
+        the cap is a count over a sliding window, so any one restores exactly
+        the capacity that was taken, and the newest is this caller's except
+        under a concurrent claim in between.
+        """
+        if self._surfacing_timestamps:
+            self._surfacing_timestamps.pop()
+
     def record_surfacing(self, query: str) -> None:
         """Record that a surfacing was actually performed (call after success).
 
