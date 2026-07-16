@@ -123,16 +123,17 @@ class SurfacingEngine:
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
         self._token_tracker = token_tracker
-        # Decouple cross-session dedup from feedback-event recording. When a
-        # tracker is attached, it normally does two independent jobs: (1) seed
-        # ``_surfaced_ids`` + ``mark_surfaced`` for dedup (``seen_memories`` —
-        # memory IDs only, privacy-clean), and (2) mint a ``surfacing_id`` +
-        # ``record_surfacing`` the extracted query into ``surfacing_events`` +
-        # advertise a ``stm_surfacing_feedback`` rating prompt. The hook daemon
-        # path wants (1) but not (2): it has no in-band channel for the model to
-        # return a rating (the prompt would be unresolvable), and the query for
-        # ``Bash`` may carry secrets we refuse to persist. Set this ``False`` to
-        # keep dedup while skipping all feedback-event recording/prompting.
+        # Feedback-loop enablement, not event persistence. When a tracker is
+        # attached, telemetry writes (``surfacing_events`` rows, ``seen_memories``
+        # dedup, fault counters) gate on tracker presence alone — so paths like
+        # the hook daemon stay visible in ``stm_surfacing_stats`` / ``mms stats``.
+        # This flag gates only the feedback loop on top of that telemetry: the
+        # advertised ``stm_surfacing_feedback(surfacing_id=...)`` rating prompt
+        # and the durable-demotion read. The hook daemon path sets it ``False``
+        # because it has no in-band channel for the model to return a rating
+        # (the prompt would be unresolvable). Raw-query privacy is
+        # ``persist_query_text``'s job (``_persistable_query`` digests the
+        # query), not this flag's.
         self._record_feedback_events = record_feedback_events
         # Public ``observability`` property still returns the original
         # ``SurfacingObservability | None`` so consumers (server.py) can
@@ -1060,17 +1061,19 @@ class SurfacingEngine:
         # concurrent-identical-query contract. Cooldown refresh
         # (record_surfacing) and cross-session mark_surfaced stay miss-only by
         # design.
-        # See ``_do_surface_miss``: only advertise a feedback ID we actually
-        # recorded, so neither a no-tracker path nor the dedup-only daemon path
-        # (``record_feedback_events=False``) prompts for an unresolvable ID.
+        # See the miss path: the event row is tracker-gated telemetry;
+        # ``record_feedback_events`` gates only whether the ID is advertised
+        # as a rating prompt, so a no-tracker path skips the row and a
+        # feedback-loop-off path records it prompt-free.
         surfacing_id: str | None = None
-        if self._feedback_tracker is not None and self._record_feedback_events:
+        if self._feedback_tracker is not None:
             surfacing_id = uuid.uuid4().hex[:16]
+        advertised_id = surfacing_id if self._record_feedback_events else None
         manifest = self._formatter.render(
             response_text,
             cached,
             query,
-            surfacing_id=surfacing_id,
+            surfacing_id=advertised_id,
             score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
         )
         delivered_ids = list(manifest.delivered_ids)
@@ -1099,12 +1102,16 @@ class SurfacingEngine:
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
                 surfacing_id = None
-                manifest = self._formatter.render(
-                    response_text,
-                    cached,
-                    query,
-                    score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
-                )
+                if advertised_id is not None:
+                    # Same contract as the miss path: withdraw the dead
+                    # feedback handle; a prompt-free render stands as-is.
+                    advertised_id = None
+                    manifest = self._formatter.render(
+                        response_text,
+                        cached,
+                        query,
+                        score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
+                    )
         return manifest.text
 
     async def _do_surface(
@@ -1477,23 +1484,27 @@ class SurfacingEngine:
                 logger.debug("Failed to fetch session scratch items", exc_info=True)
                 scratch_items = None
 
-        # Generate surfacing ID and record event. Only mint an ID when a
-        # tracker is attached *and* feedback-event recording is on — otherwise
-        # the formatter would advertise a ``stm_surfacing_feedback(...)`` prompt
-        # for an event no in-band channel can resolve. Three cases skip it: the
-        # no-tracker ``mms hook`` / feedback-disabled server paths, and the hook
-        # daemon's dedup-only wiring (``record_feedback_events=False``) which
-        # keeps a tracker for ``seen_memories`` dedup but persists no query.
+        # Mint an event ID whenever a tracker is attached: the
+        # ``surfacing_events`` row is telemetry (stm_surfacing_stats /
+        # mms stats / mms doctor), written like ``seen_memories`` and the fault
+        # counters regardless of the feedback loop. ``record_feedback_events``
+        # gates only whether the ID is ADVERTISED as a
+        # ``stm_surfacing_feedback(...)`` rating prompt — the hook daemon path
+        # has no in-band channel to resolve one, so it records the row (query
+        # already digest-substituted via ``persist_query_text=False``) but
+        # renders no prompt. Only the no-tracker ``mms hook`` /
+        # feedback-disabled server paths skip the row entirely.
         surfacing_id: str | None = None
-        if self._feedback_tracker is not None and self._record_feedback_events:
+        if self._feedback_tracker is not None:
             surfacing_id = uuid.uuid4().hex[:16]
+        advertised_id = surfacing_id if self._record_feedback_events else None
 
         # Inject memories into response
         manifest = self._formatter.render(
             response_text,
             relevant,
             query,
-            surfacing_id=surfacing_id,
+            surfacing_id=advertised_id,
             scratch_items=scratch_items,
             score_floor=min_score,
         )
@@ -1529,16 +1540,22 @@ class SurfacingEngine:
                 )
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
-                # The rendered prompt references an unresolvable event ID. Re-render
-                # without it instead of handing the agent a dead feedback handle.
+                # No row was written, so the webhook payload must carry None.
                 surfacing_id = None
-                manifest = self._formatter.render(
-                    response_text,
-                    relevant,
-                    query,
-                    scratch_items=scratch_items,
-                    score_floor=min_score,
-                )
+                if advertised_id is not None:
+                    # The rendered prompt references an unresolvable event ID.
+                    # Re-render without it instead of handing the agent a dead
+                    # feedback handle. When nothing was advertised (feedback
+                    # loop off) the rendered text carries no ID, so the output
+                    # stands as-is.
+                    advertised_id = None
+                    manifest = self._formatter.render(
+                        response_text,
+                        relevant,
+                        query,
+                        scratch_items=scratch_items,
+                        score_floor=min_score,
+                    )
         if self._feedback_tracker is not None:
             try:
                 self._feedback_tracker.store.mark_surfaced(delivered_ids)

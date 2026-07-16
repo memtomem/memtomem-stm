@@ -578,9 +578,11 @@ async def test_hook_run_hook_routes_to_live_daemon(
 
 
 async def test_build_engine_dedup_only_wiring(tmp_path: Path) -> None:
-    # Default (record_feedback_events=False) → dedup-only: result cache off so
-    # _surfaced_ids/seen_memories dedup is authoritative (F1), AutoTuner off so
-    # shared feedback rows can't nudge ranking (F3), query text never persisted.
+    # Default (record_feedback_events=False) → feedback loop off: result cache
+    # off so _surfaced_ids/seen_memories dedup is authoritative (F1), AutoTuner
+    # off so shared feedback rows can't nudge ranking (F3), query text never
+    # persisted raw. The tracker is still wired — for dedup AND for
+    # surfacing_events telemetry (see the e2e test below).
     cfg = _config(tmp_path)
     assert cfg.hook.record_feedback_events is False
     server = DaemonServer(cfg)
@@ -593,6 +595,40 @@ async def test_build_engine_dedup_only_wiring(tmp_path: Path) -> None:
         assert server._engine._auto_tuner is None
         assert server._engine._record_feedback_events is False
         assert server._tracker is not None  # tracker still wired for dedup
+    finally:
+        if server._tracker is not None:
+            server._tracker.close()
+        await server._adapter.stop()
+
+
+async def test_build_engine_default_records_surfacing_event_telemetry(tmp_path: Path) -> None:
+    # The L0 telemetry gap regression test: with the default daemon wiring
+    # (record_feedback_events=False) a successful surfacing must still write a
+    # surfacing_events row — server='builtin', digest-substituted query — so
+    # stm_surfacing_stats / mms stats / mms doctor see hook-path activity. The
+    # rendered output must stay prompt-free (no advertised surfacing_id).
+    cfg = _config(tmp_path)
+    server = DaemonServer(cfg)
+    server._build_engine()
+    try:
+        adapter = AsyncMock()
+        adapter.search = AsyncMock(return_value=([_Result(_Chunk(), 0.5)], [], "ok"))
+        server._engine._mcp_adapter = adapter
+
+        out = await server._engine.surface(
+            "builtin", "Read", {"file_path": "/src/auth/jwt_handler.py"}, _LONG
+        )
+
+        assert "remembered detail about jwt" in out
+        assert "stm_surfacing_feedback" not in out
+        assert "surfacing_id" not in out
+        assert server._tracker is not None
+        rows = server._tracker.store._db.execute(
+            "SELECT server, query FROM surfacing_events"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "builtin"
+        assert rows[0][1].startswith("sha256:")
     finally:
         if server._tracker is not None:
             server._tracker.close()

@@ -175,7 +175,7 @@ export MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=2.5
 export MEMTOMEM_STM_HOOK__FALLBACK=skip                # skip | cold
 export MEMTOMEM_STM_HOOK__AUTO_SPAWN=true
 export MEMTOMEM_STM_HOOK__METRICS_ENABLED=true          # size/timing-only rows; inspect with mms stats --source hook
-export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # no query text / rating prompt by default
+export MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS=false # rating prompt / feedback loop off by default; telemetry event rows are still recorded (digest query)
 
 # Built-in Bash stdout compression is opt-in, separate from surfacing, and
 # Claude Code only — native output replacement ports to no other host. Unsafe

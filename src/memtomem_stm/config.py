@@ -137,11 +137,16 @@ class HookConfig(BaseModel):
     ``use_daemon``/``fallback``) — excluded from the daemon config fingerprint,
     so a daemon started with it off still matches an auto-spawning hook."""
     record_feedback_events: bool = False
-    """Passed to the daemon's ``SurfacingEngine``. Default ``False`` keeps
-    cross-session dedup (``seen_memories``, memory IDs only) while persisting
-    *no* query text and emitting no ``stm_surfacing_feedback`` rating prompt:
-    the pure-hook path has no in-band channel for the model to return a rating,
-    and a ``Bash`` query may carry secrets. See
+    """Passed to the daemon's ``SurfacingEngine``. Gates the feedback loop,
+    not event persistence: default ``False`` emits no ``stm_surfacing_feedback``
+    rating prompt (the pure-hook path has no in-band channel for the model to
+    return a rating) and skips the durable-demotion read; the daemon also
+    forces auto-tune off in this mode. Surfacing telemetry is recorded either
+    way whenever the dedup tracker exists: ``surfacing_events`` rows with
+    ``server='builtin'`` and a ``sha256:`` digest query (the daemon forces
+    ``persist_query_text=False``, so raw query text — e.g. a ``Bash`` command
+    carrying secrets — never persists), so ``stm_surfacing_stats`` /
+    ``mms stats`` / ``mms doctor`` reflect hook-path activity. See
     ``SurfacingEngine(record_feedback_events=...)``."""
     compression: HookCompressionConfig = Field(default_factory=HookCompressionConfig)
     """Built-in tool *output compression* (P1a — Bash). Independent of surfacing:

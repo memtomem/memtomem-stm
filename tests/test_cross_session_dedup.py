@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,7 @@ from memtomem_stm.surfacing.feedback_store import FeedbackStore
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 
 @dataclass
@@ -306,27 +307,31 @@ class TestCrossSessionDedup:
         assert "memory" in output
 
 
-# ── record_feedback_events flag (hook daemon dedup-only wiring) ───────────
+# ── record_feedback_events flag (hook daemon feedback-loop-off wiring) ────
 
 
 class TestRecordFeedbackEventsFlag:
-    """The hook daemon wires a FeedbackTracker for cross-session dedup but sets
-    ``record_feedback_events=False`` so it persists *no* query text and emits no
-    unresolvable ``stm_surfacing_feedback`` rating prompt. Dedup
-    (``seen_memories``, memory IDs only) must keep working; the feedback-event
-    side (``surfacing_events``, ``surfacing_id``) must be fully suppressed."""
+    """The hook daemon wires a FeedbackTracker and sets
+    ``record_feedback_events=False``: the flag suppresses the feedback loop —
+    the advertised ``stm_surfacing_feedback`` rating prompt (unresolvable on
+    the pure-hook path) and the demotion read — NOT event persistence. Dedup
+    (``seen_memories``) and ``surfacing_events`` telemetry (query
+    digest-substituted via ``persist_query_text=False`` on the daemon path)
+    must both keep working."""
 
     @staticmethod
     def _event_count(tracker) -> int:
         row = tracker.store._db.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()
         return row[0]
 
-    async def test_dedup_only_skips_event_and_prompt(self, tmp_path):
-        tracker = FeedbackTracker(config=_make_config(), db_path=tmp_path / "feedback.db")
+    async def test_dedup_only_records_event_without_prompt(self, tmp_path):
+        # Mirror the daemon wiring: feedback loop off + persist_query_text off.
+        config = _make_config(persist_query_text=False)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "feedback.db")
         chunk = FakeChunk(content="surfaced now")
         results = [FakeSearchResult(chunk=chunk, score=0.5)]
         engine = SurfacingEngine(
-            config=_make_config(),
+            config=config,
             mcp_adapter=_make_mcp_adapter(results),
             feedback_tracker=tracker,
             record_feedback_events=False,
@@ -338,10 +343,69 @@ class TestRecordFeedbackEventsFlag:
         assert "surfaced now" in output
         # ... and dedup still persisted (seen_memories holds the ID).
         assert chunk.id in tracker.store.get_seen_ids(ttl_seconds=3600)
-        # But no feedback event was recorded and no rating prompt leaked.
-        assert self._event_count(tracker) == 0
+        # The telemetry event IS recorded (the L0 gap fix) ...
+        assert self._event_count(tracker) == 1
+        row = tracker.store._db.execute(
+            "SELECT server, tool, query FROM surfacing_events"
+        ).fetchone()
+        assert row[0] == "gh"
+        assert row[1] == "read_file"
+        # ... with the query digest-substituted, never raw text.
+        assert re.fullmatch(r"sha256:[0-9a-f]{16}", row[2])
+        # But no rating prompt leaked: the event ID is not advertised.
         assert "stm_surfacing_feedback" not in output
         assert "surfacing_id" not in output
+
+        tracker.close()
+
+    async def test_dedup_only_record_failure_degrades_silently(self, caplog):
+        """Flag off + record_surfacing() raising: the memory is still injected
+        and the output stands as-is (nothing was advertised, so there is no
+        dead handle to withdraw) — only the warning is logged."""
+        results = [FakeSearchResult(chunk=FakeChunk(content="mem content"), score=0.7)]
+        tracker = MagicMock()
+        tracker.record_surfacing = MagicMock(side_effect=RuntimeError("DB locked"))
+        tracker.store = MagicMock()
+        tracker.store.mark_surfaced = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=[])
+
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+            record_feedback_events=False,
+        )
+
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "mem content" in output
+        assert "stm_surfacing_feedback" not in output
+        assert "surfacing_id" not in output
+        assert "Failed to record surfacing event" in caplog.text
+
+    async def test_dedup_only_cache_hit_records_event_without_prompt(self, tmp_path):
+        """Flag off with the result cache on: each cache hit records its own
+        telemetry row (same per-hit semantics as the flag-on proxy path),
+        still prompt-free."""
+        config = _make_config(persist_query_text=False)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "feedback.db")
+        results = [FakeSearchResult(chunk=FakeChunk(content="cached mem"), score=0.6)]
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+            record_feedback_events=False,
+        )
+
+        out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "cached mem" in out1
+        assert "cached mem" in out2
+        assert self._event_count(tracker) == 2
+        for output in (out1, out2):
+            assert "stm_surfacing_feedback" not in output
+            assert "surfacing_id" not in output
 
         tracker.close()
 

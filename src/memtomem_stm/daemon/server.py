@@ -15,12 +15,13 @@ retry) **before** building the engine and holds it until teardown, so a
 redundant/late daemon exits without warming an LTM. This replaces the older
 ``ping``-based guard, closing its TOCTOU window and recycled-PID weakness.
 
-Engine wiring is the **dedup-only** variant of ``server.py``'s app_lifespan: a
-``FeedbackTracker`` is attached so cross-session dedup (``seen_memories``)
-survives restarts, but ``record_feedback_events=False`` means no query text is
-persisted and no rating prompt is emitted (the pure-hook path has no in-band
-feedback channel, and Bash queries may carry secrets). ``persist_query_text``
-is additionally forced off as defense-in-depth.
+Engine wiring is the **feedback-loop-off** variant of ``server.py``'s
+app_lifespan: a ``FeedbackTracker`` is attached so cross-session dedup
+(``seen_memories``) survives restarts and successful surfacing is recorded as
+``surfacing_events`` telemetry (``server='builtin'``, query digest-substituted
+via the forced ``persist_query_text=False``), but
+``record_feedback_events=False`` means no rating prompt is emitted (the
+pure-hook path has no in-band feedback channel) and no demotion read runs.
 
 Concurrency: LTM RPCs share one MCP ``ClientSession`` whose stdio framing is not
 safe under interleaved calls, so ``surface`` requests are serialized on a single
@@ -321,10 +322,11 @@ class DaemonServer:
 
         record_events = self._config.hook.record_feedback_events
         updates: dict[str, Any] = {
-            # Defense-in-depth: the hook/daemon path never persists raw query
-            # text, even if an operator flips feedback events on.
-            # ``record_feedback_events`` already gates whether any event row is
-            # written at all.
+            # The hook/daemon path never persists raw query text, even if an
+            # operator flips feedback events on. This is the guarantee that
+            # matters here: ``surfacing_events`` telemetry rows ARE written on
+            # this path (``server='builtin'``), with the query
+            # digest-substituted by ``_persistable_query``.
             "persist_query_text": False,
             # Disable the result cache. A cache hit intentionally short-circuits
             # the in-session ``_surfaced_ids`` dedup (documented engine
@@ -337,14 +339,19 @@ class DaemonServer:
             "cache_ttl_seconds": 0.0,
         }
         if not record_events:
-            # Dedup-only: the tracker exists solely for ``seen_memories``. Don't
-            # let AutoTuner learn min_score from feedback rows (possibly written
+            # Feedback loop off: the tracker still writes ``seen_memories``
+            # dedup and ``surfacing_events`` telemetry, but this mode emits no
+            # rating prompt so it never generates feedback rows. Don't let
+            # AutoTuner learn min_score from feedback rows (possibly written
             # by the proxy path sharing the same DB) — the daemon's ranking must
             # be self-contained, not nudged by feedback this mode never records.
             updates["auto_tune_enabled"] = False
         surfacing_cfg = self._config.surfacing.model_copy(update=updates)
 
         self._adapter = McpClientSearchAdapter(surfacing_cfg)  # lazy LTM start
+        # No tracker when dedup is off and the feedback loop is off — that is
+        # an explicit opt-out of all feedback-DB persistence, including
+        # ``surfacing_events`` telemetry.
         want_tracker = surfacing_cfg.dedup_ttl_seconds > 0 or record_events
         if want_tracker:
             try:

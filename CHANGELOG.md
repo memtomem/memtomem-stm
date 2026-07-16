@@ -74,6 +74,18 @@ changes inline only. See the deprecation policy in
   the daemon can never enforce — and would have every request rejected).
   **Behavior change**: `daemon_timeout_seconds=inf`/`nan` is a config
   `ValidationError` instead of an accepted value. (#722)
+- Successful surfacing on the hook/daemon path now records a `surfacing_events`
+  telemetry row, so `stm_surfacing_stats` / `mms stats` / `mms doctor` no
+  longer report 0 events for a working hook path ("0 events" was previously
+  indistinguishable from "0 surfacing" — only `seen_memories` and
+  `surfacing_faults` were written there). Hook-path rows carry
+  `server='builtin'` and a `sha256:` digest in place of the query (the daemon
+  forces `persist_query_text=false`), and the injected block still advertises
+  no `stm_surfacing_feedback` rating prompt. `hook.record_feedback_events` now
+  gates only the rating prompt and feedback loop, not event persistence.
+  **Behavior change**: default daemon installs start writing these rows;
+  growth is bounded by the existing `stats_retention_days` /
+  `query_retention_days` cleanup.
 
 ## [0.1.40] — 2026-07-15
 
