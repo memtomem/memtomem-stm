@@ -29,6 +29,22 @@ from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 logger = logging.getLogger(__name__)
 
+
+def _fifo_prune(d: dict[Any, None], cap: int) -> None:
+    """Evict oldest (first-inserted) entries once *cap* is exceeded.
+
+    Prunes down to roughly half the cap so steady-state inserts don't
+    re-trip the prune on every call. Shared by the engine's bounded
+    insertion-ordered guard maps (boost dedup, cache invalidation,
+    surfaced-id dedup) so the eviction policy can't drift per site.
+    """
+    if len(d) <= cap:
+        return
+    excess = len(d) - cap // 2
+    for k in list(d)[:excess]:
+        del d[k]
+
+
 _QUERY_HASH_PREFIX = "sha256:"
 """Marker prefixed to the truncated sha256 digest written to
 ``surfacing_events.query`` when ``SurfacingConfig.persist_query_text`` is
@@ -789,11 +805,7 @@ class SurfacingEngine:
                         },
                     ):
                         await self._increment_access_with_timeout(target_ids)
-                    # Prune if exceeded cap — evict oldest (first-inserted) entries.
-                    if len(self._boosted_event_ids) > self._boosted_event_ids_max:
-                        excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
-                        for k in list(self._boosted_event_ids)[:excess]:
-                            del self._boosted_event_ids[k]
+                    _fifo_prune(self._boosted_event_ids, self._boosted_event_ids_max)
                 else:
                     # No memories to boost — release the guard so a later
                     # call with a resolvable memory_id can retry.
@@ -871,10 +883,7 @@ class SurfacingEngine:
                     },
                 ):
                     await self._increment_access_with_timeout(helpful_ids)
-                if len(self._boosted_event_ids) > self._boosted_event_ids_max:
-                    excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
-                    for k in list(self._boosted_event_ids)[:excess]:
-                        del self._boosted_event_ids[k]
+                _fifo_prune(self._boosted_event_ids, self._boosted_event_ids_max)
             except Exception:
                 self._boosted_event_ids.pop(surfacing_id, None)
                 logger.debug(
@@ -926,10 +935,7 @@ class SurfacingEngine:
         target_ids = [memory_id] if memory_id else event["memory_ids"]
         for mid in target_ids:
             self._invalidated_ids[(server, tool, mid)] = None
-        if len(self._invalidated_ids) > self._invalidated_ids_max:
-            excess = len(self._invalidated_ids) - self._invalidated_ids_max // 2
-            for k in list(self._invalidated_ids)[:excess]:
-                del self._invalidated_ids[k]
+        _fifo_prune(self._invalidated_ids, self._invalidated_ids_max)
 
     def _feedback_demoted_ids(self, memory_ids: list[str]) -> set[str]:
         """Return IDs that accumulated enough durable negative feedback.
@@ -962,10 +968,7 @@ class SurfacingEngine:
         the oldest half once the cap is exceeded)."""
         for mid in ids:
             self._surfaced_ids[mid] = None
-        if len(self._surfaced_ids) > self._surfaced_ids_max:
-            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
-            for k in list(self._surfaced_ids)[:excess]:
-                del self._surfaced_ids[k]
+        _fifo_prune(self._surfaced_ids, self._surfaced_ids_max)
 
     def _render_cached(
         self,
