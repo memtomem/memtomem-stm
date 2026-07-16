@@ -847,22 +847,127 @@ class TestSurfacingDeadline:
         # first attempt's per-key lock and be cancelled there, never reaching
         # the adapter — so it would never leave an operation behind and the
         # pile-up this guards against would not appear.
-        for i in range(engine_module._MAX_ABANDONED_OPS + 3):
+        for i in range(engine_module._MAX_OUTSTANDING_LTM_OPS + 3):
             await engine.surface(
                 "gh",
                 "read_file",
-                {"path": f"src/app{i}.py", "_context_query": f"distinct query {i}"},
+                {
+                    "path": f"src/app{i}.py",
+                    "_context_query": f"distinct Flask routing architecture {i}",
+                },
                 LONG_RESPONSE,
                 deadline_monotonic=None,
             )
 
-        assert len(engine._abandoned_ops) == engine_module._MAX_ABANDONED_OPS
+        assert len(engine._abandoned_ops) == engine_module._MAX_OUTSTANDING_LTM_OPS
         outcomes = obs.snapshot()
         assert outcomes["skip_reasons"]["read_file"]["ltm_draining"] == 3
         # The declined calls are not charged as LTM timeouts.
         assert (
-            outcomes["outcomes"]["read_file"]["error_timeout"] == engine_module._MAX_ABANDONED_OPS
+            outcomes["outcomes"]["read_file"]["error_timeout"]
+            == engine_module._MAX_OUTSTANDING_LTM_OPS
         )
+
+    async def test_concurrent_calls_cannot_all_pass_the_admission_bound(self):
+        # The daemon serializes surfacing, but ProxyManager does not, and the
+        # engine supports concurrent distinct keys. A check-then-admit gate
+        # reading a count of already-abandoned operations lets every concurrent
+        # caller observe zero and start anyway — the bound then holds only for
+        # sequential traffic, which is not a bound.
+        async def never_lets_go(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=never_lets_go)
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+        )
+
+        # All in flight before any of them times out, each on its own key so no
+        # per-key lock serializes them into a queue.
+        attempts = engine_module._MAX_OUTSTANDING_LTM_OPS + 4
+        await asyncio.gather(
+            *(
+                engine.surface(
+                    "gh",
+                    "read_file",
+                    {
+                        "path": f"src/app{i}.py",
+                        "_context_query": f"distinct Flask routing architecture {i}",
+                    },
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+                for i in range(attempts)
+            )
+        )
+
+        assert len(engine._abandoned_ops) == engine_module._MAX_OUTSTANDING_LTM_OPS
+        assert engine._ltm_ops_outstanding == engine_module._MAX_OUTSTANDING_LTM_OPS
+
+    async def test_draining_does_not_refuse_cache_hits(self):
+        # The gate belongs on the path that starts LTM work, not at the top of
+        # surface(). A cache hit needs no LTM at all, so stuck unwinds must not
+        # disable it — and eligibility classifications (no_query, gate
+        # rejections) must keep their own names rather than becoming
+        # ltm_draining.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        hit_args = {"path": "src/cached.py", "_context_query": "cached Flask routing architecture"}
+
+        async def answers_then_wedges(*args, **kwargs):
+            if not wedge["armed"]:
+                return [FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.9)], [], "ok"
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)
+                raise
+
+        wedge = {"armed": False}
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=answers_then_wedges)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        # Populate the cache for this key while the LTM is healthy.
+        assert "Relevant Memories" in await engine.surface(
+            "gh", "read_file", hit_args, LONG_RESPONSE, deadline_monotonic=None
+        )
+
+        # Now wedge it and burn the whole admission budget on other keys.
+        wedge["armed"] = True
+        for i in range(engine_module._MAX_OUTSTANDING_LTM_OPS):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {
+                    "path": f"src/other{i}.py",
+                    "_context_query": f"other Flask routing architecture {i}",
+                },
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        assert engine._ltm_ops_outstanding == engine_module._MAX_OUTSTANDING_LTM_OPS
+
+        # The cached key still surfaces: it never touches the LTM.
+        assert "Relevant Memories" in await engine.surface(
+            "gh", "read_file", hit_args, LONG_RESPONSE, deadline_monotonic=None
+        )
+        # And an ineligible call keeps its own classification rather than
+        # being relabelled by the gate.
+        await engine.surface("gh", "read_file", {}, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["read_file"].get("no_query") == 1
+        assert obs.snapshot()["skip_reasons"]["read_file"].get("ltm_draining") is None
 
     async def test_stop_is_not_held_open_by_a_cancellation_resistant_unwind(self, monkeypatch):
         # `_run_within` abandons the LTM operation precisely because its unwind
@@ -884,7 +989,7 @@ class TestSurfacingDeadline:
                     try:
                         await asyncio.sleep(0.02)
                     except asyncio.CancelledError:
-                        pass  # including stop()'s own cancel
+                        pass  # a stubborn unwind, ignoring what it is told
                 raise
 
         adapter = _make_mcp_adapter()
@@ -1167,7 +1272,10 @@ class TestRelevanceGateConcurrency:
                 engine.surface(
                     "gh",
                     "read_file",
-                    {"path": f"src/f{i}.py", "_context_query": f"distinct query {i}"},
+                    {
+                        "path": f"src/f{i}.py",
+                        "_context_query": f"distinct Flask routing architecture {i}",
+                    },
                     LONG_RESPONSE,
                 )
                 for i in range(5)

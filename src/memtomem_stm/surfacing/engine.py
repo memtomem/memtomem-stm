@@ -37,9 +37,9 @@ hashed-form row without re-reading config and lets ad-hoc DB inspection
 tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
 
-_MAX_ABANDONED_OPS = 4
-"""How many timed-out LTM operations may still be unwinding before this engine
-stops starting new ones.
+_MAX_OUTSTANDING_LTM_OPS = 4
+"""How many LTM operations may be in flight — including ones still unwinding
+after being abandoned — before this engine stops starting new ones.
 
 ``_run_within`` abandons an operation rather than waiting out an unwind it
 cannot bound, which means a wedged LTM leaves one behind per attempt, each
@@ -191,6 +191,13 @@ class SurfacingEngine:
         # stops waiting on them — so ``stop()`` must not block on them the way
         # it does on webhooks.
         self._abandoned_ops: set[asyncio.Task] = set()
+        # LTM operations started and not yet finished — including the ones
+        # ``_run_within`` stopped waiting on, which keep their reservation for
+        # as long as they keep unwinding. Reserved before the search and
+        # released in its ``finally``, both without an await in between, so the
+        # count is a real bound rather than a check that concurrent callers can
+        # all pass at once.
+        self._ltm_ops_outstanding = 0
         # Per-key stampede guard — identical concurrent ``_do_surface`` calls
         # serialize on the same lock so a cache miss triggers one LTM search
         # rather than N and the losing coroutine cannot overwrite the
@@ -631,23 +638,6 @@ class SurfacingEngine:
             self._observability.record_skip(tool, "circuit_open")
             self._persist_fault(server, tool, "circuit_open")
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
-            return response_text
-
-        # Enough previous attempts are still unwinding that starting another
-        # would only add to the pile (#720). The breaker throttles this but
-        # cannot stop it: each reset lets a probe through, and against an LTM
-        # that never lets go every probe leaves another operation behind.
-        # Declining is also the accurate answer — a dependency this stuck is
-        # not about to serve this call either.
-        if len(self._abandoned_ops) >= _MAX_ABANDONED_OPS:
-            self._observability.record_skip(tool, "ltm_draining")
-            self._persist_fault(server, tool, "ltm_draining")
-            logger.debug(
-                "Surfacing skipped: %d abandoned LTM operation(s) still unwinding for %s/%s",
-                len(self._abandoned_ops),
-                server,
-                tool,
-            )
             return response_text
 
         query = self._extractor.extract_query(
@@ -1134,6 +1124,59 @@ class SurfacingEngine:
                 self._key_locks.pop(cache_key, None)
 
     async def _do_surface_miss(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        response_text: str,
+        query: str,
+        cache_key: str,
+        *,
+        trace_id: str | None = None,
+    ) -> str:
+        """Admission for the one path that starts LTM work, then the work.
+
+        Deliberately not at the top of :meth:`surface`: gating there would also
+        refuse cache hits, which need no LTM at all, and would relabel every
+        ``no_query`` or gate rejection as ``ltm_draining``.
+
+        The reservation is taken here, and released in the ``finally`` below
+        only once the operation truly ends — which for one ``_run_within``
+        abandoned mid-flight means when its unwind finishes, not when the
+        caller walked away. Check and increment sit together with no await
+        between them, so concurrent callers cannot all pass a bound that only
+        one of them should (the daemon serializes surfacing, but
+        ``ProxyManager`` does not).
+        """
+        if self._ltm_ops_outstanding >= _MAX_OUTSTANDING_LTM_OPS:
+            self._observability.record_skip(tool, "ltm_draining")
+            self._persist_fault(server, tool, "ltm_draining")
+            logger.warning(
+                "Surfacing skipped for %s/%s: %d LTM operation(s) outstanding, "
+                "%d of them abandoned mid-unwind — the LTM is not releasing "
+                "cancelled calls",
+                server,
+                tool,
+                self._ltm_ops_outstanding,
+                len(self._abandoned_ops),
+            )
+            raise _OperationalSkip("ltm_draining")
+
+        self._ltm_ops_outstanding += 1
+        try:
+            return await self._do_surface_miss_admitted(
+                server,
+                tool,
+                arguments,
+                response_text,
+                query,
+                cache_key,
+                trace_id=trace_id,
+            )
+        finally:
+            self._ltm_ops_outstanding -= 1
+
+    async def _do_surface_miss_admitted(
         self,
         server: str,
         tool: str,
