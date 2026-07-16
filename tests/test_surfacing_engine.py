@@ -984,6 +984,44 @@ class TestSurfacingDeadline:
         # The refusals gave their slots back, so the budget still has room.
         assert "Relevant Memories" in out
 
+    async def test_a_window_consumed_by_pre_work_does_not_spend_a_rate_limit_slot(self):
+        # The window-fully-consumed branch books a timeout but starts no LTM
+        # work — by the rate limiter's own definition ("an attempt has already
+        # spent LTM/MCP resources") it is not an attempt, so it refunds its
+        # claim exactly like an ltm_draining refusal. Keeping the slot would
+        # let a run of too-tight deadlines exhaust the budget and go on
+        # rate-limiting the LTM after the deadlines recover. The timeout and
+        # breaker booking still stand: real time did pass.
+        adapter = _make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.9)])
+        engine = SurfacingEngine(
+            config=_make_config(
+                timeout_seconds=30.0, circuit_max_failures=1000, max_surfacings_per_minute=3
+            ),
+            mcp_adapter=adapter,
+        )
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.05)  # stand-in pre-work
+
+        for i in range(3):  # would exhaust the 3-per-minute budget if kept
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/p{i}.py", "_context_query": f"prework Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() + 0.01,
+            )
+        assert engine._circuit_breaker.failure_count == 3  # still booked as timeouts
+
+        # A healthy call (no deadline pressure) still has budget: the consumed
+        # windows gave their slots back.
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "src/ok.py", "_context_query": "recovered healthy Django ORM query"},
+            LONG_RESPONSE,
+            deadline_monotonic=None,
+        )
+        assert "Relevant Memories" in out
+
     async def test_draining_warns_once_per_episode(self, caplog):
         # ltm_draining has no natural throttle behind it: a refusal records
         # neither breaker success nor failure, so once the breaker's reset

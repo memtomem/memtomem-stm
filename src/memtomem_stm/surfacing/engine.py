@@ -684,7 +684,12 @@ class SurfacingEngine:
                 # consumed the caller's whole window (#720). Book the abort
                 # through the branch below without starting an LTM round trip
                 # that would be cancelled mid-RPC and force a stdio child
-                # respawn on the next call (#290/#296).
+                # respawn on the next call (#290/#296). No LTM work started
+                # also means no rate-limit attempt was made (the cap counts
+                # attempts because an attempt spent LTM resources — see
+                # ``release_claim``); the timeout/breaker booking still
+                # stands, since real time did pass.
+                self._gate.release_claim(rate_claim)
                 raise asyncio.TimeoutError
             result = await self._run_within(
                 self._do_surface(
