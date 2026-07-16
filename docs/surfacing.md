@@ -458,7 +458,7 @@ the same event cannot demote a memory by themselves.
 
 ### Query text lifecycle in `stm_feedback.db`
 
-Every successful surfacing call writes one `surfacing_events` row containing the verbatim extracted query — typically file paths, the first sentence of a description argument, or an explicit `_context_query` from the agent. The text is kept so `stm_surfacing_stats` can render the most recent queries when an operator investigates skip-reason imbalances, and so per-tool query previews remain available for triage.
+Every successful surfacing call writes one `surfacing_events` row containing the extracted query — typically file paths, the first sentence of a description argument, or an explicit `_context_query` from the agent. On the proxy path the text is verbatim; hook/daemon-path rows carry `server='builtin'` and a `sha256:` digest instead (the daemon forces `persist_query_text=false`, so a Bash command carrying secrets never persists raw). The text is kept so `stm_surfacing_stats` can render the most recent queries when an operator investigates skip-reason imbalances, and so per-tool query previews remain available for triage.
 
 To keep the per-user DB from accumulating raw query text indefinitely, the opportunistic cleanup loop (one pass per hour from `SurfacingEngine.surface()`) clears the `query` column on rows older than `query_retention_days` (default `30`). The row itself is preserved so `SELECT COUNT(*)` aggregates in `stm_surfacing_stats` stay accurate; only the user-derived text is dropped. Set `query_retention_days=0` to disable the sweep entirely, or lower it for tighter retention. The DB path is `~/.memtomem/stm_feedback.db` by default; you can also delete the file manually to clear all history.
 
