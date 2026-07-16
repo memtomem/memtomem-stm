@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- Surfacing retrievals now ask the core to skip its cross-encoder rerank
+  stage per call (core #1766, first available in the core release after
+  v0.3.11). On a rerank-enabled core that stage is ~99% of retrieval latency
+  (compose p50 4.2s vs 42ms bypassed) and blew the surfacing budget on every
+  builtin call, while survival past the default `min_score` is measured
+  identical either way — the bypass trades ranking precision, not result
+  existence. New `surfacing.rerank` tri-state (`MEMTOMEM_STM_SURFACING__RERANK`):
+  `false` (default) bypasses, `true` forces the server-configured rerank,
+  `none` omits the parameter so server config decides. The parameter is only
+  sent when the connected core advertises it in its `mem_search` tool schema
+  (negotiated once per session, like the `result_format` downgrade), so on
+  older cores every value degrades to today's behavior instead of tripping
+  the server's argument validation and charging the circuit breaker.
+  **Behavior change**: on a bypass-capable core with rerank enabled
+  server-side, surfacing scores return on the RRF scale (`(0, ~0.033]`) —
+  the scale `min_score` and the auto-tuner were calibrated against; set
+  `rerank: none` to restore server policy. (#726)
+
 ### Fixed
 
 - The daemon now hands the surfacing engine the time left in the client's
