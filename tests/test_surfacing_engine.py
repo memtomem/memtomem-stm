@@ -818,6 +818,13 @@ class TestSurfacingDeadline:
 
         # Bounded by the drain, and well short of the 0.4s the unwind resists.
         assert elapsed < 0.3
+        # Still referenced: giving up waiting is not the same as it having
+        # finished, and the set is what keeps it from being collected
+        # mid-unwind. It retires itself once it genuinely ends.
+        assert engine._abandoned_ops
+        straggler = next(iter(engine._abandoned_ops))
+        assert not straggler.done()
+        await asyncio.wait({straggler}, timeout=2.0)
         assert not engine._abandoned_ops
 
     async def test_cancellation_inside_the_window_books_nothing(self):

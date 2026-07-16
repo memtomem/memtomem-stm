@@ -1485,10 +1485,13 @@ class SurfacingEngine:
         if stragglers:
             _, pending = await asyncio.wait(stragglers, timeout=_ABANDONED_DRAIN_SECONDS)
             if pending:
+                # Deliberately still referenced: the set exists to keep an
+                # unwinding op from being collected mid-flight, and giving up
+                # waiting is not the same as it having finished. Each one
+                # retires itself through ``_on_abandoned_op_done``.
                 logger.debug(
                     "%d abandoned surfacing operation(s) still unwinding at stop", len(pending)
                 )
-        self._abandoned_ops.clear()
 
     def _run_stats_retention(self, store: Any) -> None:
         """Delete ``surfacing_events`` rows past the stats-retention window so
