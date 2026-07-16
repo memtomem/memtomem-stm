@@ -200,6 +200,14 @@ class SurfacingEngine:
         # stops waiting on them — so ``stop()`` must not block on them the way
         # it does on webhooks.
         self._abandoned_ops: set[asyncio.Task] = set()
+        # Latch for the ``ltm_draining`` warning: one per draining episode,
+        # re-armed by the next admission. A refusal records neither breaker
+        # success nor failure, so once the breaker's reset window elapses
+        # every eligible call reaches admission and is refused — warning on
+        # each would flood the log at call rate for as long as the LTM stays
+        # wedged. The skip counter and fault row stay per-call: they are the
+        # count.
+        self._draining_warning_latched = False
 
         # Per-key stampede guard — identical concurrent ``_do_surface`` calls
         # serialize on the same lock so a cache miss triggers one LTM search
@@ -1150,15 +1158,32 @@ class SurfacingEngine:
             self._gate.release_claim()
             self._observability.record_skip(tool, "ltm_draining")
             self._persist_fault(server, tool, "ltm_draining")
-            logger.warning(
-                "Surfacing skipped for %s/%s: %d cancelled LTM operation(s) still "
-                "unwinding — the LTM is not releasing cancelled calls",
-                server,
-                tool,
-                len(self._abandoned_ops),
-            )
+            # Warn once per draining episode (see the latch's init comment):
+            # refusals record nothing on the breaker, so with the reset window
+            # elapsed every call lands here and per-call warnings would flood
+            # the log for as long as the LTM stays wedged.
+            if self._draining_warning_latched:
+                logger.debug(
+                    "Surfacing skipped for %s/%s: %d cancelled LTM operation(s) still unwinding",
+                    server,
+                    tool,
+                    len(self._abandoned_ops),
+                )
+            else:
+                self._draining_warning_latched = True
+                logger.warning(
+                    "Surfacing skipped for %s/%s: %d cancelled LTM operation(s) still "
+                    "unwinding — the LTM is not releasing cancelled calls (further "
+                    "refusals log at debug until the pile drains)",
+                    server,
+                    tool,
+                    len(self._abandoned_ops),
+                )
             raise _OperationalSkip("ltm_draining")
 
+        # Admission passed: the pile drained below the bound, so the episode
+        # is over and the next one deserves its own warning.
+        self._draining_warning_latched = False
         return await self._do_surface_miss_admitted(
             server,
             tool,

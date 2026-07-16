@@ -984,6 +984,101 @@ class TestSurfacingDeadline:
         # The refusals gave their slots back, so the budget still has room.
         assert "Relevant Memories" in out
 
+    async def test_draining_warns_once_per_episode(self, caplog):
+        # ltm_draining has no natural throttle behind it: a refusal records
+        # neither breaker success nor failure, so once the breaker's reset
+        # window elapses every eligible call reaches admission, is refused,
+        # and would warn — at call rate, for as long as the LTM stays wedged.
+        # The warning is therefore latched to the first refusal of a draining
+        # episode and re-armed by the next admission. The skip counter and
+        # fault row stay per-call (like ``circuit_open``): they ARE the count.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        release = asyncio.Event()
+
+        async def wedges_until_released(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        adapter = _make_mcp_adapter()
+        wedged = AsyncMock(side_effect=wedges_until_released)
+        healthy = adapter.search
+        adapter.search = wedged
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        def draining_warnings() -> list[logging.LogRecord]:
+            return [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and "still unwinding" in r.getMessage()
+            ]
+
+        with caplog.at_level(logging.DEBUG, logger="memtomem_stm.surfacing.engine"):
+            for i in range(engine_module._MAX_ABANDONED_OPS):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/w{i}.py", "_context_query": f"wedge Flask routing query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+            for i in range(3):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/r{i}.py", "_context_query": f"refused Flask routing query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+            # Three refusals, one warning — but every refusal is still counted.
+            assert len(draining_warnings()) == 1
+            assert obs.snapshot()["skip_reasons"]["read_file"]["ltm_draining"] == 3
+
+            # Drain the pile and let one call be admitted: the episode is over.
+            release.set()
+            await asyncio.wait(set(engine._abandoned_ops), timeout=5.0)
+            assert not engine._abandoned_ops
+            adapter.search = healthy
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": "src/ok.py", "_context_query": "recovered Flask routing query"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+
+            # A second wedge is a new episode and earns its own warning.
+            release.clear()
+            adapter.search = wedged
+            for i in range(engine_module._MAX_ABANDONED_OPS):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/w2{i}.py", "_context_query": f"rewedged Django ORM query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": "src/r2.py", "_context_query": "rewedged refused Django ORM query"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+            assert len(draining_warnings()) == 2
+            assert obs.snapshot()["skip_reasons"]["read_file"]["ltm_draining"] == 4
+
+        release.set()  # let the second pile unwind before the loop closes
+        await asyncio.wait(set(engine._abandoned_ops), timeout=5.0)
+
     async def test_draining_does_not_refuse_cache_hits(self):
         # The gate belongs on the path that starts LTM work, not at the top of
         # surface(). A cache hit needs no LTM at all, so stuck unwinds must not
