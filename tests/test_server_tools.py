@@ -2430,68 +2430,69 @@ class TestAdvertiseOrder:
             tools_dict.clear()
             tools_dict.update(snapshot)
 
-    def test_lifespan_reorders_after_proxy_registration(self):
-        """The reorder is only effective if ``app_lifespan`` actually calls
-        it, as a sibling statement *after* the ``register_proxy_tool`` loop.
-        The e2e test above drives the helper directly, so it would stay
-        green if the lifespan call were dropped, hoisted above proxy
-        registration, or moved *inside* the loop (later proxied tools would
-        then append after the STM utilities again). Pin the call site
-        structurally via AST — a substring check can't tell "after the
-        loop" from "inside the loop", and an execution test would need the
-        full upstream-connection machinery."""
-        import ast
-        import inspect
-        import textwrap
+    async def test_lifespan_reorders_after_proxy_registration(self):
+        """Execute the real registration path end to end: ``app_lifespan``
+        must leave proxied tools ahead of STM utility tools in the
+        advertise order. The e2e test above drives the helper directly, so
+        it alone would stay green if the lifespan dropped the reorder call,
+        hoisted it above the ``register_proxy_tool`` loop, or moved it
+        inside the loop (later proxied tools would then append after the
+        STM utilities again). Observing the lifespan's actual outcome pins
+        all of those at once — no source-shape inspection needed. Mirrors
+        the ``TestLifespan`` mocked-ProxyManager pattern; the registration
+        loop and reorder run for real against the module-global server."""
+        from memtomem_stm.proxy.manager import ProxyToolInfo
+        from memtomem_stm.server import _STM_UTILITY_TOOL_NAMES, app_lifespan, mcp
 
-        from memtomem_stm import server
-
-        def _calls(node: ast.AST, name: str) -> bool:
-            return any(
-                isinstance(n, ast.Call)
-                and (
-                    (isinstance(n.func, ast.Name) and n.func.id == name)
-                    or (isinstance(n.func, ast.Attribute) and n.func.attr == name)
-                )
-                for n in ast.walk(node)
+        infos = [
+            ProxyToolInfo(
+                prefixed_name=name,
+                description="fake proxied tool",
+                input_schema={"type": "object", "properties": {}},
+                server="fake",
+                original_name=name.split("__", 1)[1],
             )
+            for name in ("fake__alpha", "fake__beta")
+        ]
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = infos
 
-        def _is_reorder_stmt(stmt: ast.stmt) -> bool:
-            # A DIRECT bare-expression call — a descendant search would also
-            # accept unreachable shapes (an uncalled nested def, ``if False:``).
-            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
-                return False
-            func = stmt.value.func
-            return (isinstance(func, ast.Name) and func.id == "_move_stm_tools_to_end") or (
-                isinstance(func, ast.Attribute) and func.attr == "_move_stm_tools_to_end"
-            )
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                mock_cfg = MockConfig.return_value
+                mock_cfg.proxy = MagicMock()
+                mock_cfg.proxy.enabled = True
+                mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+                mock_cfg.proxy.metrics.enabled = False
+                mock_cfg.proxy.compression_feedback.enabled = False
+                mock_cfg.proxy.progressive_reads.enabled = False
+                mock_cfg.proxy.selection_telemetry.enabled = False
+                mock_cfg.proxy.cache.enabled = False
+                mock_cfg.surfacing = MagicMock()
+                mock_cfg.surfacing.enabled = False
+                mock_cfg.langfuse = MagicMock()
+                mock_cfg.langfuse.enabled = False
 
-        tree = ast.parse(textwrap.dedent(inspect.getsource(server.app_lifespan)))
-        loop_sites: list[tuple[int, list[ast.stmt]]] = []
-        reorder_sites: list[tuple[int, list[ast.stmt]]] = []
-        for parent in ast.walk(tree):
-            for field in ("body", "orelse", "finalbody"):
-                stmts = getattr(parent, field, None)
-                if not isinstance(stmts, list):
-                    continue
-                for i, s in enumerate(stmts):
-                    if isinstance(s, (ast.For, ast.AsyncFor)) and _calls(s, "register_proxy_tool"):
-                        loop_sites.append((i, stmts))
-                    elif _is_reorder_stmt(s):
-                        reorder_sites.append((i, stmts))
-        assert len(loop_sites) == 1 and len(reorder_sites) == 1, (
-            "app_lifespan must hold exactly one register_proxy_tool loop and "
-            "one direct _move_stm_tools_to_end statement — a dropped call, or "
-            "a duplicate/unreachable copy, breaks this pin's subject "
-            f"(loops={len(loop_sites)}, reorders={len(reorder_sites)})."
-        )
-        loop_at, loop_stmts = loop_sites[0]
-        reorder_at, reorder_stmts = reorder_sites[0]
-        assert reorder_stmts is loop_stmts and reorder_at > loop_at, (
-            "app_lifespan must reorder as a sibling statement AFTER the "
-            "register_proxy_tool loop; hoisted, nested, or relocated calls "
-            "are a no-op for #228 (proxied tools first)."
-        )
+                async with app_lifespan(mcp) as _ctx:
+                    advertised = [t.name for t in await mcp.list_tools()]
+
+            positions = {name: idx for idx, name in enumerate(advertised)}
+            utility = [n for n in advertised if n in set(_STM_UTILITY_TOOL_NAMES)]
+            assert {"fake__alpha", "fake__beta"} <= set(advertised), advertised
+            assert utility, "no STM utility tools advertised — test lost its subject"
+            assert max(positions["fake__alpha"], positions["fake__beta"]) < min(
+                positions[n] for n in utility
+            ), f"proxied tools must advertise before STM utility tools, got: {advertised}"
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
 
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
