@@ -707,6 +707,12 @@ class DaemonServer:
         deadline = req.get("deadline_monotonic")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
             return None
+        try:
+            deadline = float(deadline)
+        except OverflowError:
+            # JSON integers are unbounded; one too large for a float cannot
+            # be a real monotonic point (math.isfinite would raise on it too).
+            return None
         if not math.isfinite(deadline):
             # Not a usable monotonic point: +inf would reach the engine as a
             # "real" deadline that its non-finite guard treats as no deadline
@@ -714,7 +720,7 @@ class DaemonServer:
             # actually infinitely patient — and NaN poisons every comparison
             # it meets, starting with the expiry check below.
             return None
-        surface_deadline = float(deadline) - _DEADLINE_RESPONSE_MARGIN_SECONDS
+        surface_deadline = deadline - _DEADLINE_RESPONSE_MARGIN_SECONDS
         if surface_deadline - time.monotonic() < _MIN_SURFACE_BUDGET_SECONDS:
             return None
         return surface_deadline

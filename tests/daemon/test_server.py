@@ -392,8 +392,11 @@ def test_surface_deadline_rejects_non_finite_deadlines(tmp_path: Path) -> None:
     # ceiling, behind a client that is not actually infinitely patient), and
     # NaN poisons every comparison it meets. Both mean "don't start LTM work"
     # — the same answer a missing deadline gets.
+    # 10**400 is an int the isinstance check accepts but float() cannot
+    # represent — math.isfinite would raise OverflowError instead of
+    # rejecting it.
     server = DaemonServer(_config(tmp_path))
-    for bad in (float("nan"), float("inf"), float("-inf"), True, False, "1.0", None):
+    for bad in (float("nan"), float("inf"), float("-inf"), 10**400, True, False, "1.0", None):
         assert server._surface_deadline({"deadline_monotonic": bad}) is None, bad
 
 
