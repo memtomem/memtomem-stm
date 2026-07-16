@@ -487,8 +487,8 @@ class McpClientSearchAdapter:
         self._parser = get_parser(getattr(config, "result_format", "compact"))
         self._capabilities = LtmCapabilities()
         self._runtime_profile: dict[str, Any] | None = None
-        # #290: SurfacingEngine wraps adapter calls in ``asyncio.wait_for``;
-        # an outer-timeout cancellation interrupts ``call_tool`` mid-RPC and
+        # #290: SurfacingEngine bounds adapter calls with its own timeout
+        # (``_run_within``); that abort interrupts ``call_tool`` mid-RPC and
         # leaves the MCP session in a mid-message state. ``_TRANSPORT_ERRORS``
         # below intentionally does not catch ``CancelledError`` (cooperative
         # cancellation must propagate), so we mark the session here and let
@@ -841,7 +841,7 @@ class McpClientSearchAdapter:
         self._requests.put_nowait(req)
         try:
             # ``shield`` so that cancelling the *caller* (SurfacingEngine's
-            # ``asyncio.wait_for`` timeout) does NOT cancel ``req.fut`` — the
+            # timeout) does NOT cancel ``req.fut`` — the
             # owner keeps running the op after the caller leaves, and it must
             # be able to resolve the future (success or failure) so the
             # discard callback below can observe the outcome.
@@ -1081,9 +1081,9 @@ class McpClientSearchAdapter:
                 try:
                     await self.start()
                 except asyncio.CancelledError:
-                    # Outer wait_for / timeout cancelled us mid-init
-                    # (SurfacingEngine wraps adapter calls in
-                    # ``asyncio.wait_for``). The in-flight start keeps
+                    # The caller's timeout cancelled us mid-init
+                    # (SurfacingEngine bounds adapter calls with its
+                    # own timeout). The in-flight start keeps
                     # running abandoned in the owner task (#664); reset
                     # the sticky flag so the next call re-enters this
                     # path instead of short-circuiting — its start op
@@ -1176,10 +1176,12 @@ class McpClientSearchAdapter:
                 )
                 return [], [], "transport_error"
         except asyncio.CancelledError:
-            # #290: outer wait_for cancelled us mid-RPC. Mark for lazy
+            # #290: the caller's timeout cancelled us mid-RPC. Mark for lazy
             # reconnect on the next call (the session's read/write streams
-            # are now in a half-read state) and propagate the cancellation
-            # so the caller's wait_for can surface its TimeoutError.
+            # are now in a half-read state) and propagate the cancellation.
+            # The caller does not await this unwind (#720) — it books its
+            # timeout as soon as its own timer fires — so the marking must
+            # not depend on getting there first.
             self._mark_dirty(session, generation)
             raise
         except Exception as exc:

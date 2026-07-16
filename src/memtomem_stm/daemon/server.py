@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import secrets
 import signal
@@ -115,12 +116,13 @@ def _direct_child_pids() -> set[int]:
 _LEAK_KILL_ESCALATE_SECONDS = 2.0
 
 # Reserved out of the client's deadline for encoding + the loopback write/read
-# of the response. The engine's budget is the remainder, so the engine's own
-# timeout fires *before* the client gives up and `_run_admitted`'s
-# `asyncio.timeout_at` backstop cancels it from outside. It also has to absorb
-# the engine's pre-timeout work (gate, query extraction, privacy scan — local
-# CPU on short strings) and the time `wait_for` spends awaiting the cancelled
-# adapter, neither of which the budget arithmetic can see.
+# of the response. The engine's deadline is the client's minus this margin, so
+# the engine's own timeout fires *before* the client gives up and
+# `_run_admitted`'s `asyncio.timeout_at` backstop cancels it from outside. The
+# margin no longer has to be sized to absorb anything else (#720): the engine
+# re-reads the clock right before its LTM attempt, so its pre-timeout work
+# debits its own window, and it books its timeout off which timer fired rather
+# than off having beaten the backstop by enough wall clock.
 _DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
 
 # Below this, an LTM round trip cannot plausibly complete, so starting one only
@@ -461,11 +463,13 @@ class DaemonServer:
                 # Computed here, not at admission: the admission queue and the
                 # serialization lock have already eaten part of the client's
                 # deadline by the time we run.
-                budget = self._remaining_budget(req)
-                if budget is None:
+                surface_deadline = self._surface_deadline(req)
+                if surface_deadline is None:
                     logger.debug("surface skipped: no budget left in the client deadline")
                     return surface_response({})
-                output = await run_surfacing_hook(call, engine=self._engine, budget_seconds=budget)
+                output = await run_surfacing_hook(
+                    call, engine=self._engine, deadline_monotonic=surface_deadline
+                )
                 return surface_response(output)
 
             return await self._run_admitted(
@@ -687,23 +691,39 @@ class DaemonServer:
             return await self._run_admitted(req, scratch_call)
         return {"v": PROTOCOL_VERSION, "ok": False, "error": "unknown op"}
 
-    def _remaining_budget(self, req: dict[str, Any]) -> float | None:
-        """Seconds of the client's deadline still usable for an LTM attempt.
+    def _surface_deadline(self, req: dict[str, Any]) -> float | None:
+        """Absolute monotonic point by which this request's LTM attempt must
+        be over, or ``None`` for "don't start one".
 
-        ``None`` means "don't start one". The margin keeps the engine's own
-        timeout ahead of the client's give-up point, so the abort is the
-        engine's (fault row + log + breaker count, #579) rather than a silent
-        outside cancellation. ``_run_admitted`` already rejected a missing or
-        expired deadline; this re-reads it because queue/lock wait may have
-        consumed the rest since admission.
+        The margin keeps the engine's own timeout ahead of the client's
+        give-up point, so the abort is the engine's (fault row + log + breaker
+        count, #579) rather than a silent outside cancellation. It is a
+        *deadline*, not the remaining budget, so the engine can re-read the
+        clock right before its LTM attempt and its own pre-timeout work cannot
+        silently eat the margin (#720). ``_run_admitted`` already rejected a
+        missing or expired deadline; this re-reads it because queue/lock wait
+        may have consumed the rest since admission.
         """
         deadline = req.get("deadline_monotonic")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
             return None
-        remaining = float(deadline) - time.monotonic() - _DEADLINE_RESPONSE_MARGIN_SECONDS
-        if remaining < _MIN_SURFACE_BUDGET_SECONDS:
+        try:
+            deadline = float(deadline)
+        except OverflowError:
+            # JSON integers are unbounded; one too large for a float cannot
+            # be a real monotonic point (math.isfinite would raise on it too).
             return None
-        return remaining
+        if not math.isfinite(deadline):
+            # Not a usable monotonic point: +inf would reach the engine as a
+            # "real" deadline that its non-finite guard treats as no deadline
+            # at all — the full configured ceiling behind a client that is not
+            # actually infinitely patient — and NaN poisons every comparison
+            # it meets, starting with the expiry check below.
+            return None
+        surface_deadline = deadline - _DEADLINE_RESPONSE_MARGIN_SECONDS
+        if surface_deadline - time.monotonic() < _MIN_SURFACE_BUDGET_SECONDS:
+            return None
+        return surface_deadline
 
     async def _run_admitted(
         self,

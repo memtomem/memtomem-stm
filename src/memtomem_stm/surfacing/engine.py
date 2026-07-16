@@ -23,7 +23,7 @@ from memtomem_stm.surfacing.mcp_client import (
     SearchOutcome,
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
-from memtomem_stm.surfacing.relevance import RelevanceGate
+from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
@@ -36,6 +36,40 @@ _QUERY_HASH_PREFIX = "sha256:"
 hashed-form row without re-reading config and lets ad-hoc DB inspection
 tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
+
+_MAX_ABANDONED_OPS = 4
+"""How many cancelled LTM operations may still be unwinding before this engine
+stops starting new ones.
+
+``_run_within`` abandons an operation rather than waiting out an unwind it
+cannot bound, so an LTM that never lets go leaves one behind per attempt, each
+still holding whatever it held (its session, the per-key lock). The circuit
+breaker throttles but does not stop that: every reset lets another probe
+through. Rather than evict the references — the point of keeping them is that
+the operation is still running — refuse the *next* attempt while this many are
+stuck, which is also the honest reading of a dependency that will not let go.
+Small on purpose: past one or two, the LTM is not answering anyway.
+
+Counts only *abandoned* operations, not every one in flight. Reserving on every
+attempt would give a hard instantaneous cap, but nothing at admission time
+knows which attempts will get stuck, so it would equally cap healthy
+concurrency (the daemon serializes surfacing; ``ProxyManager`` does not) and
+report ordinary saturation as this dependency fault. The cost is that a burst
+already in flight when the LTM wedges can overshoot — each of those read the
+count before any of them had timed out. That is bounded, since everything after
+they land is refused, and it errs toward letting a healthy LTM work.
+"""
+
+_ABANDONED_DRAIN_SECONDS = 1.0
+"""How long :meth:`SurfacingEngine.stop` waits on LTM operations abandoned at
+timeout before giving up on them.
+
+Not a tuning knob: an abandoned operation is already cancelled and its result
+discarded, so this only buys a tidy unwind (the adapter's session marking) on
+the way out. It is bounded because that unwind is not — the reason
+``_run_within`` stopped waiting on it in the first place — and the daemon's
+teardown calls this before the adapter's own bounded stop.
+"""
 
 _SCORE_SCALE_WARNING_STREAK = 5
 """Fresh LTM searches required before warning about a score-scale mismatch.
@@ -160,6 +194,21 @@ class SurfacingEngine:
         self._invalidated_ids: dict[tuple[str, str, str], None] = {}
         self._invalidated_ids_max = 10000
         self._background_tasks: set[asyncio.Task] = set()
+        # LTM operations abandoned at timeout/cancellation, kept apart from
+        # ``_background_tasks`` because they are the one thing here whose
+        # unwind is *not* known to be bounded — that is why ``_run_within``
+        # stops waiting on them — so ``stop()`` must not block on them the way
+        # it does on webhooks.
+        self._abandoned_ops: set[asyncio.Task] = set()
+        # Latch for the ``ltm_draining`` warning: one per draining episode,
+        # re-armed by the next admission. A refusal records neither breaker
+        # success nor failure, so once the breaker's reset window elapses
+        # every eligible call reaches admission and is refused — warning on
+        # each would flood the log at call rate for as long as the LTM stays
+        # wedged. The skip counter and fault row stay per-call: they are the
+        # count.
+        self._draining_warning_latched = False
+
         # Per-key stampede guard — identical concurrent ``_do_surface`` calls
         # serialize on the same lock so a cache miss triggers one LTM search
         # rather than N and the losing coroutine cannot overwrite the
@@ -279,21 +328,113 @@ class SurfacingEngine:
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
 
-    def _effective_timeout(self, budget_seconds: float | None) -> float:
-        """This call's LTM budget: the configured ceiling, lowered to a
-        deadline-bounded caller's remaining time.
+    async def _run_within(self, coro: Any, timeout: float) -> Any:
+        """Run *coro* under *timeout*, turning an abort *this* call's timer
+        started into :class:`asyncio.TimeoutError` (#720).
 
-        ``budget_seconds`` only ever shrinks the window — an operator's
-        ``timeout_seconds`` stays the upper bound. Non-finite or non-positive
-        budgets are ignored rather than turned into an instant timeout: the
-        caller owns the "no budget left, don't start" decision (starting an LTM
-        round trip we cannot finish is what cancels the adapter mid-RPC), and a
-        bad value must not silently open the breaker on a healthy LTM.
+        (A :class:`asyncio.TimeoutError` raised by *coro* itself also reaches
+        the caller, and :meth:`surface` books it the same way. That predates
+        this and is not what the machinery below is about.)
+
+        Telling that apart from a cancellation of the call itself is the whole
+        job here, because only the timeout books the fault, the log, and the
+        breaker failure (#579) — and charging a *cancelled* call would open the
+        breaker on a healthy LTM. It cannot be decided after the fact: neither
+        elapsed time, nor the caller's deadline, nor a timeout scope's own
+        ``expired()`` distinguishes "my timer fired first" from "my timer also
+        fired, later, while something else was cancelling me". So the flag is
+        set inside the timer callback itself. The loop runs due callbacks in
+        scheduled order, and this timer is always scheduled ahead of a caller's
+        backstop, so it cannot be preempted even when a stall makes both come
+        due on the same iteration — which is exactly how the backstop used to
+        cancel :meth:`surface` from outside and skip the bookkeeping entirely.
+
+        The ``shield`` is what keeps that prompt: cancelling it wakes us
+        immediately instead of after the cancelled LTM adapter has finished
+        unwinding, which is unbounded — a stdio child can be slow to give up.
+        The abandoned operation is cancelled but not awaited. The MCP adapter
+        already expects a caller to leave mid-RPC — it shields its own owner
+        request precisely so the op can outlive the caller (#664) — and marks
+        the session for lazy reconnect while unwinding (#290/#296). Parking the
+        task keeps it from being garbage-collected mid-unwind and lets
+        :meth:`stop` drain what it can at shutdown.
+        """
+        op = asyncio.ensure_future(coro)
+        shielded = asyncio.shield(op)
+        timed_out = False
+
+        def _fire() -> None:
+            nonlocal timed_out
+            # ``op`` first: a shield resolves its wrapper from a queued
+            # callback, so there is one loop batch where the operation has
+            # finished but ``shielded`` has not caught up. Firing on the
+            # wrapper alone would charge an LTM that answered inside its
+            # window.
+            if op.done() or shielded.done():
+                return
+            timed_out = True
+            # Only the wrapper: ``op`` keeps unwinding on its own time.
+            shielded.cancel()
+
+        handle = asyncio.get_running_loop().call_later(timeout, _fire)
+        try:
+            return await shielded
+        except asyncio.CancelledError:
+            self._abandon(op)
+            if timed_out:
+                raise asyncio.TimeoutError from None
+            raise
+        except BaseException:
+            self._abandon(op)
+            raise
+        finally:
+            handle.cancel()
+
+    def _abandon(self, op: asyncio.Future) -> None:
+        """Cancel an operation we are no longer waiting on and park it so it is
+        not garbage-collected mid-unwind."""
+        op.cancel()
+        if isinstance(op, asyncio.Task) and not op.done():
+            self._abandoned_ops.add(op)
+            op.add_done_callback(self._on_abandoned_op_done)
+
+    def _on_abandoned_op_done(self, task: asyncio.Task) -> None:
+        """Retire an operation abandoned at timeout/cancellation, consuming
+        any exception it raised on the way out so asyncio does not report it
+        as never retrieved."""
+        self._abandoned_ops.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("Abandoned surfacing operation failed while unwinding: %s", exc)
+
+    def _effective_timeout(self, deadline_monotonic: float | None) -> float:
+        """This call's LTM window: the configured ceiling, lowered to what is
+        left of a deadline-bounded caller's absolute deadline.
+
+        Reading the clock *here* — after the gate, query extraction, and
+        privacy scan — makes the engine's own pre-timeout work debit its own
+        window instead of the caller's response margin (#720); a relative
+        budget captured before that work silently spent the margin. The
+        deadline only ever shrinks the window — an operator's
+        ``timeout_seconds`` stays the upper bound. ``None``, non-finite, or
+        non-positive values (a ``time.monotonic()`` reading is always
+        positive, so those are caller bugs, not elapsed time) are ignored
+        rather than turned into an instant timeout: a bad value must not
+        silently open the breaker on a healthy LTM. A *plausible* deadline
+        that pre-work has already consumed returns a non-positive remainder —
+        real time did pass, so :meth:`surface` books the timeout without
+        starting an LTM round trip it would have to cancel mid-RPC.
         """
         ceiling = self._config.timeout_seconds
-        if budget_seconds is None or not math.isfinite(budget_seconds) or budget_seconds <= 0:
+        if (
+            deadline_monotonic is None
+            or not math.isfinite(deadline_monotonic)
+            or deadline_monotonic <= 0
+        ):
             return ceiling
-        return min(ceiling, budget_seconds)
+        return min(ceiling, deadline_monotonic - time.monotonic())
 
     def _observe_score_scale(
         self,
@@ -465,7 +606,7 @@ class SurfacingEngine:
         trace_id: str | None = None,
         context_query: str | None = None,
         source_response_chars: int | None = None,
-        budget_seconds: float | None = None,
+        deadline_monotonic: float | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -475,15 +616,21 @@ class SurfacingEngine:
         - relevance gate rejects the call
         - timeout exceeded
 
-        ``budget_seconds`` lets a caller that is itself deadline-bounded (the
-        daemon, whose client gives up after ``hook.daemon_timeout_seconds``)
-        shrink this call's timeout below ``timeout_seconds``. It never *raises*
-        the configured ceiling. Passing it keeps the abort inside :meth:`surface`
-        instead of letting the caller cancel it from outside: only the
+        ``deadline_monotonic`` — an absolute ``time.monotonic()`` point — lets
+        a caller that is itself deadline-bounded (the daemon, whose client
+        gives up after ``hook.daemon_timeout_seconds``) shrink this call's
+        timeout below ``timeout_seconds``. It never *raises* the configured
+        ceiling. Passing it keeps the abort inside :meth:`surface` instead of
+        letting the caller cancel it from outside: the
         :class:`asyncio.TimeoutError` path below records the fault, logs, and
-        counts the failure toward the breaker (#579) — an external cancellation
-        skips all three, so the breaker never opens and every subsequent call
-        pays the full timeout and respawns the LTM child again.
+        counts the failure toward the breaker (#579), and an outside
+        cancellation skips all three, so the breaker never opens and every
+        subsequent call pays the full timeout and respawns the LTM child again.
+        :meth:`_run_within` is what makes that abort reliably ours to raise
+        rather than a race against the caller's backstop (#720). A cancellation
+        that reaches here is therefore one this call did not start — a
+        shutdown, a client hanging up — and propagates unbooked rather than
+        charging a healthy LTM.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -515,7 +662,11 @@ class SurfacingEngine:
             # Never send raw credentials/PII to a remote LTM. A stable digest
             # preserves cache/cooldown behavior without disclosing the source.
             query = self._hashed_query(query)
-        if not self._gate.should_surface(server, tool, query):
+        # On pass the gate eagerly claims a rate-limit slot; the claim token
+        # rides along so a path that ends up starting no LTM work can give
+        # back exactly its own slot (``release_claim``).
+        rate_claim = self._gate.should_surface(server, tool, query)
+        if rate_claim is None:
             # Gate has already recorded the specific reason internally. Avoid
             # double-counting by not recording at the engine level here.
             logger.debug(
@@ -526,11 +677,31 @@ class SurfacingEngine:
             )
             return response_text
 
-        effective_timeout = self._effective_timeout(budget_seconds)
+        effective_timeout = self._effective_timeout(deadline_monotonic)
         try:
-            result = await asyncio.wait_for(
-                self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
-                timeout=effective_timeout,
+            if effective_timeout <= 0:
+                # Pre-timeout work (gate, query extraction, privacy scan)
+                # consumed the caller's whole window (#720). Book the abort
+                # through the branch below without starting an LTM round trip
+                # that would be cancelled mid-RPC and force a stdio child
+                # respawn on the next call (#290/#296). No LTM work started
+                # also means no rate-limit attempt was made (the cap counts
+                # attempts because an attempt spent LTM resources — see
+                # ``release_claim``); the timeout/breaker booking still
+                # stands, since real time did pass.
+                self._gate.release_claim(rate_claim)
+                raise asyncio.TimeoutError
+            result = await self._run_within(
+                self._do_surface(
+                    server,
+                    tool,
+                    arguments,
+                    response_text,
+                    query,
+                    rate_claim=rate_claim,
+                    trace_id=trace_id,
+                ),
+                effective_timeout,
             )
             self._circuit_breaker.record_success()
             return result
@@ -541,7 +712,9 @@ class SurfacingEngine:
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
                 tool,
-                effective_timeout,
+                # Clamped: the pre-work branch above reaches here with a
+                # window already spent, and a negative "limit" reads as a bug.
+                max(effective_timeout, 0.0),
             )
             # A hung LTM must open the breaker like an erroring one (#579): a
             # timeout is a degraded dependency, and it also cancels the adapter
@@ -942,6 +1115,7 @@ class SurfacingEngine:
         response_text: str,
         query: str,
         *,
+        rate_claim: RateClaim,
         trace_id: str | None = None,
     ) -> str:
         # Check surfacing cache (keyed by server+tool+query). The full miss
@@ -973,12 +1147,74 @@ class SurfacingEngine:
                     response_text,
                     query,
                     cache_key,
+                    rate_claim=rate_claim,
                     trace_id=trace_id,
                 )
             finally:
                 self._key_locks.pop(cache_key, None)
 
     async def _do_surface_miss(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        response_text: str,
+        query: str,
+        cache_key: str,
+        *,
+        rate_claim: RateClaim,
+        trace_id: str | None = None,
+    ) -> str:
+        """Admission for the one path that starts LTM work, then the work.
+
+        Deliberately not at the top of :meth:`surface`: gating there would also
+        refuse cache hits, which need no LTM at all, and would relabel every
+        ``no_query`` or gate rejection as ``ltm_draining``.
+        """
+        if len(self._abandoned_ops) >= _MAX_ABANDONED_OPS:
+            # No LTM work started, so this is not an "attempt" by the rate
+            # limiter's own definition — give the slot back rather than let a
+            # run of refusals spend the throttle on nothing.
+            self._gate.release_claim(rate_claim)
+            self._observability.record_skip(tool, "ltm_draining")
+            self._persist_fault(server, tool, "ltm_draining")
+            # Warn once per draining episode (see the latch's init comment):
+            # refusals record nothing on the breaker, so with the reset window
+            # elapsed every call lands here and per-call warnings would flood
+            # the log for as long as the LTM stays wedged.
+            if self._draining_warning_latched:
+                logger.debug(
+                    "Surfacing skipped for %s/%s: %d cancelled LTM operation(s) still unwinding",
+                    server,
+                    tool,
+                    len(self._abandoned_ops),
+                )
+            else:
+                self._draining_warning_latched = True
+                logger.warning(
+                    "Surfacing skipped for %s/%s: %d cancelled LTM operation(s) still "
+                    "unwinding — the LTM is not releasing cancelled calls (further "
+                    "refusals log at debug until the pile drains)",
+                    server,
+                    tool,
+                    len(self._abandoned_ops),
+                )
+            raise _OperationalSkip("ltm_draining")
+
+        # Admission passed: the pile drained below the bound, so the episode
+        # is over and the next one deserves its own warning.
+        self._draining_warning_latched = False
+        return await self._do_surface_miss_admitted(
+            server,
+            tool,
+            arguments,
+            response_text,
+            query,
+            cache_key,
+            trace_id=trace_id,
+        )
+
+    async def _do_surface_miss_admitted(
         self,
         server: str,
         tool: str,
@@ -1341,12 +1577,41 @@ class SurfacingEngine:
             logger.warning("Webhook fire-and-forget task failed: %s", exc)
 
     async def stop(self) -> None:
-        """Cancel and drain pending background tasks (webhooks)."""
+        """Cancel and drain pending background tasks (webhooks), then give
+        abandoned LTM operations a bounded chance to finish unwinding.
+
+        The two are drained differently on purpose. A webhook POST is bounded
+        by its own client timeout, so waiting for it is safe. An abandoned LTM
+        operation is not — ``_run_within`` stopped waiting on it precisely
+        because a stdio child can be slow, or refuse, to give up — so waiting
+        without a bound would let one such unwind hold the daemon's shutdown
+        open, and this runs before the adapter's own bounded stop. They only
+        get ``_ABANDONED_DRAIN_SECONDS``; anything still in flight is left to
+        the loop's teardown rather than blocking it.
+
+        They are also *not* re-cancelled here. ``_abandon`` already cancelled
+        each one, and what they are doing now is the cleanup that cancellation
+        asked for — the adapter marking its session for lazy reconnect, locks
+        unwinding. A second cancellation lands inside that cleanup and aborts
+        it, which is the opposite of draining.
+        """
         for task in self._background_tasks:
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+        stragglers = {task for task in self._abandoned_ops if not task.done()}
+        if stragglers:
+            _, pending = await asyncio.wait(stragglers, timeout=_ABANDONED_DRAIN_SECONDS)
+            if pending:
+                # Deliberately still referenced: the set exists to keep an
+                # unwinding op from being collected mid-flight, and giving up
+                # waiting is not the same as it having finished. Each one
+                # retires itself through ``_on_abandoned_op_done``.
+                logger.debug(
+                    "%d abandoned surfacing operation(s) still unwinding at stop", len(pending)
+                )
 
     def _run_stats_retention(self, store: Any) -> None:
         """Delete ``surfacing_events`` rows past the stats-retention window so

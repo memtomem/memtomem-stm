@@ -109,8 +109,9 @@ class HookConfig(BaseModel):
     effective ceiling on the LTM attempt inside it. Small and independent of the
     cold-path ``_hook_budget_seconds()`` backstop.
 
-    The daemon subtracts queue/lock wait plus a response margin from this
-    deadline and hands the remainder to the surfacing engine as its timeout, so
+    The daemon reserves a response margin out of this deadline and hands the
+    rest to the surfacing engine as its absolute deadline (queue/lock wait
+    and the engine's own pre-work debit it before the LTM attempt starts), so
     a value **below** ``surfacing.timeout_seconds`` silently shortens every LTM
     attempt rather than letting it run its configured course. That is the
     intended precedence — the host is waiting on this hook — but it means

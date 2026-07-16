@@ -78,6 +78,40 @@ class TestRelevanceGateRateLimit:
         assert not gate.should_surface("s", "tool_x", "another different query")
 
 
+class TestRelevanceGateReleaseClaim:
+    def test_release_returns_the_callers_own_claim(self):
+        # A and B claim concurrently; A is refused downstream and refunds.
+        # Popping the newest would hand back B's claim: the surviving slot
+        # would then be A's OLDER timestamp, whose earlier expiry frees
+        # capacity before B's real LTM attempt should allow. The claim token
+        # makes the refund exact.
+        gate = _gate(max_surfacings_per_minute=2, cooldown_seconds=0.0)
+        claim_a = gate.should_surface("s", "t1", "query about topic A")
+        claim_b = gate.should_surface("s", "t2", "completely different topic B query")
+        assert claim_a is not None and claim_b is not None
+        gate.release_claim(claim_a)
+        assert list(gate._surfacing_timestamps) == [claim_b]
+
+    def test_release_tolerates_an_already_pruned_claim(self, monkeypatch):
+        # A claim can leave the deque before its caller refunds — pruned by
+        # window expiry or evicted by the deque's maxlen. The refund must
+        # neither raise nor take someone else's slot with it. The clock is
+        # frozen because two claims really can share one time.monotonic()
+        # reading (Windows ticks at ~15.6ms, where CI caught exactly this):
+        # the token must name the claim by identity, not by a timestamp
+        # value that a *different* caller's live slot can collide with.
+        from memtomem_stm.surfacing import relevance as relevance_module
+
+        monkeypatch.setattr(relevance_module.time, "monotonic", lambda: 790.828)
+        gate = _gate(max_surfacings_per_minute=2, cooldown_seconds=0.0)
+        claim_a = gate.should_surface("s", "t1", "query about topic A")
+        assert claim_a is not None
+        gate._surfacing_timestamps.clear()  # pruned by expiry
+        claim_b = gate.should_surface("s", "t2", "completely different topic B query")
+        gate.release_claim(claim_a)
+        assert list(gate._surfacing_timestamps) == [claim_b]
+
+
 class TestRelevanceGateCooldown:
     def test_duplicate_query_rejected(self):
         gate = _gate(cooldown_seconds=10.0)

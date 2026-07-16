@@ -7,11 +7,13 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 
+from memtomem_stm.surfacing import engine as engine_module
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 
@@ -424,16 +426,19 @@ class TestSurfacingTimeout:
         assert call_count == 2
 
 
-class TestSurfacingBudget:
-    """``budget_seconds`` — a deadline-bounded caller shrinking this call's timeout.
+class TestSurfacingDeadline:
+    """``deadline_monotonic`` — a deadline-bounded caller capping this call's abort point.
 
     The daemon's client gives up after ``hook.daemon_timeout_seconds``; without a
-    propagated budget it cancels ``surface()`` from outside, which skips the
-    fault/log/breaker bookkeeping that only the internal TimeoutError path does.
+    propagated deadline it cancels ``surface()`` from outside, which skips the
+    fault/log/breaker bookkeeping that only the internal TimeoutError path does
+    (#719). The deadline is absolute so the engine's own pre-timeout work debits
+    the engine's window, and a lost abort race is booked by the CancelledError
+    path instead of relying on the caller's response margin to prevent it (#720).
     """
 
-    async def test_budget_below_config_shortens_the_attempt(self):
-        # The engine must abort on the caller's budget, not run to the
+    async def test_deadline_below_config_shortens_the_attempt(self):
+        # The engine must abort at the caller's deadline, not run to the
         # (much larger) configured ceiling.
         async def slow_search(*args, **kwargs):
             await asyncio.sleep(10)
@@ -448,17 +453,17 @@ class TestSurfacingBudget:
         )
         started = time.monotonic()
         output = await engine.surface(
-            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=0.05
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 0.05
         )
         elapsed = time.monotonic() - started
 
         assert output == LONG_RESPONSE
-        # The ceiling is 600x the budget, so one absolute bound already tells the
+        # The ceiling is 600x the window, so one absolute bound already tells the
         # two apart — an abort at the ceiling would take ~30s.
         assert elapsed < 1.0
 
-    async def test_budget_abort_still_counts_toward_the_breaker(self):
-        # The whole point of propagating the budget instead of cancelling from
+    async def test_deadline_abort_still_counts_toward_the_breaker(self):
+        # The whole point of propagating the deadline instead of cancelling from
         # outside: the timeout stays *inside* surface(), so #579's bookkeeping
         # (fault + breaker) still runs and the breaker eventually opens.
         async def slow_search(*args, **kwargs):
@@ -472,12 +477,18 @@ class TestSurfacingBudget:
             config=_make_config(timeout_seconds=30.0),
             mcp_adapter=adapter,
         )
-        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=0.05)
+        await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.05,
+        )
         assert engine._circuit_breaker.failure_count == 1
 
-    async def test_budget_never_raises_the_configured_ceiling(self):
-        # An over-generous budget must not extend timeout_seconds — the operator
-        # ceiling stays authoritative.
+    async def test_deadline_never_raises_the_configured_ceiling(self):
+        # An over-generous deadline must not extend timeout_seconds — the
+        # operator ceiling stays authoritative.
         async def slow_search(*args, **kwargs):
             await asyncio.sleep(10)
             return [], [], "empty_results"
@@ -490,28 +501,824 @@ class TestSurfacingBudget:
             mcp_adapter=adapter,
         )
         started = time.monotonic()
-        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=30.0)
+        await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 30.0
+        )
         elapsed = time.monotonic() - started
 
         assert elapsed < 1.0
         assert engine._circuit_breaker.failure_count == 1
 
-    @pytest.mark.parametrize("budget", [None, 0.0, -1.0, float("nan"), float("inf")])
-    async def test_unusable_budget_falls_back_to_the_configured_timeout(self, budget):
-        # A non-positive/non-finite budget must not become an instant timeout:
-        # that would persist a fault and open the breaker on a *healthy* LTM.
-        # "No budget left, don't start" is the caller's call, not the engine's.
+    @pytest.mark.parametrize("deadline", [None, 0.0, -1.0, float("nan"), float("inf")])
+    async def test_unusable_deadline_falls_back_to_the_configured_timeout(self, deadline):
+        # A non-positive/non-finite deadline is a caller bug, not elapsed time
+        # (time.monotonic() readings are positive and finite). It must not
+        # become an instant timeout: that would persist a fault and open the
+        # breaker on a *healthy* LTM.
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=7.0),
             mcp_adapter=_make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(), score=0.5)]),
         )
-        assert engine._effective_timeout(budget) == 7.0
+        assert engine._effective_timeout(deadline) == 7.0
 
         output = await engine.surface(
-            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, budget_seconds=budget
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=deadline
         )
         assert "Relevant Memories" in output
         assert engine._circuit_breaker.failure_count == 0
+
+    @staticmethod
+    def _hangs_unwinding(entered: asyncio.Event, cancel_started: asyncio.Event):
+        """Adapter whose cancellation outlives whoever cancelled it — a stdio
+        LTM child that is slow to give up.
+
+        ``entered`` fires once the LTM call is genuinely in flight, so a test
+        cancelling "inside the window" cannot instead be cancelling before the
+        attempt started — a pass for the wrong reason. ``cancel_started`` fires
+        the instant the adapter is cancelled, pinning *when* the abort began
+        independently of when the caller learned about it.
+        """
+
+        async def search(*args, **kwargs):
+            entered.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancel_started.set()
+                await asyncio.sleep(10)  # unwind outlives the canceller
+                raise
+
+        return search
+
+    async def test_slow_unwind_does_not_delay_the_timeout_booking(self):
+        # #720 acceptance: an adapter whose cancellation outlives the caller's
+        # backstop must not be able to make the engine miss its own abort. The
+        # operation is shielded, so the engine's TimeoutError — and the fault
+        # row, log, and breaker increment with it — lands the moment its timer
+        # fires, while the adapter is still unwinding. Awaiting that unwind was
+        # what let a caller's backstop cancel surface() from outside first and
+        # skip the bookkeeping entirely.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        entered = asyncio.Event()
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(entered, cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        started = time.monotonic()
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 0.05
+        )
+        elapsed = time.monotonic() - started
+
+        assert output == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
+        # Booked without waiting on the adapter's 10s unwind at all.
+        assert elapsed < 1.0
+        await asyncio.sleep(0)  # hand the abandoned operation a turn
+        assert cancel_started.is_set()  # it was cancelled, not left running
+
+    async def test_a_backstop_cannot_beat_the_engines_own_timer(self):
+        # The daemon wraps surface() in `asyncio.timeout_at` a response margin
+        # behind the engine's deadline (#719). The engine must reach its own
+        # abort first, so the call returns a booked, well-formed empty result
+        # rather than blowing up the caller's scope — even when the adapter's
+        # unwind outlives the backstop.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        entered = asyncio.Event()
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(entered, cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        async with asyncio.timeout(0.3):  # stands in for the daemon backstop
+            output = await engine.surface(
+                "gh",
+                "read_file",
+                VALID_ARGS,
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() + 0.05,
+            )
+
+        assert output == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
+
+    # ``None`` covers the cold in-process path, which has no deadline at all.
+    @pytest.mark.parametrize("deadline_offset", [None, 30.0], ids=["no_deadline", "far_deadline"])
+    async def test_timeout_at_the_config_ceiling_books(self, deadline_offset):
+        # The window can end at the configured ceiling rather than the caller's
+        # deadline, and that abort is just as much a timeout — the attempt blew
+        # the window it was given.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        deadline = None if deadline_offset is None else time.monotonic() + deadline_offset
+        entered = asyncio.Event()
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(entered, cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),  # ceiling binds, not the deadline
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=deadline
+        )
+
+        assert output == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
+
+    async def test_cancelling_the_call_mid_unwind_books_nothing(self):
+        # The reverse of the acceptance test: an external cancellation arrives
+        # first, inside the window, and the adapter's unwind survives past the
+        # point the engine's own timer would have fired. Neither elapsed time
+        # nor the timeout's own expiry flag can tell that apart from a real
+        # timeout — both read as "expired" and would charge a healthy LTM.
+        # Shielding the operation makes it structural: a CancelledError here is
+        # always someone cancelling *us*, never our own timer.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        entered = asyncio.Event()
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(entered, cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        task = asyncio.create_task(
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5.0)  # in flight, inside the window
+        task.cancel()  # a real cancellation, requested while still healthy
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancel_started.is_set()  # the adapter really was aborted mid-call
+        await asyncio.sleep(0.1)  # past the point the engine's timer would have fired
+
+        assert obs.snapshot()["outcomes"] == {}
+        assert engine._circuit_breaker.failure_count == 0
+
+    async def test_starved_loop_does_not_charge_an_unrelated_cancellation(self):
+        # The mirror of test_starvation_past_both_deadlines_still_books: here
+        # the cancellation was requested while the attempt was healthy and only
+        # *delivered* past the window, because the loop stalled. The wakeup was
+        # queued before this call's timer came due, so the timer never fires
+        # first and nothing books — where reading elapsed time off the clock
+        # would charge a healthy LTM a breaker failure.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        entered = asyncio.Event()
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(entered, cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        task = asyncio.create_task(
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5.0)  # in flight, inside the window
+        task.cancel()  # a real cancellation, requested while still healthy
+        time.sleep(0.15)  # starve the loop well past the 0.05s window
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert obs.snapshot()["outcomes"] == {}
+        assert engine._circuit_breaker.failure_count == 0
+
+    async def test_starvation_past_both_deadlines_still_books(self):
+        # The mirror case, and the one that makes the booking flag load-bearing:
+        # the loop stalls past the engine's timer AND the caller's backstop, so
+        # both come due on the same iteration. The engine's timer is scheduled
+        # first and so runs first, but it can only *schedule* surface() to
+        # resume — the backstop's callback then cancels surface() before that
+        # resume happens, and the engine learns of its own timeout as a
+        # CancelledError. Reading the clock, the deadline, or a timeout scope's
+        # expiry here all skip the bookkeeping, which is the #719/#720 gap.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        entered = asyncio.Event()
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(entered, cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),  # the engine's timer
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        async def admitted() -> str:
+            async with asyncio.timeout(0.1):  # the daemon's backstop, scheduled later
+                return await engine.surface(
+                    "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None
+                )
+
+        task = asyncio.create_task(admitted())
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        time.sleep(0.2)  # stall past BOTH timers
+        output = await task
+
+        assert output == LONG_RESPONSE  # the engine's own timeout won, and fail-open
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
+
+    async def test_a_finished_operation_is_not_booked_by_a_timer_in_the_same_batch(
+        self, monkeypatch
+    ):
+        # A shield resolves its wrapper from a queued callback, so there is one
+        # loop batch where the operation is done but the wrapper is not. A timer
+        # firing in exactly that batch must not book: the LTM answered inside
+        # its window, and charging it would open the breaker on a healthy one.
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=_make_mcp_adapter(),
+        )
+        loop = asyncio.get_running_loop()
+        fire: dict[str, Any] = {}
+        real_call_later = loop.call_later
+
+        def spy_call_later(delay, callback, *args):
+            fire["callback"] = callback
+            return real_call_later(delay, callback, *args)
+
+        monkeypatch.setattr(loop, "call_later", spy_call_later)
+
+        async def answers() -> str:
+            return "answered in time"
+
+        task = asyncio.create_task(engine._run_within(answers(), 30.0))
+        await asyncio.sleep(0)  # arm the timer, suspend on the shield
+        await asyncio.sleep(0)  # the operation finishes; the wrapper is only queued to resolve
+        fire["callback"]()  # the timer, landing in exactly that batch
+
+        assert await task == "answered in time"
+
+    async def test_stop_does_not_abort_the_cleanup_it_is_draining(self):
+        # `_abandon` already cancelled these; what they are doing now IS the
+        # cleanup that cancellation asked for (the adapter marks its session
+        # for lazy reconnect, locks unwind). Cancelling a second time in stop()
+        # lands inside that cleanup and kills it — the opposite of draining.
+        # An unwind that merely absorbs repeated cancellation would hide this,
+        # so this one awaits normally, the way real cleanup does.
+        cleanup_started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+
+        async def cleans_up_on_cancel(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.sleep(0.05)  # cleanup that yields, e.g. an async close
+                cleaned_up.set()
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=cleans_up_on_cancel)
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+        )
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None)
+        assert engine._abandoned_ops
+
+        # Wait for the cleanup to actually be in flight. Without this the test
+        # is worthless: a re-cancel delivered before the task has been stepped
+        # at all collapses into the first one and the cleanup survives anyway,
+        # so the bug would go unseen. In the daemon plenty of turns pass here —
+        # the response is written long before stop() runs.
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5.0)
+        await engine.stop()
+
+        assert cleaned_up.is_set()  # the drain let it finish, rather than cutting it short
+        assert not engine._abandoned_ops
+
+    async def test_abandoned_operations_do_not_accumulate_without_bound(self):
+        # Each timed-out attempt against an LTM that never lets go leaves an
+        # operation behind, still holding what it holds. The breaker throttles
+        # that but cannot stop it — every reset admits another probe — so the
+        # engine declines new attempts once enough are outstanding, rather than
+        # evicting references to operations that are still running.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def never_lets_go(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)  # unwind that outlives everything
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=never_lets_go)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.02, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        # Distinct queries per call: a repeated one would queue behind the
+        # first attempt's per-key lock and be cancelled there, never reaching
+        # the adapter — so it would never leave an operation behind and the
+        # pile-up this guards against would not appear.
+        for i in range(engine_module._MAX_ABANDONED_OPS + 3):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {
+                    "path": f"src/app{i}.py",
+                    "_context_query": f"distinct Flask routing architecture {i}",
+                },
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+
+        assert len(engine._abandoned_ops) == engine_module._MAX_ABANDONED_OPS
+        outcomes = obs.snapshot()
+        assert outcomes["skip_reasons"]["read_file"]["ltm_draining"] == 3
+        # The declined calls are not charged as LTM timeouts.
+        assert (
+            outcomes["outcomes"]["read_file"]["error_timeout"] == engine_module._MAX_ABANDONED_OPS
+        )
+
+    async def test_a_burst_overshoots_but_nothing_starts_after_it(self):
+        # The bound counts operations known to be stuck, so a burst already in
+        # flight when the LTM wedges can exceed it — every one of them read the
+        # count before any had timed out. What must hold is that the pile stops
+        # growing: once they land, further attempts are refused. Reserving per
+        # attempt instead would cap this hard, but nothing at admission knows
+        # which attempts get stuck, so it would cap healthy concurrency too.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def never_lets_go(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=never_lets_go)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        burst = engine_module._MAX_ABANDONED_OPS + 4
+        await asyncio.gather(
+            *(
+                engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/app{i}.py", "_context_query": f"burst Flask routing query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+                for i in range(burst)
+            )
+        )
+        assert len(engine._abandoned_ops) == burst  # the overshoot, acknowledged
+        assert obs.snapshot()["skip_reasons"].get("read_file", {}).get("ltm_draining") is None
+
+        # Nothing new starts while they are stuck.
+        adapter.search.reset_mock()
+        for i in range(3):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/late{i}.py", "_context_query": f"later Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        assert len(engine._abandoned_ops) == burst  # no growth
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["skip_reasons"]["read_file"]["ltm_draining"] == 3
+
+    async def test_a_refusal_does_not_spend_a_rate_limit_slot(self):
+        # The cap counts *attempts* because an attempt has already spent LTM
+        # resources — the gate's own contract. A call turned away before
+        # starting any work has not made an attempt, so keeping its eagerly
+        # claimed slot would let a run of refusals exhaust the budget and go on
+        # blocking surfacing after the LTM recovers.
+        release = asyncio.Event()
+
+        async def wedges_until_released(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        adapter = _make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.9)])
+        wedged = AsyncMock(side_effect=wedges_until_released)
+        healthy = adapter.search
+        adapter.search = wedged
+        # 4 wedged attempts + 3 refusals + 1 recovered call = 8 without the
+        # release, but only 5 real attempts with it.
+        engine = SurfacingEngine(
+            config=_make_config(
+                timeout_seconds=0.05, circuit_max_failures=1000, max_surfacings_per_minute=6
+            ),
+            mcp_adapter=adapter,
+        )
+
+        for i in range(engine_module._MAX_ABANDONED_OPS):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/w{i}.py", "_context_query": f"wedge Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        for i in range(3):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/r{i}.py", "_context_query": f"refused Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+        assert len(engine._abandoned_ops) == engine_module._MAX_ABANDONED_OPS
+
+        # Let the stuck unwinds finish, so admission reopens.
+        release.set()
+        await asyncio.wait(set(engine._abandoned_ops), timeout=5.0)
+        assert not engine._abandoned_ops
+
+        adapter.search = healthy
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "src/ok.py", "_context_query": "recovered Flask routing query"},
+            LONG_RESPONSE,
+            deadline_monotonic=None,
+        )
+        # The refusals gave their slots back, so the budget still has room.
+        assert "Relevant Memories" in out
+
+    async def test_a_window_consumed_by_pre_work_does_not_spend_a_rate_limit_slot(self):
+        # The window-fully-consumed branch books a timeout but starts no LTM
+        # work — by the rate limiter's own definition ("an attempt has already
+        # spent LTM/MCP resources") it is not an attempt, so it refunds its
+        # claim exactly like an ltm_draining refusal. Keeping the slot would
+        # let a run of too-tight deadlines exhaust the budget and go on
+        # rate-limiting the LTM after the deadlines recover. The timeout and
+        # breaker booking still stand: real time did pass.
+        adapter = _make_mcp_adapter([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.9)])
+        engine = SurfacingEngine(
+            config=_make_config(
+                timeout_seconds=30.0, circuit_max_failures=1000, max_surfacings_per_minute=3
+            ),
+            mcp_adapter=adapter,
+        )
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.05)  # stand-in pre-work
+
+        for i in range(3):  # would exhaust the 3-per-minute budget if kept
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/p{i}.py", "_context_query": f"prework Flask routing query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() + 0.01,
+            )
+        assert engine._circuit_breaker.failure_count == 3  # still booked as timeouts
+
+        # A healthy call (no deadline pressure) still has budget: the consumed
+        # windows gave their slots back.
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            {"path": "src/ok.py", "_context_query": "recovered healthy Django ORM query"},
+            LONG_RESPONSE,
+            deadline_monotonic=None,
+        )
+        assert "Relevant Memories" in out
+
+    async def test_draining_warns_once_per_episode(self, caplog):
+        # ltm_draining has no natural throttle behind it: a refusal records
+        # neither breaker success nor failure, so once the breaker's reset
+        # window elapses every eligible call reaches admission, is refused,
+        # and would warn — at call rate, for as long as the LTM stays wedged.
+        # The warning is therefore latched to the first refusal of a draining
+        # episode and re-armed by the next admission. The skip counter and
+        # fault row stay per-call (like ``circuit_open``): they ARE the count.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        release = asyncio.Event()
+
+        async def wedges_until_released(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        adapter = _make_mcp_adapter()
+        wedged = AsyncMock(side_effect=wedges_until_released)
+        healthy = adapter.search
+        adapter.search = wedged
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        def draining_warnings() -> list[logging.LogRecord]:
+            return [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING and "still unwinding" in r.getMessage()
+            ]
+
+        with caplog.at_level(logging.DEBUG, logger="memtomem_stm.surfacing.engine"):
+            for i in range(engine_module._MAX_ABANDONED_OPS):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/w{i}.py", "_context_query": f"wedge Flask routing query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+            for i in range(3):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/r{i}.py", "_context_query": f"refused Flask routing query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+            # Three refusals, one warning — but every refusal is still counted.
+            assert len(draining_warnings()) == 1
+            assert obs.snapshot()["skip_reasons"]["read_file"]["ltm_draining"] == 3
+
+            # Drain the pile and let one call be admitted: the episode is over.
+            release.set()
+            await asyncio.wait(set(engine._abandoned_ops), timeout=5.0)
+            assert not engine._abandoned_ops
+            adapter.search = healthy
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": "src/ok.py", "_context_query": "recovered Flask routing query"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+
+            # A second wedge is a new episode and earns its own warning.
+            release.clear()
+            adapter.search = wedged
+            for i in range(engine_module._MAX_ABANDONED_OPS):
+                await engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/w2{i}.py", "_context_query": f"rewedged Django ORM query {i}"},
+                    LONG_RESPONSE,
+                    deadline_monotonic=None,
+                )
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": "src/r2.py", "_context_query": "rewedged refused Django ORM query"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+            assert len(draining_warnings()) == 2
+            assert obs.snapshot()["skip_reasons"]["read_file"]["ltm_draining"] == 4
+
+        release.set()  # let the second pile unwind before the loop closes
+        await asyncio.wait(set(engine._abandoned_ops), timeout=5.0)
+
+    async def test_draining_does_not_refuse_cache_hits(self):
+        # The gate belongs on the path that starts LTM work, not at the top of
+        # surface(). A cache hit needs no LTM at all, so stuck unwinds must not
+        # disable it — and eligibility classifications (no_query, gate
+        # rejections) must keep their own names rather than becoming
+        # ltm_draining.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        hit_args = {"path": "src/cached.py", "_context_query": "cached Flask routing architecture"}
+
+        async def answers_then_wedges(*args, **kwargs):
+            if not wedge["armed"]:
+                return [FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.9)], [], "ok"
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)
+                raise
+
+        wedge = {"armed": False}
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=answers_then_wedges)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        # Populate the cache for this key while the LTM is healthy.
+        assert "Relevant Memories" in await engine.surface(
+            "gh", "read_file", hit_args, LONG_RESPONSE, deadline_monotonic=None
+        )
+
+        # Now wedge it and burn the whole admission budget on other keys.
+        wedge["armed"] = True
+        for i in range(engine_module._MAX_ABANDONED_OPS):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {
+                    "path": f"src/other{i}.py",
+                    "_context_query": f"other Flask routing architecture {i}",
+                },
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+
+        # The cached key still surfaces: it never touches the LTM.
+        assert "Relevant Memories" in await engine.surface(
+            "gh", "read_file", hit_args, LONG_RESPONSE, deadline_monotonic=None
+        )
+        # And an ineligible call keeps its own classification rather than
+        # being relabelled by the gate.
+        await engine.surface("gh", "read_file", {}, LONG_RESPONSE)
+        assert obs.snapshot()["skip_reasons"]["read_file"].get("no_query") == 1
+        assert obs.snapshot()["skip_reasons"]["read_file"].get("ltm_draining") is None
+
+    async def test_stop_is_not_held_open_by_a_cancellation_resistant_unwind(self, monkeypatch):
+        # `_run_within` abandons the LTM operation precisely because its unwind
+        # is not known to be bounded. stop() therefore must not wait on it the
+        # way it waits on webhooks: the daemon calls stop() before the adapter's
+        # own bounded teardown, so one unwind that ignores cancellation would
+        # hold shutdown open indefinitely.
+        monkeypatch.setattr(engine_module, "_ABANDONED_DRAIN_SECONDS", 0.05)
+
+        async def resists_cancellation(*args, **kwargs):
+            # Absorbs repeated cancellation for far longer than the drain
+            # allows, then gives up — an unwind that never finished at all
+            # would wedge the test loop's own teardown rather than stop().
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                deadline = time.monotonic() + 0.4
+                while time.monotonic() < deadline:
+                    try:
+                        await asyncio.sleep(0.02)
+                    except asyncio.CancelledError:
+                        pass  # a stubborn unwind, ignoring what it is told
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=resists_cancellation)
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+        )
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None)
+        assert engine._abandoned_ops  # parked, still unwinding
+
+        started = time.monotonic()
+        await engine.stop()
+        elapsed = time.monotonic() - started
+
+        # Bounded by the drain, and well short of the 0.4s the unwind resists.
+        assert elapsed < 0.3
+        # Still referenced: giving up waiting is not the same as it having
+        # finished, and the set is what keeps it from being collected
+        # mid-unwind. It retires itself once it genuinely ends.
+        assert engine._abandoned_ops
+        straggler = next(iter(engine._abandoned_ops))
+        assert not straggler.done()
+        await asyncio.wait({straggler}, timeout=2.0)
+        assert not engine._abandoned_ops
+
+    async def test_cancellation_inside_the_window_books_nothing(self):
+        # A cancellation while the LTM is still inside its window is a real one
+        # (daemon shutdown, client gone) — not a timeout. Booking it would
+        # count breaker failures against a healthy LTM.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def slow_search(*args, **kwargs):
+            await asyncio.sleep(10)
+            return [], [], "empty_results"
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=slow_search)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        task = asyncio.create_task(
+            engine.surface(
+                "gh",
+                "read_file",
+                VALID_ARGS,
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() + 30.0,
+            )
+        )
+        await asyncio.sleep(0.05)  # let it reach the adapter await
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert obs.snapshot()["outcomes"] == {}
+        assert engine._circuit_breaker.failure_count == 0
+
+    async def test_pre_timeout_work_debits_the_engines_window(self, monkeypatch):
+        # #720 race source 1: the window is derived *after* the gate, query
+        # extraction, and privacy scan, so pre-timeout work shrinks the LTM
+        # attempt instead of pushing the abort past the caller's margin. Assert
+        # on the window actually opened rather than on elapsed wall clock: a
+        # relative budget captured before the pre-work would hand over the full
+        # 0.5s, the absolute deadline hands over what is left.
+        captured: list[float] = []
+        engine_cls = SurfacingEngine
+        real_run_within = engine_cls._run_within
+
+        async def spy_run_within(self, coro, timeout):
+            captured.append(timeout)
+            return await real_run_within(self, coro, timeout)
+
+        monkeypatch.setattr(engine_cls, "_run_within", spy_run_within)
+
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=_make_mcp_adapter(),
+        )
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.2)  # stand-in pre-work
+
+        await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.5,
+        )
+
+        assert len(captured) == 1
+        # ~0.3s (0.5 window − 0.2 pre-work). The 0.4 bound only trips if the
+        # pre-work were not debited at all (0.5) — it holds for any pre-work
+        # overrun, which can only shrink the number further.
+        assert 0 < captured[0] < 0.4
+
+    async def test_window_fully_consumed_books_without_starting_an_rpc(self):
+        # Pre-work ate the entire window: starting an LTM round trip now would
+        # only cancel the adapter mid-RPC (stdio child respawn, #290/#296).
+        # The abort is still booked as a timeout — real time did pass.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        adapter = _make_mcp_adapter()
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        engine._maybe_cleanup_expired = lambda: time.sleep(0.1)  # stand-in pre-work
+
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=time.monotonic() + 0.05
+        )
+
+        assert output == LONG_RESPONSE
+        adapter.search.assert_not_awaited()
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
 
 
 class TestSessionDedup:
@@ -671,7 +1478,10 @@ class TestRelevanceGateConcurrency:
                 engine.surface(
                     "gh",
                     "read_file",
-                    {"path": f"src/f{i}.py", "_context_query": f"distinct query {i}"},
+                    {
+                        "path": f"src/f{i}.py",
+                        "_context_query": f"distinct Flask routing architecture {i}",
+                    },
                     LONG_RESPONSE,
                 )
                 for i in range(5)
