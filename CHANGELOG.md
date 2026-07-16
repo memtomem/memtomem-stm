@@ -37,20 +37,21 @@ changes inline only. See the deprecation policy in
   deadline as an absolute monotonic point rather than a relative budget, and
   derives its window right before the LTM attempt — so its pre-timeout work
   (gate, query extraction, privacy scan) debits that window instead of silently
-  eating the fixed response margin. If something cancels the call from outside
-  anyway — the backstop winning the abort race against a slow-to-unwind LTM
-  adapter, or an event loop stalled past both timers — the engine books it as a
-  surfacing timeout (`error_timeout` fault row, warning log, circuit-breaker
-  increment) before re-raising, instead of skipping that bookkeeping exactly as
-  in the silent failure mode #719 removed. The booking asks the call's own
-  timeout whether it fired, rather than reading elapsed time off the clock: a
-  cancellation that lands while the attempt is still inside its window (daemon
-  shutdown, client gone) books nothing and never charges a healthy LTM — not
-  even when a stalled loop delivers it after the window would have closed —
-  while a window that ended at the configured `surfacing.timeout_seconds`
-  ceiling, earlier than the caller's deadline, is booked rather than missed. A
-  window fully consumed by pre-work is booked without starting an LTM round
-  trip that would be cancelled mid-RPC. (#721)
+  eating the fixed response margin. The remaining gap was that the engine only
+  *raised* its timeout once the LTM adapter it had just cancelled finished
+  unwinding — an unbounded wait, since a stdio child can be slow to give up —
+  which is what let the caller's backstop cancel the engine from outside first
+  and skip the `error_timeout` fault row, the warning log, and the
+  circuit-breaker increment that only the engine's own timeout path records
+  (#579). The LTM operation is now shielded, so that abort lands the moment the
+  engine's timer fires and the abandoned unwind is left to finish on its own
+  (the adapter already expects a caller to leave mid-RPC and marks the session
+  for lazy reconnect). A window fully consumed by pre-work is likewise booked
+  without starting an LTM round trip that would be cancelled mid-RPC. Because
+  the engine's timer always sits ahead of the caller's, a cancellation reaching
+  `surface()` is never a timeout in disguise: it is a real one (daemon
+  shutdown, client hanging up), and it is left unbooked rather than charging a
+  healthy LTM a breaker failure. (#721)
 
 ## [0.1.40] — 2026-07-15
 

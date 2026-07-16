@@ -431,10 +431,12 @@ async def run_surfacing_hook(
     failure** — disabled surfacing, LTM error/timeout, an internal bug all
     degrade to ``{}`` so any caller (the CLI, the daemon) can emit it and let
     the tool output pass through. Cooperative cancellation still propagates:
-    :class:`asyncio.CancelledError` is not an ``Exception``, the engine books
-    it as a timeout first when the LTM window had already elapsed (#720), and
-    the canceller's scope needs it to resolve itself. ``engine`` is a test
-    seam: when provided it is used as-is (caller owns its lifecycle); when
+    :class:`asyncio.CancelledError` is not an ``Exception``, and the
+    canceller's scope needs it to resolve itself. A surfacing *timeout* never
+    arrives that way — the engine reaches its own abort first and returns the
+    tool output unmodified (#720) — so cancelling this call is a decision by
+    the caller, not a failure to report. ``engine`` is a test seam: when
+    provided it is used as-is (caller owns its lifecycle); when
     ``None``, an engine + LTM adapter are built from :class:`STMConfig` and
     torn down before returning.
 

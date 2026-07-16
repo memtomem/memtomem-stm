@@ -527,13 +527,12 @@ class TestSurfacingDeadline:
 
     @staticmethod
     def _hangs_unwinding(cancel_started: asyncio.Event):
-        """Adapter whose cancellation outlives whoever cancelled it.
+        """Adapter whose cancellation outlives whoever cancelled it — a stdio
+        LTM child that is slow to give up.
 
         ``cancel_started`` fires the instant the adapter is cancelled, which is
-        what makes the lost-race tests deterministic: waiting on it proves the
-        engine's *own* ``wait_for`` initiated the cancellation before any outer
-        timer could, so a test that then books a timeout cannot be passing
-        because something else cancelled the engine outright.
+        what lets the tests below pin *when* the abort began independently of
+        when the caller learned about it.
         """
 
         async def search(*args, **kwargs):
@@ -546,12 +545,14 @@ class TestSurfacingDeadline:
 
         return search
 
-    async def test_lost_abort_race_still_books_the_timeout(self):
+    async def test_slow_unwind_does_not_delay_the_timeout_booking(self):
         # #720 acceptance: an adapter whose cancellation outlives the caller's
-        # backstop. The engine's own wait_for fires first, but its TimeoutError
-        # cannot propagate until the adapter finishes unwinding — the caller's
-        # outer timeout wins that race and delivers CancelledError instead.
-        # The fault row and the breaker increment must survive anyway.
+        # backstop must not be able to make the engine miss its own abort. The
+        # operation is shielded, so the engine's TimeoutError — and the fault
+        # row, log, and breaker increment with it — lands the moment its timer
+        # fires, while the adapter is still unwinding. Awaiting that unwind was
+        # what let a caller's backstop cancel surface() from outside first and
+        # skip the bookkeeping entirely.
         from memtomem_stm.surfacing.observability import SurfacingObservability
 
         cancel_started = asyncio.Event()
@@ -564,8 +565,40 @@ class TestSurfacingDeadline:
             observability=obs,
         )
 
-        async def surface_then_hold() -> None:
-            await engine.surface(
+        started = time.monotonic()
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=started + 0.05
+        )
+        elapsed = time.monotonic() - started
+
+        assert output == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert engine._circuit_breaker.failure_count == 1
+        # Booked without waiting on the adapter's 10s unwind at all.
+        assert elapsed < 1.0
+        await asyncio.sleep(0)  # hand the abandoned operation a turn
+        assert cancel_started.is_set()  # it was cancelled, not left running
+
+    async def test_a_backstop_cannot_beat_the_engines_own_timer(self):
+        # The daemon wraps surface() in `asyncio.timeout_at` a response margin
+        # behind the engine's deadline (#719). The engine must reach its own
+        # abort first, so the call returns a booked, well-formed empty result
+        # rather than blowing up the caller's scope — even when the adapter's
+        # unwind outlives the backstop.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=30.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        async with asyncio.timeout(0.3):  # stands in for the daemon backstop
+            output = await engine.surface(
                 "gh",
                 "read_file",
                 VALID_ARGS,
@@ -573,26 +606,16 @@ class TestSurfacingDeadline:
                 deadline_monotonic=time.monotonic() + 0.05,
             )
 
-        task = asyncio.create_task(surface_then_hold())
-        # The engine's own wait_for — not the backstop — must own the first
-        # cancellation, or this is not the race the issue describes.
-        await asyncio.wait_for(cancel_started.wait(), timeout=5.0)
-        assert engine._circuit_breaker.failure_count == 0  # unwind still in flight
-
-        task.cancel()  # the caller's backstop, landing mid-unwind
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
+        assert output == LONG_RESPONSE
         assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
         assert engine._circuit_breaker.failure_count == 1
 
     # ``None`` covers the cold in-process path, which has no deadline at all.
     @pytest.mark.parametrize("deadline_offset", [None, 30.0], ids=["no_deadline", "far_deadline"])
-    async def test_lost_race_under_the_config_ceiling_still_books(self, deadline_offset):
+    async def test_timeout_at_the_config_ceiling_books(self, deadline_offset):
         # The window can end at the configured ceiling rather than the caller's
-        # deadline. A cancellation landing after the ceiling but *before* the
-        # deadline is still a real timeout — the attempt blew the window it was
-        # given. Keying the booking off the deadline would miss it.
+        # deadline, and that abort is just as much a timeout — the attempt blew
+        # the window it was given.
         from memtomem_stm.surfacing.observability import SurfacingObservability
 
         deadline = None if deadline_offset is None else time.monotonic() + deadline_offset
@@ -606,18 +629,45 @@ class TestSurfacingDeadline:
             observability=obs,
         )
 
-        task = asyncio.create_task(
-            engine.surface(
-                "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=deadline
-            )
+        output = await engine.surface(
+            "gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=deadline
         )
-        await asyncio.wait_for(cancel_started.wait(), timeout=5.0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
 
+        assert output == LONG_RESPONSE
         assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
         assert engine._circuit_breaker.failure_count == 1
+
+    async def test_cancelling_the_call_mid_unwind_books_nothing(self):
+        # The reverse of the acceptance test: an external cancellation arrives
+        # first, inside the window, and the adapter's unwind survives past the
+        # point the engine's own timer would have fired. Neither elapsed time
+        # nor the timeout's own expiry flag can tell that apart from a real
+        # timeout — both read as "expired" and would charge a healthy LTM.
+        # Shielding the operation makes it structural: a CancelledError here is
+        # always someone cancelling *us*, never our own timer.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        cancel_started = asyncio.Event()
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(cancel_started))
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        task = asyncio.create_task(
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None)
+        )
+        await asyncio.sleep(0)  # let it reach the adapter await, inside the window
+        task.cancel()  # a real cancellation, requested while still healthy
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.1)  # past the point the engine's timer would have fired
+
+        assert obs.snapshot()["outcomes"] == {}
+        assert engine._circuit_breaker.failure_count == 0
 
     async def test_starved_loop_does_not_charge_an_unrelated_cancellation(self):
         # The window elapsing is NOT proof that this call's timer owned the
@@ -652,39 +702,6 @@ class TestSurfacingDeadline:
 
         assert obs.snapshot()["outcomes"] == {}
         assert engine._circuit_breaker.failure_count == 0
-
-    async def test_lost_race_resolves_as_expired_for_an_enclosing_timeout(self):
-        # The engine re-raises so the canceller's scope stays sound: the daemon
-        # wraps surface() in `asyncio.timeout_at` and answers `expired` off the
-        # TimeoutError that scope produces. Pins that the re-raise still
-        # converts there — the booking must not swallow the cancellation, and
-        # asyncio's nested-timeout uncancel bookkeeping must keep the engine's
-        # own frame seeing CancelledError rather than TimeoutError.
-        from memtomem_stm.surfacing.observability import SurfacingObservability
-
-        cancel_started = asyncio.Event()
-        adapter = _make_mcp_adapter()
-        adapter.search = AsyncMock(side_effect=self._hangs_unwinding(cancel_started))
-        obs = SurfacingObservability()
-        engine = SurfacingEngine(
-            config=_make_config(timeout_seconds=30.0),
-            mcp_adapter=adapter,
-            observability=obs,
-        )
-
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.2):  # stands in for the daemon backstop
-                await engine.surface(
-                    "gh",
-                    "read_file",
-                    VALID_ARGS,
-                    LONG_RESPONSE,
-                    deadline_monotonic=time.monotonic() + 0.05,
-                )
-
-        assert cancel_started.is_set()  # the engine's own timer opened the abort
-        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
-        assert engine._circuit_breaker.failure_count == 1
 
     async def test_cancellation_inside_the_window_books_nothing(self):
         # A cancellation while the LTM is still inside its window is a real one
@@ -730,13 +747,13 @@ class TestSurfacingDeadline:
         # relative budget captured before the pre-work would hand over the full
         # 0.5s, the absolute deadline hands over what is left.
         captured: list[float] = []
-        real_timeout = asyncio.timeout
+        real_wait_for = asyncio.wait_for
 
-        def spy_timeout(delay):
-            captured.append(delay)
-            return real_timeout(delay)
+        async def spy_wait_for(aw, timeout):
+            captured.append(timeout)
+            return await real_wait_for(aw, timeout)
 
-        monkeypatch.setattr(asyncio, "timeout", spy_timeout)
+        monkeypatch.setattr(asyncio, "wait_for", spy_wait_for)
 
         engine = SurfacingEngine(
             config=_make_config(timeout_seconds=30.0),

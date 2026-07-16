@@ -279,6 +279,54 @@ class SurfacingEngine:
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
 
+    async def _run_within(self, coro: Any, timeout: float) -> Any:
+        """Run *coro* under *timeout*, keeping this call's own timeout
+        structurally distinct from a cancellation of the call itself (#720).
+
+        The operation runs as its own task behind a ``shield``, which buys two
+        things the plain ``asyncio.wait_for`` around it could not:
+
+        - :class:`asyncio.TimeoutError` out of here means *this* call's timer
+          fired, and it is raised the moment it does rather than once the
+          cancelled LTM adapter has finished unwinding. That unwind is
+          unbounded — a stdio child can be slow to give up — and waiting on it
+          is what let a caller's outer backstop cancel :meth:`surface` from
+          outside first, skipping the fault/log/breaker bookkeeping only the
+          ``TimeoutError`` path does (#719, #720).
+        - :class:`asyncio.CancelledError` out of here always means something
+          cancelled *this call* — a shutdown, a client hanging up — and never
+          our own timeout. So the two need no telling apart after the fact:
+          neither the clock nor a timeout's own state can say which came
+          first, and both readings charge a healthy LTM a breaker failure when
+          they guess wrong.
+
+        The abandoned operation is cancelled but not awaited. The MCP adapter
+        already expects a caller to leave mid-RPC — it shields its own owner
+        request precisely so the op can outlive the caller — and marks the
+        session for lazy reconnect while unwinding (#290/#296). Parking the
+        task keeps it from being garbage-collected mid-unwind and lets
+        :meth:`stop` drain whatever is still in flight.
+        """
+        op = asyncio.ensure_future(coro)
+        try:
+            return await asyncio.wait_for(asyncio.shield(op), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            op.cancel()
+            self._background_tasks.add(op)
+            op.add_done_callback(self._on_abandoned_op_done)
+            raise
+
+    def _on_abandoned_op_done(self, task: asyncio.Task) -> None:
+        """Retire an operation abandoned at timeout/cancellation, consuming
+        any exception it raised on the way out so asyncio does not report it
+        as never retrieved."""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("Abandoned surfacing operation failed while unwinding: %s", exc)
+
     def _effective_timeout(self, deadline_monotonic: float | None) -> float:
         """This call's LTM window: the configured ceiling, lowered to what is
         left of a deadline-bounded caller's absolute deadline.
@@ -491,16 +539,15 @@ class SurfacingEngine:
         gives up after ``hook.daemon_timeout_seconds``) shrink this call's
         timeout below ``timeout_seconds``. It never *raises* the configured
         ceiling. Passing it keeps the abort inside :meth:`surface` instead of
-        letting the caller cancel it from outside: only the
+        letting the caller cancel it from outside: the
         :class:`asyncio.TimeoutError` path below records the fault, logs, and
-        counts the failure toward the breaker (#579) — an external cancellation
-        skips all three, so the breaker never opens and every subsequent call
-        pays the full timeout and respawns the LTM child again. If something
-        cancels this call from outside anyway (#720) — the caller's backstop
-        winning the abort race, a shutdown, a stalled loop — the
-        :class:`asyncio.CancelledError` path books the same timeout before
-        re-raising, but only once this call's own LTM window has elapsed; a
-        cancellation inside the window is a real one and books nothing.
+        counts the failure toward the breaker (#579), and an outside
+        cancellation skips all three, so the breaker never opens and every
+        subsequent call pays the full timeout and respawns the LTM child again.
+        :meth:`_run_within` is what makes that abort reliably ours to raise
+        rather than a race against the caller's backstop (#720). A
+        cancellation of this call is therefore never a timeout and is left to
+        propagate unbooked, so a healthy LTM is never charged for one.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -544,13 +591,6 @@ class SurfacingEngine:
             return response_text
 
         effective_timeout = self._effective_timeout(deadline_monotonic)
-        # ``asyncio.timeout`` rather than the equivalent ``wait_for`` so the
-        # handlers below can ask ``window.expired()`` — did *this* call's timer
-        # fire? — instead of inferring it from the clock (#720). Elapsed time
-        # cannot answer it: a stalled loop can resume past the window with an
-        # unrelated cancellation (shutdown, client gone) already pending and
-        # deliver it before the timer callback ever runs.
-        window: asyncio.Timeout | None = None
         try:
             if effective_timeout <= 0:
                 # Pre-timeout work (gate, query extraction, privacy scan)
@@ -559,10 +599,10 @@ class SurfacingEngine:
                 # that would be cancelled mid-RPC and force a stdio child
                 # respawn on the next call (#290/#296).
                 raise asyncio.TimeoutError
-            async with asyncio.timeout(effective_timeout) as window:
-                result = await self._do_surface(
-                    server, tool, arguments, response_text, query, trace_id=trace_id
-                )
+            result = await self._run_within(
+                self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
+                effective_timeout,
+            )
             self._circuit_breaker.record_success()
             return result
         except asyncio.TimeoutError:
@@ -583,34 +623,6 @@ class SurfacingEngine:
             # indefinitely and the breaker never opens.
             self._circuit_breaker.record_failure()
             return response_text
-        except asyncio.CancelledError:
-            # Lost the abort race to a cancellation from outside (#720): the
-            # timeout above only *raises* once the cancelled adapter has
-            # finished unwinding, and anything that cancels this task can land
-            # inside that window — the daemon's backstop (`_run_admitted`'s
-            # ``asyncio.timeout_at``), a shutdown, a stalled loop. This is the
-            # only site that owns the fault/log/breaker bookkeeping, so an
-            # unbooked pass-through recreates the silent loop #719 removed.
-            #
-            # ``expired()`` is the whole point: this call's own timer fired and
-            # started the abort, so the attempt overran the window it was
-            # given and a timeout is the right booking no matter who delivered
-            # the final cancellation. If it did not fire, the attempt was still
-            # within its window — a genuine external cancellation, which books
-            # nothing, so a healthy LTM is never charged a breaker failure.
-            # Always re-raise: the canceller's scope needs the cancellation to
-            # resolve itself.
-            if window is not None and window.expired():
-                self._observability.record_outcome(tool, "error_timeout")
-                self._persist_fault(server, tool, "error_timeout")
-                logger.warning(
-                    "Surfacing cancelled past its %.1fs window for %s/%s — booking as timeout",
-                    effective_timeout,
-                    server,
-                    tool,
-                )
-                self._circuit_breaker.record_failure()
-            raise
         except _DependencyFault:
             self._circuit_breaker.record_failure()
             return response_text
