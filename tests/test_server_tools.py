@@ -2387,6 +2387,115 @@ class TestAdvertiseOrder:
             r.message for r in caplog.records
         ]
 
+    async def test_reorder_pins_order_through_real_fastmcp_list_tools(self):
+        """End-to-end #228 pin against the real FastMCP instance.
+
+        The stand-in tests above validate the helper's dict surgery, but a
+        FastMCP upgrade could change what ``_tool_manager._tools`` insertion
+        order *means* — e.g. a ``list_tools()`` that re-sorts, or a tool
+        manager that stops preserving insertion order — and every stand-in
+        test would stay green while the #228 advertise order silently
+        regressed. Register fake proxied tools through the public API on the
+        real module-global server (after the module-import ``stm_*``
+        registrations, exactly like the production lifespan), reorder, and
+        assert through the public ``list_tools()`` — the surface MCP clients
+        actually see.
+        """
+        from memtomem_stm import server
+
+        tools_dict = server.mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+
+            @server.mcp.tool(name="fs__read_file")
+            def _fake_read(path: str) -> str:  # pragma: no cover - never invoked
+                return path
+
+            @server.mcp.tool(name="gh__search_repositories")
+            def _fake_search(query: str) -> str:  # pragma: no cover - never invoked
+                return query
+
+            server._move_stm_tools_to_end(server.mcp)
+
+            advertised = [t.name for t in await server.mcp.list_tools()]
+            positions = {name: idx for idx, name in enumerate(advertised)}
+            proxied = [n for n in advertised if "__" in n]
+            utility = [n for n in advertised if n in set(server._STM_UTILITY_TOOL_NAMES)]
+            assert {"fs__read_file", "gh__search_repositories"} <= set(proxied)
+            assert utility, "no STM utility tools advertised — test lost its subject"
+            assert max(positions[n] for n in proxied) < min(positions[n] for n in utility), (
+                f"proxied tools must advertise before STM utility tools, got: {advertised}"
+            )
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_lifespan_reorders_after_proxy_registration(self):
+        """Execute the real registration path end to end: ``app_lifespan``
+        must leave proxied tools ahead of STM utility tools in the
+        advertise order. The e2e test above drives the helper directly, so
+        it alone would stay green if the lifespan dropped the reorder call,
+        hoisted it above the ``register_proxy_tool`` loop, or reordered
+        only mid-loop (later proxied tools would then append after the STM
+        utilities). This test pins the OUTCOME — every call arrangement
+        that leaves proxied tools first passes by design; pinning the call
+        sequence itself would fail legitimate refactors that preserve the
+        invariant. Mirrors
+        the ``TestLifespan`` mocked-ProxyManager pattern; the registration
+        loop and reorder run for real against the module-global server."""
+        from memtomem_stm.proxy.manager import ProxyToolInfo
+        from memtomem_stm.server import _STM_UTILITY_TOOL_NAMES, app_lifespan, mcp
+
+        infos = [
+            ProxyToolInfo(
+                prefixed_name=name,
+                description="fake proxied tool",
+                input_schema={"type": "object", "properties": {}},
+                server="fake",
+                original_name=name.split("__", 1)[1],
+            )
+            for name in ("fake__alpha", "fake__beta")
+        ]
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = infos
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                mock_cfg = MockConfig.return_value
+                mock_cfg.proxy = MagicMock()
+                mock_cfg.proxy.enabled = True
+                mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+                mock_cfg.proxy.metrics.enabled = False
+                mock_cfg.proxy.compression_feedback.enabled = False
+                mock_cfg.proxy.progressive_reads.enabled = False
+                mock_cfg.proxy.selection_telemetry.enabled = False
+                mock_cfg.proxy.cache.enabled = False
+                mock_cfg.surfacing = MagicMock()
+                mock_cfg.surfacing.enabled = False
+                mock_cfg.langfuse = MagicMock()
+                mock_cfg.langfuse.enabled = False
+
+                async with app_lifespan(mcp) as _ctx:
+                    advertised = [t.name for t in await mcp.list_tools()]
+
+            positions = {name: idx for idx, name in enumerate(advertised)}
+            utility = [n for n in advertised if n in set(_STM_UTILITY_TOOL_NAMES)]
+            assert {"fake__alpha", "fake__beta"} <= set(advertised), advertised
+            assert utility, "no STM utility tools advertised — test lost its subject"
+            assert max(positions["fake__alpha"], positions["fake__beta"]) < min(
+                positions[n] for n in utility
+            ), f"proxied tools must advertise before STM utility tools, got: {advertised}"
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
         ``@mcp.tool()`` / ``@_obs_tool`` decorators at module import must
