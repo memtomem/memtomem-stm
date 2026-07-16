@@ -2387,6 +2387,49 @@ class TestAdvertiseOrder:
             r.message for r in caplog.records
         ]
 
+    async def test_reorder_pins_order_through_real_fastmcp_list_tools(self):
+        """End-to-end #228 pin against the real FastMCP instance.
+
+        The stand-in tests above validate the helper's dict surgery, but a
+        FastMCP upgrade could change what ``_tool_manager._tools`` insertion
+        order *means* — e.g. a ``list_tools()`` that re-sorts, or a tool
+        manager that stops preserving insertion order — and every stand-in
+        test would stay green while the #228 advertise order silently
+        regressed. Register fake proxied tools through the public API on the
+        real module-global server (after the module-import ``stm_*``
+        registrations, exactly like the production lifespan), reorder, and
+        assert through the public ``list_tools()`` — the surface MCP clients
+        actually see.
+        """
+        from memtomem_stm import server
+
+        tools_dict = server.mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+
+            @server.mcp.tool(name="fs__read_file")
+            def _fake_read(path: str) -> str:  # pragma: no cover - never invoked
+                return path
+
+            @server.mcp.tool(name="gh__search_repositories")
+            def _fake_search(query: str) -> str:  # pragma: no cover - never invoked
+                return query
+
+            server._move_stm_tools_to_end(server.mcp)
+
+            advertised = [t.name for t in await server.mcp.list_tools()]
+            positions = {name: idx for idx, name in enumerate(advertised)}
+            proxied = [n for n in advertised if "__" in n]
+            utility = [n for n in advertised if n in set(server._STM_UTILITY_TOOL_NAMES)]
+            assert {"fs__read_file", "gh__search_repositories"} <= set(proxied)
+            assert utility, "no STM utility tools advertised — test lost its subject"
+            assert max(positions[n] for n in proxied) < min(positions[n] for n in utility), (
+                f"proxied tools must advertise before STM utility tools, got: {advertised}"
+            )
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
         ``@mcp.tool()`` / ``@_obs_tool`` decorators at module import must
