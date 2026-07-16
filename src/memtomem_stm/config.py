@@ -104,10 +104,13 @@ class HookConfig(BaseModel):
     manual ``mms daemon start`` is needed. Set
     ``MEMTOMEM_STM_HOOK__USE_DAEMON=0`` to opt out to the legacy cold in-process
     path."""
-    daemon_timeout_seconds: float = Field(default=2.5, gt=0.0)
+    daemon_timeout_seconds: float = Field(default=2.5, gt=0.0, allow_inf_nan=False)
     """Per-request wall-clock budget for the hook→daemon round trip, and the
     effective ceiling on the LTM attempt inside it. Small and independent of the
-    cold-path ``_hook_budget_seconds()`` backstop.
+    cold-path ``_hook_budget_seconds()`` backstop. Must be finite: this budget
+    becomes the client deadline (``now + budget``), and ``+inf`` is not a big
+    budget but a deadline the daemon can never enforce — it rejects one as
+    unusable (#722), which would silently disable surfacing.
 
     The daemon reserves a response margin out of this deadline and hands the
     rest to the surfacing engine as its absolute deadline (queue/lock wait

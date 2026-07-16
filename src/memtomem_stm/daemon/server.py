@@ -163,6 +163,32 @@ async def _terminate_leaked_children(pids: set[int]) -> None:
         _signal_pid(pid, signal.SIGKILL)
 
 
+def _usable_deadline(req: dict[str, Any]) -> float | None:
+    """The request's ``deadline_monotonic`` as a float, or ``None`` when it
+    is not a usable monotonic point.
+
+    Rejects non-numbers and ``bool`` (JSON ``true`` is not a deadline); an
+    int too large for a float (JSON integers are unbounded, and ``float()``
+    raises ``OverflowError`` on one rather than answering); and non-finite
+    values — ``NaN`` compares ``False`` against everything, so it would slip
+    past an expiry comparison and reach ``asyncio.timeout_at(NaN)``, and
+    ``±inf`` is a backstop that can never fire (or one that already has).
+    Callers decide what "no usable deadline" means for them:
+    ``_run_admitted`` answers ``expired``, ``_surface_deadline`` starts no
+    LTM attempt.
+    """
+    deadline = req.get("deadline_monotonic")
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        return None
+    try:
+        value = float(deadline)
+    except OverflowError:
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
 class DaemonServer:
     """A single-process loopback surfacing daemon."""
 
@@ -704,21 +730,8 @@ class DaemonServer:
         missing or expired deadline; this re-reads it because queue/lock wait
         may have consumed the rest since admission.
         """
-        deadline = req.get("deadline_monotonic")
-        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
-            return None
-        try:
-            deadline = float(deadline)
-        except OverflowError:
-            # JSON integers are unbounded; one too large for a float cannot
-            # be a real monotonic point (math.isfinite would raise on it too).
-            return None
-        if not math.isfinite(deadline):
-            # Not a usable monotonic point: +inf would reach the engine as a
-            # "real" deadline that its non-finite guard treats as no deadline
-            # at all — the full configured ceiling behind a client that is not
-            # actually infinitely patient — and NaN poisons every comparison
-            # it meets, starting with the expiry check below.
+        deadline = _usable_deadline(req)
+        if deadline is None:
             return None
         surface_deadline = deadline - _DEADLINE_RESPONSE_MARGIN_SECONDS
         if surface_deadline - time.monotonic() < _MIN_SURFACE_BUDGET_SECONDS:
@@ -744,10 +757,8 @@ class DaemonServer:
         whole budget — censored data in the percentiles the timeout
         recommendation is derived from.
         """
-        deadline = req.get("deadline_monotonic")
-        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
-            return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
-        if float(deadline) <= time.monotonic():
+        deadline = _usable_deadline(req)
+        if deadline is None or deadline <= time.monotonic():
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         if self._pending_slots.locked():
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
@@ -761,7 +772,7 @@ class DaemonServer:
         self._last_request = time.monotonic()
         self._active_requests += 1
         try:
-            async with asyncio.timeout_at(float(deadline)):
+            async with asyncio.timeout_at(deadline):
                 async with self._surface_lock:
                     # Read under the lock, not before the queue: admissions
                     # overlap (`max_pending_requests` is 32), and the engine's
