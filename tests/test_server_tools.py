@@ -2430,6 +2430,28 @@ class TestAdvertiseOrder:
             tools_dict.clear()
             tools_dict.update(snapshot)
 
+    def test_lifespan_reorders_after_proxy_registration(self):
+        """The reorder is only effective if ``app_lifespan`` actually calls
+        it, *after* the ``register_proxy_tool`` loop. The e2e test above
+        drives the helper directly, so it would stay green if the lifespan
+        call were dropped or hoisted above proxy registration — pin the call
+        site's presence and position in the source instead (an execution
+        test would need the full upstream-connection machinery)."""
+        import inspect
+
+        from memtomem_stm import server
+
+        source = inspect.getsource(server.app_lifespan)
+        register_at = source.index("register_proxy_tool(")
+        assert "_move_stm_tools_to_end(" in source, (
+            "app_lifespan no longer reorders the advertise list — the #228 "
+            "invariant (proxied tools first) has lost its production call site."
+        )
+        assert source.index("_move_stm_tools_to_end(") > register_at, (
+            "app_lifespan must reorder AFTER registering proxied tools; a "
+            "reorder that runs first is a no-op for #228."
+        )
+
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
         ``@mcp.tool()`` / ``@_obs_tool`` decorators at module import must
