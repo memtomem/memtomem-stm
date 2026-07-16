@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from memtomem_stm.config import DaemonConfig, LangfuseConfig, STMConfig
+from memtomem_stm.config import DaemonConfig, HookConfig, LangfuseConfig, STMConfig
 from memtomem_stm.proxy.config import (
     AutoIndexConfig,
     ExtractionConfig,
@@ -655,3 +655,21 @@ class TestDaemonHostConstraint:
         monkeypatch.setenv("MEMTOMEM_STM_DAEMON__HOST", "0.0.0.0")
         monkeypatch.setenv("MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK", "true")
         assert STMConfig().daemon.host == "0.0.0.0"
+
+
+class TestHookDeadlineBudgetConstraint:
+    """``daemon_timeout_seconds`` becomes the client deadline
+    (``now + budget``), so a non-finite value is not a big budget — it is a
+    deadline the daemon can never enforce. ``+inf`` passed ``gt=0.0`` and
+    produced an infinite deadline the daemon now rejects as unusable (#722),
+    which would silently disable surfacing for an accepted configuration;
+    ``NaN`` already failed ``gt`` but is pinned here so the rejection is a
+    contract, not a comparison accident."""
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+    def test_non_finite_budget_rejected(self, bad: float) -> None:
+        with pytest.raises(ValidationError):
+            HookConfig(daemon_timeout_seconds=bad)
+
+    def test_ordinary_budget_accepted(self) -> None:
+        assert HookConfig(daemon_timeout_seconds=2.5).daemon_timeout_seconds == 2.5
