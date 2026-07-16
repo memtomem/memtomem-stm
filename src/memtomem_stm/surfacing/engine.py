@@ -23,7 +23,7 @@ from memtomem_stm.surfacing.mcp_client import (
     SearchOutcome,
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
-from memtomem_stm.surfacing.relevance import RelevanceGate
+from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
@@ -1115,7 +1115,7 @@ class SurfacingEngine:
         response_text: str,
         query: str,
         *,
-        rate_claim: float,
+        rate_claim: RateClaim,
         trace_id: str | None = None,
     ) -> str:
         # Check surfacing cache (keyed by server+tool+query). The full miss
@@ -1162,7 +1162,7 @@ class SurfacingEngine:
         query: str,
         cache_key: str,
         *,
-        rate_claim: float,
+        rate_claim: RateClaim,
         trace_id: str | None = None,
     ) -> str:
         """Admission for the one path that starts LTM work, then the work.

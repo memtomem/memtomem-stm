@@ -92,10 +92,17 @@ class TestRelevanceGateReleaseClaim:
         gate.release_claim(claim_a)
         assert list(gate._surfacing_timestamps) == [claim_b]
 
-    def test_release_tolerates_an_already_pruned_claim(self):
+    def test_release_tolerates_an_already_pruned_claim(self, monkeypatch):
         # A claim can leave the deque before its caller refunds — pruned by
         # window expiry or evicted by the deque's maxlen. The refund must
-        # neither raise nor take someone else's slot with it.
+        # neither raise nor take someone else's slot with it. The clock is
+        # frozen because two claims really can share one time.monotonic()
+        # reading (Windows ticks at ~15.6ms, where CI caught exactly this):
+        # the token must name the claim by identity, not by a timestamp
+        # value that a *different* caller's live slot can collide with.
+        from memtomem_stm.surfacing import relevance as relevance_module
+
+        monkeypatch.setattr(relevance_module.time, "monotonic", lambda: 790.828)
         gate = _gate(max_surfacings_per_minute=2, cooldown_seconds=0.0)
         claim_a = gate.should_surface("s", "t1", "query about topic A")
         assert claim_a is not None

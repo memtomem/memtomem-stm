@@ -16,6 +16,23 @@ _RATE_LIMIT_WINDOW_SECONDS = 60.0
 _SIMILARITY_THRESHOLD = 0.95
 
 
+class RateClaim:
+    """One claimed rate-limit slot (see :meth:`RelevanceGate.should_surface`).
+
+    Identity-based on purpose: two claims really can share one
+    ``time.monotonic()`` reading (Windows ticks at ~15.6ms), so a bare
+    timestamp token would let ``release_claim`` for an already-pruned claim
+    remove a value-equal but *different* caller's live slot. Object identity
+    names exactly one claim; ``deque.remove`` compares ``==``, which for this
+    class is identity.
+    """
+
+    __slots__ = ("ts",)
+
+    def __init__(self, ts: float) -> None:
+        self.ts = ts
+
+
 class RelevanceGate:
     """Determine whether to run proactive surfacing for a given tool call."""
 
@@ -32,22 +49,22 @@ class RelevanceGate:
         # stay unconditional.
         self._observability = observability if observability is not None else _NOOP_OBSERVABILITY
         self._recent_queries: deque[tuple[float, str]] = deque(maxlen=_MAX_RECENT_QUERIES)
-        self._surfacing_timestamps: deque[float] = deque(maxlen=_MAX_SURFACING_TIMESTAMPS)
+        self._surfacing_timestamps: deque[RateClaim] = deque(maxlen=_MAX_SURFACING_TIMESTAMPS)
 
     def should_surface(
         self,
         server: str,
         tool: str,
         query: str | None,
-    ) -> float | None:
+    ) -> RateClaim | None:
         """Gate a prospective surfacing. On pass, eagerly claim a slot in
         ``_surfacing_timestamps`` — so concurrent callers see the budget
         consumption immediately; otherwise N coroutines all check the
         rate limit before any of them reaches ``record_surfacing`` and
         every one passes, bursting through the ``max_surfacings_per_minute``
-        cap by up to the concurrency level — and return the claim (its
-        timestamp) as the token :meth:`release_claim` takes back. ``None``
-        means rejected, no slot claimed.
+        cap by up to the concurrency level — and return the claim as the
+        token :meth:`release_claim` takes back. ``None`` means rejected,
+        no slot claimed.
 
         Cooldown claim stays with ``record_surfacing`` (see that method)
         because cooldown is a "skip if we already returned similar results"
@@ -88,7 +105,7 @@ class RelevanceGate:
         now = time.monotonic()
         while (
             self._surfacing_timestamps
-            and now - self._surfacing_timestamps[0] > _RATE_LIMIT_WINDOW_SECONDS
+            and now - self._surfacing_timestamps[0].ts > _RATE_LIMIT_WINDOW_SECONDS
         ):
             self._surfacing_timestamps.popleft()
         if len(self._surfacing_timestamps) >= self._config.max_surfacings_per_minute:
@@ -110,10 +127,11 @@ class RelevanceGate:
         # ``max_surfacings_per_minute`` counts attempts because an attempt
         # already consumed LTM/MCP resources and that is what the throttle
         # is defending against.
-        self._surfacing_timestamps.append(now)
-        return now
+        claim = RateClaim(now)
+        self._surfacing_timestamps.append(claim)
+        return claim
 
-    def release_claim(self, claim: float) -> None:
+    def release_claim(self, claim: RateClaim) -> None:
         """Give back the rate-limit slot :meth:`should_surface` claimed, for a
         caller that ends up starting no LTM work at all.
 
@@ -125,13 +143,14 @@ class RelevanceGate:
         blocking surfacing after the condition that caused them cleared.
 
         ``claim`` is the token :meth:`should_surface` returned, so exactly the
-        caller's own slot is removed. Popping the newest instead would, under
-        a concurrent claim in between, hand back the *other* caller's slot and
-        leave this caller's older timestamp counting — whose earlier expiry
-        frees capacity sooner than the surviving real attempt should allow.
-        A claim that already left the deque (pruned by window expiry, or
-        evicted by ``maxlen``) is simply gone; releasing it is a no-op rather
-        than someone else's slot.
+        caller's own slot is removed (by identity — see :class:`RateClaim` for
+        why a timestamp value cannot name a claim). Popping the newest instead
+        would, under a concurrent claim in between, hand back the *other*
+        caller's slot and leave this caller's older timestamp counting — whose
+        earlier expiry frees capacity sooner than the surviving real attempt
+        should allow. A claim that already left the deque (pruned by window
+        expiry, or evicted by ``maxlen``) is simply gone; releasing it is a
+        no-op rather than someone else's slot.
         """
         try:
             self._surfacing_timestamps.remove(claim)
