@@ -3871,3 +3871,45 @@ class TestSurfacingQueryPrivacyAtInfo:
             "operators flipping the surfacing logger to DEBUG must still see the "
             "query preview for tracing — only the default INFO level is sanitized"
         )
+
+
+# ── _fifo_prune helper — shared eviction for the bounded guard maps ────────
+
+
+class TestFifoPruneHelper:
+    """The bounded insertion-ordered guard maps (boost dedup single/batch,
+    cache invalidation, surfaced-id dedup) share one eviction helper so the
+    policy can't drift per site."""
+
+    def test_prunes_oldest_down_to_half_cap(self):
+        from memtomem_stm.surfacing.engine import _fifo_prune
+
+        d: dict[str, None] = {f"k{i}": None for i in range(15)}
+        _fifo_prune(d, 10)
+        # excess = 15 - 10 // 2 → the 10 oldest evict, newest 5 remain.
+        assert list(d) == [f"k{i}" for i in range(10, 15)]
+
+    def test_no_op_at_or_below_cap(self):
+        from memtomem_stm.surfacing.engine import _fifo_prune
+
+        d: dict[str, None] = {f"k{i}": None for i in range(10)}
+        _fifo_prune(d, 10)
+        assert list(d) == [f"k{i}" for i in range(10)]
+
+    def test_prune_idiom_lives_only_in_the_helper(self):
+        """Source-inspection drift pin: a new guard map re-introducing the
+        inline prune idiom would silently fork the eviction policy. Every
+        cap prune must route through ``_fifo_prune`` — a deliberate fifth
+        call site should bump the expected count here."""
+        import inspect
+        import re
+
+        from memtomem_stm.surfacing import engine
+
+        source = inspect.getsource(engine)
+        assert len(re.findall(r"excess = len\(", source)) == 1, (
+            "inline FIFO-prune idiom found outside _fifo_prune — route it "
+            "through the helper instead"
+        )
+        # 1 def + 4 call sites (boost single/batch, invalidation, surfaced).
+        assert len(re.findall(r"_fifo_prune\(", source)) == 5
