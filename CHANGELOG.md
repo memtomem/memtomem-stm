@@ -85,7 +85,7 @@ changes inline only. See the deprecation policy in
   gates only the rating prompt and feedback loop, not event persistence.
   **Behavior change**: default daemon installs start writing these rows;
   growth is bounded by the existing `stats_retention_days` /
-  `query_retention_days` cleanup.
+  `query_retention_days` cleanup. (#723)
 
 ## [0.1.40] — 2026-07-15
 
