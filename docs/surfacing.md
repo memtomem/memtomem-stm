@@ -637,6 +637,12 @@ hit:
 - `circuit_open` — repeated upstream failures opened the circuit
   breaker. Surfacing pauses for `circuit_reset_seconds` (default
   60s) before retrying.
+- `ltm_draining` — surfacing declined to start new LTM work because
+  too many earlier attempts, cancelled at timeout, are still
+  unwinding inside the LTM adapter. Clears itself once those
+  operations finish; a persistent count means the LTM is not
+  releasing cancelled calls. Refused calls give their rate-limit
+  slot back and warn once per episode.
 - `no_query` — `ContextExtractor` could not synthesize a query
   from the tool arguments and fell below `min_query_tokens`.
 - `no_results_score` — LTM returned results, none above

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import secrets
 import signal
@@ -705,6 +706,13 @@ class DaemonServer:
         """
         deadline = req.get("deadline_monotonic")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return None
+        if not math.isfinite(deadline):
+            # Not a usable monotonic point: +inf would reach the engine as a
+            # "real" deadline that its non-finite guard treats as no deadline
+            # at all — the full configured ceiling behind a client that is not
+            # actually infinitely patient — and NaN poisons every comparison
+            # it meets, starting with the expiry check below.
             return None
         surface_deadline = float(deadline) - _DEADLINE_RESPONSE_MARGIN_SECONDS
         if surface_deadline - time.monotonic() < _MIN_SURFACE_BUDGET_SECONDS:

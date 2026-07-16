@@ -385,6 +385,18 @@ async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) 
     assert engine.calls == []
 
 
+def test_surface_deadline_rejects_non_finite_deadlines(tmp_path: Path) -> None:
+    # NaN and ±inf pass the isinstance check but are not usable monotonic
+    # points: +inf would reach the engine as a "real" deadline that its
+    # non-finite guard then treats as no deadline at all (the full configured
+    # ceiling, behind a client that is not actually infinitely patient), and
+    # NaN poisons every comparison it meets. Both mean "don't start LTM work"
+    # — the same answer a missing deadline gets.
+    server = DaemonServer(_config(tmp_path))
+    for bad in (float("nan"), float("inf"), float("-inf"), True, False, "1.0", None):
+        assert server._surface_deadline({"deadline_monotonic": bad}) is None, bad
+
+
 async def test_surface_rejects_when_pending_queue_is_full(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     cfg.daemon.max_pending_requests = 1

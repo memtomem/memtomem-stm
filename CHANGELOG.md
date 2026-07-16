@@ -48,8 +48,9 @@ changes inline only. See the deprecation policy in
   (the adapter already expects a caller to leave mid-RPC and marks the session
   for lazy reconnect; shutdown waits a bounded moment for that cleanup rather
   than cancelling it a second time, and declines new attempts once too many
-  cancelled operations are still unwinding — refunding the rate-limit slot it
-  claimed, since a refusal starts no LTM work). The engine also
+  cancelled operations are still unwinding — warning once per draining episode
+  and refunding the rate-limit slot it claimed, since a refusal starts no LTM
+  work). The engine also
   books its timeout off *which timer fired* — a flag set inside the timer
   callback, which the loop runs in scheduled order ahead of any backstop
   scheduled later — rather than off elapsed time, the caller's deadline, or a
@@ -58,7 +59,8 @@ changes inline only. See the deprecation policy in
   A cancellation that is not this call's own timeout is left unbooked, so a
   shutdown or a client hanging up never charges a healthy LTM a breaker
   failure. A window fully consumed by pre-work is booked without starting an
-  LTM round trip that would be cancelled mid-RPC. (#721)
+  LTM round trip that would be cancelled mid-RPC, and gives its rate-limit
+  slot back the same way a refusal does. (#721)
 
 ## [0.1.40] — 2026-07-15
 
