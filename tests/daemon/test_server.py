@@ -241,6 +241,19 @@ async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
     assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
 
 
+class _DeadlineSpyEngine:
+    """Records the ``deadline_monotonic`` the daemon hands to the engine."""
+
+    injection_mode = "append"
+
+    def __init__(self) -> None:
+        self.calls: list[float | None] = []
+
+    async def surface(self, *args, deadline_monotonic: float | None = None, **kwargs) -> str:
+        self.calls.append(deadline_monotonic)
+        return args[3] if len(args) > 3 else ""
+
+
 async def test_admission_rejects_unusable_deadlines(tmp_path: Path) -> None:
     # _run_admitted's own validation, not just _surface_deadline's (#721
     # fixed only the latter): NaN passed the expiry comparison (nan <= now is
@@ -263,19 +276,6 @@ async def test_admission_rejects_unusable_deadlines(tmp_path: Path) -> None:
         )
         assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}, bad
     assert engine.calls == []  # none of them reached the engine
-
-
-class _DeadlineSpyEngine:
-    """Records the ``deadline_monotonic`` the daemon hands to the engine."""
-
-    injection_mode = "append"
-
-    def __init__(self) -> None:
-        self.calls: list[float | None] = []
-
-    async def surface(self, *args, deadline_monotonic: float | None = None, **kwargs) -> str:
-        self.calls.append(deadline_monotonic)
-        return args[3] if len(args) > 3 else ""
 
 
 async def test_surface_propagates_deadline_minus_response_margin(tmp_path: Path) -> None:
