@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -487,6 +488,10 @@ class McpClientSearchAdapter:
         self._parser = get_parser(getattr(config, "result_format", "compact"))
         self._capabilities = LtmCapabilities()
         self._runtime_profile: dict[str, Any] | None = None
+        # Whether the connected core's mem_search schema advertises the
+        # per-call ``rerank`` parameter (core #1766). Session-scoped like the
+        # parser negotiation; see ``_probe_rerank_support``.
+        self._rerank_param_supported = False
         # #290: SurfacingEngine bounds adapter calls with its own timeout
         # (``_run_within``); that abort interrupts ``call_tool`` mid-RPC and
         # leaves the MCP session in a mid-message state. ``_TRANSPORT_ERRORS``
@@ -593,6 +598,7 @@ class McpClientSearchAdapter:
                 self._target_display(),
             )
             await self._negotiate_format(session)
+            await self._probe_rerank_support(session)
             # Publish only after initialize + negotiation succeed: `_session`
             # is the readiness signal `_heal_if_needed`'s fast path trusts
             # without taking `_start_lock`, and an abandoned start (#664) runs
@@ -718,6 +724,67 @@ class McpClientSearchAdapter:
         else:
             logger.info("Core does not advertise structured format — falling back to compact")
             self._parser = CompactResultParser()
+
+    async def _probe_rerank_support(self, session: ClientSession | None = None) -> None:
+        """Detect whether the core accepts a per-call ``rerank`` argument.
+
+        Runs next to ``_negotiate_format`` in ``_do_start`` (so reconnects
+        re-evaluate it per session) but stays a separate step: the format
+        negotiation early-returns for compact parsers, and rerank support is
+        orthogonal to the result format. Core #1766 shipped no
+        ``mem_do(action="version")`` capability bit, so the only automatic
+        signal is the ``mem_search`` tool schema — FastMCP derives it from
+        the tool signature, so a bypass-capable core advertises a ``rerank``
+        property. The same probe gates the compose-side key: core shipped
+        ``mem_search`` and ``context_compose`` threading together, and
+        ``mem_do``'s own schema (``action`` + opaque ``params``) can't
+        advertise it.
+
+        Reset-first and failure-proof: any probe error degrades to "key
+        withheld" — it must never fail ``_do_start``, or a healthy old
+        server would flip from working surfacing to ``no_session`` skips
+        plus circuit-breaker charges.
+        """
+        self._rerank_param_supported = False
+        if self._config.rerank is None:
+            return
+        if session is None:
+            session = self._session
+        if session is None:
+            return
+        try:
+            listing = await session.list_tools()
+            for tool in getattr(listing, "tools", None) or []:
+                if tool.name != "mem_search":
+                    continue
+                schema = tool.inputSchema
+                properties = schema.get("properties") if isinstance(schema, dict) else None
+                if isinstance(properties, dict) and "rerank" in properties:
+                    self._rerank_param_supported = True
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("rerank support probe failed (older core?): %s", self._scrub_exc(exc))
+        if not self._rerank_param_supported:
+            logger.info(
+                "Core does not advertise per-call rerank — surfacing.rerank=%s is withheld",
+                self._config.rerank,
+            )
+
+    def _refresh_rerank_arg(self, target: dict[str, Any]) -> None:
+        """Re-derive the per-call ``rerank`` key from the CURRENT latch.
+
+        Must run immediately before every ``call_tool`` send, not at
+        args-build time: transport-error retries reuse the dict built for
+        the pre-reconnect session, and the reconnect re-probes the
+        replacement core — which may be *older* (rollback) and reject the
+        key its predecessor advertised. Strip-then-inject keeps the dict
+        consistent in both directions across a mid-call up/downgrade.
+        """
+        target.pop("rerank", None)
+        if self._config.rerank is not None and self._rerank_param_supported:
+            target["rerank"] = self._config.rerank
 
     @property
     def capabilities(self) -> LtmCapabilities:
@@ -1147,6 +1214,7 @@ class McpClientSearchAdapter:
             args["_trace_id"] = trace_id
         if isinstance(self._parser, StructuredResultParser):
             args["output_format"] = "structured"
+        self._refresh_rerank_arg(args)
 
         try:
             result = await self._rpc(session, generation, "mem_search", args)
@@ -1160,6 +1228,7 @@ class McpClientSearchAdapter:
                 assert self._session is not None
                 retry_session = self._session
                 retry_generation = self._generation
+                self._refresh_rerank_arg(args)
                 result = await self._rpc(retry_session, retry_generation, "mem_search", args)
             except asyncio.CancelledError:
                 raise
@@ -1228,8 +1297,15 @@ class McpClientSearchAdapter:
         params: dict[str, Any],
         *,
         trace_id: str | None = None,
+        refresh_params: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
-        """Call a negotiated core action with the standard reconnect contract."""
+        """Call a negotiated core action with the standard reconnect contract.
+
+        ``refresh_params`` re-derives session-dependent keys in *params*
+        right before each send: the retry below reuses the caller's dict
+        after a reconnect that may have re-negotiated against a different
+        core (see ``_refresh_rerank_arg``).
+        """
         if not await self._heal_if_needed():
             raise RuntimeError("LTM session unavailable")
         assert self._session is not None
@@ -1238,6 +1314,8 @@ class McpClientSearchAdapter:
         args: dict[str, Any] = {"action": action, "params": params}
         if trace_id is not None:
             args["_trace_id"] = trace_id
+        if refresh_params is not None:
+            refresh_params(params)
         try:
             return await self._rpc(session, generation, "mem_do", args)
         except self._TRANSPORT_ERRORS:
@@ -1246,6 +1324,8 @@ class McpClientSearchAdapter:
             assert self._session is not None
             retry_session = self._session
             retry_generation = self._generation
+            if refresh_params is not None:
+                refresh_params(params)
             try:
                 return await self._rpc(retry_session, retry_generation, "mem_do", args)
             except asyncio.CancelledError:
@@ -1293,7 +1373,12 @@ class McpClientSearchAdapter:
         if agent_id:
             params["agent_id"] = agent_id
         try:
-            result = await self._call_mem_do("context_compose", params, trace_id=trace_id)
+            result = await self._call_mem_do(
+                "context_compose",
+                params,
+                trace_id=trace_id,
+                refresh_params=self._refresh_rerank_arg,
+            )
         except self._TRANSPORT_ERRORS as exc:
             raise LtmTransportError("core context_compose transport unavailable") from exc
         if getattr(result, "isError", False) is True:

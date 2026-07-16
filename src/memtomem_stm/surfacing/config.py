@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from memtomem_stm.proxy.config import MODEL_CONTEXT_WINDOWS
 
@@ -179,6 +179,38 @@ class SurfacingConfig(BaseModel):
     (``not_relevant`` / ``already_known``) still works because it keys on
     the same surrogate within the process. ``structured`` carries the real
     ``chunk_id`` end to end, so per-memory boost / dedup stay reliable."""
+    rerank: bool | None = False
+    """Per-call rerank decision forwarded to the core's ``mem_search`` /
+    ``context_compose`` (core #1766). ``False`` (default) asks the core to
+    skip its cross-encoder rerank stage for surfacing retrievals; ``True``
+    forces the server-configured rerank; ``None`` omits the parameter so
+    the server's own config decides.
+
+    Surfacing is latency-bounded by design — the rerank stage is ~99% of
+    retrieval latency on a rerank-enabled core (compose p50 4,247ms vs
+    42ms bypassed) and blows the daemon/engine budget on every call, while
+    survival past the default ``min_score`` (0.03) is measured identical
+    with rerank on or off. Bypassing trades ranking precision within the
+    result set, not result existence. Note the bypassed scores come back
+    on the RRF scale (``(0, ~0.033]``), the scale ``min_score`` and the
+    auto-tuner were calibrated against.
+
+    Old-core safety: the parameter is only ever sent when the connected
+    core advertises ``rerank`` in its ``mem_search`` tool schema
+    (negotiated once per session, like ``result_format``); on older cores
+    the key is silently withheld, so ``False``/``True`` degrade to today's
+    behavior instead of tripping the server's argument validation. Env:
+    ``MEMTOMEM_STM_SURFACING__RERANK`` (``true`` / ``false`` / ``none``)."""
+
+    @field_validator("rerank", mode="before")
+    @classmethod
+    def _rerank_env_none(cls, value: object) -> object:
+        """Make the tri-state reachable from env vars: pydantic-settings
+        delivers nested values as strings, and ``bool | None`` has no
+        string spelling for ``None`` without this mapping."""
+        if isinstance(value, str) and value.strip().lower() in ("", "none", "null"):
+            return None
+        return value
 
     @model_validator(mode="after")
     def _validate_auto_tune_bounds(self) -> SurfacingConfig:

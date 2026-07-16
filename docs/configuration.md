@@ -135,6 +135,7 @@ export MEMTOMEM_STM_SURFACING__MIN_SCORE=0.03
 export MEMTOMEM_STM_SURFACING__MAX_RESULTS=3
 export MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS=5000
 export MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS=3.0         # cold-start escape hatch: raise past the LTM child's model-load time (#664)
+export MEMTOMEM_STM_SURFACING__RERANK=false                # per-call core rerank: false = bypass (default), true = force, none = server config decides; sent only when the core advertises it (core #1766)
 export MEMTOMEM_STM_SURFACING__FEEDBACK_ENABLED=true
 export MEMTOMEM_STM_SURFACING__AUTO_TUNE_ENABLED=true
 export MEMTOMEM_STM_SURFACING__AUTO_TUNE_SCORE_FLOOR=0.005
