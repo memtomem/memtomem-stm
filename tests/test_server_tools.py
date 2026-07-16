@@ -2435,10 +2435,12 @@ class TestAdvertiseOrder:
         must leave proxied tools ahead of STM utility tools in the
         advertise order. The e2e test above drives the helper directly, so
         it alone would stay green if the lifespan dropped the reorder call,
-        hoisted it above the ``register_proxy_tool`` loop, or moved it
-        inside the loop (later proxied tools would then append after the
-        STM utilities again). Observing the lifespan's actual outcome pins
-        all of those at once — no source-shape inspection needed. Mirrors
+        hoisted it above the ``register_proxy_tool`` loop, or reordered
+        only mid-loop (later proxied tools would then append after the STM
+        utilities). This test pins the OUTCOME — every call arrangement
+        that leaves proxied tools first passes by design; pinning the call
+        sequence itself would fail legitimate refactors that preserve the
+        invariant. Mirrors
         the ``TestLifespan`` mocked-ProxyManager pattern; the registration
         loop and reorder run for real against the module-global server."""
         from memtomem_stm.proxy.manager import ProxyToolInfo
