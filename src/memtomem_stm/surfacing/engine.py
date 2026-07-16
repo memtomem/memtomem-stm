@@ -1101,6 +1101,9 @@ class SurfacingEngine:
                 )
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
+                # Kept symmetric with the miss path; the cached path fires no
+                # webhook, so this reset has no consumer here — it just states
+                # "no row was written" for the next reader.
                 surfacing_id = None
                 if advertised_id is not None:
                     # Same contract as the miss path: withdraw the dead
