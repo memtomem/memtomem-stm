@@ -241,6 +241,30 @@ async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
     assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
 
 
+async def test_admission_rejects_unusable_deadlines(tmp_path: Path) -> None:
+    # _run_admitted's own validation, not just _surface_deadline's (#721
+    # fixed only the latter): NaN passed the expiry comparison (nan <= now is
+    # False) and reached asyncio.timeout_at(NaN), polluting the loop's timer
+    # heap; +inf was admitted with a backstop that can never fire; and an int
+    # too large for a float raised OverflowError out of the dispatch instead
+    # of answering. All are the same thing — not a usable monotonic point —
+    # and get the same answer a missing or past deadline gets.
+    engine = _DeadlineSpyEngine()
+    server = DaemonServer(_config(tmp_path))
+    server._engine = engine
+    for bad in (float("nan"), float("inf"), float("-inf"), 10**400):
+        response = await server._dispatch(
+            {
+                "v": PROTOCOL_VERSION,
+                "op": OP_SURFACE,
+                "payload": _canonical(_READ_PAYLOAD).to_wire(),
+                "deadline_monotonic": bad,
+            }
+        )
+        assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}, bad
+    assert engine.calls == []  # none of them reached the engine
+
+
 class _DeadlineSpyEngine:
     """Records the ``deadline_monotonic`` the daemon hands to the engine."""
 
