@@ -39,13 +39,15 @@ class RelevanceGate:
         server: str,
         tool: str,
         query: str | None,
-    ) -> bool:
-        """Gate a prospective surfacing. On ``True``, eagerly claim a slot
-        in ``_surfacing_timestamps`` so concurrent callers see the budget
-        consumption immediately — otherwise N coroutines all check the
+    ) -> float | None:
+        """Gate a prospective surfacing. On pass, eagerly claim a slot in
+        ``_surfacing_timestamps`` — so concurrent callers see the budget
+        consumption immediately; otherwise N coroutines all check the
         rate limit before any of them reaches ``record_surfacing`` and
         every one passes, bursting through the ``max_surfacings_per_minute``
-        cap by up to the concurrency level.
+        cap by up to the concurrency level — and return the claim (its
+        timestamp) as the token :meth:`release_claim` takes back. ``None``
+        means rejected, no slot claimed.
 
         Cooldown claim stays with ``record_surfacing`` (see that method)
         because cooldown is a "skip if we already returned similar results"
@@ -57,7 +59,7 @@ class RelevanceGate:
         # ``query is None`` is the extractor's outcome (engine-level).
         # Recording them here would double-count when the engine also bails.
         if not self._config.enabled or query is None:
-            return False
+            return None
 
         full_name = f"{server}__{tool}"
 
@@ -65,7 +67,7 @@ class RelevanceGate:
         for pattern in self._config.exclude_tools:
             if fnmatch(full_name, pattern) or fnmatch(tool, pattern):
                 self._observability.record_skip(tool, "gate_excluded_tool")
-                return False
+                return None
 
         # Write-tool heuristic. Match against both the bare tool name and the
         # ``server__tool`` full name — symmetric with ``exclude_tools`` above —
@@ -74,13 +76,13 @@ class RelevanceGate:
         for pattern in self._config.write_tool_patterns:
             if fnmatch(full_name, pattern) or fnmatch(tool, pattern):
                 self._observability.record_skip(tool, "gate_write_tool")
-                return False
+                return None
 
         # Per-tool override
         tool_cfg = self._config.context_tools.get(tool)
         if tool_cfg is not None and not tool_cfg.enabled:
             self._observability.record_skip(tool, "gate_tool_disabled")
-            return False
+            return None
 
         # Rate limit
         now = time.monotonic()
@@ -91,7 +93,7 @@ class RelevanceGate:
             self._surfacing_timestamps.popleft()
         if len(self._surfacing_timestamps) >= self._config.max_surfacings_per_minute:
             self._observability.record_skip(tool, "gate_rate_limit")
-            return False
+            return None
 
         # Cooldown: skip if very similar query was recently surfaced
         for ts, prev_query in reversed(self._recent_queries):
@@ -99,7 +101,7 @@ class RelevanceGate:
                 break
             if self._jaccard_similarity(query, prev_query) > _SIMILARITY_THRESHOLD:
                 self._observability.record_skip(tool, "gate_cooldown")
-                return False
+                return None
 
         # Eagerly claim the rate-limit slot. A concurrent ``should_surface``
         # for a different query will now observe this timestamp and apply
@@ -109,9 +111,9 @@ class RelevanceGate:
         # already consumed LTM/MCP resources and that is what the throttle
         # is defending against.
         self._surfacing_timestamps.append(now)
-        return True
+        return now
 
-    def release_claim(self) -> None:
+    def release_claim(self, claim: float) -> None:
         """Give back the rate-limit slot :meth:`should_surface` claimed, for a
         caller that ends up starting no LTM work at all.
 
@@ -122,13 +124,19 @@ class RelevanceGate:
         burst of refusals exhaust ``max_surfacings_per_minute`` and go on
         blocking surfacing after the condition that caused them cleared.
 
-        Drops the newest timestamp rather than hunting for this caller's own:
-        the cap is a count over a sliding window, so any one restores exactly
-        the capacity that was taken, and the newest is this caller's except
-        under a concurrent claim in between.
+        ``claim`` is the token :meth:`should_surface` returned, so exactly the
+        caller's own slot is removed. Popping the newest instead would, under
+        a concurrent claim in between, hand back the *other* caller's slot and
+        leave this caller's older timestamp counting — whose earlier expiry
+        frees capacity sooner than the surviving real attempt should allow.
+        A claim that already left the deque (pruned by window expiry, or
+        evicted by ``maxlen``) is simply gone; releasing it is a no-op rather
+        than someone else's slot.
         """
-        if self._surfacing_timestamps:
-            self._surfacing_timestamps.pop()
+        try:
+            self._surfacing_timestamps.remove(claim)
+        except ValueError:
+            pass
 
     def record_surfacing(self, query: str) -> None:
         """Record that a surfacing was actually performed (call after success).

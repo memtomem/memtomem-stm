@@ -662,7 +662,11 @@ class SurfacingEngine:
             # Never send raw credentials/PII to a remote LTM. A stable digest
             # preserves cache/cooldown behavior without disclosing the source.
             query = self._hashed_query(query)
-        if not self._gate.should_surface(server, tool, query):
+        # On pass the gate eagerly claims a rate-limit slot; the claim token
+        # rides along so a path that ends up starting no LTM work can give
+        # back exactly its own slot (``release_claim``).
+        rate_claim = self._gate.should_surface(server, tool, query)
+        if rate_claim is None:
             # Gate has already recorded the specific reason internally. Avoid
             # double-counting by not recording at the engine level here.
             logger.debug(
@@ -683,7 +687,15 @@ class SurfacingEngine:
                 # respawn on the next call (#290/#296).
                 raise asyncio.TimeoutError
             result = await self._run_within(
-                self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
+                self._do_surface(
+                    server,
+                    tool,
+                    arguments,
+                    response_text,
+                    query,
+                    rate_claim=rate_claim,
+                    trace_id=trace_id,
+                ),
                 effective_timeout,
             )
             self._circuit_breaker.record_success()
@@ -1098,6 +1110,7 @@ class SurfacingEngine:
         response_text: str,
         query: str,
         *,
+        rate_claim: float,
         trace_id: str | None = None,
     ) -> str:
         # Check surfacing cache (keyed by server+tool+query). The full miss
@@ -1129,6 +1142,7 @@ class SurfacingEngine:
                     response_text,
                     query,
                     cache_key,
+                    rate_claim=rate_claim,
                     trace_id=trace_id,
                 )
             finally:
@@ -1143,6 +1157,7 @@ class SurfacingEngine:
         query: str,
         cache_key: str,
         *,
+        rate_claim: float,
         trace_id: str | None = None,
     ) -> str:
         """Admission for the one path that starts LTM work, then the work.
@@ -1155,7 +1170,7 @@ class SurfacingEngine:
             # No LTM work started, so this is not an "attempt" by the rate
             # limiter's own definition — give the slot back rather than let a
             # run of refusals spend the throttle on nothing.
-            self._gate.release_claim()
+            self._gate.release_claim(rate_claim)
             self._observability.record_skip(tool, "ltm_draining")
             self._persist_fault(server, tool, "ltm_draining")
             # Warn once per draining episode (see the latch's init comment):
