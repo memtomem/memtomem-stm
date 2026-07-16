@@ -37,6 +37,20 @@ hashed-form row without re-reading config and lets ad-hoc DB inspection
 tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
 
+_MAX_ABANDONED_OPS = 4
+"""How many timed-out LTM operations may still be unwinding before this engine
+stops starting new ones.
+
+``_run_within`` abandons an operation rather than waiting out an unwind it
+cannot bound, which means a wedged LTM leaves one behind per attempt, each
+still holding whatever it held (its session, the per-key lock). The circuit
+breaker throttles but does not stop that: every reset lets another probe
+through. Rather than evict the references — the point of keeping them is that
+the operation is still running — refuse the *next* attempt while this many are
+outstanding, which is also the honest reading of a dependency that will not let
+go. Small on purpose: past one or two, the LTM is not answering anyway.
+"""
+
 _ABANDONED_DRAIN_SECONDS = 1.0
 """How long :meth:`SurfacingEngine.stop` waits on LTM operations abandoned at
 timeout before giving up on them.
@@ -617,6 +631,23 @@ class SurfacingEngine:
             self._observability.record_skip(tool, "circuit_open")
             self._persist_fault(server, tool, "circuit_open")
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
+            return response_text
+
+        # Enough previous attempts are still unwinding that starting another
+        # would only add to the pile (#720). The breaker throttles this but
+        # cannot stop it: each reset lets a probe through, and against an LTM
+        # that never lets go every probe leaves another operation behind.
+        # Declining is also the accurate answer — a dependency this stuck is
+        # not about to serve this call either.
+        if len(self._abandoned_ops) >= _MAX_ABANDONED_OPS:
+            self._observability.record_skip(tool, "ltm_draining")
+            self._persist_fault(server, tool, "ltm_draining")
+            logger.debug(
+                "Surfacing skipped: %d abandoned LTM operation(s) still unwinding for %s/%s",
+                len(self._abandoned_ops),
+                server,
+                tool,
+            )
             return response_text
 
         query = self._extractor.extract_query(
@@ -1473,9 +1504,15 @@ class SurfacingEngine:
         operation is not — ``_run_within`` stopped waiting on it precisely
         because a stdio child can be slow, or refuse, to give up — so waiting
         without a bound would let one such unwind hold the daemon's shutdown
-        open, and this runs before the adapter's own bounded stop. They are
-        cancelled and given ``_ABANDONED_DRAIN_SECONDS``; anything still in
-        flight is left to the loop's teardown rather than blocking it.
+        open, and this runs before the adapter's own bounded stop. They only
+        get ``_ABANDONED_DRAIN_SECONDS``; anything still in flight is left to
+        the loop's teardown rather than blocking it.
+
+        They are also *not* re-cancelled here. ``_abandon`` already cancelled
+        each one, and what they are doing now is the cleanup that cancellation
+        asked for — the adapter marking its session for lazy reconnect, locks
+        unwinding. A second cancellation lands inside that cleanup and aborts
+        it, which is the opposite of draining.
         """
         for task in self._background_tasks:
             task.cancel()
@@ -1484,8 +1521,6 @@ class SurfacingEngine:
         self._background_tasks.clear()
 
         stragglers = {task for task in self._abandoned_ops if not task.done()}
-        for task in stragglers:
-            task.cancel()
         if stragglers:
             _, pending = await asyncio.wait(stragglers, timeout=_ABANDONED_DRAIN_SECONDS)
             if pending:

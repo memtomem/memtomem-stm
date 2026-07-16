@@ -46,7 +46,9 @@ changes inline only. See the deprecation policy in
   (#579). The LTM operation is now shielded, so that abort lands the moment the
   engine's timer fires and the abandoned unwind is left to finish on its own
   (the adapter already expects a caller to leave mid-RPC and marks the session
-  for lazy reconnect; shutdown gives it a bounded chance to). The engine also
+  for lazy reconnect; shutdown waits a bounded moment for that cleanup rather
+  than cancelling it a second time, and declines new attempts once too many
+  are still unwinding). The engine also
   books its timeout off *which timer fired* — a flag set inside the timer
   callback, which the loop runs in scheduled order ahead of any backstop
   scheduled later — rather than off elapsed time, the caller's deadline, or a

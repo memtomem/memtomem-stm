@@ -779,6 +779,91 @@ class TestSurfacingDeadline:
 
         assert await task == "answered in time"
 
+    async def test_stop_does_not_abort_the_cleanup_it_is_draining(self):
+        # `_abandon` already cancelled these; what they are doing now IS the
+        # cleanup that cancellation asked for (the adapter marks its session
+        # for lazy reconnect, locks unwind). Cancelling a second time in stop()
+        # lands inside that cleanup and kills it — the opposite of draining.
+        # An unwind that merely absorbs repeated cancellation would hide this,
+        # so this one awaits normally, the way real cleanup does.
+        cleanup_started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+
+        async def cleans_up_on_cancel(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.sleep(0.05)  # cleanup that yields, e.g. an async close
+                cleaned_up.set()
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=cleans_up_on_cancel)
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=adapter,
+        )
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE, deadline_monotonic=None)
+        assert engine._abandoned_ops
+
+        # Wait for the cleanup to actually be in flight. Without this the test
+        # is worthless: a re-cancel delivered before the task has been stepped
+        # at all collapses into the first one and the cleanup survives anyway,
+        # so the bug would go unseen. In the daemon plenty of turns pass here —
+        # the response is written long before stop() runs.
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5.0)
+        await engine.stop()
+
+        assert cleaned_up.is_set()  # the drain let it finish, rather than cutting it short
+        assert not engine._abandoned_ops
+
+    async def test_abandoned_operations_do_not_accumulate_without_bound(self):
+        # Each timed-out attempt against an LTM that never lets go leaves an
+        # operation behind, still holding what it holds. The breaker throttles
+        # that but cannot stop it — every reset admits another probe — so the
+        # engine declines new attempts once enough are outstanding, rather than
+        # evicting references to operations that are still running.
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        async def never_lets_go(*args, **kwargs):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)  # unwind that outlives everything
+                raise
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=never_lets_go)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.02, circuit_max_failures=1000),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        # Distinct queries per call: a repeated one would queue behind the
+        # first attempt's per-key lock and be cancelled there, never reaching
+        # the adapter — so it would never leave an operation behind and the
+        # pile-up this guards against would not appear.
+        for i in range(engine_module._MAX_ABANDONED_OPS + 3):
+            await engine.surface(
+                "gh",
+                "read_file",
+                {"path": f"src/app{i}.py", "_context_query": f"distinct query {i}"},
+                LONG_RESPONSE,
+                deadline_monotonic=None,
+            )
+
+        assert len(engine._abandoned_ops) == engine_module._MAX_ABANDONED_OPS
+        outcomes = obs.snapshot()
+        assert outcomes["skip_reasons"]["read_file"]["ltm_draining"] == 3
+        # The declined calls are not charged as LTM timeouts.
+        assert (
+            outcomes["outcomes"]["read_file"]["error_timeout"] == engine_module._MAX_ABANDONED_OPS
+        )
+
     async def test_stop_is_not_held_open_by_a_cancellation_resistant_unwind(self, monkeypatch):
         # `_run_within` abandons the LTM operation precisely because its unwind
         # is not known to be bounded. stop() therefore must not wait on it the

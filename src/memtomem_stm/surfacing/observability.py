@@ -48,6 +48,10 @@ SkipReason = Literal[
     "no_results_demoted",
     "no_results_invalidated",
     "no_results_empty_cache",
+    # #720: previous attempts against this LTM were abandoned at timeout and
+    # are still unwinding. Starting another only adds to the pile, so the
+    # engine declines rather than evicting a running operation's reference.
+    "ltm_draining",
     # #295: LTM adapter outcome typing — distinguish unreachable from
     # call_failed from parse_empty so operators can tell "session never
     # opened / transport down" from "core raised mid-call" from "core
@@ -114,6 +118,7 @@ HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
 FAULT_SKIP_REASONS: frozenset[str] = frozenset(
     {
         "circuit_open",
+        "ltm_draining",
         "ltm_unavailable",
         "ltm_call_failed",
         "ltm_parse_empty",

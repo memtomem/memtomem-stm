@@ -115,6 +115,7 @@ FAULT_KINDS: frozenset[str] = frozenset(
         "error_timeout",
         "error_other",
         "circuit_open",
+        "ltm_draining",
         "ltm_unavailable",
         "ltm_call_failed",
         "ltm_parse_empty",
