@@ -2432,24 +2432,59 @@ class TestAdvertiseOrder:
 
     def test_lifespan_reorders_after_proxy_registration(self):
         """The reorder is only effective if ``app_lifespan`` actually calls
-        it, *after* the ``register_proxy_tool`` loop. The e2e test above
-        drives the helper directly, so it would stay green if the lifespan
-        call were dropped or hoisted above proxy registration — pin the call
-        site's presence and position in the source instead (an execution
-        test would need the full upstream-connection machinery)."""
+        it, as a sibling statement *after* the ``register_proxy_tool`` loop.
+        The e2e test above drives the helper directly, so it would stay
+        green if the lifespan call were dropped, hoisted above proxy
+        registration, or moved *inside* the loop (later proxied tools would
+        then append after the STM utilities again). Pin the call site
+        structurally via AST — a substring check can't tell "after the
+        loop" from "inside the loop", and an execution test would need the
+        full upstream-connection machinery."""
+        import ast
         import inspect
+        import textwrap
 
         from memtomem_stm import server
 
-        source = inspect.getsource(server.app_lifespan)
-        register_at = source.index("register_proxy_tool(")
-        assert "_move_stm_tools_to_end(" in source, (
-            "app_lifespan no longer reorders the advertise list — the #228 "
-            "invariant (proxied tools first) has lost its production call site."
-        )
-        assert source.index("_move_stm_tools_to_end(") > register_at, (
-            "app_lifespan must reorder AFTER registering proxied tools; a "
-            "reorder that runs first is a no-op for #228."
+        def _calls(node: ast.AST, name: str) -> bool:
+            return any(
+                isinstance(n, ast.Call)
+                and (
+                    (isinstance(n.func, ast.Name) and n.func.id == name)
+                    or (isinstance(n.func, ast.Attribute) and n.func.attr == name)
+                )
+                for n in ast.walk(node)
+            )
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(server.app_lifespan)))
+        pinned = False
+        for parent in ast.walk(tree):
+            for field in ("body", "orelse", "finalbody"):
+                stmts = getattr(parent, field, None)
+                if not isinstance(stmts, list):
+                    continue
+                loop_at = [
+                    i
+                    for i, s in enumerate(stmts)
+                    if isinstance(s, (ast.For, ast.AsyncFor)) and _calls(s, "register_proxy_tool")
+                ]
+                reorder_at = [
+                    i
+                    for i, s in enumerate(stmts)
+                    if not isinstance(s, (ast.For, ast.AsyncFor))
+                    and _calls(s, "_move_stm_tools_to_end")
+                ]
+                if loop_at and reorder_at:
+                    assert min(reorder_at) > max(loop_at), (
+                        "app_lifespan must reorder AFTER the register_proxy_tool "
+                        "loop; a reorder that runs first is a no-op for #228."
+                    )
+                    pinned = True
+        assert pinned, (
+            "app_lifespan no longer reorders the advertise list as a sibling "
+            "statement after the register_proxy_tool loop — the #228 invariant "
+            "(proxied tools first) has lost its production call site, or the "
+            "shape moved and this pin needs a conscious update."
         )
 
     def test_utility_tool_names_tuple_matches_registered_set(self):
