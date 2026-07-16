@@ -2456,35 +2456,41 @@ class TestAdvertiseOrder:
                 for n in ast.walk(node)
             )
 
+        def _is_reorder_stmt(stmt: ast.stmt) -> bool:
+            # A DIRECT bare-expression call — a descendant search would also
+            # accept unreachable shapes (an uncalled nested def, ``if False:``).
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+                return False
+            func = stmt.value.func
+            return (isinstance(func, ast.Name) and func.id == "_move_stm_tools_to_end") or (
+                isinstance(func, ast.Attribute) and func.attr == "_move_stm_tools_to_end"
+            )
+
         tree = ast.parse(textwrap.dedent(inspect.getsource(server.app_lifespan)))
-        pinned = False
+        loop_sites: list[tuple[int, list[ast.stmt]]] = []
+        reorder_sites: list[tuple[int, list[ast.stmt]]] = []
         for parent in ast.walk(tree):
             for field in ("body", "orelse", "finalbody"):
                 stmts = getattr(parent, field, None)
                 if not isinstance(stmts, list):
                     continue
-                loop_at = [
-                    i
-                    for i, s in enumerate(stmts)
-                    if isinstance(s, (ast.For, ast.AsyncFor)) and _calls(s, "register_proxy_tool")
-                ]
-                reorder_at = [
-                    i
-                    for i, s in enumerate(stmts)
-                    if not isinstance(s, (ast.For, ast.AsyncFor))
-                    and _calls(s, "_move_stm_tools_to_end")
-                ]
-                if loop_at and reorder_at:
-                    assert min(reorder_at) > max(loop_at), (
-                        "app_lifespan must reorder AFTER the register_proxy_tool "
-                        "loop; a reorder that runs first is a no-op for #228."
-                    )
-                    pinned = True
-        assert pinned, (
-            "app_lifespan no longer reorders the advertise list as a sibling "
-            "statement after the register_proxy_tool loop — the #228 invariant "
-            "(proxied tools first) has lost its production call site, or the "
-            "shape moved and this pin needs a conscious update."
+                for i, s in enumerate(stmts):
+                    if isinstance(s, (ast.For, ast.AsyncFor)) and _calls(s, "register_proxy_tool"):
+                        loop_sites.append((i, stmts))
+                    elif _is_reorder_stmt(s):
+                        reorder_sites.append((i, stmts))
+        assert len(loop_sites) == 1 and len(reorder_sites) == 1, (
+            "app_lifespan must hold exactly one register_proxy_tool loop and "
+            "one direct _move_stm_tools_to_end statement — a dropped call, or "
+            "a duplicate/unreachable copy, breaks this pin's subject "
+            f"(loops={len(loop_sites)}, reorders={len(reorder_sites)})."
+        )
+        loop_at, loop_stmts = loop_sites[0]
+        reorder_at, reorder_stmts = reorder_sites[0]
+        assert reorder_stmts is loop_stmts and reorder_at > loop_at, (
+            "app_lifespan must reorder as a sibling statement AFTER the "
+            "register_proxy_tool loop; hoisted, nested, or relocated calls "
+            "are a no-op for #228 (proxied tools first)."
         )
 
     def test_utility_tool_names_tuple_matches_registered_set(self):
