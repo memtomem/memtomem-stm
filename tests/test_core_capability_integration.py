@@ -210,6 +210,7 @@ async def test_direct_schema_two_compose_forwards_scope_fields(
             "context_window": 2,
         },
         trace_id="trace-1",
+        refresh_params=adapter._refresh_rerank_arg,
     )
 
 

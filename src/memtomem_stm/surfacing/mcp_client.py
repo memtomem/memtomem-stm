@@ -10,6 +10,7 @@ import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Literal, Protocol, cast
 
 import httpx
@@ -771,6 +772,20 @@ class McpClientSearchAdapter:
                 self._config.rerank,
             )
 
+    def _refresh_rerank_arg(self, target: dict[str, Any]) -> None:
+        """Re-derive the per-call ``rerank`` key from the CURRENT latch.
+
+        Must run immediately before every ``call_tool`` send, not at
+        args-build time: transport-error retries reuse the dict built for
+        the pre-reconnect session, and the reconnect re-probes the
+        replacement core — which may be *older* (rollback) and reject the
+        key its predecessor advertised. Strip-then-inject keeps the dict
+        consistent in both directions across a mid-call up/downgrade.
+        """
+        target.pop("rerank", None)
+        if self._config.rerank is not None and self._rerank_param_supported:
+            target["rerank"] = self._config.rerank
+
     @property
     def capabilities(self) -> LtmCapabilities:
         return self._capabilities
@@ -1199,8 +1214,7 @@ class McpClientSearchAdapter:
             args["_trace_id"] = trace_id
         if isinstance(self._parser, StructuredResultParser):
             args["output_format"] = "structured"
-        if self._config.rerank is not None and self._rerank_param_supported:
-            args["rerank"] = self._config.rerank
+        self._refresh_rerank_arg(args)
 
         try:
             result = await self._rpc(session, generation, "mem_search", args)
@@ -1214,6 +1228,7 @@ class McpClientSearchAdapter:
                 assert self._session is not None
                 retry_session = self._session
                 retry_generation = self._generation
+                self._refresh_rerank_arg(args)
                 result = await self._rpc(retry_session, retry_generation, "mem_search", args)
             except asyncio.CancelledError:
                 raise
@@ -1282,8 +1297,15 @@ class McpClientSearchAdapter:
         params: dict[str, Any],
         *,
         trace_id: str | None = None,
+        refresh_params: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
-        """Call a negotiated core action with the standard reconnect contract."""
+        """Call a negotiated core action with the standard reconnect contract.
+
+        ``refresh_params`` re-derives session-dependent keys in *params*
+        right before each send: the retry below reuses the caller's dict
+        after a reconnect that may have re-negotiated against a different
+        core (see ``_refresh_rerank_arg``).
+        """
         if not await self._heal_if_needed():
             raise RuntimeError("LTM session unavailable")
         assert self._session is not None
@@ -1292,6 +1314,8 @@ class McpClientSearchAdapter:
         args: dict[str, Any] = {"action": action, "params": params}
         if trace_id is not None:
             args["_trace_id"] = trace_id
+        if refresh_params is not None:
+            refresh_params(params)
         try:
             return await self._rpc(session, generation, "mem_do", args)
         except self._TRANSPORT_ERRORS:
@@ -1300,6 +1324,8 @@ class McpClientSearchAdapter:
             assert self._session is not None
             retry_session = self._session
             retry_generation = self._generation
+            if refresh_params is not None:
+                refresh_params(params)
             try:
                 return await self._rpc(retry_session, retry_generation, "mem_do", args)
             except asyncio.CancelledError:
@@ -1346,10 +1372,13 @@ class McpClientSearchAdapter:
         }
         if agent_id:
             params["agent_id"] = agent_id
-        if self._config.rerank is not None and self._rerank_param_supported:
-            params["rerank"] = self._config.rerank
         try:
-            result = await self._call_mem_do("context_compose", params, trace_id=trace_id)
+            result = await self._call_mem_do(
+                "context_compose",
+                params,
+                trace_id=trace_id,
+                refresh_params=self._refresh_rerank_arg,
+            )
         except self._TRANSPORT_ERRORS as exc:
             raise LtmTransportError("core context_compose transport unavailable") from exc
         if getattr(result, "isError", False) is True:

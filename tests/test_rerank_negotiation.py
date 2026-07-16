@@ -142,20 +142,106 @@ async def test_compose_params_carry_rerank_only_when_supported() -> None:
         adapter = McpClientSearchAdapter(SurfacingConfig())
         adapter._capabilities = LtmCapabilities(context_compose_schema=2)
         adapter._rerank_param_supported = supported
-        adapter._session = AsyncMock()
-        adapter._start_attempted = True
-        call = AsyncMock(
-            return_value=SimpleNamespace(
-                isError=False,
-                content=[
-                    SimpleNamespace(type="text", text=json.dumps({"pinned": [], "retrieved": []}))
-                ],
-            )
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=False,
+            content=[
+                SimpleNamespace(type="text", text=json.dumps({"pinned": [], "retrieved": []}))
+            ],
         )
-        adapter._call_mem_do = call  # type: ignore[method-assign]
+        adapter._session = session
+        adapter._start_attempted = True
         await adapter.context_compose("deployment", max_chars=2000, top_k=6)
-        params = call.await_args.args[1]
+        tool, args = session.call_tool.await_args.args
+        assert tool == "mem_do"
+        params = args["params"]
         assert {k: v for k, v in params.items() if k == "rerank"} == expected
+
+
+@pytest.mark.asyncio
+async def test_search_retry_after_reconnect_reevaluates_the_latch() -> None:
+    """A transport-error retry reuses the args dict built for the
+    pre-reconnect session; the reconnect re-probes the replacement core,
+    which may be OLDER (rollback) — the retry must re-derive the key from
+    the current latch, not replay the stale injection."""
+    adapter = McpClientSearchAdapter(SurfacingConfig())
+    adapter._rerank_param_supported = True
+    # Snapshot the args at send time: the retry mutates the SAME dict the
+    # mock would otherwise record by reference.
+    sent: list[dict[str, object]] = []
+    old_session = AsyncMock()
+
+    async def fail_first(tool: str, args: dict[str, object]) -> SimpleNamespace:
+        sent.append(dict(args))
+        raise OSError("transport died")
+
+    old_session.call_tool.side_effect = fail_first
+    new_session = AsyncMock()
+
+    async def succeed(tool: str, args: dict[str, object]) -> SimpleNamespace:
+        sent.append(dict(args))
+        return _search_response()
+
+    new_session.call_tool.side_effect = succeed
+    adapter._session = old_session
+    adapter._start_attempted = True
+
+    async def fake_reconnect(generation: int) -> None:
+        adapter._session = new_session
+        adapter._generation += 1
+        adapter._rerank_param_supported = False  # replacement core predates #1766
+
+    adapter._shared_reconnect = fake_reconnect  # type: ignore[method-assign]
+    _, _, outcome = await adapter.search("deployment")
+
+    assert outcome == "empty_results"
+    first_args, retry_args = sent
+    assert first_args["rerank"] is False  # positive control: capable session got the key
+    assert "rerank" not in retry_args
+
+
+@pytest.mark.asyncio
+async def test_compose_retry_after_reconnect_reevaluates_the_latch() -> None:
+    from memtomem_stm.surfacing.mcp_client import LtmCapabilities
+
+    adapter = McpClientSearchAdapter(SurfacingConfig())
+    adapter._capabilities = LtmCapabilities(context_compose_schema=2)
+    adapter._rerank_param_supported = True
+    sent: list[dict[str, object]] = []
+    old_session = AsyncMock()
+
+    async def fail_first(tool: str, args: dict[str, object]) -> SimpleNamespace:
+        sent.append(json.loads(json.dumps(args)))
+        raise OSError("transport died")
+
+    old_session.call_tool.side_effect = fail_first
+    new_session = AsyncMock()
+
+    async def succeed(tool: str, args: dict[str, object]) -> SimpleNamespace:
+        sent.append(json.loads(json.dumps(args)))
+        return SimpleNamespace(
+            isError=False,
+            content=[
+                SimpleNamespace(type="text", text=json.dumps({"pinned": [], "retrieved": []}))
+            ],
+        )
+
+    new_session.call_tool.side_effect = succeed
+    adapter._session = old_session
+    adapter._start_attempted = True
+
+    async def fake_reconnect(generation: int) -> None:
+        adapter._session = new_session
+        adapter._generation += 1
+        adapter._rerank_param_supported = False
+
+    adapter._shared_reconnect = fake_reconnect  # type: ignore[method-assign]
+    bundle = await adapter.context_compose("deployment")
+
+    assert bundle is not None
+    first_args, retry_args = sent
+    assert first_args["params"]["rerank"] is False
+    assert "rerank" not in retry_args["params"]
 
 
 def test_env_style_strings_reach_the_tri_state() -> None:
