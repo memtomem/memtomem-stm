@@ -7,10 +7,10 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any, Literal, Protocol, cast
 
 import httpx
