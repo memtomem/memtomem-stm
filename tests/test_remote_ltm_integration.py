@@ -210,6 +210,49 @@ async def test_timed_out_surface_still_warms_ltm_child():
 
 
 @pytest.mark.asyncio
+async def test_old_server_keeps_working_under_the_default_rerank_config():
+    """Old-core safety for the rerank bypass (core #1766): the unmodified fake
+    server's ``mem_search`` has no ``rerank`` parameter, standing in for every
+    core release up to v0.3.11. The default config (``rerank=False``) must
+    negotiate "unsupported", withhold the key, and leave the call healthy —
+    FastMCP would reject the unknown argument otherwise, and that
+    ``call_error`` would charge the circuit breaker."""
+    config = _stdio_config()
+    adapter = McpClientSearchAdapter(config)
+    await adapter.start()
+    try:
+        assert adapter._rerank_param_supported is False
+        results, _, outcome = await adapter.search("JWT authentication")
+    finally:
+        await adapter.stop()
+
+    assert outcome == "ok"
+    assert results
+    assert all("[rerank=" not in result.chunk.content for result in results)
+
+
+@pytest.mark.asyncio
+async def test_capable_server_receives_rerank_false_end_to_end():
+    """The ``--rerank-capable`` fake advertises the parameter in its
+    ``mem_search`` schema and echoes the received value into every hit, so
+    this proves the default bypass decision crosses the real MCP/FastMCP
+    boundary — not just that the client meant to send it."""
+    config = _stdio_config()
+    config = config.model_copy(update={"ltm_mcp_args": [str(_FAKE_SERVER), "--rerank-capable"]})
+    adapter = McpClientSearchAdapter(config)
+    await adapter.start()
+    try:
+        assert adapter._rerank_param_supported is True
+        results, _, outcome = await adapter.search("JWT authentication")
+    finally:
+        await adapter.stop()
+
+    assert outcome == "ok"
+    assert results
+    assert all("[rerank=False]" in result.chunk.content for result in results)
+
+
+@pytest.mark.asyncio
 async def test_format_negotiation_keeps_structured_with_capable_server():
     """When core advertises structured support, negotiation keeps StructuredResultParser."""
     from memtomem_stm.surfacing.mcp_client import StructuredResultParser

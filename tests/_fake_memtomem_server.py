@@ -104,7 +104,6 @@ def _emit_structured(items: list[dict]) -> str:
     return json.dumps({"results": results})
 
 
-@mcp.tool()
 async def mem_search(
     query: str,
     top_k: int | None = None,
@@ -121,6 +120,12 @@ async def mem_search(
     (no-seeds) mode each call embeds a fresh UUID in both the source path
     and the body text so ``sha256(content)`` dedup never collapses repeated
     calls. See the module docstring for the full rationale.
+
+    Registered in ``__main__`` rather than via a module-level decorator:
+    the default registration is this legacy signature — deliberately
+    **without** the per-call ``rerank`` parameter, standing in for cores
+    older than #1766 so integration tests prove the adapter withholds the
+    key — while ``--rerank-capable`` swaps in the variant below.
     """
     if _SEEDS is not None:
         if output_format == "structured":
@@ -156,6 +161,33 @@ async def mem_search(
         blocks.append(str(hit["content"]))
         blocks.append("")
     return "\n".join(blocks).rstrip()
+
+
+async def mem_search_rerank_capable(
+    query: str,
+    top_k: int | None = None,
+    namespace: str | list[str] | None = None,
+    context_window: int = 0,
+    output_format: str = "compact",
+    rerank: bool | None = None,
+) -> str:
+    """``--rerank-capable`` variant: core after #1766.
+
+    FastMCP derives the tool schema from this signature, so the ``rerank``
+    parameter shows up in the advertised ``mem_search`` inputSchema — the
+    exact signal the adapter's schema probe keys on. The received value is
+    echoed into every hit's content as ``[rerank=<value>]`` so an e2e test
+    can prove the argument crossed the real MCP boundary, not just that the
+    client meant to send it.
+    """
+    base = await mem_search(query, top_k, namespace, context_window, output_format)
+    marker = f"[rerank={rerank}]"
+    if output_format == "structured":
+        payload = json.loads(base)
+        for entry in payload["results"]:
+            entry["content"] = f"{entry['content']} {marker}"
+        return json.dumps(payload)
+    return f"{base}\n{marker}"
 
 
 @mcp.tool()
@@ -206,9 +238,21 @@ if __name__ == "__main__":
             "answers initialize (#664)."
         ),
     )
+    parser.add_argument(
+        "--rerank-capable",
+        action="store_true",
+        help=(
+            "Advertise and accept the per-call rerank parameter on mem_search "
+            "(core #1766); the default registration stands in for older cores."
+        ),
+    )
     args = parser.parse_args()
     if args.seeds is not None:
         _SEEDS = _load_seeds(args.seeds)
+    if args.rerank_capable:
+        mcp.tool(name="mem_search")(mem_search_rerank_capable)
+    else:
+        mcp.tool(name="mem_search")(mem_search)
     if args.startup_delay > 0:
         time.sleep(args.startup_delay)
     mcp.run()
