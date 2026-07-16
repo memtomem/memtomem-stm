@@ -46,12 +46,16 @@ changes inline only. See the deprecation policy in
   (#579). The LTM operation is now shielded, so that abort lands the moment the
   engine's timer fires and the abandoned unwind is left to finish on its own
   (the adapter already expects a caller to leave mid-RPC and marks the session
-  for lazy reconnect). A window fully consumed by pre-work is likewise booked
-  without starting an LTM round trip that would be cancelled mid-RPC. Because
-  the engine's timer always sits ahead of the caller's, a cancellation reaching
-  `surface()` is never a timeout in disguise: it is a real one (daemon
-  shutdown, client hanging up), and it is left unbooked rather than charging a
-  healthy LTM a breaker failure. (#721)
+  for lazy reconnect; shutdown gives it a bounded chance to). The engine also
+  books its timeout off *which timer fired* — a flag set inside the timer
+  callback, which the loop runs in scheduled order ahead of any backstop
+  scheduled later — rather than off elapsed time, the caller's deadline, or a
+  timeout scope's own expiry, none of which can tell "my timer fired first"
+  from "my timer also fired, later, while something else was cancelling me".
+  A cancellation that is not this call's own timeout is left unbooked, so a
+  shutdown or a client hanging up never charges a healthy LTM a breaker
+  failure. A window fully consumed by pre-work is booked without starting an
+  LTM round trip that would be cancelled mid-RPC. (#721)
 
 ## [0.1.40] — 2026-07-15
 

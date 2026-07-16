@@ -37,6 +37,17 @@ hashed-form row without re-reading config and lets ad-hoc DB inspection
 tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
 
+_ABANDONED_DRAIN_SECONDS = 1.0
+"""How long :meth:`SurfacingEngine.stop` waits on LTM operations abandoned at
+timeout before giving up on them.
+
+Not a tuning knob: an abandoned operation is already cancelled and its result
+discarded, so this only buys a tidy unwind (the adapter's session marking) on
+the way out. It is bounded because that unwind is not — the reason
+``_run_within`` stopped waiting on it in the first place — and the daemon's
+teardown calls this before the adapter's own bounded stop.
+"""
+
 _SCORE_SCALE_WARNING_STREAK = 5
 """Fresh LTM searches required before warning about a score-scale mismatch.
 
@@ -160,6 +171,12 @@ class SurfacingEngine:
         self._invalidated_ids: dict[tuple[str, str, str], None] = {}
         self._invalidated_ids_max = 10000
         self._background_tasks: set[asyncio.Task] = set()
+        # LTM operations abandoned at timeout/cancellation, kept apart from
+        # ``_background_tasks`` because they are the one thing here whose
+        # unwind is *not* known to be bounded — that is why ``_run_within``
+        # stops waiting on them — so ``stop()`` must not block on them the way
+        # it does on webhooks.
+        self._abandoned_ops: set[asyncio.Task] = set()
         # Per-key stampede guard — identical concurrent ``_do_surface`` calls
         # serialize on the same lock so a cache miss triggers one LTM search
         # rather than N and the losing coroutine cannot overwrite the
@@ -280,47 +297,70 @@ class SurfacingEngine:
         self._score_scale_streaks.pop((server, tool), None)
 
     async def _run_within(self, coro: Any, timeout: float) -> Any:
-        """Run *coro* under *timeout*, keeping this call's own timeout
-        structurally distinct from a cancellation of the call itself (#720).
+        """Run *coro* under *timeout*, raising :class:`asyncio.TimeoutError` if
+        and only if *this* call's timer started the abort (#720).
 
-        The operation runs as its own task behind a ``shield``, which buys two
-        things the plain ``asyncio.wait_for`` around it could not:
+        Telling that apart from a cancellation of the call itself is the whole
+        job here, because only the timeout books the fault, the log, and the
+        breaker failure (#579) — and charging a *cancelled* call would open the
+        breaker on a healthy LTM. It cannot be decided after the fact: neither
+        elapsed time, nor the caller's deadline, nor a timeout scope's own
+        ``expired()`` distinguishes "my timer fired first" from "my timer also
+        fired, later, while something else was cancelling me". So the flag is
+        set inside the timer callback itself. The loop runs due callbacks in
+        scheduled order, and this timer is always scheduled ahead of a caller's
+        backstop, so it cannot be preempted even when a stall makes both come
+        due on the same iteration — which is exactly how the backstop used to
+        cancel :meth:`surface` from outside and skip the bookkeeping entirely.
 
-        - :class:`asyncio.TimeoutError` out of here means *this* call's timer
-          fired, and it is raised the moment it does rather than once the
-          cancelled LTM adapter has finished unwinding. That unwind is
-          unbounded — a stdio child can be slow to give up — and waiting on it
-          is what let a caller's outer backstop cancel :meth:`surface` from
-          outside first, skipping the fault/log/breaker bookkeeping only the
-          ``TimeoutError`` path does (#719, #720).
-        - :class:`asyncio.CancelledError` out of here always means something
-          cancelled *this call* — a shutdown, a client hanging up — and never
-          our own timeout. So the two need no telling apart after the fact:
-          neither the clock nor a timeout's own state can say which came
-          first, and both readings charge a healthy LTM a breaker failure when
-          they guess wrong.
-
+        The ``shield`` is what keeps that prompt: cancelling it wakes us
+        immediately instead of after the cancelled LTM adapter has finished
+        unwinding, which is unbounded — a stdio child can be slow to give up.
         The abandoned operation is cancelled but not awaited. The MCP adapter
         already expects a caller to leave mid-RPC — it shields its own owner
-        request precisely so the op can outlive the caller — and marks the
-        session for lazy reconnect while unwinding (#290/#296). Parking the
+        request precisely so the op can outlive the caller (#664) — and marks
+        the session for lazy reconnect while unwinding (#290/#296). Parking the
         task keeps it from being garbage-collected mid-unwind and lets
-        :meth:`stop` drain whatever is still in flight.
+        :meth:`stop` drain what it can at shutdown.
         """
         op = asyncio.ensure_future(coro)
+        shielded = asyncio.shield(op)
+        timed_out = False
+
+        def _fire() -> None:
+            nonlocal timed_out
+            if not shielded.done():
+                timed_out = True
+                # Only the wrapper: ``op`` keeps unwinding on its own time.
+                shielded.cancel()
+
+        handle = asyncio.get_running_loop().call_later(timeout, _fire)
         try:
-            return await asyncio.wait_for(asyncio.shield(op), timeout=timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            op.cancel()
-            self._background_tasks.add(op)
-            op.add_done_callback(self._on_abandoned_op_done)
+            return await shielded
+        except asyncio.CancelledError:
+            self._abandon(op)
+            if timed_out:
+                raise asyncio.TimeoutError from None
             raise
+        except BaseException:
+            self._abandon(op)
+            raise
+        finally:
+            handle.cancel()
+
+    def _abandon(self, op: asyncio.Future) -> None:
+        """Cancel an operation we are no longer waiting on and park it so it is
+        not garbage-collected mid-unwind."""
+        op.cancel()
+        if isinstance(op, asyncio.Task) and not op.done():
+            self._abandoned_ops.add(op)
+            op.add_done_callback(self._on_abandoned_op_done)
 
     def _on_abandoned_op_done(self, task: asyncio.Task) -> None:
         """Retire an operation abandoned at timeout/cancellation, consuming
         any exception it raised on the way out so asyncio does not report it
         as never retrieved."""
-        self._background_tasks.discard(task)
+        self._abandoned_ops.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -545,9 +585,10 @@ class SurfacingEngine:
         cancellation skips all three, so the breaker never opens and every
         subsequent call pays the full timeout and respawns the LTM child again.
         :meth:`_run_within` is what makes that abort reliably ours to raise
-        rather than a race against the caller's backstop (#720). A
-        cancellation of this call is therefore never a timeout and is left to
-        propagate unbooked, so a healthy LTM is never charged for one.
+        rather than a race against the caller's backstop (#720). A cancellation
+        that reaches here is therefore one this call did not start — a
+        shutdown, a client hanging up — and propagates unbooked rather than
+        charging a healthy LTM.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -1414,12 +1455,34 @@ class SurfacingEngine:
             logger.warning("Webhook fire-and-forget task failed: %s", exc)
 
     async def stop(self) -> None:
-        """Cancel and drain pending background tasks (webhooks)."""
+        """Cancel and drain pending background tasks (webhooks), then give
+        abandoned LTM operations a bounded chance to finish unwinding.
+
+        The two are drained differently on purpose. A webhook POST is bounded
+        by its own client timeout, so waiting for it is safe. An abandoned LTM
+        operation is not — ``_run_within`` stopped waiting on it precisely
+        because a stdio child can be slow, or refuse, to give up — so waiting
+        without a bound would let one such unwind hold the daemon's shutdown
+        open, and this runs before the adapter's own bounded stop. They are
+        cancelled and given ``_ABANDONED_DRAIN_SECONDS``; anything still in
+        flight is left to the loop's teardown rather than blocking it.
+        """
         for task in self._background_tasks:
             task.cancel()
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+        stragglers = {task for task in self._abandoned_ops if not task.done()}
+        for task in stragglers:
+            task.cancel()
+        if stragglers:
+            _, pending = await asyncio.wait(stragglers, timeout=_ABANDONED_DRAIN_SECONDS)
+            if pending:
+                logger.debug(
+                    "%d abandoned surfacing operation(s) still unwinding at stop", len(pending)
+                )
+        self._abandoned_ops.clear()
 
     def _run_stats_retention(self, store: Any) -> None:
         """Delete ``surfacing_events`` rows past the stats-retention window so

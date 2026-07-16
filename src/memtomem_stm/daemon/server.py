@@ -118,10 +118,10 @@ _LEAK_KILL_ESCALATE_SECONDS = 2.0
 # of the response. The engine's deadline is the client's minus this margin, so
 # the engine's own timeout fires *before* the client gives up and
 # `_run_admitted`'s `asyncio.timeout_at` backstop cancels it from outside. The
-# margin no longer has to absorb anything else (#720): the engine re-reads the
-# clock right before its LTM attempt, so its pre-timeout work debits its own
-# window, and if the backstop still wins the unwind race the engine books the
-# cancellation as a timeout instead of relying on this number to prevent it.
+# margin no longer has to be sized to absorb anything else (#720): the engine
+# re-reads the clock right before its LTM attempt, so its pre-timeout work
+# debits its own window, and it books its timeout off which timer fired rather
+# than off having beaten the backstop by enough wall clock.
 _DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
 
 # Below this, an LTM round trip cannot plausibly complete, so starting one only
