@@ -707,7 +707,8 @@ and Windows hosts without sending them an incompatible frame.
 
 `mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) — see RFC §5 for the full data model.
 
-W1 ships five subcommands. State lives in three TOML files:
+The group ships six subcommands. State lives in three TOML files plus the
+explicit route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
@@ -726,6 +727,7 @@ Commands:
   list     List known projects from the index. Mark current cwd's project with `*`.
   enable   Add MCP names to the project's enabled list (RFC §7.1).
   disable  Remove MCP names from the project's enabled list.
+  route    Preview or apply selected registry entries as STM proxy upstreams.
 ```
 
 ### `mms project init`
@@ -776,6 +778,26 @@ Options:
 `enable` adds MCP names to the project's `[mcp].enabled` list; `disable` removes them. Both require either a marker at cwd (or up the tree) or an explicit `--project NAME`. `enable` additionally requires a non-empty `~/.mms/registry.toml` — populate it with `mms import` first. `disable` works regardless of registry state since it only mutates project state.
 
 `enable` validates every requested name against the registry and rejects unknown ones, listing the registered set as a hint — register or import the MCP first, then enable it. (The validity check was originally deferred to sync time, but no sync surface ever consumed the project enabled list, so a typo would have sat in `project.toml` and silently resolved to nothing at proxy time.) `disable` stays registry-agnostic by design.
+
+### `mms project route`
+
+```
+Usage: mms project route [OPTIONS]
+
+Options:
+  --project TEXT  Target project (default: detect from cwd).
+  --config PATH   STM proxy config target.
+  --apply         Write the validated additive plan (preview by default).
+  --json          Machine-readable output.
+```
+
+Routes enabled stdio registry definitions into the proxy. Preview and JSON
+output never include entry contents, so registry `env` secrets stay out of
+terminal output. Apply holds the proxy config write lock, creates a
+backup of an existing config, validates the complete result, and records the
+registry origin. Existing equivalent routes are unchanged; name and prefix
+conflicts are reported and never overwritten. The command does not prune proxy
+upstreams that are no longer selected.
 
 ## `mms import` — populate the registry from host configs
 

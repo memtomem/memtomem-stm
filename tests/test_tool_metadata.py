@@ -139,6 +139,7 @@ def _make_manager_with_tools(
     server_strip: bool = False,
     compression: CompressionStrategy = CompressionStrategy.AUTO,
     hybrid: HybridConfig | None = None,
+    advertise_context_query: bool = False,
 ) -> ProxyManager:
     server_cfg = UpstreamServerConfig(
         prefix="test",
@@ -153,10 +154,14 @@ def _make_manager_with_tools(
         upstream_servers={"srv": server_cfg},
         max_description_chars=max_description_chars,
         strip_schema_descriptions=strip_schema_descriptions,
+        advertise_context_query=advertise_context_query,
     )
     mgr = ProxyManager(proxy_cfg, TokenTracker())
     conn = UpstreamConnection(
-        name="srv", config=server_cfg, session=AsyncMock(), tools=tools,
+        name="srv",
+        config=server_cfg,
+        session=AsyncMock(),
+        tools=tools,
     )
     mgr._connections["srv"] = conn
     return mgr
@@ -207,6 +212,32 @@ class TestGetProxyToolsDescription:
 
 
 class TestGetProxyToolsSchema:
+    def test_context_query_not_advertised_by_default(self):
+        mgr = _make_manager_with_tools([_fake_tool("tool")])
+        assert "_context_query" not in mgr.get_proxy_tools()[0].input_schema.get("properties", {})
+
+    def test_context_query_advertised_when_opted_in_without_mutating_upstream(self):
+        schema = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        mgr = _make_manager_with_tools(
+            [_fake_tool("tool", schema=schema)], advertise_context_query=True
+        )
+        exposed = mgr.get_proxy_tools()[0].input_schema
+        assert exposed["properties"]["_context_query"]["type"] == "string"
+        assert exposed["additionalProperties"] is False
+        assert "_context_query" not in schema["properties"]
+
+    def test_existing_context_query_contract_is_preserved(self):
+        existing = {"type": "integer", "description": "upstream owns this"}
+        schema = {"type": "object", "properties": {"_context_query": existing}}
+        mgr = _make_manager_with_tools(
+            [_fake_tool("tool", schema=schema)], advertise_context_query=True
+        )
+        assert mgr.get_proxy_tools()[0].input_schema["properties"]["_context_query"] == existing
+
     def test_schema_distilled_global(self):
         schema = {
             "type": "object",

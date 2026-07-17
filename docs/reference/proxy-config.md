@@ -11,6 +11,8 @@ Langfuse settings; those are covered by the
 ```json
 {
   "enabled": true,
+  "advertise_context_query": true,
+  "token_estimation_mode": "unicode",
   "cache": {
     "tool_annotation_policy": "strict"
   },
@@ -21,6 +23,7 @@ Langfuse settings; those are covered by the
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
       "prefix": "fs",
       "compression": "auto",
+      "max_result_tokens": 2000,
       "selective": {
         "json_depth": 1,
         "min_section_chars": 50
@@ -50,6 +53,11 @@ remain restart-bound.
 Per-server and per-tool values override global proxy settings. A tool override
 can set compression/cache budgets and `description_override`, which replaces
 the advertised proxied-tool description without changing the callable name.
+`token_estimation_mode="unicode"` makes a configured token budget inspect the
+actual response; the backwards-compatible default is `static`.
+`advertise_context_query=true` is a proxy-level opt-in that adds the optional
+proxy-only `_context_query` field to object input schemas without forwarding it
+or mutating the upstream contract.
 
 ## Compression sections
 

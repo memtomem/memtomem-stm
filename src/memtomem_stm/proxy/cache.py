@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS proxy_cache (
     result        TEXT    NOT NULL,
     created_at    REAL    NOT NULL,
     ttl_seconds   REAL,
+    envelope_json TEXT,
     envelope_safe INTEGER NOT NULL DEFAULT 0
 );
 """
@@ -48,15 +49,32 @@ class CacheEntry:
         return time.time() >= self.created_at + self.ttl_seconds
 
 
+class CachedResponse(str):
+    """Cached text plus an optional safe MCP result-level envelope."""
+
+    structured_content: dict[str, Any] | None
+    meta: dict[str, Any] | None
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        structured_content: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> CachedResponse:
+        obj = super().__new__(cls, value)
+        obj.structured_content = structured_content
+        obj.meta = meta
+        return obj
+
+
 # Bump when the key derivation OR the row contract changes shape so
 # ``initialize()`` can purge rows written under an older scheme (opaque hashes
 # make them unreachable but otherwise immortal for ``ttl_seconds NULL`` rows).
 # Stored in SQLite's ``PRAGMA user_version``.
-# v3: envelope contract — only ``isError=false``, text-only responses without
-# ``structuredContent`` or result-level ``_meta`` are stored, recorded in the
-# ``envelope_safe`` column. Legacy rows cannot prove that, so the bump drops
-# the whole table (and, via the DROP, adds the column).
-_KEY_SCHEMA_VERSION = 3
+# v4: successful text responses may carry JSON-safe ``structuredContent`` and
+# result-level ``_meta`` in ``envelope_json``.
+_KEY_SCHEMA_VERSION = 4
 
 
 def _make_key(
@@ -152,8 +170,8 @@ class ProxyCache:
             # current lookup can ever produce, so they would sit as dead
             # weight — forever, for ``ttl_seconds NULL`` rows — while still
             # counting against ``max_entries``. DROP (not DELETE) so the
-            # recreate below also picks up column additions (v3:
-            # ``envelope_safe``) without a separate ALTER migration.
+            # recreate below also picks up column additions without a separate
+            # ALTER migration.
             # ``user_version`` is 0 for both fresh and pre-versioning
             # databases; the DROP on a fresh database is a no-op.
             (schema_version,) = db.execute("PRAGMA user_version").fetchone()
@@ -197,8 +215,11 @@ class ProxyCache:
             # the read-side guard in ``get()`` refuses and evicts those.
             stale_keys = [
                 key
-                for key, result in db.execute("SELECT cache_key, result FROM proxy_cache")
+                for key, result, envelope in db.execute(
+                    "SELECT cache_key, result, envelope_json FROM proxy_cache"
+                )
                 if contains_sensitive_content(result)
+                or (envelope is not None and contains_sensitive_content(envelope))
             ]
             if stale_keys:
                 db.executemany(
@@ -224,7 +245,7 @@ class ProxyCache:
         *,
         context_query: str | None = None,
         config_fingerprint: str = "",
-    ) -> str | None:
+    ) -> CachedResponse | None:
         if self._db is None:
             return None
         key = _make_key(
@@ -233,7 +254,7 @@ class ProxyCache:
         try:
             with self._lock:
                 row = self._db.execute(
-                    "SELECT result, created_at, ttl_seconds, envelope_safe "
+                    "SELECT result, created_at, ttl_seconds, envelope_safe, envelope_json "
                     "FROM proxy_cache WHERE cache_key = ?",
                     (key,),
                 ).fetchone()
@@ -253,7 +274,10 @@ class ProxyCache:
         if row is None:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
-        if contains_sensitive_content(entry.result):
+        envelope_json = row[4]
+        if contains_sensitive_content(entry.result) or (
+            envelope_json is not None and contains_sensitive_content(envelope_json)
+        ):
             # Read-side mirror of the ``set()`` gate: a row can land here
             # without passing ``set()`` — written by an older still-running
             # pre-gate process or an external SQL writer — and the startup
@@ -261,26 +285,7 @@ class ProxyCache:
             # would break the SECURITY.md exclusion, so evict and miss.
             # Checked BEFORE expiry: an expired sensitive row must still be
             # deleted, not left resting on disk until the next startup.
-            try:
-                with self._lock:
-                    self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
-                    self._db.commit()
-                logger.debug(
-                    "Evicted cached response for %s/%s: result matches a privacy pattern",
-                    server,
-                    tool,
-                )
-            except sqlite3.Error:
-                # Eviction is best-effort: a concurrent writer holding the
-                # file lock must degrade this to a plain miss, never abort
-                # the caller's request. The row is retried on the next
-                # ``get()`` and swept by the next startup purge.
-                logger.warning(
-                    "Privacy eviction failed for %s/%s — serving a miss",
-                    server,
-                    tool,
-                    exc_info=True,
-                )
+            self._evict_row(key, server, tool, reason="result matches a privacy pattern")
             return None
         if not row[3]:
             # Envelope-safety marker (v3): every row written by ``set()`` is
@@ -293,7 +298,67 @@ class ProxyCache:
             return None
         if entry.is_expired():
             return None
-        return entry.result
+        structured_content: dict[str, Any] | None = None
+        meta: dict[str, Any] | None = None
+        if envelope_json is not None:
+            parsed = self._parse_envelope(envelope_json)
+            if parsed is None:
+                # ``set()`` validates before writing, so a malformed envelope
+                # can only come from an out-of-band writer. Mirror the
+                # sensitive-row eviction above: a plain miss would leave the
+                # row as dead weight — immortal for ``ttl_seconds NULL`` rows
+                # — while still counting against ``max_entries``.
+                self._evict_row(key, server, tool, reason="envelope_json is malformed")
+                return None
+            structured_content, meta = parsed
+        return CachedResponse(entry.result, structured_content=structured_content, meta=meta)
+
+    @staticmethod
+    def _parse_envelope(
+        envelope_json: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None] | None:
+        """Validated ``(structured_content, meta)`` from a stored envelope.
+
+        ``None`` (as the whole tuple) means the row is malformed: non-JSON,
+        an unknown ``schema_version``, or a non-dict field value.
+        """
+        try:
+            envelope = json.loads(envelope_json)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(envelope, dict) or envelope.get("schema_version") != 1:
+            return None
+        raw_structured = envelope.get("structuredContent")
+        raw_meta = envelope.get("_meta")
+        if raw_structured is not None and not isinstance(raw_structured, dict):
+            return None
+        if raw_meta is not None and not isinstance(raw_meta, dict):
+            return None
+        return raw_structured, raw_meta
+
+    def _evict_row(self, key: str, server: str, tool: str, *, reason: str) -> None:
+        """Best-effort single-row eviction from the ``get()`` read path.
+
+        A failure (e.g. a concurrent writer holding the file lock past the
+        busy timeout) degrades to a plain miss — it must never abort the
+        caller's request. The row is retried on the next ``get()`` and swept
+        by the next startup purge.
+        """
+        if self._db is None:
+            return
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+                self._db.commit()
+            logger.debug("Evicted cached response for %s/%s: %s", server, tool, reason)
+        except sqlite3.Error:
+            logger.warning(
+                "Cache eviction (%s) failed for %s/%s — serving a miss",
+                reason,
+                server,
+                tool,
+                exc_info=True,
+            )
 
     def invalidate(
         self,
@@ -330,6 +395,8 @@ class ProxyCache:
         *,
         context_query: str | None = None,
         config_fingerprint: str = "",
+        structured_content: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         if self._db is None:
             return
@@ -354,7 +421,27 @@ class ProxyCache:
                 config_fingerprint=config_fingerprint,
             )
             return
-        if contains_sensitive_content(result):
+        envelope_json: str | None = None
+        if structured_content is not None or meta is not None:
+            try:
+                envelope_json = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "structuredContent": structured_content,
+                        "_meta": meta,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Skipping cache store for %s/%s: envelope is not JSON-safe", server, tool
+                )
+                return
+        if contains_sensitive_content(result) or (
+            envelope_json is not None and contains_sensitive_content(envelope_json)
+        ):
             # SECURITY.md: responses that look like secrets are never
             # persisted to the response cache. Enforced at the store
             # chokepoint so no caller can bypass it (#453); a false positive
@@ -378,15 +465,17 @@ class ProxyCache:
             self._db.execute(
                 """
                 INSERT INTO proxy_cache
-                    (cache_key, server, tool, result, created_at, ttl_seconds, envelope_safe)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                    (cache_key, server, tool, result, created_at, ttl_seconds,
+                     envelope_json, envelope_safe)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     result        = excluded.result,
                     created_at    = excluded.created_at,
                     ttl_seconds   = excluded.ttl_seconds,
+                    envelope_json = excluded.envelope_json,
                     envelope_safe = excluded.envelope_safe
                 """,
-                (key, server, tool, result, now, ttl_seconds),
+                (key, server, tool, result, now, ttl_seconds, envelope_json),
             )
             self._db.commit()
             self._trim()

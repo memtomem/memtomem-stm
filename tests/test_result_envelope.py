@@ -8,9 +8,8 @@ Pins the envelope contract introduced with the ⑥ first-user fixes:
   non-text-only error surfaces as an error instead of a passthrough success;
 - content-block order is preserved: the processed text is reinserted at the
   upstream's first-text position;
-- the cache never stores an envelope-bearing response (the ``result TEXT``
-  schema cannot reproduce the fields), while envelope-free text responses
-  keep storing and serving identically on hit and miss.
+- the cache stores text-only successful envelopes and reconstructs them on a
+  hit, while mixed/non-text and error envelopes remain uncached.
 """
 
 from __future__ import annotations
@@ -243,21 +242,24 @@ class TestIsErrorOrdering:
 # ── cache store bypass for envelope-bearing responses ────────────────────
 
 
-class TestEnvelopeStoreBypass:
+class TestEnvelopeCache:
     @pytest.mark.parametrize(
         ("structured", "meta"),
         [({"a": 1}, None), (None, {"m": 1}), ({"a": 1}, {"m": 1})],
         ids=["structured-only", "meta-only", "both"],
     )
-    async def test_envelope_response_is_never_stored(self, make_mgr, structured, meta):
+    async def test_text_envelope_is_stored_and_reconstructed(self, make_mgr, structured, meta):
         mgr, _, cache = make_mgr(with_cache=True)
         session = _set_upstream(mgr, _result("cacheable text", structured=structured, meta=meta))
-        first = await mgr._call_tool_inner("srv", "tool", {"a": 1})
-        second = await mgr._call_tool_inner("srv", "tool", {"a": 1})
-        assert cache.stats()["total_entries"] == 0  # store bypassed
-        assert session.call_tool.await_count == 2  # second call re-hit upstream
+        first = await mgr.call_tool("srv", "tool", {"a": 1})
+        second = await mgr.call_tool("srv", "tool", {"a": 1})
+        assert cache.stats()["total_entries"] == 1
+        assert session.call_tool.await_count == 1
         assert isinstance(first, CallToolResult)
         assert isinstance(second, CallToolResult)
+        assert second.structuredContent == structured
+        assert second.meta == meta
+        assert second.content[0].text == first.content[0].text
 
     async def test_envelope_response_invalidates_stale_row_when_cache_disabled(self, make_mgr):
         """Mirror of the #541 non-text invalidation for the envelope gate: an

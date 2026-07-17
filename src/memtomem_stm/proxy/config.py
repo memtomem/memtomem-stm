@@ -244,6 +244,13 @@ class CompressionStrategy(StrEnum):
     PROGRESSIVE = "progressive"
 
 
+class TokenEstimationMode(StrEnum):
+    """How token-equivalent response budgets are evaluated at gate time."""
+
+    STATIC = "static"
+    UNICODE = "unicode"
+
+
 class TailMode(StrEnum):
     TOC = "toc"
     TRUNCATE = "truncate"
@@ -479,6 +486,9 @@ class ToolOverrideConfig(BaseModel):
     """Per-tool override for the chars-per-token ratio used to convert
     ``max_result_tokens`` to a char budget. Falls back to the upstream
     server's ratio, then ``ProxyConfig.chars_per_token``."""
+    token_estimation_mode: TokenEstimationMode | None = None
+    """Per-tool gate mode. ``unicode`` measures the actual response; ``None``
+    inherits the upstream or proxy setting."""
     retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     """Override the dynamic retention floor for this tool.
 
@@ -592,6 +602,8 @@ class UpstreamServerConfig(BaseModel):
     """Per-server override for the chars-per-token ratio. Falls back to
     ``ProxyConfig.chars_per_token`` (default 3.5, English-biased). Set to
     ~2.0 for Korean-dominant content, ~1.3 for Chinese-dominant."""
+    token_estimation_mode: TokenEstimationMode | None = None
+    """Per-server token gate mode. ``None`` inherits the proxy default."""
     retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     """Per-server retention floor override (see ToolOverrideConfig)."""
     llm: LLMCompressorConfig | None = None
@@ -1222,6 +1234,10 @@ class ProxyConfig(BaseModel):
     """
     max_description_chars: int = Field(default=200, gt=0)
     strip_schema_descriptions: bool = False
+    advertise_context_query: bool = False
+    """Advertise the proxy-only ``_context_query`` string in every upstream
+    tool schema. Opt-in preserves existing catalogs; the argument is stripped
+    before forwarding and only guides query-aware compression and surfacing."""
     # Bounded lock acquisition timeout (#208). Applies to internal state
     # locks in ``ProxyManager`` (selective compressor, LLM compressor,
     # extractor). A timeout here raises ``LockTimeoutError`` → recorded as
@@ -1240,6 +1256,9 @@ class ProxyConfig(BaseModel):
     are available on ``UpstreamServerConfig`` and ``ToolOverrideConfig``.
     Also used inside ``effective_max_result_chars()`` to convert the
     consumer model's context window from tokens to chars."""
+    token_estimation_mode: TokenEstimationMode = TokenEstimationMode.STATIC
+    """``static`` preserves chars-per-token conversion. ``unicode`` uses the
+    runtime codepoint estimator and remains opt-in in 0.1.x."""
     cache: CacheConfig = Field(default_factory=CacheConfig)
     auto_index: AutoIndexConfig = Field(default_factory=AutoIndexConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)

@@ -472,6 +472,52 @@ class TestStatus:
         # predicate.
         assert data["server_count"] == 1
         assert data["pruned_count"] == 0
+        assert data["tuning"]["sample_threshold"] == 5
+
+    def test_tuning_ready_hint_points_to_preview(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setattr(
+            proxy_mod,
+            "_tuning_readiness",
+            lambda data: {
+                "available": True,
+                "ready": True,
+                "sample_threshold": 5,
+                "tools": [{"server": "docs", "tool": "search", "calls": 7}],
+            },
+        )
+
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "Tuning : ready for 1 tool(s)" in result.output
+        assert "mms tune" in result.output
+
+    def test_tuning_readiness_ignores_malformed_summary_rows(self, monkeypatch):
+        """A summary row missing a key must be filtered, not crash ``status``."""
+        from memtomem_stm.cli.proxy import _tuning_readiness
+        from memtomem_stm.proxy import metrics_store
+
+        monkeypatch.setattr(
+            metrics_store,
+            "read_compression_summary",
+            lambda db_path, tool=None, source=None: {
+                "available": True,
+                "by_tool": [
+                    {"tool": "no-server-key", "calls": 9},
+                    {"server": "docs", "tool": "search", "calls": 7},
+                    "not-a-dict",
+                    {"server": "docs", "tool": "stringy", "calls": "7"},
+                ],
+            },
+        )
+
+        readiness = _tuning_readiness({"enabled": True, "upstream_servers": {}})
+
+        assert readiness["ready"] is True
+        assert readiness["tools"] == [{"server": "docs", "tool": "search", "calls": 7}]
 
     def test_json_missing_config(self, runner, config):
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
@@ -9528,6 +9574,7 @@ class TestDoctor:
             "upstream:fake",
             "host_registration",
             "cache_policy",
+            "tuning",
             "ltm",
         ]
         assert data["servers"]["fake"]["stage"] == "tools_discovered"

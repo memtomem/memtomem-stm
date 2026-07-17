@@ -134,6 +134,8 @@ async def ping(config: STMConfig, *, timeout: float = 2.0) -> dict[str, Any] | N
         merged["ltm"] = resp.get("ltm")
         if isinstance(resp.get("latency"), dict):
             merged["latency"] = resp["latency"]
+        if isinstance(resp.get("queue"), dict):
+            merged["queue"] = resp["queue"]
         if isinstance(resp.get("core"), dict):
             merged["core"] = resp["core"]
         return merged

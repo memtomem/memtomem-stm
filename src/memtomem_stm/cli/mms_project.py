@@ -1,6 +1,6 @@
-"""``mms project`` Click subgroup — W1 project state CRUD (RFC §7.1).
+"""``mms project`` Click subgroup — project state and proxy routing.
 
-Five subcommands: ``init / show / list / enable / disable``. All
+Six subcommands: ``init / show / list / enable / disable / route``. State
 reads/writes go through :mod:`memtomem_stm.mms.state`; project
 detection through :mod:`memtomem_stm.mms.detect`.
 
@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json as _json
 from pathlib import Path
+from typing import Any
 
 import click
 
-from memtomem_stm.cli._write_lock import with_write_lock
+from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.detect import Project, Source, detect_project
 
@@ -126,6 +127,48 @@ def _refresh_index(name: str, root: Path) -> None:
     idx = state.load_projects_index()
     idx = state.upsert_project_in_index(idx, name=name, path=str(root))
     state.save_projects_index(idx)
+
+
+def _registry_route_entry(
+    server: state.RegistryServer, *, registry_path: Path, imported_at: str
+) -> dict[str, Any]:
+    """Translate one registry definition into an additive STM upstream.
+
+    The registry currently stores stdio definitions only.  Keep a private
+    origin snapshot so later inspection can explain where the route came from
+    without making the proxy runtime depend on the registry at call time.
+    """
+    original = server.model_dump(mode="json")
+    return {
+        "command": server.command,
+        "args": list(server.args),
+        "env": dict(server.env) or None,
+        "prefix": server.prefix,
+        "transport": "stdio",
+        "compression": "auto",
+        "max_result_chars": 8000,
+        "origin": {
+            "schema_version": 1,
+            "source": {"kind": "mms-registry", "path": str(registry_path)},
+            "imported_at": imported_at,
+            "original": original,
+        },
+    }
+
+
+def _same_registry_route(existing: object, server: state.RegistryServer) -> bool:
+    """Whether an STM upstream already routes the same registry identity."""
+    if not isinstance(existing, dict):
+        return False
+    return (
+        existing.get("transport", "stdio") == "stdio"
+        and existing.get("command", "") == server.command
+        and existing.get("args", []) == server.args
+        # ``or None`` on both sides: the route writer normalizes an empty env
+        # to null, and a hand-edited ``"env": {}`` is the same identity.
+        and (existing.get("env") or None) == (dict(server.env) or None)
+        and existing.get("prefix") == server.prefix
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +403,154 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
         click.echo(f"Enabled in '{proj.name}': {', '.join(added)}")
     else:
         click.echo(f"No changes to '{proj.name}' (all already enabled).")
+
+
+@project_group.command("route")
+@click.option("--project", "project_name", default=None, help="Route a named project.")
+@click.option(
+    "--config",
+    "config_path",
+    default=None,
+    show_default="~/.memtomem/stm_proxy.json",
+    help="STM proxy config to update.",
+)
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    help="Write additive routes (default: preview only).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable result.")
+@with_config_write_lock(
+    skip=lambda kwargs: not kwargs.get("do_apply"),
+    json_envelope=True,
+)
+def route_cmd(
+    project_name: str | None,
+    config_path: str | None,
+    do_apply: bool,
+    as_json: bool,
+) -> None:
+    """Preview or add the project's enabled registry MCPs to STM.
+
+    Routing is deliberately additive. Existing entries are kept, same-name
+    or prefix conflicts are reported and skipped, and source host configs are
+    never pruned. Use ``mms prune`` separately after verifying the proxy.
+    """
+    # Lazy import avoids making the lightweight project-state module own a
+    # second implementation of STM's JSON validation/atomic-save contract
+    # (and a module-level import would be circular: ``cli.proxy`` imports
+    # this module to register the group). ``_DEFAULT_CONFIG`` comes from the
+    # same place so the default can never drift from the other commands'.
+    from memtomem_stm.cli.proxy import (
+        _DEFAULT_CONFIG,
+        _backup_config_snapshot,
+        _load,
+        _save,
+        _schema_validation_error,
+    )
+
+    try:
+        project = _resolve_project_for_mutation(project_name)
+        registry = state.load_registry()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    assert project.config is not None and project.marker_path is not None
+    enabled = list(project.config.mcp.enabled)
+    path = Path(config_path if config_path is not None else _DEFAULT_CONFIG)
+    path = path.expanduser().resolve()
+    data = _load(path)
+    if "upstream_servers" not in data:
+        data["upstream_servers"] = {}
+    raw_upstreams = data["upstream_servers"]
+    if not isinstance(raw_upstreams, dict):
+        raise click.ClickException("invalid proxy config: 'upstream_servers' must be a JSON object")
+    upstreams: dict[str, Any] = raw_upstreams
+
+    planned: list[str] = []
+    unchanged: list[str] = []
+    skipped: list[dict[str, str]] = []
+    prefix_owner: dict[str, str] = {}
+    for existing_name, entry in upstreams.items():
+        if isinstance(entry, dict) and isinstance(entry.get("prefix"), str):
+            prefix_owner.setdefault(entry["prefix"], existing_name)
+
+    route_entries: dict[str, dict[str, Any]] = {}
+    imported_at = state.utc_now_iso()
+    for name in enabled:
+        server = registry.servers.get(name)
+        if server is None:
+            skipped.append({"name": name, "reason": "missing_from_registry"})
+            continue
+        existing = upstreams.get(name)
+        if existing is not None:
+            if _same_registry_route(existing, server):
+                unchanged.append(name)
+            else:
+                skipped.append({"name": name, "reason": "name_conflict"})
+            continue
+        owner = prefix_owner.get(server.prefix)
+        if owner is not None:
+            skipped.append(
+                {"name": name, "reason": "prefix_conflict", "detail": f"owned by {owner}"}
+            )
+            continue
+        route_entries[name] = _registry_route_entry(
+            server, registry_path=state.registry_path().resolve(), imported_at=imported_at
+        )
+        planned.append(name)
+        prefix_owner[server.prefix] = name
+
+    payload: dict[str, Any] = {
+        "action": "route",
+        "ok": True,
+        "mode": "apply" if do_apply else "preview",
+        "project": project.name,
+        "config_path": str(path),
+        "planned": planned,
+        "unchanged": unchanged,
+        "skipped": skipped,
+        "applied": [],
+    }
+
+    if do_apply and planned:
+        for name, entry in route_entries.items():
+            upstreams[name] = entry
+        validation_error = _schema_validation_error(data)
+        if validation_error is not None:
+            raise click.ClickException(
+                f"routing would produce an invalid proxy config ({validation_error}); "
+                "nothing written"
+            )
+        backup: Path | None = None
+        if path.exists():
+            backup = _backup_config_snapshot(path, path.read_text(encoding="utf-8"))
+        _save(path, data)
+        payload["applied"] = list(planned)
+        if backup is not None:
+            payload["backup"] = str(backup)
+
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    mode = "Apply" if do_apply else "Preview"
+    click.echo(f"{mode} project routes for '{project.name}' -> {path}")
+    if planned:
+        verb = "Added" if do_apply else "Would add"
+        click.echo(f"  {verb}: {', '.join(planned)}")
+    if unchanged:
+        click.echo(f"  Already routed: {', '.join(unchanged)}")
+    for item in skipped:
+        detail = f" ({item['detail']})" if item.get("detail") else ""
+        click.echo(f"  Skipped {item['name']}: {item['reason']}{detail}")
+    if not planned and not unchanged and not skipped:
+        click.echo("  No enabled MCPs. Run `mms project enable <name> ...` first.")
+    if not do_apply and planned:
+        click.echo("Run again with --apply to write these additive routes.")
+    elif do_apply and planned:
+        click.echo("Run `mms doctor` and call the prefixed tool to verify routing.")
 
 
 @project_group.command("disable")

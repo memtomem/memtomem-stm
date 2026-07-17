@@ -349,6 +349,169 @@ def test_disable_noop_when_not_enabled(runner, sandbox):
 
 
 # ---------------------------------------------------------------------------
+# route — project registry selection -> additive STM upstreams
+# ---------------------------------------------------------------------------
+
+
+def _seed_routable_project(runner: CliRunner) -> None:
+    state.save_registry(
+        state.RegistryConfig(
+            servers={
+                "filesystem": state.RegistryServer(
+                    command="npx",
+                    args=["-y", "@modelcontextprotocol/server-filesystem", "/work"],
+                    env={"ROUTE_SECRET": "keep-private"},
+                    prefix="fs",
+                ),
+                "github": state.RegistryServer(command="github-mcp", prefix="gh"),
+            }
+        )
+    )
+    runner.invoke(project_group, ["init"])
+    enabled = runner.invoke(project_group, ["enable", "filesystem", "github"])
+    assert enabled.exit_code == 0, enabled.output
+
+
+def test_route_preview_is_read_only_and_redacted(runner, sandbox):
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--json"])
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["mode"] == "preview"
+    assert payload["planned"] == ["filesystem", "github"]
+    assert payload["applied"] == []
+    assert "keep-private" not in res.output
+    assert not config.exists()
+
+
+def test_route_apply_writes_valid_additive_config_and_is_idempotent(runner, sandbox):
+    from memtomem_stm.proxy.config import ProxyConfig
+
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--apply", "--json"])
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["applied"] == ["filesystem", "github"]
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    typed = ProxyConfig.model_validate(raw)
+    assert set(typed.upstream_servers) == {"filesystem", "github"}
+    fs = raw["upstream_servers"]["filesystem"]
+    assert fs["env"] == {"ROUTE_SECRET": "keep-private"}
+    assert fs["origin"]["source"]["kind"] == "mms-registry"
+    assert fs["origin"]["original"]["env"] == {"ROUTE_SECRET": "keep-private"}
+
+    again = runner.invoke(project_group, ["route", "--config", str(config), "--apply", "--json"])
+    assert again.exit_code == 0, again.output
+    again_payload = json.loads(again.output)
+    assert again_payload["planned"] == []
+    assert again_payload["unchanged"] == ["filesystem", "github"]
+    assert again_payload["applied"] == []
+
+
+@pytest.mark.parametrize("invalid_upstreams", [None, [], "servers"])
+def test_route_rejects_non_object_upstream_map_cleanly(runner, sandbox, invalid_upstreams):
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": invalid_upstreams}), encoding="utf-8")
+
+    res = runner.invoke(project_group, ["route", "--config", str(config)])
+
+    assert res.exit_code == 1
+    assert "upstream_servers" in res.output
+    assert "object" in res.output
+    assert "AttributeError" not in res.output
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; lock contention is covered on Windows by shared tests",
+)
+def test_route_lock_timeout_preserves_json_contract(runner, sandbox, monkeypatch):
+    from memtomem_stm.cli._write_lock import stm_config_lock_path
+
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    monkeypatch.setattr(state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with state.write_lock(lock_path=stm_config_lock_path()):
+        res = runner.invoke(
+            project_group,
+            ["route", "--config", str(config), "--apply", "--json"],
+        )
+
+    assert res.exit_code == 1
+    payload = json.loads(res.stdout)
+    assert payload["action"] == "route"
+    assert payload["ok"] is False
+    assert payload["error"] == "config_lock_timeout"
+    assert "timed out" in payload["message"]
+    assert "timed out" in res.stderr
+
+
+def test_route_skips_name_and_prefix_conflicts_without_clobbering(runner, sandbox):
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    original = {
+        "enabled": True,
+        "cache": {"tool_annotation_policy": "strict"},
+        "upstream_servers": {
+            "filesystem": {"command": "different", "prefix": "other"},
+            "existing": {"command": "echo", "prefix": "gh"},
+        },
+    }
+    config.write_text(json.dumps(original), encoding="utf-8")
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--apply", "--json"])
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["applied"] == []
+    assert payload["skipped"] == [
+        {"name": "filesystem", "reason": "name_conflict"},
+        {"name": "github", "reason": "prefix_conflict", "detail": "owned by existing"},
+    ]
+    assert json.loads(config.read_text(encoding="utf-8")) == original
+
+
+def test_route_treats_empty_env_as_equivalent_to_null(runner, sandbox):
+    """A hand-edited ``"env": {}`` on an otherwise identical entry is the
+    same route — report it unchanged, not as a name conflict (the route
+    writer itself normalizes an empty env to ``null``)."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "github": {
+                        "command": "github-mcp",
+                        "args": [],
+                        "env": {},
+                        "prefix": "gh",
+                        "transport": "stdio",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--json"])
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["unchanged"] == ["github"]
+    assert payload["planned"] == ["filesystem"]
+    assert payload["skipped"] == []
+
+
+# ---------------------------------------------------------------------------
 # Project resolution edge case — --project name with stale index
 # ---------------------------------------------------------------------------
 
@@ -359,7 +522,7 @@ def test_disable_noop_when_not_enabled(runner, sandbox):
 
 
 def test_project_group_wired_into_top_level_cli(runner):
-    """`mms project --help` lists all five W1 subcommands.
+    """`mms project --help` lists the project subcommands.
 
     Pins the wiring in proxy.py — if the import or `add_command` line is
     accidentally removed, this test catches it before the §12 e2e
@@ -369,7 +532,7 @@ def test_project_group_wired_into_top_level_cli(runner):
 
     res = runner.invoke(cli, ["project", "--help"])
     assert res.exit_code == 0, res.output
-    for name in ["init", "show", "list", "enable", "disable"]:
+    for name in ["init", "show", "list", "enable", "disable", "route"]:
         assert name in res.output, f"subcommand '{name}' missing from `mms project --help`"
 
 

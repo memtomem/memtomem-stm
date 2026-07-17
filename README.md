@@ -139,9 +139,10 @@ is the same boundary every MCP proxy lives within—not one specific to STM.
 ## Project-scoped MCPs (`mms project` + `mms import`)
 
 A separate registry lets a project select which MCP definitions it wants to
-expose. `~/.mms/registry.toml` and project `.mms/project.toml` files are
-deliberately independent of STM's `~/.memtomem/stm_proxy.json`. Importing a
-definition does not automatically route it through the proxy. See
+expose. `~/.mms/registry.toml` and project `.mms/project.toml` files remain
+independent of STM's `~/.memtomem/stm_proxy.json`. Preview the additive route
+plan with `mms project route`, then use `mms project route --apply` to copy the
+selected stdio definitions into the proxy with provenance and conflict checks. See
 [Project-Scoped MCP Management](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/project-scoped-mcps.md).
 
 ## Tutorial notebooks

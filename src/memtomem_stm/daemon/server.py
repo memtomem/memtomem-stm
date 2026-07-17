@@ -214,8 +214,10 @@ class DaemonServer:
         self._last_request = time.monotonic()
         self._shutdown_event = asyncio.Event()
         self._surface_lock = asyncio.Lock()
-        self._pending_slots = asyncio.Semaphore(config.daemon.max_pending_requests)
+        self._max_pending_requests = config.daemon.max_pending_requests
+        self._pending_slots = asyncio.Semaphore(self._max_pending_requests)
         self._active_requests = 0
+        self._busy_rejections = 0
         self._latency = DaemonLatencyTracker()
         self._handshake_written = False
         self._engine: Any = None
@@ -478,6 +480,7 @@ class DaemonServer:
                 "status": "ready",
                 "ltm": self._ltm_warmth(),
                 "latency": self._latency.snapshot(),
+                "queue": self._queue_snapshot(),
                 "core": {"runtime_profile": getattr(self._adapter, "runtime_profile", None)},
             }
         if op == OP_SHUTDOWN:
@@ -778,6 +781,7 @@ class DaemonServer:
         if deadline is None or deadline <= time.monotonic():
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         if self._pending_slots.locked():
+            self._busy_rejections += 1
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
         # Advice is based on user-observed end-to-end latency, intentionally
         # including admission-queue and serialization-lock wait time.
@@ -841,6 +845,18 @@ class DaemonServer:
             self._active_requests -= 1
             self._pending_slots.release()
             self._last_request = time.monotonic()
+
+    def _queue_snapshot(self) -> dict[str, int]:
+        """Bounded numeric admission/serialization telemetry for operators."""
+        in_flight = 1 if self._surface_lock.locked() else 0
+        return {
+            "active": self._active_requests,
+            "in_flight": in_flight,
+            "queued": max(0, self._active_requests - in_flight),
+            "capacity": self._max_pending_requests,
+            "available": max(0, self._max_pending_requests - self._active_requests),
+            "busy_rejections": self._busy_rejections,
+        }
 
     def _surfacing_retrieval_count(self) -> int:
         """Number of engine terminal decisions that require an LTM attempt.

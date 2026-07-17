@@ -62,6 +62,7 @@ from memtomem_stm.proxy.config import (
     ProxyConfigLoader,
     RelevanceScorerConfig,
     SelectiveConfig,
+    TokenEstimationMode,
     ToolgraphConfig,
     TransportType,
     UpstreamServerConfig,
@@ -85,7 +86,7 @@ from memtomem_stm.proxy.pipeline_stages import (
     ShapePassthrough,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
-from memtomem_stm.proxy.token_estimate import tokens_to_chars
+from memtomem_stm.proxy.token_estimate import approx_tokens, tokens_to_chars
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
     REASON_PROFILE_EXCLUDED,
@@ -242,6 +243,8 @@ class ToolConfig:
     extraction_enabled: bool = False
     progressive: ProgressiveConfig | None = None
     retention_floor: float | None = None
+    token_budget: int | None = None
+    token_estimation_mode: TokenEstimationMode = TokenEstimationMode.STATIC
 
 
 # Field classification for ``compression_fingerprint``. Every ``ToolConfig``
@@ -264,6 +267,8 @@ _FINGERPRINT_FIELDS = frozenset(
         "selective",
         "progressive",
         "llm",
+        "token_budget",
+        "token_estimation_mode",
     }
 )
 _FINGERPRINT_EXCLUDED_FIELDS = frozenset({"auto_index_enabled", "extraction_enabled"})
@@ -310,6 +315,8 @@ def compression_fingerprint(
     payload: dict[str, Any] = {
         "compression": tc.compression.value,
         "max_chars": tc.max_chars,
+        "token_budget": tc.token_budget,
+        "token_estimation_mode": tc.token_estimation_mode.value,
         "retention_floor": tc.retention_floor,
         "cleaning": tc.cleaning.model_dump(mode="json"),
         "hybrid": tc.hybrid.model_dump(mode="json") if tc.hybrid is not None else None,
@@ -1997,6 +2004,8 @@ class ProxyManager:
                 schema = t.inputSchema or {"type": "object"}
                 if strip:
                     schema = self._distill_schema(schema, True)
+                if self._config.advertise_context_query:
+                    schema = self._with_context_query_schema(schema)
 
                 candidates.append(
                     ExposureCandidate(
@@ -2032,6 +2041,24 @@ class ProxyManager:
             self._compose_advertised_penalties(verdict.eligible, verdict.risk_penalties)
         )
         return verdict.eligible
+
+    @staticmethod
+    def _with_context_query_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy advertising STM's optional proxy-only query hint."""
+        copied = json.loads(json.dumps(schema))
+        if copied.get("type") not in (None, "object"):
+            return copied
+        properties = copied.setdefault("properties", {})
+        if not isinstance(properties, dict) or "_context_query" in properties:
+            return copied
+        properties["_context_query"] = {
+            "type": "string",
+            "description": (
+                "Optional current-task query used by the proxy for relevance-aware "
+                "compression; it is not forwarded upstream."
+            ),
+        }
+        return copied
 
     def _compose_advertised_penalties(
         self, eligible: list[ProxyToolInfo], native: dict[str, float]
@@ -2248,6 +2275,8 @@ class ProxyManager:
         # Falls back to existing char-budget paths when neither override is set.
         _default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
         server_token_budget = cfg.max_result_tokens
+        token_budget = server_token_budget
+        token_estimation_mode = cfg.token_estimation_mode or config.token_estimation_mode
         if server_token_budget is not None:
             cpt = cfg.chars_per_token if cfg.chars_per_token is not None else config.chars_per_token
             max_chars = tokens_to_chars(server_token_budget, cpt)
@@ -2279,6 +2308,7 @@ class ProxyManager:
             # if both are set. Resolution order for chars_per_token (when token
             # budget is used): tool override → server → proxy default.
             if override.max_result_tokens is not None:
+                token_budget = override.max_result_tokens
                 cpt = (
                     override.chars_per_token
                     if override.chars_per_token is not None
@@ -2288,7 +2318,10 @@ class ProxyManager:
                 )
                 max_chars = tokens_to_chars(override.max_result_tokens, cpt)
             elif override.max_result_chars is not None:
+                token_budget = None
                 max_chars = override.max_result_chars
+            if override.token_estimation_mode is not None:
+                token_estimation_mode = override.token_estimation_mode
             if override.retention_floor is not None:
                 retention_floor = override.retention_floor
             if override.llm is not None:
@@ -2317,6 +2350,8 @@ class ProxyManager:
             extraction_enabled=extraction_enabled,
             progressive=progressive_cfg,
             retention_floor=retention_floor,
+            token_budget=token_budget,
+            token_estimation_mode=token_estimation_mode,
         )
 
     def _cache_key_fingerprint(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> str:
@@ -3194,7 +3229,7 @@ class ProxyManager:
         tool: str,
         arguments: dict[str, Any],
         trace_id: str,
-    ) -> str:
+    ) -> str | CallToolResult:
         """Shared hit path: record metric, trace span, re-apply surfacing.
 
         Called from both the stampede guard's fast-path check and its
@@ -3204,7 +3239,7 @@ class ProxyManager:
         self.tracker.record_cache_hit(chars=len(cached))
         context_query = arguments.get("_context_query") if arguments else None
         with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
-            return await self._apply_surfacing(
+            surfaced = await self._apply_surfacing(
                 server,
                 tool,
                 arguments,
@@ -3212,6 +3247,17 @@ class ProxyManager:
                 trace_id=trace_id,
                 context_query=context_query if isinstance(context_query, str) else None,
             )
+            structured_content = getattr(cached, "structured_content", None)
+            result_meta = getattr(cached, "meta", None)
+            if structured_content is not None or result_meta is not None:
+                from mcp.types import TextContent
+
+                return mcp_types.CallToolResult(
+                    content=[TextContent(type="text", text=surfaced)],
+                    structuredContent=structured_content,
+                    _meta=result_meta,
+                )
+            return surfaced
 
     async def call_tool(
         self,
@@ -4073,6 +4119,11 @@ class ProxyManager:
         # (not only in the else-branch) because the shared CompressionResult
         # construction at the end reads it on the PROGRESSIVE path too.
         selective_store_error = False
+        # Set True when the opt-in unicode token gate evaluates this response
+        # (else-branch only — PROGRESSIVE is zero-loss and has no size gate).
+        # Read by the metrics block in ``_call_tool_inner`` to pick the token
+        # estimator, so it must track the gate exactly.
+        unicode_token_gate = False
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
             if len(cleaned) <= pcfg.chunk_size:
@@ -4137,6 +4188,26 @@ class ProxyManager:
             # Dynamic scaling: shorter content → higher retention (less to gain from cutting).
             # This is the SINGLE place where retention is enforced — compressors trust max_chars.
             effective_max_chars = tc.max_chars
+            if (
+                tc.token_budget is not None
+                and tc.token_estimation_mode == TokenEstimationMode.UNICODE
+            ):
+                unicode_token_gate = True
+                estimated_tokens = approx_tokens(cleaned)
+                if estimated_tokens <= tc.token_budget:
+                    # The actual response fits the requested token budget even
+                    # when its character count would have crossed the static
+                    # gate. Preserve it byte-for-byte.
+                    effective_compression = CompressionStrategy.NONE
+                elif estimated_tokens > 0:
+                    # Convert THIS response's observed token density back into
+                    # a char budget for the existing compressors. The retention
+                    # floor below may deliberately widen it to protect answer
+                    # quality, matching the static path's contract.
+                    effective_max_chars = max(
+                        1,
+                        int(len(cleaned) * tc.token_budget / estimated_tokens),
+                    )
             min_retention = getattr(cfg_snap, "min_result_retention", 0.65)
             dynamic = 0.0  # effective retention floor applied to this call (0 = unset)
             if min_retention > 0:
@@ -4438,6 +4509,7 @@ class ProxyManager:
             compress_ms=_compress_ms,
             surface_ms=_surface_ms,
             selective_store_error=selective_store_error,
+            unicode_token_gate=unicode_token_gate,
         )
 
     async def _run_index_stage(
@@ -4857,7 +4929,8 @@ class ProxyManager:
         cache_args: dict[str, Any],
         comp: CompressionResult,
         non_text_content: list,
-        has_result_envelope: bool,
+        structured_content: dict[str, Any] | None,
+        result_meta: dict[str, Any] | None,
         cfg_snap: ProxyConfig,
         context_query: str | None,
         config_fingerprint: str,
@@ -4866,11 +4939,10 @@ class ProxyManager:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
 
-        Only envelope-safe responses are ever stored: text-only content with no
-        result-level ``structuredContent``/``_meta`` (``has_result_envelope``)
-        — the ``result TEXT`` schema can reproduce nothing else, and a hit that
-        dropped those fields would break the envelope-preservation contract.
-        Rows written here are marked ``envelope_safe`` by ``ProxyCache.set``.
+        Successful text responses may include JSON-safe result-level
+        ``structuredContent``/``_meta``; cache v4 stores and reconstructs that
+        envelope. Non-text/mixed content remains unstorable. Rows written here
+        are marked ``envelope_safe`` by ``ProxyCache.set``.
 
         Cache writes are an optional fast-path: a SQLite lock timeout, disk full,
         or any other store error must NOT propagate to the agent and discard a
@@ -4914,17 +4986,10 @@ class ProxyManager:
             # not-yet-resolved background work retryable on the next call.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             return
-        if non_text_content or has_result_envelope:
-            # A non-text / mixed response is never STORED (only its text twin
-            # for the same key could have been), and neither is a response
-            # carrying result-level envelope fields (``structuredContent`` /
-            # ``_meta``): the ``result TEXT`` cache serves plain text, so a
-            # hit would silently drop those fields even when the content is
-            # text-only. Invalidate the prior row when caching is disabled
-            # (resolved ttl<=0); the explicit ttl<=0 branch below does the
-            # same for text responses. The non-text-ONLY response
-            # early-returns in ``_call_tool_inner`` and invalidates there
-            # instead.
+        if non_text_content:
+            # A non-text / mixed response is never stored because the cache row
+            # contract cannot reproduce arbitrary content blocks and ordering.
+            # Text-only result envelopes are handled below.
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
             self._invalidate_disabled_cache(
                 server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
@@ -4984,6 +5049,8 @@ class ProxyManager:
                     ttl_seconds=cache_ttl,
                     context_query=context_query,
                     config_fingerprint=config_fingerprint,
+                    structured_content=structured_content,
+                    meta=result_meta,
                 )
             except Exception:
                 logger.warning(
@@ -5078,8 +5145,8 @@ class ProxyManager:
         # attribute, MagicMock fabricates a truthy non-dict) as well as
         # spec-noncompliant upstreams. When either field is present the
         # return shape below is a full ``CallToolResult`` so the fields reach
-        # the client verbatim, and the Stage-5 store is bypassed — a
-        # ``result TEXT`` cache hit could never reproduce them.
+        # the client verbatim. Cache v4 reproduces them for successful text-only
+        # results; mixed/non-text envelopes remain live-call-only.
         raw_structured = getattr(result, "structuredContent", None)
         raw_meta = getattr(result, "meta", None)
         structured_content: dict[str, Any] | None = (
@@ -5240,10 +5307,19 @@ class ProxyManager:
         extract_error = ext.error
 
         # Record metrics (using pre-surfacing compressed size)
-        # Approximate token counts: chars / 3.5 (average for mixed en/code/json).
-        # Not exact but sufficient for budget tracking and cost estimation.
-        _orig_tokens = max(1, int(len(original_text) / 3.5))
-        _comp_tokens = max(1, int(compressed_chars_for_metrics / 3.5))
+        # When the unicode gate evaluated THIS response, report token counts
+        # from the same estimator so the recorded decision and the counts
+        # reconcile. Keyed on the gate having RUN (not on the mode alone):
+        # mode without a token budget, and the PROGRESSIVE branch with its
+        # deliberate ``len(cleaned)`` accounting basis, keep the static path.
+        # On the gated (non-progressive) branch ``comp.compressed`` is exactly
+        # the text whose length static mode measures.
+        if comp.unicode_token_gate:
+            _orig_tokens = max(1, approx_tokens(original_text))
+            _comp_tokens = max(1, approx_tokens(comp.compressed))
+        else:
+            _orig_tokens = max(1, int(len(original_text) / 3.5))
+            _comp_tokens = max(1, int(compressed_chars_for_metrics / 3.5))
 
         self.tracker.record(
             CallMetrics(
@@ -5281,7 +5357,8 @@ class ProxyManager:
             cache_args=cache_args,
             comp=comp,
             non_text_content=non_text_content,
-            has_result_envelope=has_result_envelope,
+            structured_content=structured_content,
+            result_meta=result_meta,
             cfg_snap=cfg_snap,
             context_query=context_query,
             config_fingerprint=config_fp,
