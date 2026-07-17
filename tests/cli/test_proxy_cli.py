@@ -9195,6 +9195,48 @@ class TestDoctor:
         assert "outer hook deadline truncates" in result.output
         assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10" in result.output
 
+    def test_score_scale_mismatch_diagnostic_fails_before_ceiling_heuristic(
+        self, runner, config, monkeypatch
+    ):
+        """#1781: the definitive core-named mismatch outranks the streak
+        heuristic in the doctor's ltm score scale check and names the fix."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "ltm_server": {"connected": True, "display": "mms daemon"},
+                "feedback_summary": {
+                    "active_diagnostics": {
+                        "score_scale_mismatch": 1,
+                        "score_ceiling_below_min": 1,
+                    },
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        scale_line = next(line for line in result.output.splitlines() if "ltm score scale" in line)
+        assert "FAIL" in scale_line
+        assert "core reports a non-RRF score scale" in result.output
+        assert "score_scale_mismatch" in result.output
+        # The definitive branch preempts the heuristic wording.
+        assert "unrecovered score_ceiling_below_min episode" not in result.output
+        # Remedy points at the reachable cause, not an impossible core upgrade.
+        assert "check surfacing.rerank" in result.output
+        assert "upgrade memtomem past v0.3.11" not in result.output
+
     def test_measure_ltm_is_explicitly_forwarded_but_default_is_passive(
         self, runner, config, monkeypatch
     ):

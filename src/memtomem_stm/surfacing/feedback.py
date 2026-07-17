@@ -63,6 +63,7 @@ class FeedbackTracker:
         query: str,
         memory_ids: list[str],
         scores: list[float],
+        score_scale: str | None = None,
     ) -> None:
         self._store.record_surfacing(
             surfacing_id,
@@ -71,6 +72,7 @@ class FeedbackTracker:
             query,
             memory_ids,
             scores,
+            score_scale=score_scale,
         )
 
     def record_fault(self, server: str, tool: str, kind: str) -> None:

@@ -13,6 +13,21 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- Surfacing now reads the score scale the core names in structured
+  `mem_search` output (`score_scale`: `rrf`/`bm25`/`dense`/`none`/`rerank`
+  plus the active `reranker` model ID, core #1781, first available in the
+  core release after v0.3.11) and threads it through observability:
+  every parsed result carries the scale (including across the hook-daemon
+  wire and the surfacing cache), each `surfacing_events` row records it
+  (additive nullable column, migrated in place), `stm_surfacing_stats`
+  renders a `Score scale:` line plus a per-scale event distribution, and
+  the below-threshold tripwire gains a definitive tier — when the core
+  names a non-RRF scale while the ceiling sits under the RRF-calibrated
+  `min_score`, STM fires `score_scale_mismatch` on first observation
+  (no five-call streak) and `mms doctor` names the mismatch and the fix.
+  Observability only: filtering, thresholds, and unreported-scale paths
+  (compose, compact format, older cores) behave exactly as before. (#727)
+
 - Surfacing retrievals now ask the core to skip its cross-encoder rerank
   stage per call (core #1766, first available in the core release after
   v0.3.11). On a rerank-enabled core that stage is ~99% of retrieval latency

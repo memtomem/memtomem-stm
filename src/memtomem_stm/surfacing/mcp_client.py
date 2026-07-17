@@ -125,11 +125,20 @@ class RemoteSearchResult:
         *,
         pinned: bool = False,
         context: RemoteContextInfo | None = None,
+        score_scale: str | None = None,
+        reranker: str | None = None,
     ):
         self.chunk = self._FakeChunk(content, source, namespace)
         self.score = score
         self.pinned = pinned
         self.context = context
+        # Core-reported scale of ``score`` (#1781): stamped by the structured
+        # parser when the core names it, ``None`` everywhere else (compact
+        # format, compose bundles, pre-#1781 cores). Stamped per result so
+        # cached entries keep their scale and no shared mutable state is
+        # needed across concurrent surfacing calls.
+        self.score_scale = score_scale
+        self.reranker = reranker
 
 
 def require_context_compose_lists(
@@ -285,6 +294,21 @@ class ResultParser:
         raise NotImplementedError
 
 
+KNOWN_SCORE_SCALES: frozenset[str] = frozenset({"rrf", "bm25", "dense", "none", "rerank"})
+"""Score-scale labels core names in structured search output (core #1781).
+
+Labels describe the BASE scale of the pipeline branch that produced the
+scores — RRF fusion (~0.033 ceiling), single-retriever bm25/dense
+passthrough, filter-only enumeration (``"none"``, no relevance scale), or
+cross-encoder rerank (model-dependent; raw logits locally — hence the
+sibling ``reranker`` model-ID key). Enabled decay/access/importance
+modifiers multiply on top. The ``"rerank"`` label is derived by core from
+the returned results, not its decision flag, so silent rerank fallbacks
+still report the fused scale truthfully. Unknown labels are kept verbatim
+(telemetry reports what core said); this set only gates debug logging and
+scale-conditional diagnostics.
+"""
+
 _BLOCK_SPLIT_RE = re.compile(r"^(?=\[\d+\]\s+\d+\.?\d*\s*\|)", flags=re.MULTILINE)
 _HEADER_RE = re.compile(r"\[(\d+)\]\s+(\d+\.?\d*)\s*\|(.+)")
 _NS_RE = re.compile(r"\[([^\]]+)\]\s*(.*)")
@@ -367,6 +391,11 @@ class StructuredResultParser(ResultParser):
     annotations (parent commit ``7d184f1``, PR #231). Hints are read
     opportunistically via ``data.get("hints", [])`` — the field is not
     asserted on and its absence degrades silently to an empty list.
+
+    Cores after #1781 also name the scale their ``score`` values are on via
+    optional top-level ``score_scale`` / ``reranker`` keys (omitted when
+    ``results`` is empty). Both are read with the same opportunistic
+    contract as ``hints`` and stamped onto every parsed result.
     """
 
     def parse(
@@ -389,6 +418,15 @@ class StructuredResultParser(ResultParser):
             [str(h) for h in raw_hints if isinstance(h, str)] if isinstance(raw_hints, list) else []
         )
 
+        raw_scale = data.get("score_scale")
+        score_scale = raw_scale if isinstance(raw_scale, str) and raw_scale else None
+        raw_reranker = data.get("reranker")
+        reranker = raw_reranker if isinstance(raw_reranker, str) and raw_reranker else None
+        if score_scale is not None and score_scale not in KNOWN_SCORE_SCALES:
+            # Keep the label verbatim — telemetry wants the truth, and a
+            # renamed core label must surface as itself, not as ``None``.
+            logger.debug("StructuredResultParser: unknown score_scale label %r", score_scale)
+
         raw_results = data.get("results", [])
         results: list[RemoteSearchResult] = []
         for item in raw_results:
@@ -407,6 +445,8 @@ class StructuredResultParser(ResultParser):
                 score=safe_float(item.get("score", 0.0), 0.0),
                 source=item.get("source", "unknown"),
                 namespace=item.get("namespace", "default"),
+                score_scale=score_scale,
+                reranker=reranker,
             )
             # Preserve chunk_id from core instead of sha256(content)
             chunk_id = item.get("chunk_id")

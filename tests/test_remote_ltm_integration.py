@@ -91,6 +91,43 @@ async def test_session_context_via_remote_stdio_mcp_server():
 
 
 @pytest.mark.asyncio
+async def test_score_scale_stamped_over_real_mcp_boundary():
+    """#1781: a core that names its score scale stamps every adapter result;
+    the default fake (pre-#1781 stand-in) yields ``None`` stamps."""
+    config = _stdio_config()
+    config = config.model_copy(
+        update={
+            "ltm_mcp_args": [
+                str(_FAKE_SERVER),
+                "--score-scale",
+                "rerank",
+                "--reranker-id",
+                "fake-rr",
+            ]
+        }
+    )
+    adapter = McpClientSearchAdapter(config)
+    await adapter.start()
+    try:
+        results, _, outcome = await adapter.search("JWT authentication", top_k=2)
+    finally:
+        await adapter.stop()
+    assert outcome == "ok"
+    assert results and all(r.score_scale == "rerank" for r in results)
+    assert all(r.reranker == "fake-rr" for r in results)
+
+    old_core = McpClientSearchAdapter(_stdio_config())
+    await old_core.start()
+    try:
+        results, _, outcome = await old_core.search("JWT authentication", top_k=2)
+    finally:
+        await old_core.stop()
+    assert outcome == "ok"
+    assert results and all(r.score_scale is None for r in results)
+    assert all(r.reranker is None for r in results)
+
+
+@pytest.mark.asyncio
 async def test_increment_access_via_remote_stdio_mcp_server():
     """McpClientSearchAdapter.increment_access reaches the fake mem_do handler.
 

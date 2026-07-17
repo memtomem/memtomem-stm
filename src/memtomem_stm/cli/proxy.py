@@ -6757,7 +6757,18 @@ def doctor(
                 if isinstance(feedback_summary, dict):
                     active = feedback_summary.get("active_diagnostics")
                     supported = feedback_summary.get("diagnostics_recovery_supported", True)
-                    if isinstance(active, dict) and active.get("score_ceiling_below_min"):
+                    if isinstance(active, dict) and active.get("score_scale_mismatch"):
+                        check(
+                            "ltm_score_scale",
+                            "ltm score scale",
+                            "FAIL",
+                            "core reports a non-RRF score scale while min_score assumes RRF "
+                            "(unrecovered score_scale_mismatch episode in the last 7 UTC days)",
+                            "if the scale is 'rerank', check surfacing.rerank (default false "
+                            "returns RRF scores); otherwise pin context_tools.<tool>.min_score "
+                            "to the core's scale",
+                        )
+                    elif isinstance(active, dict) and active.get("score_ceiling_below_min"):
                         check(
                             "ltm_score_scale",
                             "ltm score scale",

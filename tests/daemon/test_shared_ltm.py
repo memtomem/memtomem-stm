@@ -129,6 +129,31 @@ async def test_daemon_search_round_trip_preserves_structured_fields(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_daemon_search_round_trips_score_scale(tmp_path: Path) -> None:
+    """#1781 scale stamps ride the wire as additive keys — present when
+    stamped (encoder) and read back onto the result (adapter is covered by
+    ``test_adapter_decodes_score_scale``); the unstamped case is pinned by
+    the exact-dict assertion in the round-trip test above (no keys)."""
+    server = DaemonServer(_config(tmp_path))
+    result = RemoteSearchResult(
+        "remember this",
+        -0.17,
+        "/notes/a.md",
+        "work",
+        score_scale="rerank",
+        reranker="fake-rr",
+    )
+    result.chunk.id = "real-chunk-id"
+    server._adapter = SimpleNamespace(search=AsyncMock(return_value=([result], [], "ok")))
+
+    response = await server._dispatch(_request(OP_LTM_SEARCH, {"query": "jwt handler"}))
+
+    assert response is not None and response["ok"] is True
+    assert response["results"][0]["score_scale"] == "rerank"
+    assert response["results"][0]["reranker"] == "fake-rr"
+
+
+@pytest.mark.asyncio
 async def test_daemon_v7_compose_and_candidate_roundtrip_and_validation(tmp_path: Path) -> None:
     server = DaemonServer(_config(tmp_path))
     pinned = RemoteSearchResult("policy", 1.0, "/policy.md", "global", pinned=True)
@@ -678,7 +703,55 @@ async def test_adapter_decodes_results_and_busy_is_operational_skip(
     assert outcome == "ok" and hints == ["hint"]
     assert results[0].score == 0.0312345
     assert results[0].chunk.id == "chunk-1"
+    # Legacy daemon response without the #1781 keys → None stamps.
+    assert results[0].score_scale is None
+    assert results[0].reranker is None
     assert await adapter.search("query") == ([], [], "daemon_busy")
+
+
+@pytest.mark.asyncio
+async def test_adapter_decodes_score_scale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    async def reply(*args, **kwargs):
+        return (
+            "ok",
+            {
+                "ok": True,
+                "results": [
+                    {
+                        "content": "memory",
+                        "score": -0.17,
+                        "source": "/m.md",
+                        "namespace": "default",
+                        "chunk_id": "chunk-1",
+                        "score_scale": "rerank",
+                        "reranker": "fake-rr",
+                    },
+                    {
+                        "content": "corrupt scale",
+                        "score": 0.5,
+                        "source": "/m.md",
+                        "namespace": "default",
+                        "chunk_id": "chunk-2",
+                        "score_scale": 3,
+                        "reranker": [],
+                    },
+                ],
+                "hints": [],
+                "outcome": "ok",
+            },
+        )
+
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", reply)
+
+    results, _, outcome = await adapter.search("query")
+    assert outcome == "ok"
+    assert results[0].score_scale == "rerank"
+    assert results[0].reranker == "fake-rr"
+    # Non-string wire values degrade to None, mirroring the parser guard.
+    assert results[1].score_scale is None
+    assert results[1].reranker is None
 
 
 @pytest.mark.asyncio
