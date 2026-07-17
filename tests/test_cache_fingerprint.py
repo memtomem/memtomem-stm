@@ -20,6 +20,7 @@ from memtomem_stm.proxy.config import (
     ProgressiveConfig,
     RelevanceScorerConfig,
     SelectiveConfig,
+    TokenEstimationMode,
 )
 from memtomem_stm.proxy.manager import (
     _FINGERPRINT_EXCLUDED_FIELDS,
@@ -93,6 +94,8 @@ def _mutate(field: str) -> ToolConfig:
         "selective": _tc(selective=SelectiveConfig(json_depth=3)),
         "progressive": _tc(progressive=ProgressiveConfig(chunk_size=1111)),
         "llm": _tc(llm=LLMCompressorConfig(model="gpt-x", api_key="sk-test")),
+        "token_budget": _tc(token_budget=1000),
+        "token_estimation_mode": _tc(token_estimation_mode=TokenEstimationMode.UNICODE),
     }
     return values[field]
 

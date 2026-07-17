@@ -472,6 +472,28 @@ class TestStatus:
         # predicate.
         assert data["server_count"] == 1
         assert data["pruned_count"] == 0
+        assert data["tuning"]["sample_threshold"] == 5
+
+    def test_tuning_ready_hint_points_to_preview(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setattr(
+            proxy_mod,
+            "_tuning_readiness",
+            lambda data: {
+                "available": True,
+                "ready": True,
+                "sample_threshold": 5,
+                "tools": [{"server": "docs", "tool": "search", "calls": 7}],
+            },
+        )
+
+        result = runner.invoke(cli, ["status", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "Tuning : ready for 1 tool(s)" in result.output
+        assert "mms tune" in result.output
 
     def test_json_missing_config(self, runner, config):
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
@@ -9523,6 +9545,7 @@ class TestDoctor:
             "upstream:fake",
             "host_registration",
             "cache_policy",
+            "tuning",
             "ltm",
         ]
         assert data["servers"]["fake"]["stage"] == "tools_discovered"

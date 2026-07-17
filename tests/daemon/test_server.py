@@ -175,6 +175,14 @@ async def test_ping_reports_ready_and_cold_ltm(tmp_path: Path) -> None:
         assert hs["ltm"] == "cold"  # injected engine: adapter never started
         assert hs["latency"]["retrieval"]["samples"] == 0
         assert hs["latency"]["surface"]["samples"] == 0
+        assert hs["queue"] == {
+            "active": 0,
+            "in_flight": 0,
+            "queued": 0,
+            "capacity": cfg.daemon.max_pending_requests,
+            "available": cfg.daemon.max_pending_requests,
+            "busy_rejections": 0,
+        }
     finally:
         await _stop(cfg, task)
 
@@ -439,6 +447,9 @@ async def test_surface_rejects_when_pending_queue_is_full(tmp_path: Path) -> Non
         }
     )
     assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+    ping = await server._dispatch({"v": PROTOCOL_VERSION, "op": OP_PING})
+    assert ping["queue"]["busy_rejections"] == 1
+    assert ping["queue"]["capacity"] == 1
 
 
 async def test_noop_surface_for_non_allowlisted_tool_real_wiring(tmp_path: Path) -> None:

@@ -19,6 +19,8 @@ never adopted silently.
 | `mms project list` | List known project selections |
 | `mms project enable NAMES...` | Enable registry entries for this project |
 | `mms project disable NAMES...` | Disable entries for this project |
+| `mms project route` | Preview selected registry entries as additive STM upstreams |
+| `mms project route --apply` | Validate, back up, and write non-conflicting routes to the proxy config |
 
 ## Host synchronization
 
@@ -27,8 +29,10 @@ host configuration, then previews or applies the selected synchronization.
 Adopting project-local commands requires explicit authorization; removal and
 sidecar backfill do not adopt a new command.
 
-This subsystem is independent of `~/.memtomem/stm_proxy.json`. Registry import
-does not automatically proxy an MCP server through STM.
+Registry selection stays independent of `~/.memtomem/stm_proxy.json`; routing
+is an explicit preview/apply step. Existing names and prefixes are never
+overwritten, routes are never pruned, and applied entries retain their registry
+origin for later inspection.
 
 See [Project-Scoped MCP Management](../guides/project-scoped-mcps.md) for the
 recommended workflow.

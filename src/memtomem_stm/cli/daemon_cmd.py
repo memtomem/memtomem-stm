@@ -410,6 +410,7 @@ def status_cmd(as_json: bool) -> None:
             "host": hs.get("host"),
             "port": hs.get("port"),
             "ltm": hs.get("ltm"),
+            "queue": hs.get("queue"),
             "uptime_seconds": round(uptime, 1),
             "hook_will_use_daemon": use_daemon,
             "standalone_will_use_daemon": standalone_use_daemon,
@@ -449,6 +450,14 @@ def status_cmd(as_json: bool) -> None:
                 f"ltm={info['ltm']} uptime={info['uptime_seconds']}s"
             )
         )
+        queue = info.get("queue")
+        if isinstance(queue, dict):
+            click.echo(
+                "queue: "
+                f"active={queue.get('active', 0)} queued={queue.get('queued', 0)} "
+                f"capacity={queue.get('capacity', 0)} "
+                f"busy_rejections={queue.get('busy_rejections', 0)}"
+            )
     elif state == "stale":
         click.echo(
             _warn(

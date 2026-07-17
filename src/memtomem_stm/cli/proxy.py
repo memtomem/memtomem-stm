@@ -1488,6 +1488,43 @@ def _origin_cell(cfg: Any) -> str:
     return source["kind"] + ("*" if _origin_fully_pruned(origin) else "")
 
 
+def _tuning_readiness(data: dict[str, Any]) -> dict[str, Any]:
+    """Read-only signal that enough per-tool samples exist for ``mms tune``.
+
+    This intentionally does not run the tuner or migrate/open SQLite
+    read-write: ``status`` and default ``doctor`` are inspection commands.
+    ``mms tune`` remains the authoritative recommendation preview and apply
+    surface once a tool reaches the tuner's five-call sample floor.
+    """
+    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+    from memtomem_stm.proxy.tuner import MIN_CALLS
+
+    try:
+        config = ProxyConfig.model_validate(data)
+    except Exception:
+        return {
+            "available": False,
+            "ready": False,
+            "sample_threshold": MIN_CALLS,
+            "tools": [],
+        }
+    summary = read_compression_summary(config.metrics.db_path, source="mcp")
+    rows = summary.get("by_tool")
+    safe_rows = rows if isinstance(rows, list) else []
+    tools = [
+        {"server": row["server"], "tool": row["tool"], "calls": row["calls"]}
+        for row in safe_rows
+        if isinstance(row, dict) and isinstance(row.get("calls"), int) and row["calls"] >= MIN_CALLS
+    ]
+    return {
+        "available": bool(summary.get("available")),
+        "ready": bool(tools),
+        "sample_threshold": MIN_CALLS,
+        "tools": tools,
+    }
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
@@ -1508,6 +1545,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     enabled = data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     config_error = _schema_validation_error(data)
+    tuning = _tuning_readiness(data)
     # Same predicate as the `mms list` pruned marker (via _origin_cell), so
     # this count and list's `*` rows can never disagree on what "pruned" means.
     pruned_count = sum(
@@ -1532,6 +1570,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
                     "config_error": config_error,
                     "server_count": len(servers),
                     "pruned_count": pruned_count,
+                    "tuning": tuning,
                     "servers": _redacted_servers_json(servers),
                 },
                 indent=2,
@@ -1550,6 +1589,11 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
     click.echo(f"Servers: {len(servers)}{pruned_suffix}")
+    if tuning["ready"]:
+        click.echo(
+            f"Tuning : ready for {len(tuning['tools'])} tool(s); "
+            "run `mms tune` to preview recommendations"
+        )
     click.echo("")
     if servers:
         click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
@@ -6735,7 +6779,36 @@ def doctor(
                     f'{resolved}  # or "conservative" to pin current behavior',
                 )
 
-            # 8. LTM server — never FAIL: LTM is optional, and an unreachable
+            # 8. Tuning readiness — read-only.  This is a discoverability
+            # hint, not an automatic config mutation; the existing
+            # preview/apply boundary remains authoritative in ``mms tune``.
+            tuning = _tuning_readiness(data)
+            ready_tools = tuning["tools"]
+            if tuning["ready"]:
+                check(
+                    "tuning",
+                    "compression tuning",
+                    "PASS",
+                    f"{len(ready_tools)} tool(s) have at least "
+                    f"{tuning['sample_threshold']} samples",
+                    f"mms tune {cfg_arg}",
+                )
+            elif tuning["available"]:
+                check(
+                    "tuning",
+                    "compression tuning",
+                    "PASS",
+                    f"collecting per-tool samples (need {tuning['sample_threshold']})",
+                )
+            else:
+                check(
+                    "tuning",
+                    "compression tuning",
+                    "PASS",
+                    "no proxy metrics recorded yet",
+                )
+
+            # 9. LTM server — never FAIL: LTM is optional, and an unreachable
             # or unconfigured LTM only disables surfacing, not the proxy
             # core. A FAIL here would break the exit-code gate on every
             # fresh install without a memtomem server.

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS proxy_cache (
     result        TEXT    NOT NULL,
     created_at    REAL    NOT NULL,
     ttl_seconds   REAL,
+    envelope_json TEXT,
     envelope_safe INTEGER NOT NULL DEFAULT 0
 );
 """
@@ -48,15 +49,32 @@ class CacheEntry:
         return time.time() >= self.created_at + self.ttl_seconds
 
 
+class CachedResponse(str):
+    """Cached text plus an optional safe MCP result-level envelope."""
+
+    structured_content: dict[str, Any] | None
+    meta: dict[str, Any] | None
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        structured_content: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> CachedResponse:
+        obj = super().__new__(cls, value)
+        obj.structured_content = structured_content
+        obj.meta = meta
+        return obj
+
+
 # Bump when the key derivation OR the row contract changes shape so
 # ``initialize()`` can purge rows written under an older scheme (opaque hashes
 # make them unreachable but otherwise immortal for ``ttl_seconds NULL`` rows).
 # Stored in SQLite's ``PRAGMA user_version``.
-# v3: envelope contract — only ``isError=false``, text-only responses without
-# ``structuredContent`` or result-level ``_meta`` are stored, recorded in the
-# ``envelope_safe`` column. Legacy rows cannot prove that, so the bump drops
-# the whole table (and, via the DROP, adds the column).
-_KEY_SCHEMA_VERSION = 3
+# v4: successful text responses may carry JSON-safe ``structuredContent`` and
+# result-level ``_meta`` in ``envelope_json``.
+_KEY_SCHEMA_VERSION = 4
 
 
 def _make_key(
@@ -152,8 +170,8 @@ class ProxyCache:
             # current lookup can ever produce, so they would sit as dead
             # weight — forever, for ``ttl_seconds NULL`` rows — while still
             # counting against ``max_entries``. DROP (not DELETE) so the
-            # recreate below also picks up column additions (v3:
-            # ``envelope_safe``) without a separate ALTER migration.
+            # recreate below also picks up column additions without a separate
+            # ALTER migration.
             # ``user_version`` is 0 for both fresh and pre-versioning
             # databases; the DROP on a fresh database is a no-op.
             (schema_version,) = db.execute("PRAGMA user_version").fetchone()
@@ -197,8 +215,11 @@ class ProxyCache:
             # the read-side guard in ``get()`` refuses and evicts those.
             stale_keys = [
                 key
-                for key, result in db.execute("SELECT cache_key, result FROM proxy_cache")
+                for key, result, envelope in db.execute(
+                    "SELECT cache_key, result, envelope_json FROM proxy_cache"
+                )
                 if contains_sensitive_content(result)
+                or (envelope is not None and contains_sensitive_content(envelope))
             ]
             if stale_keys:
                 db.executemany(
@@ -224,7 +245,7 @@ class ProxyCache:
         *,
         context_query: str | None = None,
         config_fingerprint: str = "",
-    ) -> str | None:
+    ) -> CachedResponse | None:
         if self._db is None:
             return None
         key = _make_key(
@@ -233,7 +254,7 @@ class ProxyCache:
         try:
             with self._lock:
                 row = self._db.execute(
-                    "SELECT result, created_at, ttl_seconds, envelope_safe "
+                    "SELECT result, created_at, ttl_seconds, envelope_safe, envelope_json "
                     "FROM proxy_cache WHERE cache_key = ?",
                     (key,),
                 ).fetchone()
@@ -253,7 +274,10 @@ class ProxyCache:
         if row is None:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
-        if contains_sensitive_content(entry.result):
+        envelope_json = row[4]
+        if contains_sensitive_content(entry.result) or (
+            envelope_json is not None and contains_sensitive_content(envelope_json)
+        ):
             # Read-side mirror of the ``set()`` gate: a row can land here
             # without passing ``set()`` — written by an older still-running
             # pre-gate process or an external SQL writer — and the startup
@@ -293,7 +317,24 @@ class ProxyCache:
             return None
         if entry.is_expired():
             return None
-        return entry.result
+        structured_content: dict[str, Any] | None = None
+        meta: dict[str, Any] | None = None
+        if envelope_json is not None:
+            try:
+                envelope = json.loads(envelope_json)
+                if not isinstance(envelope, dict) or envelope.get("schema_version") != 1:
+                    return None
+                raw_structured = envelope.get("structuredContent")
+                raw_meta = envelope.get("_meta")
+                if raw_structured is not None and not isinstance(raw_structured, dict):
+                    return None
+                if raw_meta is not None and not isinstance(raw_meta, dict):
+                    return None
+                structured_content = raw_structured
+                meta = raw_meta
+            except (TypeError, ValueError):
+                return None
+        return CachedResponse(entry.result, structured_content=structured_content, meta=meta)
 
     def invalidate(
         self,
@@ -330,6 +371,8 @@ class ProxyCache:
         *,
         context_query: str | None = None,
         config_fingerprint: str = "",
+        structured_content: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         if self._db is None:
             return
@@ -354,7 +397,27 @@ class ProxyCache:
                 config_fingerprint=config_fingerprint,
             )
             return
-        if contains_sensitive_content(result):
+        envelope_json: str | None = None
+        if structured_content is not None or meta is not None:
+            try:
+                envelope_json = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "structuredContent": structured_content,
+                        "_meta": meta,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Skipping cache store for %s/%s: envelope is not JSON-safe", server, tool
+                )
+                return
+        if contains_sensitive_content(result) or (
+            envelope_json is not None and contains_sensitive_content(envelope_json)
+        ):
             # SECURITY.md: responses that look like secrets are never
             # persisted to the response cache. Enforced at the store
             # chokepoint so no caller can bypass it (#453); a false positive
@@ -378,15 +441,17 @@ class ProxyCache:
             self._db.execute(
                 """
                 INSERT INTO proxy_cache
-                    (cache_key, server, tool, result, created_at, ttl_seconds, envelope_safe)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                    (cache_key, server, tool, result, created_at, ttl_seconds,
+                     envelope_json, envelope_safe)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     result        = excluded.result,
                     created_at    = excluded.created_at,
                     ttl_seconds   = excluded.ttl_seconds,
+                    envelope_json = excluded.envelope_json,
                     envelope_safe = excluded.envelope_safe
                 """,
-                (key, server, tool, result, now, ttl_seconds),
+                (key, server, tool, result, now, ttl_seconds, envelope_json),
             )
             self._db.commit()
             self._trim()

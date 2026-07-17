@@ -15,6 +15,7 @@ import pytest
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ProxyConfig,
+    TokenEstimationMode,
     ToolOverrideConfig,
     UpstreamServerConfig,
 )
@@ -91,6 +92,7 @@ class TestProxyConfigCharsPerToken:
     def test_default_is_3_5(self):
         cfg = ProxyConfig()
         assert cfg.chars_per_token == 3.5
+        assert cfg.token_estimation_mode == TokenEstimationMode.STATIC
 
     def test_validator_rejects_zero_or_negative(self):
         with pytest.raises(ValueError):
@@ -338,6 +340,99 @@ class TestCharsPerTokenResolutionOrder:
         tc = mgr._resolve_tool_config("srv", "any_tool")
         # 2000 * 2.5 = 5000
         assert tc.max_chars == 5000
+
+
+class TestTokenEstimationMode:
+    def test_server_and_tool_mode_precedence(self):
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            max_result_tokens=1000,
+            token_estimation_mode="unicode",
+            tool_overrides={
+                "static_tool": ToolOverrideConfig(token_estimation_mode="static"),
+            },
+        )
+        proxy_cfg = ProxyConfig(
+            upstream_servers={"srv": server_cfg}, token_estimation_mode="static"
+        )
+        mgr = _make_manager(proxy_cfg, server_cfg)
+
+        dynamic = mgr._resolve_tool_config("srv", "dynamic_tool")
+        static = mgr._resolve_tool_config("srv", "static_tool")
+        assert dynamic.token_budget == 1000
+        assert dynamic.token_estimation_mode == TokenEstimationMode.UNICODE
+        assert static.token_estimation_mode == TokenEstimationMode.STATIC
+
+    def test_char_override_clears_inherited_token_budget(self):
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            max_result_tokens=1000,
+            token_estimation_mode="unicode",
+            tool_overrides={"chars": ToolOverrideConfig(max_result_chars=321)},
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg})
+        mgr = _make_manager(proxy_cfg, server_cfg)
+
+        tc = mgr._resolve_tool_config("srv", "chars")
+        assert tc.max_chars == 321
+        assert tc.token_budget is None
+
+    @pytest.mark.asyncio
+    async def test_unicode_gate_uses_actual_hangul_density(self):
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            compression="truncate",
+            max_result_tokens=100,
+            chars_per_token=3.5,
+            token_estimation_mode="unicode",
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg}, min_result_retention=0)
+        mgr = _make_manager(proxy_cfg, server_cfg)
+        tc = mgr._resolve_tool_config("srv", "tool")
+        mgr._apply_compression = AsyncMock(return_value=("압" * 80, None))  # type: ignore[method-assign]
+
+        await mgr._compress_and_surface(
+            server="srv",
+            tool="tool",
+            upstream_args={},
+            cleaned="가" * 200,
+            tc=tc,
+            cfg_snap=proxy_cfg,
+            context_query=None,
+            trace_id=None,
+        )
+
+        call = mgr._apply_compression.await_args  # type: ignore[union-attr]
+        assert call.args[1] == CompressionStrategy.TRUNCATE
+        assert call.args[2] == 80  # 200 chars * 100 budget / 250 estimated tokens
+
+    @pytest.mark.asyncio
+    async def test_unicode_gate_preserves_ascii_response_that_fits(self):
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            compression="truncate",
+            max_result_tokens=100,
+            chars_per_token=0.5,
+            token_estimation_mode="unicode",
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg}, min_result_retention=0)
+        mgr = _make_manager(proxy_cfg, server_cfg)
+        tc = mgr._resolve_tool_config("srv", "tool")
+        mgr._apply_compression = AsyncMock(return_value=("a" * 200, None))  # type: ignore[method-assign]
+
+        await mgr._compress_and_surface(
+            server="srv",
+            tool="tool",
+            upstream_args={},
+            cleaned="a" * 200,  # approx 60 tokens: below the 100-token gate
+            tc=tc,
+            cfg_snap=proxy_cfg,
+            context_query=None,
+            trace_id=None,
+        )
+
+        call = mgr._apply_compression.await_args  # type: ignore[union-attr]
+        assert call.args[1] == CompressionStrategy.NONE
 
 
 class TestKoreanWorkloadEndToEnd:

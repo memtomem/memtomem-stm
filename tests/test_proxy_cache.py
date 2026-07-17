@@ -42,6 +42,36 @@ class TestProxyCacheBasic:
         proxy_cache.set("s", "t", {"a": 1}, "new", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {"a": 1}) == "new"
 
+    def test_envelope_round_trip(self, proxy_cache: ProxyCache):
+        proxy_cache.set(
+            "s",
+            "t",
+            {},
+            "body",
+            ttl_seconds=60.0,
+            structured_content={"answer": 42},
+            meta={"trace": "safe"},
+        )
+        cached = proxy_cache.get("s", "t", {})
+        assert cached == "body"
+        assert cached.structured_content == {"answer": 42}
+        assert cached.meta == {"trace": "safe"}
+
+    def test_non_json_envelope_is_not_stored(self, proxy_cache: ProxyCache):
+        proxy_cache.set("s", "t", {}, "body", ttl_seconds=60.0, meta={"bad": object()})
+        assert proxy_cache.get("s", "t", {}) is None
+
+    def test_sensitive_envelope_is_not_stored(self, proxy_cache: ProxyCache):
+        proxy_cache.set(
+            "s",
+            "t",
+            {},
+            "body",
+            ttl_seconds=60.0,
+            meta={"api_key": "abc123-def"},
+        )
+        assert proxy_cache.get("s", "t", {}) is None
+
 
 class TestProxyCacheDegradation:
     def test_get_degrades_to_miss_on_sqlite_error(self, tmp_path, caplog):
@@ -571,7 +601,7 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 3
+            assert version == 4
         finally:
             reopened.close()
 
@@ -589,7 +619,7 @@ class TestKeySchemaVersionPurge:
         finally:
             reopened.close()
 
-    def test_v2_table_reopen_wipes_and_adds_marker_column(self, tmp_path):
+    def test_v2_table_reopen_wipes_and_adds_envelope_columns(self, tmp_path):
         """A v2-era database (old six-column table, user_version=2) is dropped
         and recreated on open: rows are gone and the recreated table carries
         the ``envelope_safe`` column."""
@@ -623,8 +653,9 @@ class TestKeySchemaVersionPurge:
                 row[1] for row in cache._db.execute("PRAGMA table_info(proxy_cache)").fetchall()
             }
             assert "envelope_safe" in columns
+            assert "envelope_json" in columns
             (version,) = cache._db.execute("PRAGMA user_version").fetchone()
-            assert version == 3
+            assert version == 4
         finally:
             cache.close()
 

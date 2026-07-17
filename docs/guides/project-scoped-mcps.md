@@ -35,7 +35,19 @@ Use `mms host` to compare the registry/project selection with supported host
 configuration. Mutating operations retain their preview/apply boundary; review
 the plan before allowing a host-config write.
 
-These commands do not implicitly add an entry to the STM proxy. Use `mms add`
-or the guided import in `mms init` when the server should route through STM.
+## Route the project through STM
+
+Routing remains explicit and previews by default:
+
+```bash
+mms project route
+mms project route --apply
+mms doctor
+```
+
+Only enabled stdio definitions are eligible. Apply is additive: it validates
+the complete proxy config, creates a backup when the config already exists,
+and skips name/prefix conflicts instead of replacing another route. Re-running
+the command is idempotent.
 
 See the complete [project CLI reference](../reference/cli-projects.md).

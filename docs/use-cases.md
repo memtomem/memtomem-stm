@@ -15,6 +15,12 @@ the question remains answerable, additional `stm_proxy_select_chunks` or
 progressive retain a way to retrieve source content; they do not guarantee
 that an agent will request every omitted section.
 
+Place a named "needle" fact in a late section and assert both exact retention
+and answerability. Run the same fixture without a query and with an advertised
+`_context_query`; this distinguishes ordinary head bias from query-aware
+quality. Treat a missing needle as a release-gate failure even if the aggregate
+compression ratio improved.
+
 ## Resume a project with reviewed memory
 
 With a core that advertises `context_compose` schema 2 or later, pre-load a
@@ -40,7 +46,9 @@ and response equality.
 Caching avoids upstream I/O and latency. Model-input reduction comes from the
 cached compressed response, not from the cache hit itself. Write-like,
 credential-bearing, mixed-content, error, and transient-key responses are not
-assumed cacheable.
+assumed cacheable. Successful text responses with JSON-safe
+`structuredContent` or result `_meta` should hit cache v4 and reproduce the
+envelope exactly.
 
 ## Share one local LTM connection across agents
 
@@ -53,6 +61,12 @@ The daemon shares the LTM connection. Response caches, feedback, rate limits,
 and tuning remain local to each proxy; this is not remote HA or multi-tenant
 infrastructure.
 
+Use `mms daemon status --json` to record `queue.active`, `queue.queued`, queue
+capacity, and cumulative busy rejections beside latency percentiles. The
+current daemon serializes access to one warm MCP session; queue telemetry is
+the evidence needed before increasing concurrency or introducing a session
+pool.
+
 ## Common evidence rules
 
 - Compare direct upstream, STM passthrough, and STM feature-on separately.
@@ -60,5 +74,5 @@ infrastructure.
 - Report answer quality and additional round trips beside any size reduction.
 - Label examples as MCP-routed; built-in `Read`, `Bash`, or editor tools may
   bypass the proxy.
-- Treat STM's character-derived token estimate as an estimate, not a provider
-  billing count.
+- Treat static and Unicode runtime token estimates as estimates, not provider
+  billing counts.
