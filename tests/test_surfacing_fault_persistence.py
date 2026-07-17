@@ -199,6 +199,37 @@ class TestEngineFaultPersistence:
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert _fault_rows(config.feedback_db_path) == [("gh", "read_file", "ltm_unavailable", 1)]
 
+    async def test_scale_gate_recovers_stale_mismatch_episode(self, tmp_path):
+        """A pre-existing score-scale episode (recorded while the gate was
+        disabled, or before it existed) is marked recovered by the first
+        scale-gated batch — ``mms doctor`` stops FAILing on a setup the gate
+        just fixed instead of lingering for the full 7-day window."""
+
+        @dataclass
+        class _StampedResult:
+            chunk: FakeChunk
+            score: float
+            score_scale: str | None = None
+            reranker: str | None = None
+
+        adapter = AsyncMock()
+        adapter.search = AsyncMock(
+            return_value=([_StampedResult(FakeChunk(), -0.17, "rerank")], [], "ok")
+        )
+        config = _make_config(tmp_path)
+        tracker = FeedbackTracker(config)
+        tracker.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        tracker.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {
+            "score_scale_mismatch": 1,
+            "score_ceiling_below_min": 1,
+        }
+
+        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
+
     async def test_no_tracker_does_not_raise(self, tmp_path):
         async def slow_search(*args, **kwargs):
             await asyncio.sleep(10)

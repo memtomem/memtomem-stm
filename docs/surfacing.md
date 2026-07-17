@@ -83,7 +83,7 @@ flowchart LR
     Extract --> Gate{"3. relevance gate"}
     Gate -->|skip| Pass
     Gate -->|pass| Search["4. search LTM<br/>(compose schema 2+ or mem_search)"]
-    Search --> Filter{"score ≥ min_score?<br/>not already shown?"}
+    Search --> Filter{"score ≥ min_score?<br/>(suspended on core-named non-RRF scale)<br/>not already shown?"}
     Filter -->|no| Pass
     Filter -->|yes| Inject["5. inject memories<br/>+ working memory"]
     Inject --> Out["enriched response"]
@@ -147,7 +147,7 @@ data from constructing a new structural memory boundary. It cannot guarantee
 that arbitrary natural-language prose will never persuade a model, so surfaced
 memories must still be treated as reference data rather than instructions.
 
-Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. Exact raw-score distributions remain available through `stm_surfacing_stats`.
+Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. The tag is suppressed for results the core stamped with a known non-RRF `score_scale` (`bm25` / `dense` / `none` / `rerank`) — the `[min_score, 1.0]` band math only holds on the RRF scale, and e.g. rerank logits can be negative. Suppression keys on each result's own stamp, so cache hits render the same way the original miss did; unstamped results and unrecognized labels keep the bucket. Exact raw-score distributions remain available through `stm_surfacing_stats`.
 
 Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution to a single value above `min_score` — the reason structured is the default (#560).
 
@@ -185,6 +185,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
 | `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
 | `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Only sent when the core advertises the parameter in its `mem_search` schema (first core release after v0.3.11) — on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
+| `scale_gated_min_score` | `true` | Suspend the RRF-calibrated `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Batches with no reported scale (compose bundles until core #1791, `compact` format, pre-#1781 cores) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
 | `ltm_mcp_command` | `memtomem-server` | Command used when `ltm_mcp_transport=stdio` |
@@ -312,7 +313,7 @@ export MEMTOMEM_STM_SURFACING__CONTEXT_TOOLS='{
 
 Template variables: `{tool_name}`, `{server}`, `{arg.ARGUMENT_NAME}`
 
-**`min_score` precedence (highest wins):** per-tool `context_tools.<name>.min_score` → auto-tuned value (when `auto_tune_enabled=true`) → top-level `min_score`. An explicit per-tool override always wins, even with auto-tune on — set it when you want a fixed threshold that the tuner should not move.
+**`min_score` precedence (highest wins):** per-tool `context_tools.<name>.min_score` → scale-gate suspension (when `scale_gated_min_score=true` and the core names a non-RRF `score_scale` — no floor is applied to that batch) → auto-tuned value (when `auto_tune_enabled=true`) → top-level `min_score`. An explicit per-tool override always wins, even with auto-tune on and even on a scale-gated batch — set it when you want a fixed threshold that neither the tuner nor the gate should move.
 
 ## End-to-end Surface Call
 
@@ -553,6 +554,8 @@ Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting.
 
 **Per-tool override wins:** if `context_tools.<name>.min_score` is set, auto-tune is skipped for that tool entirely — the tuner is not consulted and does not learn from its feedback (see [`min_score` precedence](#per-tool-templates)).
 
+**Scale-gated batches don't tune:** the tuner moves an RRF-calibrated threshold, so on a batch suspended by `scale_gated_min_score` (core-named non-RRF `score_scale`) `maybe_adjust` is skipped, and the rating ratios above are computed only from feedback earned on RRF-stamped or unstamped surfacings — ratings earned under pass-all filtering measure a different policy on a different scale and are excluded from the tuner's evidence.
+
 **Search boost from feedback**: when you rate memories as "helpful", their `access_count` is incremented in the core search index (once per surfacing event, capped at `max_boost=1.5`). This creates a positive feedback loop where useful memories rank higher in future searches.
 
 Check effectiveness with `stm_surfacing_stats`:
@@ -659,17 +662,25 @@ hit:
   Cores newer than v0.3.11 name the scale their scores are on
   (`score_scale`: `rrf` / `bm25` / `dense` / `none` / `rerank`, core
   #1781) in structured `mem_search` output, and STM stamps it onto every
-  parsed result. When the core names a **non-RRF** scale while the
-  ceiling sits below `min_score`, the mismatch is definitive — the
-  threshold is calibrated against RRF — so STM fires the warning on the
-  **first** observation (no five-call streak) and persists
-  `score_scale_mismatch` instead. `stm_surfacing_stats` shows the last
-  core-reported scale as a `Score scale:` line, the reranker model ID
-  when one is active, and each event row records its scale in
-  `stm_feedback.db`. Compose bundles and the compact format carry no
-  scale today (compose is tracked in core memtomem#1791), so those paths
-  keep the streak heuristic. In this release the scale is
-  observability-only: `min_score` filtering itself is unchanged.
+  parsed result. A core-named **non-RRF** scale normally suspends the
+  filter instead of fighting it (`scale_gated_min_score`, default on) —
+  the batch passes through bounded by `max_results`, and the first
+  suspended batch also marks any lingering `score_scale_mismatch` /
+  `score_ceiling_below_min` episode recovered. The definitive
+  `score_scale_mismatch` diagnostic therefore fires only when the filter
+  **actually applies** to a named non-RRF scale: a per-tool
+  `context_tools.<name>.min_score` pin is present, or
+  `scale_gated_min_score=false` — then STM warns on the **first**
+  below-threshold observation (no five-call streak, the threshold is
+  calibrated against RRF) and persists `score_scale_mismatch`.
+  `stm_surfacing_stats` shows the last core-reported scale as a
+  `Score scale:` line (annotated when the filter is suspended), the
+  reranker model ID when one is active, and each event row records its
+  scale in `stm_feedback.db`. Compose bundles and the compact format
+  carry no scale today (compose is tracked in core memtomem#1791), so
+  those paths keep unconditional filtering and the streak heuristic —
+  on a compose-capable core the gate only covers the legacy `mem_search`
+  fallback path until #1791 lands.
 - `no_results_dedup` — every result was already surfaced this
   session and dropped by `_surfaced_ids`. Distinct from
   `no_results_score` so an operator can tell whether to lower

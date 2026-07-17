@@ -317,6 +317,61 @@ class TestFeedbackStore:
         assert ratio is not None
         assert abs(ratio - 0.6) < 0.01
 
+    def test_ratio_excludes_feedback_from_nonrrf_scale_events(
+        self, feedback_store: FeedbackStore
+    ):
+        """AutoTuner-facing ratios move an RRF-calibrated threshold, so
+        feedback earned on a scale-gated (core-named non-RRF) surfacing must
+        not count; rrf-stamped and unstamped events keep counting."""
+        feedback_store.record_surfacing(
+            "s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf"
+        )
+        feedback_store.record_surfacing("s-bare", "sv", "t", "q2", ["m2"], [0.02])
+        feedback_store.record_surfacing(
+            "s-rr", "sv", "t", "q3", ["m3"], [-0.17], score_scale="rerank"
+        )
+        for _ in range(10):
+            feedback_store.record_feedback("s-rrf", "not_relevant")
+            feedback_store.record_feedback("s-bare", "helpful")
+        # 20 more not_relevant on the rerank event — would drag the ratio to
+        # 0.75 if pass-all-scale feedback leaked into the tuner's evidence.
+        for _ in range(20):
+            feedback_store.record_feedback("s-rr", "not_relevant")
+
+        ratio = feedback_store.get_tool_not_relevant_ratio("t", min_samples=20)
+        assert ratio is not None
+        assert abs(ratio - 0.5) < 0.01
+
+    def test_global_ratio_excludes_nonrrf_but_keeps_orphaned_feedback(
+        self, feedback_store: FeedbackStore
+    ):
+        """The global (tool=None) cold-start fallback applies the same scale
+        scoping, while feedback whose events row was aged out by retention
+        (LEFT JOIN → NULL scale) keeps counting as before."""
+        feedback_store.record_surfacing(
+            "s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf"
+        )
+        feedback_store.record_surfacing(
+            "s-rr", "sv", "t", "q2", ["m2"], [-0.17], score_scale="rerank"
+        )
+        feedback_store.record_surfacing("s-gone", "sv", "t", "q3", ["m3"], [0.02])
+        for _ in range(10):
+            feedback_store.record_feedback("s-rrf", "not_relevant")
+            feedback_store.record_feedback("s-gone", "helpful")
+        for _ in range(30):
+            feedback_store.record_feedback("s-rr", "not_relevant")
+        # Orphan s-gone's feedback: simulate the retention sweep deleting the
+        # events row while its feedback rows survive.
+        assert feedback_store._db is not None
+        feedback_store._db.execute("DELETE FROM surfacing_events WHERE id = ?", ("s-gone",))
+        feedback_store._db.commit()
+
+        ratio = feedback_store.get_tool_not_relevant_ratio(None, min_samples=20)
+        assert ratio is not None
+        # 10 not_relevant / (10 rrf + 10 orphaned) — the 30 rerank ratings
+        # are out of the denominator too.
+        assert abs(ratio - 0.5) < 0.01
+
     def test_negative_feedback_counts_distinct_surfacing_events(
         self, feedback_store: FeedbackStore
     ):
