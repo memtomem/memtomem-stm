@@ -9,6 +9,7 @@ from typing import Any
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import VALID_RATINGS
+from memtomem_stm.surfacing.mcp_client import KNOWN_SCORE_SCALES
 
 # Header for the optional scratch / working-memory section. Shared between the
 # render site and the truncation orphan-trim so the two cannot drift.
@@ -251,7 +252,22 @@ class SurfacingFormatter:
                     snippet = self._sanitize(ctx.window_after[0].content, max_chars=budget)
                     preview = preview + " | " + snippet + "..."
 
-            bucket = self._relevance_bucket(float(r.score), score_floor)
+            # The [weak|related|strong] bucket partitions the [floor, 1.0]
+            # band, which only means anything on the RRF scale ((0, ~0.033])
+            # the floor was calibrated for. When THIS result is stamped with a
+            # core-named non-RRF scale (e.g. rerank logits — unbounded, median
+            # negative) the band math is wrong regardless of filtering policy,
+            # so the tag is suppressed. Keyed per result off the stamp — not
+            # off gate config or pins — so cache hits and pinned-min_score
+            # tools stay consistent with the scores they actually carry;
+            # unstamped (compose, compact, pre-#1781 cores) and unrecognized
+            # labels keep the bucket exactly as before.
+            scale = getattr(r, "score_scale", None)
+            if isinstance(scale, str) and scale in KNOWN_SCORE_SCALES and scale != "rrf":
+                bucket_token = ""
+            else:
+                bucket = self._relevance_bucket(float(r.score), score_floor)
+                bucket_token = f" [{bucket}]"
             # The backticked ``chunk.id`` is the agent-copyable ``memory_id``
             # for ``stm_surfacing_feedback(ratings=...)`` (EN-2/3). It sits
             # before the ``[bucket]: `` marker so the preview parse (and the
@@ -264,7 +280,7 @@ class SurfacingFormatter:
             cid = getattr(chunk, "id", None)
             cid_text = str(cid) if cid is not None else ""
             id_token = f" `{cid_text}`" if _MEMORY_ID_RE.fullmatch(cid_text) else ""
-            lines.append(f"- **{source}**{ns_badge}{id_token} [{bucket}]: {preview}")
+            lines.append(f"- **{source}**{ns_badge}{id_token}{bucket_token}: {preview}")
             body_ids.append(cid_text or None)
 
         if scratch_items:

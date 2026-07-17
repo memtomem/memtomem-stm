@@ -1032,6 +1032,14 @@ class FeedbackStore:
         ratings: tuple[str, ...],
         min_samples: int,
     ) -> float | None:
+        # AutoTuner-facing ratios count only feedback earned on RRF or
+        # unstamped surfacings: the tuner moves an RRF-calibrated threshold,
+        # and ratings earned on a scale-gated (pass-all) batch measure a
+        # different filtering policy on a different scale. The LEFT JOIN +
+        # IS NULL keeps two row classes counting as before: events rows with
+        # no reported scale, and orphaned feedback whose events row was aged
+        # out by retention.
+        scale_pred = "(e.score_scale IS NULL OR e.score_scale = 'rrf')"
         if self._db is None:
             return None
 
@@ -1040,7 +1048,7 @@ class FeedbackStore:
             total = self._db.execute(
                 "SELECT COUNT(*) FROM surfacing_feedback f "
                 "JOIN surfacing_events e ON f.surfacing_id = e.id "
-                "WHERE e.tool = ?",
+                f"WHERE e.tool = ? AND {scale_pred}",
                 (tool,),
             ).fetchone()[0]
             if total < min_samples:
@@ -1048,15 +1056,21 @@ class FeedbackStore:
             matching = self._db.execute(
                 "SELECT COUNT(*) FROM surfacing_feedback f "
                 "JOIN surfacing_events e ON f.surfacing_id = e.id "
-                f"WHERE e.tool = ? AND f.rating IN ({placeholders})",
+                f"WHERE e.tool = ? AND {scale_pred} AND f.rating IN ({placeholders})",
                 (tool, *ratings),
             ).fetchone()[0]
         else:
-            total = self._db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()[0]
+            total = self._db.execute(
+                "SELECT COUNT(*) FROM surfacing_feedback f "
+                "LEFT JOIN surfacing_events e ON f.surfacing_id = e.id "
+                f"WHERE {scale_pred}",
+            ).fetchone()[0]
             if total < min_samples:
                 return None
             matching = self._db.execute(
-                f"SELECT COUNT(*) FROM surfacing_feedback WHERE rating IN ({placeholders})",
+                "SELECT COUNT(*) FROM surfacing_feedback f "
+                "LEFT JOIN surfacing_events e ON f.surfacing_id = e.id "
+                f"WHERE {scale_pred} AND f.rating IN ({placeholders})",
                 ratings,
             ).fetchone()[0]
         return matching / total if total > 0 else 0.0

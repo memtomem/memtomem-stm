@@ -13,6 +13,33 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- Surfacing now suspends the RRF-calibrated `min_score` filter when the core
+  names a foreign score scale. `min_score` (default 0.03) and the auto-tuner
+  are calibrated against RRF fusion scores (`(0, ~0.033]`); on a batch whose
+  core-reported `score_scale` (#727) is a known non-RRF label
+  (`bm25`/`dense`/`none`/`rerank` — e.g. raw cross-encoder logits with a
+  negative median), no fixed constant is meaningful, so the global/auto-tuned
+  floor is not applied (results stay bounded by `max_results`) and auto-tune
+  pauses: `maybe_adjust` skips the batch and the tuner's rating ratios count
+  only feedback earned on RRF-stamped or unstamped surfacings. Per-tool
+  `context_tools.<name>.min_score` pins always keep the filter active; the
+  relevance-bucket tags (`[weak]`/`[related]`/`[strong]`) are suppressed for
+  results stamped with a non-RRF scale (the `[min_score, 1.0]` band math only
+  holds on RRF); the first suspended batch marks a lingering
+  `score_scale_mismatch`/`score_ceiling_below_min` episode recovered, so the
+  `score_scale_mismatch` diagnostic and `mms doctor`'s `ltm_score_scale` FAIL
+  now occur exactly when the filter actually applies (pin present, or gate
+  disabled). New `surfacing.scale_gated_min_score` bool
+  (`MEMTOMEM_STM_SURFACING__SCALE_GATED_MIN_SCORE`, default `true`); set
+  `false` to restore unconditional filtering. Unstamped batches (compose
+  bundles until core #1791, `compact` format, pre-#1781 cores) and
+  unrecognized labels behave exactly as before, so on compose-capable cores
+  the gate covers the legacy `mem_search` fallback path only.
+  **Behavior change**: on a core reporting a non-RRF scale, surfacing now
+  typically injects up to `max_results` memories per call where it previously
+  filtered most or all of them out on an incommensurable threshold — dedup
+  and feedback demotion remain the quality controls. (#730)
+
 - Surfacing now reads the score scale the core names in structured
   `mem_search` output (`score_scale`: `rrf`/`bm25`/`dense`/`none`/`rerank`
   plus the active `reranker` model ID, core #1781, first available in the

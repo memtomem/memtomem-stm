@@ -35,6 +35,9 @@ class FakeChunk:
 class FakeResult:
     chunk: FakeChunk
     score: float
+    # Core-reported scale stamp (#1781). Default mirrors the unstamped paths
+    # (compact format, compose bundles, pre-#1781 cores).
+    score_scale: str | None = None
 
 
 def _preview_line_after_bucket(output: str, bucket: str = "related") -> str:
@@ -222,6 +225,39 @@ class TestFormatterInjection:
 
         assert "- **notes/test.md** [default] `f-weak` [weak]: near active floor" in output
         assert "[strong]" not in output
+
+    def test_bucket_suppressed_for_known_nonrrf_scale(self):
+        """The [weak|related|strong] band partitions [floor, 1.0], which only
+        holds on the RRF scale — a result stamped with a core-named non-RRF
+        scale (rerank logits can be negative, bm25 is unbounded) renders
+        without a bucket tag, keyed per result off the stamp."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [
+            FakeResult(FakeChunk(content="logit hit", id="s-rerank"), -0.17, score_scale="rerank"),
+            FakeResult(FakeChunk(content="bm25 hit", id="s-bm25"), 7.3, score_scale="bm25"),
+        ]
+        output = fmt.inject("response", results, "query")
+        assert "- **notes/test.md** [default] `s-rerank`: logit hit" in output
+        assert "- **notes/test.md** [default] `s-bm25`: bm25 hit" in output
+        for tag in ("[weak]", "[related]", "[strong]"):
+            assert tag not in output
+
+    def test_bucket_kept_for_rrf_unstamped_and_unknown_labels(self):
+        """Only a KNOWN non-RRF stamp suppresses: an explicit rrf stamp, an
+        unstamped result, and an unrecognized future label all keep the
+        bucket exactly as before."""
+        fmt = SurfacingFormatter(SurfacingConfig())
+        results = [
+            FakeResult(FakeChunk(content="rrf hit", id="k-rrf"), 0.95, score_scale="rrf"),
+            FakeResult(FakeChunk(content="unstamped hit", id="k-bare"), 0.95),
+            FakeResult(
+                FakeChunk(content="future hit", id="k-future"), 0.95, score_scale="cosine9000"
+            ),
+        ]
+        output = fmt.inject("response", results, "query")
+        assert "`k-rrf` [strong]: rrf hit" in output
+        assert "`k-bare` [strong]: unstamped hit" in output
+        assert "`k-future` [strong]: future hit" in output
 
     def test_source_renders_parent_and_basename(self):
         fmt = SurfacingFormatter(SurfacingConfig())

@@ -201,6 +201,26 @@ class SurfacingConfig(BaseModel):
     the key is silently withheld, so ``False``/``True`` degrade to today's
     behavior instead of tripping the server's argument validation. Env:
     ``MEMTOMEM_STM_SURFACING__RERANK`` (``true`` / ``false`` / ``none``)."""
+    scale_gated_min_score: bool = True
+    """Suspend the RRF-calibrated score filter when the core names a
+    foreign scale. ``min_score`` and the auto-tuner are calibrated against
+    RRF fusion scores (``(0, ~0.033]``); when a batch's core-reported
+    ``score_scale`` (#1781) is a known non-RRF label (``bm25`` / ``dense``
+    / ``none`` / ``rerank`` — e.g. raw cross-encoder logits spanning
+    negative values), no fixed constant is meaningful, so the
+    global/auto-tuned floor is not applied to that batch (results still
+    bounded by ``max_results``) and auto-tune pauses — ``maybe_adjust``
+    skips the batch and rating ratios only count feedback earned on
+    rrf/unstamped surfacings.
+
+    A per-tool ``context_tools.<tool>.min_score`` pin always applies —
+    explicit operator intent wins over the gate. Batches with no reported
+    scale (compose bundles until core #1791, ``compact`` format, pre-#1781
+    cores) or an unrecognized label keep today's unconditional filtering,
+    so on compose-capable cores the gate only covers the legacy
+    ``mem_search`` fallback path. Set ``False`` to restore unconditional
+    filtering on every scale. Env:
+    ``MEMTOMEM_STM_SURFACING__SCALE_GATED_MIN_SCORE``."""
 
     @field_validator("rerank", mode="before")
     @classmethod

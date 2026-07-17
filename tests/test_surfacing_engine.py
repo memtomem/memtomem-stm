@@ -3479,8 +3479,11 @@ class TestScoreScaleDiagnostic:
 
 class TestReportedScoreScale:
     """Core-reported ``score_scale`` (#1781): definitive mismatch diagnostic,
-    telemetry threading, and the stats snapshot. Observability only — the
-    min_score filter itself stays scale-blind in this change."""
+    telemetry threading, and the stats snapshot. These call
+    ``_observe_score_scale`` directly with the default
+    ``filter_suspended=False`` — i.e. the filter-applies path (gate disabled
+    or per-tool pin); the scale gate itself is covered by
+    ``TestScaleGatedMinScore``."""
 
     @staticmethod
     def _low(scale: str | None, *, reranker: str | None = None, score: float = -0.17):
@@ -3600,10 +3603,12 @@ class TestReportedScoreScale:
         assert len(warnings) == 2  # fired, recovered, fired again
 
     def test_mismatch_remedy_is_scale_specific(self, caplog):
-        """Finding #2: a 'rerank' label points at surfacing.rerank; other
-        non-RRF labels only prescribe a per-tool pin (rerank bypass is
-        irrelevant to bm25/dense/none), and neither prescribes a core upgrade
-        (score_scale only exists on already-bypass-capable cores)."""
+        """A 'rerank' label points at surfacing.rerank; other non-RRF labels
+        don't mention it (rerank bypass is irrelevant to bm25/dense/none).
+        Neither prescribes a core upgrade (score_scale only exists on
+        already-bypass-capable cores) nor a per-tool pin (the pin is clamped
+        to [0, 1] and cannot express e.g. a logit scale) — with no pin
+        present the remedy is the scale gate."""
         with caplog.at_level(logging.WARNING):
             self._engine(tracker=MagicMock())._observe_score_scale(
                 "gh", "read_file", self._low("rerank"), 0.03
@@ -3618,8 +3623,32 @@ class TestReportedScoreScale:
         }
         assert "check surfacing.rerank" in msgs["rerank"]
         assert "check surfacing.rerank" not in msgs["bm25"]
-        assert "pin context_tools.<tool>.min_score" in msgs["bm25"]
+        assert "scale_gated_min_score" in msgs["bm25"]
+        assert not any("pin context_tools" in m for m in msgs.values())
         assert not any("upgrade" in m for m in msgs.values())
+
+    def test_mismatch_remedy_names_the_pin_when_pinned(self, caplog):
+        """With a per-tool pin keeping the filter active on a foreign scale,
+        the remedy names the pin (adjust/remove) instead of suggesting the
+        gate — the gate would not apply while the pin exists."""
+        config = _make_config(
+            min_score=0.03,
+            dedup_ttl_seconds=0,
+            stats_retention_days=0,
+            context_tools={"read_file": {"min_score": 0.5}},
+        )
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=MagicMock(),
+        )
+        with caplog.at_level(logging.WARNING):
+            engine._observe_score_scale("gh", "read_file", self._low("bm25"), 0.5)
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert len(warnings) == 1
+        assert "context_tools.read_file.min_score pin" in warnings[0]
+        assert "adjust or remove the pin" in warnings[0]
+        assert "scale_gated_min_score=true" not in warnings[0]
 
     def test_mismatch_latch_survives_empty_results(self):
         """Alternating empty/below-threshold searches must not re-fire."""
@@ -3665,13 +3694,23 @@ class TestReportedScoreScale:
         ]
         engine = self._engine(results=surfaced)
         snap = engine.get_min_score_snapshot()
-        assert snap["score_scale"] == {"last_reported": None, "reranker": None}
+        assert snap["score_scale"] == {
+            "last_reported": None,
+            "reranker": None,
+            "gate_enabled": True,
+            "filter_suspended": False,
+        }
 
         await engine.surface(
             "gh", "read_file", {"_context_query": "snapshot scale query"}, LONG_RESPONSE
         )
         snap = engine.get_min_score_snapshot()
-        assert snap["score_scale"] == {"last_reported": "rerank", "reranker": "fake-rr"}
+        assert snap["score_scale"] == {
+            "last_reported": "rerank",
+            "reranker": "fake-rr",
+            "gate_enabled": True,
+            "filter_suspended": True,
+        }
 
     async def test_unstamped_search_keeps_last_reported_scale(self):
         """Compose/compact traffic (no stamp) must not flip the line to unknown."""
@@ -3700,6 +3739,278 @@ class TestReportedScoreScale:
         assert snap["score_scale"]["last_reported"] == "rrf"
         # The unstamped row still records honestly: its own scale is unknown.
         assert tracker.record_surfacing.call_args.kwargs["score_scale"] is None
+
+
+class TestScaleGatedMinScore:
+    """Scale gate (``scale_gated_min_score``, the #1781-adoption follow-up):
+    a core-named non-RRF scale suspends the RRF-calibrated global/auto-tuned
+    ``min_score`` filter (pass-all, bounded by ``max_results``) and pauses
+    auto-tune learning. Per-tool pins always keep the filter active;
+    absent/unrecognized labels and the escape hatch keep today's
+    unconditional filtering."""
+
+    @staticmethod
+    def _engine(results, *, tracker=None, observability=None, **cfg_overrides):
+        return SurfacingEngine(
+            config=_make_config(**cfg_overrides),
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+            observability=observability,
+        )
+
+    @pytest.mark.parametrize("scale", ["rerank", "bm25", "dense", "none"])
+    async def test_known_nonrrf_scale_suspends_min_score_filter(self, scale):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="below rrf floor"), score=0.001, score_scale=scale
+            )
+        ]
+        engine = self._engine(results, min_score=0.02)
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "below rrf floor" in out
+
+    async def test_negative_logit_scores_pass_when_suspended(self):
+        """Rerank logits have a NEGATIVE median (−0.17); the gate must not
+        reintroduce any floor a logit could sit under."""
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="negative logit"), score=-0.17, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02)
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "negative logit" in out
+
+    async def test_suspended_filter_still_caps_at_max_results(self):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content=f"gatecap{i}"), score=-1.0 - i, score_scale="rerank"
+            )
+            for i in range(6)
+        ]
+        engine = self._engine(results, min_score=0.02, max_results=3)
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert sum(f"gatecap{i}" in out for i in range(6)) == 3
+
+    async def test_nonfinite_scores_dropped_even_when_suspended(self):
+        """Pass-all must keep the finite guard the ``>=`` comparison used to
+        provide: a NaN score is never injected."""
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="nan scored"), score=float("nan"), score_scale="rerank"
+            ),
+            FakeSearchResult(
+                chunk=FakeChunk(content="finite scored"), score=-0.5, score_scale="rerank"
+            ),
+        ]
+        engine = self._engine(results, min_score=0.02)
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert "finite scored" in out
+        assert "nan scored" not in out
+
+    async def test_pinned_tool_min_score_still_filters_nonrrf_scale(self):
+        """A per-tool pin is explicit operator intent: the filter stays
+        active on a foreign scale, and the definitive mismatch diagnostic
+        still fires (the filter genuinely applies)."""
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        tracker = MagicMock()
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="under the pin"), score=0.1, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(
+            results,
+            tracker=tracker,
+            min_score=0.02,
+            context_tools={"read_file": ToolSurfacingConfig(min_score=0.5)},
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+
+    async def test_escape_hatch_off_restores_filtering(self):
+        tracker = MagicMock()
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="foreign scale"), score=0.001, score_scale="bm25"
+            )
+        ]
+        engine = self._engine(
+            results, tracker=tracker, min_score=0.02, scale_gated_min_score=False
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+
+    async def test_absent_scale_behavior_unchanged(self):
+        results = [FakeSearchResult(chunk=FakeChunk(content="unstamped"), score=0.001)]
+        engine = self._engine(results, min_score=0.02)
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+
+    async def test_rrf_scale_behavior_unchanged(self):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="rrf below floor"), score=0.001, score_scale="rrf"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02)
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert out == LONG_RESPONSE
+
+    async def test_unrecognized_scale_behavior_unchanged(self):
+        """An unrecognized label keeps unconditional filtering AND stays on
+        the heuristic streak tier — the gate never guesses."""
+        tracker = MagicMock()
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="future scale"), score=0.001, score_scale="cosine9000"
+            )
+        ]
+        engine = self._engine(results, tracker=tracker, min_score=0.02)
+        for i in range(5):
+            out = await engine.surface(
+                "gh", "read_file", {"_context_query": f"unrecognized scale query {i}"}, LONG_RESPONSE
+            )
+            assert out == LONG_RESPONSE
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+
+    async def test_auto_tune_learning_skipped_on_suspended_batch(self):
+        """``maybe_adjust`` must not learn on a suspended batch (the tuner is
+        RRF-calibrated); an rrf-stamped batch still learns."""
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="suspended batch"), score=0.5, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02)
+        tuner = MagicMock()
+        tuner.get_effective_min_score = MagicMock(return_value=0.02)
+        engine._auto_tuner = tuner
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tuner.maybe_adjust.assert_not_called()
+
+        engine._mcp_adapter.search = AsyncMock(
+            return_value=(
+                [
+                    FakeSearchResult(
+                        chunk=FakeChunk(content="rrf batch"), score=0.5, score_scale="rrf"
+                    )
+                ],
+                [],
+                "ok",
+            )
+        )
+        await engine.surface(
+            "gh", "read_file", {"_context_query": "rrf control query"}, LONG_RESPONSE
+        )
+        tuner.maybe_adjust.assert_called_once_with("read_file")
+
+    def test_suspended_batch_resets_streak_and_persists_recovery_once(self):
+        tracker = MagicMock()
+        engine = self._engine([], tracker=tracker, min_score=0.03)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
+
+        # Open an episode via the filter-applies path (gate off / pin).
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        tracker.record_diagnostic.assert_called_once()
+
+        # Suspended observations close it once, not per batch.
+        engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
+        engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
+        recoveries = [c.args[2] for c in tracker.record_diagnostic_recovery.call_args_list]
+        assert recoveries.count("score_scale_mismatch") == 1
+        assert recoveries.count("score_ceiling_below_min") == 1
+        assert ("gh", "read_file") not in engine._score_scale_mismatch_active
+        assert ("gh", "read_file") not in engine._score_scale_streaks
+
+    def test_suspended_recovery_retries_without_tracker(self):
+        """With no tracker the recovery write returns False, so the
+        once-per-key latch must NOT arm — a tracker attached later (or the
+        daemon path) still gets the recovery."""
+        engine = self._engine([], min_score=0.03)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
+        engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
+        assert ("gh", "read_file") not in engine._scale_gate_recovery_persisted
+
+    async def test_no_results_dedup_label_when_suspended_and_all_deduped(self):
+        """With the filter suspended an empty outcome cannot be score-caused;
+        session dedup must classify as ``no_results_dedup``."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        obs = SurfacingObservability()
+        chunk = FakeChunk(content="dup memory")
+        results = [FakeSearchResult(chunk=chunk, score=-0.5, score_scale="rerank")]
+        engine = self._engine(results, observability=obs, min_score=0.02)
+
+        out1 = await engine.surface(
+            "gh", "read_file", {"_context_query": "first dedup query"}, LONG_RESPONSE
+        )
+        assert "dup memory" in out1
+        out2 = await engine.surface(
+            "gh", "read_file", {"_context_query": "second dedup query"}, LONG_RESPONSE
+        )
+        assert out2 == LONG_RESPONSE
+        skips = obs.snapshot()["skip_reasons"]["read_file"]
+        assert skips.get("no_results_dedup") == 1
+        assert "no_results_score" not in skips
+
+    async def test_suspension_logs_info_once(self, caplog):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="logged memory"), score=-0.5, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02)
+        with caplog.at_level(logging.INFO):
+            await engine.surface(
+                "gh", "read_file", {"_context_query": "first log query"}, LONG_RESPONSE
+            )
+            await engine.surface(
+                "gh", "read_file", {"_context_query": "second log query"}, LONG_RESPONSE
+            )
+        suspended_infos = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "min_score filter suspended" in r.message
+        ]
+        assert len(suspended_infos) == 1
+
+    async def test_snapshot_reports_gate_disabled(self):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02, scale_gated_min_score=False)
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        snap = engine.get_min_score_snapshot()
+        assert snap["score_scale"]["gate_enabled"] is False
+        assert snap["score_scale"]["filter_suspended"] is False
+
+    async def test_cache_hit_stays_suspended_and_bucket_free(self):
+        """Cached results retain their scale stamps, so the hit render is
+        identical to the miss: injected, and bucket tags suppressed."""
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="logit memory"), score=-0.5, score_scale="rerank"
+            )
+        ]
+        adapter = _make_mcp_adapter(results)
+        engine = SurfacingEngine(config=_make_config(min_score=0.02), mcp_adapter=adapter)
+
+        out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert adapter.search.call_count == 1
+        for out in (out1, out2):
+            assert "logit memory" in out
+            for tag in ("[weak]", "[related]", "[strong]"):
+                assert tag not in out
 
 
 class TestSurfacingEngineObservability:

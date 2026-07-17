@@ -1415,7 +1415,14 @@ async def stm_surfacing_stats(
             if last_reported:
                 reranker_id = scale_info.get("reranker")
                 reranker_note = f"; reranker: {reranker_id}" if reranker_id else ""
-                lines.append(f"Score scale:     {last_reported} (core-reported{reranker_note})")
+                gate_note = (
+                    "; min_score filter suspended for unpinned tools"
+                    if scale_info.get("filter_suspended")
+                    else ""
+                )
+                lines.append(
+                    f"Score scale:     {last_reported} (core-reported{reranker_note}{gate_note})"
+                )
             else:
                 lines.append("Score scale:     unknown (core did not report one)")
             visible_adjusted = (

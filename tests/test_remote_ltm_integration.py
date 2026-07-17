@@ -128,6 +128,42 @@ async def test_score_scale_stamped_over_real_mcp_boundary():
 
 
 @pytest.mark.asyncio
+async def test_scale_gate_suspends_filter_over_real_mcp_boundary():
+    """Scale gate end-to-end: a core naming a non-RRF scale over the real
+    stdio MCP boundary gets its results injected past a min_score that would
+    filter them (0.95 > the fake's 0.92/0.87 scores), with relevance-bucket
+    tags suppressed; the escape hatch restores today's filtering."""
+    base = _stdio_config()
+    gated = base.model_copy(
+        update={
+            "min_score": 0.95,
+            "ltm_mcp_args": [str(_FAKE_SERVER), "--score-scale", "rerank"],
+        }
+    )
+    adapter = McpClientSearchAdapter(gated)
+    await adapter.start()
+    try:
+        engine = SurfacingEngine(gated, mcp_adapter=adapter)
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+    finally:
+        await adapter.stop()
+    assert "Relevant Memories" in output, output
+    assert "JWT authentication" in output
+    for tag in ("[weak]", "[related]", "[strong]"):
+        assert tag not in output
+
+    hatch_off = gated.model_copy(update={"scale_gated_min_score": False})
+    adapter = McpClientSearchAdapter(hatch_off)
+    await adapter.start()
+    try:
+        engine = SurfacingEngine(hatch_off, mcp_adapter=adapter)
+        output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+    finally:
+        await adapter.stop()
+    assert output == LONG_RESPONSE
+
+
+@pytest.mark.asyncio
 async def test_increment_access_via_remote_stdio_mcp_server():
     """McpClientSearchAdapter.increment_access reaches the fake mem_do handler.
 
