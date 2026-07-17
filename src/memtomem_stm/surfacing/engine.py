@@ -354,6 +354,14 @@ class SurfacingEngine:
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counter for advisory pipeline diagnostics."""
+        # A newly opened episode re-arms the scale-gate recovery latch: the
+        # next suspended batch must re-attempt the recovery UPDATE that closes
+        # THIS episode, not skip it because an EARLIER episode was already
+        # recovered. Mirrors ``_score_scale_recovery_persisted``'s discard on
+        # every below-threshold observation. Fires before the tracker guard so
+        # the in-memory latch stays correct regardless of persistence backend
+        # (a trackerless engine never arms the latch, so this is a no-op there).
+        self._scale_gate_recovery_persisted.discard((server, tool))
         if self._feedback_tracker is None:
             return
         try:

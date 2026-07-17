@@ -3929,6 +3929,36 @@ class TestScaleGatedMinScore:
         assert ("gh", "read_file") not in engine._score_scale_mismatch_active
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
+    def test_suspend_recovers_episode_opened_after_the_latch_armed(self):
+        """The once-per-key recovery latch must re-arm when a NEW episode
+        opens after a suspended batch already armed it — otherwise a tool
+        alternating rerank (suspend) and rrf/unstamped low-score (streak)
+        batches leaves the re-opened episode stuck FAILing in mms doctor."""
+        tracker = MagicMock()
+        engine = self._engine([], tracker=tracker, min_score=0.03)
+        rerank_low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
+        unstamped_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
+
+        # First suspended batch arms the latch (no episode open yet → the
+        # recovery UPDATEs are no-ops, but they "succeed" on a MagicMock).
+        engine._observe_score_scale("gh", "read_file", rerank_low, 0.03, filter_suspended=True)
+        assert ("gh", "read_file") in engine._scale_gate_recovery_persisted
+
+        # Five unstamped below-floor batches open a fresh score_ceiling_below_min
+        # — opening it must re-arm (discard) the scale-gate recovery latch.
+        for _ in range(5):
+            engine._observe_score_scale("gh", "read_file", unstamped_low, 0.03)
+        assert ("gh", "read_file") not in engine._scale_gate_recovery_persisted
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_ceiling_below_min"
+        )
+
+        # A later suspended batch must now close the re-opened episode.
+        tracker.record_diagnostic_recovery.reset_mock()
+        engine._observe_score_scale("gh", "read_file", rerank_low, 0.03, filter_suspended=True)
+        recoveries = [c.args[2] for c in tracker.record_diagnostic_recovery.call_args_list]
+        assert "score_ceiling_below_min" in recoveries
+
     def test_suspended_recovery_retries_without_tracker(self):
         """With no tracker the recovery write returns False, so the
         once-per-key latch must NOT arm — a tracker attached later (or the
