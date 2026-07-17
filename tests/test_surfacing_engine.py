@@ -2960,6 +2960,29 @@ class TestWebhookExceptionPaths:
             await asyncio.gather(*pending, return_exceptions=True)
         return engine, output
 
+    async def test_webhook_payload_carries_score_scale(self):
+        """#1781: the surface webhook payload names the core-reported scale."""
+        captured: dict = {}
+
+        async def capture_fire(event, payload):
+            captured.update(payload)
+
+        results = [
+            FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5, score_scale="rerank")
+        ]
+        webhook_manager = MagicMock()
+        webhook_manager.fire = capture_fire
+        engine = SurfacingEngine(
+            config=_make_config(fire_webhook=True),
+            mcp_adapter=_make_mcp_adapter(results),
+            webhook_manager=webhook_manager,
+        )
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        pending = list(engine._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        assert captured["score_scale"] == "rerank"
+
     async def test_webhook_http_error_is_logged_not_raised(self, caplog):
         """fire() raising (simulating HTTP 500) → warning logged, caller unaffected."""
 
@@ -3556,6 +3579,47 @@ class TestReportedScoreScale:
         # Re-arm: a fresh below-threshold observation opens a new episode.
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         assert tracker.record_diagnostic.call_count == 2
+
+    def test_mismatch_rearms_without_tracker(self, caplog):
+        """Finding #3: with no feedback tracker (mms hook / feedback off),
+        _persist_diagnostic_recovery returns False, but a healthy observation
+        must STILL re-arm the definitive-tier log — otherwise the mismatch
+        warns at most once per process while the streak tier re-warns."""
+        engine = self._engine(tracker=None)
+        low = self._low("rerank")
+        healthy = self._low("rerank", score=0.5)
+
+        with caplog.at_level(logging.WARNING):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+            # Latch cleared on the healthy observation despite no persistence.
+            assert ("gh", "read_file") not in engine._score_scale_mismatch_active
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert len(warnings) == 2  # fired, recovered, fired again
+
+    def test_mismatch_remedy_is_scale_specific(self, caplog):
+        """Finding #2: a 'rerank' label points at surfacing.rerank; other
+        non-RRF labels only prescribe a per-tool pin (rerank bypass is
+        irrelevant to bm25/dense/none), and neither prescribes a core upgrade
+        (score_scale only exists on already-bypass-capable cores)."""
+        with caplog.at_level(logging.WARNING):
+            self._engine(tracker=MagicMock())._observe_score_scale(
+                "gh", "read_file", self._low("rerank"), 0.03
+            )
+            self._engine(tracker=MagicMock())._observe_score_scale(
+                "gh", "read_file", self._low("bm25"), 0.03
+            )
+        msgs = {
+            "rerank" if "score_scale='rerank'" in r.message else "bm25": r.message
+            for r in caplog.records
+            if "score-scale mismatch" in r.message
+        }
+        assert "check surfacing.rerank" in msgs["rerank"]
+        assert "check surfacing.rerank" not in msgs["bm25"]
+        assert "pin context_tools.<tool>.min_score" in msgs["bm25"]
+        assert not any("upgrade" in m for m in msgs.values())
 
     def test_mismatch_latch_survives_empty_results(self):
         """Alternating empty/below-threshold searches must not re-fire."""

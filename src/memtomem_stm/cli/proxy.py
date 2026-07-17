@@ -6764,8 +6764,9 @@ def doctor(
                             "FAIL",
                             "core reports a non-RRF score scale while min_score assumes RRF "
                             "(unrecovered score_scale_mismatch episode in the last 7 UTC days)",
-                            "upgrade memtomem past v0.3.11 so the surfacing rerank bypass "
-                            "applies, or pin context_tools.<tool>.min_score to the core's scale",
+                            "if the scale is 'rerank', check surfacing.rerank (default false "
+                            "returns RRF scores); otherwise pin context_tools.<tool>.min_score "
+                            "to the core's scale",
                         )
                     elif isinstance(active, dict) and active.get("score_ceiling_below_min"):
                         check(

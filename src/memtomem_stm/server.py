@@ -1361,6 +1361,17 @@ async def stm_surfacing_stats(
                 "Check the LTM search path / result_format (#560)."
             )
 
+        # #1781: per-scale event counts for the same filtered window. "unknown"
+        # buckets rows the core did not label (pre-#1781 cores, compose bundles,
+        # legacy rows), so the counts sum to events_total. A mix of scales in
+        # one window flags an LTM whose scale shifted mid-window — the exact
+        # miscalibration the score_scale_mismatch diagnostic is about. ``.get``
+        # guards older/mocked stats dicts without the key.
+        ssd = stats.get("score_scale_distribution") or {}
+        if ssd:
+            rendered = ", ".join(f"{label} {count}" for label, count in sorted(ssd.items()))
+            lines.append(f"Score scales:    {rendered}")
+
         # Min score block — show the default, whether auto-tune is on, and any
         # per-tool adjustments AutoTuner has made this process. Surfaced before
         # the per-tool breakdown so the reader can interpret the breakdown's

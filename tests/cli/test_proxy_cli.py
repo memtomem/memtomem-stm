@@ -9233,7 +9233,9 @@ class TestDoctor:
         assert "score_scale_mismatch" in result.output
         # The definitive branch preempts the heuristic wording.
         assert "unrecovered score_ceiling_below_min episode" not in result.output
-        assert "upgrade memtomem past v0.3.11" in result.output
+        # Remedy points at the reachable cause, not an impossible core upgrade.
+        assert "check surfacing.rerank" in result.output
+        assert "upgrade memtomem past v0.3.11" not in result.output
 
     def test_measure_ltm_is_explicitly_forwarded_but_default_is_passive(
         self, runner, config, monkeypatch

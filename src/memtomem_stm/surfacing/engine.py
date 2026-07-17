@@ -88,6 +88,11 @@ the way out. It is bounded because that unwind is not — the reason
 teardown calls this before the adapter's own bounded stop.
 """
 
+_UNSET: Any = object()
+"""Sentinel distinguishing "caller did not pass a derived score scale" from a
+genuine ``None`` (core reported no scale). Lets ``_observe_score_scale`` accept
+the surface hot path's already-derived pair while test/hook callers omit it."""
+
 _SCORE_SCALE_WARNING_STREAK = 5
 """Fresh LTM searches required before warning about a score-scale mismatch.
 
@@ -496,8 +501,14 @@ class SurfacingEngine:
         tool: str,
         results: list[Any],
         min_score: float,
+        scale: str | None | object = _UNSET,
+        reranker: str | None = None,
     ) -> None:
         """Warn once per episode when healthy search scores stay below floor.
+
+        ``scale``/``reranker`` may be passed as the caller's already-derived
+        :meth:`_result_score_scale` pair for *results*, so the surface hot
+        path derives it once; omitted (``_UNSET``) they are derived here.
 
         Empty results and a candidate at/above the active threshold reset the
         episode. A threshold change also resets it so evidence gathered under
@@ -511,6 +522,9 @@ class SurfacingEngine:
         cores) the streak-of-``_SCORE_SCALE_WARNING_STREAK`` heuristic and its
         ``score_ceiling_below_min`` diagnostic behave exactly as before.
         """
+        if scale is _UNSET:
+            scale, reranker = self._result_score_scale(results)
+
         key = (server, tool)
         if not results:
             self._score_scale_streaks.pop(key, None)
@@ -528,34 +542,55 @@ class SurfacingEngine:
                 and self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
             ):
                 self._score_scale_recovery_persisted.add(key)
-            if key in self._score_scale_mismatch_active and self._persist_diagnostic_recovery(
-                server, tool, "score_scale_mismatch"
-            ):
+            # Re-arm the definitive-tier log UNCONDITIONALLY on a healthy
+            # observation — the DB recovery write is best-effort bookkeeping
+            # and must not gate whether a later genuine regression can warn
+            # again. Gating the discard on persistence success (which is
+            # always False when no tracker is attached, e.g. mms hook or
+            # feedback-disabled) would let the mismatch warn at most once per
+            # process, diverging from the streak tier, whose counter resets
+            # here regardless of the DB write.
+            if key in self._score_scale_mismatch_active:
+                self._persist_diagnostic_recovery(server, tool, "score_scale_mismatch")
                 self._score_scale_mismatch_active.discard(key)
             return
 
         self._score_scale_recovery_persisted.discard(key)
 
-        scale, reranker = self._result_score_scale(results)
         if scale is not None and scale in KNOWN_SCORE_SCALES and scale != "rrf":
             # Definitive tier: no streak needed — the core itself says the
             # scores are not on the scale min_score was calibrated against.
             # Unrecognized labels stay on the heuristic tier: a renamed core
             # label must not fire a diagnostic whose wording it may not match.
             if key not in self._score_scale_mismatch_active:
+                # Fix guidance is scale-specific: a "rerank" label under the
+                # default rerank=false means the per-call bypass isn't taking
+                # (surfacing.rerank forcing it, or the core not honoring the
+                # param); bm25/dense/none are unrelated to rerank. Either way
+                # min_score is RRF-calibrated, so a per-tool pin is the
+                # scale-agnostic remedy. Deliberately NOT "upgrade the core":
+                # score_scale only exists on cores that already ship the
+                # bypass, so an upgrade can never be the fix for this fire.
+                if scale == "rerank":
+                    remedy = (
+                        "check surfacing.rerank (default false should return "
+                        "RRF scores; the core may not honor the bypass param) "
+                        "or pin context_tools.<tool>.min_score to this scale"
+                    )
+                else:
+                    remedy = "pin context_tools.<tool>.min_score to this scale"
                 logger.warning(
                     "Surfacing score-scale mismatch for %s/%s: core reports "
                     "score_scale=%r%s but min_score=%.4f is calibrated for the "
                     "RRF scale (observed ceiling=%.4f). Every result is being "
-                    "filtered out; upgrade core past v0.3.11 so STM's rerank "
-                    "bypass applies, or pin a scale-appropriate per-tool "
-                    "min_score. STM did not change the threshold.",
+                    "filtered out; %s. STM did not change the threshold.",
                     server,
                     tool,
                     scale,
                     f" (reranker={reranker})" if reranker else "",
                     min_score,
                     result_max,
+                    remedy,
                 )
                 self._persist_diagnostic(server, tool, "score_scale_mismatch")
                 self._score_scale_mismatch_active.add(key)
@@ -1489,8 +1524,10 @@ class SurfacingEngine:
             raise _DependencyFault(outcome)
 
         retrieved_results = [r for r in results if not getattr(r, "pinned", False)]
-        self._observe_score_scale(server, tool, retrieved_results, min_score)
         score_scale, reranker_id = self._result_score_scale(retrieved_results)
+        self._observe_score_scale(
+            server, tool, retrieved_results, min_score, score_scale, reranker_id
+        )
         if score_scale is not None:
             self._last_score_scale = score_scale
             self._last_reranker = reranker_id

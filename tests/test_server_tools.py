@@ -1033,6 +1033,25 @@ class TestSurfacingStats:
         result = await stm_surfacing_stats(ctx=ctx)
         assert "Score scale:     rrf (core-reported)" in result
 
+    async def test_score_scale_distribution_line_rendered(self):
+        """#1781: get_stats' per-scale event counts render as a `Score scales:`
+        line (engine-independent — it comes from the events store, not the
+        min_score snapshot)."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 3,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [],
+            "rating_distribution": {},
+            "total_feedback": 0,
+            "recent": [],
+            "score_scale_distribution": {"rerank": 2, "unknown": 1},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=None)
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "Score scales:    rerank 2, unknown 1" in result
+
     async def test_need_more_uses_global_gap_when_pool_also_below_threshold(self):
         """When *both* the tool's own and the global pool are below
         ``min_samples``, the "need N more" message surfaces both numbers
