@@ -6841,9 +6841,11 @@ def doctor(
                             "FAIL",
                             "core reports a non-RRF score scale while min_score assumes RRF "
                             "(unrecovered score_scale_mismatch episode in the last 7 UTC days)",
-                            "if the scale is 'rerank', check surfacing.rerank (default false "
-                            "returns RRF scores); otherwise pin context_tools.<tool>.min_score "
-                            "to the core's scale",
+                            "set surfacing.scale_gated_min_score=true (default) to suspend the "
+                            "RRF-calibrated filter on core-named non-RRF scales, or adjust/"
+                            "remove the context_tools.<tool>.min_score pin keeping it active; "
+                            "if the scale is 'rerank', also check surfacing.rerank (default "
+                            "false returns RRF scores)",
                         )
                     elif isinstance(active, dict) and active.get("score_ceiling_below_min"):
                         check(

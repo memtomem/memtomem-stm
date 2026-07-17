@@ -278,6 +278,15 @@ class SurfacingEngine:
         # compose/search flow doesn't flip the stats line to "unknown".
         self._last_score_scale: str | None = None
         self._last_reranker: str | None = None
+        # Keys whose open score-scale episodes were closed by the scale gate
+        # (scale_gated_min_score): the gate suspends the filter, so a
+        # pre-existing ``score_scale_mismatch``/``score_ceiling_below_min``
+        # episode describes a problem that no longer exists. Closed once per
+        # key per process, guarded on persistence success so a trackerless
+        # engine retries (a cheap no-op) instead of never writing.
+        self._scale_gate_recovery_persisted: set[tuple[str, str]] = set()
+        # Warn-once INFO latch for the first suspended batch this process.
+        self._scale_gate_logged: bool = False
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -345,6 +354,14 @@ class SurfacingEngine:
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counter for advisory pipeline diagnostics."""
+        # A newly opened episode re-arms the scale-gate recovery latch: the
+        # next suspended batch must re-attempt the recovery UPDATE that closes
+        # THIS episode, not skip it because an EARLIER episode was already
+        # recovered. Mirrors ``_score_scale_recovery_persisted``'s discard on
+        # every below-threshold observation. Fires before the tracker guard so
+        # the in-memory latch stays correct regardless of persistence backend
+        # (a trackerless engine never arms the latch, so this is a no-op there).
+        self._scale_gate_recovery_persisted.discard((server, tool))
         if self._feedback_tracker is None:
             return
         try:
@@ -503,6 +520,8 @@ class SurfacingEngine:
         min_score: float,
         scale: str | None | object = _UNSET,
         reranker: str | None = None,
+        *,
+        filter_suspended: bool = False,
     ) -> None:
         """Warn once per episode when healthy search scores stay below floor.
 
@@ -521,6 +540,15 @@ class SurfacingEngine:
         Without a reported scale (compose bundles, compact format, pre-#1781
         cores) the streak-of-``_SCORE_SCALE_WARNING_STREAK`` heuristic and its
         ``score_ceiling_below_min`` diagnostic behave exactly as before.
+
+        ``filter_suspended=True`` means the scale gate did not apply
+        ``min_score`` to this batch (:meth:`_scale_gate_suspends`): "below the
+        threshold" carries no evidence when the threshold isn't enforced, and
+        the ``max >= min_score`` healthy comparison is meaningless on e.g. a
+        logit scale — so the batch resets the streak, closes any open episode
+        (the gate itself is the healthy state), and returns. The definitive
+        tier therefore fires exactly when the filter actually applies to a
+        core-named non-RRF scale: gate disabled, or a per-tool pin present.
         """
         if scale is _UNSET:
             scale, reranker = self._result_score_scale(results)
@@ -528,6 +556,25 @@ class SurfacingEngine:
         key = (server, tool)
         if not results:
             self._score_scale_streaks.pop(key, None)
+            return
+
+        if filter_suspended:
+            self._score_scale_streaks.pop(key, None)
+            self._score_scale_mismatch_active.discard(key)
+            if key not in self._scale_gate_recovery_persisted:
+                closed_mismatch = self._persist_diagnostic_recovery(
+                    server, tool, "score_scale_mismatch"
+                )
+                closed_ceiling = self._persist_diagnostic_recovery(
+                    server, tool, "score_ceiling_below_min"
+                )
+                # ``record_diagnostic_recovery`` is a WHERE-guarded UPDATE, so
+                # writing blind is safe when no episode exists; this clears a
+                # stale pre-gate episode so ``mms doctor`` recovers on the
+                # first suspended batch instead of FAILing for the full
+                # 7-day window on a setup the gate just fixed.
+                if closed_mismatch and closed_ceiling:
+                    self._scale_gate_recovery_persisted.add(key)
             return
 
         scores = [float(r.score) for r in results]
@@ -563,22 +610,38 @@ class SurfacingEngine:
             # Unrecognized labels stay on the heuristic tier: a renamed core
             # label must not fire a diagnostic whose wording it may not match.
             if key not in self._score_scale_mismatch_active:
-                # Fix guidance is scale-specific: a "rerank" label under the
-                # default rerank=false means the per-call bypass isn't taking
-                # (surfacing.rerank forcing it, or the core not honoring the
-                # param); bm25/dense/none are unrelated to rerank. Either way
-                # min_score is RRF-calibrated, so a per-tool pin is the
-                # scale-agnostic remedy. Deliberately NOT "upgrade the core":
-                # score_scale only exists on cores that already ship the
-                # bypass, so an upgrade can never be the fix for this fire.
+                # Fix guidance names why the filter still applied: with the
+                # scale gate shipped, this tier only fires when a per-tool
+                # pin keeps the filter active or the gate is disabled — and
+                # a "rerank" label under the default rerank=false also means
+                # the per-call bypass isn't taking (surfacing.rerank forcing
+                # it, or the core not honoring the param). Deliberately NOT
+                # "pin context_tools.<tool>.min_score to this scale": the pin
+                # is clamped to [0, 1] and e.g. rerank logits are unbounded
+                # with a negative median, so a pin cannot express a foreign
+                # scale. And NOT "upgrade the core": score_scale only exists
+                # on cores that already ship the bypass, so an upgrade can
+                # never be the fix for this fire.
+                pin_cfg = self._config.context_tools.get(tool)
+                if pin_cfg is not None and pin_cfg.min_score is not None:
+                    scale_fix = (
+                        f"the context_tools.{tool}.min_score pin keeps the "
+                        "RRF-calibrated filter active on this scale; adjust "
+                        "or remove the pin"
+                    )
+                else:
+                    scale_fix = (
+                        "set surfacing.scale_gated_min_score=true to suspend "
+                        "the filter on core-named non-RRF scales"
+                    )
                 if scale == "rerank":
                     remedy = (
                         "check surfacing.rerank (default false should return "
                         "RRF scores; the core may not honor the bypass param) "
-                        "or pin context_tools.<tool>.min_score to this scale"
+                        "or " + scale_fix
                     )
                 else:
-                    remedy = "pin context_tools.<tool>.min_score to this scale"
+                    remedy = scale_fix
                 logger.warning(
                     "Surfacing score-scale mismatch for %s/%s: core reports "
                     "score_scale=%r%s but min_score=%.4f is calibrated for the "
@@ -695,6 +758,24 @@ class SurfacingEngine:
             return self._auto_tuner.get_effective_min_score(tool)
         return self._config.min_score
 
+    def _scale_gate_suspends(self, tool: str, score_scale: str | None) -> bool:
+        """Return True when this batch's core-reported scale suspends the
+        global/auto-tuned ``min_score`` filter (see
+        ``SurfacingConfig.scale_gated_min_score``).
+
+        Only a KNOWN non-RRF label suspends: an absent scale (compose
+        bundles until core #1791, compact format, pre-#1781 cores) or an
+        unrecognized label keeps unconditional filtering — the gate never
+        guesses. A per-tool ``context_tools.<tool>.min_score`` pin is
+        explicit operator intent and always keeps the filter active.
+        """
+        if not self._config.scale_gated_min_score:
+            return False
+        if score_scale is None or score_scale not in KNOWN_SCORE_SCALES or score_scale == "rrf":
+            return False
+        tool_cfg = self._config.context_tools.get(tool)
+        return tool_cfg is None or tool_cfg.min_score is None
+
     @property
     def injection_mode(self) -> str:
         """Formatter injection mode — ``"prepend"``, ``"append"``, or ``"section"``.
@@ -741,9 +822,19 @@ class SurfacingEngine:
             # Last core-REPORTED scale (#1781): ``None`` means no structured
             # search this process carried the key (pre-#1781 core, compact
             # format, or compose-only traffic) — not that scores are RRF.
+            # ``filter_suspended`` is the process-level summary — "the last
+            # reported scale suspends the filter for unpinned tools" — not a
+            # per-tool verdict (pinned tools always keep the filter).
             "score_scale": {
                 "last_reported": self._last_score_scale,
                 "reranker": self._last_reranker,
+                "gate_enabled": self._config.scale_gated_min_score,
+                "filter_suspended": (
+                    self._config.scale_gated_min_score
+                    and self._last_score_scale is not None
+                    and self._last_score_scale in KNOWN_SCORE_SCALES
+                    and self._last_score_scale != "rrf"
+                ),
             },
         }
 
@@ -1375,11 +1466,7 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
     ) -> str:
-        # min_score precedence: tool_cfg override > auto-tune > global default.
-        # When the operator pins per-tool min_score, skip maybe_adjust so the
-        # tuner doesn't learn a value that will never be applied.
         tool_cfg = self._config.context_tools.get(tool)
-        min_score = self._active_min_score(tool, adjust_auto_tuner=True)
         max_results = (
             tool_cfg.max_results
             if tool_cfg and tool_cfg.max_results
@@ -1525,8 +1612,23 @@ class SurfacingEngine:
 
         retrieved_results = [r for r in results if not getattr(r, "pinned", False)]
         score_scale, reranker_id = self._result_score_scale(retrieved_results)
+        # min_score precedence: tool_cfg override > scale gate > auto-tune >
+        # global default — resolved AFTER retrieval so the gate can see the
+        # batch's core-reported scale (nothing upstream consumes min_score).
+        # maybe_adjust is skipped on a suspended batch so the RRF-calibrated
+        # tuner doesn't move on evidence from a foreign scale; on a pinned
+        # tool ``_active_min_score`` returns the pin before the tuner runs,
+        # so the pre-existing "pinned tools don't learn" behavior holds.
+        filter_suspended = self._scale_gate_suspends(tool, score_scale)
+        min_score = self._active_min_score(tool, adjust_auto_tuner=not filter_suspended)
         self._observe_score_scale(
-            server, tool, retrieved_results, min_score, score_scale, reranker_id
+            server,
+            tool,
+            retrieved_results,
+            min_score,
+            score_scale,
+            reranker_id,
+            filter_suspended=filter_suspended,
         )
         if score_scale is not None:
             self._last_score_scale = score_scale
@@ -1553,7 +1655,36 @@ class SurfacingEngine:
         # ``_render_cached`` re-applies it on the hit path for entries whose
         # memories cross the threshold mid-TTL (e.g. via another process).
         pinned_results = [r for r in results if getattr(r, "pinned", False)]
-        scored = [r for r in retrieved_results if r.score >= min_score]
+        if filter_suspended:
+            # Core-named non-RRF scale: the RRF-calibrated floor does not
+            # apply. Keep the finite guard the ``>=`` comparison used to
+            # provide — a NaN score must not be injected or persisted into
+            # ``surfacing_events.scores``. Volume stays bounded by the
+            # ``max_results`` cap below.
+            scored = [r for r in retrieved_results if math.isfinite(float(r.score))]
+            if not self._scale_gate_logged:
+                self._scale_gate_logged = True
+                logger.info(
+                    "Surfacing min_score filter suspended for %s/%s: core "
+                    "reports score_scale=%r and min_score=%.4f is calibrated "
+                    "for the RRF scale. Results stay bounded by max_results; "
+                    "per-tool context_tools.<tool>.min_score pins still "
+                    "apply; set surfacing.scale_gated_min_score=false to "
+                    "restore unconditional filtering.",
+                    server,
+                    tool,
+                    score_scale,
+                    min_score,
+                )
+            else:
+                logger.debug(
+                    "Scale gate active for %s/%s (score_scale=%r): min_score not applied",
+                    server,
+                    tool,
+                    score_scale,
+                )
+        else:
+            scored = [r for r in retrieved_results if r.score >= min_score]
         demoted_ids = self._feedback_demoted_ids([str(r.chunk.id) for r in scored])
         if demoted_ids:
             logger.debug(
@@ -1599,9 +1730,21 @@ class SurfacingEngine:
                 self._observability.record_skip(tool, "no_results_dedup")
             else:
                 self._observability.record_skip(tool, "no_results_score")
-            logger.debug(
-                "Surfacing: no results above min_score=%.2f for %s/%s", min_score, server, tool
-            )
+            if filter_suspended:
+                logger.debug(
+                    "Surfacing: no results after dedup/demotion for %s/%s "
+                    "(min_score suspended, score_scale=%r)",
+                    server,
+                    tool,
+                    score_scale,
+                )
+            else:
+                logger.debug(
+                    "Surfacing: no results above min_score=%.2f for %s/%s",
+                    min_score,
+                    server,
+                    tool,
+                )
             return response_text
 
         # Record in-memory surfaced IDs EAGERLY — before any await — so a

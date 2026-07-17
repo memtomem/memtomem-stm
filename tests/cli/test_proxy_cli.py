@@ -9279,7 +9279,12 @@ class TestDoctor:
         assert "score_scale_mismatch" in result.output
         # The definitive branch preempts the heuristic wording.
         assert "unrecovered score_ceiling_below_min episode" not in result.output
-        # Remedy points at the reachable cause, not an impossible core upgrade.
+        # Remedy leads with the scale gate (an active episode means the
+        # filter genuinely applied: gate disabled or a per-tool pin), then
+        # the pin, then the rerank-specific check — never an impossible
+        # core upgrade.
+        assert "scale_gated_min_score" in result.output
+        assert "context_tools.<tool>.min_score pin" in result.output
         assert "check surfacing.rerank" in result.output
         assert "upgrade memtomem past v0.3.11" not in result.output
 

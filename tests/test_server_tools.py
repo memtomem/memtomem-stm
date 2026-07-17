@@ -1033,6 +1033,43 @@ class TestSurfacingStats:
         result = await stm_surfacing_stats(ctx=ctx)
         assert "Score scale:     rrf (core-reported)" in result
 
+    async def test_score_scale_line_annotates_suspended_filter(self):
+        """Scale gate: when the engine snapshot says the last-reported scale
+        suspends the filter, the stats line says so."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "events_total": 1,
+            "distinct_tools": 1,
+            "date_range": {"first": 1_700_000_000.0, "last": 1_700_000_999.0},
+            "per_tool_breakdown": [],
+            "rating_distribution": {},
+            "total_feedback": 0,
+            "recent": [],
+        }
+        mock_tracker.store.get_per_tool_feedback_counts.return_value = {}
+        mock_engine = MagicMock()
+        mock_engine.observability = None
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+            "score_scale": {
+                "last_reported": "rerank",
+                "reranker": "fake-rr",
+                "gate_enabled": True,
+                "filter_suspended": True,
+            },
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert (
+            "Score scale:     rerank (core-reported; reranker: fake-rr; "
+            "min_score filter suspended for unpinned tools)" in result
+        )
+
     async def test_score_scale_distribution_line_rendered(self):
         """#1781: get_stats' per-scale event counts render as a `Score scales:`
         line (engine-independent — it comes from the events store, not the
