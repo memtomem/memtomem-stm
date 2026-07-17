@@ -63,6 +63,13 @@ PROTOCOL_VERSION = 7
 # both ``start_server`` and ``open_connection``.
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 
+# Highest ``context_compose`` schema STM understands (core #1796). Single-sources
+# the daemon-side ceiling: the server clamp, the adapter's optimistic default,
+# and its requested-schema fallback all read this so a future bump is one line
+# and the clamp can never drift from the default. The direct McpClient path is
+# not bounded here — it trusts whatever schema the core advertises.
+MAX_CONTEXT_COMPOSE_SCHEMA = 4
+
 OP_SURFACE = "surface"
 OP_LTM_SEARCH = "ltm_search"
 OP_LTM_CONTEXT_COMPOSE = "ltm_context_compose"

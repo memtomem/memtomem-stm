@@ -99,6 +99,38 @@ def _make_mcp_adapter(
     return adapter
 
 
+def _make_compose_adapter(retrieved, *, pinned=(), score_scale=None, reranker=None):
+    """Build an adapter the engine drives through its compose branch.
+
+    The engine only prefers compose when ``capabilities`` is a real
+    :class:`LtmCapabilities` advertising schema >= 2 (an ``AsyncMock``'s
+    auto-generated attribute fails that ``isinstance`` check, which is why the
+    default ``_make_mcp_adapter`` exercises the ``search`` path). ``search`` is
+    wired to explode so a test proves the compose leg actually ran.
+    """
+    from memtomem_stm.surfacing.mcp_client import ContextComposeResult, LtmCapabilities
+
+    adapter = AsyncMock()
+    adapter.capabilities = LtmCapabilities(context_compose_schema=4)
+    adapter.context_compose = AsyncMock(
+        return_value=ContextComposeResult(
+            tuple(pinned), tuple(retrieved), (), (), score_scale, reranker
+        )
+    )
+    adapter.search = AsyncMock(
+        side_effect=AssertionError("compose path must not fall back to search")
+    )
+    return adapter
+
+
+def _remote_result(content, score, *, source="memory.md", score_scale=None, reranker=None):
+    from memtomem_stm.surfacing.mcp_client import RemoteSearchResult
+
+    return RemoteSearchResult(
+        content, score, source=source, score_scale=score_scale, reranker=reranker
+    )
+
+
 LONG_RESPONSE = "x" * 200  # above min_response_chars=10
 
 # Arguments that produce a valid query for ContextExtractor
@@ -4109,6 +4141,81 @@ class TestScaleGatedMinScore:
         assert adapter.search.call_count == 1
         for out in (out1, out2):
             assert "logit memory" in out
+            for tag in ("[weak]", "[related]", "[strong]"):
+                assert tag not in out
+
+
+class TestScaleGateComposePath:
+    """The scale gate and definitive diagnostic key off per-result stamps, so
+    a compose schema-4 core (#1796) that names a non-RRF scale on the bundle
+    envelope drives the same machinery as the ``mem_search`` path — verified
+    over the engine's compose branch, not the search branch."""
+
+    async def test_compose_nonrrf_scale_suspends_filter_and_renders_pinned(self):
+        retrieved = [
+            _remote_result("compose logit hit", -0.17, score_scale="rerank", reranker="jina-v2")
+        ]
+        pinned = [_remote_result("pinned block", 1.0, source="pin.md")]
+        pinned[0].pinned = True
+        adapter = _make_compose_adapter(
+            retrieved, pinned=pinned, score_scale="rerank", reranker="jina-v2"
+        )
+        engine = SurfacingEngine(config=_make_config(min_score=0.02), mcp_adapter=adapter)
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        adapter.context_compose.assert_awaited_once()
+        # A below-floor logit result surfaces (filter suspended) alongside the
+        # pinned block, and no RRF-band bucket tag leaks onto the foreign scale.
+        assert "compose logit hit" in out
+        assert "pinned block" in out
+        for tag in ("[weak]", "[related]", "[strong]"):
+            assert tag not in out
+
+    async def test_compose_pinned_tool_min_score_filters_and_fires_mismatch(self):
+        from memtomem_stm.surfacing.config import ToolSurfacingConfig
+
+        tracker = MagicMock()
+        retrieved = [_remote_result("under the pin", 0.1, score_scale="rerank")]
+        adapter = _make_compose_adapter(retrieved, score_scale="rerank")
+        engine = SurfacingEngine(
+            config=_make_config(
+                min_score=0.02,
+                context_tools={"read_file": ToolSurfacingConfig(min_score=0.5)},
+            ),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        # A per-tool pin keeps the filter active, so the below-pin compose
+        # result is dropped and the definitive mismatch diagnostic fires.
+        assert out == LONG_RESPONSE
+        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+
+    async def test_compose_absent_scale_behavior_unchanged(self):
+        retrieved = [_remote_result("unstamped compose", 0.001)]
+        adapter = _make_compose_adapter(retrieved)
+        engine = SurfacingEngine(config=_make_config(min_score=0.02), mcp_adapter=adapter)
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        # A pre-#1796 compose bundle stamps nothing, so the RRF-calibrated
+        # filter applies exactly as before and drops the below-floor hit.
+        assert out == LONG_RESPONSE
+
+    async def test_compose_cache_hit_stays_suspended_and_bucket_free(self):
+        retrieved = [_remote_result("compose logit", -0.5, score_scale="rerank")]
+        adapter = _make_compose_adapter(retrieved, score_scale="rerank")
+        engine = SurfacingEngine(config=_make_config(min_score=0.02), mcp_adapter=adapter)
+
+        out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert adapter.context_compose.await_count == 1
+        for out in (out1, out2):
+            assert "compose logit" in out
             for tag in ("[weak]", "[related]", "[strong]"):
                 assert tag not in out
 

@@ -214,12 +214,12 @@ class SurfacingConfig(BaseModel):
     rrf/unstamped surfacings.
 
     A per-tool ``context_tools.<tool>.min_score`` pin always applies —
-    explicit operator intent wins over the gate. Batches with no reported
-    scale (compose bundles until core #1791, ``compact`` format, pre-#1781
-    cores) or an unrecognized label keep today's unconditional filtering,
-    so on compose-capable cores the gate only covers the legacy
-    ``mem_search`` fallback path. Set ``False`` to restore unconditional
-    filtering on every scale. Env:
+    explicit operator intent wins over the gate. Both the structured
+    ``mem_search`` path and a compose schema-4 core (#1796) report the scale,
+    so the gate covers both. Batches with no reported scale (``compact``
+    format, pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized
+    label keep today's unconditional filtering. Set ``False`` to restore
+    unconditional filtering on every scale. Env:
     ``MEMTOMEM_STM_SURFACING__SCALE_GATED_MIN_SCORE``."""
 
     @field_validator("rerank", mode="before")

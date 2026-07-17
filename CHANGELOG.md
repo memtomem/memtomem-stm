@@ -13,6 +13,23 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- Surfacing now reads the score scale a compose-capable core names on the
+  composed bundle itself (`score_scale`/`reranker` on the `context_compose`
+  envelope, `context_compose` schema 4, core #1796, first available in the
+  core release after v0.3.11). This closes the compose blind spot the
+  `mem_search` score-scale work (#727) left open: STM stamps the scale onto
+  the compose retrieved results (never pinned blocks), so the scale gate
+  (#730), the definitive `score_scale_mismatch` diagnostic (#727), the
+  relevance-bucket suppression, `surfacing_events` persistence, and
+  `stm_surfacing_stats` all now cover the composed retrieval path, not just
+  the legacy `mem_search` fallback. The two keys cross the hook-daemon wire
+  additively (no `PROTOCOL_VERSION` bump, emitted only at the negotiated
+  schema 4) and survive the surfacing cache. Dormant against every released
+  core (schema ≤ 3 never carries the keys → all-`None` → today's behavior);
+  the live effect requires a core release carrying #1796, a reinstall, and a
+  daemon restart. The process-level `stm_surfacing_stats` `Score scale:`
+  line now also reflects compose batches. (#734)
+
 - Surfacing now suspends the RRF-calibrated `min_score` filter when the core
   names a foreign score scale. `min_score` (default 0.03) and the auto-tuner
   are calibrated against RRF fusion scores (`(0, ~0.033]`); on a batch whose

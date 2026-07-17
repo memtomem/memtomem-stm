@@ -25,10 +25,13 @@ cross-session-deduped, or access-boosted.
 Core owns Pinned Context scope selection on this composed path. STM preserves
 its `default_namespace`, per-tool `namespace`, and `context_window_size` for
 the retrieved leg; they are not remapped to core `agent_id` scope. Schema 3
-additionally returns adjacent context-window chunks for rendering. Schema 2
-preserves the request controls but does not guarantee those chunks in the
-response. Cores that do not advertise schema 2 continue through legacy
-`mem_search`.
+additionally returns adjacent context-window chunks for rendering. Schema 4
+additively names the base `score_scale` (and `reranker` model ID) of the
+retrieved scores on the bundle envelope (core #1796), which STM stamps onto
+the compose retrieved results so the scale gate and diagnostics cover the
+composed path too. Schema 2 preserves the request controls but does not
+guarantee those chunks in the response. Cores that do not advertise schema 2
+continue through legacy `mem_search`.
 
 Capability absence is the only fallback trigger. Once a core advertises schema
 2 or later, a compose transport or response failure remains visible as an LTM
@@ -185,7 +188,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
 | `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
 | `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Only sent when the core advertises the parameter in its `mem_search` schema (first core release after v0.3.11) — on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
-| `scale_gated_min_score` | `true` | Suspend the RRF-calibrated `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Batches with no reported scale (compose bundles until core #1791, `compact` format, pre-#1781 cores) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
+| `scale_gated_min_score` | `true` | Suspend the RRF-calibrated `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Both structured `mem_search` (core #1781) and a compose schema-4 core (core #1796) report the scale, so the gate covers both retrieval paths. Batches with no reported scale (`compact` format, pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
 | `ltm_mcp_command` | `memtomem-server` | Command used when `ltm_mcp_transport=stdio` |
@@ -662,25 +665,26 @@ hit:
   Cores newer than v0.3.11 name the scale their scores are on
   (`score_scale`: `rrf` / `bm25` / `dense` / `none` / `rerank`, core
   #1781) in structured `mem_search` output, and STM stamps it onto every
-  parsed result. A core-named **non-RRF** scale normally suspends the
-  filter instead of fighting it (`scale_gated_min_score`, default on) —
-  the batch passes through bounded by `max_results`, and the first
-  suspended batch also marks any lingering `score_scale_mismatch` /
-  `score_ceiling_below_min` episode recovered. The definitive
-  `score_scale_mismatch` diagnostic therefore fires only when the filter
-  **actually applies** to a named non-RRF scale: a per-tool
-  `context_tools.<name>.min_score` pin is present, or
-  `scale_gated_min_score=false` — then STM warns on the **first**
-  below-threshold observation (no five-call streak, the threshold is
-  calibrated against RRF) and persists `score_scale_mismatch`.
-  `stm_surfacing_stats` shows the last core-reported scale as a
-  `Score scale:` line (annotated when the filter is suspended), the
-  reranker model ID when one is active, and each event row records its
-  scale in `stm_feedback.db`. Compose bundles and the compact format
-  carry no scale today (compose is tracked in core memtomem#1791), so
-  those paths keep unconditional filtering and the streak heuristic —
-  on a compose-capable core the gate only covers the legacy `mem_search`
-  fallback path until #1791 lands.
+  parsed result. A compose schema-4 core (core #1796) names the same scale
+  on the composed bundle envelope, so STM stamps the compose retrieved
+  results too — both retrieval paths feed the machinery below. A
+  core-named **non-RRF** scale normally suspends the filter instead of
+  fighting it (`scale_gated_min_score`, default on) — the batch passes
+  through bounded by `max_results`, and the first suspended batch also
+  marks any lingering `score_scale_mismatch` / `score_ceiling_below_min`
+  episode recovered. The definitive `score_scale_mismatch` diagnostic
+  therefore fires only when the filter **actually applies** to a named
+  non-RRF scale: a per-tool `context_tools.<name>.min_score` pin is
+  present, or `scale_gated_min_score=false` — then STM warns on the
+  **first** below-threshold observation (no five-call streak, the
+  threshold is calibrated against RRF) and persists
+  `score_scale_mismatch`. `stm_surfacing_stats` shows the last
+  core-reported scale as a `Score scale:` line (annotated when the filter
+  is suspended), the reranker model ID when one is active, and each event
+  row records its scale in `stm_feedback.db`. The compact format and the
+  legacy `mem_search` path on a pre-#1781 core carry no scale, as does a
+  compose bundle from a pre-#1796 core, so those paths keep unconditional
+  filtering and the streak heuristic.
 - `no_results_dedup` — every result was already surfaced this
   session and dropped by `_surfaced_ids`. Distinct from
   `no_results_score` so an operator can tell whether to lower
