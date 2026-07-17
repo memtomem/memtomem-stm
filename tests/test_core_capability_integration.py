@@ -279,6 +279,94 @@ async def test_direct_compose_accepts_present_but_empty_required_keys(
 
 
 @pytest.mark.asyncio
+async def test_direct_compose_stamps_score_scale_and_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compose schema-4 core (#1796) names the scale on the envelope; STM
+    carries it on the bundle and stamps every retrieved result, never pinned."""
+    payload = {
+        "pinned": [{"content": "pinned block", "block_id": "pin-1"}],
+        "retrieved": [
+            {"id": "hit-1", "content": "matched one", "source": "a.md", "score": 0.42},
+            {"id": "hit-2", "content": "matched two", "source": "b.md", "score": -0.17},
+        ],
+        "score_scale": "rerank",
+        "reranker": "jina-reranker-v2",
+    }
+    adapter = _compose_adapter(monkeypatch, payload, schema=4)
+
+    bundle = await adapter.context_compose("deployment")
+
+    assert bundle is not None
+    assert bundle.score_scale == "rerank"
+    assert bundle.reranker == "jina-reranker-v2"
+    assert [r.score_scale for r in bundle.retrieved] == ["rerank", "rerank"]
+    assert [r.reranker for r in bundle.retrieved] == ["jina-reranker-v2", "jina-reranker-v2"]
+    # Pinned blocks never carry a scale.
+    assert all(p.score_scale is None and p.reranker is None for p in bundle.pinned)
+
+
+@pytest.mark.asyncio
+async def test_direct_compose_scale_absent_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-#1796 core (or empty retrieved) omits both keys → all-None."""
+    payload = {
+        "pinned": [],
+        "retrieved": [{"id": "hit", "content": "matched", "source": "a.md", "score": 0.8}],
+    }
+    adapter = _compose_adapter(monkeypatch, payload, schema=3)
+
+    bundle = await adapter.context_compose("deployment")
+
+    assert bundle is not None
+    assert bundle.score_scale is None and bundle.reranker is None
+    assert bundle.retrieved[0].score_scale is None
+    assert bundle.retrieved[0].reranker is None
+
+
+@pytest.mark.asyncio
+async def test_direct_compose_ignores_non_string_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-string / empty-string envelope values degrade to None."""
+    payload = {
+        "pinned": [],
+        "retrieved": [{"id": "hit", "content": "matched", "source": "a.md", "score": 0.8}],
+        "score_scale": 123,
+        "reranker": "",
+    }
+    adapter = _compose_adapter(monkeypatch, payload, schema=4)
+
+    bundle = await adapter.context_compose("deployment")
+
+    assert bundle is not None
+    assert bundle.score_scale is None and bundle.reranker is None
+    assert bundle.retrieved[0].score_scale is None
+
+
+@pytest.mark.asyncio
+async def test_direct_compose_reads_scale_opportunistically_below_schema_four(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decode is presence-based, not schema-gated: if the keys are on the
+    payload STM stamps them even when capabilities lag at schema 2 (the same
+    opportunistic contract the mem_search parser uses)."""
+    payload = {
+        "pinned": [],
+        "retrieved": [{"id": "hit", "content": "matched", "source": "a.md", "score": 0.5}],
+        "score_scale": "bm25",
+    }
+    adapter = _compose_adapter(monkeypatch, payload, schema=2)
+
+    bundle = await adapter.context_compose("deployment")
+
+    assert bundle is not None
+    assert bundle.score_scale == "bm25"
+    assert bundle.retrieved[0].score_scale == "bm25"
+
+
+@pytest.mark.asyncio
 async def test_direct_schema_three_compose_parses_adjacent_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

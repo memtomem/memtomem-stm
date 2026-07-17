@@ -23,6 +23,7 @@ from memtomem_stm.surfacing.mcp_client import (
     RemoteSearchResult,
     SearchOutcome,
     decode_context_compose_context,
+    read_score_scale_hint,
     require_context_compose_lists,
 )
 from memtomem_stm.utils.numeric import safe_float
@@ -62,9 +63,13 @@ class DaemonLtmAdapter:
     @property
     def capabilities(self) -> LtmCapabilities:
         # The daemon owns core negotiation; operation responses distinguish a
-        # capable core from an older one without exposing session state.
+        # capable core from an older one without exposing session state. The
+        # optimistic default is the highest schema STM understands (4, core
+        # #1796) so the engine prefers compose before the first round-trip
+        # confirms the actual schema; the daemon clamps to what the core
+        # advertises, and the confirmed value replaces this after one call.
         return LtmCapabilities(
-            context_compose_schema=3 if self._compose_schema is None else self._compose_schema,
+            context_compose_schema=4 if self._compose_schema is None else self._compose_schema,
             candidate_propose_schema=0 if self._candidate_propose_supported is False else 1,
         )
 
@@ -81,7 +86,7 @@ class DaemonLtmAdapter:
     ) -> ContextComposeResult | None:
         if self._compose_schema == 0:
             return None
-        requested_schema = self._compose_schema or 3
+        requested_schema = self._compose_schema or 4
         state, resp = await client.ltm_request(
             self._daemon_config,
             OP_LTM_CONTEXT_COMPOSE,
@@ -122,6 +127,13 @@ class DaemonLtmAdapter:
             schema=selected_schema,
         )
 
+        # Compose-envelope score scale (core #1796): read opportunistically
+        # from the wire and stamp onto retrieved results only (never pinned),
+        # mirroring the direct McpClient path. Absent on an old daemon, which
+        # clamps to schema 3 and omits the keys.
+        score_scale = read_score_scale_hint(resp.get("score_scale"))
+        reranker = read_score_scale_hint(resp.get("reranker"))
+
         def decode(item: Any, *, pinned: bool):
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("daemon context item malformed")
@@ -139,6 +151,8 @@ class DaemonLtmAdapter:
                 namespace=str(item.get("namespace") or "default"),
                 pinned=pinned,
                 context=context,
+                score_scale=None if pinned else score_scale,
+                reranker=None if pinned else reranker,
             )
             if isinstance(item.get("chunk_id"), str):
                 result.chunk.id = item["chunk_id"]
@@ -154,6 +168,8 @@ class DaemonLtmAdapter:
             retrieved_items,
             tuple(v for v in warnings if isinstance(v, str)) if isinstance(warnings, list) else (),
             tuple(v for v in omitted if isinstance(v, str)) if isinstance(omitted, list) else (),
+            score_scale,
+            reranker,
         )
 
     async def candidate_propose(
@@ -241,15 +257,13 @@ class DaemonLtmAdapter:
             score = safe_float(item.get("score"), float("nan"))
             if not math.isfinite(score):
                 continue
-            raw_scale = item.get("score_scale")
-            raw_reranker = item.get("reranker")
             result = RemoteSearchResult(
                 content=item["content"],
                 score=score,
                 source=str(item.get("source") or ""),
                 namespace=str(item.get("namespace") or "default"),
-                score_scale=raw_scale if isinstance(raw_scale, str) and raw_scale else None,
-                reranker=raw_reranker if isinstance(raw_reranker, str) and raw_reranker else None,
+                score_scale=read_score_scale_hint(item.get("score_scale")),
+                reranker=read_score_scale_hint(item.get("reranker")),
             )
             chunk_id = item.get("chunk_id")
             if isinstance(chunk_id, str) and chunk_id:

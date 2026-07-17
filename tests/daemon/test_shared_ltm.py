@@ -307,6 +307,65 @@ async def test_daemon_v7_selects_schema_three_and_downconverts_for_schema_two_cl
 
 
 @pytest.mark.asyncio
+async def test_daemon_v7_emits_compose_score_scale_only_at_schema_four(tmp_path: Path) -> None:
+    """The compose-envelope score scale (core #1796) crosses the daemon wire
+    as additive top-level keys, emitted only at the negotiated schema 4 so a
+    client that asked for max schema 3 gets a byte-identical schema-3 response.
+    A bundle whose envelope fields are ``None`` omits them (core omission)."""
+    server = DaemonServer(_config(tmp_path))
+    retrieved = RemoteSearchResult(
+        "HIT", -0.17, "memory.md", "work", score_scale="rerank", reranker="jina-v2"
+    )
+    retrieved.chunk.id = "hit"
+
+    def _adapter(bundle: ContextComposeResult) -> SimpleNamespace:
+        return SimpleNamespace(
+            capabilities=LtmCapabilities(context_compose_schema=4),
+            capabilities_ready=True,
+            context_compose=AsyncMock(return_value=bundle),
+        )
+
+    base_payload = {
+        "query": "q",
+        "agent_id": None,
+        "max_chars": 100,
+        "top_k": 2,
+        "namespace": "work",
+        "context_window": 1,
+    }
+
+    stamped = ContextComposeResult((), (retrieved,), (), (), "rerank", "jina-v2")
+    server._adapter = _adapter(stamped)
+    schema_four = await server._dispatch(
+        _request(OP_LTM_CONTEXT_COMPOSE, {**base_payload, "context_compose_max_schema": 4})
+    )
+    schema_three = await server._dispatch(
+        _request(OP_LTM_CONTEXT_COMPOSE, {**base_payload, "context_compose_max_schema": 3})
+    )
+
+    assert schema_four is not None
+    assert schema_four["selected_context_compose_schema"] == 4
+    assert schema_four["score_scale"] == "rerank"
+    assert schema_four["reranker"] == "jina-v2"
+    # Old client (max schema 3): keys withheld, byte-identical schema-3 shape.
+    assert schema_three is not None
+    assert schema_three["selected_context_compose_schema"] == 3
+    assert "score_scale" not in schema_three
+    assert "reranker" not in schema_three
+
+    # A schema-4 selection whose envelope names no scale (empty retrieved on a
+    # #1796 core) omits both keys, carrying the core's omission through.
+    server._adapter = _adapter(ContextComposeResult((), (), (), (), None, None))
+    unstamped = await server._dispatch(
+        _request(OP_LTM_CONTEXT_COMPOSE, {**base_payload, "context_compose_max_schema": 4})
+    )
+    assert unstamped is not None
+    assert unstamped["selected_context_compose_schema"] == 4
+    assert "score_scale" not in unstamped
+    assert "reranker" not in unstamped
+
+
+@pytest.mark.asyncio
 async def test_cold_daemon_compose_negotiates_before_capability_verdict(tmp_path: Path) -> None:
     server = DaemonServer(_config(tmp_path))
     pinned = RemoteSearchResult("policy", 1.0, "/policy.md", "global", pinned=True)
@@ -388,7 +447,7 @@ async def test_daemon_adapter_memoizes_unsupported_compose(
     request.return_value = ("missing", None)
     monkeypatch.setattr(adapter, "_spawn_best_effort", AsyncMock())
     assert await adapter.search("q") == ([], [], "daemon_starting")
-    assert adapter.capabilities.context_compose_schema == 3
+    assert adapter.capabilities.context_compose_schema == 4
     assert adapter.capabilities.candidate_propose_schema == 1
 
 
@@ -403,7 +462,7 @@ async def test_daemon_adapter_does_not_cache_transient_compose_unavailable(
     with pytest.raises(RuntimeError, match="context compose unavailable"):
         await adapter.context_compose("q")
 
-    assert adapter.capabilities.context_compose_schema == 3
+    assert adapter.capabilities.context_compose_schema == 4
     request.return_value = ("ok", {"ok": False, "status": "unsupported"})
     assert await adapter.context_compose("q") is None
     assert request.await_count == 2
@@ -452,7 +511,7 @@ async def test_daemon_adapter_accepts_selected_schema_and_forwards_scope(
             "top_k": 10,
             "namespace": ["work"],
             "context_window": 2,
-            "context_compose_max_schema": 3,
+            "context_compose_max_schema": 4,
             "trace_id": "trace-1",
         },
         timeout=adapter._timeout,
@@ -462,7 +521,7 @@ async def test_daemon_adapter_accepts_selected_schema_and_forwards_scope(
     second = DaemonLtmAdapter(_config(tmp_path))
     with pytest.raises(ValueError, match="schema selection"):
         await second.context_compose("q")
-    assert second.capabilities.context_compose_schema == 3
+    assert second.capabilities.context_compose_schema == 4
 
 
 @pytest.mark.parametrize(
@@ -752,6 +811,82 @@ async def test_adapter_decodes_score_scale(tmp_path: Path, monkeypatch: pytest.M
     # Non-string wire values degrade to None, mirroring the parser guard.
     assert results[1].score_scale is None
     assert results[1].reranker is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_decodes_compose_score_scale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon adapter reads the compose-envelope score scale (#1796) from
+    the wire, carries it on the bundle, and stamps retrieved (never pinned)."""
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    async def reply(*args, **kwargs):
+        return (
+            "ok",
+            {
+                "ok": True,
+                "selected_context_compose_schema": 4,
+                "pinned": [{"content": "pinned block", "chunk_id": "pin-1"}],
+                "retrieved": [
+                    {
+                        "content": "compose hit",
+                        "score": -0.17,
+                        "source": "/m.md",
+                        "namespace": "default",
+                        "chunk_id": "chunk-1",
+                    }
+                ],
+                "warnings": [],
+                "omitted_block_ids": [],
+                "score_scale": "rerank",
+                "reranker": "fake-rr",
+            },
+        )
+
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", reply)
+
+    bundle = await adapter.context_compose("q")
+    assert bundle is not None
+    assert bundle.score_scale == "rerank"
+    assert bundle.reranker == "fake-rr"
+    assert bundle.retrieved[0].score_scale == "rerank"
+    assert bundle.retrieved[0].reranker == "fake-rr"
+    # Pinned blocks never carry a scale.
+    assert bundle.pinned[0].score_scale is None
+    assert bundle.pinned[0].reranker is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_compose_scale_absent_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old daemon (or empty retrieved) omits the keys → all-None, the
+    pre-#1796 behavior over the wire."""
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    async def reply(*args, **kwargs):
+        return (
+            "ok",
+            {
+                "ok": True,
+                "selected_context_compose_schema": 3,
+                "pinned": [],
+                "retrieved": [
+                    {"content": "compose hit", "score": 0.8, "source": "/m.md", "chunk_id": "c1"}
+                ],
+                "warnings": [],
+                "omitted_block_ids": [],
+            },
+        )
+
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", reply)
+
+    bundle = await adapter.context_compose("q")
+    assert bundle is not None
+    assert bundle.score_scale is None and bundle.reranker is None
+    assert bundle.retrieved[0].score_scale is None
+    assert bundle.retrieved[0].reranker is None
 
 
 @pytest.mark.asyncio

@@ -128,6 +128,54 @@ async def test_score_scale_stamped_over_real_mcp_boundary():
 
 
 @pytest.mark.asyncio
+async def test_compose_score_scale_stamped_over_real_mcp_boundary():
+    """#1796: a compose schema-4 core names the scale on the bundle envelope;
+    the adapter carries it and stamps every retrieved result over the real
+    stdio boundary. A schema-3 core (pre-#1796) yields ``None`` stamps."""
+    schema4 = _stdio_config().model_copy(
+        update={
+            "ltm_mcp_args": [
+                str(_FAKE_SERVER),
+                "--compose-schema",
+                "4",
+                "--score-scale",
+                "rerank",
+                "--reranker-id",
+                "fake-rr",
+            ]
+        }
+    )
+    adapter = McpClientSearchAdapter(schema4)
+    await adapter.start()
+    try:
+        assert adapter.capabilities.context_compose_schema == 4
+        bundle = await adapter.context_compose("JWT authentication", top_k=2)
+    finally:
+        await adapter.stop()
+    assert bundle is not None
+    assert bundle.score_scale == "rerank"
+    assert bundle.reranker == "fake-rr"
+    assert bundle.retrieved and all(r.score_scale == "rerank" for r in bundle.retrieved)
+    assert all(r.reranker == "fake-rr" for r in bundle.retrieved)
+
+    schema3 = _stdio_config().model_copy(
+        update={
+            "ltm_mcp_args": [str(_FAKE_SERVER), "--compose-schema", "3", "--score-scale", "rerank"]
+        }
+    )
+    old_core = McpClientSearchAdapter(schema3)
+    await old_core.start()
+    try:
+        assert old_core.capabilities.context_compose_schema == 3
+        bundle = await old_core.context_compose("JWT authentication", top_k=2)
+    finally:
+        await old_core.stop()
+    assert bundle is not None
+    assert bundle.score_scale is None and bundle.reranker is None
+    assert bundle.retrieved and all(r.score_scale is None for r in bundle.retrieved)
+
+
+@pytest.mark.asyncio
 async def test_scale_gate_suspends_filter_over_real_mcp_boundary():
     """Scale gate end-to-end: a core naming a non-RRF scale over the real
     stdio MCP boundary gets its results injected past a min_score that would

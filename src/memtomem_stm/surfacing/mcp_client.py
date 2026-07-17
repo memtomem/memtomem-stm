@@ -93,6 +93,15 @@ class ContextComposeResult:
     retrieved: tuple[RemoteSearchResult, ...]
     warnings: tuple[str, ...] = ()
     omitted_block_ids: tuple[str, ...] = ()
+    # Envelope mirror of the core's compose-bundle score scale (core #1796,
+    # context_compose schema 4): the BASE scale of the ``retrieved`` scores
+    # and the rerank model ID, or ``None`` when the core omitted them (empty
+    # ``retrieved``, or a pre-#1796 core). Carried on the bundle so the daemon
+    # can re-encode the wire from the decoded bundle alone; also stamped onto
+    # each retrieved result (never pinned) so downstream keys off per-result
+    # stamps exactly as the ``mem_search`` path does.
+    score_scale: str | None = None
+    reranker: str | None = None
 
 
 @dataclass
@@ -133,10 +142,11 @@ class RemoteSearchResult:
         self.pinned = pinned
         self.context = context
         # Core-reported scale of ``score`` (#1781): stamped by the structured
-        # parser when the core names it, ``None`` everywhere else (compact
-        # format, compose bundles, pre-#1781 cores). Stamped per result so
-        # cached entries keep their scale and no shared mutable state is
-        # needed across concurrent surfacing calls.
+        # parser when the core names it, and — on a compose schema-4 core
+        # (#1796) — by the compose decoders onto retrieved results. ``None``
+        # everywhere else (compact format, pinned compose blocks, pre-#1781
+        # cores). Stamped per result so cached entries keep their scale and no
+        # shared mutable state is needed across concurrent surfacing calls.
         self.score_scale = score_scale
         self.reranker = reranker
 
@@ -309,6 +319,19 @@ still report the fused scale truthfully. Unknown labels are kept verbatim
 scale-conditional diagnostics.
 """
 
+
+def read_score_scale_hint(raw: Any) -> str | None:
+    """Read a core-reported ``score_scale`` / ``reranker`` value defensively.
+
+    The opportunistic contract shared by every scale-reading site (structured
+    ``mem_search`` parser and both compose decoders, cores #1781 / #1796): a
+    non-empty string is kept verbatim (telemetry wants the label the core sent,
+    even an unrecognized one); anything else — absent key, non-string, empty
+    string — degrades to ``None``.
+    """
+    return raw if isinstance(raw, str) and raw else None
+
+
 _BLOCK_SPLIT_RE = re.compile(r"^(?=\[\d+\]\s+\d+\.?\d*\s*\|)", flags=re.MULTILINE)
 _HEADER_RE = re.compile(r"\[(\d+)\]\s+(\d+\.?\d*)\s*\|(.+)")
 _NS_RE = re.compile(r"\[([^\]]+)\]\s*(.*)")
@@ -418,10 +441,8 @@ class StructuredResultParser(ResultParser):
             [str(h) for h in raw_hints if isinstance(h, str)] if isinstance(raw_hints, list) else []
         )
 
-        raw_scale = data.get("score_scale")
-        score_scale = raw_scale if isinstance(raw_scale, str) and raw_scale else None
-        raw_reranker = data.get("reranker")
-        reranker = raw_reranker if isinstance(raw_reranker, str) and raw_reranker else None
+        score_scale = read_score_scale_hint(data.get("score_scale"))
+        reranker = read_score_scale_hint(data.get("reranker"))
         if score_scale is not None and score_scale not in KNOWN_SCORE_SCALES:
             # Keep the label verbatim — telemetry wants the truth, and a
             # renamed core label must surface as itself, not as ``None``.
@@ -1435,6 +1456,13 @@ class McpClientSearchAdapter:
             schema=self._capabilities.context_compose_schema,
         )
 
+        # Compose schema 4 (core #1796) names the base scale of the retrieved
+        # scores on the bundle envelope, omitting both keys when ``retrieved``
+        # is empty. Read opportunistically (no schema gate — a pre-#1796 core
+        # never emits them, matching the ``mem_search`` structured parser).
+        score_scale = read_score_scale_hint(payload.get("score_scale"))
+        reranker = read_score_scale_hint(payload.get("reranker"))
+
         pinned: list[RemoteSearchResult] = []
         for item in raw_pinned:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
@@ -1468,6 +1496,8 @@ class McpClientSearchAdapter:
                 source=str(item.get("source") or "unknown"),
                 namespace=str(item.get("namespace") or "default"),
                 context=context,
+                score_scale=score_scale,
+                reranker=reranker,
             )
             memory_id = item.get("id") or item.get("chunk_id")
             if isinstance(memory_id, str) and memory_id:
@@ -1478,7 +1508,9 @@ class McpClientSearchAdapter:
         raw_omitted = payload.get("omitted_block_ids", [])
         warnings = tuple(str(v) for v in raw_warnings) if isinstance(raw_warnings, list) else ()
         omitted = tuple(str(v) for v in raw_omitted) if isinstance(raw_omitted, list) else ()
-        return ContextComposeResult(tuple(pinned), tuple(retrieved), warnings, omitted)
+        return ContextComposeResult(
+            tuple(pinned), tuple(retrieved), warnings, omitted, score_scale, reranker
+        )
 
     async def candidate_propose(
         self,

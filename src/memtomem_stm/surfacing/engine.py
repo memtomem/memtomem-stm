@@ -388,10 +388,11 @@ class SurfacingEngine:
 
         Reads the first non-pinned result via ``getattr`` — engine tests use
         lightweight result stubs (same precedent as the ``pinned`` reads).
-        Compose bundles, compact parses, and pre-#1781 cores stamp nothing,
-        so those paths structurally yield ``(None, None)``. Core labels one
-        scale per response; a hypothetical mixed payload reads as its first
-        retrieved element.
+        Both the structured ``mem_search`` path and a compose schema-4 core
+        (#1796) stamp retrieved results; compact parses, pinned compose
+        blocks, and pre-#1781 cores stamp nothing, so those paths structurally
+        yield ``(None, None)``. Core labels one scale per response; a
+        hypothetical mixed payload reads as its first retrieved element.
         """
         for r in results:
             if getattr(r, "pinned", False):
@@ -537,8 +538,11 @@ class SurfacingEngine:
         non-RRF scale on the results, a below-threshold ceiling is a definitive
         calibration mismatch — ``min_score`` is calibrated against RRF — and
         the ``score_scale_mismatch`` diagnostic fires on first observation.
-        Without a reported scale (compose bundles, compact format, pre-#1781
-        cores) the streak-of-``_SCORE_SCALE_WARNING_STREAK`` heuristic and its
+        Both the structured ``mem_search`` path and a compose schema-4 core
+        (#1796) report the scale, so the definitive tier now covers the
+        compose path too. Without a reported scale (compact format, pre-#1781
+        cores, compose on a pre-#1796 core) the streak-of-
+        ``_SCORE_SCALE_WARNING_STREAK`` heuristic and its
         ``score_ceiling_below_min`` diagnostic behave exactly as before.
 
         ``filter_suspended=True`` means the scale gate did not apply
@@ -763,10 +767,11 @@ class SurfacingEngine:
         global/auto-tuned ``min_score`` filter (see
         ``SurfacingConfig.scale_gated_min_score``).
 
-        Only a KNOWN non-RRF label suspends: an absent scale (compose
-        bundles until core #1791, compact format, pre-#1781 cores) or an
-        unrecognized label keeps unconditional filtering — the gate never
-        guesses. A per-tool ``context_tools.<tool>.min_score`` pin is
+        Only a KNOWN non-RRF label suspends: an absent scale (compact format,
+        pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized label
+        keeps unconditional filtering — the gate never guesses. A compose
+        schema-4 core (#1796) reports the scale, so the compose path is now
+        gated too. A per-tool ``context_tools.<tool>.min_score`` pin is
         explicit operator intent and always keeps the filter active.
         """
         if not self._config.scale_gated_min_score:
@@ -819,9 +824,10 @@ class SurfacingEngine:
             "auto_tune_min_samples": self._config.auto_tune_min_samples,
             "adjusted": adjusted,
             "overrides": overrides,
-            # Last core-REPORTED scale (#1781): ``None`` means no structured
-            # search this process carried the key (pre-#1781 core, compact
-            # format, or compose-only traffic) — not that scores are RRF.
+            # Last core-REPORTED scale (#1781/#1796): ``None`` means no
+            # structured search or compose bundle this process carried the key
+            # (pre-#1781 core, compact format, or compose on a pre-#1796 core)
+            # — not that scores are RRF.
             # ``filter_suspended`` is the process-level summary — "the last
             # reported scale suspends the filter for unpinned tools" — not a
             # per-tool verdict (pinned tools always keep the filter).

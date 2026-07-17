@@ -56,6 +56,35 @@ _SEEDS: list[dict] | None = None
 _SCORE_SCALE: str | None = None
 _RERANKER_ID: str | None = None
 
+# Populated once at startup when ``--compose-schema`` is passed. The default
+# (None) advertises no ``context_compose`` capability and refuses the action,
+# standing in for a core that only exposes legacy ``mem_search``. The
+# score-scale keys are added to the bundle envelope only at schema 4 (core
+# #1796), mirroring the additive envelope contract.
+_COMPOSE_SCHEMA: int | None = None
+
+# Deterministic retrieved leg for ``context_compose`` when no ``--seeds`` file
+# is given — fixed content (no per-call UUID) so a single compose round-trip
+# is enough to assert stamping.
+_CANNED_COMPOSE_HITS: list[dict] = [
+    {
+        "rank": 1,
+        "score": 0.42,
+        "source": "compose-auth.md",
+        "namespace": "default",
+        "content": "Composed: JWT auth uses HS256 with rotating secrets.",
+        "chunk_id": "compose-auth-1",
+    },
+    {
+        "rank": 2,
+        "score": -0.17,
+        "source": "compose-api.md",
+        "namespace": "default",
+        "content": "Composed: API responses include X-RateLimit-* headers.",
+        "chunk_id": "compose-api-1",
+    },
+]
+
 
 def _load_seeds(path: str) -> list[dict]:
     """Load bench_qa seed array from *path*.
@@ -114,6 +143,47 @@ def _emit_structured(items: list[dict]) -> str:
         results.append(entry)
     payload: dict = {"results": results}
     if results and _SCORE_SCALE is not None:
+        payload["score_scale"] = _SCORE_SCALE
+        if _RERANKER_ID is not None:
+            payload["reranker"] = _RERANKER_ID
+    return json.dumps(payload)
+
+
+def _emit_compose(items: list[dict], schema: int) -> str:
+    """Format *items* as core's ``context_compose`` structured bundle.
+
+    Mirrors the core envelope STM's compose decoders read: ``pinned`` and
+    ``retrieved`` arrays, plus ``warnings``/``omitted_block_ids``. Schema 3+
+    attaches an adjacent ``context`` window to each retrieved item; schema 4+
+    names the base ``score_scale`` (and ``reranker``, if ``--reranker-id`` is
+    set) on the envelope — but only for non-empty ``retrieved``, mirroring
+    core #1796's omission rule. Pinned blocks never carry a scale.
+    """
+    retrieved = []
+    for item in items:
+        entry: dict = {
+            "content": str(item["content"]),
+            "score": item["score"],
+            "source": item["source"],
+            "namespace": item.get("namespace", "default"),
+        }
+        if "chunk_id" in item:
+            entry["chunk_id"] = item["chunk_id"]
+        if schema >= 3:
+            entry["context"] = {
+                "before": [],
+                "after": [],
+                "chunk_position": 0,
+                "total_chunks_in_file": 1,
+            }
+        retrieved.append(entry)
+    payload: dict = {
+        "pinned": [],
+        "retrieved": retrieved,
+        "warnings": [],
+        "omitted_block_ids": [],
+    }
+    if schema >= 4 and retrieved and _SCORE_SCALE is not None:
         payload["score_scale"] = _SCORE_SCALE
         if _RERANKER_ID is not None:
             payload["reranker"] = _RERANKER_ID
@@ -223,15 +293,16 @@ async def mem_do(action: str, params: dict | None = None) -> str:
     if action == "increment_access":
         chunk_ids = list((params or {}).get("chunk_ids") or [])
         return f"Incremented access_count for {len(chunk_ids)} chunk(s)."
+    if action == "context_compose":
+        if _COMPOSE_SCHEMA is None:
+            return f"Error: unknown action '{action}'."
+        hits = _SEEDS if _SEEDS is not None else _CANNED_COMPOSE_HITS
+        return _emit_compose(hits, _COMPOSE_SCHEMA)
     if action == "version":
-        return json.dumps(
-            {
-                "version": "0.3.0-fake",
-                "capabilities": {
-                    "search_formats": ["compact", "structured"],
-                },
-            }
-        )
+        capabilities: dict = {"search_formats": ["compact", "structured"]}
+        if _COMPOSE_SCHEMA is not None:
+            capabilities["context_compose"] = {"schema_version": _COMPOSE_SCHEMA}
+        return json.dumps({"version": "0.3.0-fake", "capabilities": capabilities})
     return f"Error: unknown action '{action}'."
 
 
@@ -277,11 +348,24 @@ if __name__ == "__main__":
         default=None,
         help="Emit the top-level reranker model-ID key alongside --score-scale.",
     )
+    parser.add_argument(
+        "--compose-schema",
+        type=int,
+        choices=(2, 3, 4),
+        default=None,
+        help=(
+            "Advertise context_compose at this schema and serve the action "
+            "(core: 2=0.3.9, 3=0.3.10, 4=#1796). Schema 4 carries the "
+            "envelope score_scale/reranker from --score-scale. The default "
+            "advertises no compose capability, standing in for older cores."
+        ),
+    )
     args = parser.parse_args()
     if args.seeds is not None:
         _SEEDS = _load_seeds(args.seeds)
     _SCORE_SCALE = args.score_scale
     _RERANKER_ID = args.reranker_id
+    _COMPOSE_SCHEMA = args.compose_schema
     if args.rerank_capable:
         mcp.tool(name="mem_search")(mem_search_rerank_capable)
     else:
