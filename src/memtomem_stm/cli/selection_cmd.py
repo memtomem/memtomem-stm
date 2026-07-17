@@ -6,6 +6,7 @@ from pathlib import Path
 
 import click
 
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
 from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
 from memtomem_stm.proxy.selection_eval import (
     SelectionEvaluationError,
@@ -14,7 +15,7 @@ from memtomem_stm.proxy.selection_eval import (
 )
 from memtomem_stm.utils.fileio import atomic_write_text
 
-_DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
+_DEFAULT_CONFIG = DEFAULT_PROXY_CONFIG
 
 
 @click.group(name="selection")

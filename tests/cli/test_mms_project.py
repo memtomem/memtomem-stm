@@ -387,6 +387,15 @@ def test_route_preview_is_read_only_and_redacted(runner, sandbox):
     assert not config.exists()
 
 
+def test_route_help_uses_shared_proxy_config_default(runner):
+    from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+
+    res = runner.invoke(project_group, ["route", "--help"])
+
+    assert res.exit_code == 0, res.output
+    assert str(DEFAULT_PROXY_CONFIG) in res.output
+
+
 def test_route_apply_writes_valid_additive_config_and_is_idempotent(runner, sandbox):
     from memtomem_stm.proxy.config import ProxyConfig
 
