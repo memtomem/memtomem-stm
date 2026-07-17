@@ -420,13 +420,16 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     is_flag=True,
     help="Write additive routes (default: preview only).",
 )
-@click.option("--json", "json_output", is_flag=True, help="Machine-readable result.")
-@with_config_write_lock(skip=lambda kwargs: not kwargs.get("do_apply"))
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable result.")
+@with_config_write_lock(
+    skip=lambda kwargs: not kwargs.get("do_apply"),
+    json_envelope=True,
+)
 def route_cmd(
     project_name: str | None,
     config_path: str | None,
     do_apply: bool,
-    json_output: bool,
+    as_json: bool,
 ) -> None:
     """Preview or add the project's enabled registry MCPs to STM.
 
@@ -458,7 +461,12 @@ def route_cmd(
     path = Path(config_path if config_path is not None else _DEFAULT_CONFIG)
     path = path.expanduser().resolve()
     data = _load(path)
-    upstreams: dict[str, Any] = data.setdefault("upstream_servers", {})
+    if "upstream_servers" not in data:
+        data["upstream_servers"] = {}
+    raw_upstreams = data["upstream_servers"]
+    if not isinstance(raw_upstreams, dict):
+        raise click.ClickException("invalid proxy config: 'upstream_servers' must be a JSON object")
+    upstreams: dict[str, Any] = raw_upstreams
 
     planned: list[str] = []
     unchanged: list[str] = []
@@ -523,7 +531,7 @@ def route_cmd(
         if backup is not None:
             payload["backup"] = str(backup)
 
-    if json_output:
+    if as_json:
         click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
         return
 

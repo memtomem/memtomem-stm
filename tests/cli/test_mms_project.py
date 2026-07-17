@@ -414,6 +414,46 @@ def test_route_apply_writes_valid_additive_config_and_is_idempotent(runner, sand
     assert again_payload["applied"] == []
 
 
+@pytest.mark.parametrize("invalid_upstreams", [None, [], "servers"])
+def test_route_rejects_non_object_upstream_map_cleanly(runner, sandbox, invalid_upstreams):
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": invalid_upstreams}), encoding="utf-8")
+
+    res = runner.invoke(project_group, ["route", "--config", str(config)])
+
+    assert res.exit_code == 1
+    assert "upstream_servers" in res.output
+    assert "object" in res.output
+    assert "AttributeError" not in res.output
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="flock is POSIX-only; lock contention is covered on Windows by shared tests",
+)
+def test_route_lock_timeout_preserves_json_contract(runner, sandbox, monkeypatch):
+    from memtomem_stm.cli._write_lock import stm_config_lock_path
+
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    monkeypatch.setattr(state, "WRITE_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with state.write_lock(lock_path=stm_config_lock_path()):
+        res = runner.invoke(
+            project_group,
+            ["route", "--config", str(config), "--apply", "--json"],
+        )
+
+    assert res.exit_code == 1
+    payload = json.loads(res.stdout)
+    assert payload["action"] == "route"
+    assert payload["ok"] is False
+    assert payload["error"] == "config_lock_timeout"
+    assert "timed out" in payload["message"]
+    assert "timed out" in res.stderr
+
+
 def test_route_skips_name_and_prefix_conflicts_without_clobbering(runner, sandbox):
     _seed_routable_project(runner)
     config = sandbox["home"] / "proxy.json"
