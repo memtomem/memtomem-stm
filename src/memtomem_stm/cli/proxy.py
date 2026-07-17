@@ -5008,6 +5008,8 @@ def _resolve_eject_plan(
                     and recorded_path
                 ):
                     target_value = f"{hint}:{recorded_path}"
+                    # Render a copy-paste-safe shell argument. This is POSIX/
+                    # PowerShell-oriented quoting, not cmd.exe syntax.
                     retry_target = f"`--to {shlex.quote(target_value)}`"
                 elif hint in _SOURCE_BY_KIND:
                     retry_target = f"`--to {hint}`"

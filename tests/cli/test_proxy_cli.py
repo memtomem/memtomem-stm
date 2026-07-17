@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -6858,7 +6859,7 @@ class TestEjectCommand:
         result = runner.invoke(cli, ["eject", "plain", "--yes", *_cfg_args(config)])
 
         assert result.exit_code == 1
-        assert f"--to mcp-json:{recorded}" in result.output
+        assert f"--to {shlex.quote(f'mcp-json:{recorded}')}" in result.output
 
     def test_origin_less_backup_hint_handles_unknown_kind(self, runner, config, _hermetic_home):
         log = _hermetic_home / ".memtomem" / "pruned_upstreams.json"
