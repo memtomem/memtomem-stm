@@ -1509,7 +1509,12 @@ class McpClientSearchAdapter:
         warnings = tuple(str(v) for v in raw_warnings) if isinstance(raw_warnings, list) else ()
         omitted = tuple(str(v) for v in raw_omitted) if isinstance(raw_omitted, list) else ()
         return ContextComposeResult(
-            tuple(pinned), tuple(retrieved), warnings, omitted, score_scale, reranker
+            pinned=tuple(pinned),
+            retrieved=tuple(retrieved),
+            warnings=warnings,
+            omitted_block_ids=omitted,
+            score_scale=score_scale,
+            reranker=reranker,
         )
 
     async def candidate_propose(

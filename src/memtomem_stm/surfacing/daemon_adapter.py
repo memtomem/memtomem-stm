@@ -10,6 +10,7 @@ from typing import Any, cast, get_args
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
 from memtomem_stm.daemon.protocol import (
+    MAX_CONTEXT_COMPOSE_SCHEMA,
     OP_LTM_CANDIDATE_PROPOSE,
     OP_LTM_CONTEXT_COMPOSE,
     OP_LTM_INCREMENT_ACCESS,
@@ -64,12 +65,14 @@ class DaemonLtmAdapter:
     def capabilities(self) -> LtmCapabilities:
         # The daemon owns core negotiation; operation responses distinguish a
         # capable core from an older one without exposing session state. The
-        # optimistic default is the highest schema STM understands (4, core
+        # optimistic default is the highest schema STM understands (core
         # #1796) so the engine prefers compose before the first round-trip
         # confirms the actual schema; the daemon clamps to what the core
         # advertises, and the confirmed value replaces this after one call.
         return LtmCapabilities(
-            context_compose_schema=4 if self._compose_schema is None else self._compose_schema,
+            context_compose_schema=(
+                MAX_CONTEXT_COMPOSE_SCHEMA if self._compose_schema is None else self._compose_schema
+            ),
             candidate_propose_schema=0 if self._candidate_propose_supported is False else 1,
         )
 
@@ -86,7 +89,7 @@ class DaemonLtmAdapter:
     ) -> ContextComposeResult | None:
         if self._compose_schema == 0:
             return None
-        requested_schema = self._compose_schema or 4
+        requested_schema = self._compose_schema or MAX_CONTEXT_COMPOSE_SCHEMA
         state, resp = await client.ltm_request(
             self._daemon_config,
             OP_LTM_CONTEXT_COMPOSE,
@@ -164,12 +167,18 @@ class DaemonLtmAdapter:
         omitted = resp.get("omitted_block_ids", [])
         self._compose_schema = selected_schema
         return ContextComposeResult(
-            pinned_items,
-            retrieved_items,
-            tuple(v for v in warnings if isinstance(v, str)) if isinstance(warnings, list) else (),
-            tuple(v for v in omitted if isinstance(v, str)) if isinstance(omitted, list) else (),
-            score_scale,
-            reranker,
+            pinned=pinned_items,
+            retrieved=retrieved_items,
+            warnings=(
+                tuple(v for v in warnings if isinstance(v, str))
+                if isinstance(warnings, list)
+                else ()
+            ),
+            omitted_block_ids=(
+                tuple(v for v in omitted if isinstance(v, str)) if isinstance(omitted, list) else ()
+            ),
+            score_scale=score_scale,
+            reranker=reranker,
         )
 
     async def candidate_propose(

@@ -51,6 +51,7 @@ from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
+    MAX_CONTEXT_COMPOSE_SCHEMA,
     MAX_MESSAGE_BYTES,
     OP_LTM_CANDIDATE_PROPOSE,
     OP_LTM_CONTEXT_COMPOSE,
@@ -632,7 +633,9 @@ class DaemonServer:
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
                     capabilities = getattr(self._adapter, "capabilities", None)
                     actual_schema = getattr(capabilities, "context_compose_schema", 0)
-                    selected_schema = min(max_compose_schema, 4, actual_schema)
+                    selected_schema = min(
+                        max_compose_schema, MAX_CONTEXT_COMPOSE_SCHEMA, actual_schema
+                    )
                     if selected_schema < 2:
                         return {"v": PROTOCOL_VERSION, "ok": False, "status": "unsupported"}
                     if bundle is None:
@@ -685,6 +688,14 @@ class DaemonServer:
                     # bundle; absence mirrors the core's empty-retrieved omission
                     # (bundle fields are None exactly when the core omitted them).
                     # No PROTOCOL_VERSION bump — readers use .get() (#1781/#727).
+                    #
+                    # Deliberate asymmetry: emission is schema-gated here while
+                    # the client decoders read the keys presence-based. It only
+                    # diverges from direct mode if capabilities lag below 4 while
+                    # the core still emits the keys — but a #1796 core advertises
+                    # schema 4 whenever it emits them, so the clamp reaches 4 too.
+                    # Gating on selected_schema keeps the negotiated contract the
+                    # authority (an old client's schema-3 answer stays clean).
                     if selected_schema >= 4:
                         scale = getattr(bundle, "score_scale", None)
                         if isinstance(scale, str) and scale:
