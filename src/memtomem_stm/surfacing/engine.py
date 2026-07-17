@@ -267,10 +267,16 @@ class SurfacingEngine:
         # Keys with an open ``score_scale_mismatch`` episode (#1781): the core
         # NAMED a non-RRF scale while the ceiling sat below min_score, so the
         # diagnostic fired without streak evidence. Fires once per episode;
-        # cleared when a healthy (at-or-above-threshold) observation persists
-        # the recovery. Deliberately NOT cleared on empty results — alternating
-        # empty/below-threshold searches must not re-fire the WARNING.
+        # cleared unconditionally on a healthy observation so a later mismatch
+        # can warn even when persistence is unavailable. Deliberately NOT
+        # cleared on empty results — alternating empty/below-threshold searches
+        # must not re-fire the WARNING.
         self._score_scale_mismatch_active: set[tuple[str, str]] = set()
+        # Keys whose definitive-tier episode became healthy but whose durable
+        # recovery UPDATE has not succeeded yet (#729). Kept separate from the
+        # warning latch above so logging re-arms immediately while transient DB
+        # failures retry on later healthy observations.
+        self._score_scale_mismatch_recovery_pending: set[tuple[str, str]] = set()
         # Last core-reported score scale / reranker model ID (#1781), fed to
         # ``get_min_score_snapshot`` for stm_surfacing_stats. ``None`` until a
         # capable core names one this process; kept at the last REPORTED value
@@ -560,6 +566,8 @@ class SurfacingEngine:
 
         if filter_suspended:
             self._score_scale_streaks.pop(key, None)
+            if key in self._score_scale_mismatch_active:
+                self._score_scale_mismatch_recovery_pending.add(key)
             self._score_scale_mismatch_active.discard(key)
             if key not in self._scale_gate_recovery_persisted:
                 closed_mismatch = self._persist_diagnostic_recovery(
@@ -573,6 +581,8 @@ class SurfacingEngine:
                 # stale pre-gate episode so ``mms doctor`` recovers on the
                 # first suspended batch instead of FAILing for the full
                 # 7-day window on a setup the gate just fixed.
+                if closed_mismatch:
+                    self._score_scale_mismatch_recovery_pending.discard(key)
                 if closed_mismatch and closed_ceiling:
                     self._scale_gate_recovery_persisted.add(key)
             return
@@ -590,16 +600,16 @@ class SurfacingEngine:
             ):
                 self._score_scale_recovery_persisted.add(key)
             # Re-arm the definitive-tier log UNCONDITIONALLY on a healthy
-            # observation — the DB recovery write is best-effort bookkeeping
-            # and must not gate whether a later genuine regression can warn
-            # again. Gating the discard on persistence success (which is
-            # always False when no tracker is attached, e.g. mms hook or
-            # feedback-disabled) would let the mismatch warn at most once per
-            # process, diverging from the streak tier, whose counter resets
-            # here regardless of the DB write.
+            # observation. Durable recovery is tracked separately so a DB
+            # failure retries without suppressing a later genuine warning.
             if key in self._score_scale_mismatch_active:
-                self._persist_diagnostic_recovery(server, tool, "score_scale_mismatch")
+                self._score_scale_mismatch_recovery_pending.add(key)
                 self._score_scale_mismatch_active.discard(key)
+            if (
+                key in self._score_scale_mismatch_recovery_pending
+                and self._persist_diagnostic_recovery(server, tool, "score_scale_mismatch")
+            ):
+                self._score_scale_mismatch_recovery_pending.discard(key)
             return
 
         self._score_scale_recovery_persisted.discard(key)

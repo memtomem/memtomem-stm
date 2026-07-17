@@ -3579,9 +3579,46 @@ class TestReportedScoreScale:
             if c.args[2] == "score_scale_mismatch"
         ]
         assert len(mismatch_recoveries) == 1
+        assert ("gh", "read_file") not in engine._score_scale_mismatch_recovery_pending
         # Re-arm: a fresh below-threshold observation opens a new episode.
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         assert tracker.record_diagnostic.call_count == 2
+
+    def test_mismatch_recovery_retries_until_success(self):
+        tracker = MagicMock()
+        mismatch_attempts = 0
+
+        def recover(_server, _tool, kind):
+            nonlocal mismatch_attempts
+            if kind == "score_scale_mismatch":
+                mismatch_attempts += 1
+                if mismatch_attempts == 1:
+                    raise RuntimeError("sqlite unavailable")
+
+        tracker.record_diagnostic_recovery.side_effect = recover
+        engine = self._engine(tracker=tracker)
+        low = self._low("rerank")
+        healthy = self._low("rerank", score=0.5)
+        key = ("gh", "read_file")
+
+        engine._observe_score_scale(*key, low, 0.03)
+        engine._observe_score_scale(*key, healthy, 0.03)
+
+        assert key not in engine._score_scale_mismatch_active
+        assert key in engine._score_scale_mismatch_recovery_pending
+
+        calls_before_empty = tracker.record_diagnostic_recovery.call_count
+        engine._observe_score_scale(*key, [], 0.03)
+        assert tracker.record_diagnostic_recovery.call_count == calls_before_empty
+        assert key in engine._score_scale_mismatch_recovery_pending
+
+        engine._observe_score_scale(*key, healthy, 0.03)
+        assert key not in engine._score_scale_mismatch_recovery_pending
+        calls_after_success = tracker.record_diagnostic_recovery.call_count
+
+        engine._observe_score_scale(*key, healthy, 0.03)
+        assert tracker.record_diagnostic_recovery.call_count == calls_after_success
+        assert mismatch_attempts == 2
 
     def test_mismatch_rearms_without_tracker(self, caplog):
         """Finding #3: with no feedback tracker (mms hook / feedback off),
@@ -3597,6 +3634,7 @@ class TestReportedScoreScale:
             engine._observe_score_scale("gh", "read_file", healthy, 0.03)
             # Latch cleared on the healthy observation despite no persistence.
             assert ("gh", "read_file") not in engine._score_scale_mismatch_active
+            assert ("gh", "read_file") in engine._score_scale_mismatch_recovery_pending
             engine._observe_score_scale("gh", "read_file", low, 0.03)
 
         warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
@@ -3928,6 +3966,38 @@ class TestScaleGatedMinScore:
         assert recoveries.count("score_ceiling_below_min") == 1
         assert ("gh", "read_file") not in engine._score_scale_mismatch_active
         assert ("gh", "read_file") not in engine._score_scale_streaks
+
+    def test_suspended_recovery_retries_failed_mismatch_write(self):
+        tracker = MagicMock()
+        engine = self._engine([], tracker=tracker, min_score=0.03)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
+        key = ("gh", "read_file")
+
+        engine._observe_score_scale(*key, low, 0.03)
+        mismatch_attempts = 0
+
+        def recover(_server, _tool, kind):
+            nonlocal mismatch_attempts
+            if kind == "score_scale_mismatch":
+                mismatch_attempts += 1
+                if mismatch_attempts == 1:
+                    raise RuntimeError("sqlite unavailable")
+
+        tracker.record_diagnostic_recovery.side_effect = recover
+
+        engine._observe_score_scale(*key, low, 0.03, filter_suspended=True)
+        assert key not in engine._score_scale_mismatch_active
+        assert key in engine._score_scale_mismatch_recovery_pending
+        assert key not in engine._scale_gate_recovery_persisted
+
+        engine._observe_score_scale(*key, low, 0.03, filter_suspended=True)
+        assert key not in engine._score_scale_mismatch_recovery_pending
+        assert key in engine._scale_gate_recovery_persisted
+        calls_after_success = tracker.record_diagnostic_recovery.call_count
+
+        engine._observe_score_scale(*key, low, 0.03, filter_suspended=True)
+        assert tracker.record_diagnostic_recovery.call_count == calls_after_success
+        assert mismatch_attempts == 2
 
     def test_suspend_recovers_episode_opened_after_the_latch_armed(self):
         """The once-per-key recovery latch must re-arm when a NEW episode

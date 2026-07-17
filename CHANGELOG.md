@@ -75,6 +75,11 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- A transient DB failure while closing a `score_scale_mismatch` diagnostic no
+  longer leaves the persisted episode open until the next full mismatch cycle.
+  The warning latch still re-arms immediately on a healthy observation, while
+  the recovery UPDATE now retries on later healthy observations or
+  scale-gated suspended batches until it succeeds. (#733)
 - The daemon now hands the surfacing engine the time left in the client's
   deadline instead of letting that deadline cancel the engine from outside.
   `hook.daemon_timeout_seconds` (2.5s) is smaller than
