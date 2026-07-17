@@ -24,6 +24,7 @@ from pathlib import Path
 import click
 from pydantic import ValidationError
 
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     _has_annotation_policy,
@@ -31,8 +32,7 @@ from memtomem_stm.proxy.config import (
     find_unknown_keys,
 )
 
-# Mirrors cli/proxy.py:_DEFAULT_CONFIG (not imported — see module docstring).
-_DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
+_DEFAULT_CONFIG = DEFAULT_PROXY_CONFIG
 
 
 def _color_on() -> bool:

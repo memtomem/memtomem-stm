@@ -17,6 +17,7 @@ from typing import Any
 
 import click
 
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
 from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.detect import Project, Source, detect_project
@@ -411,7 +412,7 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     "--config",
     "config_path",
     default=None,
-    show_default="~/.memtomem/stm_proxy.json",
+    show_default=str(DEFAULT_PROXY_CONFIG),
     help="STM proxy config to update.",
 )
 @click.option(
@@ -440,10 +441,9 @@ def route_cmd(
     # Lazy import avoids making the lightweight project-state module own a
     # second implementation of STM's JSON validation/atomic-save contract
     # (and a module-level import would be circular: ``cli.proxy`` imports
-    # this module to register the group). ``_DEFAULT_CONFIG`` comes from the
-    # same place so the default can never drift from the other commands'.
+    # this module to register the group). The path default lives in the small
+    # ``cli._defaults`` module so runtime resolution and help text stay aligned.
     from memtomem_stm.cli.proxy import (
-        _DEFAULT_CONFIG,
         _backup_config_snapshot,
         _load,
         _save,
@@ -458,7 +458,7 @@ def route_cmd(
 
     assert project.config is not None and project.marker_path is not None
     enabled = list(project.config.mcp.enabled)
-    path = Path(config_path if config_path is not None else _DEFAULT_CONFIG)
+    path = Path(config_path if config_path is not None else DEFAULT_PROXY_CONFIG)
     path = path.expanduser().resolve()
     data = _load(path)
     if "upstream_servers" not in data:

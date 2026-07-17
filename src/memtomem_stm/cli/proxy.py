@@ -29,6 +29,7 @@ import click
 if TYPE_CHECKING:
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
@@ -55,7 +56,10 @@ from memtomem_stm.utils.redact import (
     sanitize_secrets,
 )
 
-_DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
+# Backward-compatible private alias for this module's decorators. The
+# canonical value lives in ``cli._defaults`` so sibling command modules do
+# not need to import this large, mutually dependent module.
+_DEFAULT_CONFIG = DEFAULT_PROXY_CONFIG
 logger = logging.getLogger(__name__)
 
 # `_DANGEROUS_ENV_KEYS`, `_BLOCKED_IMPORT_NAMES`, `_desktop_config_path`,
@@ -2405,6 +2409,7 @@ _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
 )
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
+_EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
 
 
 def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
@@ -4996,17 +5001,35 @@ def _resolve_eject_plan(
             if row is not None:
                 src = row.get("source") or {}
                 hint = src.get("kind", "?") if isinstance(src, dict) else "?"
+                recorded_path = src.get("path") if isinstance(src, dict) else None
+                if (
+                    hint in {"claude-project", "mcp-json"}
+                    and isinstance(recorded_path, str)
+                    and recorded_path
+                ):
+                    target_value = f"{hint}:{recorded_path}"
+                    # Render a copy-paste-safe shell argument. This is POSIX/
+                    # PowerShell-oriented quoting, not cmd.exe syntax.
+                    retry_target = f"`--to {shlex.quote(target_value)}`"
+                elif hint in _SOURCE_BY_KIND:
+                    retry_target = f"`--to {hint}`"
+                else:
+                    retry_target = f"`--to TARGET` ({_EJECT_TARGETS_HELP})"
                 return _EjectPlan(
                     name=name,
                     error=(
                         f"{no_origin} — the prune backup log has a row "
                         f"for '{name}' (kind={hint}, pruned_at={row.get('pruned_at')}); "
-                        "verify it is current, then re-run with --to"
+                        f"verify it is current, then re-run with {retry_target}"
                     ),
                 )
             return _EjectPlan(
                 name=name,
-                error=f"{no_origin} — pass --to to choose a restore target",
+                error=(
+                    f"{no_origin}; STM cannot infer the original host — re-run with "
+                    f"`--to TARGET` where TARGET is one of: {_EJECT_TARGETS_HELP}. "
+                    "This STM entry was not changed"
+                ),
             )
         spec, to_path = to_spec
         kind, path = spec.kind, to_path
@@ -5165,8 +5188,7 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     default=None,
     metavar="TARGET",
     help=(
-        "Restore target for entries without a usable origin: claude-user | "
-        "claude-project[:PATH] | mcp-json[:PATH] | claude-desktop. Entries "
+        f"Restore target for entries without a usable origin: {_EJECT_TARGETS_HELP}. Entries "
         "with a recorded origin ignore this."
     ),
 )

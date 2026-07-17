@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -6800,7 +6801,10 @@ class TestEjectCommand:
         result = runner.invoke(cli, ["eject", "plain", "--yes", *_cfg_args(config)])
 
         assert result.exit_code == 1
-        assert "--to" in result.output
+        assert "STM cannot infer the original host" in result.output
+        assert "--to TARGET" in result.output
+        assert "claude-project[:PATH]" in result.output
+        assert "This STM entry was not changed" in result.output
 
     def test_origin_less_suggests_backup_log_row(self, runner, config, _hermetic_home):
         log = _hermetic_home / ".memtomem" / "pruned_upstreams.json"
@@ -6828,6 +6832,62 @@ class TestEjectCommand:
         assert result.exit_code == 1
         assert "backup log has a row" in result.output
         assert "kind=claude-user" in result.output
+        assert "--to claude-user" in result.output
+
+    def test_origin_less_backup_hint_preserves_recorded_path(self, runner, config, _hermetic_home):
+        recorded = str(_hermetic_home / "archived" / ".mcp.json")
+        log = _hermetic_home / ".memtomem" / "pruned_upstreams.json"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entries": [
+                        {
+                            "name": "plain",
+                            "source": {"kind": "mcp-json", "path": recorded},
+                            "original": {"command": "npx"},
+                            "pruned_at": "2026-06-10T00:00:00Z",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"plain": {"prefix": "p", "command": "npx"}})
+
+        result = runner.invoke(cli, ["eject", "plain", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert f"--to {shlex.quote(f'mcp-json:{recorded}')}" in result.output
+
+    def test_origin_less_backup_hint_handles_unknown_kind(self, runner, config, _hermetic_home):
+        log = _hermetic_home / ".memtomem" / "pruned_upstreams.json"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entries": [
+                        {
+                            "name": "plain",
+                            "source": {},
+                            "original": {"command": "npx"},
+                            "pruned_at": "2026-06-10T00:00:00Z",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._seed_config(config, {"plain": {"prefix": "p", "command": "npx"}})
+
+        result = runner.invoke(cli, ["eject", "plain", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--to TARGET" in result.output
+        assert "claude-project[:PATH]" in result.output
+        assert "--to ?" not in result.output
 
     def test_to_denormalizes_and_strips_stm_fields(self, runner, config, tmp_path):
         target = tmp_path / ".mcp.json"
