@@ -4119,6 +4119,11 @@ class ProxyManager:
         # (not only in the else-branch) because the shared CompressionResult
         # construction at the end reads it on the PROGRESSIVE path too.
         selective_store_error = False
+        # Set True when the opt-in unicode token gate evaluates this response
+        # (else-branch only — PROGRESSIVE is zero-loss and has no size gate).
+        # Read by the metrics block in ``_call_tool_inner`` to pick the token
+        # estimator, so it must track the gate exactly.
+        unicode_token_gate = False
         if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
             pcfg = tc.progressive
             if len(cleaned) <= pcfg.chunk_size:
@@ -4187,6 +4192,7 @@ class ProxyManager:
                 tc.token_budget is not None
                 and tc.token_estimation_mode == TokenEstimationMode.UNICODE
             ):
+                unicode_token_gate = True
                 estimated_tokens = approx_tokens(cleaned)
                 if estimated_tokens <= tc.token_budget:
                     # The actual response fits the requested token budget even
@@ -4503,6 +4509,7 @@ class ProxyManager:
             compress_ms=_compress_ms,
             surface_ms=_surface_ms,
             selective_store_error=selective_store_error,
+            unicode_token_gate=unicode_token_gate,
         )
 
     async def _run_index_stage(
@@ -5300,9 +5307,14 @@ class ProxyManager:
         extract_error = ext.error
 
         # Record metrics (using pre-surfacing compressed size)
-        # The opt-in unicode gate uses the same estimator for observability so
-        # the recorded decision and the reported token counts reconcile.
-        if tc.token_estimation_mode == TokenEstimationMode.UNICODE:
+        # When the unicode gate evaluated THIS response, report token counts
+        # from the same estimator so the recorded decision and the counts
+        # reconcile. Keyed on the gate having RUN (not on the mode alone):
+        # mode without a token budget, and the PROGRESSIVE branch with its
+        # deliberate ``len(cleaned)`` accounting basis, keep the static path.
+        # On the gated (non-progressive) branch ``comp.compressed`` is exactly
+        # the text whose length static mode measures.
+        if comp.unicode_token_gate:
             _orig_tokens = max(1, approx_tokens(original_text))
             _comp_tokens = max(1, approx_tokens(comp.compressed))
         else:

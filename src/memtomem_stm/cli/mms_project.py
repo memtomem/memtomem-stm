@@ -164,7 +164,9 @@ def _same_registry_route(existing: object, server: state.RegistryServer) -> bool
         existing.get("transport", "stdio") == "stdio"
         and existing.get("command", "") == server.command
         and existing.get("args", []) == server.args
-        and existing.get("env") == (dict(server.env) or None)
+        # ``or None`` on both sides: the route writer normalizes an empty env
+        # to null, and a hand-edited ``"env": {}`` is the same identity.
+        and (existing.get("env") or None) == (dict(server.env) or None)
         and existing.get("prefix") == server.prefix
     )
 
@@ -408,8 +410,8 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
 @click.option(
     "--config",
     "config_path",
-    default="~/.memtomem/stm_proxy.json",
-    show_default=True,
+    default=None,
+    show_default="~/.memtomem/stm_proxy.json",
     help="STM proxy config to update.",
 )
 @click.option(
@@ -422,7 +424,7 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
 @with_config_write_lock(skip=lambda kwargs: not kwargs.get("do_apply"))
 def route_cmd(
     project_name: str | None,
-    config_path: str,
+    config_path: str | None,
     do_apply: bool,
     json_output: bool,
 ) -> None:
@@ -433,8 +435,12 @@ def route_cmd(
     never pruned. Use ``mms prune`` separately after verifying the proxy.
     """
     # Lazy import avoids making the lightweight project-state module own a
-    # second implementation of STM's JSON validation/atomic-save contract.
+    # second implementation of STM's JSON validation/atomic-save contract
+    # (and a module-level import would be circular: ``cli.proxy`` imports
+    # this module to register the group). ``_DEFAULT_CONFIG`` comes from the
+    # same place so the default can never drift from the other commands'.
     from memtomem_stm.cli.proxy import (
+        _DEFAULT_CONFIG,
         _backup_config_snapshot,
         _load,
         _save,
@@ -449,7 +455,8 @@ def route_cmd(
 
     assert project.config is not None and project.marker_path is not None
     enabled = list(project.config.mcp.enabled)
-    path = Path(config_path).expanduser().resolve()
+    path = Path(config_path if config_path is not None else _DEFAULT_CONFIG)
+    path = path.expanduser().resolve()
     data = _load(path)
     upstreams: dict[str, Any] = data.setdefault("upstream_servers", {})
 

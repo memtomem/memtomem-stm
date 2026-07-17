@@ -495,6 +495,30 @@ class TestStatus:
         assert "Tuning : ready for 1 tool(s)" in result.output
         assert "mms tune" in result.output
 
+    def test_tuning_readiness_ignores_malformed_summary_rows(self, monkeypatch):
+        """A summary row missing a key must be filtered, not crash ``status``."""
+        from memtomem_stm.cli.proxy import _tuning_readiness
+        from memtomem_stm.proxy import metrics_store
+
+        monkeypatch.setattr(
+            metrics_store,
+            "read_compression_summary",
+            lambda db_path, tool=None, source=None: {
+                "available": True,
+                "by_tool": [
+                    {"tool": "no-server-key", "calls": 9},
+                    {"server": "docs", "tool": "search", "calls": 7},
+                    "not-a-dict",
+                    {"server": "docs", "tool": "stringy", "calls": "7"},
+                ],
+            },
+        )
+
+        readiness = _tuning_readiness({"enabled": True, "upstream_servers": {}})
+
+        assert readiness["ready"] is True
+        assert readiness["tools"] == [{"server": "docs", "tool": "search", "calls": 7}]
+
     def test_json_missing_config(self, runner, config):
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
         assert result.exit_code == 0

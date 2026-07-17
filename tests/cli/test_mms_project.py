@@ -439,6 +439,38 @@ def test_route_skips_name_and_prefix_conflicts_without_clobbering(runner, sandbo
     assert json.loads(config.read_text(encoding="utf-8")) == original
 
 
+def test_route_treats_empty_env_as_equivalent_to_null(runner, sandbox):
+    """A hand-edited ``"env": {}`` on an otherwise identical entry is the
+    same route — report it unchanged, not as a name conflict (the route
+    writer itself normalizes an empty env to ``null``)."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "github": {
+                        "command": "github-mcp",
+                        "args": [],
+                        "env": {},
+                        "prefix": "gh",
+                        "transport": "stdio",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--json"])
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["unchanged"] == ["github"]
+    assert payload["planned"] == ["filesystem"]
+    assert payload["skipped"] == []
+
+
 # ---------------------------------------------------------------------------
 # Project resolution edge case — --project name with stale index
 # ---------------------------------------------------------------------------

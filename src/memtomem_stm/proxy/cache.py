@@ -285,26 +285,7 @@ class ProxyCache:
             # would break the SECURITY.md exclusion, so evict and miss.
             # Checked BEFORE expiry: an expired sensitive row must still be
             # deleted, not left resting on disk until the next startup.
-            try:
-                with self._lock:
-                    self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
-                    self._db.commit()
-                logger.debug(
-                    "Evicted cached response for %s/%s: result matches a privacy pattern",
-                    server,
-                    tool,
-                )
-            except sqlite3.Error:
-                # Eviction is best-effort: a concurrent writer holding the
-                # file lock must degrade this to a plain miss, never abort
-                # the caller's request. The row is retried on the next
-                # ``get()`` and swept by the next startup purge.
-                logger.warning(
-                    "Privacy eviction failed for %s/%s — serving a miss",
-                    server,
-                    tool,
-                    exc_info=True,
-                )
+            self._evict_row(key, server, tool, reason="result matches a privacy pattern")
             return None
         if not row[3]:
             # Envelope-safety marker (v3): every row written by ``set()`` is
@@ -320,21 +301,64 @@ class ProxyCache:
         structured_content: dict[str, Any] | None = None
         meta: dict[str, Any] | None = None
         if envelope_json is not None:
-            try:
-                envelope = json.loads(envelope_json)
-                if not isinstance(envelope, dict) or envelope.get("schema_version") != 1:
-                    return None
-                raw_structured = envelope.get("structuredContent")
-                raw_meta = envelope.get("_meta")
-                if raw_structured is not None and not isinstance(raw_structured, dict):
-                    return None
-                if raw_meta is not None and not isinstance(raw_meta, dict):
-                    return None
-                structured_content = raw_structured
-                meta = raw_meta
-            except (TypeError, ValueError):
+            parsed = self._parse_envelope(envelope_json)
+            if parsed is None:
+                # ``set()`` validates before writing, so a malformed envelope
+                # can only come from an out-of-band writer. Mirror the
+                # sensitive-row eviction above: a plain miss would leave the
+                # row as dead weight — immortal for ``ttl_seconds NULL`` rows
+                # — while still counting against ``max_entries``.
+                self._evict_row(key, server, tool, reason="envelope_json is malformed")
                 return None
+            structured_content, meta = parsed
         return CachedResponse(entry.result, structured_content=structured_content, meta=meta)
+
+    @staticmethod
+    def _parse_envelope(
+        envelope_json: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None] | None:
+        """Validated ``(structured_content, meta)`` from a stored envelope.
+
+        ``None`` (as the whole tuple) means the row is malformed: non-JSON,
+        an unknown ``schema_version``, or a non-dict field value.
+        """
+        try:
+            envelope = json.loads(envelope_json)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(envelope, dict) or envelope.get("schema_version") != 1:
+            return None
+        raw_structured = envelope.get("structuredContent")
+        raw_meta = envelope.get("_meta")
+        if raw_structured is not None and not isinstance(raw_structured, dict):
+            return None
+        if raw_meta is not None and not isinstance(raw_meta, dict):
+            return None
+        return raw_structured, raw_meta
+
+    def _evict_row(self, key: str, server: str, tool: str, *, reason: str) -> None:
+        """Best-effort single-row eviction from the ``get()`` read path.
+
+        A failure (e.g. a concurrent writer holding the file lock past the
+        busy timeout) degrades to a plain miss — it must never abort the
+        caller's request. The row is retried on the next ``get()`` and swept
+        by the next startup purge.
+        """
+        if self._db is None:
+            return
+        try:
+            with self._lock:
+                self._db.execute("DELETE FROM proxy_cache WHERE cache_key = ?", (key,))
+                self._db.commit()
+            logger.debug("Evicted cached response for %s/%s: %s", server, tool, reason)
+        except sqlite3.Error:
+            logger.warning(
+                "Cache eviction (%s) failed for %s/%s — serving a miss",
+                reason,
+                server,
+                tool,
+                exc_info=True,
+            )
 
     def invalidate(
         self,

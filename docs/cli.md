@@ -792,7 +792,8 @@ Options:
 ```
 
 Routes enabled stdio registry definitions into the proxy. Preview and JSON
-output redact secrets. Apply holds the proxy config write lock, creates a
+output never include entry contents, so registry `env` secrets stay out of
+terminal output. Apply holds the proxy config write lock, creates a
 backup of an existing config, validates the complete result, and records the
 registry origin. Existing equivalent routes are unchanged; name and prefix
 conflicts are reported and never overwritten. The command does not prune proxy

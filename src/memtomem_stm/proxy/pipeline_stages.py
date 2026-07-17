@@ -93,6 +93,13 @@ class CompressionResult:
     # transient, and must not be pinned for the cache TTL. No default (the
     # module contract above): the compress branch always sets it explicitly.
     selective_store_error: bool
+    # The opt-in unicode token gate evaluated THIS response (token budget set,
+    # ``token_estimation_mode == "unicode"``, non-progressive branch). Keys the
+    # metrics estimator switch in ``_call_tool_inner`` so recorded token counts
+    # always reconcile with the gate decision — and never flip the progressive
+    # branch's deliberate ``len(cleaned)`` accounting basis. No default: both
+    # branches set it explicitly.
+    unicode_token_gate: bool
 
 
 @dataclass(frozen=True, slots=True)

@@ -72,6 +72,27 @@ class TestProxyCacheBasic:
         )
         assert proxy_cache.get("s", "t", {}) is None
 
+    @pytest.mark.parametrize(
+        "bad_envelope",
+        ["{not json", '{"schema_version": 99}', '{"schema_version": 1, "_meta": "not-a-dict"}'],
+        ids=["unparseable", "unknown-schema", "non-dict-field"],
+    )
+    def test_malformed_envelope_row_is_evicted(self, proxy_cache: ProxyCache, bad_envelope):
+        """An out-of-band envelope write must be evicted, not just missed.
+
+        ``set()`` validates before writing, so a malformed ``envelope_json``
+        can only come from an external SQL writer. Returning a plain miss
+        would leave the row as dead weight — immortal for ``ttl_seconds
+        NULL`` rows — still counting against ``max_entries``; mirror the
+        sensitive-row read-side eviction instead.
+        """
+        proxy_cache.set("s", "t", {}, "body", ttl_seconds=60.0, structured_content={"a": 1})
+        proxy_cache._db.execute("UPDATE proxy_cache SET envelope_json = ?", (bad_envelope,))
+        proxy_cache._db.commit()
+
+        assert proxy_cache.get("s", "t", {}) is None
+        assert proxy_cache.stats()["total_entries"] == 0
+
 
 class TestProxyCacheDegradation:
     def test_get_degrades_to_miss_on_sqlite_error(self, tmp_path, caplog):

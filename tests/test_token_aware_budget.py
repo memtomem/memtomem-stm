@@ -14,6 +14,7 @@ import pytest
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
+    ProgressiveConfig,
     ProxyConfig,
     TokenEstimationMode,
     ToolOverrideConfig,
@@ -433,6 +434,90 @@ class TestTokenEstimationMode:
 
         call = mgr._apply_compression.await_args  # type: ignore[union-attr]
         assert call.args[1] == CompressionStrategy.NONE
+
+    @pytest.mark.asyncio
+    async def test_unicode_gate_flag_set_when_the_gate_ran(self):
+        """``unicode_token_gate`` keys the metrics estimator switch, so it must
+        be True exactly when the gate evaluated this response."""
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            compression="truncate",
+            max_result_tokens=100,
+            token_estimation_mode="unicode",
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg}, min_result_retention=0)
+        mgr = _make_manager(proxy_cfg, server_cfg)
+        tc = mgr._resolve_tool_config("srv", "tool")
+        mgr._apply_compression = AsyncMock(return_value=("압", None))  # type: ignore[method-assign]
+
+        comp = await mgr._compress_and_surface(
+            server="srv",
+            tool="tool",
+            upstream_args={},
+            cleaned="가" * 200,
+            tc=tc,
+            cfg_snap=proxy_cfg,
+            context_query=None,
+            trace_id=None,
+        )
+
+        assert comp.unicode_token_gate is True
+
+    @pytest.mark.asyncio
+    async def test_unicode_mode_without_budget_never_sets_the_flag(self):
+        """Mode alone must not flip accounting: without a token budget the
+        gate cannot run, so metrics keep the static chars/3.5 basis."""
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            compression="truncate",
+            token_estimation_mode="unicode",
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg}, min_result_retention=0)
+        mgr = _make_manager(proxy_cfg, server_cfg)
+        tc = mgr._resolve_tool_config("srv", "tool")
+        mgr._apply_compression = AsyncMock(return_value=("압", None))  # type: ignore[method-assign]
+
+        comp = await mgr._compress_and_surface(
+            server="srv",
+            tool="tool",
+            upstream_args={},
+            cleaned="가" * 200,
+            tc=tc,
+            cfg_snap=proxy_cfg,
+            context_query=None,
+            trace_id=None,
+        )
+
+        assert comp.unicode_token_gate is False
+
+    @pytest.mark.asyncio
+    async def test_progressive_branch_never_sets_the_unicode_flag(self):
+        """PROGRESSIVE is zero-loss and skips the gate; its deliberate
+        ``len(cleaned)`` metrics basis must not flip to the envelope size."""
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            compression="progressive",
+            progressive=ProgressiveConfig(chunk_size=10_000),
+            max_result_tokens=100,
+            token_estimation_mode="unicode",
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg}, min_result_retention=0)
+        mgr = _make_manager(proxy_cfg, server_cfg)
+        tc = mgr._resolve_tool_config("srv", "tool")
+
+        comp = await mgr._compress_and_surface(
+            server="srv",
+            tool="tool",
+            upstream_args={},
+            cleaned="가" * 200,  # fits one chunk: zero-loss passthrough
+            tc=tc,
+            cfg_snap=proxy_cfg,
+            context_query=None,
+            trace_id=None,
+        )
+
+        assert comp.unicode_token_gate is False
+        assert comp.compressed_chars_for_metrics == 200
 
 
 class TestKoreanWorkloadEndToEnd:

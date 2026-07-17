@@ -1515,7 +1515,11 @@ def _tuning_readiness(data: dict[str, Any]) -> dict[str, Any]:
     tools = [
         {"server": row["server"], "tool": row["tool"], "calls": row["calls"]}
         for row in safe_rows
-        if isinstance(row, dict) and isinstance(row.get("calls"), int) and row["calls"] >= MIN_CALLS
+        if isinstance(row, dict)
+        and isinstance(row.get("server"), str)
+        and isinstance(row.get("tool"), str)
+        and isinstance(row.get("calls"), int)
+        and row["calls"] >= MIN_CALLS
     ]
     return {
         "available": bool(summary.get("available")),
