@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # relevance ``risk_penalty`` (#493) — a separate, best-effort enrichment.
 _ELIGIBLE_TOOLS = "eligible_tools"
 _RANK_FEATURES = "rank_features"
+_BACKEND_UNAVAILABLE_KIND = "backend_unavailable"
 
 # Transport failure modes that mean "graph unreachable" rather than a contract
 # mismatch. ``eligible_tools()`` wraps these into ``ToolgraphUnreachableError``;
@@ -67,13 +68,10 @@ class ToolgraphConsultError(Exception):
 class ToolgraphUnreachableError(ToolgraphConsultError):
     """The tool-graph server could not be reached, or the consult timed out.
 
-    An *availability* failure at the **transport** layer: the stdio child
-    never came up, the pipe broke, or the consult exceeded ``timeout_seconds``.
-    The caller maps this onto ``on_unreachable``. Note this is narrower than
-    "the graph is unavailable": a backend (e.g. Neo4j) outage where the graph
-    *server* stays up surfaces as an ``isError`` tool result, not a transport
-    error, and is therefore classified ``ToolgraphProtocolError`` (below) —
-    any server-side error envelope is treated as a contract class.
+    An *availability* failure: either the stdio child never came up, the pipe
+    broke, the consult exceeded ``timeout_seconds``, or a compatible Toolgraph
+    server returned its typed ``backend_unavailable`` MCP error envelope. The
+    caller maps all of these onto ``on_unreachable``.
     """
 
 
@@ -81,11 +79,10 @@ class ToolgraphProtocolError(ToolgraphConsultError):
     """The tool-graph server is reachable but returned an incompatible response.
 
     A *contract* failure: the ``eligible_tools`` tool is missing, the call
-    came back ``isError`` (including a backend/DB outage the graph server
-    reports as a tool error), or the structured payload is absent / malformed.
-    The caller maps this onto ``on_protocol_error``. Distinct from
-    ``ToolgraphUnreachableError`` so a version/contract drift is never
-    silently treated as "the graph is down".
+    returned an untyped/unknown/malformed ``isError``, or the structured
+    verdict is absent / malformed. The caller maps this onto
+    ``on_protocol_error``. Distinct from ``ToolgraphUnreachableError`` so a
+    version/contract drift is never silently treated as "the graph is down".
     """
 
 
@@ -170,9 +167,10 @@ class ToolgraphConsultAdapter:
         ``paths`` / ``candidates``.
 
         Raises:
-            ToolgraphUnreachableError: transport down / timeout / not started.
-            ToolgraphProtocolError: ``isError`` result, missing tool, or a
-                missing / non-dict structured payload.
+            ToolgraphUnreachableError: transport down / timeout / not started,
+                or a typed backend-unavailable result.
+            ToolgraphProtocolError: untyped/unknown ``isError``, missing tool,
+                or a missing / non-dict structured payload.
         """
         args: dict[str, Any] = {
             "agent": self._config.agent_id if agent is None else agent,
@@ -199,9 +197,10 @@ class ToolgraphConsultAdapter:
         ``profile`` — features are profile-independent facts.
 
         Raises:
-            ToolgraphUnreachableError: transport down / timeout / not started.
-            ToolgraphProtocolError: ``isError`` result, missing tool, or a
-                missing / non-dict structured payload.
+            ToolgraphUnreachableError: transport down / timeout / not started,
+                or a typed backend-unavailable result.
+            ToolgraphProtocolError: untyped/unknown ``isError``, missing tool,
+                or a missing / non-dict structured payload.
         """
         args: dict[str, Any] = {
             "agent": self._config.agent_id if agent is None else agent,
@@ -214,8 +213,10 @@ class ToolgraphConsultAdapter:
 
         Shared transport/error/parse contract for :meth:`eligible_tools` and
         :meth:`rank_features`: transport faults map to
-        :class:`ToolgraphUnreachableError`; an ``isError`` result, an unknown
-        tool, or an unparseable payload map to :class:`ToolgraphProtocolError`.
+        :class:`ToolgraphUnreachableError`. A producer-declared backend outage
+        maps there too, but only from the exact structured discriminator; every
+        other ``isError``, unknown tool, or unparseable payload maps to
+        :class:`ToolgraphProtocolError`.
         """
         if self._session is None:
             raise ToolgraphUnreachableError("tool-graph adapter not started")
@@ -235,6 +236,15 @@ class ToolgraphConsultAdapter:
             raise ToolgraphProtocolError(str(exc)) from exc
 
         if result.isError:
+            error = getattr(result, "structuredContent", None)
+            if (
+                isinstance(error, dict)
+                and error.get("error_kind") == _BACKEND_UNAVAILABLE_KIND
+                and error.get("retryable") is True
+            ):
+                raise ToolgraphUnreachableError(
+                    f"{tool} reported that the Toolgraph backend is temporarily unavailable"
+                )
             raise ToolgraphProtocolError(
                 f"{tool} returned an error result: {_result_error_text(result)}"
             )

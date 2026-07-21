@@ -543,19 +543,19 @@ With `source: "stdio"`, enabling the block makes the graph's backend a startup
 prerequisite. The four `on_*` knobs choose the posture when the consult
 cannot produce a usable verdict:
 
-- **`on_unreachable`** (`open` default) — the graph server is down / the
-  consult times out. `open` degrades to STM-native rules; `closed` withholds
-  every tool (high-assurance).
+- **`on_unreachable`** (`open` default) — the graph server is down, the consult
+  times out, or a compatible Toolgraph server returns its typed
+  `backend_unavailable` MCP envelope. `open` degrades to STM-native rules;
+  `closed` withholds every tool (high-assurance).
 - **`on_agent_not_found`** (`fail_start` default) — `agent_id` is unknown to
   the graph, almost always a typo. `fail_start` refuses startup loudly so a
   typo cannot silently disable enforcement; `open` / `closed` are explicit
   opt-ins.
 - **`on_protocol_error`** (`fail_start` default) — the graph is reachable but
-  returns an incompatible / error response. **A backend (Neo4j) outage while
-  the graph *server* stays up surfaces here** (a server-side error envelope),
-  not as `on_unreachable` — so the default `fail_start` means a backend outage
-  refuses proxy startup. Set it to `open` to degrade instead (availability
-  over assurance; note this also degrades on genuine contract drift).
+  returns an incompatible, untyped, unknown, or malformed error response.
+  Legacy Toolgraph versions do not declare backend availability separately,
+  so their backend failures still surface here and fail startup by default.
+  STM never classifies errors by matching message text.
 - **`on_tool_not_found`** (`open` default) — a specific candidate was never
   crawled (the graph's blind spot). `open` keeps the working tool advertised;
   `closed` rejects uncrawled candidates.
