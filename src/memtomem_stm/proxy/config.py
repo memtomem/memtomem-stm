@@ -911,9 +911,10 @@ class ToolgraphConfig(BaseModel):
     fail-closed withhold, and pins ``graph_generation`` into selection
     telemetry. Failures map onto the four ``on_*`` knobs below. Neo4j (behind
     the graph server) is an operational prerequisite of enabling this block:
-    a backend outage while the graph *server* stays up surfaces as a
-    server-side error and is classified as a contract failure
-    (``on_protocol_error``).
+    a compatible server reports a backend outage with the typed
+    ``backend_unavailable`` MCP envelope, which is classified through
+    ``on_unreachable``. Untyped, unknown, or malformed error results remain
+    contract failures (``on_protocol_error``).
     """
 
     enabled: bool = False

@@ -44,10 +44,28 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 mcp = FastMCP("fake-toolgraph")
+
+_BACKEND_UNAVAILABLE_MESSAGE = "Toolgraph backend is temporarily unavailable; retry later."
+
+
+def _backend_unavailable() -> CallToolResult:
+    payload = {
+        "error_kind": "backend_unavailable",
+        "retryable": True,
+        "message": _BACKEND_UNAVAILABLE_MESSAGE,
+    }
+    return CallToolResult(
+        content=[TextContent(type="text", text=_BACKEND_UNAVAILABLE_MESSAGE)],
+        structuredContent=payload,
+        isError=True,
+    )
+
 
 # Arbitrary fixed monotonic graph generation so tests can assert the field is
 # threaded through verbatim. The #494 consult-cache tests need to vary the
@@ -82,11 +100,13 @@ def _record_call(tool: str, n_candidates: int) -> None:
 
 
 @mcp.tool()
-async def eligible_tools(agent: str, candidates: list[str], profile: str = "strict") -> dict:
+async def eligible_tools(agent: str, candidates: list[str], profile: str = "strict") -> Any:
     """Canned ``eligible_tools`` consult mirroring the real structured shape."""
     _record_call("eligible_tools", len(candidates))
     if profile == "boom":
         raise ValueError(f"unknown profile {profile!r}")
+    if profile == "backend_unavailable":
+        return _backend_unavailable()
     if profile == "sleep":
         await asyncio.sleep(30)
     if agent == "ghost":
@@ -125,7 +145,7 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
 
 
 @mcp.tool()
-async def rank_features(agent: str, candidates: list[str]) -> dict:
+async def rank_features(agent: str, candidates: list[str]) -> Any:
     """Canned ``rank_features`` consult mirroring the real per-candidate shape.
 
     Only the fields STM's ``parse_risk_scores`` reads are populated faithfully
@@ -137,6 +157,8 @@ async def rank_features(agent: str, candidates: list[str]) -> dict:
     _record_call("rank_features", len(candidates))
     if agent == "rankboom":
         raise ValueError("rank_features boom")
+    if agent == "rankunavailable":
+        return _backend_unavailable()
     if agent == "rankmalformed":
         # A non-error response MISSING the 'features' list — the malformed-but-
         # successful enrichment shape. parse_risk_scores leniently yields no

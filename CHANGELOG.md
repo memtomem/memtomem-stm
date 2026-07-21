@@ -92,6 +92,12 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Toolgraph stdio consults now recognize the producer's typed
+  `backend_unavailable` MCP envelope and route it through `on_unreachable`;
+  legacy, unknown, malformed, and contract errors remain on
+  `on_protocol_error`. **Behavior change**: with compatible Toolgraph and the
+  default `on_unreachable: open`, a backend outage now starts loudly degraded
+  under STM-native rules instead of failing startup as a protocol error.
 - A transient DB failure while closing a `score_scale_mismatch` diagnostic no
   longer leaves the persisted episode open until the next full mismatch cycle.
   The warning latch still re-arms immediately on a healthy observation, while

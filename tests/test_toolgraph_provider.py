@@ -213,6 +213,60 @@ class TestToolgraphConsultAdapter:
         finally:
             await adapter.stop()
 
+    async def test_typed_backend_unavailable_is_availability_not_protocol(self):
+        adapter = _adapter()
+        await adapter.start()
+        try:
+            with pytest.raises(ToolgraphUnreachableError):
+                await adapter.eligible_tools(["s::a"], profile="backend_unavailable")
+        finally:
+            await adapter.stop()
+
+    @pytest.mark.parametrize(
+        "structured",
+        [
+            None,
+            {},
+            {"error_kind": "future_error", "retryable": True},
+            {"error_kind": "backend_unavailable", "retryable": False},
+            {"error_kind": "backend_unavailable"},
+        ],
+    )
+    async def test_untyped_unknown_or_malformed_error_stays_protocol(self, structured):
+        adapter = _adapter()
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=True,
+            structuredContent=structured,
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text="backend_unavailable retry later misleading text",
+                )
+            ],
+        )
+        adapter._session = session
+
+        with pytest.raises(ToolgraphProtocolError):
+            await adapter.eligible_tools(["s::a"])
+
+    async def test_typed_kind_wins_without_message_sniffing(self):
+        adapter = _adapter()
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=True,
+            structuredContent={
+                "error_kind": "backend_unavailable",
+                "retryable": True,
+                "message": "unknown profile contract failure",
+            },
+            content=[SimpleNamespace(type="text", text="unknown profile")],
+        )
+        adapter._session = session
+
+        with pytest.raises(ToolgraphUnreachableError):
+            await adapter.eligible_tools(["s::a"])
+
     async def test_eligible_tools_before_start_raises_unreachable(self):
         adapter = _adapter()
         with pytest.raises(ToolgraphUnreachableError):
@@ -636,6 +690,28 @@ class TestToolgraphConsultWiring:
         assert mgr._toolgraph_withhold_all == REASON_TOOLGRAPH_PROTOCOL_ERROR
         assert mgr.get_proxy_tools() == []
 
+    async def test_typed_backend_unavailable_default_open_degrades(self, tmp_path):
+        mgr, _ = _tg_manager(tmp_path, query_profile="backend_unavailable")
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_degraded is True
+        assert mgr._toolgraph_degraded_reason == REASON_TOOLGRAPH_UNREACHABLE
+        assert mgr._toolgraph_from_cache is False
+        assert mgr._graph_generation is None
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == [
+            "srv__read_file",
+            "srv__blocked",
+        ]
+
+    async def test_typed_backend_unavailable_closed_withholds_all(self, tmp_path):
+        mgr, _ = _tg_manager(
+            tmp_path,
+            query_profile="backend_unavailable",
+            on_unreachable="closed",
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_withhold_all == REASON_TOOLGRAPH_UNREACHABLE
+        assert mgr.get_proxy_tools() == []
+
     async def test_timeout_maps_to_unreachable(self, tmp_path):
         # query_profile="sleep" blocks past timeout_seconds → the consult
         # wait_for fires → ToolgraphUnreachableError → on_unreachable default open.
@@ -947,6 +1023,22 @@ class TestToolgraphConsultCache:
         await mgr._consult_toolgraph()
         assert mgr._toolgraph_from_cache is False  # had_risk_scores False → miss under want_risk
         assert "eligible_tools:1" in _read_calls(call_log)[n_after_first:]  # full consult re-ran
+        await mgr.stop()
+
+    async def test_typed_backend_enrichment_failure_not_cached_as_success(self, tmp_path):
+        call_log = tmp_path / "calls.txt"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["risky_tool"]},
+            agent_id="rankunavailable",
+            env={"FAKE_TG_CALL_LOG": str(call_log)},
+        )
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_risk_penalties == {}
+        n_after_first = len(_read_calls(call_log))
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_from_cache is False
+        assert "eligible_tools:1" in _read_calls(call_log)[n_after_first:]
         await mgr.stop()
 
     async def test_malformed_enrichment_not_cached_as_success(self, tmp_path):
