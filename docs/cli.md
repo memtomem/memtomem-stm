@@ -606,10 +606,11 @@ Commands:
 ```
 
 Bare `mms hook` (no subcommand) is the **runtime bridge**: it reads a host's
-`PostToolUse` hook payload from stdin and prints a hook response. It adds LTM
-surfacing through `additionalContext` for read-like
-built-ins (`Read`/`Grep`/`Glob`/`Bash` and their per-host equivalents). Bash
-stdout compression is separate, Claude-only, and opt-in via
+`PostToolUse` hook payload from stdin and prints a hook response. Supported
+Claude and approved Codex hooks add LTM surfacing through `additionalContext`
+for read-like built-ins (`Read`/`Grep`/`Glob`/`Bash` and their per-host
+equivalents). Bash stdout compression is separate, Claude-only, requires Claude
+Code 2.1.121+, and is opt-in via
 `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
 preserving stderr, exit status, interruption state, and image markers.
 
@@ -663,13 +664,15 @@ the safety net.
 
 Native hooks are PostToolUse observers, not full MCP proxies: they do not add
 proxy response caching, upstream retries, progressive delivery, or general MCP
-routing.
-Surfacing is the only capability that ports to Codex (native output
-replacement/compression is Claude-only). The command prints each host's runtime
-caveat after planning: Codex requires approving the hook via its `/hooks`
-command. Cursor and Kimi are metrics-only. Current Kimi installs use
-`~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`) and current native
-tool names such as `Read`, `Grep`, `Glob`, and `Bash` are recognized.
+routing. Codex's official PostToolUse contract supports `additionalContext`,
+but STM limits Codex surfacing to read-like `Bash`; `apply_patch` remains
+metrics-only and output replacement/compression remains Claude-only. Codex
+requires approving the hook via `/hooks`. Claude Code 2.1.121+ is required for
+the output-replacement path; Claude `--bare` and `--safe-mode` can intentionally
+bypass installed hooks/MCP. Cursor and Kimi are metrics-only. Current Kimi
+installs use `~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`) and
+current native tool names such as `Read`, `Grep`, `Glob`, and `Bash` are
+recognized.
 
 ## `mms daemon` — warm surfacing process
 

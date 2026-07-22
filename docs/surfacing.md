@@ -4,6 +4,42 @@ For environment naming and configuration-source boundaries, see the
 [Environment Variable Reference](reference/environment-variables.md). For
 runtime diagnosis, see [Operations](guides/operations.md).
 
+## Which memory layer does what?
+
+Provider-native memory and STM's LTM surfacing are independent, complementary
+layers. Enabling or disabling one does not configure the others.
+
+| Layer | Owner and default | Relationship to STM |
+|---|---|---|
+| Claude Code auto memory | Claude Code writes project learnings. It is enabled by default, stored under `~/.claude/projects/<project>/memory/` by default, shared across worktrees of the same repository, and may be relocated with `autoMemoryDirectory`. Startup preloads at most the first 200 lines or 25 KB of its index. | STM does not create, modify, index, or synchronize it automatically. |
+| Codex local memories | Codex generates local memories in the background. They are off by default, enabled with `[features] memories = true`, controlled per chat with `/memories`, and stored under `$CODEX_HOME/memories/` (normally `~/.codex/memories/`). | STM does not create, modify, index, or synchronize them automatically. `mms import --from codex` imports MCP registration into the STM project registry, not Codex memory. |
+| memtomem Core LTM | Core owns durable storage, indexing, namespaces, retrieval, and review. | STM searches a configured Core over MCP and injects the returned context. |
+| memtomem-stm | STM owns proxying, compression, caching, surfacing gates, and model-visible injection. | STM does not automatically write tool responses or provider-native memory into durable LTM. |
+
+Keep mandatory team rules in checked-in `CLAUDE.md`, `AGENTS.md`, or other
+project documentation. Those instruction files are not substitutes for
+semantic retrieval, and provider memory should not be the only source of rules
+that must always apply.
+
+To make provider-native memory searchable through Core, take an explicit
+read-only snapshot with the Core CLI. Preview first, then rerun without
+`--dry-run` to apply:
+
+```bash
+mm ingest claude-memory --source ~/.claude/projects/PROJECT_SLUG/memory/ --dry-run
+mm ingest codex-memory --source ~/.codex/memories/ --dry-run
+```
+
+Use the actual `autoMemoryDirectory` or `$CODEX_HOME` path when customized.
+Ingest is one-way and does not edit provider files; rerun it to pick up later
+changes. See Core's
+[Claude memory ingest](https://github.com/memtomem/memtomem/blob/main/docs/guides/reference/data-config-cli.md#ingesting-claude-code-auto-memory)
+and [Codex memory ingest](https://github.com/memtomem/memtomem/blob/main/docs/guides/reference/data-config-cli.md#ingesting-codex-cli-memory)
+reference for namespace, exclusion, and refresh behavior. The provider
+contracts themselves are documented in
+[Claude Code memory](https://code.claude.com/docs/en/memory) and
+[Codex memories](https://learn.chatgpt.com/docs/customization/memories).
+
 When your agent calls a proxied tool, STM automatically:
 
 1. **Gates on response size** — skips before any work when the cleaned
@@ -44,10 +80,11 @@ original `max_injection_chars` model-injection limit; schema 2 and disabled
 windows retain the original request budget.
 
 Core 0.3.8 is the tested legacy baseline, 0.3.9 carries schema 2, and 0.3.10 is
-the first release to carry schema 3. The intermediate schema 1 contract was
-never included in a tagged PyPI release, although source-installed builds may
-exist. Capability negotiation, not these version labels, controls runtime
-behavior.
+the first release to carry schema 3. Core 0.3.12 is the planned first release
+to carry schema 4. The intermediate schema 1 contract was never included in a
+tagged PyPI release, although source-installed builds may exist. Capability
+negotiation, not these version labels, controls runtime behavior; until a Core
+advertises schema 4, STM keeps the schema 3-or-older path.
 
 To force a rollback, configure the actual LTM command rather than installing
 an older core into an unrelated environment:
@@ -187,7 +224,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
 | `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
-| `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Only sent when the core advertises the parameter in its `mem_search` schema (first core release after v0.3.11) — on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
+| `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Only sent when the core advertises the parameter in its `mem_search` schema (planned for Core 0.3.12) — on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
 | `scale_gated_min_score` | `true` | Suspend the RRF-calibrated `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Both structured `mem_search` (core #1781) and a compose schema-4 core (core #1796) report the scale, so the gate covers both retrieval paths. Batches with no reported scale (`compact` format, pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
@@ -662,12 +699,12 @@ hit:
   intentional, set `context_tools.<name>.min_score` explicitly. The
   diagnostic never lowers the threshold automatically.
 
-  Cores newer than v0.3.11 name the scale their scores are on
-  (`score_scale`: `rrf` / `bm25` / `dense` / `none` / `rerank`, core
-  #1781) in structured `mem_search` output, and STM stamps it onto every
-  parsed result. A compose schema-4 core (core #1796) names the same scale
-  on the composed bundle envelope, so STM stamps the compose retrieved
-  results too — both retrieval paths feed the machinery below. A
+  Core 0.3.12 is planned to name the scale its scores are on (`score_scale`:
+  `rrf` / `bm25` / `dense` / `none` / `rerank`, core #1781) in structured
+  `mem_search` output, and STM stamps it onto every parsed result. A core
+  advertising compose schema 4 (core #1796) names the same scale on the
+  composed bundle envelope, so STM stamps the compose retrieved results too —
+  both retrieval paths feed the machinery below. A
   core-named **non-RRF** scale normally suspends the filter instead of
   fighting it (`scale_gated_min_score`, default on) — the batch passes
   through bounded by `max_results`, and the first suspended batch also

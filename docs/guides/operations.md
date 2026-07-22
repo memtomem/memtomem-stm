@@ -22,7 +22,8 @@ mms stats
 ### LTM warning on a fresh install
 
 An unavailable LTM server disables proactive memory surfacing only. Proxying,
-compression, and caching remain available, so `doctor` treats this as WARN.
+compression, and caching remain available, so `doctor` treats this as WARN. It
+does not change Claude Code or Codex client-managed memory.
 
 ### Proxied tools are missing
 
