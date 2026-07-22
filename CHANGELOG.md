@@ -11,7 +11,52 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.41] — 2026-07-22
+
+### Upgrade notes
+
+- The response cache is upgraded to schema v4 and performs a one-time cache
+  reset on first run after upgrade; a cache-hit now retains JSON-safe
+  `structuredContent` and result `_meta`. `mms daemon status` and the daemon
+  ping gain queue-telemetry fields in both human and JSON output. Opt-in
+  Unicode token estimation and `_context_query` schema advertisement are both
+  off by default (character-budget behavior unchanged). (#731)
+- On a core reporting a non-RRF `score_scale`, surfacing now injects up to
+  `max_results` memories per call where it previously filtered most or all of
+  them out against an incommensurable `min_score` threshold; dedup and feedback
+  demotion remain the quality controls. Set
+  `surfacing.scale_gated_min_score=false` to restore unconditional filtering.
+  (#730)
+- On a bypass-capable core with server-side rerank enabled, surfacing scores
+  now return on the RRF scale (`(0, ~0.033]`) that `min_score` and the
+  auto-tuner are calibrated against; set `surfacing.rerank=none` to restore
+  server rerank policy. (#726)
+- With a compatible Toolgraph and the default `on_unreachable: open`, a typed
+  backend outage now starts loudly degraded under STM-native rules instead of
+  failing startup as a protocol error. (#736)
+- `hook.daemon_timeout_seconds=inf`/`nan` is now a config `ValidationError`
+  instead of an accepted value. (#722)
+- Default daemon installs now write `surfacing_events` telemetry rows on the
+  hook path; growth is bounded by the existing `stats_retention_days` /
+  `query_retention_days` cleanup. (#723)
+
 ### Added
+
+- Developer-first project routing and runtime controls for the proxy. `mms
+  project route` previews and applies a project-selected registry entry with
+  config locking, validation, backups, provenance, conflict protection, and
+  idempotency (previews by default; never overwrites a name/prefix conflict or
+  prunes routes). Opt-in Unicode runtime token estimation
+  (`token_estimation_mode`, default `static` — character-budget behavior
+  unchanged) resolves with proxy/server/tool precedence. `mms status` and `mms
+  doctor` surface compression-tuning readiness. `_context_query` schema
+  advertisement is available opt-in (disabled by default) and never forwards
+  the proxy-only argument upstream. **Behavior change**: the response cache is
+  upgraded to schema v4 so a cache-hit now retains JSON-safe
+  `structuredContent` and result `_meta` (errors and mixed/non-text responses
+  remain uncached); the upgrade performs a one-time cache reset. `mms daemon
+  status` and the daemon ping now expose bounded queue telemetry, adding fields
+  to both the human and JSON output. (#731)
 
 - Surfacing now reads the score scale a compose-capable core names on the
   composed bundle itself (`score_scale`/`reranker` on the `context_compose`
@@ -48,10 +93,12 @@ changes inline only. See the deprecation policy in
   now occur exactly when the filter actually applies (pin present, or gate
   disabled). New `surfacing.scale_gated_min_score` bool
   (`MEMTOMEM_STM_SURFACING__SCALE_GATED_MIN_SCORE`, default `true`); set
-  `false` to restore unconditional filtering. Unstamped batches (compose
-  bundles until core #1791, `compact` format, pre-#1781 cores) and
-  unrecognized labels behave exactly as before, so on compose-capable cores
-  the gate covers the legacy `mem_search` fallback path only.
+  `false` to restore unconditional filtering. Unstamped batches (`compact`
+  format, pre-#1781 cores, and compose bundles on a core older than the
+  schema-4 stamp) and unrecognized labels behave exactly as before; #734 later
+  in this release extends the scale stamp to the composed retrieval path on a
+  schema-4 core, so the gate is no longer limited to the legacy `mem_search`
+  fallback.
   **Behavior change**: on a core reporting a non-RRF scale, surfacing now
   typically injects up to `max_results` memories per call where it previously
   filtered most or all of them out on an incommensurable threshold — dedup
@@ -70,7 +117,8 @@ changes inline only. See the deprecation policy in
   `min_score`, STM fires `score_scale_mismatch` on first observation
   (no five-call streak) and `mms doctor` names the mismatch and the fix.
   Observability only: filtering, thresholds, and unreported-scale paths
-  (compose, compact format, older cores) behave exactly as before. (#727)
+  (`compact` format, older cores, and — until #734 later in this release —
+  compose) behave exactly as before. (#727)
 
 - Surfacing retrievals now ask the core to skip its cross-encoder rerank
   stage per call (core #1766, first available in the core release after
@@ -92,12 +140,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- Aligned proxy CLI defaults and clarified `mms eject` recovery. The default
+  STM proxy config path is now centralized across CLI modules, and `mms project
+  route`'s runtime resolution stays consistent with its help output. An
+  origin-less `mms eject` failure now lists the valid `--to` targets, and
+  prune-backup hints render as a concrete retry command. (#732)
 - Toolgraph stdio consults now recognize the producer's typed
   `backend_unavailable` MCP envelope and route it through `on_unreachable`;
   legacy, unknown, malformed, and contract errors remain on
   `on_protocol_error`. **Behavior change**: with compatible Toolgraph and the
   default `on_unreachable: open`, a backend outage now starts loudly degraded
-  under STM-native rules instead of failing startup as a protocol error.
+  under STM-native rules instead of failing startup as a protocol error. (#736)
 - A transient DB failure while closing a `score_scale_mismatch` diagnostic no
   longer leaves the persisted episode open until the next full mismatch cycle.
   The warning latch still re-arms immediately on a healthy observation, while
