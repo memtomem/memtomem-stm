@@ -629,7 +629,7 @@ class TestKeySchemaVersionPurge:
     def test_current_version_rows_survive_reopen(self, tmp_path):
         db_path = tmp_path / "c.db"
         cache = ProxyCache(db_path, max_entries=10)
-        cache.initialize()  # stamps user_version = 3
+        cache.initialize()  # stamps user_version = 4
         cache.set("s", "t", {"a": 1}, "row", ttl_seconds=None)
         cache.close()
 
