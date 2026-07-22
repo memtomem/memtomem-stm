@@ -12,11 +12,11 @@
 Spend fewer tokens. Remember more. Ship faster.
 
 memtomem-stm is an MCP proxy that can substantially reduce the model-visible
-size of large tool responses and gives your agent **memory across sessions** —
-with no changes to your upstream MCP servers. The actual reduction depends on
-response shape, compression strategy, and whether the call travels through
-MCP; verify it against your workload with the repository's deterministic
-`bench_qa` suite.
+size of large tool responses and surface **cross-session memory from a
+configured memtomem LTM** — with no changes to your upstream MCP servers. The
+actual reduction depends on response shape, compression strategy, and whether
+the call travels through MCP; verify it against your workload with the
+repository's deterministic `bench_qa` suite.
 
 It sits between your AI agent and its upstream MCP servers, compressing tool responses, caching repeated calls, and automatically surfacing relevant context from prior sessions via a memtomem LTM server.
 
@@ -64,12 +64,14 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 | No core | Proxying, compression, and caching remain available; LTM surfacing is disabled |
 | No `context_compose` advertisement, or schema 0/1 | Legacy `mem_search` surfacing |
 | `context_compose` schema 2 | Optional scoped Pinned Context composition |
-| `context_compose` schema 3+ | Pinned composition plus adjacent context-window chunks |
+| `context_compose` schema 3 | Pinned composition plus adjacent context-window chunks |
+| `context_compose` schema 4+ | Schema 3 behavior plus score-scale and reranker metadata |
 | `candidate_propose` schema 1+ | Optional review-first proposal submission |
 
 Core 0.3.8 is the tested legacy baseline, 0.3.9 first advertises schema 2, and
-0.3.10 first advertises schema 3. Runtime behavior always follows the advertised
-capability, not the package version.
+0.3.10 first advertises schema 3. Core 0.3.12 is planned as the first schema 4
+release. Runtime behavior always follows the advertised capability, not the
+package version; do not assume schema 4 until the connected core advertises it.
 
 ## Quick Start
 
@@ -95,7 +97,8 @@ mms doctor
 
 Your client should now list a proxied tool such as `fs__read_file`. An LTM
 warning is expected when no memtomem server is configured; it disables memory
-surfacing only, not proxying, compression, or caching.
+surfacing only, not proxying, compression, caching, or Claude Code/Codex's own
+client-managed memory.
 
 Continue with the complete
 [Getting Started guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md),
@@ -131,6 +134,12 @@ agent while keeping proxy feedback, caching, and tuning local.
 reads from LTM via MCP. The opt-in review-first formation integration may
 submit an explicit pending candidate to a capable core, but it cannot create
 durable memory before core-side approval.
+
+Claude Code auto memory and Codex local memories are separate, client-managed
+stores. Registering STM as MCP, installing `mms hook`, or running `mms import
+--from codex` does not automatically index or synchronize those stores. See
+[Which memory layer does what?](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md#which-memory-layer-does-what)
+for the ownership boundary and explicit, read-only Core ingest options.
 
 To bring file or shell operations under STM, register an MCP server that exposes
 them and steer the agent toward the proxied alias instead of the built-in. This

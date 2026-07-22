@@ -1034,6 +1034,20 @@ def test_public_docs_pin_current_hook_paths_and_runtime_host_contract() -> None:
     assert "KIMI_CODE_HOME" in result.output
     assert "~/.kimi/config.toml" not in result.output
 
+    guide = _read("docs/guides/vibe-coding-getting-started-ko.md")
+    native_hooks = _read("docs/guides/native-hooks.md")
+    cli = _read("docs/cli.md")
+    cli_reference = _read("docs/reference/cli-hooks.md")
+    for body in (guide, native_hooks, cli, cli_reference):
+        assert "2.1.121" in body, "Claude output replacement lost its minimum version"
+        assert "additionalContext" in body, "Codex model-visible hook context disappeared"
+    for body in (guide, native_hooks, cli_reference):
+        assert "--bare" in body
+        assert "--safe-mode" in body
+    assert "not explicitly guaranteed" not in native_hooks
+    assert "명확히 보장되지" not in guide
+    assert "updatedMCPToolOutput" in native_hooks
+
 
 def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> None:
     """Keep the Korean first-user journey aligned with live host contracts."""
@@ -1069,6 +1083,36 @@ def test_vibe_coding_guide_pins_client_registration_and_hook_boundaries() -> Non
             preview = f"mms hook install --host {host}"
             assert f"\n{preview}\n" in body
             assert f"\n{preview} --apply\n" in body
+
+
+def test_public_docs_pin_provider_memory_ownership_and_ingest_boundaries() -> None:
+    """Provider-native memory must not be conflated with Core or STM state."""
+    surfacing = _read("docs/surfacing.md")
+    for token in (
+        "~/.claude/projects/<project>/memory/",
+        "autoMemoryDirectory",
+        "[features] memories = true",
+        "/memories",
+        "$CODEX_HOME/memories/",
+        "mm ingest claude-memory",
+        "mm ingest codex-memory",
+        "mms import --from codex",
+        "AGENTS.md",
+    ):
+        assert token in surfacing, f"memory-layer guide lost {token!r}"
+
+    readme = _read("README.md")
+    getting_started = _read("docs/getting-started.md")
+    guide = _read("docs/guides/vibe-coding-getting-started-ko.md")
+    assert "docs/surfacing.md#which-memory-layer-does-what" in readme
+    assert "surfacing.md#which-memory-layer-does-what" in getting_started
+    assert "surfacing.md#which-memory-layer-does-what" in guide
+    assert "~/.codex/memories/" in guide
+    assert "does not automatically index or synchronize" in readme
+    assert "자동 색인되지는 않으며" in guide
+
+    operations = _read("docs/guides/operations.md")
+    assert "client-managed memory" in operations
 
 
 def test_new_reference_docs_pin_high_risk_public_fields() -> None:
@@ -1168,6 +1212,7 @@ def test_mcp_tool_reference_matches_optional_argument_signatures() -> None:
 
 
 def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
+    readme = _read("README.md")
     surfacing = _read("docs/surfacing.md")
     for phrase in (
         "context_compose schema 2+",
@@ -1178,6 +1223,11 @@ def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
         "ProxyManager(index_engine=...)",
     ):
         assert phrase in surfacing, f"surfacing guide lost {phrase!r}"
+    for body in (readme, surfacing):
+        assert "Core 0.3.12" in body
+        assert "schema 4" in body
+    assert "planned first release" in surfacing
+    assert "Cores newer than v0.3.11" not in surfacing
     assert "expected to carry schema 3" not in surfacing
     assert '"surfacing": {' not in surfacing
 

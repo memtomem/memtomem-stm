@@ -11,6 +11,13 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- Public docs now distinguish Claude Code auto memory and Codex local memories
+  from memtomem Core LTM and STM surfacing, align native-hook guidance with
+  Claude Code 2.1.121+ and Codex's documented PostToolUse `additionalContext`,
+  and identify Core 0.3.12 as the planned schema-4 compatibility baseline.
+
 ## [0.1.41] — 2026-07-22
 
 ### Upgrade notes

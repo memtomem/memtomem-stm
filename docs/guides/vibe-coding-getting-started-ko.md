@@ -5,8 +5,9 @@
 memtomem-stm을 설치하고, MCP 도구 하나를 STM 경유로 호출한 뒤, 그 호출이
 기록됐는지 확인하는 것입니다.
 
-세션 간 기억은 선택 기능입니다. memtomem LTM 서버가 없어도 프록시,
-응답 압축, 캐시는 사용할 수 있습니다.
+STM의 세션 간 LTM surfacing은 선택 기능입니다. memtomem LTM 서버가 없어도
+프록시, 응답 압축, 캐시는 사용할 수 있으며 Claude Code와 Codex의 내장
+memory 설정도 바뀌지 않습니다.
 
 ## 30초 적합성 확인
 
@@ -86,7 +87,8 @@ prefix는 공개 도구 이름이 됩니다. 예를 들어 `fs`를 사용하면
 > 신뢰된 프로젝트의 `.codex/config.toml`은 `--allow-project-configs`로
 > 명시적으로 허용할 때만 가져옵니다. `mms import --from codex`는
 > `~/.mms/registry.toml`을 채우는 별도 프로젝트 레지스트리 기능이며,
-> `~/.memtomem/stm_proxy.json`에 upstream을 추가하지 않습니다.
+> `~/.memtomem/stm_proxy.json`에 upstream을 추가하지 않습니다. 또한 Codex
+> local memory의 기본 경로인 `~/.codex/memories/`를 색인하는 명령도 아닙니다.
 
 이미 `~/.memtomem/stm_proxy.json`이 있다면 다음처럼 등록 단계를 이어갑니다.
 
@@ -139,8 +141,9 @@ mms doctor
 ```
 
 `mms doctor`가 종료 코드 0이면 사용할 수 있는 상태입니다. WARN은 허용됩니다.
-특히 `ltm server` WARN은 세션 간 기억만 비활성화됐다는 뜻이며 프록시,
-압축, 캐시는 계속 동작합니다.
+특히 `ltm server` WARN은 STM의 proactive LTM surfacing만 사용할 수 없다는
+뜻입니다. 프록시, 압축, 캐시는 계속 동작하고 Claude Code/Codex 자체
+memory는 영향을 받지 않습니다.
 
 Claude Code 또는 Codex CLI에 다음처럼 요청합니다.
 
@@ -198,25 +201,34 @@ mms hook install --host codex --apply
 ```
 
 - Claude Code는 재시작 후 LTM 문맥 주입을 받을 수 있고, Bash 출력 교체는
-  별도 opt-in 기능입니다.
+  별도 opt-in 기능입니다. 출력 교체에는 Claude Code 2.1.121 이상이
+  필요합니다.
 - Codex CLI는 설치 후 `/hooks`에서 hook을 승인해야 합니다. STM의 Codex
   어댑터는 출력 교체를 지원하지 않으며, 실제 surfacing 대상은 read-like
-  allowlist에 들어가는 `Bash` 호출입니다. standalone `additionalContext`
-  노출은 Codex 공식 문서에 명확히 보장되지 않으므로 기억이 실제 대화에
-  나타나는지 확인한 뒤 의존하세요.
-- LTM 서버가 없다면 hook은 세션 간 기억을 만들지 않습니다. hook 지표는
-  `mms stats --source hook`에서 따로 확인할 수 있습니다.
+  allowlist에 들어가는 `Bash` 호출입니다. Codex의 공식 PostToolUse 계약은
+  `additionalContext`를 developer context로 전달합니다. `apply_patch`는 STM
+  hook 지표에는 기록될 수 있지만 surfacing 대상은 아닙니다.
+- Claude Code의 `--bare`는 hook, MCP, auto memory를 로드하지 않고,
+  `--safe-mode`도 hook과 MCP를 비활성화합니다. 이 모드에서는 설치 상태가
+  정상이어도 STM hook/MCP가 실행되지 않습니다.
+- LTM 서버가 없다면 hook은 durable memory를 만들거나 STM LTM 문맥을
+  주입하지 않습니다. hook 지표는 `mms stats --source hook`에서 확인합니다.
 
 자세한 기능표와 제거 방법은 [Native PostToolUse Hooks](native-hooks.md)를
 참고하세요.
 
 ## 8. 선택 기능: 세션 간 기억
 
-세션 간 기억에는 별도 memtomem core/LTM 서버와 검색할 기억 데이터가
-필요합니다. STM은 도구 응답을 자동으로 durable memory로 저장하지
-않습니다. 먼저 [Proactive Memory Surfacing](../surfacing.md)에서 연결 구조를
-확인하고, 재현 가능한 전체 예제는
-[Resume a project with reviewed memory](reviewed-memory-resume.md)를 따라가세요.
+Claude Code auto memory와 Codex local memories는 각 클라이언트가 관리합니다.
+memtomem Core는 durable LTM 저장소이고, STM은 그 Core를 검색해 관련 문맥을
+도구 응답에 주입합니다. MCP 등록, `mms hook`, `mms import --from codex`만으로
+클라이언트 memory가 Core에 자동 색인되지는 않으며 STM도 도구 응답을
+자동으로 durable memory로 저장하지 않습니다.
+
+먼저 [Proactive Memory Surfacing의 memory 계층 비교](../surfacing.md#which-memory-layer-does-what)에서
+기본 경로, 활성화 방식, 선택적 read-only ingest를 확인하세요. 재현 가능한
+전체 예제는 [Resume a project with reviewed memory](reviewed-memory-resume.md)를
+따라가면 됩니다.
 
 ## 9. 선택 기능: Toolgraph 정책 gateway
 
@@ -234,7 +246,7 @@ upstream 이름이 안정된 뒤 `strict`로 전환하는 흐름을 권장합니
 | STM은 보이지만 `fs__...`가 없음 | `mms list`, `mms health --names`, upstream command/args 확인 |
 | `ltm server` WARN | 프록시에는 문제 없음; 기억 기능이 필요할 때만 LTM 설정 |
 | 같은 도구가 두 벌 보임 | `mms prune --all --dry-run`으로 직접 등록 중복 확인 |
-| hook이 실행되지 않음 | `mms daemon status`, 설정 파일, Codex `/hooks` 승인 여부 확인 |
+| hook이 실행되지 않음 | `mms daemon status`, 설정 파일, Codex `/hooks` 승인, Claude `--bare`/`--safe-mode` 여부 확인 |
 
 운영 진단 순서와 안전한 변경 방법은
 [Operations and Troubleshooting](operations.md)을 참고하세요.

@@ -30,6 +30,14 @@ Current host paths are:
 - Cursor: `~/.cursor/hooks.json`
 - Kimi: `$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`
 
+Claude Bash output replacement requires Claude Code 2.1.121+ and remains
+opt-in. Codex officially accepts PostToolUse `additionalContext`, but STM only
+surfaces read-like `Bash` calls after `/hooks` approval; `apply_patch` is
+metrics-only and Codex output replacement is unsupported. Claude `--bare` and
+`--safe-mode` can bypass installed hooks/MCP. See
+[Native PostToolUse Hooks](../guides/native-hooks.md) for the full host and
+privacy contract.
+
 ## `mms daemon`
 
 | Command | Purpose |
@@ -45,5 +53,5 @@ native hooks plus standalone surfacing when
 `MEMTOMEM_STM_SURFACING__USE_DAEMON=true`. Runtime files live under
 `MEMTOMEM_STM_DATA_DIR` (default `~/.memtomem`).
 
-See [Native PostToolUse Hooks](../guides/native-hooks.md) for capabilities,
-metrics, privacy, and troubleshooting.
+See [Native PostToolUse Hooks](../guides/native-hooks.md) for daemon behavior
+and troubleshooting.

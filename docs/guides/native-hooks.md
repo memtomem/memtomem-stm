@@ -8,8 +8,8 @@ caching, upstream retries, progressive reads, or general MCP routing.
 
 | Host | Surfaced context | Output replacement | Metrics |
 |---|---|---|---|
-| Claude Code | Yes | Opt-in Bash compression | Yes |
-| Codex CLI | Bash only; verify after hook approval | No | Yes |
+| Claude Code | Yes | Opt-in Bash compression; requires Claude Code 2.1.121+ | Yes |
+| Codex CLI | Bash only after `/hooks` approval | No | Yes |
 | Cursor | No reliable model-visible channel | No | Yes |
 | Kimi Code | No reliable model-visible channel | No | Yes |
 
@@ -55,12 +55,25 @@ entry are preserved.
 | Kimi Code | `$KIMI_CODE_HOME/config.toml`, otherwise `~/.kimi-code/config.toml` |
 
 Codex requires approving the installed hook through `/hooks`. Its adapter
-cannot replace output, and only `Bash` currently reaches the read-like
+cannot replace output, and only `Bash` currently reaches STM's read-like
 surfacing allowlist (`apply_patch` can still be observed for metrics). Codex's
-standalone `additionalContext` injection is not explicitly guaranteed by its
-public hook documentation, so confirm that a memory appears before relying on
-it. TOML host files are re-serialized; use the generated `.bak` file if
-comments or formatting must be restored.
+official PostToolUse contract adds `additionalContext` as extra developer
+context; `updatedMCPToolOutput` remains unsupported. See the official
+[Codex hook documentation](https://learn.chatgpt.com/docs/hooks#posttooluse).
+TOML host files are re-serialized; use the generated `.bak` file if comments or
+formatting must be restored.
+
+Claude Bash output replacement uses `PostToolUse.updatedToolOutput` for native
+tools and therefore requires Claude Code 2.1.121 or later. Older clients can
+still keep the fail-open hook path, but do not rely on model-visible output
+replacement. See Claude Code's
+[PostToolUse decision control](https://code.claude.com/docs/en/hooks#posttooluse-decision-control).
+
+Claude Code startup modes can intentionally bypass the integration:
+[`--bare`](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)
+does not load hooks, MCP servers, or auto memory, while `--safe-mode` disables
+hooks and MCP servers along with other project customization. Exit those modes
+before diagnosing an apparently missing STM registration.
 
 ## Runtime host selection
 
@@ -103,6 +116,11 @@ Rows contain source/tool identity, sizes, timing, and compression outcome—not
 the native tool's content. Set the variable to `false` to disable recording.
 Feedback-event recording, which can retain query metadata, remains separately
 opt-in through `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS`.
+
+Claude's `updatedToolOutput` changes what the model sees; it does not guarantee
+that the original output was absent from Claude Code telemetry recorded before
+the hook ran. Do not treat output replacement as a telemetry-redaction
+boundary.
 
 Claude-only Bash output replacement is also opt-in:
 

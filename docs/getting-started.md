@@ -2,7 +2,9 @@
 
 This guide takes a new installation from zero to one verified proxied tool.
 Long-term-memory (LTM) surfacing is optional: the proxy still compresses and
-caches upstream MCP responses when no LTM server is configured.
+caches upstream MCP responses when no LTM server is configured. This STM
+feature is separate from Claude Code auto memory and Codex local memories; see
+[Which memory layer does what?](surfacing.md#which-memory-layer-does-what).
 
 ## 1. Install
 
@@ -76,7 +78,8 @@ read only when the project is marked trusted in the user Codex config and the
 caller acknowledges project configs. `mms import --from codex` populates the
 separate project registry at
 `~/.mms/registry.toml`; it does not add an upstream to
-`~/.memtomem/stm_proxy.json`.
+`~/.memtomem/stm_proxy.json` and does not ingest Codex's
+`$CODEX_HOME/memories` store.
 
 ## 4. Verify the setup
 
@@ -87,7 +90,7 @@ mms doctor
 Setup is complete when `mms doctor` exits 0 and the client lists at least one
 proxied tool. WARNs are allowed. An `ltm server` warning only means proactive
 memory surfacing is unavailable; it does not disable proxying, compression, or
-caching.
+caching, and it does not change the client's own memory settings.
 
 Use these commands when more detail is needed:
 
