@@ -177,6 +177,16 @@ changes inline only. See the deprecation policy in
   growth is bounded by the existing `stats_retention_days` /
   `query_retention_days` cleanup. (#723)
 
+### Security
+
+- Raised the declared `mcp[cli]` floor to `>=1.28.1` so a fresh install cannot
+  resolve a version affected by CVE-2026-52869 and CVE-2026-52870 (fixed in
+  1.27.2) or CVE-2026-59950 (fixed in 1.28.1). #728 moved the lockfile to
+  1.28.1 to clear the `pip-audit` CI gate, but the published wheel resolves
+  against the declared floor, not `uv.lock` — the previous `>=1.26.0` still let
+  a downstream install pull a vulnerable `mcp`. The floor now matches the
+  audited lock. (#737)
+
 ## [0.1.40] — 2026-07-15
 
 0.1.39 was never published — the version was bumped and a changelog section cut,

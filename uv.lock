@@ -1661,7 +1661,7 @@ requires-dist = [
     { name = "langchain-mcp-adapters", marker = "extra == 'langchain'", specifier = ">=0.1" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=4.0" },
     { name = "langsmith", marker = "extra == 'langchain'", specifier = ">=0.8.18" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.28.1" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "pyjwt", specifier = ">=2.13.0" },
