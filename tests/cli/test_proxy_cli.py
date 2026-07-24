@@ -584,24 +584,28 @@ class TestShellJoinCmdRoundTrip:
         # ``&`` is literal (no second command / "INJECTED" line).
         assert self._roundtrip("%MMS_749_INJECT%") == "oops&echo INJECTED"
 
-    def test_diagnostic_paste_fails_when_no_hash_executable(self, tmp_path, monkeypatch):
+    def test_diagnostic_paste_fails_when_no_hash_executable(self, tmp_path):
         """The ``#``-prefixed diagnostic (#751) is not a cmd.exe comment: with no
         ``#.{cmd,bat,exe}`` resolvable, cmd's command lookup fails, so the tail
         of a ``# ... && real-cmd`` compound hint is short-circuited and nothing
-        runs. Runs from an empty cwd to pin exactly that (the documented residual
-        is a *planted* ``#`` executable, which this deliberately excludes). A
-        control-char token has no argv to recover, so we pin the fallback's paste
-        behavior rather than round-tripping the suppressed token."""
+        runs. To pin exactly that — and exclude the documented *planted-``#``*
+        residual — the child runs from an empty cwd AND with an emptied ``PATH``
+        so the lookup provably cannot resolve (``echo`` is a cmd builtin and
+        needs no PATH). A control-char token has no argv to recover, so we pin
+        the fallback's paste behavior rather than round-tripping the token."""
         from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
 
-        monkeypatch.chdir(tmp_path)  # empty dir: no planted ``#`` executable
+        # Clear PATH in the child so ``#`` cannot resolve to any executable;
+        # keep the rest of the environment so cmd.exe itself still starts.
+        env = {**os.environ, "PATH": ""}
         proc = subprocess.run(
             f'cmd.exe /d /s /c "{_HINT_UNRENDERABLE} && echo TAIL_RAN"',
             capture_output=True,
             text=True,
-            cwd=tmp_path,
+            cwd=tmp_path,  # empty dir: no ``#`` executable in cwd either
+            env=env,
         )
-        assert proc.returncode != 0
+        assert proc.returncode != 0  # ``#`` is genuinely unknown → nonzero
         assert "TAIL_RAN" not in proc.stdout  # ``&&`` tail short-circuited
 
 
@@ -6764,6 +6768,30 @@ class TestEjectCommand:
             assert hint == f"claude mcp {payload} -s user"
         else:
             assert hint == f'cd "/proj dir" && claude mcp {payload} -s local'
+
+    def test_manual_hint_compound_suppresses_injected_newline_tail(self):
+        """#751 at the compound (fragment-embedding) ``cd X && <join>`` site: a
+        control char in *either* leg's config-derived value fully collapses that
+        leg to the diagnostic, so an injected newline-tail never survives as an
+        executable token. The tainted value is replaced wholesale — the guard is
+        inside ``_shell_join`` — leaving only the app-owned ``cd``/``&&`` scaffold
+        (benign, documented). Pins that the injection marker is gone in both
+        orientations, closing the composability concern for this site."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _eject_manual_hint
+
+        marker = "INJECTED_evil_cmd"
+        # Tainted NAME (right leg): the whole ``claude mcp add-json ...`` leg is
+        # replaced, so neither the marker nor the payload survives.
+        h_name = _eject_manual_hint(f"srv\n{marker}", "claude-project", "/proj", {"command": "npx"})
+        assert _HINT_UNRENDERABLE in h_name
+        assert marker not in h_name
+        assert "add-json" not in h_name  # right leg fully suppressed
+        # Tainted PATH (left leg): the ``cd`` leg is replaced by the diagnostic;
+        # the injected marker is gone. The real right leg remains but is prefixed
+        # by ``# ... &&`` (commented on bash, short-circuited on zsh/cmd).
+        h_path = _eject_manual_hint("gh", "claude-project", f"/proj\n{marker}", {"command": "npx"})
+        assert _HINT_UNRENDERABLE in h_path
+        assert marker not in h_path
 
     def _seed_config(self, config: Path, servers: dict) -> None:
         config.write_text(
