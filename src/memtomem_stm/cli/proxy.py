@@ -2550,7 +2550,7 @@ def _source_removal_hint(name: str, source: str) -> str:
     if spec is None:
         return f"# Remove '{name}' from {source}."
     if spec.claude_scope is not None:
-        return f"claude mcp remove {name} -s {spec.claude_scope}"
+        return f"claude mcp remove {shlex.quote(name)} -s {spec.claude_scope}"
     return f"# Edit {_desktop_config_path()} and remove '{name}' under mcpServers."
 
 
@@ -4464,7 +4464,10 @@ def tune(
     _save(resolved, data)
     tool_count = len({(c.server, c.tool) for c in selected})
     click.echo(f"{_ok('Applied')} {len(selected)} override(s) to {tool_count} tool(s).")
-    click.echo(f"  A running proxy hot-reloads the config; restore with: cp {backup} {resolved}")
+    click.echo(
+        "  A running proxy hot-reloads the config; restore with: "
+        f"cp -- {shlex.quote(str(backup))} {shlex.quote(str(resolved))}"
+    )
 
 
 # ── prune command ──────────────────────────────────────────────────────
@@ -4910,11 +4913,11 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
     """
     payload_json = json.dumps(payload, ensure_ascii=False)
     if kind == "claude-user":
-        return f"claude mcp add-json {name} {shlex.quote(payload_json)} -s user"
+        return f"claude mcp add-json {shlex.quote(name)} {shlex.quote(payload_json)} -s user"
     if kind == "claude-project":
         return (
             f"cd {shlex.quote(path or '.')} && "
-            f"claude mcp add-json {name} {shlex.quote(payload_json)} -s local"
+            f"claude mcp add-json {shlex.quote(name)} {shlex.quote(payload_json)} -s local"
         )
     target = path if kind == "mcp-json" else str(_desktop_config_path())
     return f'# Edit {target} and add under mcpServers: "{name}": {payload_json}'

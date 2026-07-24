@@ -5155,6 +5155,15 @@ class TestAddFromClients:
         assert "No servers selected" in result.output
         assert "claude mcp remove" not in result.output
 
+    def test_removal_hint_shell_quotes_discovered_name(self):
+        """`name` is a server name read from *another client's* config — input
+        this repo does not validate. A name with whitespace must stay one argv
+        token in the pasted `claude mcp remove` command (#741)."""
+        from memtomem_stm.cli.proxy import _source_removal_hint
+
+        hint = _source_removal_hint("my server", "Claude Code (user)")
+        assert shlex.split(hint) == ["claude", "mcp", "remove", "my server", "-s", "user"]
+
 
 class TestAddFromClientsPrune:
     """`mms add --from-clients --prune` (and the TTY prompt variant) removes
@@ -6388,6 +6397,19 @@ class TestEjectCommand:
     against the backing host config, and only then removes the STM entry
     (#475 PR3). Order invariant: host write first, STM removal second —
     every failure mode is dual registration, never disappearance."""
+
+    @pytest.mark.parametrize("kind", ["claude-user", "claude-project"])
+    def test_manual_hint_shell_quotes_name(self, kind):
+        """The manual `claude mcp add-json` fallback already quotes the payload;
+        the adjacent `{name}` (an imported server name, unvalidated here) must
+        be quoted too so a whitespace name stays one argv token (#741)."""
+        from memtomem_stm.cli.proxy import _eject_manual_hint
+
+        hint = _eject_manual_hint("my server", kind, "/proj dir", {"command": "npx"})
+        argv = shlex.split(hint)
+        # `add-json` is followed by the name as a single token, whitespace intact
+        # (claude-project prefixes a `cd <path> &&`, so index by add-json, not [0]).
+        assert argv[argv.index("add-json") + 1] == "my server"
 
     def _seed_config(self, config: Path, servers: dict) -> None:
         config.write_text(
@@ -10023,6 +10045,28 @@ class TestTune:
         if sys.platform != "win32":  # chmod is a near-no-op on Windows
             assert (backups[0].stat().st_mode & 0o777) == 0o600
         assert str(backups[0]) in result.output  # restore hint names the backup
+
+    def test_restore_hint_is_shell_safe_for_whitespace_paths(self, runner, tmp_path):
+        """The `restore with: cp ...` hint must survive paste-back when the
+        config path contains whitespace (easy on macOS). Round-trip the printed
+        line through `shlex.split` and assert it parses to the exact argv — a
+        raw `cp {backup} {resolved}` would split the path into wrong args (#741)."""
+        cfg_dir = tmp_path / "dir with space"
+        cfg_dir.mkdir()
+        config = cfg_dir / "stm_proxy.json"
+        metrics_db = cfg_dir / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        backups = sorted(cfg_dir.glob("stm_proxy.json.bak-*"))
+        assert len(backups) == 1
+
+        marker = "restore with: "
+        line = next(ln for ln in result.output.splitlines() if marker in ln)
+        argv = shlex.split(line.split(marker, 1)[1])
+        assert argv == ["cp", "--", str(backups[0]), str(config)]
 
     def test_backup_same_second_collision_uses_numbered_slot(self, tmp_path, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
