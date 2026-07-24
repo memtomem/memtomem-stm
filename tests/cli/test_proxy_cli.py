@@ -472,6 +472,49 @@ class TestShellJoin:
         assert _shell_join(["%USERNAME%"]) == '"%USERNAME%"'
         assert _shell_join(["a!b"]) == "a!b"
 
+    @staticmethod
+    def _argv_with_unsafe_char_at(pos: str, ch: str) -> list[str]:
+        """A 3-token argv with ``ch`` embedded in the first/middle/last token —
+        pins the ``any(...)`` contract so an ``args[-1]``-only check can't pass."""
+        argv = ["where.exe", "-v", "target"]
+        idx = {"first": 0, "middle": 1, "last": 2}[pos]
+        argv[idx] = f"missing{ch}whoami"
+        return argv
+
+    @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
+    @pytest.mark.parametrize("pos", ["first", "middle", "last"])
+    def test_win32_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch, pos):
+        """CR/LF/NUL cannot be neutralized by ``_cmd_quote``: a pasted newline
+        submits the truncated prefix even inside a quoted span (#751), so the
+        whole hint collapses to the non-executable diagnostic and the raw value
+        (``whoami``, the injected second command) never survives into it. An
+        unsafe char in *any* token position triggers it, not just the last."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = _shell_join(self._argv_with_unsafe_char_at(pos, ch))
+        assert out == _HINT_UNRENDERABLE
+        assert out.startswith("#")
+        assert not (set(out) & {"\r", "\n", "\x00"})
+        assert "whoami" not in out
+
+    @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
+    @pytest.mark.parametrize("pos", ["first", "middle", "last"])
+    def test_posix_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch, pos):
+        """The guard is platform-uniform, not win32-only: ``shlex.join`` would
+        single-quote a ``\\n`` into a technically-pasteable *multi-line* hint,
+        but that shatters the one-line ``next:``/``run:`` rendering, and NUL is
+        unrepresentable on every shell. So POSIX suppresses it identically, for
+        an unsafe char in any token position."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        out = _shell_join(self._argv_with_unsafe_char_at(pos, ch))
+        assert out == _HINT_UNRENDERABLE
+        assert out.startswith("#")
+        assert not (set(out) & {"\r", "\n", "\x00"})
+        assert "whoami" not in out
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real cmd.exe + CRT argv semantics")
 class TestShellJoinCmdRoundTrip:
@@ -540,6 +583,30 @@ class TestShellJoinCmdRoundTrip:
         # The child receives the whole expanded value as one argument; the
         # ``&`` is literal (no second command / "INJECTED" line).
         assert self._roundtrip("%MMS_749_INJECT%") == "oops&echo INJECTED"
+
+    def test_diagnostic_paste_fails_when_no_hash_executable(self, tmp_path):
+        """The ``#``-prefixed diagnostic (#751) is not a cmd.exe comment: with no
+        ``#.{cmd,bat,exe}`` resolvable, cmd's command lookup fails, so the tail
+        of a ``# ... && real-cmd`` compound hint is short-circuited and nothing
+        runs. To pin exactly that — and exclude the documented *planted-``#``*
+        residual — the child runs from an empty cwd AND with an emptied ``PATH``
+        so the lookup provably cannot resolve (``echo`` is a cmd builtin and
+        needs no PATH). A control-char token has no argv to recover, so we pin
+        the fallback's paste behavior rather than round-tripping the token."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
+
+        # Clear PATH in the child so ``#`` cannot resolve to any executable;
+        # keep the rest of the environment so cmd.exe itself still starts.
+        env = {**os.environ, "PATH": ""}
+        proc = subprocess.run(
+            f'cmd.exe /d /s /c "{_HINT_UNRENDERABLE} && echo TAIL_RAN"',
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,  # empty dir: no ``#`` executable in cwd either
+            env=env,
+        )
+        assert proc.returncode != 0  # ``#`` is genuinely unknown → nonzero
+        assert "TAIL_RAN" not in proc.stdout  # ``&&`` tail short-circuited
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────
@@ -6702,6 +6769,30 @@ class TestEjectCommand:
         else:
             assert hint == f'cd "/proj dir" && claude mcp {payload} -s local'
 
+    def test_manual_hint_compound_suppresses_injected_newline_tail(self):
+        """#751 at the compound (fragment-embedding) ``cd X && <join>`` site: a
+        control char in *either* leg's config-derived value fully collapses that
+        leg to the diagnostic, so an injected newline-tail never survives as an
+        executable token. The tainted value is replaced wholesale — the guard is
+        inside ``_shell_join`` — leaving only the app-owned ``cd``/``&&`` scaffold
+        (benign, documented). Pins that the injection marker is gone in both
+        orientations, closing the composability concern for this site."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _eject_manual_hint
+
+        marker = "INJECTED_evil_cmd"
+        # Tainted NAME (right leg): the whole ``claude mcp add-json ...`` leg is
+        # replaced, so neither the marker nor the payload survives.
+        h_name = _eject_manual_hint(f"srv\n{marker}", "claude-project", "/proj", {"command": "npx"})
+        assert _HINT_UNRENDERABLE in h_name
+        assert marker not in h_name
+        assert "add-json" not in h_name  # right leg fully suppressed
+        # Tainted PATH (left leg): the ``cd`` leg is replaced by the diagnostic;
+        # the injected marker is gone. The real right leg remains but is prefixed
+        # by ``# ... &&`` (commented on bash, short-circuited on zsh/cmd).
+        h_path = _eject_manual_hint("gh", "claude-project", f"/proj\n{marker}", {"command": "npx"})
+        assert _HINT_UNRENDERABLE in h_path
+        assert marker not in h_path
+
     def _seed_config(self, config: Path, servers: dict) -> None:
         config.write_text(
             json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
@@ -8091,6 +8182,20 @@ class TestRemoveEjectHint:
             "--",
             "my server",
         ]
+
+    def test_hint_control_char_name_renders_diagnostic(self):
+        """A server name (config key) carrying a newline can't render a runnable
+        ``mms eject`` command — pasted it would submit a truncated command and
+        run the tail (#751). The embedded restore command collapses to the
+        non-executable diagnostic, leaving no ``mms eject`` fragment to paste.
+        (The surrounding prose still prints the raw name — a display wart, not
+        a paste-execution surface, and out of scope here.)"""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _remove_eject_hint
+
+        hint = _remove_eject_hint("bad\nname", self._imported_entry(), Path("/tmp/custom.json"))
+        assert hint is not None
+        assert _HINT_UNRENDERABLE in hint
+        assert "mms eject" not in hint
 
     def test_hint_names_active_config_not_default(self, runner, config):
         """#746: `mms remove --config <custom>` must render the *custom*
@@ -10051,6 +10156,43 @@ class TestDoctor:
             "/no such/dir/my binary"
         ]
         assert argv == expected
+
+    def test_offline_server_hint_suppresses_control_char_command(self, runner, config):
+        """A `command` carrying a newline can't be rendered into a runnable
+        lookup: pasted at cmd.exe the ``where.exe missing\\nwhoami`` hint would
+        submit ``where.exe missing`` then run ``whoami`` (#751). The dead-stdio
+        next-action must therefore collapse to the non-executable diagnostic —
+        no ``where.exe``/``command -v``/``whoami`` in the ``next:`` line on
+        either CI leg. Real probe, mirrors
+        test_offline_server_hint_shell_quotes_command."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bad",
+                            "transport": "stdio",
+                            "command": "missing\nwhoami",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["doctor", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "stdio child process did not start" in result.output
+        # Assert on the ``next:`` line only — the FAIL ``detail`` may echo the
+        # probe's OS error (which can contain the raw command); that is error
+        # reporting, not a copy/paste hint.
+        next_lines = [ln for ln in result.output.splitlines() if "next:" in ln]
+        assert next_lines
+        assert any(_HINT_UNRENDERABLE in ln for ln in next_lines)
+        assert not any("where.exe" in ln or "command -v" in ln for ln in next_lines)
+        assert not any("whoami" in ln for ln in next_lines)
 
     def test_cache_policy_unset_warns(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod

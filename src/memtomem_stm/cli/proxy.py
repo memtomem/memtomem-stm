@@ -188,12 +188,56 @@ def _cmd_quote(token: str) -> str:
     return "".join(out)
 
 
+# CR/LF/NUL can't be rendered into a safe one-line paste hint, so
+# ``_shell_join`` refuses them on every platform. The failure mode differs by
+# shell, which is why this is a different class from the ``_cmd_quote``
+# metacharacters (#749):
+#   - Windows cmd.exe / the interactive console consume a pasted newline as
+#     Enter *even inside an open quoted span*, submitting the truncated prefix
+#     as its own command — quoting genuinely cannot defeat this (#751).
+#   - POSIX shells DO contain a newline inside ``shlex``'s single quotes (the
+#     paste is a valid multi-line command, not an early submit), but that
+#     shatters the one-line ``next:``/``run:`` rendering; NUL is unrepresentable
+#     everywhere.
+# Rejecting uniformly (rather than only on win32) keeps the guard testable on
+# both CI legs. A JSON config (plain ``json.loads``, no character validation on
+# server names/``command``/env values) can carry any of these into a token.
+_HINT_UNSAFE_CHARS = frozenset("\r\n\x00")
+
+# Non-executable fallback (never embeds the raw value). Pasted, the ``#`` line
+# is inert on every target shell but by two routes: bash/fish/POSIX sh treat
+# ``#`` as a comment; interactive zsh (``interactive_comments`` off by default)
+# and cmd.exe instead look ``#`` up as a command, which *normally* fails —
+# ``command not found``/unknown command — and short-circuits any ``&&`` tail.
+# Residual (documented, not fixed): ``#`` can still resolve via a shell
+# alias/function/command hash, or a planted ``#.{cmd,bat,exe}`` on PATH/cwd —
+# the same residual the pre-existing ``# Edit ...`` / ``# Remove ...`` fallback
+# hints already carry, and below #751's own low severity (the user pastes their
+# own hint). No single prefix is a comment on both shell families.
+#
+# At the few call sites that embed the result as a *fragment* (``--config
+# {join}``; ``cd X && {join}``) the tainted value is still fully suppressed — the
+# injected newline-tail never survives — but the surrounding app-owned prefix
+# (an errored ``--config``, a benign ``cd``) remains. That prefix is never
+# attacker-controlled, so no injected command runs (see the composition test).
+_HINT_UNRENDERABLE = "# copy/paste hint unavailable: a value contains line-break or NUL characters"
+
+
 def _shell_join(args: list[str]) -> str:
     """Render a copy/paste command for the current native shell family.
 
     The win32 leg is cmd.exe-metacharacter-safe (via ``_cmd_quote``), not just
     argv-safe; the POSIX leg (``shlex.join``) already quotes metacharacters.
+
+    An argv carrying CR/LF/NUL renders as the non-executable
+    ``_HINT_UNRENDERABLE`` diagnostic on *both* legs (#751). On Windows a pasted
+    newline submits the truncated prefix even inside quotes (quoting cannot
+    help); on POSIX ``shlex`` would contain it, but only as a multi-line paste
+    that breaks the one-line hint, and NUL is unrepresentable everywhere. See
+    ``_HINT_UNSAFE_CHARS`` for the per-shell rationale.
     """
+    if any(_HINT_UNSAFE_CHARS & set(token) for token in args):
+        return _HINT_UNRENDERABLE
     if sys.platform == "win32":
         return " ".join(_cmd_quote(a) for a in args)
     return shlex.join(args)
