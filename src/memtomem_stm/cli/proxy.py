@@ -3800,7 +3800,7 @@ def register(
     )
 
 
-def _remove_eject_hint(name: str, entry: Any) -> str | None:
+def _remove_eject_hint(name: str, entry: Any, resolved: Path) -> str | None:
     """Eject hint printed before removing an imported entry (#475 PR4).
 
     Fires only when the recorded provenance says removal would leave the
@@ -3809,6 +3809,12 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
     ``origin`` block (manual ``mms add``, pre-#475 imports) and entries
     some host still registers get no hint — removing those just stops
     proxying.
+
+    The rendered ``mms eject`` command names the *active* ``--config``
+    (``resolved``, the config being removed from) so pasting it doesn't
+    silently target the default ``~/.memtomem/stm_proxy.json`` (#746), and
+    guards ``name`` with a ``--`` end-of-options terminator so a
+    leading-dash server name pastes as a positional rather than an option.
 
     Advisory only: the flags are as recorded at prune time (a manually
     re-added host entry isn't detected), and ``mms eject``'s live
@@ -3833,7 +3839,8 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
         f"{_warn('Note:')} '{name}' was imported from {label} and the host original "
         "was pruned —\n"
         "  removing it from STM leaves it registered nowhere.\n"
-        f"  To restore it to the host instead, run: {_shell_join(['mms', 'eject', name])}"
+        "  To restore it to the host instead, run: "
+        f"{_shell_join(['mms', 'eject', '--config', str(resolved), '--', name])}"
     )
 
 
@@ -3876,7 +3883,7 @@ def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> Non
         sys.exit(1)
 
     warnings: list[str] = []
-    hint = _remove_eject_hint(name, servers[name])
+    hint = _remove_eject_hint(name, servers[name], resolved)
     if hint:
         if as_json:
             # Same wording as the terminal hint; unstyle so the payload never
