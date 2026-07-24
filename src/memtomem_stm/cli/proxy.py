@@ -3503,7 +3503,7 @@ def init(
                 config_path=resolved,
                 replace_registration=replace_registration,
             )
-            click.echo(f"Next: mms doctor --config {resolved}")
+            click.echo(f"Next: {_shell_join(['mms', 'doctor', '--config', str(resolved)])}")
             return
         click.echo(f"{_err('Error:')} config already exists at {resolved}.", err=True)
         click.echo("  Use `mms add` to register another server.", err=True)
@@ -3703,9 +3703,9 @@ def init(
     if resolved != _DEFAULT_CONFIG.expanduser().resolve():
         click.echo("")
         click.echo(f"  {_hdr('Manage this config:')}")
-        click.echo(f"    mms list --config {resolved}")
-        click.echo(f"    mms health --config {resolved}")
-        click.echo(f"    mms add --import --config {resolved}")
+        click.echo(f"    {_shell_join(['mms', 'list', '--config', str(resolved)])}")
+        click.echo(f"    {_shell_join(['mms', 'health', '--config', str(resolved)])}")
+        click.echo(f"    {_shell_join(['mms', 'add', '--import', '--config', str(resolved)])}")
         click.echo(
             "    New client registrations carry this config path via "
             "MEMTOMEM_STM_PROXY__CONFIG_PATH."
@@ -3833,7 +3833,7 @@ def _remove_eject_hint(name: str, entry: Any) -> str | None:
         f"{_warn('Note:')} '{name}' was imported from {label} and the host original "
         "was pruned —\n"
         "  removing it from STM leaves it registered nowhere.\n"
-        f"  To restore it to the host instead, run: mms eject {name}"
+        f"  To restore it to the host instead, run: {_shell_join(['mms', 'eject', name])}"
     )
 
 
@@ -6580,7 +6580,12 @@ def doctor(
     """
     path = Path(config_path)
     resolved = path.expanduser().resolve()
-    cfg_arg = f"--config {resolved}"
+    # Only the path token needs shell-safe rendering; the surrounding hints are
+    # templates with literal ``<name>``/``<prefix>`` metavariables that must not
+    # be quoted, so quote just the path (platform-aware) rather than the whole
+    # command. ``_shell_join`` on a one-item list yields the correctly-quoted
+    # token for the native shell (cmd.exe vs POSIX).
+    cfg_arg = f"--config {_shell_join([str(resolved)])}"
 
     checks: list[dict[str, Any]] = []
 
@@ -6740,9 +6745,11 @@ def doctor(
                         # Transport-neutral stage names; the child-process
                         # detail is stdio-only rendering, not a stage.
                         detail += " (stdio child process did not start)"
-                        command = servers[n].get("command", "")
+                        command = str(servers[n].get("command", ""))
                         next_cmd = (
-                            f"where.exe {command}" if os.name == "nt" else f"command -v {command}"
+                            _shell_join(["where.exe", command])
+                            if os.name == "nt"
+                            else _shell_join(["command", "-v", command])
                         )
                     elif timed_out:
                         next_cmd = f"mms health --timeout {max(30, timeout)} {cfg_arg}"
