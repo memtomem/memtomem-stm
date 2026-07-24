@@ -2304,6 +2304,32 @@ class TestInit:
             }
         ]
 
+    def test_resume_next_hint_is_shell_safe_for_whitespace_paths(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """The `Next: mms doctor --config <path>` hint printed by
+        `init --resume` must survive paste-back when the config path
+        contains whitespace. Round-trip the printed line through
+        `shlex.split` and assert the exact argv (#743)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        cfg_dir = tmp_path / "dir with space"
+        cfg_dir.mkdir()
+        config = cfg_dir / "stm_proxy.json"
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {"kept": {"prefix": "k"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
+
+        result = runner.invoke(cli, ["init", "--resume", "--client", "skip", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        marker = "Next: "
+        line = next(ln for ln in result.output.splitlines() if marker in ln)
+        argv = shlex.split(line.split(marker, 1)[1])
+        assert argv == ["mms", "doctor", "--config", str(config.resolve())]
+
     def test_init_save_unverified_acknowledgement_keeps_config(
         self, runner, config, no_discovery, monkeypatch
     ):
@@ -3299,6 +3325,43 @@ class TestInitImportFlow:
         # them verbatim — no ``{path}`` placeholder leakage.
         assert f"mms list --config {config.resolve()}" in result.output
         assert f"mms health --config {config.resolve()}" in result.output
+
+    def test_management_hint_is_shell_safe_for_whitespace_paths(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """The `Manage this config` block prints three `mms … --config
+        <path>` commands. With a whitespace-bearing config path each must
+        round-trip through `shlex.split` to the exact argv rather than
+        splitting the path into wrong arguments (#743)."""
+        cfg_dir = tmp_path / "dir with space"
+        cfg_dir.mkdir()
+        config = cfg_dir / "stm_proxy.json"
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "only",
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "c"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        resolved = str(config.resolve())
+        expected = {
+            "mms list": ["mms", "list", "--config", resolved],
+            "mms health": ["mms", "health", "--config", resolved],
+            "mms add": ["mms", "add", "--import", "--config", resolved],
+        }
+        for marker, argv in expected.items():
+            line = next(ln for ln in result.output.splitlines() if marker in ln)
+            assert shlex.split(line.strip()) == argv
 
     def test_default_config_does_not_show_management_hint(self, runner, tmp_path, monkeypatch):
         """Inverse of the above: when the user accepts the default
@@ -7791,6 +7854,18 @@ class TestRemoveEjectHint:
             encoding="utf-8",
         )
 
+    def test_hint_shell_quotes_server_name(self):
+        """`name` is a server name (a config key — arbitrary string, not
+        validated for shell safety). A whitespace name must stay one argv
+        token in the pasted `mms eject` command (#743)."""
+        from memtomem_stm.cli.proxy import _remove_eject_hint
+
+        hint = _remove_eject_hint("my server", self._imported_entry())
+        assert hint is not None
+        marker = "run: "
+        line = next(ln for ln in hint.splitlines() if marker in ln)
+        assert shlex.split(line.split(marker, 1)[1]) == ["mms", "eject", "my server"]
+
     def test_hint_shown_and_removal_proceeds_under_yes(self, runner, config):
         self._seed(config, self._imported_entry())
         result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
@@ -9560,6 +9635,25 @@ class TestDoctor:
         assert "upstream" not in result.output
         assert "ltm server" not in result.output
 
+    def test_next_hint_is_shell_safe_for_whitespace_paths(self, runner, tmp_path):
+        """Doctor's `next: mms … --config <path>` hints all interpolate the
+        resolved config path via a shared `cfg_arg`. With a whitespace path
+        the pasted command must round-trip through `shlex.split` to the exact
+        argv. Broken JSON short-circuits to the `mms config validate` hint,
+        which is enough to exercise the shared `cfg_arg` (#743)."""
+        cfg_dir = tmp_path / "dir with space"
+        cfg_dir.mkdir()
+        config = cfg_dir / "stm_proxy.json"
+        config.write_text("{oops", encoding="utf-8")
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+
+        marker = "next: "
+        line = next(ln for ln in result.output.splitlines() if "mms config validate" in ln)
+        argv = shlex.split(line.split(marker, 1)[1])
+        assert argv == ["mms", "config", "validate", "--config", str(config.resolve())]
+
     def test_bad_transport_config_fails(self, runner, config, monkeypatch):
         """잘못된 transport scenario: sse without url."""
         from memtomem_stm.cli import proxy as proxy_mod
@@ -9639,6 +9733,40 @@ class TestDoctor:
         assert "stdio child process did not start" in result.output
         lookup = "where.exe" if os.name == "nt" else "command -v"
         assert f"next: {lookup} __nonexistent_cmd_12345__" in result.output
+
+    def test_offline_server_hint_shell_quotes_command(self, runner, config):
+        """The dead-stdio `command -v <command>` next-action interpolates the
+        server's `command` (a free-form config value). A command with
+        whitespace must stay one argv token so the pasted lookup targets the
+        real binary, not a truncated name (#743, sweep site #742/#743 missed).
+        Real probe — no monkeypatch, mirrors
+        test_offline_server_fails_with_stage_and_stdio_note."""
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bad",
+                            "transport": "stdio",
+                            "command": "/no such/dir/my binary",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["doctor", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "stdio child process did not start" in result.output
+        lookup = "where.exe" if os.name == "nt" else "command -v"
+        marker = "next: "
+        line = next(ln for ln in result.output.splitlines() if lookup in ln)
+        argv = shlex.split(line.split(marker, 1)[1])
+        expected = (["where.exe"] if os.name == "nt" else ["command", "-v"]) + [
+            "/no such/dir/my binary"
+        ]
+        assert argv == expected
 
     def test_cache_policy_unset_warns(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
