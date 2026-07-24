@@ -11,12 +11,129 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.42] — 2026-07-25
+
+### Upgrade notes
+
+- Copy/paste hints now quote an interpolated config path, server name, backup
+  path, or upstream `command` that requires quoting, where those values were
+  previously emitted bare; a value needing no quoting renders
+  byte-identically. (#742, #744)
+- `mms tune`'s restore line now prints `cp -- <backup> <config>` — a literal
+  `--` end-of-options terminator that was not emitted before. (#742)
+- `mms remove`'s eject hint now prints
+  `mms eject --config <active-config> -- <name>` instead of `mms eject <name>`,
+  which on paste silently targeted the default
+  `~/.memtomem/stm_proxy.json`. (#748)
+- On Windows, the three hints that previously rendered with POSIX
+  `shlex` quoting now render in cmd.exe form. (#747)
+- On Windows, a hint token containing a cmd.exe metacharacter
+  (`& | < > ^ ( )`) or `%` is now double-quoted where it was previously emitted
+  bare, and an embedded `"` renders as `""` instead of `\"`. Tokens whose only
+  special content is a space or tab, and empty tokens, keep the exact
+  `subprocess.list2cmdline` rendering they already had. (#750)
+- A `_shell_join` call whose argv carries CR, LF, or NUL now returns only the
+  `# copy/paste hint unavailable: …` text, in place of everything it would have
+  rendered — not just the offending value. Hints come in three shapes and lose
+  different amounts of the line. A whole-command join loses the command
+  entirely. A `mms doctor` hint embeds a joined `--config <path>` fragment, so
+  a tainted path leaves the surrounding `mms <subcommand> …` text followed by
+  the diagnostic. The project-scoped `claude mcp add-json` eject fallback
+  composes two whole-command joins around a literal `&&`, so a `cd <path>` leg
+  whose own path is clean still prints and can run on paste. See the Fixed
+  bullet for the full scope. (#752)
+
+### Fixed
+
+- Copy/paste command hints are now rendered shell-safely instead of by bare
+  f-string interpolation. `mms init`'s `Next:`/`Manage this config:` lines,
+  `mms remove`'s eject hint, and `mms doctor`'s `--config` argument plus its
+  `where.exe <command>` / `command -v <command>` probe hints route their
+  interpolated values (config paths, server names, upstream `command` values)
+  through the `_shell_join` helper, so a renderable value containing a space or
+  shell metacharacter pastes as one argument. `mms doctor` quotes only the path
+  token so the templates' literal `<name>`/`<prefix>` metavariables stay
+  readable. **Behavior change**: at these sites a value that requires quoting
+  now renders quoted where it was previously interpolated bare; a value needing
+  no quoting renders byte-identically, and a value carrying CR/LF/NUL instead
+  collapses to the #752 diagnostic below. (#744, fixes #743)
+- The three hints that already quoted with `shlex.quote` — `claude mcp remove`,
+  `mms tune`'s `cp` restore line, and `mms eject`'s manual `claude mcp add-json`
+  hint (including its `cd <path> &&` prefix) — now go through `_shell_join` too.
+  `shlex.quote` is POSIX-only: it single-quotes a Windows path's backslashes
+  into a token cmd.exe cannot read, so the Windows hints were unpasteable.
+  **Behavior change**: the `cp` restore hint gains a literal `--`
+  end-of-options terminator and the server name and both paths are quoted when
+  they require it, where they were previously interpolated bare (#742); on
+  Windows these three hints change from POSIX single-quoted rendering to
+  cmd.exe rendering (#747). (#742, #747; fixes #741, closes #745)
+- `mms remove`'s eject hint now names the active `--config` and guards the
+  server name with a `--` terminator, so pasting it restores the entry to the
+  host from the config it was removed from rather than from the default path,
+  and a leading-dash server name pastes as a positional instead of an option.
+  **Behavior change**: the hint text changes for every user, from
+  `mms eject <name>` to `mms eject --config <active-config> -- <name>`.
+  (#748, closes #746)
+- The win32 leg of the hint joiner is now cmd.exe-shell-safe, not merely
+  argv-safe. `subprocess.list2cmdline` implements MS C-runtime argv quoting
+  only, leaving the cmd.exe metacharacters `& | < > ^ ( )` unprotected in
+  tokens without whitespace, so a legal NTFS path like `C:\a&b\cfg.json` split
+  or redirected the pasted command. Such tokens are now double-quoted (with
+  embedded `"` escaped as `""` to preserve cmd's quote parity), and a token
+  containing `%` is quoted so metacharacters in an expanded `%VAR%` value
+  cannot split the command. Documented residuals: a defined `%VAR%` still
+  expands, and `!VAR!` under `cmd /v:on` is not defeatable by quoting.
+  **Behavior change**: on Windows, a token containing `& | < > ^ ( )` or `%` is
+  now quoted where `list2cmdline` left it bare, and a token containing `"`
+  renders as a quoted span with `""` instead of `list2cmdline`'s bare `\"`.
+  Everything else keeps its previous rendering byte for byte: a token whose
+  only special content is a space or tab (asserted against `list2cmdline`
+  itself), an empty token, and a plain backslash path each keep their old
+  output under a regression test. POSIX rendering is untouched.
+  (#750, fixes #749)
+- A `_shell_join` call is now refused outright when its argv carries CR, LF, or
+  NUL: on every platform it returns a fixed `# copy/paste hint unavailable: …`
+  string in place of its entire rendering, so the raw value never reaches the
+  output. At an interactive cmd.exe prompt a pasted newline is consumed as
+  Enter even inside an open quoted span, submitting the truncated prefix as its
+  own command, so quoting cannot fix
+  that class; on POSIX `shlex` contains the newline but only as a multi-line
+  paste that breaks the one-line hint, and NUL is unrepresentable everywhere.
+  Config is plain `json.loads` with no character validation on server names,
+  `command`, or env values, so an imported or hand-edited config could carry
+  these into a hint.
+  **Behavior change**: the guard covers what `_shell_join` renders, not the
+  prose around it, and it replaces that call's whole output rather than
+  scrubbing the offending value out of it. What survives depends on the hint's
+  shape, of which there are three. A **whole-command join** — the registration
+  hints, `mms init`'s lines, `mms remove`'s eject restore hint, `mms tune`'s
+  `cp`, `claude mcp remove`, the user-scoped `claude mcp add-json`, and
+  `mms doctor`'s `where.exe` / `command -v` probes — loses the whole command
+  along with the tainted value. The **doctor fragment** joins only the
+  `--config` path (`--config {join}`) and has commands built around the result,
+  so a tainted path leaves `mms <subcommand> … --config` followed by the
+  diagnostic. The **two-leg project hint** (the project-scoped
+  `claude mcp add-json` fallback, `{join} && {join}`) is composed from two
+  whole-command joins, so a tainted leg collapses while the other still
+  renders — a clean `cd <path>`, config-derived rather than app-owned, can
+  still execute on paste. No injected content survives into a pasteable
+  command. `mms remove`'s surrounding `Note:` sentence still prints
+  the server name verbatim — a display wart rather than a paste-execution
+  surface, and out of scope for #751. The `#` prefix is a comment on bash, fish
+  and POSIX sh, and elsewhere (interactive zsh, cmd.exe) an ordinarily-failing
+  command lookup, with the documented residual that `#` can still resolve via
+  an alias, function, command hash, or a planted `#.{cmd,bat,exe}` — the same
+  residual the pre-existing `# Edit …` /
+  `# Remove …` hints already carry.
+  (#752, fixes #751)
+
 ### Changed
 
 - Public docs now distinguish Claude Code auto memory and Codex local memories
   from memtomem Core LTM and STM surfacing, align native-hook guidance with
   Claude Code 2.1.121+ and Codex's documented PostToolUse `additionalContext`,
   and identify Core 0.3.12 as the planned schema-4 compatibility baseline.
+  (#740)
 
 ## [0.1.41] — 2026-07-22
 
