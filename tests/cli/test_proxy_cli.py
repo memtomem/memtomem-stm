@@ -5227,6 +5227,16 @@ class TestAddFromClients:
         hint = _source_removal_hint("my server", "Claude Code (user)")
         assert shlex.split(hint) == ["claude", "mcp", "remove", "my server", "-s", "user"]
 
+    def test_removal_hint_uses_cmd_quoting_on_windows(self, monkeypatch):
+        """POSIX `shlex.quote` single-quotes are literal in `cmd.exe`; `_shell_join`
+        must render the whitespace name with `cmd.exe`-valid double quotes on
+        win32 (#745). Monkeypatched platform runs the branch on POSIX runners too."""
+        from memtomem_stm.cli.proxy import _source_removal_hint
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        hint = _source_removal_hint("my server", "Claude Code (user)")
+        assert hint == 'claude mcp remove "my server" -s user'
+
 
 class TestAddFromClientsPrune:
     """`mms add --from-clients --prune` (and the TTY prompt variant) removes
@@ -6473,6 +6483,21 @@ class TestEjectCommand:
         # `add-json` is followed by the name as a single token, whitespace intact
         # (claude-project prefixes a `cd <path> &&`, so index by add-json, not [0]).
         assert argv[argv.index("add-json") + 1] == "my server"
+
+    @pytest.mark.parametrize("kind", ["claude-user", "claude-project"])
+    def test_manual_hint_uses_cmd_quoting_on_windows(self, kind, monkeypatch):
+        """`_shell_join` renders the whitespace name and the JSON payload with
+        `cmd.exe`-valid double quotes on win32 (#745). The `&&` in the
+        claude-project chain stays a literal shell operator, never an argv token."""
+        from memtomem_stm.cli.proxy import _eject_manual_hint
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        hint = _eject_manual_hint("my server", kind, "/proj dir", {"command": "npx"})
+        payload = 'add-json "my server" "{\\"command\\": \\"npx\\"}"'
+        if kind == "claude-user":
+            assert hint == f"claude mcp {payload} -s user"
+        else:
+            assert hint == f'cd "/proj dir" && claude mcp {payload} -s local'
 
     def _seed_config(self, config: Path, servers: dict) -> None:
         config.write_text(
@@ -10276,6 +10301,27 @@ class TestTune:
         line = next(ln for ln in result.output.splitlines() if marker in ln)
         argv = shlex.split(line.split(marker, 1)[1])
         assert argv == ["cp", "--", str(backups[0]), str(config)]
+
+    def test_restore_hint_uses_cmd_quoting_on_windows(self, runner, tmp_path, monkeypatch):
+        """On win32 `_shell_join` renders the whitespace-bearing backup/config
+        paths with `cmd.exe`-valid double quotes, not POSIX single quotes (#745).
+        Monkeypatched platform runs the branch on POSIX runners too."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        cfg_dir = tmp_path / "dir with space"
+        cfg_dir.mkdir()
+        config = cfg_dir / "stm_proxy.json"
+        metrics_db = cfg_dir / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        backups = sorted(cfg_dir.glob("stm_proxy.json.bak-*"))
+        assert len(backups) == 1
+
+        marker = "restore with: "
+        line = next(ln for ln in result.output.splitlines() if marker in ln)
+        assert line.split(marker, 1)[1] == f'cp -- "{backups[0]}" "{config}"'
 
     def test_backup_same_second_collision_uses_numbered_slot(self, tmp_path, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
