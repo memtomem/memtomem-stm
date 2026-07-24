@@ -7830,10 +7830,17 @@ class TestRemoveEjectHint:
         )
 
     def _eject_argv(self, hint: str) -> list[str]:
-        """Parse the ``mms eject ...`` command out of the rendered hint."""
+        """Parse the ``mms eject ...`` command out of the rendered hint.
+
+        Splits with the platform-aware ``_split_args`` (the inverse of the
+        ``_shell_join`` the hint renders through), so a Windows config path
+        with backslashes round-trips instead of being chewed up by POSIX
+        ``shlex.split`` — the Windows suite gates merge too."""
+        from memtomem_stm.cli.proxy import _split_args
+
         marker = "run: "
         line = next(ln for ln in hint.splitlines() if marker in ln)
-        return shlex.split(line.split(marker, 1)[1])
+        return _split_args(line.split(marker, 1)[1])
 
     def test_hint_shell_quotes_server_name(self):
         """`name` is a server name (a config key — arbitrary string, not
@@ -7842,13 +7849,17 @@ class TestRemoveEjectHint:
         the active config and guards the name with ``--`` (#746)."""
         from memtomem_stm.cli.proxy import _remove_eject_hint
 
-        hint = _remove_eject_hint("my server", self._imported_entry(), Path("/tmp/custom.json"))
+        custom = Path("/tmp/custom.json")
+        hint = _remove_eject_hint("my server", self._imported_entry(), custom)
         assert hint is not None
+        # Build the expected config token from ``str(custom)`` — it differs
+        # by separator across platforms; a hard-coded POSIX literal would
+        # spuriously fail the Windows suite.
         assert self._eject_argv(hint) == [
             "mms",
             "eject",
             "--config",
-            "/tmp/custom.json",
+            str(custom),
             "--",
             "my server",
         ]
@@ -7860,21 +7871,35 @@ class TestRemoveEjectHint:
         self._seed(config, self._imported_entry())
         result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0
-        resolved = str(config.resolve())
-        line = next(ln for ln in result.output.splitlines() if "mms eject" in ln)
-        assert shlex.split(line.split("run: ", 1)[1]) == [
+        assert self._eject_argv(result.output) == [
             "mms",
             "eject",
             "--config",
-            resolved,
+            str(config.resolve()),
             "--",
             "gh",
         ]
 
+    def test_hint_config_is_resolved_not_raw(self, runner, config, monkeypatch):
+        """#746: the hint renders the *resolved* absolute path, not the raw
+        ``--config`` string the user typed — a relative path pasted from a
+        different cwd would otherwise resolve elsewhere. Distinguishes
+        threading ``resolved`` from threading the raw argument."""
+        self._seed(config, self._imported_entry())
+        monkeypatch.chdir(config.parent)
+        result = runner.invoke(cli, ["remove", "gh", "--yes", "--config", config.name])
+        assert result.exit_code == 0
+        argv = self._eject_argv(result.output)
+        rendered = argv[argv.index("--config") + 1]
+        assert rendered == str(config.resolve())
+        assert Path(rendered).is_absolute()  # not the relative ``config.name``
+
     def test_hint_terminator_guards_leading_dash_name(self, runner, config):
         """#746: a leading-dash server name (e.g. ``-f``) would parse as an
         option on paste; the ``--`` terminator precedes the name so
-        `mms eject` treats it as a positional."""
+        `mms eject` treats it as a positional. The companion
+        ``test_eject_accepts_terminated_leading_dash_name`` proves the
+        rendered command actually parses in ``eject``."""
         self._seed(config, self._imported_entry())
         # Rename the seeded server to a leading-dash name.
         data = json.loads(config.read_text(encoding="utf-8"))
@@ -7882,9 +7907,20 @@ class TestRemoveEjectHint:
         config.write_text(json.dumps(data), encoding="utf-8")
         result = runner.invoke(cli, ["remove", "--yes", *_cfg_args(config), "--", "-f"])
         assert result.exit_code == 0, result.output
-        line = next(ln for ln in result.output.splitlines() if "mms eject" in ln)
-        argv = shlex.split(line.split("run: ", 1)[1])
+        argv = self._eject_argv(result.output)
         assert argv[-2:] == ["--", "-f"]
+
+    def test_eject_accepts_terminated_leading_dash_name(self, runner, config):
+        """#746: feed the exact ``-- <name>`` shape the hint renders back to
+        ``mms eject`` and confirm ``-f`` is parsed as a positional NAME, not
+        rejected as an unknown option. Without ``--`` Click exits 2 with
+        "No such option: -f"; with it, ``-f`` reaches eject's own logic
+        (here a domain error that names ``-f``). ``--dry-run`` keeps it
+        read-only."""
+        self._seed(config, {"-f": self._imported_entry()})
+        result = runner.invoke(cli, ["eject", "--dry-run", *_cfg_args(config), "--", "-f"])
+        assert "No such option" not in result.output
+        assert "-f" in result.output  # ``-f`` reached eject as the name positional
 
     def test_hint_shown_and_removal_proceeds_under_yes(self, runner, config):
         self._seed(config, self._imported_entry())
