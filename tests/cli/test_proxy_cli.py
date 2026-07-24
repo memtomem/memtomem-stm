@@ -7829,24 +7829,105 @@ class TestRemoveEjectHint:
             encoding="utf-8",
         )
 
+    def _eject_argv(self, hint: str) -> list[str]:
+        """Parse the ``mms eject ...`` command out of the rendered hint.
+
+        Splits with the platform-aware ``_split_args`` (the inverse of the
+        ``_shell_join`` the hint renders through), so a Windows config path
+        with backslashes round-trips instead of being chewed up by POSIX
+        ``shlex.split`` — the Windows suite gates merge too."""
+        from memtomem_stm.cli.proxy import _split_args
+
+        marker = "run: "
+        line = next(ln for ln in hint.splitlines() if marker in ln)
+        return _split_args(line.split(marker, 1)[1])
+
     def test_hint_shell_quotes_server_name(self):
         """`name` is a server name (a config key — arbitrary string, not
         validated for shell safety). A whitespace name must stay one argv
-        token in the pasted `mms eject` command (#743)."""
+        token in the pasted `mms eject` command (#743). The hint also names
+        the active config and guards the name with ``--`` (#746)."""
         from memtomem_stm.cli.proxy import _remove_eject_hint
 
-        hint = _remove_eject_hint("my server", self._imported_entry())
+        custom = Path("/tmp/custom.json")
+        hint = _remove_eject_hint("my server", self._imported_entry(), custom)
         assert hint is not None
-        marker = "run: "
-        line = next(ln for ln in hint.splitlines() if marker in ln)
-        assert shlex.split(line.split(marker, 1)[1]) == ["mms", "eject", "my server"]
+        # Build the expected config token from ``str(custom)`` — it differs
+        # by separator across platforms; a hard-coded POSIX literal would
+        # spuriously fail the Windows suite.
+        assert self._eject_argv(hint) == [
+            "mms",
+            "eject",
+            "--config",
+            str(custom),
+            "--",
+            "my server",
+        ]
+
+    def test_hint_names_active_config_not_default(self, runner, config):
+        """#746: `mms remove --config <custom>` must render the *custom*
+        config in the eject hint — pasting it against the default
+        `~/.memtomem/stm_proxy.json` would target the wrong config."""
+        self._seed(config, self._imported_entry())
+        result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert self._eject_argv(result.output) == [
+            "mms",
+            "eject",
+            "--config",
+            str(config.resolve()),
+            "--",
+            "gh",
+        ]
+
+    def test_hint_config_is_resolved_not_raw(self, runner, config, monkeypatch):
+        """#746: the hint renders the *resolved* absolute path, not the raw
+        ``--config`` string the user typed — a relative path pasted from a
+        different cwd would otherwise resolve elsewhere. Distinguishes
+        threading ``resolved`` from threading the raw argument."""
+        self._seed(config, self._imported_entry())
+        monkeypatch.chdir(config.parent)
+        result = runner.invoke(cli, ["remove", "gh", "--yes", "--config", config.name])
+        assert result.exit_code == 0
+        argv = self._eject_argv(result.output)
+        rendered = argv[argv.index("--config") + 1]
+        assert rendered == str(config.resolve())
+        assert Path(rendered).is_absolute()  # not the relative ``config.name``
+
+    def test_hint_terminator_guards_leading_dash_name(self, runner, config):
+        """#746: a leading-dash server name (e.g. ``-f``) would parse as an
+        option on paste; the ``--`` terminator precedes the name so
+        `mms eject` treats it as a positional. The companion
+        ``test_eject_accepts_terminated_leading_dash_name`` proves the
+        rendered command actually parses in ``eject``."""
+        self._seed(config, self._imported_entry())
+        # Rename the seeded server to a leading-dash name.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["upstream_servers"] = {"-f": data["upstream_servers"].pop("gh")}
+        config.write_text(json.dumps(data), encoding="utf-8")
+        result = runner.invoke(cli, ["remove", "--yes", *_cfg_args(config), "--", "-f"])
+        assert result.exit_code == 0, result.output
+        argv = self._eject_argv(result.output)
+        assert argv[-2:] == ["--", "-f"]
+
+    def test_eject_accepts_terminated_leading_dash_name(self, runner, config):
+        """#746: feed the exact ``-- <name>`` shape the hint renders back to
+        ``mms eject`` and confirm ``-f`` is parsed as a positional NAME, not
+        rejected as an unknown option. Without ``--`` Click exits 2 with
+        "No such option: -f"; with it, ``-f`` reaches eject's own logic
+        (here a domain error that names ``-f``). ``--dry-run`` keeps it
+        read-only."""
+        self._seed(config, {"-f": self._imported_entry()})
+        result = runner.invoke(cli, ["eject", "--dry-run", *_cfg_args(config), "--", "-f"])
+        assert "No such option" not in result.output
+        assert "-f" in result.output  # ``-f`` reached eject as the name positional
 
     def test_hint_shown_and_removal_proceeds_under_yes(self, runner, config):
         self._seed(config, self._imported_entry())
         result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0
         assert "registered nowhere" in result.output
-        assert "mms eject gh" in result.output
+        assert self._eject_argv(result.output)[-1] == "gh"
         # The recorded kind resolves to its human label, not the raw kind.
         assert "Claude Code (user)" in result.output
         data = json.loads(config.read_text(encoding="utf-8"))
@@ -7858,7 +7939,7 @@ class TestRemoveEjectHint:
         self._seed(config, self._imported_entry())
         result = runner.invoke(cli, ["remove", "gh", *_cfg_args(config)], input="n\n")
         assert result.exit_code != 0
-        assert "mms eject gh" in result.output
+        assert self._eject_argv(result.output)[-1] == "gh"
         data = json.loads(config.read_text(encoding="utf-8"))
         assert "gh" in data["upstream_servers"]
 
@@ -7894,7 +7975,7 @@ class TestRemoveEjectHint:
         )
         result = runner.invoke(cli, ["remove", "gh", "--yes", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert "mms eject gh" in result.output
+        assert self._eject_argv(result.output)[-1] == "gh"
 
     def test_json_mode_moves_hint_into_warnings(self, runner, config):
         """In --json mode the orphaning hint moves off stdout into the
@@ -7906,7 +7987,7 @@ class TestRemoveEjectHint:
         assert data["removed"] is True
         assert len(data["warnings"]) == 1
         assert "registered nowhere" in data["warnings"][0]
-        assert "mms eject gh" in data["warnings"][0]
+        assert self._eject_argv(data["warnings"][0])[-1] == "gh"
         assert "\x1b[" not in data["warnings"][0]
 
 
