@@ -6670,13 +6670,17 @@ class TestEjectCommand:
     @pytest.mark.parametrize("kind", ["claude-user", "claude-project"])
     def test_manual_hint_uses_cmd_quoting_on_windows(self, kind, monkeypatch):
         """`_shell_join` renders the whitespace name and the JSON payload with
-        `cmd.exe`-valid double quotes on win32 (#745). The `&&` in the
-        claude-project chain stays a literal shell operator, never an argv token."""
+        `cmd.exe`-valid double quotes on win32 (#745). Embedded quotes in the
+        payload render as `""` (not `\\"`) so cmd's quote parity holds — the
+        old `\\"` form toggled cmd out of the quoted span at the first inner
+        quote, exposing the payload's spaces to argv splitting (#749). The `&&`
+        in the claude-project chain stays a literal shell operator, never an
+        argv token."""
         from memtomem_stm.cli.proxy import _eject_manual_hint
 
         monkeypatch.setattr(sys, "platform", "win32")
         hint = _eject_manual_hint("my server", kind, "/proj dir", {"command": "npx"})
-        payload = 'add-json "my server" "{\\"command\\": \\"npx\\"}"'
+        payload = 'add-json "my server" "{""command"": ""npx""}"'
         if kind == "claude-user":
             assert hint == f"claude mcp {payload} -s user"
         else:
