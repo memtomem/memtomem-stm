@@ -459,16 +459,17 @@ class TestShellJoin:
         monkeypatch.setattr(sys, "platform", "win32")
         assert _shell_join(["KEY=a&b"]) == '"KEY=a&b"'
 
-    def test_win32_percent_and_bang_pass_through(self, monkeypatch):
-        """Accepted residual (#749): quoting cannot stop cmd's ``%VAR%``
-        expansion (it runs before quote processing) nor ``!`` under
-        ``cmd /v:on``, so tokens whose only specials are ``%``/``!`` are left
-        unquoted rather than churned."""
+    def test_win32_percent_is_quoted_bang_passes_through(self, monkeypatch):
+        """A ``%``-bearing token is quoted: quoting cannot stop ``%VAR%``
+        expansion (it runs before quote processing) but it keeps a
+        metacharacter in the *expanded value* from splitting the command
+        (#749). ``!`` is left unquoted — it is inert unless ``cmd /v:on``, and
+        there ``!VAR!`` expands even inside quotes, so quoting cannot help."""
         from memtomem_stm.cli.proxy import _shell_join
 
         monkeypatch.setattr(sys, "platform", "win32")
-        assert _shell_join([r"C:\100%done\x"]) == r"C:\100%done\x"
-        assert _shell_join(["%USERNAME%"]) == "%USERNAME%"
+        assert _shell_join([r"C:\100%done\x"]) == '"C:\\100%done\\x"'
+        assert _shell_join(["%USERNAME%"]) == '"%USERNAME%"'
         assert _shell_join(["a!b"]) == "a!b"
 
 
@@ -526,6 +527,19 @@ class TestShellJoinCmdRoundTrip:
 
         assert _shell_join(["x&%MMS_749_PROBE%"]) == '"x&%MMS_749_PROBE%"'
         assert self._roundtrip("x&%MMS_749_PROBE%") == "x&oops"
+
+    def test_percent_var_value_metachar_cannot_split_command(self, monkeypatch):
+        """An all-``%VAR%`` token (no literal trigger char) is still quoted so
+        a ``&`` *in the expanded value* stays inside one argv token and cannot
+        run a second command. The expansion itself is the accepted residual;
+        the command-splitting is what quoting closes (#749)."""
+        monkeypatch.setenv("MMS_749_INJECT", "oops&echo INJECTED")
+        from memtomem_stm.cli.proxy import _shell_join
+
+        assert _shell_join(["%MMS_749_INJECT%"]) == '"%MMS_749_INJECT%"'
+        # The child receives the whole expanded value as one argument; the
+        # ``&`` is literal (no second command / "INJECTED" line).
+        assert self._roundtrip("%MMS_749_INJECT%") == "oops&echo INJECTED"
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────

@@ -129,11 +129,14 @@ def _split_args(args_str: str) -> list[str]:
     return shlex.split(args_str)
 
 
-# cmd.exe metacharacters that a double-quoted span renders literal. ``%`` and
-# ``!`` are intentionally excluded: ``%VAR%`` is expanded before quote/caret
-# processing (so quoting cannot stop it) and ``!`` is inert unless the user
-# opted into ``cmd /v:on``. See ``_cmd_quote``'s docstring for the residuals.
-_CMD_NEEDS_QUOTE = set(' \t"&|<>^()')
+# cmd.exe metacharacters that a double-quoted span renders literal. ``%`` is
+# included not to stop ``%VAR%`` expansion (quoting can't — it runs first) but
+# because a quoted span keeps any metacharacter *introduced by the expanded
+# value* (e.g. a var whose value contains ``&``) from splitting the command.
+# ``!`` is excluded: it is inert unless the user opted into ``cmd /v:on``, and
+# there ``!VAR!`` expands even inside double quotes, so quoting cannot help it.
+# See ``_cmd_quote``'s docstring for the residuals.
+_CMD_NEEDS_QUOTE = set(' \t"&|<>^()%')
 
 
 def _cmd_quote(token: str) -> str:
@@ -154,9 +157,16 @@ def _cmd_quote(token: str) -> str:
     ucrt argv parser reads the pair as one literal quote. Backslash runs are
     doubled before an emitted quote per the MS argv rules.
 
+    A token containing ``%`` is quoted too: quoting cannot stop a *defined*
+    ``%VAR%`` from expanding (that runs before quote processing), but it keeps
+    metacharacters in the *expanded value* from splitting the command — an
+    unquoted ``%VAR%`` whose value is ``a&whoami`` would otherwise run
+    ``whoami`` as a second command.
+
     Residual limitations (batch-file paste is out of scope): a *defined*
-    ``%VAR%`` still expands even when quoted, and ``!VAR!`` expands under
-    ``cmd /v:on`` delayed expansion — neither is defeatable by quoting.
+    ``%VAR%`` still expands (only its value's metacharacters are neutralized),
+    and ``!VAR!`` expands under ``cmd /v:on`` delayed expansion even inside
+    double quotes — that one is not defeatable by quoting.
     """
     if token and not (set(token) & _CMD_NEEDS_QUOTE):
         return token
