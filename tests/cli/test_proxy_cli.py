@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -368,6 +369,149 @@ class TestSplitArgs:
         assert result.exit_code == 0, result.output
         data = json.loads(config.read_text(encoding="utf-8"))
         assert data["upstream_servers"]["fake"]["args"] == [win_path]
+
+
+class TestShellJoin:
+    """``_shell_join`` renders copy/paste command hints for the native shell.
+
+    The win32 leg must neutralize cmd.exe metacharacters (``& | < > ^ ( )``)
+    in addition to the MS-argv whitespace/quote rules — ``list2cmdline`` (the
+    prior implementation) only did the latter, so a token like
+    ``C:\\a&b\\cfg.json`` pasted into cmd.exe split the command at ``&``
+    (#749). Tested against monkeypatched ``sys.platform`` so the Windows
+    branch runs on POSIX runners too; ``TestShellJoinCmdRoundTrip`` covers the
+    real interpreter on the windows-latest matrix.
+    """
+
+    def test_posix_leg_is_shlex_join(self, monkeypatch):
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        args = ["mms", "doctor", "--config", "/a b/c&d.json"]
+        assert _shell_join(args) == shlex.join(args)
+
+    def test_win32_clean_argv_stays_unquoted(self, monkeypatch):
+        """Regression guard vs #744: metachar-free tokens (incl. plain
+        backslash paths) must render byte-for-byte unquoted — quoting only
+        when needed keeps the doctor hint templates' ``<name>`` metavars
+        readable."""
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert (
+            _shell_join(["mms", "doctor", "--config", r"C:\cfg\x.json"])
+            == r"mms doctor --config C:\cfg\x.json"
+        )
+
+    def test_win32_whitespace_path_matches_list2cmdline(self, monkeypatch):
+        """Whitespace-only-special tokens keep the exact ``list2cmdline``
+        output, including trailing-backslash doubling before the close
+        quote."""
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join([r"C:\dir with space\stm_proxy.json"]) == (
+            '"C:\\dir with space\\stm_proxy.json"'
+        )
+        assert _shell_join([r"C:\dir with space\\"]) == '"C:\\dir with space\\\\\\\\"'
+
+    @pytest.mark.parametrize("meta", ["&", "|", "<", ">", "^", "(", ")"])
+    def test_win32_metachar_path_is_quoted(self, monkeypatch, meta):
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        token = f"C:\\a{meta}b\\cfg.json"
+        assert _shell_join([token]) == f'"{token}"'
+
+    def test_win32_whitespace_plus_metachar(self, monkeypatch):
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join([r"C:\a & b\cfg.json"]) == '"C:\\a & b\\cfg.json"'
+
+    def test_win32_embedded_quote_uses_double_quote_escape(self, monkeypatch):
+        """Embedded ``"`` renders as ``""`` (not ``list2cmdline``'s ``\\"``)
+        so cmd's quote parity is preserved and the following ``&`` stays
+        protected; the modern ucrt argv parser reads ``""`` as one literal
+        quote."""
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join(['he said "hi" & ran']) == '"he said ""hi"" & ran"'
+
+    def test_win32_backslash_before_quote_is_doubled(self, monkeypatch):
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join(['a\\"b&c']) == '"a\\\\""b&c"'
+
+    def test_win32_empty_token(self, monkeypatch):
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join([""]) == '""'
+
+    def test_win32_env_pair_with_metachar_is_quoted(self, monkeypatch):
+        """Register hints interpolate ``KEY=value`` env strings (proxy.py
+        ``_emit_skip_hints``); a ``&`` in the value must be neutralized."""
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join(["KEY=a&b"]) == '"KEY=a&b"'
+
+    def test_win32_percent_and_bang_pass_through(self, monkeypatch):
+        """Accepted residual (#749): quoting cannot stop cmd's ``%VAR%``
+        expansion (it runs before quote processing) nor ``!`` under
+        ``cmd /v:on``, so tokens whose only specials are ``%``/``!`` are left
+        unquoted rather than churned."""
+        from memtomem_stm.cli.proxy import _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert _shell_join([r"C:\100%done\x"]) == r"C:\100%done\x"
+        assert _shell_join(["%USERNAME%"]) == "%USERNAME%"
+        assert _shell_join(["a!b"]) == "a!b"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real cmd.exe + CRT argv semantics")
+class TestShellJoinCmdRoundTrip:
+    """Authoritative win32 leg: paste a rendered token through a real
+    ``cmd.exe`` parse plus the child's CRT argv split and confirm it arrives
+    intact. Runs only on the windows-latest CI matrix (#749)."""
+
+    def _roundtrip(self, token: str) -> str:
+        from memtomem_stm.cli.proxy import _shell_join
+
+        inner = _shell_join([sys.executable, "-c", "import sys; print(sys.argv[1])", token])
+        # Run as a single string so Python does no re-quoting; ``/s`` avoids
+        # cmd's nested-quote stripping so ``inner`` is parsed verbatim.
+        proc = subprocess.run(
+            f'cmd.exe /d /s /c "{inner}"',
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.rstrip("\r\n")
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            r"C:\a&b\cfg.json",
+            "a|b<c>d",
+            "caret^tok",
+            r"C:\a & b\x",
+            'he said "hi" & ran',
+            r"C:\100%done\x",
+        ],
+    )
+    def test_token_survives_cmd_parse(self, token):
+        assert self._roundtrip(token) == token
+
+    def test_percent_var_expands_documented_policy(self, monkeypatch):
+        """Pin the accepted residual: a *defined* ``%VAR%`` still expands even
+        though quoted. This test must change if the ``%`` policy ever
+        changes."""
+        monkeypatch.setenv("MMS_749_PROBE", "oops")
+        assert self._roundtrip("%MMS_749_PROBE%") == "oops"
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────
@@ -2329,6 +2473,31 @@ class TestInit:
         line = next(ln for ln in result.output.splitlines() if marker in ln)
         argv = shlex.split(line.split(marker, 1)[1])
         assert argv == ["mms", "doctor", "--config", str(config.resolve())]
+
+    def test_resume_next_hint_quotes_cmd_metachar_path_on_win32(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """A config path containing ``&`` (legal on NTFS) must render the
+        path as one quoted token in the win32 ``Next:`` hint, so pasting it
+        into cmd.exe does not split the command at ``&`` (#749)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        cfg_dir = tmp_path / "a&b"
+        cfg_dir.mkdir()
+        config = cfg_dir / "stm_proxy.json"
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {"kept": {"prefix": "k"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        result = runner.invoke(cli, ["init", "--resume", "--client", "skip", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        marker = "Next: "
+        line = next(ln for ln in result.output.splitlines() if marker in ln)
+        assert f'"{config.resolve()}"' in line
 
     def test_init_save_unverified_acknowledgement_keeps_config(
         self, runner, config, no_discovery, monkeypatch

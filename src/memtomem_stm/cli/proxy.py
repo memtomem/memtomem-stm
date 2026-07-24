@@ -129,10 +129,63 @@ def _split_args(args_str: str) -> list[str]:
     return shlex.split(args_str)
 
 
+# cmd.exe metacharacters that a double-quoted span renders literal. ``%`` and
+# ``!`` are intentionally excluded: ``%VAR%`` is expanded before quote/caret
+# processing (so quoting cannot stop it) and ``!`` is inert unless the user
+# opted into ``cmd /v:on``. See ``_cmd_quote``'s docstring for the residuals.
+_CMD_NEEDS_QUOTE = set(' \t"&|<>^()')
+
+
+def _cmd_quote(token: str) -> str:
+    """Quote one token for paste at an interactive ``cmd.exe`` prompt / ``cmd /c``.
+
+    ``subprocess.list2cmdline`` implements MS C-runtime *argv* quoting only —
+    it wraps tokens containing whitespace/quotes/empty but leaves cmd.exe
+    *shell* metacharacters (``& | < > ^ ( )``) unprotected in tokens without
+    whitespace, so ``C:\\a&b\\cfg.json`` pasted into cmd.exe splits the command
+    at ``&`` (#749). This wraps any token carrying a metacharacter in double
+    quotes — inside a quoted span cmd treats those chars as literal — while
+    keeping metachar-free tokens (incl. plain backslash paths) untouched so the
+    hint templates' ``<name>`` metavars stay readable.
+
+    Embedded ``"`` is escaped as ``""`` rather than ``list2cmdline``'s ``\\"``:
+    cmd ignores the backslash, so ``\\"`` toggles cmd's quote state and exposes
+    the following metacharacters; ``""`` keeps quote parity while the modern
+    ucrt argv parser reads the pair as one literal quote. Backslash runs are
+    doubled before an emitted quote per the MS argv rules.
+
+    Residual limitations (batch-file paste is out of scope): a *defined*
+    ``%VAR%`` still expands even when quoted, and ``!VAR!`` expands under
+    ``cmd /v:on`` delayed expansion — neither is defeatable by quoting.
+    """
+    if token and not (set(token) & _CMD_NEEDS_QUOTE):
+        return token
+    out = ['"']
+    backslashes = 0
+    for ch in token:
+        if ch == "\\":
+            backslashes += 1
+        elif ch == '"':
+            out.append("\\" * (backslashes * 2))
+            backslashes = 0
+            out.append('""')
+        else:
+            out.append("\\" * backslashes)
+            backslashes = 0
+            out.append(ch)
+    out.append("\\" * (backslashes * 2))
+    out.append('"')
+    return "".join(out)
+
+
 def _shell_join(args: list[str]) -> str:
-    """Render a copy/paste command for the current native shell family."""
+    """Render a copy/paste command for the current native shell family.
+
+    The win32 leg is cmd.exe-metacharacter-safe (via ``_cmd_quote``), not just
+    argv-safe; the POSIX leg (``shlex.join``) already quotes metacharacters.
+    """
     if sys.platform == "win32":
-        return subprocess.list2cmdline(args)
+        return " ".join(_cmd_quote(a) for a in args)
     return shlex.join(args)
 
 
