@@ -188,12 +188,36 @@ def _cmd_quote(token: str) -> str:
     return "".join(out)
 
 
+# CR/LF/NUL are unrenderable in a pasteable hint on every target shell, so
+# ``_shell_join`` refuses them regardless of platform. A pasted newline is a
+# different class from the ``_cmd_quote`` metacharacters (#749): an interactive
+# console consumes it as Enter and submits the truncated prefix as a command
+# even inside an open quoted span, so quoting cannot fix it (#751); NUL can
+# never reach argv. A JSON config (plain ``json.loads``, no character
+# validation on server names/``command``/env values) can carry any of these.
+_HINT_UNSAFE_CHARS = frozenset("\r\n\x00")
+
+# Non-executable fallback (never embeds the raw value): ``#`` comments the
+# whole line on POSIX; cmd.exe has no ``#`` comment, but the unknown command
+# fails harmlessly and short-circuits any ``&&`` tail — same accepted behavior
+# as the existing ``# Edit ...`` fallback hints.
+_HINT_UNRENDERABLE = "# copy/paste hint unavailable: a value contains line-break or NUL characters"
+
+
 def _shell_join(args: list[str]) -> str:
     """Render a copy/paste command for the current native shell family.
 
     The win32 leg is cmd.exe-metacharacter-safe (via ``_cmd_quote``), not just
     argv-safe; the POSIX leg (``shlex.join``) already quotes metacharacters.
+
+    An argv carrying CR/LF/NUL renders as the non-executable
+    ``_HINT_UNRENDERABLE`` diagnostic on *both* legs (#751): a pasted newline
+    submits the truncated prefix as a command even inside quotes, and NUL is
+    unrepresentable — neither is defeatable by quoting. See
+    ``_HINT_UNSAFE_CHARS``.
     """
+    if any(_HINT_UNSAFE_CHARS & set(token) for token in args):
+        return _HINT_UNRENDERABLE
     if sys.platform == "win32":
         return " ".join(_cmd_quote(a) for a in args)
     return shlex.join(args)

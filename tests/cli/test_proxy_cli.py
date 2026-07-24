@@ -472,6 +472,36 @@ class TestShellJoin:
         assert _shell_join(["%USERNAME%"]) == '"%USERNAME%"'
         assert _shell_join(["a!b"]) == "a!b"
 
+    @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
+    def test_win32_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch):
+        """CR/LF/NUL cannot be neutralized by ``_cmd_quote``: a pasted newline
+        submits the truncated prefix even inside a quoted span (#751), so the
+        whole hint collapses to the non-executable diagnostic and the raw value
+        (``whoami``, the injected second command) never survives into it."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        out = _shell_join(["where.exe", f"missing{ch}whoami"])
+        assert out == _HINT_UNRENDERABLE
+        assert out.startswith("#")
+        assert not (set(out) & {"\r", "\n", "\x00"})
+        assert "whoami" not in out
+
+    @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
+    def test_posix_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch):
+        """The guard is platform-uniform, not win32-only: ``shlex.join`` would
+        single-quote a ``\\n`` into a technically-pasteable *multi-line* hint,
+        but that shatters the one-line ``next:``/``run:`` rendering, and NUL is
+        unrepresentable on every shell. So POSIX suppresses it identically."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        out = _shell_join(["command", "-v", f"missing{ch}whoami"])
+        assert out == _HINT_UNRENDERABLE
+        assert out.startswith("#")
+        assert not (set(out) & {"\r", "\n", "\x00"})
+        assert "whoami" not in out
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real cmd.exe + CRT argv semantics")
 class TestShellJoinCmdRoundTrip:
@@ -540,6 +570,22 @@ class TestShellJoinCmdRoundTrip:
         # The child receives the whole expanded value as one argument; the
         # ``&`` is literal (no second command / "INJECTED" line).
         assert self._roundtrip("%MMS_749_INJECT%") == "oops&echo INJECTED"
+
+    def test_diagnostic_paste_fails_harmlessly(self):
+        """The ``#``-prefixed diagnostic (#751) is not a cmd.exe comment: pasted
+        it is an unknown command that errors and runs nothing. A control-char
+        token has no argv to recover, so we pin the fallback's paste behavior
+        rather than round-tripping the token (which is deliberately suppressed).
+        Mirrors ``_roundtrip`` but does not assert returncode 0."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
+
+        proc = subprocess.run(
+            f'cmd.exe /d /s /c "{_HINT_UNRENDERABLE}"',
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode != 0
+        assert proc.stdout.strip() == ""
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────
@@ -8092,6 +8138,20 @@ class TestRemoveEjectHint:
             "my server",
         ]
 
+    def test_hint_control_char_name_renders_diagnostic(self):
+        """A server name (config key) carrying a newline can't render a runnable
+        ``mms eject`` command — pasted it would submit a truncated command and
+        run the tail (#751). The embedded restore command collapses to the
+        non-executable diagnostic, leaving no ``mms eject`` fragment to paste.
+        (The surrounding prose still prints the raw name — a display wart, not
+        a paste-execution surface, and out of scope here.)"""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _remove_eject_hint
+
+        hint = _remove_eject_hint("bad\nname", self._imported_entry(), Path("/tmp/custom.json"))
+        assert hint is not None
+        assert _HINT_UNRENDERABLE in hint
+        assert "mms eject" not in hint
+
     def test_hint_names_active_config_not_default(self, runner, config):
         """#746: `mms remove --config <custom>` must render the *custom*
         config in the eject hint — pasting it against the default
@@ -10051,6 +10111,43 @@ class TestDoctor:
             "/no such/dir/my binary"
         ]
         assert argv == expected
+
+    def test_offline_server_hint_suppresses_control_char_command(self, runner, config):
+        """A `command` carrying a newline can't be rendered into a runnable
+        lookup: pasted at cmd.exe the ``where.exe missing\\nwhoami`` hint would
+        submit ``where.exe missing`` then run ``whoami`` (#751). The dead-stdio
+        next-action must therefore collapse to the non-executable diagnostic —
+        no ``where.exe``/``command -v``/``whoami`` in the ``next:`` line on
+        either CI leg. Real probe, mirrors
+        test_offline_server_hint_shell_quotes_command."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "bad": {
+                            "prefix": "bad",
+                            "transport": "stdio",
+                            "command": "missing\nwhoami",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["doctor", "--timeout", "3", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "stdio child process did not start" in result.output
+        # Assert on the ``next:`` line only — the FAIL ``detail`` may echo the
+        # probe's OS error (which can contain the raw command); that is error
+        # reporting, not a copy/paste hint.
+        next_lines = [ln for ln in result.output.splitlines() if "next:" in ln]
+        assert next_lines
+        assert any(_HINT_UNRENDERABLE in ln for ln in next_lines)
+        assert not any("where.exe" in ln or "command -v" in ln for ln in next_lines)
+        assert not any("whoami" in ln for ln in next_lines)
 
     def test_cache_policy_unset_warns(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
