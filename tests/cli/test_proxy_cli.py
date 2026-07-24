@@ -6686,10 +6686,12 @@ class TestEjectCommand:
         """`_shell_join` renders the whitespace name and the JSON payload with
         `cmd.exe`-valid double quotes on win32 (#745). Embedded quotes in the
         payload render as `""` (not `\\"`) so cmd's quote parity holds — the
-        old `\\"` form toggled cmd out of the quoted span at the first inner
-        quote, exposing the payload's spaces to argv splitting (#749). The `&&`
-        in the claude-project chain stays a literal shell operator, never an
-        argv token."""
+        old `\\"` form toggled cmd out of the quoted span at each inner quote
+        (cmd ignores the backslash), which would expose any shell
+        metacharacter in the payload to command splitting (#749). The child
+        CRT reads `""` as one literal quote, so the payload round-trips. The
+        `&&` in the claude-project chain stays a literal shell operator, never
+        an argv token."""
         from memtomem_stm.cli.proxy import _eject_manual_hint
 
         monkeypatch.setattr(sys, "platform", "win32")
