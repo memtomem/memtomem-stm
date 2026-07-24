@@ -482,8 +482,9 @@ class TestShellJoinCmdRoundTrip:
         from memtomem_stm.cli.proxy import _shell_join
 
         inner = _shell_join([sys.executable, "-c", "import sys; print(sys.argv[1])", token])
-        # Run as a single string so Python does no re-quoting; ``/s`` avoids
-        # cmd's nested-quote stripping so ``inner`` is parsed verbatim.
+        # Run as a single string so Python does no re-quoting; ``/s`` makes
+        # cmd's wrapper-quote stripping deterministic (first/last quote only),
+        # so ``inner`` is parsed verbatim.
         proc = subprocess.run(
             f'cmd.exe /d /s /c "{inner}"',
             capture_output=True,
@@ -501,6 +502,14 @@ class TestShellJoinCmdRoundTrip:
             r"C:\a & b\x",
             'he said "hi" & ran',
             r"C:\100%done\x",
+            # Backslash-run/quote UCRT edge cases (the most failure-prone for
+            # the ``\\``-doubling + ``""`` escaping) — only a real cmd.exe plus
+            # the child UCRT parser validate these independently of the spelling
+            # pins in ``TestShellJoin``.
+            'a\\"b&c',
+            'a\\\\"b&c',
+            "a&\\",
+            'a\\"',
         ],
     )
     def test_token_survives_cmd_parse(self, token):
@@ -508,10 +517,15 @@ class TestShellJoinCmdRoundTrip:
 
     def test_percent_var_expands_documented_policy(self, monkeypatch):
         """Pin the accepted residual: a *defined* ``%VAR%`` still expands even
-        though quoted. This test must change if the ``%`` policy ever
-        changes."""
+        though the token is quoted. The token carries ``&`` so ``_cmd_quote``
+        wraps it, yet ``%``-expansion (which runs before quote processing)
+        still fires — exactly the case the ``%`` policy documents. This test
+        must change if the ``%`` policy ever changes."""
         monkeypatch.setenv("MMS_749_PROBE", "oops")
-        assert self._roundtrip("%MMS_749_PROBE%") == "oops"
+        from memtomem_stm.cli.proxy import _shell_join
+
+        assert _shell_join(["x&%MMS_749_PROBE%"]) == '"x&%MMS_749_PROBE%"'
+        assert self._roundtrip("x&%MMS_749_PROBE%") == "x&oops"
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────
