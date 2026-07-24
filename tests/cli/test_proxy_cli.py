@@ -472,31 +472,44 @@ class TestShellJoin:
         assert _shell_join(["%USERNAME%"]) == '"%USERNAME%"'
         assert _shell_join(["a!b"]) == "a!b"
 
+    @staticmethod
+    def _argv_with_unsafe_char_at(pos: str, ch: str) -> list[str]:
+        """A 3-token argv with ``ch`` embedded in the first/middle/last token —
+        pins the ``any(...)`` contract so an ``args[-1]``-only check can't pass."""
+        argv = ["where.exe", "-v", "target"]
+        idx = {"first": 0, "middle": 1, "last": 2}[pos]
+        argv[idx] = f"missing{ch}whoami"
+        return argv
+
     @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
-    def test_win32_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch):
+    @pytest.mark.parametrize("pos", ["first", "middle", "last"])
+    def test_win32_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch, pos):
         """CR/LF/NUL cannot be neutralized by ``_cmd_quote``: a pasted newline
         submits the truncated prefix even inside a quoted span (#751), so the
         whole hint collapses to the non-executable diagnostic and the raw value
-        (``whoami``, the injected second command) never survives into it."""
+        (``whoami``, the injected second command) never survives into it. An
+        unsafe char in *any* token position triggers it, not just the last."""
         from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
 
         monkeypatch.setattr(sys, "platform", "win32")
-        out = _shell_join(["where.exe", f"missing{ch}whoami"])
+        out = _shell_join(self._argv_with_unsafe_char_at(pos, ch))
         assert out == _HINT_UNRENDERABLE
         assert out.startswith("#")
         assert not (set(out) & {"\r", "\n", "\x00"})
         assert "whoami" not in out
 
     @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
-    def test_posix_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch):
+    @pytest.mark.parametrize("pos", ["first", "middle", "last"])
+    def test_posix_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch, pos):
         """The guard is platform-uniform, not win32-only: ``shlex.join`` would
         single-quote a ``\\n`` into a technically-pasteable *multi-line* hint,
         but that shatters the one-line ``next:``/``run:`` rendering, and NUL is
-        unrepresentable on every shell. So POSIX suppresses it identically."""
+        unrepresentable on every shell. So POSIX suppresses it identically, for
+        an unsafe char in any token position."""
         from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
 
         monkeypatch.setattr(sys, "platform", "linux")
-        out = _shell_join(["command", "-v", f"missing{ch}whoami"])
+        out = _shell_join(self._argv_with_unsafe_char_at(pos, ch))
         assert out == _HINT_UNRENDERABLE
         assert out.startswith("#")
         assert not (set(out) & {"\r", "\n", "\x00"})
@@ -571,21 +584,25 @@ class TestShellJoinCmdRoundTrip:
         # ``&`` is literal (no second command / "INJECTED" line).
         assert self._roundtrip("%MMS_749_INJECT%") == "oops&echo INJECTED"
 
-    def test_diagnostic_paste_fails_harmlessly(self):
-        """The ``#``-prefixed diagnostic (#751) is not a cmd.exe comment: pasted
-        it is an unknown command that errors and runs nothing. A control-char
-        token has no argv to recover, so we pin the fallback's paste behavior
-        rather than round-tripping the token (which is deliberately suppressed).
-        Mirrors ``_roundtrip`` but does not assert returncode 0."""
+    def test_diagnostic_paste_fails_when_no_hash_executable(self, tmp_path, monkeypatch):
+        """The ``#``-prefixed diagnostic (#751) is not a cmd.exe comment: with no
+        ``#.{cmd,bat,exe}`` resolvable, cmd's command lookup fails, so the tail
+        of a ``# ... && real-cmd`` compound hint is short-circuited and nothing
+        runs. Runs from an empty cwd to pin exactly that (the documented residual
+        is a *planted* ``#`` executable, which this deliberately excludes). A
+        control-char token has no argv to recover, so we pin the fallback's paste
+        behavior rather than round-tripping the suppressed token."""
         from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
 
+        monkeypatch.chdir(tmp_path)  # empty dir: no planted ``#`` executable
         proc = subprocess.run(
-            f'cmd.exe /d /s /c "{_HINT_UNRENDERABLE}"',
+            f'cmd.exe /d /s /c "{_HINT_UNRENDERABLE} && echo TAIL_RAN"',
             capture_output=True,
             text=True,
+            cwd=tmp_path,
         )
         assert proc.returncode != 0
-        assert proc.stdout.strip() == ""
+        assert "TAIL_RAN" not in proc.stdout  # ``&&`` tail short-circuited
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────

@@ -197,10 +197,16 @@ def _cmd_quote(token: str) -> str:
 # validation on server names/``command``/env values) can carry any of these.
 _HINT_UNSAFE_CHARS = frozenset("\r\n\x00")
 
-# Non-executable fallback (never embeds the raw value): ``#`` comments the
-# whole line on POSIX; cmd.exe has no ``#`` comment, but the unknown command
-# fails harmlessly and short-circuits any ``&&`` tail — same accepted behavior
-# as the existing ``# Edit ...`` fallback hints.
+# Non-executable fallback (never embeds the raw value). Pasted, the ``#`` line
+# is inert on every target shell but by two routes: bash/fish (and POSIX sh)
+# treat ``#`` as a comment; interactive zsh (``interactive_comments`` off by
+# default) and cmd.exe instead look ``#`` up as a command, which fails —
+# ``command not found``/unknown command — and short-circuits any ``&&`` tail.
+# Residual (documented, not fixed): a planted ``#.{cmd,bat,exe}`` in the paste
+# cwd could resolve on cmd.exe, so the lookup would succeed there. This is the
+# same residual the pre-existing ``# Edit ...`` / ``# Remove ...`` fallback
+# hints already carry, and stays below #751's own low severity (the user pastes
+# their own hint). No single prefix is a comment on both shell families.
 _HINT_UNRENDERABLE = "# copy/paste hint unavailable: a value contains line-break or NUL characters"
 
 
