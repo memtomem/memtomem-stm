@@ -2550,7 +2550,7 @@ def _source_removal_hint(name: str, source: str) -> str:
     if spec is None:
         return f"# Remove '{name}' from {source}."
     if spec.claude_scope is not None:
-        return f"claude mcp remove {shlex.quote(name)} -s {spec.claude_scope}"
+        return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
     return f"# Edit {_desktop_config_path()} and remove '{name}' under mcpServers."
 
 
@@ -4466,7 +4466,7 @@ def tune(
     click.echo(f"{_ok('Applied')} {len(selected)} override(s) to {tool_count} tool(s).")
     click.echo(
         "  A running proxy hot-reloads the config; restore with: "
-        f"cp -- {shlex.quote(str(backup))} {shlex.quote(str(resolved))}"
+        f"{_shell_join(['cp', '--', str(backup), str(resolved)])}"
     )
 
 
@@ -4913,11 +4913,13 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
     """
     payload_json = json.dumps(payload, ensure_ascii=False)
     if kind == "claude-user":
-        return f"claude mcp add-json {shlex.quote(name)} {shlex.quote(payload_json)} -s user"
+        return _shell_join(["claude", "mcp", "add-json", name, payload_json, "-s", "user"])
     if kind == "claude-project":
+        # `&&` is a shell chain operator valid in both cmd.exe and POSIX sh, so it
+        # stays a literal between two independently-joined commands — never an argv token.
         return (
-            f"cd {shlex.quote(path or '.')} && "
-            f"claude mcp add-json {shlex.quote(name)} {shlex.quote(payload_json)} -s local"
+            f"{_shell_join(['cd', path or '.'])} && "
+            f"{_shell_join(['claude', 'mcp', 'add-json', name, payload_json, '-s', 'local'])}"
         )
     target = path if kind == "mcp-json" else str(_desktop_config_path())
     return f'# Edit {target} and add under mcpServers: "{name}": {payload_json}'
