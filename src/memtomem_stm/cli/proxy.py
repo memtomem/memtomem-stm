@@ -1144,10 +1144,17 @@ def _emit_skip_hints(config_path: Path = _DEFAULT_CONFIG) -> None:
     click.echo(f"    {_shell_join(codex_cmd)}")
     click.echo("")
     click.echo(f"  {_hdr('Claude Desktop / JSON MCP config:')}")
+    # Every value goes through ``json.dumps``, which supplies its own
+    # quotes — hand-writing them around ``server_cmd`` emitted a document
+    # the user could not paste back whenever the interpreter path held a
+    # ``"`` or a ``\`` (a Windows path always does). ``ensure_ascii`` stays
+    # at its default here, unlike the ``--json`` legs: it escapes the
+    # control characters and BiDi overrides ``_disp`` guards elsewhere, so
+    # this snippet needs no separate display pass (#755).
     json_args = f', "args": {json.dumps(server_args)}' if server_args else ""
     json_env = f', "env": {json.dumps(server_env)}'
     click.echo(
-        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": "{server_cmd}"'
+        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": {json.dumps(server_cmd)}'
         f"{json_args}{json_env} }} }} }}"
     )
     click.echo("")
@@ -5680,22 +5687,30 @@ def eject(
         click.echo(_hdr(f"Eject plan ({len(plans)} entr{'y' if len(plans) == 1 else 'ies'}):"))
         for plan in plans:
             if plan.error:
-                click.echo(f"  {plan.name}: {_bad('cannot eject')} — {plan.error}")
+                # Escaped here rather than where the message is built: every
+                # branch that sets ``error`` folds in a config value — a
+                # name, an origin path, a ``kind`` and ``pruned_at`` read
+                # back from the prune backup log (#755).
+                click.echo(f"  {_disp(plan.name)}: {_bad('cannot eject')} — {_disp(plan.error)}")
                 continue
             spec = _SOURCE_BY_KIND[plan.kind]
-            where = f"{spec.label}" + (f" [{plan.path}]" if plan.path else "")
+            where = f"{spec.label}" + (f" [{_disp(plan.path)}]" if plan.path else "")
             action = (
                 "already present — skip write"
                 if plan.skip_write
                 else ("overwrite" if plan.overwrite else "restore")
             )
             body = "verbatim original" if plan.verbatim else "reconstructed entry"
-            click.echo(f"  {plan.name}: {action} → {where}  ({body})")
+            click.echo(f"  {_disp(plan.name)}: {action} → {where}  ({body})")
             for w in plan.warnings or []:
-                click.echo(f"    {_warn('warning:')} {w}")
+                click.echo(f"    {_warn('warning:')} {_disp(w)}")
             if plan.pruned_duplicates:
+                # Source labels are constants, except that a row recorded
+                # under an unrecognized kind falls back to printing that
+                # kind — a config value — verbatim.
                 click.echo(
-                    f"    {_warn('note:')} also pruned from {', '.join(plan.pruned_duplicates)} — "
+                    f"    {_warn('note:')} also pruned from "
+                    f"{_disp(', '.join(plan.pruned_duplicates))} — "
                     "not restored here; originals remain in "
                     f"{_pruned_backup_path()} (restore manually if needed)"
                 )
@@ -5751,7 +5766,7 @@ def eject(
         assert plan.payload is not None
         if plan.needs_secret_confirm:
             ok = click.confirm(
-                f"  '{plan.name}': pass the secret value(s) above on `claude` argv "
+                f"  '{_disp(plan.name)}': pass the secret value(s) above on `claude` argv "
                 "(visible in the process list while it runs)?",
                 default=False,
             )
@@ -5788,8 +5803,8 @@ def eject(
                 )
                 continue
             click.echo(
-                f"  {_warn('Warning:')} '{plan.name}' {state} deviates from the "
-                f"original (schema loss accepted): {detail}",
+                f"  {_warn('Warning:')} '{_disp(plan.name)}' {state} deviates from the "
+                f"original (schema loss accepted): {_disp(detail)}",
                 err=True,
             )
 
@@ -5809,7 +5824,7 @@ def eject(
             click.echo(f"{_ok('Restored to host and removed from STM:')}")
         for plan in restored:
             spec = _SOURCE_BY_KIND[plan.kind]
-            click.echo(f"  {plan.name} — {spec.label}")
+            click.echo(f"  {_disp(plan.name)} — {spec.label}")
         if keep:
             click.echo(
                 f"{_warn('Note:')} entries are now dual-registered (direct + via STM). "
@@ -5821,7 +5836,10 @@ def eject(
             click.echo("")
         click.echo(f"{_warn('Warning:')} could not eject {len(failed)} entr(ies):", err=True)
         for plan, err in failed:
-            click.echo(f"  {plan.name}: {err}", err=True)
+            # Distinct from the ``plan.error`` line above: these come from
+            # the host write — the claude CLI's stderr, or an OS error
+            # naming the target file.
+            click.echo(f"  {_disp(plan.name)}: {_disp(err)}", err=True)
         click.echo("", err=True)
         click.echo("Restore manually (entry remains in STM):", err=True)
         click.echo(

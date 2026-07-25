@@ -4738,6 +4738,30 @@ class TestRegisterCommand:
         assert "claude mcp add memtomem-stm" in result.output
         assert "mms register" in result.output
 
+    @pytest.mark.parametrize(
+        "server_cmd",
+        [r"C:\Users\me\py.exe", 'we"ird', "sp ace/mms", "서버/mms"],
+    )
+    def test_skip_hint_json_snippet_is_pastable(self, runner, config, monkeypatch, server_cmd):
+        """The snippet is not prose — the user pastes it into a client's
+        config file. Hand-writing the quotes around ``command`` (the one
+        value that did not go through ``json.dumps``) produced a document
+        that would not parse back for any Windows path, since its
+        separators escape and a ``"`` closes the string early (#755)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod, "_registration_command", lambda _p: (server_cmd, ["run"], {"K": "v"})
+        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["register", "--mcp", "skip", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        snippet = next(ln for ln in result.output.splitlines() if '"mcpServers"' in ln)
+        parsed = json.loads(snippet)
+        entry = parsed["mcpServers"]["memtomem-stm"]
+        assert entry == {"command": server_cmd, "args": ["run"], "env": {"K": "v"}}
+
     def test_register_is_idempotent_when_already_registered(self, runner, config, fake_claude):
         """Re-running register when STM is already in Claude Code and the
         user picks 'keep' → no destructive side effects.
@@ -7845,6 +7869,52 @@ class TestEjectCommand:
         assert result.exit_code == 0, result.output
         assert "Dry run" in result.output
         assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_unejectable_plan_escapes_name_and_reason_but_not_json(self, runner, config):
+        """The refusal line folds in both the STM key and whatever the
+        resolver put in the reason — here a recorded origin path (#755).
+        Only the printed copy is escaped: the same values reach ``--json``
+        as ``name`` and ``error``, where a caller compares them against
+        the config it just read."""
+        self._seed_config(
+            config,
+            {"ev\ril": _eject_entry(kind="claude-project", path="/no/such\rdir")},
+        )
+
+        result = runner.invoke(cli, ["eject", "ev\ril", "--dry-run", *_cfg_args(config)])
+        assert "ev\\u000Dil: " in result.output
+        assert "/no/such\\u000Ddir" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["eject", "ev\ril", "--dry-run", "--json", *_cfg_args(config)])
+        data = json.loads(result.stdout)
+        row = data["plan"][0]
+        assert row["name"] == "ev\ril"
+        assert "/no/such\rdir" in row["error"]
+
+    def test_failed_host_write_escapes_the_writers_message(
+        self, runner, config, monkeypatch, fake_claude_host
+    ):
+        """The failure list quotes what the host writer reported — the
+        claude CLI's stderr or an OS error naming the target file, neither
+        of which passed through any validation of ours (#755). It prints
+        while the STM entry is deliberately still in place, so the user is
+        reading it to decide what to retry."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {"demo": _eject_entry()})
+        monkeypatch.setattr(
+            proxy_mod,
+            "_eject_host_write",
+            lambda _plan: (False, "boom\rRestored to host and removed from STM:"),
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "boom\\u000DRestored to host and removed from STM:" in result.output
+        assert "\r" not in result.output
+        # The entry stays — a failed host write must never orphan it.
         assert "demo" in self._stm_servers(config)
 
     def test_non_tty_without_yes_exits_1(self, runner, config, fake_claude_host):
