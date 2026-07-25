@@ -13,7 +13,12 @@ import json
 
 import pytest
 
-from memtomem_stm.utils.json_out import dumps, has_lone_surrogate
+from memtomem_stm.utils.json_out import (
+    dumps,
+    escape_lone_surrogates,
+    has_lone_surrogate,
+    scrub_lone_surrogates,
+)
 
 # One from each end of the high and low surrogate blocks, so a range that is
 # off by one at either boundary fails.
@@ -146,3 +151,114 @@ class TestHasLoneSurrogate:
             pair.encode("utf-8")
 
         assert has_lone_surrogate(pair) is True
+
+
+class TestSeparatorsContract:
+    """Compact separators are inside the documented contract (#761).
+
+    ``encode_line``, the two fingerprints and the cache envelope all pass
+    ``(",", ":")``; the contract's ASCII qualifier is what makes the blanket
+    substitution safe for them, so pin it rather than leaving it to prose.
+    """
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_compact_separators_still_produce_parsable_json(self, surrogate):
+        payload = {"b": f"sr{surrogate}v", "a": [1, {"k": surrogate}]}
+        out = dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+        assert " " not in out  # the separators actually took effect
+        out.encode("utf-8")  # the encode that used to raise
+        assert json.loads(out) == payload
+
+    def test_identity_on_clean_input_with_compact_separators(self):
+        payload = {"name": "🚀 서버 漢字", "l": ["a", "b"]}
+        assert dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ) == json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+class TestEscapeLoneSurrogates:
+    """The ingest-side escape: the surrogate is replaced in the value itself."""
+
+    @pytest.mark.parametrize("value", ["", "fs", "서버 🚀", "a\\ud800b", "sr\tv"])
+    def test_identity_on_clean_input(self, value):
+        """Same *object* back, not merely an equal one — the no-copy fast path
+        is what lets this sit in ``_sanitize_nonfinite``'s per-node walk."""
+        assert escape_lone_surrogates(value) is value
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_each_boundary_surrogate_becomes_its_literal(self, surrogate):
+        out = escape_lone_surrogates(f"sr{surrogate}v")
+
+        assert out == f"sr\\u{ord(surrogate):04x}v"
+        out.encode("utf-8")  # the encode every downstream consumer performs
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_the_escape_is_inert_under_a_dumps_loads_round_trip(self, surrogate):
+        """The property ``dumps``-alone does NOT have, and the reason the
+        daemon's read side scrubs as well as its write side: ``dumps`` emits an
+        escape that ``loads`` decodes *back* into a raw surrogate, so escaping
+        only at the emitter relocates the failure into the receiving process.
+        Escaping the value itself survives the trip as inert text.
+        """
+        escaped = escape_lone_surrogates(f"sr{surrogate}v")
+        decoded = json.loads(json.dumps({"t": escaped}, ensure_ascii=False))["t"]
+
+        assert decoded == escaped
+        assert not has_lone_surrogate(decoded)
+
+        # Contrast: the emitter-only route hands back the raw code unit.
+        via_dumps = json.loads(dumps({"t": f"sr{surrogate}v"}, ensure_ascii=False))["t"]
+        assert has_lone_surrogate(via_dumps)
+
+    def test_an_adjacent_pair_is_escaped_as_two_code_units(self):
+        """``.encode()`` raises on a pair just as it does on a lone surrogate,
+        so the pair must be escaped rather than carved out — the same call
+        ``has_lone_surrogate`` makes for the config gate."""
+        out = escape_lone_surrogates("ok" + chr(0xD83D) + chr(0xDE80))
+
+        assert out == "ok\\ud83d\\ude80"
+        out.encode("utf-8")
+
+
+class TestScrubLoneSurrogates:
+    def test_identity_on_a_clean_tree(self):
+        tree = {"a": ["x", {"b": "서버 🚀"}], "n": 1, "f": 1.5, "z": None, "t": True}
+        assert scrub_lone_surrogates(tree) is tree
+
+    def test_nested_values_are_escaped(self):
+        tree = {"a": ["x", {"b": "sr\ud800v"}], "n": 1}
+        out = scrub_lone_surrogates(tree)
+
+        assert out == {"a": ["x", {"b": "sr\\ud800v"}], "n": 1}
+        json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+    def test_a_clean_branch_keeps_its_identity(self):
+        """Copy-on-write is per node: only the containers on the path to a
+        surrogate are rebuilt, so scrubbing a large upstream payload with one
+        bad leaf does not copy the whole tree."""
+        clean_branch = {"deep": ["untouched"]}
+        tree = {"clean": clean_branch, "dirty": "sr\ud800v"}
+        out = scrub_lone_surrogates(tree)
+
+        assert out is not tree
+        assert out["clean"] is clean_branch
+
+    def test_dict_keys_are_scrubbed_too(self):
+        """A key encodes exactly like a value does, so leaving keys raw would
+        leave the very next ``json.dumps(...).encode()`` raising."""
+        out = scrub_lone_surrogates({"k\ud800": 1, "fine": 2})
+
+        assert out == {"k\\ud800": 1, "fine": 2}
+        json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+    def test_clean_keys_keep_their_order(self):
+        out = scrub_lone_surrogates({"z": "sr\ud800v", "a": 1, "m": 2})
+        assert list(out) == ["z", "a", "m"]
+
+    def test_non_string_leaves_are_untouched(self):
+        tree = {"n": 1, "f": 1.5, "b": True, "z": None, "s": "sr\ud800v"}
+        out = scrub_lone_surrogates(tree)
+
+        assert out["n"] == 1 and out["f"] == 1.5
+        assert out["b"] is True and out["z"] is None

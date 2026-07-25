@@ -55,6 +55,9 @@ import json
 import secrets
 from typing import Any
 
+from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import scrub_lone_surrogates
+
 PROTOCOL_VERSION = 7
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
@@ -86,8 +89,15 @@ class ProtocolError(Exception):
 
 
 def encode_line(obj: dict[str, Any]) -> bytes:
-    """Serialize ``obj`` to a single newline-terminated UTF-8 frame."""
-    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    """Serialize ``obj`` to a single newline-terminated UTF-8 frame.
+
+    ``json_out.dumps`` rather than ``json.dumps``: the ``.encode("utf-8")``
+    below is exactly the encode a lone surrogate raises on, and a frame that
+    cannot be encoded fails the whole connection rather than the request —
+    on the daemon side the client just sees the socket close with no response
+    (#761). Compact separators are inside that writer's documented contract.
+    """
+    return (_json_dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
@@ -95,6 +105,14 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
 
     Relies on the stream having been opened with ``limit=MAX_MESSAGE_BYTES`` so
     an over-long line surfaces as a read error rather than unbounded buffering.
+
+    Both ends of the link are made surrogate-safe, not just the write end.
+    ``encode_line``'s escape is the *JSON* one, which ``json.loads`` faithfully
+    decodes back into the code unit — so escaping only on the way out would
+    relocate the failure into the receiving process, at whichever encode it
+    reaches next (its reply frame, the hook's output, an outbound LTM call).
+    Scrubbing here turns it into inert literal text once, which also covers a
+    peer that never escaped it (#761).
     """
     try:
         line = await reader.readline()
@@ -108,7 +126,8 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
         raise ProtocolError("malformed JSON frame") from exc
     if not isinstance(obj, dict):
         raise ProtocolError("frame is not a JSON object")
-    return obj
+    scrubbed: dict[str, Any] = scrub_lone_surrogates(obj)
+    return scrubbed
 
 
 def build_request(
