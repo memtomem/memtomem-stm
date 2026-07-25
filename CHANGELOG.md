@@ -264,6 +264,15 @@ changes inline only. See the deprecation policy in
   *inside* that text, where the six characters `\ud800` are a legal escape
   that survives text-level escaping and then decodes into a fresh code unit
   when that nested document is parsed. Clean replies are unchanged. (#761)
+- `mms import` skips a host entry it cannot store instead of aborting the whole
+  import. A host config is plain `json.loads` with no character validation, so
+  a legal `"\ud800"` escape reaches the registry writer as a code unit that the
+  drift hash cannot encode and TOML cannot represent. That raise was uncaught
+  and left **nothing** imported, so one malformed entry cost every clean entry
+  beside it. Such an entry is now reported and skipped per entry, naming the
+  offending field and never its value (env values are routinely secrets and
+  this text reaches CI logs) — the same refusal `mms add` and the discovery
+  scan have made since #757/#758, now applied to the third create path. (#761)
 
 ## [0.1.42] — 2026-07-25
 

@@ -72,9 +72,11 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
     "mms/drift.py": (
         1,
         "Canonical form of a registry server, hashed by its only caller with "
-        "an explicit ``.encode('utf-8')`` — the encode this class of bug "
-        "lands on. Registry entries come from the same host configs the "
-        "CLI reads, so this is a reachable path and is unaudited — see #761.",
+        "an explicit ``.encode('utf-8')``. Unreachable with an unencodable "
+        "value as of #761: every path that puts an entry into the registry "
+        "gates it first — ``mms add`` and the discovery scan since #758, "
+        "``mms import`` since #761 — and TOML cannot represent one either, so "
+        "a stored entry cannot carry what this would fail to hash.",
     ),
     "server.py": (
         1,

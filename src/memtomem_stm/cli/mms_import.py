@@ -71,8 +71,37 @@ from memtomem_stm.mms.import_hosts import (
 )
 from memtomem_stm.mms.secrets import redact_for_plan
 from memtomem_stm.mms.state import RegistryServer
+from memtomem_stm.utils.json_out import unencodable_field
 
 _VALID_FROM_VALUES = (*ALL_HOSTS, "all")
+
+
+def _partition_encodable(
+    candidates: list[ImportCandidate],
+) -> tuple[list[ImportCandidate], list[tuple[ImportCandidate, str]]]:
+    """Split candidates into storable ones and (candidate, offending field).
+
+    Gates exactly what gets stored and hashed: the name (a registry key, a
+    proxy cache-key component) and the three fields ``drift.canonical_form``
+    puts into the digest. ``unencodable_field`` returns a *path* such as
+    ``env['TOK']`` and never the value (#758).
+    """
+    ok: list[ImportCandidate] = []
+    refused: list[tuple[ImportCandidate, str]] = []
+    for cand in candidates:
+        bad = unencodable_field(
+            {
+                "name": cand.name,
+                "command": cand.server.command,
+                "args": list(cand.server.args or []),
+                "env": dict(cand.server.env or {}),
+            }
+        )
+        if bad is None:
+            ok.append(cand)
+        else:
+            refused.append((cand, bad))
+    return ok, refused
 
 
 def _format_env_summary(
@@ -190,6 +219,33 @@ def import_command(
     """Import MCP definitions from host configs into the mms registry."""
     cwd = Path.cwd().resolve()
     candidates = discover(from_host, cwd)
+
+    # Drop entries that cannot survive being stored, BEFORE anything hashes or
+    # renders them. A host config is plain `json.loads` with no character
+    # validation, so `"\ud800"` — a legal JSON escape — reaches us as a code
+    # unit that `compute_drift_hash` cannot encode, TOML cannot represent, and
+    # the proxy cache cannot use as a key component. Such an entry is unusable
+    # end to end, which is why `mms add` and the discovery scan already refuse
+    # to create one (#757/#758); this is the third create path.
+    #
+    # Per entry, not per run: before this, the drift hash raised and aborted the
+    # whole `--apply` with nothing imported, so one host's malformed entry cost
+    # the user every clean entry beside it (#761).
+    candidates, refused = _partition_encodable(candidates)
+    for cand, bad_field in refused:
+        # Name the field, never the value: env values are routinely secrets and
+        # this text reaches CI logs — the rule `mms add` and the scan follow.
+        #
+        # `!r` rather than `_disp`: that helper lives in the #760 stack, and
+        # `repr` already escapes the whole class here — a surrogate renders as
+        # `\ud800` and a control character as its escape — which is also why
+        # `unencodable_field` builds its own path with `!r`. `source_label` is
+        # a host-spec literal this package writes.
+        click.echo(
+            f"Note: skipping {cand.name!r} from {cand.source_label} — "
+            f"{bad_field} is not valid UTF-8 (value withheld).",
+            err=True,
+        )
 
     if not candidates:
         click.echo(
