@@ -10031,6 +10031,48 @@ asyncio.run(main())
         assert data["servers"]["docs"]["connected"] is True
         assert data["servers"]["docs"]["tools"] == 2
 
+    def test_upstream_advertised_values_render_display_escaped(self, runner, config, monkeypatch):
+        """The overflow list and the probe error carry values chosen by the
+        *upstream server*, not by whoever wrote this config (#755): tool
+        names come straight off ``tools/list``, and the error is the
+        connect failure's text. A CR in either would overwrite the line the
+        terminal just drew, so both render escaped — while ``--json``, whose
+        consumer decodes rather than displays, keeps them raw."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "docs": {"prefix": "d", "transport": "stdio", "command": "x"},
+                        "down": {"prefix": "n", "transport": "stdio", "command": "y"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "docs": _probe_ok(tools=1, overflowing=("evil\rtool",)),
+                "down": StagedProbeResult(
+                    stage=ProbeStage.CONFIGURED, error="connect failed\rFAKE ok"
+                ),
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", "--names", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "evil\\u000Dtool" in result.output
+        assert "connect failed\\u000DFAKE ok" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["health", "--names", "--json", *_cfg_args(config)])
+        data = json.loads(result.output)
+        assert data["servers"]["docs"]["overflowing"] == ["evil\rtool"]
+        assert data["servers"]["down"]["error"] == "connect failed\rFAKE ok"
+
 
 # ── doctor command ──────────────────────────────────────────────────────
 
@@ -10523,8 +10565,8 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "stdio child process did not start" in result.output
         # Assert on the ``next:`` line only — the FAIL ``detail`` may echo the
-        # probe's OS error (which can contain the raw command); that is error
-        # reporting, not a copy/paste hint.
+        # probe's OS error, which can name the command (display-escaped since
+        # #755); that is error reporting, not a copy/paste hint.
         next_lines = [ln for ln in result.output.splitlines() if "next:" in ln]
         assert next_lines
         assert any(_HINT_UNRENDERABLE in ln for ln in next_lines)
@@ -10577,6 +10619,48 @@ class TestDoctor:
         ]
         assert data["servers"]["fake"]["stage"] == "tools_discovered"
         assert data["surfacing"]["ltm_server"]["connected"] is False
+
+    def test_check_label_and_detail_escaped_in_text_but_raw_in_json(
+        self, runner, config, monkeypatch
+    ):
+        """A doctor check dict is rendered twice from one source: as a
+        terminal row and as a ``--json`` entry. Only the row is escaped
+        (#755) — escaping inside ``check()`` would change the document a
+        consumer decodes, and the label carries the server name while the
+        detail carries the probe error."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "ev\ril": {"prefix": "ev", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(stage=ProbeStage.CONFIGURED, error="boom\rFAKE PASS")
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "upstream: ev\\u000Dil" in result.output
+        assert "boom\\u000DFAKE PASS" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        data = json.loads(result.output)
+        upstream = next(c for c in data["checks"] if c["id"].startswith("upstream:"))
+        assert upstream["label"] == "upstream: ev\ril"
+        assert "boom\rFAKE PASS" in upstream["detail"]
 
     def test_json_short_circuit_omits_unexecuted_checks(self, runner, config):
         config.write_text("{oops", encoding="utf-8")

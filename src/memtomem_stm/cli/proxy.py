@@ -1832,7 +1832,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     # output; status now answers "is the proxy set up and pointed at the
     # right config", list answers "what servers are behind it").
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
@@ -4722,7 +4722,7 @@ def tune(
     if config_error:
         click.echo(
             f"{_err('Error:')} applying would produce an invalid config "
-            f"({config_error}); nothing written.",
+            f"({_disp(config_error)}); nothing written.",
             err=True,
         )
         sys.exit(1)
@@ -6641,7 +6641,7 @@ def health(
             )
         else:
             if config_error:
-                click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
+                click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
             click.echo("No upstream servers configured.")
             click.echo("")
             for line in _format_surfacing_bootstrap(surfacing_status):
@@ -6675,12 +6675,12 @@ def health(
         return
 
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
     click.echo(_hdr("Upstream Server Health"))
     click.echo("=" * 30)
     for name, info in results.items():
         if info.connected:
-            click.echo(f"  {name}: {_ok('connected')} ({info.tools} tools)")
+            click.echo(f"  {_disp(name)}: {_ok('connected')} ({info.tools} tools)")
             if show_names:
                 if info.overflowing:
                     click.echo(
@@ -6689,12 +6689,16 @@ def health(
                         f"client limit and will be silently dropped:"
                     )
                     for t_name in info.overflowing:
-                        click.echo(f"      - {t_name}")
+                        # Advertised by the upstream over ``tools/list``, so
+                        # unlike the config-derived names elsewhere in this
+                        # block nobody on this machine ever typed or reviewed
+                        # them (#755).
+                        click.echo(f"      - {_disp(t_name)}")
                 else:
                     click.echo("    all tool names fit")
         else:
             click.echo(
-                f"  {name}: {_bad('DISCONNECTED')} — {info.error} "
+                f"  {_disp(name)}: {_bad('DISCONNECTED')} — {_disp(info.error or '')} "
                 f"(last successful stage: {info.stage.display()})"
             )
     click.echo("")
@@ -7369,7 +7373,12 @@ def doctor(
         click.echo("=" * 30)
         for c in checks:
             styled = _DOCTOR_STYLES[c["status"]](c["status"])
-            click.echo(f"  {styled}  {c['label']:<18} {c['detail']}")
+            # Escape at render, not in ``check()``: the same dicts are the
+            # ``--json`` payload above, where a consumer decodes the value
+            # rather than reading it off a terminal (#755). ``next_action``
+            # is exempt — every one is a literal template or goes through
+            # ``_shell_join``, which refuses these characters outright.
+            click.echo(f"  {styled}  {_disp(c['label']):<18} {_disp(c['detail'])}")
             if c["next_action"]:
                 click.echo(f"        next: {c['next_action']}")
         click.echo(f"Summary: {counts['FAIL']} FAIL, {counts['WARN']} WARN, {counts['PASS']} PASS")
