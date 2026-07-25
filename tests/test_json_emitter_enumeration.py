@@ -34,9 +34,13 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "memtomem_stm"
 ALLOWLIST: dict[str, tuple[int, str]] = {
     "proxy/compression.py": (
         26,
-        "Model-facing text, not a document: these serialize an upstream "
-        "response to measure or reshape it, and the result goes back to the "
-        "MCP client through the SDK, which owns the wire encoding.",
+        "Reshapes an upstream response for the model. NOT safe and NOT fixed "
+        "here — deferred to #761. 'The SDK owns the encoding' was wrong: "
+        "``TextContent(...).model_dump_json()`` raises "
+        "``PydanticSerializationError`` on a raw surrogate, and "
+        "``_mm_json_loads`` decodes one out of a legal ``\\ud800`` escape in "
+        "upstream content. Routing these also changes the lengths the "
+        "compression budgets count, which is why it is not a one-line fix.",
     ),
     "proxy/selection_eval.py": (
         1,
@@ -81,7 +85,9 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
     "daemon/discovery.py": (1, "Daemon fingerprint, encoded by us — see #761."),
     "server.py": (
         1,
-        "MCP tool response text; the SDK owns the wire encoding.",
+        "MCP tool response text, serializing values parsed out of Core's "
+        "nested candidate JSON. Same false 'the SDK owns it' reasoning as "
+        "``compression.py`` and the same real exposure — deferred to #761.",
     ),
     "cli/hook_cmd.py": (
         1,
@@ -121,6 +127,33 @@ def _stdlib_dumps_names(tree: ast.Module) -> tuple[set[str], set[str]]:
     return modules, directs
 
 
+def _dumps_lines_in(tree: ast.Module) -> list[int]:
+    """Sorted line numbers of stdlib ``dumps`` calls passing
+    ``ensure_ascii=False``, under any binding the module established."""
+    modules, directs = _stdlib_dumps_names(tree)
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        is_stdlib = (
+            isinstance(fn, ast.Attribute)
+            and fn.attr == "dumps"
+            and isinstance(fn.value, ast.Name)
+            and fn.value.id in modules
+        ) or (isinstance(fn, ast.Name) and fn.id in directs)
+        if not is_stdlib:
+            continue
+        if any(
+            kw.arg == "ensure_ascii"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value is False
+            for kw in node.keywords
+        ):
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
 def _raw_dumps_sites() -> dict[str, list[int]]:
     """``{relative path: [line, ...]}`` for stdlib ``json.dumps`` calls that
     pass ``ensure_ascii=False``.
@@ -131,52 +164,37 @@ def _raw_dumps_sites() -> dict[str, list[int]]:
     """
     found: dict[str, list[int]] = {}
     for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        modules, directs = _stdlib_dumps_names(tree)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            is_stdlib = (
-                isinstance(fn, ast.Attribute)
-                and fn.attr == "dumps"
-                and isinstance(fn.value, ast.Name)
-                and fn.value.id in modules
-            ) or (isinstance(fn, ast.Name) and fn.id in directs)
-            if not is_stdlib:
-                continue
-            if any(
-                kw.arg == "ensure_ascii"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value is False
-                for kw in node.keywords
-            ):
-                rel = str(path.relative_to(SRC))
-                found.setdefault(rel, []).append(node.lineno)
+        lines = _dumps_lines_in(ast.parse(path.read_text(encoding="utf-8")))
+        if lines:
+            # ``as_posix``, not ``str``: on Windows the latter renders
+            # ``proxy\cache.py`` and matches nothing in the allowlist, so
+            # every site would read as unclassified there.
+            found[path.relative_to(SRC).as_posix()] = lines
     return found
 
 
-def test_the_matcher_resolves_aliases_and_ignores_the_routed_writer(tmp_path) -> None:
+def test_the_matcher_resolves_aliases_and_ignores_the_routed_writer() -> None:
     """The guard is only as good as what it can see.
 
-    Pins the three spellings that matter: the alias this repository already
-    uses (`import json as _json`), a direct `from json import dumps`, and the
-    routed `json_out.dumps`, which must never be counted — miscounting it
-    would make every routed site look like a violation.
+    Asserts the *detected lines*, not the import bindings: checking the
+    bindings alone would still pass with the call-matching half deleted, and
+    there is no production ``from json import dumps`` site to catch that.
+
+    Pins the three spellings that matter — the alias this repository already
+    uses, a direct ``from json import dumps``, and the routed
+    ``json_out.dumps``, which must never be counted (miscounting it would
+    make every routed site read as a violation).
     """
     src = (
-        "import json as _json\n"
-        "from json import dumps as _d\n"
-        "from memtomem_stm.utils import json_out\n"
-        "a = _json.dumps({}, ensure_ascii=False)\n"
-        "b = _d({}, ensure_ascii=False)\n"
-        "c = json_out.dumps({}, ensure_ascii=False)\n"
+        "import json as _json\n"  # 1
+        "from json import dumps as _d\n"  # 2
+        "from memtomem_stm.utils import json_out\n"  # 3
+        "a = _json.dumps({}, ensure_ascii=False)\n"  # 4  <- counted
+        "b = _d({}, ensure_ascii=False)\n"  # 5  <- counted
+        "c = json_out.dumps({}, ensure_ascii=False)\n"  # 6  <- routed, ignored
+        "d = _json.dumps({})\n"  # 7  <- default ensure_ascii, ignored
     )
-    tree = ast.parse(src)
-    modules, directs = _stdlib_dumps_names(tree)
-    assert modules == {"_json"}
-    assert directs == {"_d"}
-    assert "json_out" not in modules
+    assert _dumps_lines_in(ast.parse(src)) == [4, 5]
 
 
 def test_every_unrouted_emitter_is_accounted_for() -> None:

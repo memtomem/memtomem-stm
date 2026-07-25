@@ -77,6 +77,37 @@ def dumps(payload: Any, **kwargs: Any) -> str:
     return _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", json.dumps(payload, **kwargs))
 
 
+def unencodable_field(entry: object, path: str = "") -> str | None:
+    """Path of the first string in *entry* that cannot encode, or ``None``.
+
+    The server *name* is not the only field that has to survive being used:
+    a ``command`` is spawned, a ``url`` is dialled, ``env`` values are handed
+    to a child process — all of which encode. Making the config writable
+    (#757) is what let those reach disk at all, so the create paths gate the
+    whole entry rather than the name alone.
+
+    Returns a *path* (``env['TOKEN']``, ``args[1]``) and never the offending
+    value: env and header values are routinely secrets, and this string goes
+    into stderr and into ``--json`` payloads that get piped to CI logs.
+    """
+    if isinstance(entry, str):
+        return path or "value" if has_lone_surrogate(entry) else None
+    if isinstance(entry, dict):
+        for key, value in entry.items():
+            if isinstance(key, str) and has_lone_surrogate(key):
+                return f"{path}[key]" if path else "key"
+            found = unencodable_field(value, f"{path}[{key!r}]" if path else str(key))
+            if found:
+                return found
+        return None
+    if isinstance(entry, (list, tuple)):
+        for idx, value in enumerate(entry):
+            found = unencodable_field(value, f"{path}[{idx}]")
+            if found:
+                return found
+    return None
+
+
 def has_lone_surrogate(value: str) -> bool:
     """True when ``value`` holds a code unit that cannot be encoded to UTF-8.
 

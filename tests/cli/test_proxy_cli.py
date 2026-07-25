@@ -8761,6 +8761,41 @@ class TestJsonLoneSurrogate:
             config.read_text(encoding="utf-8")
         ).get("upstream_servers", {})
 
+    @pytest.mark.parametrize(
+        ("argv", "field"),
+        [
+            (["--command", f"echo{ARGV_SURROGATE_NAME}"], "command"),
+            (["--command", "echo", "--args", f'["{ARGV_SURROGATE_NAME}"]'], "args[0]"),
+            (["--transport", "sse", "--url", f"https://x/{ARGV_SURROGATE_NAME}"], "url"),
+            (["--command", "echo", "--env", f"TOKEN={ARGV_SURROGATE_NAME}"], "env['TOKEN']"),
+        ],
+    )
+    def test_add_refuses_an_operational_field_that_is_not_valid_utf8(
+        self, runner, config, argv, field
+    ):
+        """The name gate alone let the rest of the entry through.
+
+        A `command` is spawned, a `url` dialled, `env` values handed to a
+        child process — each encodes, so an entry carrying such a value saves
+        and then cannot run. Before this branch the writer refused it, which
+        means making `_save` succeed is what created the path; `mms add` exited
+        0 and persisted a command ending in U+DCFF.
+
+        The diagnostic names the exact position — `args[0]`, `env['TOKEN']` —
+        and withholds the value: env and header values are routinely secrets
+        and this text reaches CI logs. The env case pins both halves at once,
+        since naming the key while hiding the value is the whole contract.
+        """
+        result = runner.invoke(cli, ["add", "srv", "--prefix", "sx", *argv] + _cfg_args(config))
+
+        assert result.exit_code == 1
+        assert f"{field} is not valid UTF-8" in result.output
+        assert "value withheld" in result.output
+        assert ARGV_SURROGATE_NAME not in result.output
+        assert not config.exists() or "srv" not in json.loads(
+            config.read_text(encoding="utf-8")
+        ).get("upstream_servers", {})
+
     def test_remove_still_works_on_a_name_add_would_refuse(self, runner, config):
         """The refusal must not strand an already-broken config.
 

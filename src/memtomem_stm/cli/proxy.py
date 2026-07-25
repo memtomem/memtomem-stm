@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
 from memtomem_stm.utils.json_out import dumps as _json_dumps
-from memtomem_stm.utils.json_out import has_lone_surrogate
+from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
@@ -2536,6 +2536,21 @@ def add(
             headers_dict[k] = v
         entry["headers"] = headers_dict
 
+    # The name gate above is not enough: a `command` gets spawned, a `url`
+    # dialled, `env` values handed to a child process, and each of those
+    # encodes. Before #757 the write itself refused such an entry, so making
+    # `_save` succeed is what let one reach disk — an entry that saves but
+    # can never run. Gate the assembled entry at the one point that writes
+    # it. The diagnostic names the field and never its value: env and header
+    # values are routinely secrets and this text reaches CI logs.
+    bad_field = unencodable_field(entry)
+    if bad_field is not None:
+        msg = f"{bad_field} is not valid UTF-8 (value withheld)"
+        click.echo(f"{_err('Error:')} {msg}", err=True)
+        if as_json:
+            _json_fail("add", "invalid_entry", msg, name=name)
+        sys.exit(1)
+
     tools_reachable: int | None = None
     if validate:
         if not as_json:
@@ -2774,6 +2789,17 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 continue
             entry = _normalize_client_entry(raw)
             if entry is None or _is_self_reference(entry):
+                continue
+            bad_field = unencodable_field(entry)
+            if bad_field is not None:
+                # Same reasoning as the name above, for the fields that get
+                # spawned or dialled rather than keyed on. Named, never
+                # echoed: a host entry's env values are its secrets.
+                click.echo(
+                    f"{_warn('Note:')} skipping {name!r} from {spec.label} — "
+                    f"{bad_field} is not valid UTF-8 (value withheld).",
+                    err=True,
+                )
                 continue
             source_ref: dict[str, Any] = {"kind": spec.kind}
             if src_path is not None:
