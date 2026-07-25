@@ -89,7 +89,7 @@ def _resolve_project_for_mutation(project_name: str | None) -> Project:
         p = detect_project(Path.cwd())
         if p.source is not Source.MARKER:
             raise click.ClickException(
-                f"No project marker at {p.root} (detected via {p.source.value}). "
+                f"No project marker at {_disp(str(p.root))} (detected via {p.source.value}). "
                 "Run `mms project init` here first."
             )
         return p
@@ -99,19 +99,21 @@ def _resolve_project_for_mutation(project_name: str | None) -> Project:
     matches = [entry for entry in idx.projects if entry.name == project_name]
     if not matches:
         raise click.ClickException(
-            f"Project '{project_name}' not found in {state.projects_index_path()}. "
+            f"Project '{_disp(project_name)}' not found in "
+            f"{_disp(str(state.projects_index_path()))}. "
             "Run `mms project list` to see known projects."
         )
     if len(matches) > 1:
         raise click.ClickException(
-            f"Project name '{project_name}' is ambiguous ({len(matches)} matches). "
+            f"Project name '{_disp(project_name)}' is ambiguous ({len(matches)} matches). "
             "Use `mms project show NAME` from inside the target project root instead."
         )
     entry = matches[0]
     marker = Path(entry.path) / state.PROJECT_MARKER_RELPATH
     if not marker.is_file():
         raise click.ClickException(
-            f"Project '{project_name}' indexed at {entry.path} but marker file is missing. "
+            f"Project '{_disp(project_name)}' indexed at {_disp(str(entry.path))} "
+            "but marker file is missing. "
             "The directory may have been moved or the marker deleted; "
             "run `mms project list --prune` to clean up."
         )
@@ -194,12 +196,12 @@ def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
     """Create ``<path>/.mms/project.toml`` (default path = cwd) and add to index."""
     target_root = (path or Path.cwd()).expanduser().resolve()
     if not target_root.is_dir():
-        raise click.ClickException(f"Not a directory: {target_root}")
+        raise click.ClickException(f"Not a directory: {_disp(str(target_root))}")
 
     marker = target_root / state.PROJECT_MARKER_RELPATH
     if marker.is_file() and not force:
         raise click.ClickException(
-            f"{marker} already exists. Use --force to overwrite, or edit it directly."
+            f"{_disp(str(marker))} already exists. Use --force to overwrite, or edit it directly."
         )
 
     project_name = name_opt or target_root.name
@@ -209,8 +211,8 @@ def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
     )
     state.save_project_config(cfg, marker)
     _refresh_index(project_name, target_root)
-    click.echo(f"Created {marker}")
-    click.echo(f"Indexed in {state.projects_index_path()}")
+    click.echo(f"Created {_disp(str(marker))}")
+    click.echo(f"Indexed in {_disp(str(state.projects_index_path()))}")
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +230,14 @@ def show_cmd(name: str | None, json_output: bool) -> None:
         matches = [e for e in idx.projects if e.name == name]
         if not matches:
             raise click.ClickException(
-                f"Project '{name}' not found in {state.projects_index_path()}."
+                f"Project '{_disp(name)}' not found in {_disp(str(state.projects_index_path()))}."
             )
         # The index is keyed by canonical path, so two projects can share a
         # name — mirror _resolve_project_for_mutation's ambiguity error
         # instead of silently showing an arbitrary one of them.
         if len(matches) > 1:
             raise click.ClickException(
-                f"Project name '{name}' is ambiguous ({len(matches)} matches). "
+                f"Project name '{_disp(name)}' is ambiguous ({len(matches)} matches). "
                 "Run `mms project show` without NAME from inside the "
                 "target project root instead."
             )
@@ -243,7 +245,7 @@ def show_cmd(name: str | None, json_output: bool) -> None:
         marker = Path(entry.path) / state.PROJECT_MARKER_RELPATH
         if not marker.is_file():
             raise click.ClickException(
-                f"Project '{name}' indexed at {entry.path} but marker is missing."
+                f"Project '{_disp(name)}' indexed at {_disp(str(entry.path))} but marker is missing."
             )
         cfg = state.load_project_config(marker)
         proj = Project(
@@ -267,12 +269,12 @@ def _emit_show(proj: Project, json_output: bool, *, cwd: Path) -> None:
         return
 
     if proj.source is Source.MARKER:
-        click.echo(f"Project: {proj.name}")
-        click.echo(f"Root: {proj.root}")
+        click.echo(f"Project: {_disp(proj.name)}")
+        click.echo(f"Root: {_disp(str(proj.root))}")
         click.echo("Detected via: marker")
         enabled = proj.config.mcp.enabled if proj.config else []
         if enabled:
-            click.echo(f"Enabled MCPs: {', '.join(enabled)}")
+            click.echo(f"Enabled MCPs: {_disp(', '.join(enabled))}")
         else:
             click.echo("Enabled MCPs: (none)")
         return
@@ -340,7 +342,7 @@ def list_cmd(prune: bool, json_output: bool) -> None:
         return
 
     for entry in pruned:
-        click.echo(f"pruned: {entry.name} ({entry.path})")
+        click.echo(f"pruned: {_disp(entry.name)} ({_disp(str(entry.path))})")
     if pruned:
         click.echo(f"Pruned {len(pruned)} stale entr{'y' if len(pruned) == 1 else 'ies'}.")
     if not idx.projects:
@@ -348,7 +350,9 @@ def list_cmd(prune: bool, json_output: bool) -> None:
         return
     for entry in idx.projects:
         marker = "*" if _is_current(entry) else " "
-        click.echo(f"{marker} {entry.name}\t{entry.path}\t(last seen {entry.last_seen})")
+        click.echo(
+            f"{marker} {_disp(entry.name)}\t{_disp(str(entry.path))}\t(last seen {entry.last_seen})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +385,8 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     if unknown:
         known = ", ".join(sorted(registry.servers))
         raise click.ClickException(
-            f"Unknown MCP name(s): {', '.join(unknown)}. "
-            f"Registered: {known}. Run `mms list` to inspect the registry."
+            f"Unknown MCP name(s): {_disp(', '.join(unknown))}. "
+            f"Registered: {_disp(known)}. Run `mms list` to inspect the registry."
         )
 
     assert proj.config is not None  # _resolve_project_for_mutation guarantees MARKER
@@ -403,9 +407,9 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     _refresh_index(proj.name, proj.root)
 
     if added:
-        click.echo(f"Enabled in '{proj.name}': {', '.join(added)}")
+        click.echo(f"Enabled in '{_disp(proj.name)}': {_disp(', '.join(added))}")
     else:
-        click.echo(f"No changes to '{proj.name}' (all already enabled).")
+        click.echo(f"No changes to '{_disp(proj.name)}' (all already enabled).")
 
 
 @project_group.command("route")
@@ -522,7 +526,8 @@ def route_cmd(
         validation_error = _schema_validation_error(data)
         if validation_error is not None:
             raise click.ClickException(
-                f"routing would produce an invalid proxy config ({validation_error}); "
+                f"routing would produce an invalid proxy config "
+                f"({_disp(str(validation_error))}); "
                 "nothing written"
             )
         backup: Path | None = None
@@ -590,6 +595,8 @@ def disable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     _refresh_index(proj.name, proj.root)
 
     if removed:
-        click.echo(f"Disabled in '{proj.name}': {', '.join(removed)}")
+        click.echo(f"Disabled in '{_disp(proj.name)}': {_disp(', '.join(removed))}")
     else:
-        click.echo(f"No changes to '{proj.name}' (none of {list(mcps)} were enabled).")
+        click.echo(
+            f"No changes to '{_disp(proj.name)}' (none of {_disp(', '.join(mcps))} were enabled)."
+        )
