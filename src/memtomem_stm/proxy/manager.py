@@ -151,6 +151,7 @@ from memtomem_stm.proxy.metrics import (
 )
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
 from memtomem_stm.utils.redact import redact_exception_text
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
@@ -426,6 +427,43 @@ def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
         tuple(sorted((cfg.headers or {}).items())),
         cfg.connect_timeout_seconds,
     )
+
+
+def _scrub_result_surrogates(result: Any) -> None:
+    """Escape lone surrogates in an upstream ``CallToolResult``, in place (#761).
+
+    In place rather than rebuilt, because the caller holds this object and
+    several later stages read attributes off it directly; and because upstream
+    results are duck-typed here (tests and spec-noncompliant servers pass
+    objects modelling only ``content``), so reconstructing the model would be
+    the fragile half of the change rather than the safe one. Every write is
+    guarded and skipped when the value is unchanged, so a clean response — the
+    overwhelming majority — is not touched at all.
+
+    Covers the three fields that reach a client: the text of each content
+    block, ``structuredContent`` and ``_meta``. Non-text blocks (image, audio,
+    resource) carry base64 or a URI and cannot hold a surrogate.
+    """
+    for block in getattr(result, "content", None) or ():
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            escaped = escape_lone_surrogates(text)
+            if escaped is not text:
+                try:
+                    block.text = escaped
+                except (AttributeError, TypeError, ValueError):
+                    # A frozen or read-only block: leave it. The response is
+                    # then no worse off than before this scrub existed.
+                    logger.debug("Could not scrub a read-only content block", exc_info=True)
+    for envelope_field in ("structuredContent", "meta"):
+        value = getattr(result, envelope_field, None)
+        if isinstance(value, dict):
+            scrubbed = scrub_lone_surrogates(value)
+            if scrubbed is not value:
+                try:
+                    setattr(result, envelope_field, scrubbed)
+                except (AttributeError, TypeError, ValueError):
+                    logger.debug("Could not scrub result.%s", envelope_field, exc_info=True)
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -5130,6 +5168,18 @@ class ProxyManager:
         result = await self._fetch_upstream(
             server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
         )
+
+        # ── Stage 2: INGEST SCRUB (lone surrogates) ──
+        # Escape here, once, rather than at each place the text is later
+        # serialized. The MCP SDK decodes a legal ``"\ud800"`` escape out of the
+        # upstream's wire JSON into a raw code unit, which
+        # ``TextContent(...).model_dump_json()`` then refuses to serialize —
+        # so the alternative to escaping is discarding a successful response.
+        # Placed BEFORE ``_shape_response`` because several consumers never go
+        # through it: the ``isError`` branch re-reads ``result.content`` itself,
+        # and ``structuredContent``/``meta`` bypass shaping entirely on their
+        # way to the client and to the cache envelope (#761).
+        _scrub_result_surrogates(result)
 
         # ── Stage 3: SHAPE (text/non-text split + max_upstream_chars guard) ──
         # The helper records no metrics and performs no return; when no text
