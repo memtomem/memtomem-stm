@@ -5532,6 +5532,22 @@ def _resolve_eject_plan(
     )
 
 
+def _argv_is_encodable(name: str, payload: dict[str, Any]) -> bool:
+    """True when both halves of the ``claude mcp add-json`` argv can be spawned.
+
+    ``subprocess`` encodes arguments to UTF-8 and raises ``UnicodeEncodeError``
+    on a lone surrogate — a raise the callers' ``FileNotFoundError`` /
+    ``OSError`` handlers do not cover. Asking before a destructive step turns
+    that into the ordinary non-fatal failure those callers already report.
+    """
+    try:
+        name.encode("utf-8")
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     """Dispatch the host write for one resolved plan (RFC §4.1 writer table)."""
     assert plan.payload is not None
@@ -5544,6 +5560,14 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
             # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The
             # pre-remove needs the same cwd as the add: `-s local` resolves
             # its project slot from the process cwd on both verbs.
+            # The pre-remove is destructive and the add that follows passes the
+            # payload as a subprocess argument, which encodes to UTF-8 and
+            # raises on a code unit that cannot (#757). Check first: failing
+            # here returns the non-fatal error that prints the manual restore
+            # hint, whereas failing after the remove would leave the host with
+            # neither the old registration nor the new one.
+            if not _argv_is_encodable(plan.name, plan.payload):
+                return (False, "server name or payload is not valid UTF-8")
             ok, err = _claude_mcp_remove(plan.name, scope, cwd=cwd)
             if not ok:
                 return (False, f"--force pre-remove failed: {err}")
