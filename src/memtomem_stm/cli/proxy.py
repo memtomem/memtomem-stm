@@ -2283,7 +2283,7 @@ def add(
 
     if name in servers:
         click.echo(
-            f"{_err('Error:')} server '{name}' already exists. Use `remove` first.",
+            f"{_err('Error:')} server '{_disp(name)}' already exists. Use `remove` first.",
             err=True,
         )
         if as_json:
@@ -2498,11 +2498,14 @@ def add(
     tools_reachable: int | None = None
     if validate:
         if not as_json:
-            click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
+            click.echo(f"Validating '{_disp(name)}' (timeout={validate_timeout}s)...")
         probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
         if not probe.connected:
             msg = f"validation failed — {probe.error} (stage reached: {probe.stage.display()})"
-            click.echo(f"{_err('Error:')} {msg}", err=True)
+            # ``msg`` is also the ``--json`` error text below, which a
+            # consumer parses rather than displays — escape the printed
+            # copy only (#755).
+            click.echo(f"{_err('Error:')} {_disp(msg)}", err=True)
             if as_json:
                 _json_fail("add", "validation_failed", msg, name=name)
             sys.exit(1)
@@ -2529,7 +2532,7 @@ def add(
             }
         )
         return
-    click.echo(f"{_ok('Added')} server '{name}' (prefix={prefix})")
+    click.echo(f"{_ok('Added')} server '{_disp(name)}' (prefix={prefix})")
 
 
 # ── init command ────────────────────────────────────────────────────────
@@ -3115,7 +3118,7 @@ def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
             if key in seen:
                 continue
             seen.add(key)
-            click.echo(f"    {cand['name']} — {src}")
+            click.echo(f"    {_disp(cand['name'])} — {src}")
     return click.confirm("Remove from source(s)?", default=False)
 
 
@@ -3187,7 +3190,7 @@ def _report_prune_results(
         click.echo("")
         click.echo(f"{_ok('Removed from source client(s):')}")
         for name, src in pruned:
-            click.echo(f"  {name} — {src}")
+            click.echo(f"  {_disp(name)} — {src}")
 
     if failed:
         # Visual separator: stdout in human mode, but it must not precede
@@ -3200,7 +3203,9 @@ def _report_prune_results(
             err=True,
         )
         for name, src, err in failed:
-            click.echo(f"  {name} ({src}): {err}", err=True)
+            # ``err`` is whatever the host client's CLI wrote to stderr —
+            # arbitrary text from a subprocess, not a value from our config.
+            click.echo(f"  {_disp(name)} ({src}): {_disp(err)}", err=True)
         click.echo("", err=True)
         click.echo("Run the following to remove them manually:", err=True)
         for name, src, _ in failed:
@@ -3538,7 +3543,9 @@ def _add_from_clients(
     click.echo("")
     for idx in picks:
         cand = new_candidates[idx]
-        click.echo(_hdr(f"Configuring '{cand['name']}'"))
+        # Escape the value, never the styled result: ``_hdr`` wraps this
+        # line in a bold SGR span whose own escapes must stay real (#755).
+        click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
         suggested = _suggest_prefix(cand["name"], used_prefixes)
         prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
         used_prefixes.add(prefix)
@@ -3554,9 +3561,12 @@ def _add_from_clients(
         probes = asyncio.run(_probe_servers(imported, validate_timeout))
         for n, probe in probes.items():
             if probe.connected:
-                click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
+                click.echo(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
             else:
-                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
+                click.echo(
+                    f"  {_warn('Warning:')} {_disp(n)} — probe failed: {_disp(probe.error or '')}",
+                    err=True,
+                )
                 click.echo("  Saving anyway. Run `mms health` later to retry.", err=True)
 
     servers.update(imported)
@@ -3833,7 +3843,9 @@ def init(
         imported_at = utc_now_iso()
         for idx in picks:
             cand = candidates[idx]
-            click.echo(_hdr(f"Configuring '{cand['name']}'"))
+            # Escape the value, never the styled result: ``_hdr`` wraps this
+            # line in a bold SGR span whose own escapes must stay real (#755).
+            click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
             suggested = _suggest_prefix(cand["name"], used_prefixes)
             prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
             used_prefixes.add(prefix)
@@ -3927,9 +3939,12 @@ def init(
         probes = asyncio.run(_probe_servers(probe_map, 10))
         for n, probe in probes.items():
             if probe.connected:
-                click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
+                click.echo(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
             else:
-                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
+                click.echo(
+                    f"  {_warn('Warning:')} {_disp(n)} — probe failed: {_disp(probe.error or '')}",
+                    err=True,
+                )
                 suffix = " (--save-unverified acknowledged)" if save_unverified else ""
                 click.echo(
                     f"  Saving config anyway{suffix}. Run `mms health` later to retry.",

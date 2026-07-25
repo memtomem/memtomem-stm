@@ -2296,6 +2296,32 @@ class TestAddValidate:
             data = json.loads(config.read_text(encoding="utf-8"))
             assert "bad" not in data.get("upstream_servers", {})
 
+    def test_probe_failure_escaped_in_text_but_raw_in_json(self, runner, config, monkeypatch):
+        """One `msg` feeds both the printed error and the ``--json`` error
+        text, so the escaping goes on the printed copy only (#755): the
+        probe error is the upstream's failure text, which reaches the
+        terminal before anything about this server was written."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(stage=ProbeStage.CONFIGURED, error="boom\rFAKE Validated:")
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        argv = ["add", "srv", "--prefix", "s", "--command", "x", "--validate", *_cfg_args(config)]
+
+        result = runner.invoke(cli, argv)
+        assert result.exit_code == 1
+        assert "boom\\u000DFAKE Validated:" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, [*argv, "--json"])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert "boom\rFAKE Validated:" in data["message"]
+
     def test_validate_success_writes_entry_with_tool_count(self, config):
         """Probe against the repo's fake MCP server — should report tool count.
 
@@ -5638,6 +5664,45 @@ class TestAddFromClients:
         assert len(probe_calls) == 1
         assert set(probe_calls[0].keys()) == {"a"}  # "b" not probed
 
+    def test_candidate_name_escaped_through_the_whole_import(self, runner, config, monkeypatch):
+        """The import walks one name past the user four times — preview,
+        per-server header, probe result, summary — and the name is a key
+        from *another* client's config, which never passed `add`'s
+        validation (#755). The header is the load-bearing one: `_hdr`
+        wraps it in a bold span, so an ESC inside would end the styling
+        this command emitted."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "ev\ril",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=3) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "\r" not in result.output
+        assert "Configuring 'ev\\u000Dil'" in result.output
+        assert "Reachable: ev\\u000Dil" in result.output
+        # The name is still stored verbatim — this is a display fix.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "ev\ril" in data["upstream_servers"]
+
     def test_prints_source_removal_hint_per_client(self, runner, config, monkeypatch):
         """After a successful import, the user sees a per-source hint for
         removing the direct registration from the originating MCP client.
@@ -6460,6 +6525,33 @@ class TestPruneCommand:
         assert "could not remove 1 direct registration" in result.output
         assert "boom" in result.output
         assert "claude mcp remove docs-langchain -s user" in result.output
+
+    def test_failure_line_escapes_the_host_clis_stderr(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """The failure line quotes whatever the host client's CLI wrote to
+        stderr — a subprocess we invoked, not a value from any config
+        (#755). It renders on the way out of a partially-completed prune,
+        which is exactly when the user is reading for what survived."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1, stderr="boom\rRemoved from source client(s):")
+        ]
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+        assert result.exit_code != 0
+        assert "boom\\u000DRemoved from source client(s):" in result.output
+        assert "\r" not in result.output
 
     # ── --json result summary (#614) ──
 
