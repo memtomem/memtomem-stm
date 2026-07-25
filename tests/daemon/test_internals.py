@@ -213,6 +213,49 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
+def test_config_fingerprint_survives_a_hostile_surface_tools_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # ``MEMTOMEM_STM_HOOK_SURFACE_TOOLS`` is folded into the fingerprint material
+    # verbatim, and on POSIX an environment variable holding a byte that is not
+    # valid UTF-8 is decoded with ``surrogateescape`` — so a lone surrogate
+    # reaches the digest's ``.encode("utf-8")`` without any config file being
+    # involved (#761). Before the fix this raised ``UnicodeEncodeError`` out of
+    # ``DaemonServer.__init__`` and out of ``client._live_handshake_candidate``,
+    # i.e. no daemon could start and ``mms daemon status`` printed a traceback.
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
+    clean = discovery.config_fingerprint(STMConfig())
+
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,\udcff")
+    hostile = discovery.config_fingerprint(STMConfig())
+
+    assert len(hostile) == 16 and all(c in "0123456789abcdef" for c in hostile)
+    # Still a *fingerprint*: it is stable, and it separates this env from the
+    # clean one rather than collapsing every unencodable value onto one digest.
+    assert hostile == discovery.config_fingerprint(STMConfig())
+    assert hostile != clean
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,\udcfe")
+    assert discovery.config_fingerprint(STMConfig()) != hostile
+
+
+def test_daemon_server_constructs_under_a_hostile_surface_tools_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    # The fingerprint is frozen in ``DaemonServer.__init__`` (before ``serve()``,
+    # before any ``try``), so a raise there means the process never starts. Pin
+    # the construction itself rather than only the helper (#761).
+    from memtomem_stm.daemon.server import DaemonServer
+
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,\udcff")
+    config = STMConfig()
+    config.data_dir = tmp_path
+    server = DaemonServer(config)
+    assert len(server._fingerprint) == 16
+    # The frozen value is what names the lock and handshake files, so it has to
+    # survive being turned into a path too.
+    assert discovery.handshake_path(tmp_path, server._fingerprint).name.endswith(".json")
+
+
 def test_config_fingerprint_includes_protocol_version(monkeypatch: pytest.MonkeyPatch):
     # A wire-protocol bump must move the fingerprint so a hook and a daemon built
     # at different PROTOCOL_VERSIONs key to distinct handshake/lock paths and
