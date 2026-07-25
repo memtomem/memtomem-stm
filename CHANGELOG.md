@@ -284,6 +284,32 @@ changes inline only. See the deprecation policy in
   downstream rather than at the read. With the ingest escaping above in place
   nothing should reach these in normal operation; they are hardened because
   their failure mode was bad out of proportion to its cause. (#761)
+- The response cache and progressive store are now surrogate-safe on read as
+  well as write, closing part of the gap #761 left when it hardened only the
+  pending store. Both escape on write and then parsed with a plain
+  `json.loads`, which decodes the six characters `\ud800` straight back into
+  the code unit, so the value came back unencodable and raised at the next
+  encode downstream rather than at the read. The progressive store's `__meta__`
+  is a JSON document nested *inside* a chunk, so the backing store's own scrub
+  never reached it.
+  `ProxyCache` also stored a response body without escaping it. `sqlite3`
+  encodes text parameters to UTF-8, so that raised at `execute`; the caller
+  catches it and leaves the response alone, so the cost was a silently uncached
+  response and a warning on every call rather than a lost one.
+  Its **identifiers** are handled differently from its content, on purpose. The
+  cache key now hashes `server` and `tool` through `errors="surrogatepass"`
+  rather than the escaping helper, which is documented as non-injective and
+  would have let one identifier's row answer for the distinct identifier
+  spelled with those six literal characters. That closes the aliasing this
+  change would otherwise have introduced; it does not make the key injective
+  in general, and two older collision classes in the same derivation are
+  tracked in #784. A `server`/`tool` that cannot be a SQLite text parameter
+  now skips the store rather than being escaped into one, because an escaped
+  name is unmatchable by `clear()` and aliases that same distinct identifier;
+  `clear()` returns 0 for such a filter, which is what it now always matches,
+  and `stm_proxy_cache_clear` escapes the filter it echoes back so the reply
+  itself stays serializable. Clean values hash, store, read and clear exactly
+  as before. (#782, fixes #781)
 - A lone surrogate in `stm_memory_propose`'s own arguments no longer escapes as
   a traceback. The tool derives its idempotency key by hashing the client's
   `content` and `source_ref`, and that `.encode()` sits *above* the tool's

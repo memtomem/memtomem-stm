@@ -14,6 +14,11 @@ from typing import Any
 
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import (
+    escape_lone_surrogates,
+    has_lone_surrogate,
+    scrub_lone_surrogates,
+)
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -101,7 +106,23 @@ def _make_key(
             json.dumps(context_query),
         ]
     )
-    return hashlib.sha256(raw.encode()).hexdigest()
+    # ``surrogatepass``, not the escaping helper. ``escape_lone_surrogates`` is
+    # documented as non-injective — it maps the code unit U+D800 and the six
+    # literal characters ``\ud800`` onto the same text — so deriving the key
+    # through it let one identifier's row answer for a different one. Nothing
+    # decodes this byte string, so the usual objection to ``surrogatepass``
+    # (it emits bytes that are not valid UTF-8) has no consumer to bite, and
+    # clean input encodes byte-identically, so no existing key is orphaned.
+    # All three derivations — ``get``, ``set`` and ``invalidate`` — come
+    # through here, so they cannot disagree.
+    #
+    # This closes that one aliasing; it does NOT make the key injective. The
+    # serialization above is unframed, so ``server="a\0b"`` collides with
+    # ``tool="b\0c"``, and ``json.dumps``'s ``ensure_ascii`` renders a non-BMP
+    # character as the same surrogate pair a caller could send as two lone
+    # ones. Both predate this change and both need a framed derivation behind
+    # a ``_KEY_SCHEMA_VERSION`` bump — see #784 (#781).
+    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 # Substrings that flag a response embedding a TRANSIENT retrieval key pointing
@@ -324,7 +345,11 @@ class ProxyCache:
         an unknown ``schema_version``, or a non-dict field value.
         """
         try:
-            envelope = json.loads(envelope_json)
+            # Scrub on the way out as well as in. The writer escapes, but this
+            # is a plain ``json.loads``: the six characters ``\ud800`` it
+            # stored decode straight back into the code unit, which would then
+            # raise at the next encode downstream rather than here (#781).
+            envelope = scrub_lone_surrogates(json.loads(envelope_json))
         except (TypeError, ValueError):
             return None
         if not isinstance(envelope, dict) or envelope.get("schema_version") != 1:
@@ -453,6 +478,21 @@ class ProxyCache:
                 tool,
             )
             return
+        if has_lone_surrogate(server) or has_lone_surrogate(tool):
+            # ``sqlite3`` encodes text parameters to UTF-8, so such an
+            # identifier cannot be stored as one. Escaping it instead would
+            # make the row unmatchable by its real name in ``clear()`` and
+            # would alias it onto the distinct identifier spelled with those
+            # six literal characters, so the honest answer is not to cache
+            # this response. The caller treats a non-store as "response
+            # unaffected", and this skips exactly as the sensitive-content and
+            # non-JSON-envelope checks above do (#781).
+            logger.debug(
+                "Skipping cache store: server or tool name is not encodable (%r/%r)",
+                server,
+                tool,
+            )
+            return
         key = _make_key(
             server, tool, args, context_query=context_query, config_fingerprint=config_fingerprint
         )
@@ -476,7 +516,19 @@ class ProxyCache:
                     envelope_json = excluded.envelope_json,
                     envelope_safe = excluded.envelope_safe
                 """,
-                (key, server, tool, result, now, ttl_seconds, envelope_json),
+                (
+                    key,
+                    server,
+                    tool,
+                    # The body is content, not an identity: nothing matches on
+                    # it, so escaping is right where it would be wrong for the
+                    # two names above. Without it ``sqlite3`` raises at
+                    # ``execute`` and the response goes uncached (#781).
+                    escape_lone_surrogates(result),
+                    now,
+                    ttl_seconds,
+                    envelope_json,
+                ),
             )
             self._db.commit()
             self._trim()
@@ -497,6 +549,14 @@ class ProxyCache:
 
     def clear(self, *, server: str | None = None, tool: str | None = None) -> int:
         if self._db is None:
+            return 0
+        if has_lone_surrogate(server or "") or has_lone_surrogate(tool or ""):
+            # ``set()`` refuses to store such an identifier, so no row can
+            # carry one and the filter matches nothing. Binding it anyway
+            # would raise out of an admin call that is semantically a no-op
+            # here — and escaping it to make the bind succeed would delete the
+            # rows of the *distinct* identifier spelled with those six literal
+            # characters, which is worse than either (#781).
             return 0
         with self._lock:
             if server is not None and tool is not None:

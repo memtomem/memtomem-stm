@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from memtomem_stm.proxy.compression import PendingSelection
 from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import scrub_lone_surrogates
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
@@ -102,7 +103,11 @@ class ProgressiveStoreAdapter:
             )
             return None
         try:
-            meta = json.loads(sel.chunks.get("__meta__", "{}"))
+            # The backing store scrubs its own chunk payload, but this parses
+            # a JSON document nested *inside* one of those chunks — an escape
+            # surviving that outer scrub decodes back to the code unit here
+            # (#781).
+            meta = scrub_lone_surrogates(json.loads(sel.chunks.get("__meta__", "{}")))
         except json.JSONDecodeError:
             logger.warning("Corrupted __meta__ JSON for progressive key=%s; using defaults", key)
             meta = {}

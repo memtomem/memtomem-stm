@@ -867,3 +867,40 @@ class TestProgressiveReadsTelemetry:
             assert stats["follow_up_rate"] == 0.0
         finally:
             tracker.close()
+
+
+# One from each end of the high and low surrogate blocks, matching the corpus
+# in ``test_json_out.py``.
+_SURROGATES = ["\ud800", "\udbff", "\udc00", "\udfff"]
+
+
+class TestProgressiveStoreSurrogateRoundTrip:
+    """``__meta__`` is read with a plain ``json.loads`` (#781).
+
+    The backing pending store scrubs its own chunk payload, but the adapter
+    parses a JSON document nested *inside* one of those chunks, and a
+    ``\\ud800`` escape surviving that outer scrub decodes back into the code
+    unit here.
+    """
+
+    @pytest.mark.parametrize("surrogate", _SURROGATES)
+    def test_meta_survives_the_round_trip(self, surrogate: str):
+        store = ProgressiveStoreAdapter(InMemoryPendingStore())
+        resp = ProgressiveResponse(
+            content="body",
+            total_chars=4,
+            total_lines=1,
+            content_type="text",
+            structure_hint="1 lines",
+            created_at=time.monotonic(),
+            server=f"srv{surrogate}",
+            tool=f"tool{surrogate}",
+        )
+        store.put("k", resp)
+
+        out = store.get("k")
+
+        assert out is not None
+        assert surrogate not in out.server and surrogate not in out.tool
+        out.server.encode("utf-8")  # the call that used to raise
+        out.tool.encode("utf-8")
