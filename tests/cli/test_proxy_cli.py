@@ -8599,6 +8599,78 @@ class TestRemove:
         assert data["error"] == "config_not_found" and data["path"] == str(missing.resolve())
 
 
+# Lone surrogate: unpaired, so it cannot be encoded to UTF-8. It reaches the
+# CLI only through a hand-edited or imported config — ``"\ud800"`` is a legal
+# JSON escape, and ``_load`` is a plain ``json.loads`` with no character
+# validation — never through argv on a config we wrote ourselves.
+SURROGATE_NAME = "sr\ud800v"
+
+
+def _write_surrogate_config(config: Path, *, sibling: bool = False) -> None:
+    """Config carrying a server whose *name* holds a lone surrogate.
+
+    Written with ``json.dumps``' default ``ensure_ascii=True``, which emits
+    the ``\\ud800`` escape rather than raising — exactly the byte sequence a
+    hand-edited config would contain.
+    """
+    servers: dict = {SURROGATE_NAME: {"prefix": "sx", "transport": "stdio", "command": "x"}}
+    if sibling:
+        servers["fs"] = {"prefix": "fs", "transport": "stdio", "command": "y"}
+    config.write_text(
+        json.dumps({"enabled": True, "upstream_servers": servers}), encoding="utf-8"
+    )
+
+
+class TestJsonLoneSurrogate:
+    """A lone surrogate in a ``--json`` payload used to crash the *report*
+    (#757).
+
+    ``json.dumps(..., ensure_ascii=False)`` left the surrogate raw in the
+    returned string and ``click.echo`` raised ``UnicodeEncodeError`` encoding
+    it — after the config write. Automation saw exit 1 and no parsable output
+    for an operation that had in fact succeeded, the worst possible shape for
+    a ``--json`` contract. Each test therefore asserts all three things that
+    used to disagree: the exit code, a parsable document, and the mutation.
+    """
+
+    def test_remove_json_reports_after_deleting_a_surrogate_named_server(self, runner, config):
+        _write_surrogate_config(config, sibling=True)
+        result = runner.invoke(
+            cli, ["remove", SURROGATE_NAME, "--yes", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["action"] == "remove" and data["ok"] is True and data["removed"] is True
+        # Escaped on the wire, identical after decoding: the payload is a
+        # value consumers read back, not display prose.
+        assert data["name"] == SURROGATE_NAME
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert SURROGATE_NAME not in saved["upstream_servers"]
+
+    def test_remove_json_not_found_is_a_single_parsable_document(self, runner, config):
+        """The failure envelope goes through the same writer, and its
+        ``message`` interpolates the raw name."""
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(
+            cli, ["remove", SURROGATE_NAME, "--yes", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "server_not_found"
+        assert data["name"] == SURROGATE_NAME
+
+    def test_list_json_renders_a_surrogate_named_server(self, runner, config):
+        """Read-only legs never mutate, but they crashed on any config
+        holding such a name — with a traceback instead of a diagnosis."""
+        _write_surrogate_config(config)
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert SURROGATE_NAME in json.loads(result.stdout)["servers"]
+
+
 class TestOriginFullyPruned:
     """The shared every-source predicate behind the ``mms list`` pruned
     marker and the ``mms remove`` orphaning hint. Strict types by design:

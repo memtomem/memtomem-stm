@@ -25,6 +25,7 @@ import click
 from pydantic import ValidationError
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._json_out import dumps as _json_dumps
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     _has_annotation_policy,
@@ -120,7 +121,7 @@ def validate_command(config_path: str, as_json: bool) -> None:
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     "config_path": str(resolved),
                     "status": status,

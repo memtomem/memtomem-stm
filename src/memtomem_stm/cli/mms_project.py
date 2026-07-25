@@ -18,6 +18,7 @@ from typing import Any
 import click
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.detect import Project, Source, detect_project
@@ -532,7 +533,7 @@ def route_cmd(
             payload["backup"] = str(backup)
 
     if as_json:
-        click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
         return
 
     mode = "Apply" if do_apply else "Preview"

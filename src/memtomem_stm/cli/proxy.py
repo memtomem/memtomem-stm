@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
@@ -433,7 +434,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 if config_data is not None:
                     message = sanitize_secrets(message, _all_config_secret_values(config_data))
                 payload["message"] = message[:1000]
-            click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+            click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
             if exit_code:
                 raise SystemExit(exit_code)
 
@@ -1458,7 +1459,7 @@ def gateway_status(config_path: str, *, as_json: bool = False) -> None:
                     }
                 )
     if as_json:
-        click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        click.echo(_json_dumps(result, ensure_ascii=False, sort_keys=True))
         return
     click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({_disp(tg.source)})")
     click.echo(f"  agent/profile: {_disp(tg.agent_id)} / {config.exposure.profile.value}")
@@ -1516,7 +1517,7 @@ def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -
         "graph_generation": snapshot.generation,
     }
     if as_json:
-        click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        click.echo(_json_dumps(result, ensure_ascii=False, sort_keys=True))
     else:
         click.echo(f"{_disp(tool_key)}: {_disp(decision.decision)}")
         if decision.reason:
@@ -1561,7 +1562,7 @@ def gateway_mode(
         "bundle_path": str(target_bundle),
     }
     if not do_apply:
-        click.echo(json.dumps(preview, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(preview, indent=2, ensure_ascii=False))
         click.echo("Preview only. Re-run with --apply to write the config.")
         return
     exposure = data.setdefault("exposure", {})
@@ -1656,7 +1657,7 @@ def _echo_json(payload: dict[str, Any]) -> None:
     diagnostics stay on stderr — so ``mms <cmd> --json | jq`` parses on
     success and failure alike. Same formatting as the read-only commands.
     """
-    click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
 
 
 def _json_fail(
@@ -1818,7 +1819,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
         # count keys are additive so callers can match the human summary
         # without re-deriving the pruned predicate.
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     "config_path": str(resolved),
                     "enabled": enabled,
@@ -1881,7 +1882,7 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {"config_path": str(resolved), "servers": _redacted_servers_json(servers)},
                 indent=2,
                 ensure_ascii=False,
@@ -2113,7 +2114,7 @@ def stats(
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     "config_path": str(resolved),
                     "config_status": config_status,
@@ -4732,7 +4733,7 @@ def tune(
         payload = _tune_json_payload(
             changes, skipped, resolved=resolved, since_hours=since_hours, tool_filter=tool_filter
         )
-        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
         return
 
     if not changes:
@@ -6687,7 +6688,7 @@ def health(
     if not servers:
         if as_json:
             click.echo(
-                json.dumps(
+                _json_dumps(
                     {
                         "servers": {},
                         "config_valid": config_error is None,
@@ -6717,7 +6718,7 @@ def health(
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     # Legacy probe keys plus additive ``stage`` /
                     # ``failed_stage`` / ``transport`` — scripts written
@@ -7429,7 +7430,7 @@ def doctor(
             payload["servers"] = servers_payload
         if surfacing_status is not None:
             payload["surfacing"] = surfacing_status
-        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
     else:
         click.echo(_hdr(f"Doctor: {resolved}"))
         click.echo("=" * 30)
