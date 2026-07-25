@@ -76,7 +76,11 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "where they enter, by ``mcp_client._result_text`` (a surrogate the "
         "SDK decoded off Core's wire) and ``_core_json_loads`` (one a legal "
         "``\\ud800`` escape in Core's NESTED document would re-create after "
-        "the first escape). Both are needed; neither alone closes it.",
+        "the first escape). Both are needed; neither alone closes it. The "
+        "OTHER ingest into this file is the client's own tool arguments, "
+        "which #761 did not cover because they arrive by a different path "
+        "than any it audited; ``stm_memory_propose`` escapes its three "
+        "strings itself as of #777.",
     ),
     "cli/hook_cmd.py": (
         1,
