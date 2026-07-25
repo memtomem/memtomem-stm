@@ -588,6 +588,20 @@ def test_json_hosts_serialize_is_json_dumps_byte_identical(adapter):
             assert "\\ud55c" not in adapter.serialize(rendered)
 
 
+@pytest.mark.parametrize("adapter", [_CLAUDE, _CODEX, _CURSOR])
+def test_json_hosts_serialize_survives_a_lone_surrogate(adapter):
+    """The echoed-back tool output is host-supplied and read with
+    ``json.loads``, where ``"\\udcff"`` is a legal escape. Left raw it made the
+    final ``click.echo`` raise, breaking the hook's always-exit-0 pass-through
+    at the last step — so serialize escapes it instead (#757)."""
+    rendered = {"hookSpecificOutput": {"updatedToolOutput": "out\udcffput"}}
+
+    serialized = adapter.serialize(rendered)
+
+    serialized.encode("utf-8")  # the encode click.echo does, which used to raise
+    assert json.loads(serialized) == rendered
+
+
 # ── Kimi adapter (B2 step3 — raw-stdout surfacing channel) ─────────────────────
 
 _KIMI_DIR = _HOOK_FIXTURES / "kimi"

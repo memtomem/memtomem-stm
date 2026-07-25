@@ -49,10 +49,11 @@ canonical; the daemon rehydrates and surfaces.
 
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
+
+from memtomem_stm.cli._json_out import dumps as _json_dumps
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +174,13 @@ class HostHookAdapter(ABC):
         JSON overrides this: Kimi prints the surfaced block as **raw stdout** on
         exit 0 (no JSON envelope, no key). The caller appends the trailing newline
         (via ``click.echo``), so this returns the content without one.
+
+        Uses the surrogate-safe writer (#757): the tool output being echoed
+        back is host-supplied and read with ``json.loads``, where ``"\\udcff"``
+        is a legal escape, and an unencodable payload here would break the
+        hook's always-exit-0 pass-through contract at the very last step.
         """
-        return json.dumps(rendered, ensure_ascii=False)
+        return _json_dumps(rendered, ensure_ascii=False)
 
 
 class ClaudeHookAdapter(HostHookAdapter):
