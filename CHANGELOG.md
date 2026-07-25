@@ -337,6 +337,33 @@ changes inline only. See the deprecation policy in
   left out of that issue deliberately, because a tool argument is not one of the
   ingest points whose escaping made the rest of `server.py` safe. (#778)
 
+- The display escaping now reaches the CLI surfaces the #760 sweep left. The
+  `mms host` re-stamp diff escaped the server name and the `Source:` line but
+  rendered `command` and the env keys raw in all three branches; those lines
+  reach `sync --plan` *and* the `--apply` confirmation prompt that authorizes
+  removing registry entries, so a CR there overwrites the `[y/N]` the user is
+  answering. The env keys are escaped inside `_format_env_keys_redacted`, their
+  only renderer, and still after redaction, which alone decides what is shown.
+  `mms project show`'s two no-marker branches rendered `cwd`, `cwd.name` and the
+  git root raw — a path needs no hostile config to carry a lone surrogate, since
+  a POSIX byte that is not valid UTF-8 decodes with `surrogateescape`. And
+  `mms hook`'s preview rendered `rendered_block` raw, which embeds the
+  source-checkout command; it is escaped at the render rather than on the
+  field, since `new_text` is what gets written. The block is split on its
+  structural newline before escaping — escaping first would collapse a
+  fifteen-line preview into one line, and splitting with `splitlines()` would
+  consume a hostile CR as a line break instead of showing it. All seven
+  `HookInstallError` raises are covered by escaping at the two
+  `ClickException` sites instead, so messages added later are too.
+  Not covered, and tracked in #786: several more terminal renders of
+  unvalidated values in these same modules — `last_imported` and the
+  post-apply paths in `mms host`, `last_seen` and two exception boundaries in
+  `mms project`, and the shared `_write_lock` messages.
+  Not changed: the `args` list in that same diff line. `list.__repr__` already
+  escapes every character this class covers — verified over all 1,114,112 code
+  points — so routing it through the escaper too would only double-escape.
+  (#785, fixes #780)
+
 ## [0.1.42] — 2026-07-25
 
 ### Upgrade notes

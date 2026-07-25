@@ -684,3 +684,34 @@ class TestDisplayEscaping:
         assert res.exit_code != 0
         assert "not found in" in res.output, res.output
         self._assert_clean(res.output)
+
+
+class TestShowFallbackBranchesEscapePaths:
+    """The two no-marker branches rendered ``cwd`` and the git root raw (#780).
+
+    #771 covered the marker-backed ``show`` output but not these. A path is as
+    unvalidated as argv: on POSIX a byte that is not valid UTF-8 decodes with
+    ``surrogateescape``, so a directory name alone puts a lone surrogate here.
+    """
+
+    HOSTILE = "pr\x1b[31m\roj"
+
+    def test_no_marker_no_git_branch_escapes_cwd(self):
+        from pathlib import Path
+
+        from memtomem_stm.cli.mms_project import _show_no_marker_no_git_text
+
+        out = _show_no_marker_no_git_text(Path("/tmp") / self.HOSTILE)
+
+        assert "\x1b" not in out and "\r" not in out
+        assert "\\u001B" in out and "\\u000D" in out
+
+    def test_git_no_marker_branch_escapes_root(self):
+        from pathlib import Path
+
+        from memtomem_stm.cli.mms_project import _show_git_no_marker_text
+
+        out = _show_git_no_marker_text(Path("/tmp") / self.HOSTILE)
+
+        assert "\x1b" not in out and "\r" not in out
+        assert "\\u001B" in out and "\\u000D" in out

@@ -1062,7 +1062,22 @@ def _emit_hook_change(
             verb = "create the config and add" if change.status == "create" else "add"
             click.echo(f"  Would {verb} memtomem-stm's PostToolUse hook:")
             click.echo("")
-            for line in change.rendered_block.splitlines():
+            # The block embeds the source-checkout command, so a path with a
+            # terminal-hostile character reaches all four previews. Split
+            # BEFORE escaping: ``_disp`` escapes the newline itself, so
+            # escaping the whole block first collapses a 15-line Claude
+            # preview into one line of ``\u000A``.
+            #
+            # Split on ``"\n"`` rather than ``splitlines()``: the latter also
+            # breaks on CR, VT, FF and U+2028/9, which would consume a hostile
+            # character as a line break instead of escaping it — silently
+            # inventing preview lines. Only the structural newline this block
+            # is assembled with should split it.
+            #
+            # Escaped at the render and never on ``rendered_block`` itself,
+            # since the written form is ``new_text`` (#780).
+            for raw_line in change.rendered_block.split("\n"):
+                line = _disp(raw_line)
                 # Indent non-blank lines only — TOML array-of-tables separators are
                 # blank, and prefixing them would emit trailing-whitespace lines.
                 click.echo(f"    {line}" if line else "")
@@ -1175,7 +1190,10 @@ def hook_install_command(
             change = hook_hosts.plan_install(host, command)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
-            raise click.ClickException(str(exc)) from exc
+            # One choke point for all seven ``HookInstallError`` raises: the
+            # messages interpolate a config path and a parser's own text, and
+            # this is where they become terminal output (#780).
+            raise click.ClickException(_disp(str(exc))) from exc
         hint = ["mms", "hook", "install", "--host", host]
         if surfacing_timeout is not None:
             hint.extend(["--surfacing-timeout", format_seconds(surfacing_timeout)])
@@ -1226,5 +1244,8 @@ def hook_uninstall_command(host: str, apply_: bool) -> None:
             change = hook_hosts.plan_uninstall(host)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
-            raise click.ClickException(str(exc)) from exc
+            # One choke point for all seven ``HookInstallError`` raises: the
+            # messages interpolate a config path and a parser's own text, and
+            # this is where they become terminal output (#780).
+            raise click.ClickException(_disp(str(exc))) from exc
         _emit_hook_change(change, apply_=apply_, backup=backup)
