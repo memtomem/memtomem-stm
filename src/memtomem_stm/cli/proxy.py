@@ -1460,18 +1460,19 @@ def gateway_status(config_path: str, *, as_json: bool = False) -> None:
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return
-    click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({tg.source})")
-    click.echo(f"  agent/profile: {tg.agent_id} / {config.exposure.profile.value}")
+    click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({_disp(tg.source)})")
+    click.echo(f"  agent/profile: {_disp(tg.agent_id)} / {config.exposure.profile.value}")
     if tg.source == "bundle" and tg.enabled:
-        click.echo(f"  bundle: {result['bundle_path']}")
+        click.echo(f"  bundle: {_disp(str(result['bundle_path']))}")
         if result.get("valid"):
             click.echo(
                 f"  active: graph generation {result['graph_generation']}, "
                 f"{result['eligible']} eligible / {result['rejected']} rejected"
             )
-            click.echo(f"  digest: {result['bundle_digest']}")
+            click.echo(f"  digest: {_disp(str(result['bundle_digest']))}")
         else:
-            click.echo(f"  {_bad('INVALID')}: {result.get('error')}")
+            # The loader's message quotes the bundle file it just rejected.
+            click.echo(f"  {_bad('INVALID')}: {_disp(str(result.get('error') or ''))}")
 
 
 @gateway_group.command(name="explain")
@@ -1517,9 +1518,9 @@ def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
-        click.echo(f"{tool_key}: {decision.decision}")
+        click.echo(f"{_disp(tool_key)}: {_disp(decision.decision)}")
         if decision.reason:
-            click.echo(f"  reason: {decision.reason}")
+            click.echo(f"  reason: {_disp(decision.reason)}")
         risk_score = decision.risk_score if decision.risk_score is not None else "n/a"
         click.echo(f"  risk score: {risk_score}")
         click.echo(f"  graph generation: {snapshot.generation}")
@@ -1960,8 +1961,12 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
         click.echo(_hdr(header))
         for row in by_tool:
             saved_pct = float(row["saved_ratio"]) * 100
+            # Truncate first, then escape: the slice keeps its existing
+            # meaning (28 characters of the recorded name) and an escaped
+            # cell overflows like an over-long one, rather than being cut
+            # mid-escape into an ambiguous ``\u00`` (#755).
             click.echo(
-                f"  {str(row['server'])[:12]:<12} {str(row['tool'])[:28]:<28} "
+                f"  {_disp(str(row['server'])[:12]):<12} {_disp(str(row['tool'])[:28]):<28} "
                 f"{row['calls']:>6} {row['original_chars']:>10,} "
                 f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
             )
@@ -2365,7 +2370,7 @@ def add(
     )
     if collisions:
         click.echo(
-            f"{_err('Error:')} {prefixes.format_collision_error(collisions)}. "
+            f"{_err('Error:')} {_disp(prefixes.format_collision_error(collisions))}. "
             "The proxy refuses to load configs with duplicate prefixes — "
             "pick a different --prefix.",
             err=True,
@@ -3507,14 +3512,14 @@ def _add_from_clients(
         entry = cand["entry"]
         if cand_name in existing_names:
             click.echo(
-                f"  {_warn('Skipping:')} '{cand_name}' — already registered.",
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — already registered.",
                 err=True,
             )
             continue
         sig = _server_signature(entry)
         if sig is not None and sig in existing_signatures:
             click.echo(
-                f"  {_warn('Skipping:')} '{cand_name}' — matches an existing server "
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
                 "by command/url.",
                 err=True,
             )
@@ -4237,18 +4242,18 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     if name not in servers:
-        click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
+        click.echo(f"{_err('Error:')} server '{_disp(name)}' not found.", err=True)
         sys.exit(1)
 
     current = bool(servers[name].get("surfacing_enabled", True))
     if state is None:
-        click.echo(f"surfacing for '{name}': {'on' if current else 'off'}")
+        click.echo(f"surfacing for '{_disp(name)}': {'on' if current else 'off'}")
         return
 
     desired = state == "on"
     servers[name]["surfacing_enabled"] = desired
     _save(path, data)
-    click.echo(f"{_ok('Surfacing ' + state)} for '{name}'.")
+    click.echo(f"{_ok('Surfacing ' + state)} for '{_disp(name)}'.")
 
 
 # ── tune command (#615) ────────────────────────────────────────────────
@@ -4430,7 +4435,9 @@ def _pick_tune_tui(
             marker = "[v]" if i in picks else "[ ]"
             fields = ", ".join(f"{c.field} -> {c.recommended}" for c in items)
             choices.append(
-                questionary.Choice(title=f"{marker}  {server}/{tool}  {fields}", value=i)
+                questionary.Choice(
+                    title=f"{marker}  {_disp(server)}/{_disp(tool)}  {_disp(fields)}", value=i
+                )
             )
         choices.append(questionary.Separator())
         choices.append(
@@ -4484,7 +4491,11 @@ def _pick_tune_changes(changes: list[_TuneChange]) -> list[_TuneChange] | None:
     selected: list[_TuneChange] = []
     for (server, tool), items in groups:
         fields = ", ".join(c.field for c in items)
-        if click.confirm(f"Apply to {server}/{tool} ({fields})?", default=True):
+        # The prompt the user answers to authorize a config write: a CR in
+        # the recorded tool name would overwrite the rendered ``[Y/n]``.
+        if click.confirm(
+            f"Apply to {_disp(server)}/{_disp(tool)} ({_disp(fields)})?", default=True
+        ):
             selected.extend(items)
     return selected
 
@@ -4499,13 +4510,13 @@ def _render_tune_preview(
     groups = _tune_groups(changes)
     click.echo(_hdr(f"Tuning recommendations (last {since_hours:g}h): {len(groups)} tool(s)"))
     for (server, tool), items in groups:
-        click.echo(f"  {server}/{tool}  [{items[0].confidence} confidence]")
+        click.echo(f"  {_disp(server)}/{_disp(tool)}  [{items[0].confidence} confidence]")
         for change in items:
             current = change.current if change.current is not None else "(default)"
-            click.echo(f"    {change.field}: {current} -> {change.recommended}")
-            click.echo(f"        {change.reason}")
+            click.echo(f"    {_disp(change.field)}: {current} -> {change.recommended}")
+            click.echo(f"        {_disp(change.reason)}")
     for entry in skipped:
-        click.echo(f"  {_warn('Skipped:')} {entry}")
+        click.echo(f"  {_warn('Skipped:')} {_disp(entry)}")
     if apply_hint:
         click.echo("")
         click.echo(
@@ -4683,14 +4694,14 @@ def tune(
         if do_apply:
             click.echo(
                 f"{_err('Error:')} the config file as written fails validation "
-                f"({raw_error}) — fix it (see `mms config validate`) before applying "
+                f"({_disp(raw_error)}) — fix it (see `mms config validate`) before applying "
                 "tuning overrides.",
                 err=True,
             )
             sys.exit(1)
         click.echo(
             f"{_warn('Warning:')} the config file as written fails validation "
-            f"({raw_error}) — --apply will refuse until it is fixed "
+            f"({_disp(raw_error)}) — --apply will refuse until it is fixed "
             "(see `mms config validate`).",
             err=True,
         )
@@ -4726,7 +4737,7 @@ def tune(
 
     if not changes:
         for entry in skipped:
-            click.echo(f"{_warn('Skipped:')} {entry}")
+            click.echo(f"{_warn('Skipped:')} {_disp(entry)}")
         click.echo("No recommendations — all observed tools are within healthy parameters.")
         return
 

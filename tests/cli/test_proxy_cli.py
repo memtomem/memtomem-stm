@@ -11459,6 +11459,32 @@ class TestTune:
         assert "config validate" in result.output
         assert config.read_bytes() == before
 
+    def test_recorded_tool_name_escaped_in_preview_and_consent_prompt(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """`mms tune` keys its rows on the tool name the upstream advertised,
+        read back out of the metrics DB. That name reaches a `click.confirm`
+        whose answer authorizes a config write, so a CR in it would overwrite
+        the rendered `[Y/n]` the user is answering (#755)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db, tool="ev\ril")
+        # Plain-confirm fallback: a TTY for the gate, no questionary.
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: False)
+        monkeypatch.setattr(proxy_mod, "_stdin_is_tty", lambda: True)
+
+        result = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "srv/ev\\u000Dil" in result.output
+        assert "\r" not in result.output
+
+        # The consent prompt on the --apply path carries the same name.
+        result = runner.invoke(cli, ["tune", "--apply", *_cfg_args(config)], input="n\n")
+        assert "Apply to srv/ev\\u000Dil" in result.output
+        assert "\r" not in result.output
+
 
 class TestMergeTuneChanges:
     """Merge policy for colliding TuningActions — unit-level, hand-built recs."""
