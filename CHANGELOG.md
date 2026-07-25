@@ -138,6 +138,31 @@ changes inline only. See the deprecation policy in
   renders as one escaped line in `mms eject`'s and `mms prune`'s failure
   lists, where it previously wrapped across several.
   (#759, fixes #755)
+- A lone surrogate in a config no longer crashes the CLI's JSON output after
+  the write it was reporting. `json.dumps(..., ensure_ascii=False)` — which
+  keeps CJK and emoji readable — leaves such a code unit raw in the string it
+  returns, so the `UnicodeEncodeError` landed at the `click.echo` or file write
+  that encoded it. `mms remove <name> --yes --json` deleted the entry, saved
+  the config, and *then* failed rendering the report: exit 1 and empty stdout
+  for an operation that had succeeded. Every JSON document the CLI emits — the
+  `--json` legs of `add`/`remove`/`prune`/`eject` including their error and
+  `confirmation_required` envelopes, the read-only `status`/`list`/`stats`/
+  `health`/`doctor`/`tune` payloads, `mms host`, `mms project route`,
+  `mms config validate`, the lock-timeout envelope — and every config file the
+  CLI writes now goes through a serializer that re-escapes those code units as
+  `\udxxx`. Two things could supply one: config is plain `json.loads` with no
+  character validation and `"\ud800"` is a legal JSON escape, so an imported or
+  hand-edited config could carry it as a server name; and on POSIX a
+  command-line argument holding a byte that is not valid UTF-8 is decoded with
+  `surrogateescape`, so `mms add $'s\xffv' ...` alone produced a name the CLI
+  then could not write. Clean payloads render byte-identically, and a rewritten
+  config decodes back to the identical name rather than losing the entry.
+  **Behavior change**: `mms add` with such a name now succeeds and persists the
+  entry, where it previously aborted with a traceback having written nothing.
+  Not covered: `mms eject`'s manual `claude mcp add-json` hint and the argv it
+  shells out to, which carry the same values but fail at the terminal render
+  and the subprocess encoding rather than in a JSON document. (#758, fixes
+  #757)
 
 ## [0.1.42] — 2026-07-25
 
