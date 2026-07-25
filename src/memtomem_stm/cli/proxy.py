@@ -435,6 +435,19 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 if config_data is not None:
                     message = sanitize_secrets(message, _all_config_secret_values(config_data))
                 payload["message"] = message[:1000]
+            elif captured_err := err.getvalue():
+                # A *successful* run used to drop its diagnostics entirely —
+                # only the failure branch read the capture, and then only its
+                # last line. That is how discovery's "skipping <name>" advisory
+                # went missing under ``--json`` (#758), on exactly the output
+                # mode automation reads. Replay it on the real stderr,
+                # sanitized like ``message`` since the capture holds whatever
+                # the command wrote; stdout stays one pure JSON document.
+                if config_data is not None:
+                    captured_err = sanitize_secrets(
+                        captured_err, _all_config_secret_values(config_data)
+                    )
+                click.echo(captured_err, err=True, nl=False)
             click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
             if exit_code:
                 raise SystemExit(exit_code)
@@ -1578,14 +1591,16 @@ def gateway_mode(
         }
     )
     _save(path, data)
+    # Post-write prose again: ``--bundle`` is argv, so on POSIX it can carry a
+    # surrogateescaped byte, and the config write above has already landed.
     click.echo(
         f"{_ok('Applied')} gateway mode {profile!r}; publish a matching bundle to "
-        f"{target_bundle.expanduser()}."
+        f"{_disp(str(target_bundle.expanduser()))}."
     )
     expanded_bundle = target_bundle.expanduser()
     if profile == "strict" and not expanded_bundle.is_file():
         click.echo(
-            f"{_warn('Warning:')} no policy bundle exists at {expanded_bundle}; "
+            f"{_warn('Warning:')} no policy bundle exists at {_disp(str(expanded_bundle))}; "
             "strict mode will refuse to start until one is published.",
             err=True,
         )
@@ -4286,6 +4301,9 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     desired = state == "on"
     servers[name]["surfacing_enabled"] = desired
     _save(path, data)
+    # After the write, so an unrenderable name must not raise here — that is
+    # the mutate-then-crash shape #757 is about, and making `_save` succeed on
+    # such a config is what newly exposed it (#758).
     click.echo(f"{_ok('Surfacing ' + state)} for '{_disp(name)}'.")
 
 

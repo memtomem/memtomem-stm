@@ -8767,6 +8767,67 @@ class TestJsonLoneSurrogate:
         saved = json.loads(config.read_text(encoding="utf-8"))
         assert SURROGATE_NAME not in saved["upstream_servers"]
 
+    def test_surfacing_toggle_reports_after_writing(self, runner, config):
+        """The regression this PR's own writer fix created.
+
+        Before it, `_save` raised and nothing was written. Once the write
+        succeeds, the success line becomes a post-mutation crash unless it
+        escapes the name — the exact shape #757 is about, on a command the
+        issue never mentioned.
+        """
+        _write_surrogate_config(config)
+
+        result = runner.invoke(cli, ["surfacing", SURROGATE_NAME, "off"] + _cfg_args(config))
+
+        assert result.exit_code == 0, result.output
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert saved["upstream_servers"][SURROGATE_NAME]["surfacing_enabled"] is False
+
+    def test_init_json_still_reports_a_skipped_discovery_candidate(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """The note must survive the ``--json`` setup envelope.
+
+        That envelope captures stderr and used to consume it only on failure,
+        so a *successful* run dropped every diagnostic — leaving the skip
+        invisible on exactly the output mode automation reads.
+        """
+        home = tmp_path / "init-home"
+        home.mkdir()
+        set_home(monkeypatch, home)
+        desktop = home / "Library/Application Support/Claude"
+        desktop.mkdir(parents=True)
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod, "_desktop_config_path", lambda: desktop / "claude_desktop_config.json"
+        )
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "bad\udcffname": {"command": "npx", "args": ["-y", "@b"]},
+                        "good": {"command": "npx", "args": ["-y", "@g"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MMS_NO_TUI", "1")
+
+        result = runner.invoke(
+            cli,
+            ["init", "--client", "skip", "--no-validate", "--lang", "en", "--json"]
+            + _cfg_args(config),
+            input="\n",  # accept the default candidate selection
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)  # stdout stays exactly one JSON document
+        assert payload["ok"] is True
+        assert "bad\udcffname" not in payload["servers"]
+        assert "not valid UTF-8" in result.stderr
+
     def test_list_in_text_mode_still_raises_on_such_a_name(self, runner, config):
         """The one leg that is still exposed, pinned as a boundary.
 

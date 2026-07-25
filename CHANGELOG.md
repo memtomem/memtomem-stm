@@ -176,13 +176,19 @@ changes inline only. See the deprecation policy in
   failure, not `invalid_name`), and the discovery scan behind
   `mms add --from-clients` and `mms init` skips such an entry, with a note on
   stderr, instead of importing it — so the other servers in that host config
-  still import. `list`, `remove` and the rest stay permissive by design, so a
-  config that already holds such a name can be inspected and repaired:
-  `mms remove` clears the entry in either output mode, this change covering its
-  `--json` report and #756 its printed line. The one leg still exposed is
-  `mms list` without `--json`, whose table prints the name raw — a prose site
-  #756 deferred to #755 — and a regression test pins that boundary rather than
-  leaving it assumed. (#758)
+  still import. `list`, `remove`, `surfacing` and the rest stay permissive by
+  design, so a config that already holds such a name can be inspected and
+  repaired: `mms remove` clears the entry and `mms surfacing <name> off`
+  toggles it in either output mode, this change covering the `--json` reports
+  and the display escape covering the printed lines. Making the config writable
+  is what newly exposed that second half — before it, these commands failed
+  inside the write, so nothing had changed yet; afterwards the write lands and
+  only the report can still fail. Every command that writes the config was
+  re-checked by running it against such a config and comparing the file before
+  and after, and none now mutates and then raises. The read-only renderings of
+  `mms list`, `mms doctor` and `mms health` in text mode do still raise, which
+  changes nothing on disk; those are prose sites #756 deferred to #755, and a
+  regression test pins the boundary rather than leaving it assumed. (#758)
 
 ## [0.1.42] — 2026-07-25
 
