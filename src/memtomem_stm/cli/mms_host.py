@@ -60,6 +60,7 @@ from pathlib import Path
 
 import click
 
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state
@@ -357,7 +358,7 @@ def _render_json(rows: list[dict]) -> None:
         "no_baseline": sum(1 for r in rows if r["state"] == "no_baseline"),
     }
     payload = {"entries": rows, "summary": summary}
-    click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+    click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +490,7 @@ def _render_scan_json(rows: list[dict]) -> None:
             "new_at_host": n_total - n_in_reg,
         },
     }
-    click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+    click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
 
 
 @host_group.command("scan")
@@ -704,7 +705,7 @@ def _render_sync_json(mode: str, plan_payload: dict, summary: dict, *, aborted: 
         "plan": plan_payload,
         "summary": summary,
     }
-    click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+    click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
 
 
 def _render_sync_text(

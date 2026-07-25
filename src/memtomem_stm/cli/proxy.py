@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
@@ -433,7 +435,20 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 if config_data is not None:
                     message = sanitize_secrets(message, _all_config_secret_values(config_data))
                 payload["message"] = message[:1000]
-            click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+            elif captured_err := err.getvalue():
+                # A *successful* run used to drop its diagnostics entirely —
+                # only the failure branch read the capture, and then only its
+                # last line. That is how discovery's "skipping <name>" advisory
+                # went missing under ``--json`` (#758), on exactly the output
+                # mode automation reads. Replay it on the real stderr,
+                # sanitized like ``message`` since the capture holds whatever
+                # the command wrote; stdout stays one pure JSON document.
+                if config_data is not None:
+                    captured_err = sanitize_secrets(
+                        captured_err, _all_config_secret_values(config_data)
+                    )
+                click.echo(captured_err, err=True, nl=False)
+            click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
             if exit_code:
                 raise SystemExit(exit_code)
 
@@ -573,7 +588,7 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     ``mode=0o600`` keeps the rendered file out of a permissive listing
     even if the parent directory is shared.
     """
-    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    payload = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
     atomic_write_text(config_path, payload, mode=0o600, durable=True)
 
 
@@ -1458,7 +1473,7 @@ def gateway_status(config_path: str, *, as_json: bool = False) -> None:
                     }
                 )
     if as_json:
-        click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        click.echo(_json_dumps(result, ensure_ascii=False, sort_keys=True))
         return
     click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({_disp(tg.source)})")
     click.echo(f"  agent/profile: {_disp(tg.agent_id)} / {config.exposure.profile.value}")
@@ -1516,7 +1531,7 @@ def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -
         "graph_generation": snapshot.generation,
     }
     if as_json:
-        click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        click.echo(_json_dumps(result, ensure_ascii=False, sort_keys=True))
     else:
         click.echo(f"{_disp(tool_key)}: {_disp(decision.decision)}")
         if decision.reason:
@@ -1561,7 +1576,7 @@ def gateway_mode(
         "bundle_path": str(target_bundle),
     }
     if not do_apply:
-        click.echo(json.dumps(preview, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(preview, indent=2, ensure_ascii=False))
         click.echo("Preview only. Re-run with --apply to write the config.")
         return
     exposure = data.setdefault("exposure", {})
@@ -1576,14 +1591,16 @@ def gateway_mode(
         }
     )
     _save(path, data)
+    # Post-write prose again: ``--bundle`` is argv, so on POSIX it can carry a
+    # surrogateescaped byte, and the config write above has already landed.
     click.echo(
         f"{_ok('Applied')} gateway mode {profile!r}; publish a matching bundle to "
-        f"{target_bundle.expanduser()}."
+        f"{_disp(str(target_bundle.expanduser()))}."
     )
     expanded_bundle = target_bundle.expanduser()
     if profile == "strict" and not expanded_bundle.is_file():
         click.echo(
-            f"{_warn('Warning:')} no policy bundle exists at {expanded_bundle}; "
+            f"{_warn('Warning:')} no policy bundle exists at {_disp(str(expanded_bundle))}; "
             "strict mode will refuse to start until one is published.",
             err=True,
         )
@@ -1656,7 +1673,7 @@ def _echo_json(payload: dict[str, Any]) -> None:
     diagnostics stay on stderr — so ``mms <cmd> --json | jq`` parses on
     success and failure alike. Same formatting as the read-only commands.
     """
-    click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
 
 
 def _json_fail(
@@ -1818,7 +1835,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
         # count keys are additive so callers can match the human summary
         # without re-deriving the pruned predicate.
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     "config_path": str(resolved),
                     "enabled": enabled,
@@ -1881,7 +1898,7 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {"config_path": str(resolved), "servers": _redacted_servers_json(servers)},
                 indent=2,
                 ensure_ascii=False,
@@ -2113,7 +2130,7 @@ def stats(
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     "config_path": str(resolved),
                     "config_status": config_status,
@@ -2289,6 +2306,18 @@ def add(
         raise click.UsageError("Missing argument 'NAME' (or pass --from-clients).")
     if not prefix:
         raise click.UsageError("Missing option '--prefix' (or pass --from-clients).")
+    if has_lone_surrogate(name):
+        # Reachable without a hand-edited config: on POSIX an argument holding
+        # a byte that is not valid UTF-8 is decoded with ``surrogateescape``.
+        # Writing it is safe now (#757) but the entry would be unusable — see
+        # ``has_lone_surrogate`` — so refuse rather than persist a name that
+        # only fails later, at the first proxied call.
+        # ``!r`` renders the offending code unit as ASCII ``\udcff``; echoing
+        # the name raw is the very crash this command is refusing to set up.
+        click.echo(f"{_err('Error:')} server name {name!r} is not valid UTF-8.", err=True)
+        if as_json:
+            _json_fail("add", "invalid_name", f"server name {name!r} is not valid UTF-8", name=name)
+        sys.exit(1)
 
     data = _load(path)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
@@ -2506,6 +2535,21 @@ def add(
             # named "PATH" is legal.
             headers_dict[k] = v
         entry["headers"] = headers_dict
+
+    # The name gate above is not enough: a `command` gets spawned, a `url`
+    # dialled, `env` values handed to a child process, and each of those
+    # encodes. Before #757 the write itself refused such an entry, so making
+    # `_save` succeed is what let one reach disk — an entry that saves but
+    # can never run. Gate the assembled entry at the one point that writes
+    # it. The diagnostic names the field and never its value: env and header
+    # values are routinely secrets and this text reaches CI logs.
+    bad_field = unencodable_field(entry)
+    if bad_field is not None:
+        msg = f"{bad_field} is not valid UTF-8 (value withheld)"
+        click.echo(f"{_err('Error:')} {msg}", err=True)
+        if as_json:
+            _json_fail("add", "invalid_entry", msg, name=name)
+        sys.exit(1)
 
     tools_reachable: int | None = None
     if validate:
@@ -2729,8 +2773,33 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
         for name, raw in servers.items():
             if not isinstance(name, str) or not isinstance(raw, dict):
                 continue
+            if has_lone_surrogate(name):
+                # Skip rather than abort the scan: one unusable name in a host
+                # config must not block importing the servers beside it.
+                # `"\udcff"` is a legal JSON escape, so a host file can carry
+                # one (#757). Say so, though — dropping in silence would leave
+                # "No MCP servers found" as the only clue when it is the sole
+                # entry. ``!r`` renders the code unit as ASCII; echoing the name
+                # raw is the crash being avoided.
+                click.echo(
+                    f"{_warn('Note:')} skipping {name!r} from {spec.label} — "
+                    "the name is not valid UTF-8.",
+                    err=True,
+                )
+                continue
             entry = _normalize_client_entry(raw)
             if entry is None or _is_self_reference(entry):
+                continue
+            bad_field = unencodable_field(entry)
+            if bad_field is not None:
+                # Same reasoning as the name above, for the fields that get
+                # spawned or dialled rather than keyed on. Named, never
+                # echoed: a host entry's env values are its secrets.
+                click.echo(
+                    f"{_warn('Note:')} skipping {name!r} from {spec.label} — "
+                    f"{bad_field} is not valid UTF-8 (value withheld).",
+                    err=True,
+                )
                 continue
             source_ref: dict[str, Any] = {"kind": spec.kind}
             if src_path is not None:
@@ -2923,7 +2992,9 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
         return (False, f"'{name}' not registered in {path}")
     del servers[name]
     try:
-        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True)
+        atomic_write_text(
+            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True
+        )
     except OSError as exc:
         return (False, f"write error: {exc}")
     return (True, None)
@@ -3001,7 +3072,7 @@ def _append_pruned_backup(
     # host env/headers, secrets included.
     try:
         atomic_write_text(
-            path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600, durable=True
+            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600, durable=True
         )
     except OSError as exc:
         return (False, f"backup log write failed: {exc}")
@@ -3874,6 +3945,9 @@ def init(
         if not name:
             click.echo(f"{_err('Error:')} server name must be non-empty.", err=True)
             sys.exit(1)
+        if has_lone_surrogate(name):
+            click.echo(f"{_err('Error:')} server name {name!r} is not valid UTF-8.", err=True)
+            sys.exit(1)
 
         prefix = _prompt_prefix()
 
@@ -3922,6 +3996,16 @@ def init(
                 )
                 sys.exit(1)
             entry["url"] = url
+
+        # Third create path, same gate as `add` and the discovery scan: the
+        # name check above does not cover the command or URL typed after it,
+        # and this entry goes straight into the config that gets written.
+        bad_field = unencodable_field(entry)
+        if bad_field is not None:
+            click.echo(
+                f"{_err('Error:')} {bad_field} is not valid UTF-8 (value withheld).", err=True
+            )
+            sys.exit(1)
 
         imported[name] = entry
 
@@ -4253,6 +4337,9 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     desired = state == "on"
     servers[name]["surfacing_enabled"] = desired
     _save(path, data)
+    # After the write, so an unrenderable name must not raise here — that is
+    # the mutate-then-crash shape #757 is about, and making `_save` succeed on
+    # such a config is what newly exposed it (#758).
     click.echo(f"{_ok('Surfacing ' + state)} for '{_disp(name)}'.")
 
 
@@ -4732,7 +4819,7 @@ def tune(
         payload = _tune_json_payload(
             changes, skipped, resolved=resolved, since_hours=since_hours, tool_filter=tool_filter
         )
-        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
         return
 
     if not changes:
@@ -5188,7 +5275,7 @@ def _json_config_set_entry(
     try:
         atomic_write_text(
             path,
-            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+            _json_dumps(existing, indent=2, ensure_ascii=False) + "\n",
             mode=default_mode,
             durable=True,
         )
@@ -5481,6 +5568,22 @@ def _resolve_eject_plan(
     )
 
 
+def _argv_is_encodable(name: str, payload: dict[str, Any]) -> bool:
+    """True when both halves of the ``claude mcp add-json`` argv can be spawned.
+
+    ``subprocess`` encodes arguments to UTF-8 and raises ``UnicodeEncodeError``
+    on a lone surrogate — a raise the callers' ``FileNotFoundError`` /
+    ``OSError`` handlers do not cover. Asking before a destructive step turns
+    that into the ordinary non-fatal failure those callers already report.
+    """
+    try:
+        name.encode("utf-8")
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     """Dispatch the host write for one resolved plan (RFC §4.1 writer table)."""
     assert plan.payload is not None
@@ -5488,6 +5591,17 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     if plan.kind in ("claude-user", "claude-project"):
         scope = spec.claude_scope or "user"
         cwd = plan.path if plan.kind == "claude-project" else None
+        # Both paths below spawn `claude mcp …` with the name and payload as
+        # arguments, which `subprocess` encodes to UTF-8 — a raise neither
+        # `_claude_mcp_add_json` nor `_claude_mcp_remove` catches, since both
+        # guard `FileNotFoundError`/`OSError` (#757). Check once, before
+        # either: on the `--force` path the pre-remove is destructive and
+        # would otherwise leave the host with neither the old registration
+        # nor the new one, and on the plain path an uncaught traceback
+        # replaces the "cannot eject" diagnostic this function exists to
+        # return.
+        if not _argv_is_encodable(plan.name, plan.payload):
+            return (False, "server name or payload is not valid UTF-8")
         if plan.overwrite:
             # `claude mcp add-json` has no overwrite flag (same probe lineage
             # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The
@@ -6687,7 +6801,7 @@ def health(
     if not servers:
         if as_json:
             click.echo(
-                json.dumps(
+                _json_dumps(
                     {
                         "servers": {},
                         "config_valid": config_error is None,
@@ -6717,7 +6831,7 @@ def health(
 
     if as_json:
         click.echo(
-            json.dumps(
+            _json_dumps(
                 {
                     # Legacy probe keys plus additive ``stage`` /
                     # ``failed_stage`` / ``transport`` — scripts written
@@ -7429,7 +7543,7 @@ def doctor(
             payload["servers"] = servers_payload
         if surfacing_status is not None:
             payload["surfacing"] = surfacing_status
-        click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
     else:
         click.echo(_hdr(f"Doctor: {resolved}"))
         click.echo("=" * 30)

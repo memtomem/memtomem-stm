@@ -994,7 +994,16 @@ def hook_command(
     # suppressing the newline on an empty payload. JSON hosts always serialize to
     # a non-empty string ("{}" or more), so their trailing newline (and the
     # pre-seam byte-identity) is unchanged.
-    click.echo(serialized, nl=bool(serialized))
+    try:
+        click.echo(serialized, nl=bool(serialized))
+    except UnicodeEncodeError:
+        # Last resort for the always-exit-0 contract (#757). The JSON hosts'
+        # payload is escaped by the writer in ``serialize``, but Kimi's channel
+        # is raw stdout — surfaced text, not a JSON document — so nothing
+        # escapes an unencodable code unit there. Degrade to "nothing surfaced"
+        # rather than let the final write become a hook failure the host reads
+        # as a broken tool call.
+        logger.warning("hook output was not encodable — passing tool output through")
 
 
 def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:
