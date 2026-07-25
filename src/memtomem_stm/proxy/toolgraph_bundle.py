@@ -21,6 +21,7 @@ from typing import Any
 from memtomem_stm.proxy.tool_eligibility import (
     toolgraph_reject_code,
 )
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 
 SCHEMA_VERSION = 1
 KIND = "toolgraph.policy-bundle"
@@ -317,9 +318,25 @@ class PolicySnapshot:
 
 
 def canonical_json_bytes(value: object) -> bytes:
-    """Match Toolgraph's canonical JSON encoding for contract fingerprints."""
+    """Match Toolgraph's canonical JSON encoding for contract fingerprints.
+
+    Byte-for-byte the producer's encoding for every input the producer can
+    encode. It diverges on exactly the inputs the producer *cannot*: its own
+    ``canonical_json_bytes`` raises ``UnicodeEncodeError`` on a lone surrogate,
+    so no published bundle can hold a digest for surrogate-bearing metadata.
+
+    Ours must not raise, because it runs against **live** ``tools/list``
+    metadata rather than a crawl the producer controls, inside the bind loop
+    over every tool of every connection — and neither call site guards it. A
+    tool crawled clean and later serving a surrogate in its description binds by
+    name, reaches this, and took down every ``tools/list`` and ``tools/call`` in
+    bundle mode rather than drifting alone (#761). Escaping makes it total; the
+    resulting digest cannot match one no producer could have published, so such
+    a tool is rejected as DRIFTED, which is the fail-closed outcome the digest
+    exists to produce.
+    """
     return (
-        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+        _json_dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
 
 
