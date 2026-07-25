@@ -257,7 +257,9 @@ def import_command(
     # candidates (an untrusted repo checkout can ship .mcp.json /
     # .cursor/mcp.json) and the user hasn't acknowledged them.
     if repo_local_new and not allow_project_configs:
-        click.echo(project_local_gate_message([cand.name for cand in repo_local_new]), err=True)
+        click.echo(
+            project_local_gate_message([_disp(cand.name) for cand in repo_local_new]), err=True
+        )
         raise SystemExit(2)
 
     # Load existing sidecar up front — needed to decide whether any
