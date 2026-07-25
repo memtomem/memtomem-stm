@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -153,7 +155,7 @@ class SQLitePendingStore:
                 "INSERT OR REPLACE INTO pending_selections VALUES (?, ?, ?, ?, ?)",
                 (
                     key,
-                    json.dumps(selection.chunks, ensure_ascii=False),
+                    _json_dumps(selection.chunks, ensure_ascii=False),
                     selection.format,
                     time.time(),
                     selection.total_chars,
@@ -175,7 +177,12 @@ class SQLitePendingStore:
         if row is None:
             return None
         try:
-            chunks = json.loads(row[0])
+            # Scrub on the way out as well as in. The writer escapes, but this
+            # is a plain ``json.loads``: a ``\ud800`` escape sitting in a row
+            # some other writer (or a hand edit) put there decodes straight back
+            # into the code unit, and would then raise at the next encode
+            # downstream rather than here (#761).
+            chunks = scrub_lone_surrogates(json.loads(row[0]))
         except json.JSONDecodeError:
             logger.warning(
                 "Corrupted chunks_json in pending_selections for key=%s; treating as miss",

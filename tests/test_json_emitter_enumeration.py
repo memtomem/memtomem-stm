@@ -27,10 +27,19 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "memtomem_stm"
 
 # path relative to src/memtomem_stm → (count, why it is not routed)
 #
-# "Hashed or measured" — the string is consumed in-process (length, digest,
-# substring scan) and never encoded to bytes by us, so a surrogate cannot
-# surface. "Encoded by us" entries are the ones that *would* raise; each is
-# either already guarded at the call site or recorded as unaudited in #761.
+# Every entry below is now *audited* — #761 closed the last of the unaudited
+# ones — so each reason names which of these it is, and a new site must do the
+# same rather than inheriting a neighbour's:
+#
+# - "Hashed or measured": consumed in-process (length, digest, substring scan)
+#   and never encoded to bytes by us, so a surrogate cannot surface.
+# - "Safe by ingest": the strings reaching it were escaped where they entered
+#   the process, so nothing unencodable can be in the tree by the time it is
+#   dumped. Prefer this over routing when the dumped length is measured, or
+#   when the same values also reach a non-dumps encoder.
+# - "Unreachable by construction": every path that could put such a value here
+#   refuses it first.
+# - "Guarded at the call site": it can raise, and the caller handles that.
 ALLOWLIST: dict[str, tuple[int, str]] = {
     "proxy/compression.py": (
         26,
@@ -50,24 +59,6 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "the canonical hash input are both routed — the latter encodes on "
         "the very next expression, so 'it is only hashed' did not make it "
         "safe (#757 round 5).",
-    ),
-    "proxy/cache.py": (
-        1,
-        "Response-envelope column in the SQLite cache. sqlite3 encodes text "
-        "parameters to UTF-8, so a surrogate raises at execute time; the "
-        "value is upstream response content rather than anything from a "
-        "config, and this path is unaudited — see #761.",
-    ),
-    "proxy/pending_store.py": (
-        1,
-        "Chunk payload column in the SQLite pending store, same encode-at-"
-        "execute exposure as the response cache and the same unaudited "
-        "upstream-content origin — see #761.",
-    ),
-    "proxy/progressive.py": (
-        1,
-        "Metadata column written through the same pending store; carries the "
-        "server and tool names alongside upstream content — see #761.",
     ),
     "mms/drift.py": (
         1,

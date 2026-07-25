@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
@@ -67,7 +68,7 @@ class ProgressiveStoreAdapter:
         self._store = store
 
     def put(self, key: str, resp: ProgressiveResponse) -> None:
-        meta = json.dumps(
+        meta = _json_dumps(
             {
                 "total_lines": resp.total_lines,
                 "content_type": resp.content_type,
