@@ -617,3 +617,70 @@ def test_list_without_prune_ignores_held_lock(runner, sandbox, monkeypatch):
 
     assert res.exit_code == 0, res.output
     assert "proj" in res.output
+
+
+class TestDisplayEscaping:
+    """Project names come from ``--name`` (argv, so a lone surrogate arrives via
+    POSIX ``surrogateescape``), from the marker file, and from the project
+    index; MCP names come from argv and the registry. All of them are printed
+    into prose and into a tab-separated listing. First escaping coverage for
+    this surface (#760)."""
+
+    HOSTILE = "ev\x1b[31m\ril"
+
+    @staticmethod
+    def _assert_clean(output: str) -> None:
+        assert "\x1b" not in output
+        assert "\r" not in output
+
+    def test_show_escapes_project_name(self, runner, sandbox):
+        runner.invoke(project_group, ["init", "--name", self.HOSTILE])
+        res = runner.invoke(project_group, ["show"])
+
+        assert res.exit_code == 0, res.output
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        self._assert_clean(res.output)
+
+    def test_show_json_leg_keeps_the_name_raw(self, runner, sandbox):
+        runner.invoke(project_group, ["init", "--name", self.HOSTILE])
+        res = runner.invoke(project_group, ["show", "--json"])
+
+        assert res.exit_code == 0, res.output
+        assert json.loads(res.output)["name"] == self.HOSTILE
+
+    def test_list_escapes_indexed_name(self, runner, sandbox):
+        runner.invoke(project_group, ["init", "--name", self.HOSTILE])
+        res = runner.invoke(project_group, ["list"])
+
+        assert res.exit_code == 0, res.output
+        self._assert_clean(res.output)
+
+    def test_enable_and_disable_escape_the_project_name(self, runner, sandbox):
+        _seed_registry("gh")
+        runner.invoke(project_group, ["init", "--name", self.HOSTILE])
+
+        enabled = runner.invoke(project_group, ["enable", "gh"])
+        assert enabled.exit_code == 0, enabled.output
+        self._assert_clean(enabled.output)
+
+        disabled = runner.invoke(project_group, ["disable", "gh"])
+        assert disabled.exit_code == 0, disabled.output
+        self._assert_clean(disabled.output)
+
+    def test_unknown_mcp_error_escapes_the_name_from_argv(self, runner, sandbox):
+        """``mms project enable`` echoes back names the user typed, so this one
+        is reachable without any config on disk carrying a hostile value."""
+        _seed_registry("gh")
+        runner.invoke(project_group, ["init"])
+        res = runner.invoke(project_group, ["enable", self.HOSTILE])
+
+        assert res.exit_code != 0
+        assert "Unknown MCP name(s)" in res.output
+        self._assert_clean(res.output)
+
+    def test_project_not_found_error_escapes_the_name_from_argv(self, runner, sandbox):
+        res = runner.invoke(project_group, ["show", self.HOSTILE])
+
+        assert res.exit_code != 0
+        assert "not found in" in res.output, res.output
+        self._assert_clean(res.output)
