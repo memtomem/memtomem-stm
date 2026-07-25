@@ -257,6 +257,13 @@ changes inline only. See the deprecation policy in
   length of a re-serialized payload, so escaping later would have made them
   count a string six characters shorter per surrogate than the one actually
   delivered. (#761)
+- The same escaping now covers replies from the LTM core, so a surrogate in a
+  surfaced memory or in a review candidate no longer fails the STM tool
+  response carrying it. Two entry points, and each is needed: the SDK decodes a
+  surrogate off Core's wire into the text we read, and Core also returns JSON
+  *inside* that text, where the six characters `\ud800` are a legal escape
+  that survives text-level escaping and then decodes into a fresh code unit
+  when that nested document is parsed. Clean replies are unchanged. (#761)
 
 ## [0.1.42] — 2026-07-25
 

@@ -79,8 +79,11 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
     "server.py": (
         1,
         "MCP tool response text, serializing values parsed out of Core's "
-        "nested candidate JSON. Same false 'the SDK owns it' reasoning as "
-        "``compression.py`` and the same real exposure — deferred to #761.",
+        "nested candidate JSON. Safe as of #761: those values are escaped "
+        "where they enter, by ``mcp_client._result_text`` (a surrogate the "
+        "SDK decoded off Core's wire) and ``_core_json_loads`` (one a legal "
+        "``\\ud800`` escape in Core's NESTED document would re-create after "
+        "the first escape). Both are needed; neither alone closes it.",
     ),
     "cli/hook_cmd.py": (
         1,

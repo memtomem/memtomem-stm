@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1795,3 +1796,61 @@ class TestWarmUp:
 
         await adapter.stop()
         assert record["exited_ids"] == [first_id]
+
+
+class TestCoreSurrogateScrub:
+    """Core's replies reach us two ways, and only one is closed by escaping the
+    text we receive (#761).
+
+    A surrogate on the *wire* is decoded into ``TextContent.text`` by the SDK
+    before we see it. But Core also returns JSON *inside* that text — the
+    candidate object, the version block, the search results — and parsing that
+    nested document decodes a ``\\ud800`` escape into a fresh code unit after
+    any escaping we did on the text. So both the read and the parse are covered.
+    """
+
+    def test_result_text_escapes_a_wire_surrogate(self):
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        result = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="a\ud800b")],
+        )
+        text = McpClientSearchAdapter._result_text(result)
+
+        assert text == "a\\ud800b"
+        text.encode("utf-8")  # the encode every consumer downstream performs
+
+    def test_result_text_leaves_clean_content_identical(self):
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        result = SimpleNamespace(
+            content=[
+                SimpleNamespace(type="text", text="서버 🚀"),
+                SimpleNamespace(type="text", text="second"),
+            ],
+        )
+        assert McpClientSearchAdapter._result_text(result) == "서버 🚀\nsecond"
+
+    def test_nested_core_json_does_not_re_create_the_surrogate(self):
+        """The half escaping the text cannot reach: the six ASCII characters
+        ``\\ud800`` sit in Core's *nested* document as a legal JSON escape, so
+        they survive any text-level escaping untouched and then decode."""
+        from memtomem_stm.surfacing.mcp_client import _core_json_loads
+
+        payload = _core_json_loads('{"review_hint": "run \\ud800 now"}')
+
+        assert payload == {"review_hint": "run \\ud800 now"}
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def test_nested_core_json_is_unchanged_when_clean(self):
+        from memtomem_stm.surfacing.mcp_client import _core_json_loads
+
+        assert _core_json_loads('{"a": [1, "서버"], "b": null}') == {"a": [1, "서버"], "b": None}
+
+    def test_malformed_nested_json_still_raises_for_its_caller(self):
+        """Every call site distinguishes a decode error from an empty result,
+        so the scrub must not swallow or re-type the exception."""
+        from memtomem_stm.surfacing.mcp_client import _core_json_loads
+
+        with pytest.raises(json.JSONDecodeError):
+            _core_json_loads("not json")
