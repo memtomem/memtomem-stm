@@ -619,3 +619,65 @@ class TestDisplayEscaping:
         assert "Conflicts:" in res.output
         assert "\x1b" not in res.output
         assert "\r" not in res.output
+
+
+class TestUnencodableEntryGate:
+    """A host config can hold a lone surrogate — it is plain ``json.loads`` with
+    no character validation, and ``"\\ud800"`` is a legal JSON escape.
+
+    Such an entry is unusable end to end: ``compute_drift_hash`` encodes its
+    canonical form, TOML cannot represent the character at all, and the name is
+    a cache-key component. Before the gate, one of them aborted the whole
+    ``--apply`` with an uncaught ``UnicodeEncodeError`` and **nothing** was
+    imported, so a clean sibling was lost to an unrelated entry's defect (#761).
+    """
+
+    @staticmethod
+    def _seed(sandbox, *, where: str):
+        bad = {"command": "npx", "args": [], "env": {}}
+        if where == "env":
+            bad["env"] = {"TOK": "a\ud800b"}
+        elif where == "command":
+            bad["command"] = "np\ud800x"
+        elif where == "args":
+            bad["args"] = ["--flag=\ud800"]
+        entry = {"clean": {"command": "npx"}, "bad": bad}
+        if where == "name":
+            entry = {"clean": {"command": "npx"}, "b\ud800d": {"command": "npx"}}
+        _seed_claude_code(sandbox, entry)
+
+    @pytest.mark.parametrize("where", ["env", "command", "args", "name"])
+    def test_apply_skips_the_entry_and_still_imports_its_sibling(self, runner, sandbox, where):
+        self._seed(sandbox, where=where)
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert res.exception is None
+        registry = state.load_registry()
+        assert "clean" in registry.servers
+        assert len(registry.servers) == 1
+
+    def test_the_skip_names_the_field_but_never_its_value(self, runner, sandbox):
+        """Env values are routinely secrets, and this text reaches CI logs —
+        the same rule ``mms add`` and the discovery scan follow."""
+        self._seed(sandbox, where="env")
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert "TOK" in res.output
+        assert "not valid UTF-8" in res.output
+        assert "\ud800" not in res.output
+
+    def test_plan_reports_the_skip_before_anything_is_written(self, runner, sandbox):
+        self._seed(sandbox, where="env")
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+
+        assert res.exit_code == 0, res.output
+        assert "not valid UTF-8" in res.output
+
+    def test_a_clean_import_is_completely_unaffected(self, runner, sandbox):
+        _seed_claude_code(sandbox, {"a": {"command": "npx"}, "b": {"command": "uvx"}})
+        res = runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+
+        assert res.exit_code == 0, res.output
+        assert "not valid UTF-8" not in res.output
+        assert set(state.load_registry().servers) == {"a", "b"}
