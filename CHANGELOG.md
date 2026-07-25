@@ -138,6 +138,63 @@ changes inline only. See the deprecation policy in
   renders as one escaped line in `mms eject`'s and `mms prune`'s failure
   lists, where it previously wrapped across several.
   (#759, fixes #755)
+- A lone surrogate in a config no longer crashes the CLI's JSON output after
+  the write it was reporting. `json.dumps(..., ensure_ascii=False)` — which
+  keeps CJK and emoji readable — leaves such a code unit raw in the string it
+  returns, so the `UnicodeEncodeError` landed at the `click.echo` or file write
+  that encoded it. `mms remove <name> --yes --json` deleted the entry, saved
+  the config, and *then* failed rendering the report: exit 1 and empty stdout
+  for an operation that had succeeded. Every JSON document the CLI emits — the
+  `--json` legs of `add`/`remove`/`prune`/`eject` including their error and
+  `confirmation_required` envelopes, the read-only `status`/`list`/`stats`/
+  `health`/`doctor`/`tune` payloads, `mms host`, `mms project route`,
+  `mms config validate`, the lock-timeout envelope, and the PostToolUse hook's
+  reply to Claude/Codex/Cursor — and every JSON config writer that passed
+  `ensure_ascii=False` now goes through a serializer that re-escapes those code
+  units as `\udxxx`. (The writers that omit it, and the TOML writers, were never
+  exposed.) Two things
+  could supply one: config is plain `json.loads` with no character validation
+  and `"\ud800"` is a legal JSON escape, so an imported or hand-edited config
+  could carry it as a server name; and on POSIX a command-line argument holding
+  a byte that is not valid UTF-8 is decoded with `surrogateescape`, so
+  `mms add $'s\xffv' ...` alone produced a name the CLI then could not write.
+  Clean payloads render byte-identically, and a rewritten config decodes back to
+  the identical name rather than losing the entry. `mms eject`'s manual
+  `claude mcp add-json` hint is not a JSON document and needs none of this: its
+  command form is refused wholesale by `_shell_join` and its `# Edit` form is
+  display-escaped, both since #756. The argv `mms eject` actually spawns was
+  the real remaining exposure there — see the entry below. (#758, fixes #757)
+- The commands that *create* an upstream server now refuse a name that is not
+  valid UTF-8, rather than storing one that fails later. Being writable is not
+  the same as being usable: the server name is the first component of the
+  response-cache key and part of the Toolgraph contract fingerprint, both of
+  which hash encoded bytes and raise on such a character, and TOML cannot
+  represent it at all, so `mms import`'s registry could never hold one either.
+  **Behavior change**: `mms add <name>` now exits 1 with an `invalid_name`
+  error — under `--json` too — where it previously aborted with an
+  `UnicodeEncodeError` traceback having written nothing. `mms init`'s manual
+  prompt refuses as well (its `--json` envelope reports the generic setup
+  failure, not `invalid_name`), and the discovery scan behind
+  `mms add --from-clients` and `mms init` skips such an entry, with a note on
+  stderr, instead of importing it — so the other servers in that host config
+  still import. `list`, `remove`, `surfacing` and the rest stay permissive by
+  design, so a config that already holds such a name can be inspected and
+  repaired: `mms remove` clears the entry and `mms surfacing <name> off`
+  toggles it in either output mode, this change covering the `--json` reports
+  and the display escape covering the printed lines. Making the config writable
+  is what newly exposed that second half — before it, these commands failed
+  inside the write, so nothing had changed yet; afterwards the write lands and
+  only the report can still fail. Every command that writes the config was
+  re-checked by running it against such a config and comparing the file before
+  and after, and none now mutates and then raises. The read-only renderings of
+  `mms list`, `mms doctor` and `mms health` print the name display-escaped
+  rather than raising, as of #759 — the two escapes meet there, and a test
+  pins all three text legs so a regression in either shows up as a crash.
+  `mms eject` is checked the same way before it spawns either `claude mcp`
+  verb: the name and payload go out as subprocess arguments, which encode to
+  UTF-8, so the command now reports "server name or payload is not valid
+  UTF-8" and leaves both sides intact where it previously raised — after the
+  destructive pre-remove, on the `--force` path. (#758)
 
 ## [0.1.42] — 2026-07-25
 

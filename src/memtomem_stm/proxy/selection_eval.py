@@ -28,6 +28,7 @@ from memtomem_stm.proxy.manager import ProxyToolInfo
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.proxy.selection_log import SCHEMA_VERSION
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
+from memtomem_stm.utils import json_out
 from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25,
     RANKER_VERSION_BM25_GRAPH_RISK,
@@ -62,8 +63,12 @@ class SelectionEvaluationReport:
         return json.loads(self.to_json())
 
     def to_json(self, *, indent: int = 2) -> str:
+        # Surrogate-safe (#757): this is what `mms selection replay --json`
+        # echoes and what `--output-dir` writes, and the report embeds
+        # telemetry strings such as ``query_source`` that arrive through
+        # ``json.loads``, where ``"\udcff"`` is a legal escape.
         return (
-            json.dumps(
+            json_out.dumps(
                 self.data, indent=indent, sort_keys=True, ensure_ascii=False, allow_nan=False
             )
             + "\n"
@@ -205,7 +210,11 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
     for split in ("train", "validation", "test"):
         if rankable_counts[split] == 0:
             raise SelectionEvaluationError(f"{split} split needs at least one rankable case")
-    canonical = json.dumps(
+    # Encoded on the next expression, so this is one of the sites that
+    # raises rather than one that only measures (#757): a fixture case may
+    # carry a legal ``"\ud800"`` escape, and `mms selection replay` does not
+    # catch `UnicodeEncodeError`.
+    canonical = json_out.dumps(
         data,
         sort_keys=True,
         ensure_ascii=False,
