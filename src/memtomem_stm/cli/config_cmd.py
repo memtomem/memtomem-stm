@@ -25,6 +25,7 @@ import click
 from pydantic import ValidationError
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.proxy.config import (
     ProxyConfig,
@@ -134,13 +135,19 @@ def validate_command(config_path: str, as_json: bool) -> None:
             )
         )
     else:
-        click.echo(f"Validating {resolved}")
+        # Every value below is config- or argv-derived and none is validated:
+        # an unknown key is whatever the file contains, a pydantic `loc` is
+        # built from the config's own keys (so a hostile *server name* renders
+        # inside `upstream_servers.<name>.prefix`), and `resolved` comes from
+        # `--config`. Escape the interpolated value only — the `_err`/`_warn`
+        # styling wraps around it and its escape codes must stay real (#760).
+        click.echo(f"Validating {_disp(str(resolved))}")
         for msg in errors:
-            click.echo(f"{_err('Error:')} {msg}")
+            click.echo(f"{_err('Error:')} {_disp(msg)}")
         for path in unknown_keys:
-            click.echo(f"{_err('Error:')} unknown key (silently ignored at runtime): {path}")
+            click.echo(f"{_err('Error:')} unknown key (silently ignored at runtime): {_disp(path)}")
         for msg in warnings:
-            click.echo(f"{_warn('Warning:')} {msg}")
+            click.echo(f"{_warn('Warning:')} {_disp(msg)}")
         if status == "ok":
             click.echo(_ok("OK") + " — config is valid")
         else:
