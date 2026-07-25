@@ -39,6 +39,46 @@ async def test_encode_read_round_trip():
     assert got == frame  # embedded newline survived as an escaped char
 
 
+async def test_encode_line_survives_a_lone_surrogate():
+    # ``encode_line`` ends in an explicit ``.encode("utf-8")``, so a lone
+    # surrogate anywhere in the frame raised and took the connection with it —
+    # on the daemon side that meant the client saw a silently closed socket
+    # rather than an error frame (#761).
+    frame = protocol.surface_response({"text": "a\ud800b"})
+    wire = protocol.encode_line(frame)
+
+    assert wire.endswith(b"\n") and wire.count(b"\n") == 1
+    assert b"\\ud800" in wire
+
+
+async def test_a_surrogate_bearing_frame_round_trips_as_inert_text():
+    # The write-side escape alone is not enough: ``json.loads`` decodes
+    # ``\ud800`` straight back into the code unit, which would then raise in
+    # the *receiving* process at its next encode. The read side scrubs so the
+    # value arrives as the six literal characters and stays encodable.
+    frame = protocol.surface_response({"text": "a\ud800b"})
+    got = await protocol.read_message(_reader_with(protocol.encode_line(frame)))
+
+    assert got["output"]["text"] == "a\\ud800b"
+    protocol.encode_line(got)  # re-framing what we received must not raise
+
+
+async def test_read_message_scrubs_a_surrogate_the_peer_sent_raw():
+    # A peer that did not escape — an older build, or anything else speaking
+    # this protocol — can still put a surrogate on the wire as a legal JSON
+    # escape. The read side owns making what we hand upward encodable.
+    raw = b'{"v":7,"ok":true,"output":{"text":"a\\ud800b"}}\n'
+    got = await protocol.read_message(_reader_with(raw))
+
+    assert got["output"]["text"] == "a\\ud800b"
+
+
+async def test_read_message_leaves_a_clean_frame_identical():
+    frame = protocol.build_request("tok", protocol.OP_SURFACE, {"msg": "서버 🚀"})
+    got = await protocol.read_message(_reader_with(protocol.encode_line(frame)))
+    assert got == frame
+
+
 async def test_read_message_closed_stream():
     with pytest.raises(protocol.ProtocolError):
         await protocol.read_message(_reader_with(b""))

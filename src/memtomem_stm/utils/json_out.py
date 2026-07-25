@@ -1,10 +1,20 @@
-"""UTF-8-safe JSON serialization for the CLI's ``--json`` legs and config
-writers.
+"""UTF-8-safe JSON serialization and lone-surrogate scrubbing.
 
 Lives in its own leaf module (imports nothing from the package) because
 every JSON emitter needs it: ``proxy``, ``mms_host``, ``mms_project``,
 ``config_cmd`` and ``_write_lock`` — and ``_write_lock`` is imported *by*
-``proxy``, so the helper cannot live there without a cycle.
+``proxy``, so the helper cannot live there without a cycle. The daemon and
+the proxy pipeline import it for the same reason.
+
+Two shapes of helper, for two different jobs (#761):
+
+- :func:`dumps` for an emitter — a value we are *serializing now*, where the
+  escape belongs in the emitted text and a consumer decodes it back.
+- :func:`escape_lone_surrogates` / :func:`scrub_lone_surrogates` for an
+  *ingest* point — content arriving from an upstream server, the daemon wire
+  or Core, where the surrogate is escaped once on the way in so that every
+  later encode (a ``TextContent`` serialization, a SQLite parameter, a
+  fingerprint) is total without each of them having to know about this.
 """
 
 from __future__ import annotations
@@ -38,20 +48,23 @@ def dumps(payload: Any, **kwargs: Any) -> str:
 
     So re-escape those code units after the fact. This is safe as a blanket
     substitution over the dumped text **for the keyword arguments this module's
-    callers pass** — ``indent``, ``sort_keys``, and nothing else. Under those,
-    every structural character ``dumps`` emits is ASCII, so a raw surrogate can
-    only appear inside a string literal; and ``dumps`` escapes ``\\`` as
-    ``\\\\``, so the substituted character is always preceded by an *even*
-    number of backslashes and the inserted ``\\u`` therefore opens a fresh
-    escape rather than continuing one. The result is valid JSON, and
+    callers pass** — ``indent``, ``sort_keys``, and ``separators`` holding only
+    ASCII. Under those, every structural character ``dumps`` emits is ASCII, so
+    a raw surrogate can only appear inside a string literal; and ``dumps``
+    escapes ``\\`` as ``\\\\``, so the substituted character is always preceded
+    by an *even* number of backslashes and the inserted ``\\u`` therefore opens
+    a fresh escape rather than continuing one. The result is valid JSON, and
     ``json.loads(dumps(x)) == x`` for every *lone* surrogate — see the pair
     caveat two paragraphs down for the one input where it does not hold.
 
-    Both halves depend on that argument contract. A caller passing a surrogate
-    inside ``separators`` would have it escaped *structurally*, yielding text
-    that no longer parses; a ``default=`` returning one is fine, since it is
-    escaped as data like any other. Do not widen the contract without
-    revisiting this.
+    Both halves depend on that argument contract, and the ASCII qualifier on
+    ``separators`` is the whole of it: a caller passing a surrogate *inside*
+    ``separators`` would have it escaped **structurally**, yielding text that no
+    longer parses. Compact separators (``(",", ":")``, which the daemon frame,
+    the fingerprints and the cache envelope all pass) are ASCII and so change
+    nothing about the argument above. A ``default=`` returning a surrogate is
+    fine, since its result is escaped as data like any other. Do not widen the
+    contract further without revisiting this.
 
     One inherited caveat on the round-trip: a string holding an *adjacent*
     high-then-low pair decodes back as the single astral character they encode,
@@ -75,6 +88,79 @@ def dumps(payload: Any, **kwargs: Any) -> str:
     matches nothing and the dumped text is returned unchanged.
     """
     return _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", json.dumps(payload, **kwargs))
+
+
+def escape_lone_surrogates(text: str) -> str:
+    """``text`` with every lone surrogate replaced by its ``\\udxxx`` literal.
+
+    The ingest-side counterpart to :func:`dumps`. Where ``dumps`` escapes into
+    text a consumer will decode back, this escapes into the *value itself*: the
+    six ASCII characters ``\\ud800`` replace one unencodable code unit, so
+    everything downstream — a ``json.dumps``, a ``TextContent`` serialization, a
+    SQLite text parameter, a ``.encode()`` for a digest — is total without
+    knowing this happened. Crucially the result is inert under a later
+    dumps/loads round trip: ``dumps`` renders the backslash as ``\\\\`` and
+    ``loads`` decodes it back to the same six characters, so the surrogate
+    cannot re-materialize downstream the way it does when only the emitter
+    escapes (#761).
+
+    Returns the input object UNCHANGED (same identity) when there is nothing to
+    escape, so the overwhelmingly common case allocates nothing.
+
+    Lowercase to match :func:`dumps` and ``json.dumps``'s own
+    ``ensure_ascii=True`` style. Like the display escaping in ``cli/_display``
+    this is non-injective — text that already held the six literal characters
+    ``\\ud800`` is indistinguishable from text that held the code unit — which
+    is the accepted trade for a value that otherwise cannot be delivered at all.
+    """
+    if _LONE_SURROGATE.search(text) is None:
+        return text
+    return _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+
+
+def scrub_lone_surrogates(value: Any) -> Any:
+    """:func:`escape_lone_surrogates` applied to every string in a parsed tree.
+
+    For ingest points that receive a decoded structure rather than one string —
+    a daemon frame, an upstream JSON payload, Core's nested candidate object.
+    Dict *keys* are scrubbed too: a key encodes exactly like a value does.
+
+    Returns the input object UNCHANGED (same identity) when it holds no lone
+    surrogate, mirroring ``compression._sanitize_nonfinite``'s no-copy fast path
+    so this can be folded into the same walk without costing an allocation on
+    the clean path.
+
+    Two consequences of scrubbing a key, both confined to the already-broken
+    input and both acceptable for a JSON object, whose member order carries no
+    meaning: a rewritten key moves to the end of its object, and if it collides
+    with a key that already held those literal characters the two merge, last
+    one winning. Values are rewritten in place, so an object whose keys are all
+    clean keeps its order exactly.
+    """
+    if isinstance(value, str):
+        return escape_lone_surrogates(value)
+    if isinstance(value, dict):
+        replaced: dict[Any, Any] | None = None
+        for key, item in value.items():
+            new_key = escape_lone_surrogates(key) if isinstance(key, str) else key
+            new_item = scrub_lone_surrogates(item)
+            if new_key is not key or new_item is not item:
+                if replaced is None:
+                    replaced = dict(value)
+                if new_key is not key:
+                    del replaced[key]
+                replaced[new_key] = new_item
+        return replaced if replaced is not None else value
+    if isinstance(value, list):
+        replaced_seq: list[Any] | None = None
+        for index, item in enumerate(value):
+            new_item = scrub_lone_surrogates(item)
+            if new_item is not item:
+                if replaced_seq is None:
+                    replaced_seq = list(value)
+                replaced_seq[index] = new_item
+        return replaced_seq if replaced_seq is not None else value
+    return value
 
 
 def unencodable_field(entry: object, path: str = "") -> str | None:

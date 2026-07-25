@@ -210,6 +210,19 @@ changes inline only. See the deprecation policy in
   still produce distinct digests, so two configs cannot collapse onto one
   handshake or lock file. A value with nothing to escape hashes byte-identically
   to before, so no existing daemon is orphaned by this. (#761)
+- A lone surrogate in a hook↔daemon frame no longer fails the connection.
+  `encode_line` ends in an explicit `.encode("utf-8")`, so such a frame raised
+  and the peer saw the socket close with no response — a hook waiting on a
+  reply, not an error it could report. Both ends are now covered, not just the
+  write end: the frame is serialized through the same surrogate-escaping writer
+  the `--json` legs use, and `read_message` escapes what it decodes. The read
+  half is load-bearing rather than belt-and-braces, because the write half's
+  escape is the *JSON* one and `json.loads` decodes it faithfully back into the
+  code unit — escaping only on the way out would have moved the failure into
+  the receiving process, at whichever encode it reached next. It also covers a
+  peer that never escaped it. A frame with nothing to escape is byte-identical
+  on the wire and decodes to an equal object, so this is invisible to every
+  existing exchange. (#761)
 
 ## [0.1.42] — 2026-07-25
 
