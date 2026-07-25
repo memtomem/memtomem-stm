@@ -18,6 +18,7 @@ from typing import Any
 import click
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
 from memtomem_stm.mms import state
@@ -538,11 +539,7 @@ def route_cmd(
 
     # Everything below prints AFTER the `_save` above, and every value is
     # registry- or config-derived, so an unrenderable one here would be a
-    # mutate-then-crash (#757). `_disp` lives in `cli.proxy`, which imports
-    # this module for registration — import it at call time to keep that one
-    # way (#756).
-    from memtomem_stm.cli.proxy import _disp
-
+    # mutate-then-crash (#757).
     mode = "Apply" if do_apply else "Preview"
     click.echo(f"{mode} project routes for '{_disp(project.name)}' -> {_disp(str(path))}")
     if planned:
