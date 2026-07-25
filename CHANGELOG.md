@@ -88,6 +88,56 @@ changes inline only. See the deprecation policy in
   tables, the discovery/`mms add` flow, the eject summary and backup-log lines,
   and `mms health --names` / `mms doctor` — are deferred to #755.
   (#756, fixes #754)
+- The same display escaping now covers the rest of the terminal output that
+  carries a value nobody validated. Which values those are, by command:
+  `mms list`'s table cells (name, prefix, transport, compression, origin,
+  command/URL); `mms prune`'s and the import previews' candidate rows, whose
+  command/URL cell comes from *another* client's config; the discovery flow's
+  `Configuring '<name>'` header, probe results and import summary; `mms add`'s
+  own name echoes and its `--validate` failure text; `mms eject`'s refusal
+  reason, plan, warning, secret-gate prompt and failure lines; `mms health`'s
+  server lines and, under `--names`, the tool names the upstream advertised
+  over `tools/list`; `mms doctor`'s check labels and details; `mms stats`'s
+  per-tool compression table and `mms tune`'s preview, selector and per-tool
+  confirmation prompt, which key on tool names recorded from the upstream at
+  call time; `mms surfacing`'s name echoes; `mms gateway status`/`explain`;
+  the prefix-collision error; and the config-validation warning shared by
+  `status`, `health` and `tune`, whose text names the offending config key.
+  Unchanged: every `--json`
+  payload and every `_json_fail` envelope keep raw values — those are decoded
+  by a consumer, not read off a terminal — as do the copy/paste hints, which
+  `_shell_join` already refuses wholesale for this character class. Also
+  untouched, and not part of this change: values passed as argv by the user
+  running the command, and the same class of site in `mms host`,
+  `mms project`, `mms import`, `mms config validate` and `mms hook`, whose
+  modules have no access to this helper.
+  Three of these were more than cosmetic. `mms health --names` and the two
+  metrics-derived tables are the first sites where the value is chosen by a
+  *remote* party rather than by whoever wrote the config: a proxied server
+  picks the tool names it advertises, so reaching this output needed no
+  access to any file on the machine — and in `mms tune` such a name renders
+  inside the prompt whose answer authorizes a config write. And in
+  `mms list`, a name containing a lone surrogate — `"\ud800"` is a legal JSON
+  escape, so such a config loads fine — made the command exit 1 with a bare
+  `UnicodeEncodeError` and print no table at all; the row now renders with the
+  character escaped. (The `--json` half of that failure is #757, separate.)
+  Column widths are unchanged: an escaped value is longer than its raw form
+  and so overflows its cell, exactly as an over-long ordinary name already
+  did. `mms prune`'s preview, the one table whose width is computed rather
+  than fixed, measures the escaped names so its second column stays aligned.
+  Names are still padded by character count, so a CJK or emoji name misaligns
+  the table by as much as it did before — that is unrelated and untouched.
+  **Behavior change**: the JSON snippet printed by `mms register --mcp skip`
+  and by `mms init`'s skip option now renders `command` through `json.dumps`
+  like the neighbouring `args` and `env`, instead of wrapping the value in
+  literal quotes. The snippet is meant to be pasted into a client's config
+  file, and for any path containing `\` or `"` — on Windows, every path — it
+  previously produced a document that would not parse back. A path needing no
+  escaping renders byte-identically.
+  **Behavior change**: a multi-line message from a host client's CLI now
+  renders as one escaped line in `mms eject`'s and `mms prune`'s failure
+  lists, where it previously wrapped across several.
+  (#759, fixes #755)
 
 ## [0.1.42] — 2026-07-25
 

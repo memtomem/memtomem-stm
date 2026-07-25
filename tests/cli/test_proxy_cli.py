@@ -776,6 +776,36 @@ class TestDisp:
         assert _disp(r"C:\srv\u001B") == r"C:\srv\u001B"
 
 
+class TestFormatCandidateDetail:
+    """``_format_candidate_detail`` renders *another client's* config into a
+    terminal cell — a preview list, the picker title, a prune row — so it
+    escapes its own result once rather than leaving six call sites to
+    remember (#755). Pinned here because the questionary picker, one of
+    those callers, has no CliRunner-drivable path."""
+
+    def test_stdio_command_and_args_are_escaped(self):
+        from memtomem_stm.cli.proxy import _format_candidate_detail
+
+        out = _format_candidate_detail(
+            {"transport": "stdio", "command": "np\rx", "args": ["-y", "pk\x1bg"]}
+        )
+        assert out == "[stdio] np\\u000Dx -y pk\\u001Bg"
+
+    def test_url_and_transport_label_are_escaped(self):
+        from memtomem_stm.cli.proxy import _format_candidate_detail
+
+        out = _format_candidate_detail({"transport": "s\rse", "url": "https://x/m\rcp"})
+        assert out == "[s\\u000Dse] https://x/m\\u000Dcp"
+
+    def test_ordinary_entry_renders_unchanged(self):
+        """The escaping must be invisible on every real candidate — CJK and
+        emoji included, since discovered configs routinely carry them."""
+        from memtomem_stm.cli.proxy import _format_candidate_detail
+
+        entry = {"transport": "stdio", "command": "npx", "args": ["-y", "@서버/mcp-🚀"]}
+        assert _format_candidate_detail(entry) == "[stdio] npx -y @서버/mcp-🚀"
+
+
 # ── _load / config-corruption paths ──────────────────────────────────────
 
 
@@ -1220,6 +1250,57 @@ class TestListServers:
         # Same pin for the ORIGIN column added in #475 PR4 ("-" is the
         # no-provenance cell; this entry was added manually).
         assert row[header.index("ORIGIN")] == "-"
+
+    def test_hostile_cell_escapes_without_disturbing_the_clean_row(self, runner, config):
+        """A CR in any cell used to redraw the row over the one above it,
+        so a single hand-edited entry could hide or forge every line of
+        the table. Each cell is escaped inside its pad (#755) — and the
+        clean row's columns must still land exactly where the header says,
+        which is what pins that escaping is a no-op on ordinary names."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "clean": {"prefix": "cl", "command": "npx"},
+                        "ev\ril": {"prefix": "ev", "command": "np\rx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        header = next(line for line in lines if "NAME" in line and "TRANSPORT" in line)
+        hostile = next(line for line in lines if line.startswith("ev\\u000Dil"))
+        assert "np\\u000Dx" in hostile
+        assert "\r" not in result.output
+
+        clean = next(line for line in lines if line.startswith("clean"))
+        assert header.index("COMPRESSION") == clean.index("auto")
+        assert clean[header.index("SURFACING") :].startswith("on")
+        assert clean[header.index("ORIGIN")] == "-"
+
+    def test_lone_surrogate_name_renders_instead_of_crashing(self, runner, config):
+        """A lone surrogate is the one member of the escape class that did
+        more than garble the table: `"\\ud800"` is a legal JSON escape, so
+        it loads fine and then cannot be encoded, and printing the row
+        raised `UnicodeEncodeError` with no diagnosis. Escaping the cell
+        removes it before the terminal write."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"s\ud800v": {"prefix": "s", "command": "npx"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert result.exception is None
+        assert "s\\uD800v" in result.output
 
     def test_list_surfacing_column_shows_toggle(self, runner, config):
         """The SURFACING column is the per-server toggle's visible home
@@ -2234,6 +2315,32 @@ class TestAddValidate:
         if config.exists():
             data = json.loads(config.read_text(encoding="utf-8"))
             assert "bad" not in data.get("upstream_servers", {})
+
+    def test_probe_failure_escaped_in_text_but_raw_in_json(self, runner, config, monkeypatch):
+        """One `msg` feeds both the printed error and the ``--json`` error
+        text, so the escaping goes on the printed copy only (#755): the
+        probe error is the upstream's failure text, which reaches the
+        terminal before anything about this server was written."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(stage=ProbeStage.CONFIGURED, error="boom\rFAKE Validated:")
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        argv = ["add", "srv", "--prefix", "s", "--command", "x", "--validate", *_cfg_args(config)]
+
+        result = runner.invoke(cli, argv)
+        assert result.exit_code == 1
+        assert "boom\\u000DFAKE Validated:" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, [*argv, "--json"])
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert "boom\rFAKE Validated:" in data["message"]
 
     def test_validate_success_writes_entry_with_tool_count(self, config):
         """Probe against the repo's fake MCP server — should report tool count.
@@ -4651,6 +4758,30 @@ class TestRegisterCommand:
         assert "claude mcp add memtomem-stm" in result.output
         assert "mms register" in result.output
 
+    @pytest.mark.parametrize(
+        "server_cmd",
+        [r"C:\Users\me\py.exe", 'we"ird', "sp ace/mms", "서버/mms"],
+    )
+    def test_skip_hint_json_snippet_is_pastable(self, runner, config, monkeypatch, server_cmd):
+        """The snippet is not prose — the user pastes it into a client's
+        config file. Hand-writing the quotes around ``command`` (the one
+        value that did not go through ``json.dumps``) produced a document
+        that would not parse back for any Windows path, since its
+        separators escape and a ``"`` closes the string early (#755)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod, "_registration_command", lambda _p: (server_cmd, ["run"], {"K": "v"})
+        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(cli, ["register", "--mcp", "skip", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        snippet = next(ln for ln in result.output.splitlines() if '"mcpServers"' in ln)
+        parsed = json.loads(snippet)
+        entry = parsed["mcpServers"]["memtomem-stm"]
+        assert entry == {"command": server_cmd, "args": ["run"], "env": {"K": "v"}}
+
     def test_register_is_idempotent_when_already_registered(self, runner, config, fake_claude):
         """Re-running register when STM is already in Claude Code and the
         user picks 'keep' → no destructive side effects.
@@ -5577,6 +5708,45 @@ class TestAddFromClients:
         assert len(probe_calls) == 1
         assert set(probe_calls[0].keys()) == {"a"}  # "b" not probed
 
+    def test_candidate_name_escaped_through_the_whole_import(self, runner, config, monkeypatch):
+        """The import walks one name past the user four times — preview,
+        per-server header, probe result, summary — and the name is a key
+        from *another* client's config, which never passed `add`'s
+        validation (#755). The header is the load-bearing one: `_hdr`
+        wraps it in a bold span, so an ESC inside would end the styling
+        this command emitted."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "ev\ril",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=3) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "\r" not in result.output
+        assert "Configuring 'ev\\u000Dil'" in result.output
+        assert "Reachable: ev\\u000Dil" in result.output
+        # The name is still stored verbatim — this is a display fix.
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "ev\ril" in data["upstream_servers"]
+
     def test_prints_source_removal_hint_per_client(self, runner, config, monkeypatch):
         """After a successful import, the user sees a per-source hint for
         removing the direct registration from the originating MCP client.
@@ -6264,6 +6434,40 @@ class TestPruneCommand:
         pairs = {(c[3], c[5]) for c in argvs}
         assert pairs == {("filesystem", "user"), ("filesystem", "local")}
 
+    def test_preview_pads_names_by_their_displayed_width(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """This preview is the only table in the CLI whose column width is
+        computed rather than a literal, and the consent prompt that follows
+        is the user's last look before entries are removed from their other
+        clients. Measuring the stored name would pad the escaped one too
+        narrow and ragged the detail column (#755), so the width comes from
+        the displayed form."""
+        self._seed_config(config, ["clean", "ev\ril"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "clean",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "ev\ril",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "\r" not in result.output
+
+        rows = [ln for ln in result.output.splitlines() if "[stdio] npx" in ln]
+        assert len(rows) == 2
+        assert any(ln.lstrip().startswith("ev\\u000Dil") for ln in rows)
+        assert len({ln.index("[stdio]") for ln in rows}) == 1
+
     def test_divergent_identity_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
         """Same name in STM and source client but different command → the
         user has two intentionally distinct servers sharing a name, not a
@@ -6365,6 +6569,33 @@ class TestPruneCommand:
         assert "could not remove 1 direct registration" in result.output
         assert "boom" in result.output
         assert "claude mcp remove docs-langchain -s user" in result.output
+
+    def test_failure_line_escapes_the_host_clis_stderr(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """The failure line quotes whatever the host client's CLI wrote to
+        stderr — a subprocess we invoked, not a value from any config
+        (#755). It renders on the way out of a partially-completed prune,
+        which is exactly when the user is reading for what survived."""
+        self._seed_config(config, ["docs-langchain"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs-langchain",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        fake_claude["script"] = [
+            _FakeClaudeResult(returncode=1, stderr="boom\rRemoved from source client(s):")
+        ]
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+        assert result.exit_code != 0
+        assert "boom\\u000DRemoved from source client(s):" in result.output
+        assert "\r" not in result.output
 
     # ── --json result summary (#614) ──
 
@@ -7658,6 +7889,52 @@ class TestEjectCommand:
         assert result.exit_code == 0, result.output
         assert "Dry run" in result.output
         assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+    def test_unejectable_plan_escapes_name_and_reason_but_not_json(self, runner, config):
+        """The refusal line folds in both the STM key and whatever the
+        resolver put in the reason — here a recorded origin path (#755).
+        Only the printed copy is escaped: the same values reach ``--json``
+        as ``name`` and ``error``, where a caller compares them against
+        the config it just read."""
+        self._seed_config(
+            config,
+            {"ev\ril": _eject_entry(kind="claude-project", path="/no/such\rdir")},
+        )
+
+        result = runner.invoke(cli, ["eject", "ev\ril", "--dry-run", *_cfg_args(config)])
+        assert "ev\\u000Dil: " in result.output
+        assert "/no/such\\u000Ddir" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["eject", "ev\ril", "--dry-run", "--json", *_cfg_args(config)])
+        data = json.loads(result.stdout)
+        row = data["plan"][0]
+        assert row["name"] == "ev\ril"
+        assert "/no/such\rdir" in row["error"]
+
+    def test_failed_host_write_escapes_the_writers_message(
+        self, runner, config, monkeypatch, fake_claude_host
+    ):
+        """The failure list quotes what the host writer reported — the
+        claude CLI's stderr or an OS error naming the target file, neither
+        of which passed through any validation of ours (#755). It prints
+        while the STM entry is deliberately still in place, so the user is
+        reading it to decide what to retry."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {"demo": _eject_entry()})
+        monkeypatch.setattr(
+            proxy_mod,
+            "_eject_host_write",
+            lambda _plan: (False, "boom\rRestored to host and removed from STM:"),
+        )
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "boom\\u000DRestored to host and removed from STM:" in result.output
+        assert "\r" not in result.output
+        # The entry stays — a failed host write must never orphan it.
         assert "demo" in self._stm_servers(config)
 
     def test_non_tty_without_yes_exits_1(self, runner, config, fake_claude_host):
@@ -10031,6 +10308,48 @@ asyncio.run(main())
         assert data["servers"]["docs"]["connected"] is True
         assert data["servers"]["docs"]["tools"] == 2
 
+    def test_upstream_advertised_values_render_display_escaped(self, runner, config, monkeypatch):
+        """The overflow list and the probe error carry values chosen by the
+        *upstream server*, not by whoever wrote this config (#755): tool
+        names come straight off ``tools/list``, and the error is the
+        connect failure's text. A CR in either would overwrite the line the
+        terminal just drew, so both render escaped — while ``--json``, whose
+        consumer decodes rather than displays, keeps them raw."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "docs": {"prefix": "d", "transport": "stdio", "command": "x"},
+                        "down": {"prefix": "n", "transport": "stdio", "command": "y"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "docs": _probe_ok(tools=1, overflowing=("evil\rtool",)),
+                "down": StagedProbeResult(
+                    stage=ProbeStage.CONFIGURED, error="connect failed\rFAKE ok"
+                ),
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", "--names", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "evil\\u000Dtool" in result.output
+        assert "connect failed\\u000DFAKE ok" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["health", "--names", "--json", *_cfg_args(config)])
+        data = json.loads(result.output)
+        assert data["servers"]["docs"]["overflowing"] == ["evil\rtool"]
+        assert data["servers"]["down"]["error"] == "connect failed\rFAKE ok"
+
 
 # ── doctor command ──────────────────────────────────────────────────────
 
@@ -10523,8 +10842,8 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "stdio child process did not start" in result.output
         # Assert on the ``next:`` line only — the FAIL ``detail`` may echo the
-        # probe's OS error (which can contain the raw command); that is error
-        # reporting, not a copy/paste hint.
+        # probe's OS error, which can name the command (display-escaped since
+        # #755); that is error reporting, not a copy/paste hint.
         next_lines = [ln for ln in result.output.splitlines() if "next:" in ln]
         assert next_lines
         assert any(_HINT_UNRENDERABLE in ln for ln in next_lines)
@@ -10577,6 +10896,48 @@ class TestDoctor:
         ]
         assert data["servers"]["fake"]["stage"] == "tools_discovered"
         assert data["surfacing"]["ltm_server"]["connected"] is False
+
+    def test_check_label_and_detail_escaped_in_text_but_raw_in_json(
+        self, runner, config, monkeypatch
+    ):
+        """A doctor check dict is rendered twice from one source: as a
+        terminal row and as a ``--json`` entry. Only the row is escaped
+        (#755) — escaping inside ``check()`` would change the document a
+        consumer decodes, and the label carries the server name while the
+        detail carries the probe error."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "ev\ril": {"prefix": "ev", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(stage=ProbeStage.CONFIGURED, error="boom\rFAKE PASS")
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "upstream: ev\\u000Dil" in result.output
+        assert "boom\\u000DFAKE PASS" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        data = json.loads(result.output)
+        upstream = next(c for c in data["checks"] if c["id"].startswith("upstream:"))
+        assert upstream["label"] == "upstream: ev\ril"
+        assert "boom\rFAKE PASS" in upstream["detail"]
 
     def test_json_short_circuit_omits_unexecuted_checks(self, runner, config):
         config.write_text("{oops", encoding="utf-8")
@@ -11097,6 +11458,32 @@ class TestTune:
         assert result.exit_code == 1
         assert "config validate" in result.output
         assert config.read_bytes() == before
+
+    def test_recorded_tool_name_escaped_in_preview_and_consent_prompt(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """`mms tune` keys its rows on the tool name the upstream advertised,
+        read back out of the metrics DB. That name reaches a `click.confirm`
+        whose answer authorizes a config write, so a CR in it would overwrite
+        the rendered `[Y/n]` the user is answering (#755)."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db, tool="ev\ril")
+        # Plain-confirm fallback: a TTY for the gate, no questionary.
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: False)
+        monkeypatch.setattr(proxy_mod, "_stdin_is_tty", lambda: True)
+
+        result = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "srv/ev\\u000Dil" in result.output
+        assert "\r" not in result.output
+
+        # The consent prompt on the --apply path carries the same name.
+        result = runner.invoke(cli, ["tune", "--apply", *_cfg_args(config)], input="n\n")
+        assert "Apply to srv/ev\\u000Dil" in result.output
+        assert "\r" not in result.output
 
 
 class TestMergeTuneChanges:

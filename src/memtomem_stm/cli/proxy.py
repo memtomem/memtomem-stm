@@ -1144,10 +1144,17 @@ def _emit_skip_hints(config_path: Path = _DEFAULT_CONFIG) -> None:
     click.echo(f"    {_shell_join(codex_cmd)}")
     click.echo("")
     click.echo(f"  {_hdr('Claude Desktop / JSON MCP config:')}")
+    # Every value goes through ``json.dumps``, which supplies its own
+    # quotes — hand-writing them around ``server_cmd`` emitted a document
+    # the user could not paste back whenever the interpreter path held a
+    # ``"`` or a ``\`` (a Windows path always does). ``ensure_ascii`` stays
+    # at its default here, unlike the ``--json`` legs: it escapes the
+    # control characters and BiDi overrides ``_disp`` guards elsewhere, so
+    # this snippet needs no separate display pass (#755).
     json_args = f', "args": {json.dumps(server_args)}' if server_args else ""
     json_env = f', "env": {json.dumps(server_env)}'
     click.echo(
-        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": "{server_cmd}"'
+        f'    {{ "mcpServers": {{ "memtomem-stm": {{ "command": {json.dumps(server_cmd)}'
         f"{json_args}{json_env} }} }} }}"
     )
     click.echo("")
@@ -1453,18 +1460,19 @@ def gateway_status(config_path: str, *, as_json: bool = False) -> None:
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return
-    click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({tg.source})")
-    click.echo(f"  agent/profile: {tg.agent_id} / {config.exposure.profile.value}")
+    click.echo(f"Gateway policy: {'enabled' if tg.enabled else 'disabled'} ({_disp(tg.source)})")
+    click.echo(f"  agent/profile: {_disp(tg.agent_id)} / {config.exposure.profile.value}")
     if tg.source == "bundle" and tg.enabled:
-        click.echo(f"  bundle: {result['bundle_path']}")
+        click.echo(f"  bundle: {_disp(str(result['bundle_path']))}")
         if result.get("valid"):
             click.echo(
                 f"  active: graph generation {result['graph_generation']}, "
                 f"{result['eligible']} eligible / {result['rejected']} rejected"
             )
-            click.echo(f"  digest: {result['bundle_digest']}")
+            click.echo(f"  digest: {_disp(str(result['bundle_digest']))}")
         else:
-            click.echo(f"  {_bad('INVALID')}: {result.get('error')}")
+            # The loader's message quotes the bundle file it just rejected.
+            click.echo(f"  {_bad('INVALID')}: {_disp(str(result.get('error') or ''))}")
 
 
 @gateway_group.command(name="explain")
@@ -1510,9 +1518,9 @@ def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
-        click.echo(f"{tool_key}: {decision.decision}")
+        click.echo(f"{_disp(tool_key)}: {_disp(decision.decision)}")
         if decision.reason:
-            click.echo(f"  reason: {decision.reason}")
+            click.echo(f"  reason: {_disp(decision.reason)}")
         risk_score = decision.risk_score if decision.risk_score is not None else "n/a"
         click.echo(f"  risk score: {risk_score}")
         click.echo(f"  graph generation: {snapshot.generation}")
@@ -1832,7 +1840,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     # output; status now answers "is the proxy set up and pointed at the
     # right config", list answers "what servers are behind it").
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
@@ -1918,9 +1926,13 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
             detail = f"{cmd} {args_str}".strip()
         else:
             detail = cfg.get("url", "")
+        # Escaped per cell, inside the pad: a CR in any of them would
+        # otherwise redraw this row over the previous one and take the
+        # whole table's alignment with it (#755). ``surfacing`` is computed
+        # here, so only the config-derived cells need it.
         click.echo(
-            f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} "
-            f"{surfacing:<10} {origin_cell:<16} {detail}"
+            f"{_disp(name):<20} {_disp(prefix):<10} {_disp(transport):<16} "
+            f"{_disp(compression):<12} {surfacing:<10} {_disp(origin_cell):<16} {_disp(detail)}"
         )
     click.echo(f"\n{len(servers)} server(s) configured.")
     if any_pruned:
@@ -1949,8 +1961,12 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
         click.echo(_hdr(header))
         for row in by_tool:
             saved_pct = float(row["saved_ratio"]) * 100
+            # Truncate first, then escape: the slice keeps its existing
+            # meaning (28 characters of the recorded name) and an escaped
+            # cell overflows like an over-long one, rather than being cut
+            # mid-escape into an ambiguous ``\u00`` (#755).
             click.echo(
-                f"  {str(row['server'])[:12]:<12} {str(row['tool'])[:28]:<28} "
+                f"  {_disp(str(row['server'])[:12]):<12} {_disp(str(row['tool'])[:28]):<28} "
                 f"{row['calls']:>6} {row['original_chars']:>10,} "
                 f"{row['compressed_chars']:>10,} {saved_pct:>6.1f}%"
             )
@@ -2279,7 +2295,7 @@ def add(
 
     if name in servers:
         click.echo(
-            f"{_err('Error:')} server '{name}' already exists. Use `remove` first.",
+            f"{_err('Error:')} server '{_disp(name)}' already exists. Use `remove` first.",
             err=True,
         )
         if as_json:
@@ -2354,7 +2370,7 @@ def add(
     )
     if collisions:
         click.echo(
-            f"{_err('Error:')} {prefixes.format_collision_error(collisions)}. "
+            f"{_err('Error:')} {_disp(prefixes.format_collision_error(collisions))}. "
             "The proxy refuses to load configs with duplicate prefixes — "
             "pick a different --prefix.",
             err=True,
@@ -2494,11 +2510,14 @@ def add(
     tools_reachable: int | None = None
     if validate:
         if not as_json:
-            click.echo(f"Validating '{name}' (timeout={validate_timeout}s)...")
+            click.echo(f"Validating '{_disp(name)}' (timeout={validate_timeout}s)...")
         probe = asyncio.run(_probe_servers({name: entry}, validate_timeout))[name]
         if not probe.connected:
             msg = f"validation failed — {probe.error} (stage reached: {probe.stage.display()})"
-            click.echo(f"{_err('Error:')} {msg}", err=True)
+            # ``msg`` is also the ``--json`` error text below, which a
+            # consumer parses rather than displays — escape the printed
+            # copy only (#755).
+            click.echo(f"{_err('Error:')} {_disp(msg)}", err=True)
             if as_json:
                 _json_fail("add", "validation_failed", msg, name=name)
             sys.exit(1)
@@ -2525,7 +2544,7 @@ def add(
             }
         )
         return
-    click.echo(f"{_ok('Added')} server '{name}' (prefix={prefix})")
+    click.echo(f"{_ok('Added')} server '{_disp(name)}' (prefix={prefix})")
 
 
 # ── init command ────────────────────────────────────────────────────────
@@ -2768,12 +2787,20 @@ def _build_origin(cand: dict[str, Any], imported_at: str) -> dict[str, Any] | No
 
 
 def _format_candidate_detail(entry: dict[str, Any]) -> str:
+    """One-line ``[transport] command/url`` cell for a discovered candidate.
+
+    Display-escaped as a whole (#755): every caller prints the result into
+    a terminal — a preview list, a picker title, a prune row — and none
+    puts it in a ``--json`` payload or styles it, so there is no escape
+    sequence of ours inside the string to protect. The values are another
+    client's config, not STM's, so they never passed ``add``'s validation.
+    """
     transport = entry.get("transport", "stdio")
     if transport == "stdio":
         parts = [entry.get("command", "")]
         parts.extend(entry.get("args", []))
-        return f"[stdio] {' '.join(p for p in parts if p).strip()}"
-    return f"[{transport}] {entry.get('url', '')}"
+        return _disp(f"[stdio] {' '.join(p for p in parts if p).strip()}")
+    return _disp(f"[{transport}] {entry.get('url', '')}")
 
 
 def _source_removal_hint(name: str, source: str) -> str:
@@ -3103,7 +3130,7 @@ def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
             if key in seen:
                 continue
             seen.add(key)
-            click.echo(f"    {cand['name']} — {src}")
+            click.echo(f"    {_disp(cand['name'])} — {src}")
     return click.confirm("Remove from source(s)?", default=False)
 
 
@@ -3175,7 +3202,7 @@ def _report_prune_results(
         click.echo("")
         click.echo(f"{_ok('Removed from source client(s):')}")
         for name, src in pruned:
-            click.echo(f"  {name} — {src}")
+            click.echo(f"  {_disp(name)} — {src}")
 
     if failed:
         # Visual separator: stdout in human mode, but it must not precede
@@ -3188,7 +3215,9 @@ def _report_prune_results(
             err=True,
         )
         for name, src, err in failed:
-            click.echo(f"  {name} ({src}): {err}", err=True)
+            # ``err`` is whatever the host client's CLI wrote to stderr —
+            # arbitrary text from a subprocess, not a value from our config.
+            click.echo(f"  {_disp(name)} ({src}): {_disp(err)}", err=True)
         click.echo("", err=True)
         click.echo("Run the following to remove them manually:", err=True)
         for name, src, _ in failed:
@@ -3354,7 +3383,7 @@ def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
         for i, c in enumerate(candidates):
             marker = "[v]" if i in picks else "[ ]"
             title = (
-                f"{marker}  {c['name']:<18}  "
+                f"{marker}  {_disp(c['name']):<18}  "
                 f"{_format_candidate_detail(c['entry'])}  — from {c['source']}"
             )
             choices.append(questionary.Choice(title=title, value=i))
@@ -3483,14 +3512,14 @@ def _add_from_clients(
         entry = cand["entry"]
         if cand_name in existing_names:
             click.echo(
-                f"  {_warn('Skipping:')} '{cand_name}' — already registered.",
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — already registered.",
                 err=True,
             )
             continue
         sig = _server_signature(entry)
         if sig is not None and sig in existing_signatures:
             click.echo(
-                f"  {_warn('Skipping:')} '{cand_name}' — matches an existing server "
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
                 "by command/url.",
                 err=True,
             )
@@ -3507,7 +3536,7 @@ def _add_from_clients(
         dup = cand.get("duplicate_in")
         dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
         click.echo(
-            f"  {i:>2}. {cand['name']:<18} {_format_candidate_detail(cand['entry'])}"
+            f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
             f"    — from {cand['source']}{dup_hint}"
         )
     click.echo("")
@@ -3526,7 +3555,9 @@ def _add_from_clients(
     click.echo("")
     for idx in picks:
         cand = new_candidates[idx]
-        click.echo(_hdr(f"Configuring '{cand['name']}'"))
+        # Escape the value, never the styled result: ``_hdr`` wraps this
+        # line in a bold SGR span whose own escapes must stay real (#755).
+        click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
         suggested = _suggest_prefix(cand["name"], used_prefixes)
         prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
         used_prefixes.add(prefix)
@@ -3542,9 +3573,12 @@ def _add_from_clients(
         probes = asyncio.run(_probe_servers(imported, validate_timeout))
         for n, probe in probes.items():
             if probe.connected:
-                click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
+                click.echo(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
             else:
-                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
+                click.echo(
+                    f"  {_warn('Warning:')} {_disp(n)} — probe failed: {_disp(probe.error or '')}",
+                    err=True,
+                )
                 click.echo("  Saving anyway. Run `mms health` later to retry.", err=True)
 
     servers.update(imported)
@@ -3553,7 +3587,7 @@ def _add_from_clients(
     click.echo("")
     click.echo(f"{_ok('Added')} {len(imported)} server(s) to {resolved}:")
     for n, e in imported.items():
-        click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
+        click.echo(f"  {_disp(n):<20} prefix={_disp(e['prefix'])}  {_format_candidate_detail(e)}")
 
     # Source clients still hold the direct registrations. Without a prune,
     # tools surface on two paths (client → upstream and client → STM →
@@ -3797,7 +3831,7 @@ def init(
             dup = cand.get("duplicate_in")
             dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
             click.echo(
-                f"  {i:>2}. {cand['name']:<18} {_format_candidate_detail(cand['entry'])}"
+                f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
                 f"    — from {cand['source']}{dup_hint}"
             )
         click.echo("")
@@ -3821,7 +3855,9 @@ def init(
         imported_at = utc_now_iso()
         for idx in picks:
             cand = candidates[idx]
-            click.echo(_hdr(f"Configuring '{cand['name']}'"))
+            # Escape the value, never the styled result: ``_hdr`` wraps this
+            # line in a bold SGR span whose own escapes must stay real (#755).
+            click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
             suggested = _suggest_prefix(cand["name"], used_prefixes)
             prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
             used_prefixes.add(prefix)
@@ -3915,9 +3951,12 @@ def init(
         probes = asyncio.run(_probe_servers(probe_map, 10))
         for n, probe in probes.items():
             if probe.connected:
-                click.echo(f"  {_ok('Reachable:')} {n} — {probe.tools} tool(s).")
+                click.echo(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
             else:
-                click.echo(f"  {_warn('Warning:')} {n} — probe failed: {probe.error}", err=True)
+                click.echo(
+                    f"  {_warn('Warning:')} {_disp(n)} — probe failed: {_disp(probe.error or '')}",
+                    err=True,
+                )
                 suffix = " (--save-unverified acknowledged)" if save_unverified else ""
                 click.echo(
                     f"  Saving config anyway{suffix}. Run `mms health` later to retry.",
@@ -3941,7 +3980,7 @@ def init(
     click.echo("")
     click.echo(_hdr("Configured upstream servers:"))
     for n, e in imported.items():
-        click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
+        click.echo(f"  {_disp(n):<20} prefix={_disp(e['prefix'])}  {_format_candidate_detail(e)}")
 
     # Non-default ``--config`` paths: surface the flag in the management
     # hints so ``mms list`` / ``mms health`` don't silently read the empty
@@ -4203,18 +4242,18 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     if name not in servers:
-        click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
+        click.echo(f"{_err('Error:')} server '{_disp(name)}' not found.", err=True)
         sys.exit(1)
 
     current = bool(servers[name].get("surfacing_enabled", True))
     if state is None:
-        click.echo(f"surfacing for '{name}': {'on' if current else 'off'}")
+        click.echo(f"surfacing for '{_disp(name)}': {'on' if current else 'off'}")
         return
 
     desired = state == "on"
     servers[name]["surfacing_enabled"] = desired
     _save(path, data)
-    click.echo(f"{_ok('Surfacing ' + state)} for '{name}'.")
+    click.echo(f"{_ok('Surfacing ' + state)} for '{_disp(name)}'.")
 
 
 # ── tune command (#615) ────────────────────────────────────────────────
@@ -4396,7 +4435,9 @@ def _pick_tune_tui(
             marker = "[v]" if i in picks else "[ ]"
             fields = ", ".join(f"{c.field} -> {c.recommended}" for c in items)
             choices.append(
-                questionary.Choice(title=f"{marker}  {server}/{tool}  {fields}", value=i)
+                questionary.Choice(
+                    title=f"{marker}  {_disp(server)}/{_disp(tool)}  {_disp(fields)}", value=i
+                )
             )
         choices.append(questionary.Separator())
         choices.append(
@@ -4450,7 +4491,11 @@ def _pick_tune_changes(changes: list[_TuneChange]) -> list[_TuneChange] | None:
     selected: list[_TuneChange] = []
     for (server, tool), items in groups:
         fields = ", ".join(c.field for c in items)
-        if click.confirm(f"Apply to {server}/{tool} ({fields})?", default=True):
+        # The prompt the user answers to authorize a config write: a CR in
+        # the recorded tool name would overwrite the rendered ``[Y/n]``.
+        if click.confirm(
+            f"Apply to {_disp(server)}/{_disp(tool)} ({_disp(fields)})?", default=True
+        ):
             selected.extend(items)
     return selected
 
@@ -4465,13 +4510,13 @@ def _render_tune_preview(
     groups = _tune_groups(changes)
     click.echo(_hdr(f"Tuning recommendations (last {since_hours:g}h): {len(groups)} tool(s)"))
     for (server, tool), items in groups:
-        click.echo(f"  {server}/{tool}  [{items[0].confidence} confidence]")
+        click.echo(f"  {_disp(server)}/{_disp(tool)}  [{items[0].confidence} confidence]")
         for change in items:
             current = change.current if change.current is not None else "(default)"
-            click.echo(f"    {change.field}: {current} -> {change.recommended}")
-            click.echo(f"        {change.reason}")
+            click.echo(f"    {_disp(change.field)}: {current} -> {change.recommended}")
+            click.echo(f"        {_disp(change.reason)}")
     for entry in skipped:
-        click.echo(f"  {_warn('Skipped:')} {entry}")
+        click.echo(f"  {_warn('Skipped:')} {_disp(entry)}")
     if apply_hint:
         click.echo("")
         click.echo(
@@ -4649,14 +4694,14 @@ def tune(
         if do_apply:
             click.echo(
                 f"{_err('Error:')} the config file as written fails validation "
-                f"({raw_error}) — fix it (see `mms config validate`) before applying "
+                f"({_disp(raw_error)}) — fix it (see `mms config validate`) before applying "
                 "tuning overrides.",
                 err=True,
             )
             sys.exit(1)
         click.echo(
             f"{_warn('Warning:')} the config file as written fails validation "
-            f"({raw_error}) — --apply will refuse until it is fixed "
+            f"({_disp(raw_error)}) — --apply will refuse until it is fixed "
             "(see `mms config validate`).",
             err=True,
         )
@@ -4692,7 +4737,7 @@ def tune(
 
     if not changes:
         for entry in skipped:
-            click.echo(f"{_warn('Skipped:')} {entry}")
+            click.echo(f"{_warn('Skipped:')} {_disp(entry)}")
         click.echo("No recommendations — all observed tools are within healthy parameters.")
         return
 
@@ -4722,7 +4767,7 @@ def tune(
     if config_error:
         click.echo(
             f"{_err('Error:')} applying would produce an invalid config "
-            f"({config_error}); nothing written.",
+            f"({_disp(config_error)}); nothing written.",
             err=True,
         )
         sys.exit(1)
@@ -4891,7 +4936,13 @@ def prune(
     # plan and the human preview cannot drift.
     if not as_json:
         click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
-    name_width = max((len(c["name"]) for c in dual), default=0)
+    # Width over the *displayed* names, not the stored ones: an escaped
+    # name is longer than its raw form, so measuring the raw one would
+    # leave the detail column ragged for exactly the rows the escaping is
+    # for (#755). ``planned`` keeps the stored name — it is the ``--json``
+    # plan, and its consumer matches it against the config.
+    disp_names = {c["name"]: _disp(c["name"]) for c in dual}
+    name_width = max((len(n) for n in disp_names.values()), default=0)
     planned: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for cand in dual:
@@ -4903,7 +4954,7 @@ def prune(
             seen.add(key)
             planned.append({"name": cand["name"], "source": src})
             if not as_json:
-                click.echo(f"  {cand['name']:<{name_width}}  {detail}  — {src}")
+                click.echo(f"  {disp_names[cand['name']]:<{name_width}}  {detail}  — {src}")
 
     if dry_run:
         if as_json:
@@ -5647,22 +5698,30 @@ def eject(
         click.echo(_hdr(f"Eject plan ({len(plans)} entr{'y' if len(plans) == 1 else 'ies'}):"))
         for plan in plans:
             if plan.error:
-                click.echo(f"  {plan.name}: {_bad('cannot eject')} — {plan.error}")
+                # Escaped here rather than where the message is built: every
+                # branch that sets ``error`` folds in a config value — a
+                # name, an origin path, a ``kind`` and ``pruned_at`` read
+                # back from the prune backup log (#755).
+                click.echo(f"  {_disp(plan.name)}: {_bad('cannot eject')} — {_disp(plan.error)}")
                 continue
             spec = _SOURCE_BY_KIND[plan.kind]
-            where = f"{spec.label}" + (f" [{plan.path}]" if plan.path else "")
+            where = f"{spec.label}" + (f" [{_disp(plan.path)}]" if plan.path else "")
             action = (
                 "already present — skip write"
                 if plan.skip_write
                 else ("overwrite" if plan.overwrite else "restore")
             )
             body = "verbatim original" if plan.verbatim else "reconstructed entry"
-            click.echo(f"  {plan.name}: {action} → {where}  ({body})")
+            click.echo(f"  {_disp(plan.name)}: {action} → {where}  ({body})")
             for w in plan.warnings or []:
-                click.echo(f"    {_warn('warning:')} {w}")
+                click.echo(f"    {_warn('warning:')} {_disp(w)}")
             if plan.pruned_duplicates:
+                # Source labels are constants, except that a row recorded
+                # under an unrecognized kind falls back to printing that
+                # kind — a config value — verbatim.
                 click.echo(
-                    f"    {_warn('note:')} also pruned from {', '.join(plan.pruned_duplicates)} — "
+                    f"    {_warn('note:')} also pruned from "
+                    f"{_disp(', '.join(plan.pruned_duplicates))} — "
                     "not restored here; originals remain in "
                     f"{_pruned_backup_path()} (restore manually if needed)"
                 )
@@ -5718,7 +5777,7 @@ def eject(
         assert plan.payload is not None
         if plan.needs_secret_confirm:
             ok = click.confirm(
-                f"  '{plan.name}': pass the secret value(s) above on `claude` argv "
+                f"  '{_disp(plan.name)}': pass the secret value(s) above on `claude` argv "
                 "(visible in the process list while it runs)?",
                 default=False,
             )
@@ -5755,8 +5814,8 @@ def eject(
                 )
                 continue
             click.echo(
-                f"  {_warn('Warning:')} '{plan.name}' {state} deviates from the "
-                f"original (schema loss accepted): {detail}",
+                f"  {_warn('Warning:')} '{_disp(plan.name)}' {state} deviates from the "
+                f"original (schema loss accepted): {_disp(detail)}",
                 err=True,
             )
 
@@ -5776,7 +5835,7 @@ def eject(
             click.echo(f"{_ok('Restored to host and removed from STM:')}")
         for plan in restored:
             spec = _SOURCE_BY_KIND[plan.kind]
-            click.echo(f"  {plan.name} — {spec.label}")
+            click.echo(f"  {_disp(plan.name)} — {spec.label}")
         if keep:
             click.echo(
                 f"{_warn('Note:')} entries are now dual-registered (direct + via STM). "
@@ -5788,7 +5847,10 @@ def eject(
             click.echo("")
         click.echo(f"{_warn('Warning:')} could not eject {len(failed)} entr(ies):", err=True)
         for plan, err in failed:
-            click.echo(f"  {plan.name}: {err}", err=True)
+            # Distinct from the ``plan.error`` line above: these come from
+            # the host write — the claude CLI's stderr, or an OS error
+            # naming the target file.
+            click.echo(f"  {_disp(plan.name)}: {_disp(err)}", err=True)
         click.echo("", err=True)
         click.echo("Restore manually (entry remains in STM):", err=True)
         click.echo(
@@ -6641,7 +6703,7 @@ def health(
             )
         else:
             if config_error:
-                click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
+                click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
             click.echo("No upstream servers configured.")
             click.echo("")
             for line in _format_surfacing_bootstrap(surfacing_status):
@@ -6675,12 +6737,12 @@ def health(
         return
 
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {config_error}")
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
     click.echo(_hdr("Upstream Server Health"))
     click.echo("=" * 30)
     for name, info in results.items():
         if info.connected:
-            click.echo(f"  {name}: {_ok('connected')} ({info.tools} tools)")
+            click.echo(f"  {_disp(name)}: {_ok('connected')} ({info.tools} tools)")
             if show_names:
                 if info.overflowing:
                     click.echo(
@@ -6689,12 +6751,16 @@ def health(
                         f"client limit and will be silently dropped:"
                     )
                     for t_name in info.overflowing:
-                        click.echo(f"      - {t_name}")
+                        # Advertised by the upstream over ``tools/list``, so
+                        # unlike the config-derived names elsewhere in this
+                        # block nobody on this machine ever typed or reviewed
+                        # them (#755).
+                        click.echo(f"      - {_disp(t_name)}")
                 else:
                     click.echo("    all tool names fit")
         else:
             click.echo(
-                f"  {name}: {_bad('DISCONNECTED')} — {info.error} "
+                f"  {_disp(name)}: {_bad('DISCONNECTED')} — {_disp(info.error or '')} "
                 f"(last successful stage: {info.stage.display()})"
             )
     click.echo("")
@@ -7369,7 +7435,12 @@ def doctor(
         click.echo("=" * 30)
         for c in checks:
             styled = _DOCTOR_STYLES[c["status"]](c["status"])
-            click.echo(f"  {styled}  {c['label']:<18} {c['detail']}")
+            # Escape at render, not in ``check()``: the same dicts are the
+            # ``--json`` payload above, where a consumer decodes the value
+            # rather than reading it off a terminal (#755). ``next_action``
+            # is exempt — every one is a literal template or goes through
+            # ``_shell_join``, which refuses these characters outright.
+            click.echo(f"  {styled}  {_disp(c['label']):<18} {_disp(c['detail'])}")
             if c["next_action"]:
                 click.echo(f"        next: {c['next_action']}")
         click.echo(f"Summary: {counts['FAIL']} FAIL, {counts['WARN']} WARN, {counts['PASS']} PASS")

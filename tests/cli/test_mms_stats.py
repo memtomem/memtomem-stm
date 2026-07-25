@@ -59,6 +59,32 @@ class TestMmsStats:
         assert "calls: 2" in result.output
         assert "Surfacing" in result.output
 
+    def test_per_tool_row_escapes_the_recorded_tool_name(self, runner, tmp_path, monkeypatch):
+        """The per-tool table keys on names the *upstream* advertised, which
+        the proxy recorded verbatim at call time — nobody here typed or
+        reviewed them (#755). It is column-aligned, so a CR in one redraws
+        the row above it; ``--json`` keeps the recorded name raw."""
+        set_home(monkeypatch, tmp_path)
+        db = tmp_path / ".memtomem" / "proxy_metrics.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        store = MetricsStore(db)
+        store.initialize()
+        try:
+            store.record(
+                CallMetrics(server="c7", tool="ev\ril", original_chars=1000, compressed_chars=400)
+            )
+        finally:
+            store.close()
+
+        result = runner.invoke(cli, ["stats"])
+        assert result.exit_code == 0, result.output
+        assert "ev\\u000Dil" in result.output
+        assert "\r" not in result.output
+
+        result = runner.invoke(cli, ["stats", "--json"])
+        data = json.loads(result.output)
+        assert data["compression"]["by_tool"][0]["tool"] == "ev\ril"
+
     def test_json_output(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
         _seed_metrics(tmp_path)
