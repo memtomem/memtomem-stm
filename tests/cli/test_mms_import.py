@@ -547,3 +547,75 @@ def test_import_wired_into_top_level_cli(runner):
     assert "--apply" in res.output
     assert "--show-imported" in res.output
     assert "--allow-project-configs" in res.output
+
+
+class TestDisplayEscaping:
+    """Host configs are plain ``json.loads`` with no character validation, so an
+    imported or hand-edited one can carry anything in ``_disp_escapes``'s set
+    into this listing — which is column-aligned, so a CR takes the surrounding
+    rows with it. First escaping coverage for this surface (#760).
+    """
+
+    # ESC (opens an ANSI sequence), CR (rewrites the rendered line) and a lone
+    # surrogate (unencodable, so it raises rather than rendering) — one per
+    # subclass of the set, rather than one representative that could pass by
+    # accident.
+    HOSTILE = "ev\x1b[31m\ril"
+
+    def _seed_hostile(self, sandbox):
+        _seed_claude_code(
+            sandbox,
+            {
+                "clean": {"command": "npx", "args": ["-y", "@mcp/ok"]},
+                self.HOSTILE: {
+                    "command": f"cmd{self.HOSTILE}",
+                    "args": [],
+                    "env": {"PLAIN_VALUE": f"v{self.HOSTILE}"},
+                },
+            },
+        )
+
+    def test_plan_listing_escapes_name_command_and_env(self, runner, sandbox):
+        self._seed_hostile(sandbox)
+        res = runner.invoke(import_command, ["--from", "claude-code", "--show-imported"])
+
+        assert res.exit_code == 0, res.output
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        # The point: no member of the set survives raw anywhere in the render.
+        assert "\x1b" not in res.output
+        assert "\r" not in res.output
+        # The clean sibling is untouched — escaping must not be a blanket mangle.
+        assert "clean" in res.output
+
+    def test_plan_listing_pads_by_the_displayed_width(self, runner, sandbox):
+        """The name column is a literal ``:<22``. Padding the *stored* name pads
+        the escaped one too narrow and raggeds every following column, which is
+        the defect #755 recorded for the other aligned table."""
+        self._seed_hostile(sandbox)
+        res = runner.invoke(import_command, ["--from", "claude-code"])
+
+        rows = [ln for ln in res.output.splitlines() if "command=" in ln]
+        assert len(rows) == 2
+        starts = {ln.index("command=") for ln in rows}
+        assert len(starts) == 1, f"columns ragged: {rows}"
+
+    def test_conflict_line_escapes_name_label_and_reason(self, runner, sandbox):
+        """``reason`` is registry-derived and rendered on the same line as the
+        name; the issue's site list names the name and label but not it."""
+        self._seed_hostile(sandbox)
+        runner.invoke(import_command, ["--from", "claude-code", "--apply"])
+        # Re-import the same names from a second host with different bodies so
+        # they land in the conflict branch rather than the idempotent one.
+        _seed_dot_mcp_json(
+            sandbox,
+            {
+                self.HOSTILE: {"command": "different", "args": ["x"]},
+                "clean": {"command": "different", "args": ["x"]},
+            },
+        )
+        res = runner.invoke(import_command, ["--from", "all"])
+
+        assert res.exit_code == 0, res.output
+        assert "Conflicts:" in res.output
+        assert "\x1b" not in res.output
+        assert "\r" not in res.output
