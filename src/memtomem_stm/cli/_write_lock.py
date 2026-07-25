@@ -173,14 +173,15 @@ def with_config_write_lock(
                     return f(*args, **kwargs)
             except state.WriteLockTimeout as exc:
                 if json_envelope and kwargs.get("as_json"):
-                    import json as _json
                     import sys as _sys
+
+                    from memtomem_stm.utils.json_out import dumps as _json_dumps
 
                     ctx = click.get_current_context(silent=True)
                     action = ctx.command.name if ctx and ctx.command.name else f.__name__
                     click.echo(f"Error: {exc}", err=True)
                     click.echo(
-                        _json.dumps(
+                        _json_dumps(
                             {
                                 "action": action,
                                 "ok": False,

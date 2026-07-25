@@ -3327,6 +3327,36 @@ class TestInitDiscoverySources:
         )
         return home, cwd, desktop
 
+    def test_skips_an_invalid_utf8_name_but_keeps_its_siblings(self, tmp_path, monkeypatch, capsys):
+        """A host config can carry a name the STM config must never store
+        (``"\\udcff"`` is a legal JSON escape), but dropping it must not cost
+        the servers listed beside it — and must not be silent, or "No MCP
+        servers found" becomes the only clue when it is the sole entry (#757).
+        """
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "bad\udcffname": {"command": "npx", "args": ["-y", "@bad"]},
+                        "filesystem": {"command": "npx", "args": ["-y", "@fs"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+
+        assert {c["name"] for c in cands} == {"filesystem"}
+        err = capsys.readouterr().err
+        assert "not valid UTF-8" in err
+        # The diagnostic names the entry without echoing the raw code unit —
+        # doing that is the crash it exists to avoid.
+        assert "\\udcff" in err
+
     def test_discovers_claude_code_user_scope(self, tmp_path, monkeypatch):
         from memtomem_stm.cli.proxy import _discover_candidates
 
@@ -7678,6 +7708,31 @@ class TestEjectCommand:
         assert by_verb["remove"]["cwd"] == recorded
         assert by_verb["add-json"]["cwd"] == recorded
 
+    @pytest.mark.parametrize("force", [True, False])
+    def test_claude_write_refuses_when_the_argv_cannot_encode(
+        self, runner, config, fake_claude_host, _hermetic_home, force
+    ):
+        """Both claude paths pass the name and payload as subprocess
+        arguments, which encode to UTF-8; a lone surrogate makes that raise
+        uncaught, since the callers guard `FileNotFoundError`/`OSError`
+        (#757). Parametrized because the guard first sat on the `--force`
+        branch only, leaving the plain path — the common one — crashing with
+        a traceback instead of the diagnostic this function returns.
+
+        On `--force` the stake is higher still: its pre-remove is
+        destructive, so raising after it would leave the host with neither
+        the old registration nor the new one."""
+        self._seed_config(config, {SURROGATE_NAME: _eject_entry()})
+        argv = ["eject", SURROGATE_NAME, "--yes", *(["--force"] if force else [])]
+
+        result = runner.invoke(cli, argv + _cfg_args(config))
+
+        assert not isinstance(result.exception, UnicodeEncodeError)
+        assert result.exit_code == 1
+        assert "not valid UTF-8" in result.output
+        assert fake_claude_host["calls"] == []  # neither verb ran
+        assert SURROGATE_NAME in self._stm_servers(config)
+
     def test_claude_project_vanished_path_aborts_entry(self, runner, config, tmp_path):
         gone = str(tmp_path / "deleted-proj")
         self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=gone)})
@@ -8597,6 +8652,297 @@ class TestRemove:
         assert result.exit_code == 1
         data = json.loads(result.stdout)
         assert data["error"] == "config_not_found" and data["path"] == str(missing.resolve())
+
+
+# Lone surrogate: unpaired, so it cannot be encoded to UTF-8. Two ways in.
+# From a config — ``"\ud800"`` is a legal JSON escape and ``_load`` is a plain
+# ``json.loads`` with no character validation — and, on POSIX, from argv: an
+# argument holding a byte that is not valid UTF-8 is decoded with
+# ``surrogateescape``, which produces one in the U+DC80–U+DCFF range.
+SURROGATE_NAME = "sr\ud800v"
+ARGV_SURROGATE_NAME = "sr\udcffv"
+
+
+def _write_surrogate_config(config: Path, *, sibling: bool = False) -> None:
+    """Config carrying a server whose *name* holds a lone surrogate.
+
+    Written with ``json.dumps``' default ``ensure_ascii=True``, which emits
+    the ``\\ud800`` escape rather than raising — exactly the byte sequence a
+    hand-edited config would contain.
+    """
+    servers: dict = {SURROGATE_NAME: {"prefix": "sx", "transport": "stdio", "command": "x"}}
+    if sibling:
+        servers["fs"] = {"prefix": "fs", "transport": "stdio", "command": "y"}
+    config.write_text(
+        json.dumps({"enabled": True, "upstream_servers": servers}), encoding="utf-8"
+    )
+
+
+class TestJsonLoneSurrogate:
+    """A lone surrogate in a ``--json`` payload used to crash the *report*
+    (#757).
+
+    ``json.dumps(..., ensure_ascii=False)`` left the surrogate raw in the
+    returned string and ``click.echo`` raised ``UnicodeEncodeError`` encoding
+    it — after the config write. Automation saw exit 1 and no parsable output
+    for an operation that had in fact succeeded, the worst possible shape for
+    a ``--json`` contract. Each test therefore asserts all three things that
+    used to disagree: the exit code, a parsable document, and the mutation.
+    """
+
+    def test_remove_json_reports_after_deleting_a_surrogate_named_server(self, runner, config):
+        _write_surrogate_config(config, sibling=True)
+        result = runner.invoke(
+            cli, ["remove", SURROGATE_NAME, "--yes", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["action"] == "remove" and data["ok"] is True and data["removed"] is True
+        # Escaped on the wire, identical after decoding: the payload is a
+        # value consumers read back, not display prose.
+        assert data["name"] == SURROGATE_NAME
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert SURROGATE_NAME not in saved["upstream_servers"]
+
+    def test_remove_json_not_found_is_a_single_parsable_document(self, runner, config):
+        """The failure envelope goes through the same writer, and its
+        ``message`` interpolates the raw name."""
+        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        result = runner.invoke(
+            cli, ["remove", SURROGATE_NAME, "--yes", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "server_not_found"
+        assert data["name"] == SURROGATE_NAME
+
+    def test_remove_json_rewrites_a_config_holding_a_surrogate_sibling(self, runner, config):
+        """Removing a *clean* server from such a config still had to rewrite
+        the file with the surrogate-bearing sibling in it — which crashed the
+        write itself, before the report. The save is atomic, so no state was
+        lost, but the command still exited 1 with no JSON.
+        """
+        _write_surrogate_config(config, sibling=True)
+        result = runner.invoke(cli, ["remove", "fs", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["removed"] is True
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert "fs" not in saved["upstream_servers"]
+        # The untouched sibling survives the rewrite decoding to the same
+        # name — it is escaped on disk, not dropped or mangled.
+        assert SURROGATE_NAME in saved["upstream_servers"]
+
+    def test_add_json_refuses_a_name_that_is_not_valid_utf8(self, runner, config):
+        """Serializable is not the same as usable, so `add` declines.
+
+        ``mms add $'s\\xffv' ...`` reaches this without any hand-edited config:
+        on POSIX an argument holding a byte that is not valid UTF-8 is decoded
+        with ``surrogateescape``. Writing it is safe now, but the name is the
+        first component of the cache key and part of the Toolgraph contract
+        fingerprint — both hash encoded bytes — so the entry would fail at the
+        first proxied call instead. Refusing beats persisting that.
+
+        (CliRunner takes the already-decoded ``str``; it exercises what the
+        command does with such a name, not the OS-level argv decoding.)
+        """
+        result = runner.invoke(
+            cli,
+            ["add", ARGV_SURROGATE_NAME, "--prefix", "sx", "--command", "echo", "--json"]
+            + _cfg_args(config),
+        )
+
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "invalid_name" and data["name"] == ARGV_SURROGATE_NAME
+        assert not config.exists() or ARGV_SURROGATE_NAME not in json.loads(
+            config.read_text(encoding="utf-8")
+        ).get("upstream_servers", {})
+
+    @pytest.mark.parametrize(
+        ("argv", "field"),
+        [
+            (["--command", f"echo{ARGV_SURROGATE_NAME}"], "command"),
+            (["--command", "echo", "--args", f'["{ARGV_SURROGATE_NAME}"]'], "args[0]"),
+            (["--transport", "sse", "--url", f"https://x/{ARGV_SURROGATE_NAME}"], "url"),
+            (["--command", "echo", "--env", f"TOKEN={ARGV_SURROGATE_NAME}"], "env['TOKEN']"),
+        ],
+    )
+    def test_add_refuses_an_operational_field_that_is_not_valid_utf8(
+        self, runner, config, argv, field
+    ):
+        """The name gate alone let the rest of the entry through.
+
+        A `command` is spawned, a `url` dialled, `env` values handed to a
+        child process — each encodes, so an entry carrying such a value saves
+        and then cannot run. Before this branch the writer refused it, which
+        means making `_save` succeed is what created the path; `mms add` exited
+        0 and persisted a command ending in U+DCFF.
+
+        The diagnostic names the exact position — `args[0]`, `env['TOKEN']` —
+        and withholds the value: env and header values are routinely secrets
+        and this text reaches CI logs. The env case pins both halves at once,
+        since naming the key while hiding the value is the whole contract.
+        """
+        result = runner.invoke(cli, ["add", "srv", "--prefix", "sx", *argv] + _cfg_args(config))
+
+        assert result.exit_code == 1
+        assert f"{field} is not valid UTF-8" in result.output
+        assert "value withheld" in result.output
+        assert ARGV_SURROGATE_NAME not in result.output
+        assert not config.exists() or "srv" not in json.loads(
+            config.read_text(encoding="utf-8")
+        ).get("upstream_servers", {})
+
+    def test_remove_still_works_on_a_name_add_would_refuse(self, runner, config):
+        """The refusal must not strand an already-broken config.
+
+        Rejecting at creation only makes sense while the inspect-and-delete
+        commands stay permissive — that is the whole point of escaping rather
+        than validating at load.
+        """
+        _write_surrogate_config(config)
+        result = runner.invoke(
+            cli, ["remove", SURROGATE_NAME, "--yes", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["removed"] is True
+
+    def test_remove_repairs_such_a_config_in_text_mode_too(self, runner, config):
+        """Repair does not depend on passing ``--json``.
+
+        The payload escaping here and #756's prose escaping meet on this
+        command: the report goes through the JSON writer, the success line and
+        confirmation prompt through `_disp`. Both are needed — either one alone
+        leaves an encode on the path *after* the entry is deleted.
+        """
+        _write_surrogate_config(config)
+
+        result = runner.invoke(cli, ["remove", SURROGATE_NAME, "--yes"] + _cfg_args(config))
+
+        assert result.exit_code == 0, result.output
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert SURROGATE_NAME not in saved["upstream_servers"]
+
+    def test_surfacing_toggle_reports_after_writing(self, runner, config):
+        """The regression this PR's own writer fix created.
+
+        Before it, `_save` raised and nothing was written. Once the write
+        succeeds, the success line becomes a post-mutation crash unless it
+        escapes the name — the exact shape #757 is about, on a command the
+        issue never mentioned.
+        """
+        _write_surrogate_config(config)
+
+        result = runner.invoke(cli, ["surfacing", SURROGATE_NAME, "off"] + _cfg_args(config))
+
+        assert result.exit_code == 0, result.output
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert saved["upstream_servers"][SURROGATE_NAME]["surfacing_enabled"] is False
+
+    def test_init_json_still_reports_a_skipped_discovery_candidate(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """The note must survive the ``--json`` setup envelope.
+
+        That envelope captures stderr and used to consume it only on failure,
+        so a *successful* run dropped every diagnostic — leaving the skip
+        invisible on exactly the output mode automation reads.
+        """
+        home = tmp_path / "init-home"
+        home.mkdir()
+        set_home(monkeypatch, home)
+        desktop = home / "Library/Application Support/Claude"
+        desktop.mkdir(parents=True)
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod, "_desktop_config_path", lambda: desktop / "claude_desktop_config.json"
+        )
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "bad\udcffname": {"command": "npx", "args": ["-y", "@b"]},
+                        "good": {"command": "npx", "args": ["-y", "@g"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MMS_NO_TUI", "1")
+
+        result = runner.invoke(
+            cli,
+            ["init", "--client", "skip", "--no-validate", "--lang", "en", "--json"]
+            + _cfg_args(config),
+            input="\n",  # accept the default candidate selection
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)  # stdout stays exactly one JSON document
+        assert payload["ok"] is True
+        assert "bad\udcffname" not in payload["servers"]
+        assert "not valid UTF-8" in result.stderr
+
+    def test_entry_gate_names_the_field_and_withholds_every_value(self):
+        """The contract all three create paths share.
+
+        `init`'s manual branch is gated the same way but cannot be driven
+        end-to-end here — `CliRunner` encodes its `input` to UTF-8, so such a
+        value cannot be typed at its prompt in a test. Pin the helper against
+        the entry shape that branch builds instead; the `add` path covers the
+        wiring end-to-end.
+        """
+        from memtomem_stm.utils.json_out import unencodable_field
+
+        entry = {
+            "prefix": "sx",
+            "transport": "stdio",
+            "command": f"echo{ARGV_SURROGATE_NAME}",
+            "args": ["-y", "@pkg"],
+            "env": {"TOKEN": "sekret"},
+        }
+        found = unencodable_field(entry)
+        assert found == "command"
+        # A clean entry passes, and no value ever appears in the result.
+        entry["command"] = "echo"
+        assert unencodable_field(entry) is None
+        entry["env"]["TOKEN"] = ARGV_SURROGATE_NAME
+        assert unencodable_field(entry) == "env['TOKEN']"
+        assert "sekret" not in str(unencodable_field(entry))
+
+    def test_text_mode_read_legs_render_the_name_escaped(self, runner, config):
+        """The two escapes meet here, and each covers a leg the other cannot.
+
+        `--json` needs the surrogate escaped as data a parser decodes back;
+        the printed table needs it escaped as text a reader can see. This
+        leg was the one still raising while only the JSON half existed —
+        the prose sites #756 deferred to #755, landed since. Pinned across
+        all three read-only text legs so a regression in either escape shows
+        up as a crash here rather than as a silent gap.
+        """
+        _write_surrogate_config(config)
+
+        for argv in (["list"], ["health", "--timeout", "1"], ["doctor", "--timeout", "1"]):
+            result = runner.invoke(cli, argv + _cfg_args(config))
+            # `doctor` exits 1 on its own FAIL contract (the probe cannot
+            # reach the server), which is not a crash — assert on the
+            # exception instead of the code.
+            assert not isinstance(result.exception, UnicodeEncodeError), argv
+            assert "sr\\uD800v" in result.output, argv
+
+    def test_list_json_renders_a_surrogate_named_server(self, runner, config):
+        """Read-only legs never mutate, but they crashed on any config
+        holding such a name — with a traceback instead of a diagnosis."""
+        _write_surrogate_config(config)
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert SURROGATE_NAME in json.loads(result.stdout)["servers"]
 
 
 class TestOriginFullyPruned:

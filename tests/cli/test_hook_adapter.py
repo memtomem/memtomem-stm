@@ -588,6 +588,42 @@ def test_json_hosts_serialize_is_json_dumps_byte_identical(adapter):
             assert "\\ud55c" not in adapter.serialize(rendered)
 
 
+def test_hook_emit_fails_open_when_the_payload_cannot_be_encoded(monkeypatch):
+    """The always-exit-0 contract has to survive the *last* write too.
+
+    Escaping in ``serialize`` covers the JSON hosts, but Kimi's channel is raw
+    stdout — surfaced text, not a JSON document — so nothing escapes an
+    unencodable code unit there and the final ``click.echo`` would raise. The
+    host must read "nothing surfaced", never a hook failure (#757).
+    """
+    from click.testing import CliRunner
+
+    class _Unencodable(KimiHookAdapter):
+        def serialize(self, rendered):
+            return "surfaced \udcff block"
+
+    monkeypatch.setattr(hook_cmd, "get_adapter", lambda _tag: _Unencodable())
+
+    result = CliRunner().invoke(hook_cmd.hook_command, ["--host", "kimi"], input="{}")
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("adapter", [_CLAUDE, _CODEX, _CURSOR])
+def test_json_hosts_serialize_survives_a_lone_surrogate(adapter):
+    """The echoed-back tool output is host-supplied and read with
+    ``json.loads``, where ``"\\udcff"`` is a legal escape. Left raw it made the
+    final ``click.echo`` raise, breaking the hook's always-exit-0 pass-through
+    at the last step — so serialize escapes it instead (#757)."""
+    rendered = {"hookSpecificOutput": {"updatedToolOutput": "out\udcffput"}}
+
+    serialized = adapter.serialize(rendered)
+
+    serialized.encode("utf-8")  # the encode click.echo does, which used to raise
+    assert json.loads(serialized) == rendered
+
+
 # ── Kimi adapter (B2 step3 — raw-stdout surfacing channel) ─────────────────────
 
 _KIMI_DIR = _HOOK_FIXTURES / "kimi"
