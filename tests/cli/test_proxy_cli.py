@@ -1282,6 +1282,26 @@ class TestListServers:
         assert clean[header.index("SURFACING") :].startswith("on")
         assert clean[header.index("ORIGIN")] == "-"
 
+    def test_lone_surrogate_name_renders_instead_of_crashing(self, runner, config):
+        """A lone surrogate is the one member of the escape class that did
+        more than garble the table: `"\\ud800"` is a legal JSON escape, so
+        it loads fine and then cannot be encoded, and printing the row
+        raised `UnicodeEncodeError` with no diagnosis. Escaping the cell
+        removes it before the terminal write."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"s\ud800v": {"prefix": "s", "command": "npx"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert result.exception is None
+        assert "s\\uD800v" in result.output
+
     def test_list_surfacing_column_shows_toggle(self, runner, config):
         """The SURFACING column is the per-server toggle's visible home
         (#614 — ``mms status`` no longer prints per-server rows): ``off``
