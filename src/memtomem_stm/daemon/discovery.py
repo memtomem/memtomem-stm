@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.daemon.protocol import PROTOCOL_VERSION
 from memtomem_stm.utils.fileio import atomic_write_text
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
@@ -121,7 +122,16 @@ def config_fingerprint(config: STMConfig) -> str:
         "surface_tools_env": os.environ.get("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", ""),
         "protocol_version": PROTOCOL_VERSION,
     }
-    blob = json.dumps(material, sort_keys=True, ensure_ascii=False)
+    # ``json_out.dumps`` rather than ``json.dumps``: ``surface_tools_env`` is an
+    # environment variable, and on POSIX one holding a byte that is not valid
+    # UTF-8 is decoded with ``surrogateescape``, so a lone surrogate reaches the
+    # ``.encode`` below with no config file involved. That raise lands in
+    # ``DaemonServer.__init__`` and in ``client._live_handshake_candidate``,
+    # neither of which guards it — no daemon starts and every daemon-touching
+    # CLI command prints a traceback (#761). Escaping keeps the digest total;
+    # the escaped form is still distinct per input, so the fingerprint keeps
+    # separating configs (#757's "only hashed" is not a clearance).
+    blob = _json_dumps(material, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
