@@ -5555,19 +5555,22 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     if plan.kind in ("claude-user", "claude-project"):
         scope = spec.claude_scope or "user"
         cwd = plan.path if plan.kind == "claude-project" else None
+        # Both paths below spawn `claude mcp …` with the name and payload as
+        # arguments, which `subprocess` encodes to UTF-8 — a raise neither
+        # `_claude_mcp_add_json` nor `_claude_mcp_remove` catches, since both
+        # guard `FileNotFoundError`/`OSError` (#757). Check once, before
+        # either: on the `--force` path the pre-remove is destructive and
+        # would otherwise leave the host with neither the old registration
+        # nor the new one, and on the plain path an uncaught traceback
+        # replaces the "cannot eject" diagnostic this function exists to
+        # return.
+        if not _argv_is_encodable(plan.name, plan.payload):
+            return (False, "server name or payload is not valid UTF-8")
         if plan.overwrite:
             # `claude mcp add-json` has no overwrite flag (same probe lineage
             # as `claude mcp add`, cli/proxy.py:274) — remove-then-add. The
             # pre-remove needs the same cwd as the add: `-s local` resolves
             # its project slot from the process cwd on both verbs.
-            # The pre-remove is destructive and the add that follows passes the
-            # payload as a subprocess argument, which encodes to UTF-8 and
-            # raises on a code unit that cannot (#757). Check first: failing
-            # here returns the non-fatal error that prints the manual restore
-            # hint, whereas failing after the remove would leave the host with
-            # neither the old registration nor the new one.
-            if not _argv_is_encodable(plan.name, plan.payload):
-                return (False, "server name or payload is not valid UTF-8")
             ok, err = _claude_mcp_remove(plan.name, scope, cwd=cwd)
             if not ok:
                 return (False, f"--force pre-remove failed: {err}")

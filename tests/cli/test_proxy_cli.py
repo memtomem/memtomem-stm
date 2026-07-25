@@ -7708,6 +7708,31 @@ class TestEjectCommand:
         assert by_verb["remove"]["cwd"] == recorded
         assert by_verb["add-json"]["cwd"] == recorded
 
+    @pytest.mark.parametrize("force", [True, False])
+    def test_claude_write_refuses_when_the_argv_cannot_encode(
+        self, runner, config, fake_claude_host, _hermetic_home, force
+    ):
+        """Both claude paths pass the name and payload as subprocess
+        arguments, which encode to UTF-8; a lone surrogate makes that raise
+        uncaught, since the callers guard `FileNotFoundError`/`OSError`
+        (#757). Parametrized because the guard first sat on the `--force`
+        branch only, leaving the plain path — the common one — crashing with
+        a traceback instead of the diagnostic this function returns.
+
+        On `--force` the stake is higher still: its pre-remove is
+        destructive, so raising after it would leave the host with neither
+        the old registration nor the new one."""
+        self._seed_config(config, {SURROGATE_NAME: _eject_entry()})
+        argv = ["eject", SURROGATE_NAME, "--yes", *(["--force"] if force else [])]
+
+        result = runner.invoke(cli, argv + _cfg_args(config))
+
+        assert not isinstance(result.exception, UnicodeEncodeError)
+        assert result.exit_code == 1
+        assert "not valid UTF-8" in result.output
+        assert fake_claude_host["calls"] == []  # neither verb ran
+        assert SURROGATE_NAME in self._stm_servers(config)
+
     def test_claude_project_vanished_path_aborts_entry(self, runner, config, tmp_path):
         gone = str(tmp_path / "deleted-proj")
         self._seed_config(config, {"demo": _eject_entry(kind="claude-project", path=gone)})
@@ -8828,22 +8853,25 @@ class TestJsonLoneSurrogate:
         assert "bad\udcffname" not in payload["servers"]
         assert "not valid UTF-8" in result.stderr
 
-    def test_list_in_text_mode_still_raises_on_such_a_name(self, runner, config):
-        """The one leg that is still exposed, pinned as a boundary.
+    def test_text_mode_read_legs_render_the_name_escaped(self, runner, config):
+        """The two escapes meet here, and each covers a leg the other cannot.
 
-        `mms list --json` renders it fine; without the flag the table
-        interpolates the name straight into the printed line, so the encode
-        moves from the payload to the terminal write. That is the prose-site
-        sweep #756 deferred to #755, and it needs the display escape rather
-        than the JSON one — an escape a reader can see, not one a parser
-        decodes. Recorded here so the gap is not mistaken for a fix.
+        `--json` needs the surrogate escaped as data a parser decodes back;
+        the printed table needs it escaped as text a reader can see. This
+        leg was the one still raising while only the JSON half existed —
+        the prose sites #756 deferred to #755, landed since. Pinned across
+        all three read-only text legs so a regression in either escape shows
+        up as a crash here rather than as a silent gap.
         """
         _write_surrogate_config(config)
 
-        result = runner.invoke(cli, ["list"] + _cfg_args(config))
-
-        assert result.exit_code == 1
-        assert isinstance(result.exception, UnicodeEncodeError)
+        for argv in (["list"], ["health", "--timeout", "1"], ["doctor", "--timeout", "1"]):
+            result = runner.invoke(cli, argv + _cfg_args(config))
+            # `doctor` exits 1 on its own FAIL contract (the probe cannot
+            # reach the server), which is not a crash — assert on the
+            # exception instead of the code.
+            assert not isinstance(result.exception, UnicodeEncodeError), argv
+            assert "sr\\uD800v" in result.output, argv
 
     def test_list_json_renders_a_surrogate_named_server(self, runner, config):
         """Read-only legs never mutate, but they crashed on any config
