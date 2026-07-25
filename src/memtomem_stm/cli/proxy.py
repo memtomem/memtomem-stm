@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
 from memtomem_stm.cli._json_out import dumps as _json_dumps
+from memtomem_stm.cli._json_out import has_lone_surrogate
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
@@ -2290,6 +2291,18 @@ def add(
         raise click.UsageError("Missing argument 'NAME' (or pass --from-clients).")
     if not prefix:
         raise click.UsageError("Missing option '--prefix' (or pass --from-clients).")
+    if has_lone_surrogate(name):
+        # Reachable without a hand-edited config: on POSIX an argument holding
+        # a byte that is not valid UTF-8 is decoded with ``surrogateescape``.
+        # Writing it is safe now (#757) but the entry would be unusable — see
+        # ``has_lone_surrogate`` — so refuse rather than persist a name that
+        # only fails later, at the first proxied call.
+        # ``!r`` renders the offending code unit as ASCII ``\udcff``; echoing
+        # the name raw is the very crash this command is refusing to set up.
+        click.echo(f"{_err('Error:')} server name {name!r} is not valid UTF-8.", err=True)
+        if as_json:
+            _json_fail("add", "invalid_name", f"server name {name!r} is not valid UTF-8", name=name)
+        sys.exit(1)
 
     data = _load(path)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
@@ -2729,6 +2742,20 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             continue
         for name, raw in servers.items():
             if not isinstance(name, str) or not isinstance(raw, dict):
+                continue
+            if has_lone_surrogate(name):
+                # Skip rather than abort the scan: one unusable name in a host
+                # config must not block importing the servers beside it.
+                # `"\udcff"` is a legal JSON escape, so a host file can carry
+                # one (#757). Say so, though — dropping in silence would leave
+                # "No MCP servers found" as the only clue when it is the sole
+                # entry. ``!r`` renders the code unit as ASCII; echoing the name
+                # raw is the crash being avoided.
+                click.echo(
+                    f"{_warn('Note:')} skipping {name!r} from {spec.label} — "
+                    "the name is not valid UTF-8.",
+                    err=True,
+                )
                 continue
             entry = _normalize_client_entry(raw)
             if entry is None or _is_self_reference(entry):
@@ -3876,6 +3903,9 @@ def init(
         name = click.prompt("Server name (e.g. 'filesystem', 'github')", type=str).strip()
         if not name:
             click.echo(f"{_err('Error:')} server name must be non-empty.", err=True)
+            sys.exit(1)
+        if has_lone_surrogate(name):
+            click.echo(f"{_err('Error:')} server name {name!r} is not valid UTF-8.", err=True)
             sys.exit(1)
 
         prefix = _prompt_prefix()

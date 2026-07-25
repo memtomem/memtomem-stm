@@ -3,7 +3,8 @@
 The end-to-end counterparts — that ``mms remove --yes --json`` exits 0 with a
 parsable document after deleting a surrogate-bearing entry — live with the
 commands in ``test_proxy_cli.py``. This module pins the serializer's own
-contract: valid JSON, exact round-trip, and no collateral escaping.
+contract: valid JSON, round-trip for lone surrogates, no collateral escaping,
+and the one documented asymmetry it inherits from Python's JSON decoder.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import json
 
 import pytest
 
-from memtomem_stm.cli._json_out import dumps
+from memtomem_stm.cli._json_out import dumps, has_lone_surrogate
 
 # One from each end of the high and low surrogate blocks, so a range that is
 # off by one at either boundary fails.
@@ -85,6 +86,31 @@ class TestDumps:
 
         assert out == '{"a": "x\\ud800", "b": 1}'
 
+    def test_escaped_backslash_before_a_surrogate_keeps_the_escape_fresh(self):
+        """The safety argument is about *parity*, not absence, of backslashes.
+
+        ``dumps`` renders one backslash as two, so the substituted character is
+        always preceded by an even number of them and the inserted ``\\u``
+        opens a new escape rather than continuing one.
+        """
+        payload = {"n": "\\\ud800"}
+        out = dumps(payload, ensure_ascii=False)
+
+        assert json.loads(out) == payload
+
+    def test_adjacent_pair_collapses_exactly_as_plain_json_dumps_does(self):
+        """The documented round-trip caveat, pinned so it is not mistaken for a
+        regression: an adjacent high+low pair decodes as the astral character
+        it encodes. Python's decoder does this, not us — ``json.dumps`` with
+        ``ensure_ascii=True`` produces the same text and the same asymmetry.
+        """
+        payload = {"n": "\ud83d\ude80"}  # two code units, not the astral char
+
+        out = dumps(payload, ensure_ascii=False)
+
+        assert out == json.dumps(payload)  # identical to the stdlib's own escaping
+        assert json.loads(out) == {"n": "\U0001f680"}
+
     def test_surrogate_survives_a_dumps_loads_dumps_cycle(self):
         """Idempotent: re-serializing a decoded document produces the same
         text, so a config rewritten by ``_save`` does not accumulate escapes.
@@ -93,3 +119,30 @@ class TestDumps:
         once = dumps(payload, indent=2, ensure_ascii=False)
 
         assert dumps(json.loads(once), indent=2, ensure_ascii=False) == once
+
+
+class TestHasLoneSurrogate:
+    """The gate on names entering the config — serializable is not usable."""
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_detects_each_boundary_surrogate(self, surrogate):
+        assert has_lone_surrogate(f"sr{surrogate}v") is True
+
+    @pytest.mark.parametrize("value", ["", "fs", "서버 🚀", "a\\ud800b", "sr\tv"])
+    def test_clean_and_merely_unusual_names_pass(self, value):
+        """Encodable is the whole test: non-ASCII names, a tab, and the literal
+        ASCII text ``\\ud800`` are all writable, so none is refused."""
+        assert has_lone_surrogate(value) is False
+        value.encode("utf-8")
+
+    def test_an_adjacent_pair_is_refused_too(self):
+        """Recombination is the *JSON decoder's* behaviour, not Python's
+        encoder: a ``str`` holding the two code units still raises on
+        ``.encode()``, so such a name is exactly as unusable as a lone one and
+        the predicate must not carve out an exception for it.
+        """
+        pair = "ok" + chr(0xD83D) + chr(0xDE80)
+        with pytest.raises(UnicodeEncodeError):
+            pair.encode("utf-8")
+
+        assert has_lone_surrogate(pair) is True

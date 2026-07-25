@@ -3327,6 +3327,36 @@ class TestInitDiscoverySources:
         )
         return home, cwd, desktop
 
+    def test_skips_an_invalid_utf8_name_but_keeps_its_siblings(self, tmp_path, monkeypatch, capsys):
+        """A host config can carry a name the STM config must never store
+        (``"\\udcff"`` is a legal JSON escape), but dropping it must not cost
+        the servers listed beside it — and must not be silent, or "No MCP
+        servers found" becomes the only clue when it is the sole entry (#757).
+        """
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "bad\udcffname": {"command": "npx", "args": ["-y", "@bad"]},
+                        "filesystem": {"command": "npx", "args": ["-y", "@fs"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+
+        assert {c["name"] for c in cands} == {"filesystem"}
+        err = capsys.readouterr().err
+        assert "not valid UTF-8" in err
+        # The diagnostic names the entry without echoing the raw code unit —
+        # doing that is the crash it exists to avoid.
+        assert "\\udcff" in err
+
     def test_discovers_claude_code_user_scope(self, tmp_path, monkeypatch):
         from memtomem_stm.cli.proxy import _discover_candidates
 
@@ -8680,14 +8710,18 @@ class TestJsonLoneSurrogate:
         # name — it is escaped on disk, not dropped or mangled.
         assert SURROGATE_NAME in saved["upstream_servers"]
 
-    def test_add_json_accepts_a_name_argv_decoded_to_a_surrogate(self, runner, config):
-        """No hand-edited config needed to reach this on POSIX.
+    def test_add_json_refuses_a_name_that_is_not_valid_utf8(self, runner, config):
+        """Serializable is not the same as usable, so `add` declines.
 
-        ``mms add $'s\\xffv' ...`` hands Click a name Python already decoded
-        with ``surrogateescape``, and writing it out crashed `_save` — so the
-        command aborted with a traceback having written nothing. CliRunner
-        passes arguments as ``str`` exactly as ``sys.argv`` delivers them, so
-        this is that path, not a simulation of it.
+        ``mms add $'s\\xffv' ...`` reaches this without any hand-edited config:
+        on POSIX an argument holding a byte that is not valid UTF-8 is decoded
+        with ``surrogateescape``. Writing it is safe now, but the name is the
+        first component of the cache key and part of the Toolgraph contract
+        fingerprint — both hash encoded bytes — so the entry would fail at the
+        first proxied call instead. Refusing beats persisting that.
+
+        (CliRunner takes the already-decoded ``str``; it exercises what the
+        command does with such a name, not the OS-level argv decoding.)
         """
         result = runner.invoke(
             cli,
@@ -8695,10 +8729,60 @@ class TestJsonLoneSurrogate:
             + _cfg_args(config),
         )
 
+        assert result.exit_code == 1
+        data = json.loads(result.stdout)
+        assert data["error"] == "invalid_name" and data["name"] == ARGV_SURROGATE_NAME
+        assert not config.exists() or ARGV_SURROGATE_NAME not in json.loads(
+            config.read_text(encoding="utf-8")
+        ).get("upstream_servers", {})
+
+    def test_remove_still_works_on_a_name_add_would_refuse(self, runner, config):
+        """The refusal must not strand an already-broken config.
+
+        Rejecting at creation only makes sense while the inspect-and-delete
+        commands stay permissive — that is the whole point of escaping rather
+        than validating at load.
+        """
+        _write_surrogate_config(config)
+        result = runner.invoke(
+            cli, ["remove", SURROGATE_NAME, "--yes", "--json", *_cfg_args(config)]
+        )
+
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout)["name"] == ARGV_SURROGATE_NAME
+        assert json.loads(result.stdout)["removed"] is True
+
+    def test_remove_repairs_such_a_config_in_text_mode_too(self, runner, config):
+        """Repair does not depend on passing ``--json``.
+
+        The payload escaping here and #756's prose escaping meet on this
+        command: the report goes through the JSON writer, the success line and
+        confirmation prompt through `_disp`. Both are needed — either one alone
+        leaves an encode on the path *after* the entry is deleted.
+        """
+        _write_surrogate_config(config)
+
+        result = runner.invoke(cli, ["remove", SURROGATE_NAME, "--yes"] + _cfg_args(config))
+
+        assert result.exit_code == 0, result.output
         saved = json.loads(config.read_text(encoding="utf-8"))
-        assert ARGV_SURROGATE_NAME in saved["upstream_servers"]
+        assert SURROGATE_NAME not in saved["upstream_servers"]
+
+    def test_list_in_text_mode_still_raises_on_such_a_name(self, runner, config):
+        """The one leg that is still exposed, pinned as a boundary.
+
+        `mms list --json` renders it fine; without the flag the table
+        interpolates the name straight into the printed line, so the encode
+        moves from the payload to the terminal write. That is the prose-site
+        sweep #756 deferred to #755, and it needs the display escape rather
+        than the JSON one — an escape a reader can see, not one a parser
+        decodes. Recorded here so the gap is not mistaken for a fix.
+        """
+        _write_surrogate_config(config)
+
+        result = runner.invoke(cli, ["list"] + _cfg_args(config))
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, UnicodeEncodeError)
 
     def test_list_json_renders_a_surrogate_named_server(self, runner, config):
         """Read-only legs never mutate, but they crashed on any config

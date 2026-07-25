@@ -37,18 +37,34 @@ def dumps(payload: Any, **kwargs: Any) -> str:
     an operation that in fact succeeded.
 
     So re-escape those code units after the fact. This is safe as a blanket
-    substitution over the dumped text because inside ``json.dumps`` output a
-    raw surrogate can only appear inside a string literal (all structural
-    characters are ASCII) and is never preceded by a backslash (``dumps``
-    escapes ``\\`` as ``\\\\``). The result is therefore valid JSON that
-    round-trips: ``json.loads(dumps(x)) == x``, surrogates included.
+    substitution over the dumped text **for the keyword arguments this module's
+    callers pass** — ``indent``, ``sort_keys``, and nothing else. Under those,
+    every structural character ``dumps`` emits is ASCII, so a raw surrogate can
+    only appear inside a string literal; and ``dumps`` escapes ``\\`` as
+    ``\\\\``, so the substituted character is always preceded by an *even*
+    number of backslashes and the inserted ``\\u`` therefore opens a fresh
+    escape rather than continuing one. The result is valid JSON, and
+    ``json.loads(dumps(x)) == x`` for every *lone* surrogate — see the pair
+    caveat two paragraphs down for the one input where it does not hold.
+
+    Both halves depend on that argument contract. A caller passing a surrogate
+    inside ``separators`` would have it escaped *structurally*, yielding text
+    that no longer parses; a ``default=`` returning one is fine, since it is
+    escaped as data like any other. Do not widen the contract without
+    revisiting this.
+
+    One inherited caveat on the round-trip: a string holding an *adjacent*
+    high-then-low pair decodes back as the single astral character they encode,
+    so it is not returned unchanged. That is Python's JSON decoder, not this
+    function — plain ``json.dumps`` with ``ensure_ascii=True`` produces exactly
+    the same text and the same asymmetry. Only *lone* surrogates, the ones this
+    exists for, survive identically.
 
     Lowercase ``\\udxxx`` deliberately matches ``json.dumps``'s own
-    ``ensure_ascii=True`` escape style, so the output is byte-identical to
-    what ``dumps`` would have produced for that character on its own. That is
-    the opposite convention from ``_disp`` in ``proxy``, whose uppercase
-    ``\\uXXXX`` marks *terminal prose* — a rendering for humans, not a value
-    a consumer decodes back.
+    ``ensure_ascii=True`` escape style, so the output is byte-identical to what
+    ``dumps`` would have produced for that character on its own. Note what this
+    is *not*: an escape for humans reading a terminal. What comes out here is a
+    value a consumer decodes back, so the JSON convention is the right one.
 
     Encoding with ``errors="surrogatepass"`` would be the other way to make
     the write succeed, but it emits bytes that are not valid UTF-8, moving
@@ -59,3 +75,23 @@ def dumps(payload: Any, **kwargs: Any) -> str:
     matches nothing and the dumped text is returned unchanged.
     """
     return _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", json.dumps(payload, **kwargs))
+
+
+def has_lone_surrogate(value: str) -> bool:
+    """True when ``value`` holds a code unit that cannot be encoded to UTF-8.
+
+    Serializing such a string is now safe, but *storing* one as an upstream
+    server name is not: the name is the cache key's first component
+    (``proxy/cache.py``) and part of the Toolgraph contract fingerprint, both
+    of which hash ``.encode()``d bytes and raise on it. TOML cannot represent
+    it at all, so `mms import`'s registry could never hold it either. Such a
+    name is unusable end to end, and a config that merely *writes* is a worse
+    outcome than a refusal — so the commands that create entries call this and
+    decline, while the commands that inspect and delete them do not, which is
+    what lets an already-broken config be repaired: ``mms remove`` clears such
+    an entry in either output mode, this escaping covering its ``--json``
+    report and #756's `_disp` covering its printed line. ``mms list`` without
+    ``--json`` is the one leg still exposed, since its table prints the name
+    raw — a prose site #756 deferred to #755.
+    """
+    return _LONE_SURROGATE.search(value) is not None
