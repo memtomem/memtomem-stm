@@ -21,6 +21,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
 from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
@@ -285,6 +286,22 @@ class SurfacingLtmAdapter(Protocol):
     ) -> dict[str, Any] | None: ...
 
 
+def _core_json_loads(text: str) -> Any:
+    """``json.loads`` for the JSON Core nests *inside* its text replies (#761).
+
+    Escaping :meth:`_result_text` is not enough on its own, and the reason is
+    worth stating: the six ASCII characters ``\\ud800`` sitting in Core's nested
+    document are a legal JSON escape, not a surrogate, so they survive any
+    text-level escaping untouched — and then this parse decodes them into a
+    fresh code unit, after the point where we escaped. Scrubbing the parsed
+    result closes that second route.
+
+    Raises exactly what ``json.loads`` raises: every call site distinguishes a
+    decode error from an empty result, so this must not swallow or re-type one.
+    """
+    return scrub_lone_surrogates(json.loads(text))
+
+
 class ResultParser:
     """Strategy interface for parsing mem_search text output.
 
@@ -431,7 +448,7 @@ class StructuredResultParser(ResultParser):
             return [], []
 
         try:
-            data = json.loads(text)
+            data = _core_json_loads(text)
         except (json.JSONDecodeError, TypeError):
             logger.warning("StructuredResultParser: invalid JSON, falling back to empty")
             return [], []
@@ -484,7 +501,7 @@ class StructuredResultParser(ResultParser):
         if not text or not text.strip():
             return [], [], True
         try:
-            data = json.loads(text)
+            data = _core_json_loads(text)
         except (json.JSONDecodeError, TypeError):
             return [], [], False
         if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
@@ -745,7 +762,7 @@ class McpClientSearchAdapter:
             result = await session.call_tool("mem_do", {"action": "version"})
             text_parts = [c.text or "" for c in result.content if c.type == "text"]
             if text_parts:
-                parsed = json.loads(text_parts[0])
+                parsed = _core_json_loads(text_parts[0])
                 if isinstance(parsed, dict):
                     data = parsed
         except Exception as exc:
@@ -1401,8 +1418,16 @@ class McpClientSearchAdapter:
 
     @staticmethod
     def _result_text(result: Any) -> str:
+        """Join Core's text blocks, escaping any lone surrogate they carry.
+
+        The MCP SDK decodes a ``"\\ud800"`` escape off the wire into a raw code
+        unit, so Core's reply can hand us text that raises at the next encode —
+        including the one ``TextContent`` performs when this text is forwarded
+        into an STM tool response. Escaping on the way in makes every consumer
+        of this string total (#761). Clean text is returned unchanged.
+        """
         parts = [
-            cast(TextContent, item).text or ""
+            escape_lone_surrogates(cast(TextContent, item).text or "")
             for item in (getattr(result, "content", None) or [])
             if item.type == "text"
         ]
@@ -1445,7 +1470,7 @@ class McpClientSearchAdapter:
         if getattr(result, "isError", False) is True:
             raise RuntimeError("core context_compose returned isError=true")
         try:
-            payload = json.loads(self._result_text(result))
+            payload = _core_json_loads(self._result_text(result))
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError("core context_compose returned malformed JSON") from exc
         if not isinstance(payload, dict):
@@ -1544,7 +1569,7 @@ class McpClientSearchAdapter:
         if getattr(result, "isError", False) is True:
             raise RuntimeError("core candidate_propose returned isError=true")
         try:
-            payload = json.loads(self._result_text(result))
+            payload = _core_json_loads(self._result_text(result))
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError("core candidate_propose returned malformed JSON") from exc
         if not isinstance(payload, dict):
