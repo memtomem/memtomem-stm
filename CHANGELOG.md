@@ -137,7 +137,7 @@ changes inline only. See the deprecation policy in
   **Behavior change**: a multi-line message from a host client's CLI now
   renders as one escaped line in `mms eject`'s and `mms prune`'s failure
   lists, where it previously wrapped across several.
-  (#NNN, fixes #755)
+  (#759, fixes #755)
 
 ## [0.1.42] — 2026-07-25
 
