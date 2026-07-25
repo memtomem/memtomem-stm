@@ -80,6 +80,7 @@ from typing import Any
 
 from memtomem_stm.proxy.metrics import _percentile
 from memtomem_stm.proxy.privacy import contains_sensitive_content
+from memtomem_stm.utils import json_out
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +100,12 @@ def _canonical_args(arguments: dict[str, Any] | None) -> str:
 
     ``default=str`` keeps non-JSON-native values (e.g. Path) from raising —
     the output is only ever hashed, never persisted, so a lossy fallback
-    rendering is fine as long as it is stable.
+    rendering is fine as long as it is stable. Surrogate-safe because that
+    hash encodes it (#757): "only hashed" is not the same as "never
+    encoded", and an upstream tool argument is exactly the kind of value
+    that carries one.
     """
-    return json.dumps(
+    return json_out.dumps(
         arguments or {},
         sort_keys=True,
         ensure_ascii=False,
@@ -319,7 +323,10 @@ class SelectionTelemetryLog:
         left-outer pairing semantics, while a write failure tells it that
         nothing reached disk and the pair must be skipped.
         """
-        line = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        # The ``.encode`` below sits outside this method's write-failure
+        # handling, so an unencodable record would raise past the caller's
+        # "nothing reached disk" contract rather than returning False (#757).
+        line = json_out.dumps(record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         # Structural redaction means no payload text should ever be here;
         # this screen is the storage-gating backstop (full DEFAULT_PATTERNS
         # per the privacy.py contract) against a secret smuggled through a

@@ -210,7 +210,11 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
     for split in ("train", "validation", "test"):
         if rankable_counts[split] == 0:
             raise SelectionEvaluationError(f"{split} split needs at least one rankable case")
-    canonical = json.dumps(
+    # Encoded on the next expression, so this is one of the sites that
+    # raises rather than one that only measures (#757): a fixture case may
+    # carry a legal ``"\ud800"`` escape, and `mms selection replay` does not
+    # catch `UnicodeEncodeError`.
+    canonical = json_out.dumps(
         data,
         sort_keys=True,
         ensure_ascii=False,

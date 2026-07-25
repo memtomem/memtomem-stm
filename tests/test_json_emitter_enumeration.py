@@ -38,16 +38,13 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "response to measure or reshape it, and the result goes back to the "
         "MCP client through the SDK, which owns the wire encoding.",
     ),
-    "proxy/selection_log.py": (
-        2,
-        "Hashed or appended to a JSONL log; the argument-fingerprint helper "
-        "documents that its output is only ever hashed.",
-    ),
     "proxy/selection_eval.py": (
-        2,
-        "The remaining two are a canonical form for hashing and a privacy "
-        "scan over an in-memory string; ``to_json``, the one a --json leg "
-        "echoes, is routed (#757 round 4).",
+        1,
+        "The one left is a privacy scan over an in-memory string, which is "
+        "searched and discarded. ``to_json`` (echoed by a --json leg) and "
+        "the canonical hash input are both routed — the latter encodes on "
+        "the very next expression, so 'it is only hashed' did not make it "
+        "safe (#757 round 5).",
     ),
     "proxy/cache.py": (
         1,
@@ -102,27 +99,51 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
 }
 
 
+def _stdlib_dumps_names(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Names in *tree* that resolve to the stdlib ``json`` module and to
+    ``json.dumps`` directly.
+
+    Both spellings are already in this repository — ``import json`` and
+    ``import json as _json`` — so matching the literal ``json.dumps`` would
+    let a site in through the alias that is right there in two modules.
+    """
+    modules = set()
+    directs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "json":
+                    modules.add(alias.asname or "json")
+        elif isinstance(node, ast.ImportFrom) and node.module == "json":
+            for alias in node.names:
+                if alias.name == "dumps":
+                    directs.add(alias.asname or "dumps")
+    return modules, directs
+
+
 def _raw_dumps_sites() -> dict[str, list[int]]:
     """``{relative path: [line, ...]}`` for stdlib ``json.dumps`` calls that
     pass ``ensure_ascii=False``.
 
-    Matches on the call shape, not on text: a ``grep`` for the keyword also
+    Matches on the resolved call, not on text: a search for the keyword also
     hits every ``json_out.dumps(..., ensure_ascii=False)``, which is the
     routed form and precisely what this test must not count.
     """
     found: dict[str, list[int]] = {}
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        modules, directs = _stdlib_dumps_names(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             fn = node.func
-            if not (
+            is_stdlib = (
                 isinstance(fn, ast.Attribute)
                 and fn.attr == "dumps"
                 and isinstance(fn.value, ast.Name)
-                and fn.value.id == "json"
-            ):
+                and fn.value.id in modules
+            ) or (isinstance(fn, ast.Name) and fn.id in directs)
+            if not is_stdlib:
                 continue
             if any(
                 kw.arg == "ensure_ascii"
@@ -133,6 +154,29 @@ def _raw_dumps_sites() -> dict[str, list[int]]:
                 rel = str(path.relative_to(SRC))
                 found.setdefault(rel, []).append(node.lineno)
     return found
+
+
+def test_the_matcher_resolves_aliases_and_ignores_the_routed_writer(tmp_path) -> None:
+    """The guard is only as good as what it can see.
+
+    Pins the three spellings that matter: the alias this repository already
+    uses (`import json as _json`), a direct `from json import dumps`, and the
+    routed `json_out.dumps`, which must never be counted — miscounting it
+    would make every routed site look like a violation.
+    """
+    src = (
+        "import json as _json\n"
+        "from json import dumps as _d\n"
+        "from memtomem_stm.utils import json_out\n"
+        "a = _json.dumps({}, ensure_ascii=False)\n"
+        "b = _d({}, ensure_ascii=False)\n"
+        "c = json_out.dumps({}, ensure_ascii=False)\n"
+    )
+    tree = ast.parse(src)
+    modules, directs = _stdlib_dumps_names(tree)
+    assert modules == {"_json"}
+    assert directs == {"_d"}
+    assert "json_out" not in modules
 
 
 def test_every_unrouted_emitter_is_accounted_for() -> None:
