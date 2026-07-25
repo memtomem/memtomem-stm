@@ -591,3 +591,105 @@ class TestScorerFallbackRecorded:
         await mgr.call_tool("srv", "tool", {})
         row = _latest(store, "scorer_fallback")
         assert row["scorer_fallback"] == 0
+
+
+# ── #761: lone surrogates in upstream content ────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestUpstreamSurrogateScrub:
+    """A lone surrogate in an upstream response is *undeliverable*: the MCP
+    SDK's ``TextContent(...).model_dump_json()`` raises
+    ``PydanticSerializationError`` on it, so the alternative to escaping is
+    losing an otherwise-successful response entirely.
+
+    It arrives without anything hostile on this machine: the SDK's own JSON
+    parsing decodes a legal ``"\\ud800"`` escape in the upstream's wire JSON
+    into a raw code unit before STM sees the text (#761).
+    """
+
+    SURROGATE = "\ud800"
+
+    async def test_response_text_is_deliverable(self, make_mgr):
+        from mcp.types import TextContent
+
+        mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
+        mgr._connections["srv"].session.call_tool.return_value = _result(
+            f"before{self.SURROGATE}after"
+        )
+        result = await mgr.call_tool("srv", "tool", {})
+
+        text = result if isinstance(result, str) else result.content[0].text
+        assert "\\ud800" in text
+        # The serialization that used to raise, run bare as the real assertion.
+        TextContent(type="text", text=text).model_dump_json()
+
+    async def test_clean_text_is_returned_unchanged(self, make_mgr):
+        mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
+        payload = "ordinary 서버 🚀 text"
+        mgr._connections["srv"].session.call_tool.return_value = _result(payload)
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert (result if isinstance(result, str) else result.content[0].text) == payload
+
+    async def test_structured_content_and_meta_are_scrubbed(self, make_mgr):
+        """Both envelope fields reach the client verbatim and are serialized by
+        the same model, so escaping only ``content`` would move the raise."""
+        mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
+        upstream = SimpleNamespace(
+            content=[_text_content("plain")],
+            isError=False,
+            structuredContent={f"k{self.SURROGATE}": f"v{self.SURROGATE}"},
+            meta={"note": f"m{self.SURROGATE}"},
+        )
+        mgr._connections["srv"].session.call_tool.return_value = upstream
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert result.structuredContent == {"k\\ud800": "v\\ud800"}
+        assert result.meta == {"note": "m\\ud800"}
+        result.model_dump_json()
+
+    async def test_error_echo_path_is_scrubbed(self, make_mgr):
+        """The ``isError`` branch re-reads ``result.content`` itself and echoes
+        it back as an error result, so a scrub placed inside ``_shape_response``
+        would miss it — which is why this one is placed before shaping."""
+        mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
+        mgr._connections["srv"].session.call_tool.return_value = _result(
+            f"boom{self.SURROGATE}", is_error=True
+        )
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert result.isError is True
+        assert result.content[0].text == "boom\\ud800"
+        # An error result is serialized by the same model a success is.
+        result.model_dump_json()
+
+    async def test_the_json_escape_route_is_closed_at_ingest(self, make_mgr):
+        """The other entry path: upstream sends the six-character escape
+        ``\\ud800`` inside its JSON *text*, and ``_mm_json_loads`` decodes it
+        into a raw code unit that every compression tier then re-dumps.
+
+        Asserted on the parser directly, because that is the choke point the
+        26 ``json.dumps`` sites in ``compression.py`` all sit behind — routing
+        them individually would leave this decode still producing the code
+        unit, and would make the budget probes measure a different string than
+        the one delivered.
+        """
+        from memtomem_stm.proxy.compression import _mm_json_loads
+
+        decoded = _mm_json_loads('{"k": "a\\ud800b"}')
+
+        assert decoded == {"k": "a\\ud800b"}
+        # Whatever a tier re-dumps from this is now encodable.
+        import json as _json
+
+        _json.dumps(decoded, ensure_ascii=False).encode("utf-8")
+
+    async def test_a_clean_parse_returns_the_same_object(self, make_mgr):
+        """The no-copy fast path ``_sanitize_nonfinite`` documents, extended to
+        strings: scrubbing must not start allocating a copy of every upstream
+        payload."""
+        from memtomem_stm.proxy.compression import _sanitize_nonfinite
+
+        tree = {"a": ["x", {"b": "서버 🚀"}], "n": 1}
+        assert _sanitize_nonfinite(tree) is tree

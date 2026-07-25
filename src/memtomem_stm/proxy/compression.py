@@ -29,6 +29,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker as _CircuitBreaker
+from memtomem_stm.utils.json_out import escape_lone_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +75,21 @@ def count_markdown_headings(text: str) -> int:
 
 
 def _sanitize_nonfinite(obj: object) -> object:
-    """Recursively replace non-finite floats (``NaN`` / ``Infinity`` /
-    ``-Infinity``) with ``None`` so the result serializes to valid JSON.
+    """Recursively make a parsed payload safe to re-serialize: non-finite floats
+    become ``None``, and lone surrogates in strings are escaped to their
+    ``\\udxxx`` literal.
+
+    Both are the same shape of problem — a value ``json.loads`` accepts that
+    breaks something downstream — and both are fixed ONCE at parse time so no
+    tier has to remember. The surrogate half is #761's: ``json.loads`` decodes
+    a legal ``"\\ud800"`` escape in upstream content into a raw code unit, which
+    ``TextContent(...).model_dump_json()`` then refuses to serialize, losing an
+    otherwise-successful response. Escaping here rather than at the 26
+    ``json.dumps`` sites is what keeps the budget probes honest: they measure
+    ``len`` of a re-dumped tree, so they now count the form actually delivered
+    instead of one six characters shorter per surrogate.
+
+    Non-finite floats (the original reason this exists):
 
     ``json.dumps`` emits the bareword tokens ``NaN`` / ``Infinity`` /
     ``-Infinity`` for non-finite floats, which RFC 8259 JSON forbids and strict
@@ -87,20 +101,29 @@ def _sanitize_nonfinite(obj: object) -> object:
     ``len(json.dumps(candidate))`` — sees only finite values and never re-emits
     an invalid token.
 
-    Returns the input object UNCHANGED (same identity) when it contains no
-    non-finite float, so the common case allocates nothing. ``bool`` is an
+    Returns the input object UNCHANGED (same identity) when it contains
+    neither, so the common case allocates nothing. ``bool`` is an
     ``int`` subclass (not ``float``) and is left untouched.
     """
+    if isinstance(obj, str):
+        return escape_lone_surrogates(obj)
     if isinstance(obj, float):
         return None if not math.isfinite(obj) else obj
     if isinstance(obj, dict):
         replaced: dict | None = None
         for key, value in obj.items():
             sanitized = _sanitize_nonfinite(value)
-            if sanitized is not value:
+            # A key encodes exactly as a value does, so a surrogate in one
+            # breaks the same re-dump. Non-finite floats never needed this —
+            # JSON object keys are strings — which is why the walk did not
+            # visit keys before (#761).
+            new_key = escape_lone_surrogates(key) if isinstance(key, str) else key
+            if sanitized is not value or new_key is not key:
                 if replaced is None:
                     replaced = dict(obj)
-                replaced[key] = sanitized
+                if new_key is not key:
+                    del replaced[key]
+                replaced[new_key] = sanitized
         return replaced if replaced is not None else obj
     if isinstance(obj, (list, tuple)):
         replaced_seq: list | None = None

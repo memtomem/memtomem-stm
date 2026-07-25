@@ -239,6 +239,24 @@ changes inline only. See the deprecation policy in
   is meant to produce. Clean metadata hashes byte-identically to the producer,
   so every existing bundle keeps binding exactly as before — the cross-repo
   golden-fixture test pins that. (#761)
+- An upstream response carrying a lone surrogate is delivered with that
+  character escaped instead of being discarded. The MCP SDK decodes a legal
+  `"\ud800"` escape out of the upstream's wire JSON into a raw code unit, and
+  `TextContent(...).model_dump_json()` then refuses to serialize it — so an
+  otherwise-successful response was lost to a serialization error. Such a
+  character is undeliverable by any route, so escaping it is strictly better
+  than losing the response around it.
+  **Behavior change**: proxied content is now modified in this one case. A lone
+  surrogate is replaced by the six literal characters `\ud800` (its JSON escape
+  spelling) in tool response text, in `structuredContent` and in `_meta`.
+  Content with no lone surrogate — everything else, including all CJK, emoji
+  and astral characters — is returned byte-identically, so this is invisible to
+  every well-formed response.
+  The escape happens once at ingest rather than at each serialization site,
+  which is also what keeps the compression budgets honest: they measure the
+  length of a re-serialized payload, so escaping later would have made them
+  count a string six characters shorter per surrogate than the one actually
+  delivered. (#761)
 
 ## [0.1.42] — 2026-07-25
 
