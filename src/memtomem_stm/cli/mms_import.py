@@ -59,6 +59,7 @@ from pathlib import Path
 
 import click
 
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
@@ -77,7 +78,14 @@ _VALID_FROM_VALUES = (*ALL_HOSTS, "all")
 def _format_env_summary(
     server: RegistryServer, env_classification: dict, *, show_imported: bool
 ) -> str:
-    """Render the env block for `--plan` output, redacting secrets unless --show-imported."""
+    """Render the env block for `--plan` output, redacting secrets unless --show-imported.
+
+    Keys and values come straight out of a host's MCP config, so both are
+    display-escaped here rather than at the two call sites (#760) — this is the
+    only renderer of them, and ``mms host sync`` prints the same string.
+    Redaction still happens first: escaping a value must never be what decides
+    whether a secret is shown.
+    """
     if not server.env:
         return "no env"
     if show_imported:
@@ -85,15 +93,15 @@ def _format_env_summary(
         parts = []
         for key, value in server.env.items():
             tag = " (secret)" if env_classification[key].is_secret else ""
-            parts.append(f"{key}={value}{tag}")
+            parts.append(f"{_disp(key)}={_disp(value)}{tag}")
         return "env: " + ", ".join(parts)
 
     redacted = redact_for_plan(server.env, env_classification)
     parts = []
     for key, value in redacted.items():
         cls = env_classification[key]
-        tag = f" ← secret ({cls.reason})" if cls.is_secret else " (non-secret)"
-        parts.append(f"{key}={value}{tag}")
+        tag = f" ← secret ({_disp(cls.reason)})" if cls.is_secret else " (non-secret)"
+        parts.append(f"{_disp(key)}={_disp(value)}{tag}")
     return "env: " + ", ".join(parts)
 
 
@@ -205,8 +213,13 @@ def import_command(
         env_summary = _format_env_summary(
             cand.server, cand.env_classification, show_imported=show_imported
         )
+        # Pad the *displayed* name, not the stored one: escaping lengthens it,
+        # so measuring the raw value pads this column too narrow and raggeds
+        # every column after it — the defect #755 recorded for `mms remove`'s
+        # preview. `env_summary` is escaped by its own renderer (#760).
         click.echo(
-            f"  {cand.name:<22} [{cand.source_label}]  command={cand.server.command}  {env_summary}"
+            f"  {_disp(cand.name):<22} [{_disp(cand.source_label)}]  "
+            f"command={_disp(cand.server.command)}  {env_summary}"
         )
 
     click.echo("")
@@ -218,7 +231,7 @@ def import_command(
         click.echo("")
         click.echo("Conflicts:")
         for cand, reason in conflicts:
-            click.echo(f"  - {cand.name} from {cand.source_label}: {reason}")
+            click.echo(f"  - {_disp(cand.name)} from {_disp(cand.source_label)}: {_disp(reason)}")
 
     if is_plan:
         click.echo("")
