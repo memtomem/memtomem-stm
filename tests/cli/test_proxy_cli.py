@@ -776,6 +776,36 @@ class TestDisp:
         assert _disp(r"C:\srv\u001B") == r"C:\srv\u001B"
 
 
+class TestFormatCandidateDetail:
+    """``_format_candidate_detail`` renders *another client's* config into a
+    terminal cell — a preview list, the picker title, a prune row — so it
+    escapes its own result once rather than leaving six call sites to
+    remember (#755). Pinned here because the questionary picker, one of
+    those callers, has no CliRunner-drivable path."""
+
+    def test_stdio_command_and_args_are_escaped(self):
+        from memtomem_stm.cli.proxy import _format_candidate_detail
+
+        out = _format_candidate_detail(
+            {"transport": "stdio", "command": "np\rx", "args": ["-y", "pk\x1bg"]}
+        )
+        assert out == "[stdio] np\\u000Dx -y pk\\u001Bg"
+
+    def test_url_and_transport_label_are_escaped(self):
+        from memtomem_stm.cli.proxy import _format_candidate_detail
+
+        out = _format_candidate_detail({"transport": "s\rse", "url": "https://x/m\rcp"})
+        assert out == "[s\\u000Dse] https://x/m\\u000Dcp"
+
+    def test_ordinary_entry_renders_unchanged(self):
+        """The escaping must be invisible on every real candidate — CJK and
+        emoji included, since discovered configs routinely carry them."""
+        from memtomem_stm.cli.proxy import _format_candidate_detail
+
+        entry = {"transport": "stdio", "command": "npx", "args": ["-y", "@서버/mcp-🚀"]}
+        assert _format_candidate_detail(entry) == "[stdio] npx -y @서버/mcp-🚀"
+
+
 # ── _load / config-corruption paths ──────────────────────────────────────
 
 
@@ -1220,6 +1250,37 @@ class TestListServers:
         # Same pin for the ORIGIN column added in #475 PR4 ("-" is the
         # no-provenance cell; this entry was added manually).
         assert row[header.index("ORIGIN")] == "-"
+
+    def test_hostile_cell_escapes_without_disturbing_the_clean_row(self, runner, config):
+        """A CR in any cell used to redraw the row over the one above it,
+        so a single hand-edited entry could hide or forge every line of
+        the table. Each cell is escaped inside its pad (#755) — and the
+        clean row's columns must still land exactly where the header says,
+        which is what pins that escaping is a no-op on ordinary names."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "clean": {"prefix": "cl", "command": "npx"},
+                        "ev\ril": {"prefix": "ev", "command": "np\rx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        header = next(line for line in lines if "NAME" in line and "TRANSPORT" in line)
+        hostile = next(line for line in lines if line.startswith("ev\\u000Dil"))
+        assert "np\\u000Dx" in hostile
+        assert "\r" not in result.output
+
+        clean = next(line for line in lines if line.startswith("clean"))
+        assert header.index("COMPRESSION") == clean.index("auto")
+        assert clean[header.index("SURFACING") :].startswith("on")
+        assert clean[header.index("ORIGIN")] == "-"
 
     def test_list_surfacing_column_shows_toggle(self, runner, config):
         """The SURFACING column is the per-server toggle's visible home
@@ -6263,6 +6324,40 @@ class TestPruneCommand:
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         pairs = {(c[3], c[5]) for c in argvs}
         assert pairs == {("filesystem", "user"), ("filesystem", "local")}
+
+    def test_preview_pads_names_by_their_displayed_width(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """This preview is the only table in the CLI whose column width is
+        computed rather than a literal, and the consent prompt that follows
+        is the user's last look before entries are removed from their other
+        clients. Measuring the stored name would pad the escaped one too
+        narrow and ragged the detail column (#755), so the width comes from
+        the displayed form."""
+        self._seed_config(config, ["clean", "ev\ril"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "clean",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "ev\ril",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "\r" not in result.output
+
+        rows = [ln for ln in result.output.splitlines() if "[stdio] npx" in ln]
+        assert len(rows) == 2
+        assert any(ln.lstrip().startswith("ev\\u000Dil") for ln in rows)
+        assert len({ln.index("[stdio]") for ln in rows}) == 1
 
     def test_divergent_identity_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
         """Same name in STM and source client but different command → the

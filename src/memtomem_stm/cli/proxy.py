@@ -1918,9 +1918,13 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
             detail = f"{cmd} {args_str}".strip()
         else:
             detail = cfg.get("url", "")
+        # Escaped per cell, inside the pad: a CR in any of them would
+        # otherwise redraw this row over the previous one and take the
+        # whole table's alignment with it (#755). ``surfacing`` is computed
+        # here, so only the config-derived cells need it.
         click.echo(
-            f"{name:<20} {prefix:<10} {transport:<16} {compression:<12} "
-            f"{surfacing:<10} {origin_cell:<16} {detail}"
+            f"{_disp(name):<20} {_disp(prefix):<10} {_disp(transport):<16} "
+            f"{_disp(compression):<12} {surfacing:<10} {_disp(origin_cell):<16} {_disp(detail)}"
         )
     click.echo(f"\n{len(servers)} server(s) configured.")
     if any_pruned:
@@ -2768,12 +2772,20 @@ def _build_origin(cand: dict[str, Any], imported_at: str) -> dict[str, Any] | No
 
 
 def _format_candidate_detail(entry: dict[str, Any]) -> str:
+    """One-line ``[transport] command/url`` cell for a discovered candidate.
+
+    Display-escaped as a whole (#755): every caller prints the result into
+    a terminal — a preview list, a picker title, a prune row — and none
+    puts it in a ``--json`` payload or styles it, so there is no escape
+    sequence of ours inside the string to protect. The values are another
+    client's config, not STM's, so they never passed ``add``'s validation.
+    """
     transport = entry.get("transport", "stdio")
     if transport == "stdio":
         parts = [entry.get("command", "")]
         parts.extend(entry.get("args", []))
-        return f"[stdio] {' '.join(p for p in parts if p).strip()}"
-    return f"[{transport}] {entry.get('url', '')}"
+        return _disp(f"[stdio] {' '.join(p for p in parts if p).strip()}")
+    return _disp(f"[{transport}] {entry.get('url', '')}")
 
 
 def _source_removal_hint(name: str, source: str) -> str:
@@ -3354,7 +3366,7 @@ def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
         for i, c in enumerate(candidates):
             marker = "[v]" if i in picks else "[ ]"
             title = (
-                f"{marker}  {c['name']:<18}  "
+                f"{marker}  {_disp(c['name']):<18}  "
                 f"{_format_candidate_detail(c['entry'])}  — from {c['source']}"
             )
             choices.append(questionary.Choice(title=title, value=i))
@@ -3507,7 +3519,7 @@ def _add_from_clients(
         dup = cand.get("duplicate_in")
         dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
         click.echo(
-            f"  {i:>2}. {cand['name']:<18} {_format_candidate_detail(cand['entry'])}"
+            f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
             f"    — from {cand['source']}{dup_hint}"
         )
     click.echo("")
@@ -3553,7 +3565,7 @@ def _add_from_clients(
     click.echo("")
     click.echo(f"{_ok('Added')} {len(imported)} server(s) to {resolved}:")
     for n, e in imported.items():
-        click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
+        click.echo(f"  {_disp(n):<20} prefix={_disp(e['prefix'])}  {_format_candidate_detail(e)}")
 
     # Source clients still hold the direct registrations. Without a prune,
     # tools surface on two paths (client → upstream and client → STM →
@@ -3797,7 +3809,7 @@ def init(
             dup = cand.get("duplicate_in")
             dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
             click.echo(
-                f"  {i:>2}. {cand['name']:<18} {_format_candidate_detail(cand['entry'])}"
+                f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
                 f"    — from {cand['source']}{dup_hint}"
             )
         click.echo("")
@@ -3941,7 +3953,7 @@ def init(
     click.echo("")
     click.echo(_hdr("Configured upstream servers:"))
     for n, e in imported.items():
-        click.echo(f"  {n:<20} prefix={e['prefix']}  {_format_candidate_detail(e)}")
+        click.echo(f"  {_disp(n):<20} prefix={_disp(e['prefix'])}  {_format_candidate_detail(e)}")
 
     # Non-default ``--config`` paths: surface the flag in the management
     # hints so ``mms list`` / ``mms health`` don't silently read the empty
@@ -4891,7 +4903,13 @@ def prune(
     # plan and the human preview cannot drift.
     if not as_json:
         click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
-    name_width = max((len(c["name"]) for c in dual), default=0)
+    # Width over the *displayed* names, not the stored ones: an escaped
+    # name is longer than its raw form, so measuring the raw one would
+    # leave the detail column ragged for exactly the rows the escaping is
+    # for (#755). ``planned`` keeps the stored name — it is the ``--json``
+    # plan, and its consumer matches it against the config.
+    disp_names = {c["name"]: _disp(c["name"]) for c in dual}
+    name_width = max((len(n) for n in disp_names.values()), default=0)
     planned: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for cand in dual:
@@ -4903,7 +4921,7 @@ def prune(
             seen.add(key)
             planned.append({"name": cand["name"], "source": src})
             if not as_json:
-                click.echo(f"  {cand['name']:<{name_width}}  {detail}  — {src}")
+                click.echo(f"  {disp_names[cand['name']]:<{name_width}}  {detail}  — {src}")
 
     if dry_run:
         if as_json:
