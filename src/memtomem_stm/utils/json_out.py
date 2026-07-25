@@ -90,8 +90,9 @@ def has_lone_surrogate(value: str) -> bool:
     decline, while the commands that inspect and delete them do not, which is
     what lets an already-broken config be repaired: ``mms remove`` clears such
     an entry in either output mode, this escaping covering its ``--json``
-    report and #756's `_disp` covering its printed line. ``mms list`` without
-    ``--json`` is the one leg still exposed, since its table prints the name
-    raw — a prose site #756 deferred to #755.
+    report and #756's ``_disp`` covering its printed line. The text-mode
+    renderings of ``list`` / ``health`` / ``doctor`` print the name escaped
+    rather than raising as of #759, which closed the prose sites #756
+    deferred; a test pins all three.
     """
     return _LONE_SURROGATE.search(value) is not None

@@ -159,10 +159,11 @@ changes inline only. See the deprecation policy in
   a byte that is not valid UTF-8 is decoded with `surrogateescape`, so
   `mms add $'s\xffv' ...` alone produced a name the CLI then could not write.
   Clean payloads render byte-identically, and a rewritten config decodes back to
-  the identical name rather than losing the entry. Not covered: `mms eject`'s
-  manual `claude mcp add-json` hint and the argv it shells out to, which carry
-  the same values but fail at the terminal render and the subprocess encoding
-  rather than in a JSON document. (#758, fixes #757)
+  the identical name rather than losing the entry. `mms eject`'s manual
+  `claude mcp add-json` hint is not a JSON document and needs none of this: its
+  command form is refused wholesale by `_shell_join` and its `# Edit` form is
+  display-escaped, both since #756. The argv `mms eject` actually spawns was
+  the real remaining exposure there — see the entry below. (#758, fixes #757)
 - The commands that *create* an upstream server now refuse a name that is not
   valid UTF-8, rather than storing one that fails later. Being writable is not
   the same as being usable: the server name is the first component of the
@@ -186,9 +187,14 @@ changes inline only. See the deprecation policy in
   only the report can still fail. Every command that writes the config was
   re-checked by running it against such a config and comparing the file before
   and after, and none now mutates and then raises. The read-only renderings of
-  `mms list`, `mms doctor` and `mms health` in text mode do still raise, which
-  changes nothing on disk; those are prose sites #756 deferred to #755, and a
-  regression test pins the boundary rather than leaving it assumed. (#758)
+  `mms list`, `mms doctor` and `mms health` print the name display-escaped
+  rather than raising, as of #759 — the two escapes meet there, and a test
+  pins all three text legs so a regression in either shows up as a crash.
+  `mms eject` is checked the same way before it spawns either `claude mcp`
+  verb: the name and payload go out as subprocess arguments, which encode to
+  UTF-8, so the command now reports "server name or payload is not valid
+  UTF-8" and leaves both sides intact where it previously raised — after the
+  destructive pre-remove, on the `--force` path. (#758)
 
 ## [0.1.42] — 2026-07-25
 
