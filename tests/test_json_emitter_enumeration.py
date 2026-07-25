@@ -68,12 +68,6 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "Metadata column written through the same pending store; carries the "
         "server and tool names alongside upstream content — see #761.",
     ),
-    "proxy/toolgraph_bundle.py": (
-        1,
-        "Contract fingerprint, encoded to bytes by us. A surrogate raises "
-        "here, which is one of the reasons the CLI refuses to create such a "
-        "name at all (#758); reaching it another way is #761.",
-    ),
     "mms/drift.py": (
         1,
         "Canonical form of a registry server, hashed by its only caller with "

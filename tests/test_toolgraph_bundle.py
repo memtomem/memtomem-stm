@@ -1498,3 +1498,105 @@ class TestBundleProvenanceWiring:
         with caplog.at_level("WARNING"):
             manager._refresh_toolgraph_bundle(force=True)
         assert "not protected from substitution" not in caplog.text
+
+
+def test_contract_digest_survives_a_surrogate_in_upstream_metadata():
+    """``name``/``description``/``input_schema`` come from live ``tools/list``
+    metadata, which nothing gates — the entry-field check #758 added covers what
+    *this machine's* config can carry, not what an upstream sends back. The
+    digest encodes its canonical bytes, so such metadata raised (#761).
+    """
+    digest = tool_contract_digest(
+        server="graph-srv",
+        name="read",
+        description="hostile\ud800",
+        input_schema={"type": "object", "title": "t\udfffx"},
+        annotations=None,
+    )
+    assert len(digest) == 64
+
+    # Still a fingerprint: the escape happens before the hash, so distinct
+    # metadata keeps producing distinct digests rather than collapsing.
+    other = tool_contract_digest(
+        server="graph-srv",
+        name="read",
+        description="hostile\udfff",
+        input_schema={"type": "object", "title": "t\udfffx"},
+        annotations=None,
+    )
+    assert other != digest
+
+
+def test_contract_digest_is_byte_identical_for_clean_metadata():
+    """The producer (``toolgraph.artifacts.canonical_json_bytes``) uses exactly
+    these arguments and raises on a surrogate itself, so no published bundle can
+    hold a digest for surrogate-bearing metadata. Escaping only has to leave
+    clean metadata alone — which is what keeps every existing bundle binding.
+    """
+    contract = {
+        "server": "graph-srv",
+        "name": "read",
+        "description": "Read data 서버 🚀",
+        "input_schema": {"type": "object"},
+        "read_only_hint": True,
+        "destructive_hint": None,
+        "idempotent_hint": None,
+        "open_world_hint": None,
+    }
+    expected = (
+        json.dumps(contract, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+    assert canonical_json_bytes(contract) == expected
+
+
+def test_metadata_drifting_to_a_surrogate_drifts_one_tool_not_the_catalog(tmp_path):
+    """The reachable shape is metadata *drift*, which is what the digest exists
+    to detect. A bundle can only ever be published for clean metadata — the
+    producer's own ``canonical_json_bytes`` raises otherwise — but it keys on the
+    tool *name*, so a tool crawled clean and later serving a surrogate in its
+    description binds by name, reaches the digest, and raised.
+
+    The digest runs inside the bind loop over every tool of every connection,
+    and neither call site guards ``UnicodeEncodeError``: the reload site's
+    ``except`` catches only ``(OSError, PolicyBundleError)`` and the startup
+    apply sits outside the ``try`` entirely. So one drifted tool took down every
+    ``tools/list`` and ``tools/call`` in bundle mode, not just its own (#761).
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.REVIEW)
+    # Bundle published while BOTH tools were clean.
+    clean_publish = _tool(name="publish", description="Publish a draft")
+    doc = _bundle(tool, profile="review")
+    doc["tools"].append(
+        {
+            "tool_key": "graph-srv::publish",
+            "tool_contract_digest": tool_contract_digest(
+                server="graph-srv",
+                name=clean_publish.name,
+                description=clean_publish.description,
+                input_schema=clean_publish.inputSchema,
+                annotations=clean_publish.annotations,
+            ),
+            "decision": "eligible",
+            "risk_score": 0.1,
+        }
+    )
+    _write_bundle(path, doc)
+
+    # Upstream now serves a surrogate in that tool's description.
+    connection = manager._connections["srv"]
+    manager._connections["srv"] = UpstreamConnection(
+        name=connection.name,
+        config=connection.config,
+        session=connection.session,
+        tools=[tool, _tool(name="publish", description="Publish a draft\ud800")],
+    )
+
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+
+    # Fail-closed on the drifted tool, which is the correct outcome: the escaped
+    # digest cannot match a digest no producer could have published.
+    assert manager._toolgraph_external_rejects[("srv", "publish")] == REASON_TOOLGRAPH_DRIFTED
+    # The point of the test: its clean sibling still bound normally.
+    assert ("srv", "read") not in manager._toolgraph_external_rejects
+    assert manager._toolgraph_bind_stats["catalog_total"] == 2
+    assert manager._toolgraph_bind_stats["stm_drifted"] == 1

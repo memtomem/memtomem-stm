@@ -223,6 +223,22 @@ changes inline only. See the deprecation policy in
   peer that never escaped it. A frame with nothing to escape is byte-identical
   on the wire and decodes to an equal object, so this is invisible to every
   existing exchange. (#761)
+- In Toolgraph bundle mode, an upstream tool whose `tools/list` metadata
+  carries a lone surrogate is now rejected as drifted instead of taking the
+  whole catalog down. The contract fingerprint encodes its canonical JSON, and
+  it is computed inside the bind loop over every tool of every connection, so
+  the resulting `UnicodeEncodeError` escaped both call sites — the reload site
+  catches only `(OSError, PolicyBundleError)` and the startup apply is outside
+  that `try` — and failed every `tools/list` and `tools/call`, not just the one
+  tool's. The reachable shape is metadata *drift*, which is exactly what the
+  digest exists to detect: a bundle can only ever be published for clean
+  metadata, since Toolgraph's own encoder raises on a surrogate too, but it
+  keys on the tool name, so a tool crawled clean and later serving a surrogate
+  binds by name and reaches the digest. Its digest now cannot match one no
+  producer could have published, which is the fail-closed rejection this path
+  is meant to produce. Clean metadata hashes byte-identically to the producer,
+  so every existing bundle keeps binding exactly as before — the cross-repo
+  golden-fixture test pins that. (#761)
 
 ## [0.1.42] — 2026-07-25
 
