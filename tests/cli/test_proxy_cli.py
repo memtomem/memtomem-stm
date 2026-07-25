@@ -498,6 +498,54 @@ class TestShellJoin:
         assert not (set(out) & {"\r", "\n", "\x00"})
         assert "whoami" not in out
 
+    def test_paste_unsafe_chars_are_a_subset_of_the_display_class(self):
+        """``_HINT_UNSAFE_CHARS`` no longer drives the guard — ``_disp_escapes``
+        does — so pin that it stays a subset. If a future edit narrowed the
+        display class below CR/LF/NUL, the paste-execution guard #751 exists for
+        would silently disappear."""
+        from memtomem_stm.cli.proxy import _HINT_UNSAFE_CHARS, _disp_escapes
+
+        assert all(_disp_escapes(ch) for ch in _HINT_UNSAFE_CHARS)
+
+    @pytest.mark.parametrize(
+        "ch",
+        # The same representative-per-subclass set ``TestDisp`` escapes.
+        ["\x1b", "\x85", "\x9b", "\x7f", "\u2028", "\u2029", "\u202e", "\u2069", "\ud800"],
+    )
+    @pytest.mark.parametrize("pos", ["first", "middle", "last"])
+    def test_display_hostile_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch, pos):
+        """A rendered command is terminal output before it is anything else, so
+        the guard covers the whole display-hostile class, not only the CR/LF/NUL
+        that break the paste (#754). Quoting is no defence here — it preserves
+        an ESC or a BiDi override faithfully, which is precisely the problem —
+        and escaping is not an option either, since the pasted command would
+        then name a *different* server. So the command is refused, on both legs
+        and in any token position."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
+
+        for platform in ("linux", "win32"):
+            monkeypatch.setattr(sys, "platform", platform)
+            out = _shell_join(self._argv_with_unsafe_char_at(pos, ch))
+            assert out == _HINT_UNRENDERABLE
+            assert ch not in out
+            assert "whoami" not in out
+
+    @pytest.mark.parametrize(
+        "value",
+        ["서버", "🚀", "👨\u200d👩\u200d👧", "naïve", "a\u200eb"],
+    )
+    def test_non_ascii_names_still_render_as_commands(self, monkeypatch, value):
+        """The widened class must not start refusing legitimate names: CJK,
+        emoji, ZWJ sequences and the plain LRM mark render a real command, not
+        the diagnostic. Without this the #754 fix would have made `mms eject`
+        unusable for exactly the users the issue said not to regress."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        out = _shell_join(["mms", "eject", "--", value])
+        assert out != _HINT_UNRENDERABLE
+        assert value in out
+
     @pytest.mark.parametrize("ch", ["\r", "\n", "\x00"])
     @pytest.mark.parametrize("pos", ["first", "middle", "last"])
     def test_posix_control_char_renders_nonexecutable_diagnostic(self, monkeypatch, ch, pos):
@@ -607,6 +655,125 @@ class TestShellJoinCmdRoundTrip:
         )
         assert proc.returncode != 0  # ``#`` is genuinely unknown → nonzero
         assert "TAIL_RAN" not in proc.stdout  # ``&&`` tail short-circuited
+
+
+class TestDisp:
+    """``_disp`` escapes terminal-hostile characters in a config-derived value
+    before it is interpolated into human-facing prose (#754).
+
+    Same class as ``_shell_join``'s guard — ``_disp_escapes`` defines it for
+    both — but a different strategy: a *runnable* argv is refused wholesale
+    (#751/#752, widened by #754), while prose is escaped in place so the
+    surrounding sentence still renders. Ordinary names — including CJK and
+    emoji — must be returned unchanged, which is why ``repr()`` was rejected as
+    the primitive.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "gh",
+            "my server",
+            r"C:\a&b\cfg.json",
+            "%USERNAME%",
+            'he said "hi" & ran',
+            "a'b",
+            "~/.claude.json",
+            "[stdio] npx -y pkg",
+        ],
+    )
+    def test_identity_on_clean_input(self, value):
+        """A value with nothing to escape is returned *as the same object* —
+        pins the fast path and, with it, the byte-identical rendering of every
+        ordinary name at the call sites (the property #750 established for
+        ``_cmd_quote``)."""
+        from memtomem_stm.cli.proxy import _disp
+
+        assert _disp(value) is value
+
+    @pytest.mark.parametrize(
+        ("ch", "escaped"),
+        [
+            ("\x00", "\\u0000"),
+            ("\n", "\\u000A"),
+            ("\r", "\\u000D"),
+            ("\x1b", "\\u001B"),  # ESC — the ANSI/CSI introducer
+            ("\x7f", "\\u007F"),  # DEL
+            ("\x85", "\\u0085"),  # C1 NEL: a line break to some terminals
+            ("\x9b", "\\u009B"),  # C1 CSI: a one-byte escape-sequence intro
+            ("\u2028", "\\u2028"),  # Zl LINE SEPARATOR
+            ("\u2029", "\\u2029"),  # Zp PARAGRAPH SEPARATOR
+            ("\u202e", "\\u202E"),  # Cf RLO, a bidirectional override
+            ("\u2069", "\\u2069"),  # Cf PDI, an isolate terminator
+            # Cs lone surrogate: ``_load`` reads the config as strict UTF-8, so
+            # one arrives via a JSON ``\ud800`` escape in an ASCII file. It would
+            # raise rather than render if encoded to the terminal.
+            ("\ud800", "\\uD800"),
+        ],
+    )
+    @pytest.mark.parametrize("pos", ["first", "middle", "last"])
+    def test_escapes_hostile_chars(self, ch, escaped, pos):
+        """One representative of every subclass in ``_disp_escapes``'s set —
+        the cases below, which are chosen to cover it rather than to restate it
+        — escapes in any position. The position axis rules out an early-return
+        on the first character or a ``strip``-shaped implementation, which a
+        leading/trailing-only test would pass. U+2028/U+2029 are in the class because they end a line for
+        enough renderers to split the hint (Python's own ``str.splitlines``
+        treats both as breaks); the repo's Markdown sanitizer already handles
+        them, at surfacing/formatter.py."""
+        from memtomem_stm.cli.proxy import _disp
+
+        value = {"first": f"{ch}srv", "middle": f"sr{ch}v", "last": f"srv{ch}"}[pos]
+        out = _disp(value)
+        assert escaped in out
+        assert ch not in out
+
+    def test_escapes_bidi_overrides_but_keeps_marks(self):
+        """The bidirectional controls escape — they can reorder a rendered line
+        into a forged second ``Note:``. The plain LRM/RLM marks do not. They are
+        not inert (under UAX #9 a mark's strong direction can change how
+        *adjacent neutrals* resolve), but they cannot override a strong run or
+        open a span, and they are what makes a legitimate RTL name render
+        correctly — escaping them would regress the case #754 protects."""
+        from memtomem_stm.cli.proxy import _disp
+
+        assert _disp("srv\u202eevil") == "srv\\u202Eevil"
+        assert _disp("srv\u2066evil") == "srv\\u2066evil"
+        assert _disp("srv\u200e") == "srv\u200e"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["서버", "日本語", "🚀", "👨\u200d👩\u200d👧", "café", "naïve\ufe0f"],
+    )
+    def test_preserves_cjk_and_emoji(self, value):
+        """The issue's hard requirement. This is why the character class is
+        explicit codepoint ranges rather than ``unicodedata.category`` in
+        ``{"Cc","Cf","Cs"}`` (the ``SurfacingFormatter._sanitize`` test): ``Cf``
+        contains ZWJ, so that set would split the family emoji apart."""
+        from memtomem_stm.cli.proxy import _disp
+
+        assert _disp(value) is value
+
+    def test_ansi_sequence_is_neutralized(self):
+        """The issue's worst case: a name that repaints the terminal or forges
+        a line. The digits and letters of the sequence survive as literal text
+        — only the introducer is escaped, which is what makes it inert."""
+        from memtomem_stm.cli.proxy import _disp
+
+        out = _disp("\x1b[2J\x1b[31mFAKE Note:")
+        assert "\x1b" not in out
+        assert out == "\\u001B[2J\\u001B[31mFAKE Note:"
+
+    def test_backslash_is_not_escaped(self):
+        """Documented residual: ``_disp`` never touches ``\\``, so Windows paths
+        stay readable and any backslash escape ``json.dumps`` already produced
+        survives — at the cost of a non-injective encoding (a name containing
+        the literal text ``\\u001B`` renders the same as one containing a real
+        ESC). A display-only surface; not worth doubling every path
+        separator."""
+        from memtomem_stm.cli.proxy import _disp
+
+        assert _disp(r"C:\srv\u001B") == r"C:\srv\u001B"
 
 
 # ── _load / config-corruption paths ──────────────────────────────────────
@@ -5501,6 +5668,27 @@ class TestAddFromClients:
         hint = _source_removal_hint("my server", "Claude Code (user)")
         assert hint == 'claude mcp remove "my server" -s user'
 
+    def test_removal_hint_unknown_source_escapes_both_values(self):
+        """The unrecognized-label branch renders ``# Remove '<name>' from
+        <source>.`` as prose rather than a command, so ``_shell_join`` never
+        sees it. Both interpolations are untrusted here — reaching this branch
+        means ``source`` itself was not one of the known labels (#754)."""
+        from memtomem_stm.cli.proxy import _source_removal_hint
+
+        hint = _source_removal_hint("bad\x1bname", "weird\rsource")
+        assert hint == "# Remove 'bad\\u001Bname' from weird\\u000Dsource."
+
+    def test_removal_hint_desktop_branch_escapes_name(self):
+        """The Claude Desktop branch is prose too (STM never edits that config
+        itself). The path comes from ``_desktop_config_path()`` — platform
+        state, not config — so only the name is escaped."""
+        from memtomem_stm.cli.proxy import _desktop_config_path, _source_removal_hint
+
+        hint = _source_removal_hint("bad\nname", "Claude Desktop")
+        assert hint == (
+            f"# Edit {_desktop_config_path()} and remove 'bad\\u000Aname' under mcpServers."
+        )
+
 
 class TestAddFromClientsPrune:
     """`mms add --from-clients --prune` (and the TTY prompt variant) removes
@@ -6792,6 +6980,79 @@ class TestEjectCommand:
         h_path = _eject_manual_hint("gh", "claude-project", f"/proj\n{marker}", {"command": "npx"})
         assert _HINT_UNRENDERABLE in h_path
         assert marker not in h_path
+
+    def test_manual_hint_edit_branch_escapes_every_interpolation(self):
+        """The ``mcp-json``/desktop branch renders a ``# Edit ...`` prose line,
+        not a command, so ``_shell_join`` never guards it. Every config-derived
+        interpolation is display-escaped (#754): the target path, the name and
+        the payload JSON. Both JSON halves need it on top of ``json.dumps``,
+        because ``ensure_ascii=False`` leaves C1 characters (here U+0085) raw
+        inside string values.
+
+        The two halves escape by different conventions, which is expected: the
+        path is prose and uses ``_disp``'s uppercase ``\\u000D``, while the name
+        and payload are JSON and so carry ``json.dumps``'s own lowercase
+        escapes wherever it already escaped a character itself."""
+        from memtomem_stm.cli.proxy import _eject_manual_hint
+
+        hint = _eject_manual_hint(
+            "bad\x1bname", "mcp-json", "/proj\rdir/.mcp.json", {"command": "np\x85x"}
+        )
+        assert not (set(hint) & {"\r", "\n", "\x00", "\x1b", "\x85"})
+        assert "# Edit /proj\\u000Ddir/.mcp.json and add under mcpServers: " in hint
+        assert '"bad\\u001bname"' in hint  # json.dumps escaped the ESC, lowercase
+        assert '"np\\u0085x"' in hint  # _disp escaped the C1 json left raw
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "bad\x1bname",
+            'quote"name',  # used to end the JSON string early -> invalid
+            # ``\b`` is a *valid* JSON escape, so this one used to parse
+            # silently into a different key: a real backspace, not "\\b".
+            "back\\bslash",
+            # ``\s`` and ``\z`` are not JSON escapes, so these used to make
+            # the fragment outright invalid rather than silently wrong.
+            "back\\slash",
+            "back\\zslash",
+            "sep\u2028name",
+            "서버 🚀",
+        ],
+    )
+    def test_manual_hint_edit_branch_stays_valid_json(self, name):
+        """The ``# Edit`` line's tail is meant to be pasted into an
+        ``mcpServers`` object, so it must parse *and* reconstruct the exact
+        key. Rendering the name through ``json.dumps`` rather than wrapping it
+        in literal quotes is what makes that true for a name containing ``"``
+        or ``\\``. Both used to break it, but differently, and the difference is
+        why both are parametrized here: a ``\\`` followed by a character JSON
+        does not define as an escape (``\\s``, ``\\z``) made the fragment
+        outright invalid, while one JSON *does* define (``\\b``) parsed
+        silently into a different key — a real backspace. ``_disp`` composes
+        safely on top because ``\\uXXXX`` is itself a JSON string escape and it
+        never touches backslashes."""
+        from memtomem_stm.cli.proxy import _eject_manual_hint
+
+        payload = {"command": "np\x85x", "args": ["--tag", "서버 🚀"]}
+        hint = _eject_manual_hint(name, "mcp-json", "/proj/.mcp.json", payload)
+        fragment = hint.split(" and add under mcpServers: ", 1)[1]
+        assert json.loads("{" + fragment + "}") == {name: payload}
+
+    def test_manual_hint_command_branches_refuse_display_hostile_values(self):
+        """These branches return a command and nothing else, so there is no
+        prose here to escape into — and escaping in place is not available
+        anyway, since a `\\uXXXX` in a pasted `claude mcp add-json` would
+        register a *different* server name. #751/#752 already collapsed the
+        command to the diagnostic for CR/LF/NUL; #754 widens that same refusal
+        to the rest of the display-hostile class, so an ESC or C1 in either the
+        name or the payload now collapses it too."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _eject_manual_hint
+
+        h_name = _eject_manual_hint("srv\x1b[31m", "claude-user", None, {"command": "npx"})
+        assert h_name == _HINT_UNRENDERABLE
+        h_payload = _eject_manual_hint("gh", "claude-user", None, {"command": "np\x85x"})
+        assert h_payload == _HINT_UNRENDERABLE
+        assert "\x1b" not in h_name and "\x85" not in h_payload
 
     def _seed_config(self, config: Path, servers: dict) -> None:
         config.write_text(
@@ -8188,14 +8449,90 @@ class TestRemoveEjectHint:
         ``mms eject`` command — pasted it would submit a truncated command and
         run the tail (#751). The embedded restore command collapses to the
         non-executable diagnostic, leaving no ``mms eject`` fragment to paste.
-        (The surrounding prose still prints the raw name — a display wart, not
-        a paste-execution surface, and out of scope here.)"""
+        The surrounding prose keeps rendering, with the name display-escaped by
+        ``_disp`` rather than printed raw (#754) — the two guards cover the two
+        halves of the same hint."""
         from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _remove_eject_hint
 
         hint = _remove_eject_hint("bad\nname", self._imported_entry(), Path("/tmp/custom.json"))
         assert hint is not None
         assert _HINT_UNRENDERABLE in hint
         assert "mms eject" not in hint
+        assert "'bad\\u000Aname'" in hint
+        assert "bad\nname" not in hint
+
+    def test_hint_esc_bearing_name_escapes_prose_and_drops_command(self):
+        """The two halves must agree about the same character. An ESC does not
+        break a paste — `shlex` quotes it faithfully — so before #754 the command
+        leg let it through, as it did for every member outside the original
+        CR/LF/NUL subset it already refused. Both legs printed an ESC-bearing
+        name raw then; escaping only the prose would have made that worse rather
+        than better, leaving an escaped name in the sentence and a live ESC in
+        the `mms eject` command on the very next line. Widening the refusal is
+        what keeps the two legs consistent.
+
+        Asserted after `click.unstyle`, which strips the app's own `_warn`
+        styling around `Note:`. That styling is real ANSI on purpose — it is
+        what the composition rule on `_disp` protects, and asserting on the raw
+        string would flag it as if it were injected."""
+        import click
+
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _remove_eject_hint
+
+        hint = _remove_eject_hint(
+            "srv\x1b[31mEVIL", self._imported_entry(), Path("/tmp/custom.json")
+        )
+        assert hint is not None
+        assert "\x1b" not in click.unstyle(hint)
+        assert "'srv\\u001B[31mEVIL'" in hint
+        assert _HINT_UNRENDERABLE in hint
+        assert "mms eject" not in hint
+
+    def test_hint_escapes_unrecognized_kind_label(self):
+        """The ``from {label}`` half is tainted too: an unrecognized
+        ``origin.source.kind`` falls through to the recorded string verbatim
+        (``_origin_cell`` documents that provenance is displayed, not
+        validated), so it needs the same escaping as the name."""
+        from memtomem_stm.cli.proxy import _remove_eject_hint
+
+        entry = self._imported_entry()
+        entry["origin"]["source"]["kind"] = "evil\x1b[1mkind"
+        hint = _remove_eject_hint("gh", entry, Path("/tmp/custom.json"))
+        assert hint is not None
+        assert "from evil\\u001B[1mkind and" in hint
+        assert "\x1b[1m" not in hint
+
+    def test_remove_output_carries_no_raw_control_chars(self, runner, config):
+        """End-to-end: the whole ``mms remove`` screenful — the ``Note:`` hint,
+        and the success line that follows it — is free of raw control
+        characters for a hostile config key (#754).
+
+        Uses CR, not an ANSI sequence: ``CliRunner`` captures with color off and
+        click strips well-formed SGR on echo, so an ESC-based assertion would
+        pass even without the fix. CR survives that stripping and is what
+        overwrites the line in a real terminal."""
+        self._seed(config, self._imported_entry())
+        raw = json.loads(config.read_text(encoding="utf-8"))
+        raw["upstream_servers"] = {"bad\rname": raw["upstream_servers"]["gh"]}
+        config.write_text(json.dumps(raw), encoding="utf-8")
+
+        result = runner.invoke(cli, ["remove", "bad\rname", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "\r" not in result.output
+        assert "'bad\\u000Dname'" in result.output
+
+    def test_confirm_prompt_carries_no_raw_control_chars(self, runner, config):
+        """The confirm prompt is the one site where this is more than cosmetic:
+        a CR in the name overwrites the rendered ``[y/N]`` the user is
+        answering. Driven without ``--yes`` so the prompt actually renders."""
+        self._seed(config, self._imported_entry())
+        raw = json.loads(config.read_text(encoding="utf-8"))
+        raw["upstream_servers"] = {"bad\rname": raw["upstream_servers"]["gh"]}
+        config.write_text(json.dumps(raw), encoding="utf-8")
+
+        result = runner.invoke(cli, ["remove", "bad\rname", *_cfg_args(config)], input="n\n")
+        assert "\r" not in result.output
+        assert "Remove server 'bad\\u000Dname'? [y/N]" in result.output
 
     def test_hint_names_active_config_not_default(self, runner, config):
         """#746: `mms remove --config <custom>` must render the *custom*

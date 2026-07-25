@@ -11,6 +11,84 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- Terminal-hostile characters in a config-derived server name, source label or
+  path no longer reach the terminal verbatim in a hint. The set covers what
+  cannot be rendered or can rewrite the rendered line — control characters
+  such as ESC, the line separators, and the bidirectional controls, among
+  others. Its single authoritative definition is the `_disp_escapes`
+  predicate in `cli/proxy.py`, whose docstring enumerates the members and
+  the reason each is in; read that rather than this sentence for the exact
+  membership. Preserved: everything else, so CJK, emoji, ZWJ sequences and
+  the plain LRM/RLM marks render as before, and a value with nothing to
+  escape renders byte-identically. Config is plain
+  `json.loads` with no character validation on server names, so an imported or
+  hand-edited config could carry any of these.
+  Prose escapes such a character in place, as `\uXXXX`. A runnable command
+  cannot — an escaped token would paste as a *different* server name — so it is
+  refused wholesale instead, extending the existing CR/LF/NUL guard to the same
+  class. Both halves of a hint therefore now agree about the same character.
+  Previously both printed such a name raw — for anything outside CR/LF/NUL
+  neither half guarded it — and escaping the prose alone would have replaced
+  that with a worse state: an escaped name in the `Note:` sentence and the
+  raw one, live ESC and all, in the `mms eject` command on the line below.
+  The **prose sites** covered are: `mms remove`'s eject `Note:` sentence, in
+  both the server name and the imported-from label (an unrecognized
+  `origin.source.kind` is displayed as recorded); the
+  `# Remove '<name>' from <source>.` line, in both values; the
+  `# Edit … and remove '<name>' under mcpServers.` line; the
+  `# Edit <path> … <name>: <payload>` restore line, in the path, the name and
+  the payload JSON, since of the set's members `json.dumps(…,
+  ensure_ascii=False)` escapes only the C0 ones and so left the rest raw
+  inside string values; and the `mms remove` flow's own
+  server-not-found error, confirmation prompt and success line, which print the
+  same key in the same screenful. The prompt is the one site where this was
+  more than cosmetic — a CR in the name overwrote the rendered `[y/N]` the user
+  was answering.
+  In that same `# Edit` line the server name is now rendered by `json.dumps`
+  rather than wrapped in literal quotes, so the fragment parses back to the
+  exact key. A name containing `"` used to produce invalid JSON, and one
+  containing `\` used to break it either way: followed by a character JSON
+  does not define as an escape (`back\slash`) the fragment was outright
+  invalid, while followed by one it does define (`back\bslash`) it parsed
+  silently into a *different* key — a real backspace.
+  **Behavior change**: the `# copy/paste hint unavailable: …` diagnostic now
+  reads `a value contains characters that cannot be displayed safely` rather
+  than `a value contains line-break or NUL characters`, and stands in for a
+  command whose values carry any character in the class above, not only
+  CR/LF/NUL. The wording names no Unicode category on purpose: the class spans
+  several, so `control characters` would be false for the separators and the
+  lone surrogates.
+  `mms remove --json` embeds the eject hint in its `warnings` array, so for a
+  name carrying one of these characters that string now contains `\uXXXX`
+  escapes or the diagnostic; the array's shape is unchanged, and a name with
+  nothing to escape produces a byte-identical string. Machine-readable fields
+  (the `name` key in the result and in `--json` failures) stay raw. Those are
+  data, not display: of the set's members `json.dumps` escapes the C0 ones,
+  and the rest of the
+  set round-trips through a JSON parser unharmed even though it is emitted
+  literally. The exception is a lone surrogate, which `json.dumps` also emits
+  literally but which then cannot be encoded at all — see the residuals below.
+  This closes the display wart the #752 entry below documents as out of scope
+  for #751. Residuals: a backslash is never escaped by the display sanitizer,
+  which keeps Windows paths readable and leaves any backslash escape
+  `json.dumps` already produced intact, but makes the encoding non-injective
+  (a name containing the literal text
+  `\u001B` renders like one containing a real ESC). Within the `# Edit` line
+  the escapes are mixed-case: a character `json.dumps` already escapes itself
+  keeps its lowercase form, while one it leaves raw under `ensure_ascii=False`
+  — every member of the set outside C0 — is then escaped uppercase by the
+  sanitizer, as the path always is. A lone
+  surrogate in a `--json` payload is a different matter: `json.dumps` returns
+  it unescaped and writing that document to the terminal then raises, so the
+  command emits no JSON at all. That predates this change and is unaffected by
+  it; see #757. And the
+  remaining prose sites the sweep found — the `mms list` and `mms prune`
+  tables, the discovery/`mms add` flow, the eject summary and backup-log lines,
+  and `mms health --names` / `mms doctor` — are deferred to #755.
+  (#756, fixes #754)
+
 ## [0.1.42] — 2026-07-25
 
 ### Upgrade notes
