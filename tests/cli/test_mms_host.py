@@ -2014,3 +2014,84 @@ class TestSyncForceCrossHostLockdown6:
         # Cross-host manual-review footer fires instead.
         assert "shape-relocated to a different host than baseline source" in res.output
         assert "manual review" in res.output
+
+
+class TestDisplayEscaping:
+    """Host configs carry these values verbatim into four aligned or
+    prompt-adjacent renders. First escaping coverage for this surface (#760).
+
+    The confirmation prompt is the one where this is more than cosmetic: #755
+    recorded that a CR in a name overwrites the rendered ``[y/N]`` the user is
+    answering, which is a consent problem, not a rendering one.
+    """
+
+    HOSTILE = "ev\x1b[31m\ril"
+
+    @staticmethod
+    def _assert_no_raw_hostile(output: str) -> None:
+        assert "\x1b" not in output
+        assert "\r" not in output
+
+    def test_status_table_escapes_name_and_source(self, runner, sandbox):
+        _seed_claude_code(sandbox, {self.HOSTILE: {"command": "npx"}, "clean": {"command": "npx"}})
+        _apply_claude_code(runner)
+        res = runner.invoke(host_group, ["status"])
+
+        assert res.exit_code == 0, res.output
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        self._assert_no_raw_hostile(res.output)
+        assert "clean" in res.output
+
+    def test_status_table_stays_aligned(self, runner, sandbox):
+        _seed_claude_code(sandbox, {self.HOSTILE: {"command": "npx"}, "clean": {"command": "npx"}})
+        _apply_claude_code(runner)
+        res = runner.invoke(host_group, ["status"])
+
+        rows = [ln for ln in res.output.splitlines() if "Claude Code" in ln]
+        assert len(rows) == 2
+        assert len({ln.index("Claude Code") for ln in rows}) == 1, f"ragged: {rows}"
+
+    def test_scan_table_escapes_name_and_host(self, runner, sandbox):
+        _seed_claude_code(sandbox, {self.HOSTILE: {"command": "npx"}, "clean": {"command": "npx"}})
+        res = runner.invoke(host_group, ["scan"])
+
+        assert res.exit_code == 0, res.output
+        self._assert_no_raw_hostile(res.output)
+
+    def test_status_json_leg_keeps_the_name_raw(self, runner, sandbox):
+        """The campaign's other half: a ``--json`` consumer decodes the value
+        back, so it must NOT be display-escaped — only the text leg is."""
+        _seed_claude_code(sandbox, {self.HOSTILE: {"command": "npx"}})
+        _apply_claude_code(runner)
+        res = runner.invoke(host_group, ["status", "--json"])
+
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.output)
+        assert [e["name"] for e in payload["entries"]] == [self.HOSTILE]
+
+    def test_sync_plan_escapes_every_bucket_it_renders(self, runner, sandbox):
+        _seed_claude_code(sandbox, {self.HOSTILE: {"command": f"cmd{self.HOSTILE}"}})
+        _apply_claude_code(runner)
+        # Drop it from the host so the REMOVE bucket renders too.
+        _seed_claude_code(sandbox, {"other": {"command": "npx"}})
+        res = runner.invoke(host_group, ["sync", "--plan"])
+
+        assert res.exit_code == 0, res.output
+        assert "REMOVE" in res.output
+        self._assert_no_raw_hostile(res.output)
+
+    def test_apply_confirmation_prompt_cannot_overwrite_its_own_question(
+        self, runner, sandbox, monkeypatch
+    ):
+        """A CR in the name rewrites the line the ``[y/N]`` is rendered on, so
+        the user answers a prompt they cannot read (#755's finding, on the
+        surface that decides a destructive registry removal)."""
+        _seed_claude_code(sandbox, {self.HOSTILE: {"command": "npx"}})
+        _apply_claude_code(runner)
+        _seed_claude_code(sandbox, {"other": {"command": "npx"}})
+        # The prompt is gated on a real TTY; CliRunner is not one.
+        monkeypatch.setattr("memtomem_stm.cli.mms_host._is_interactive", lambda: True)
+        res = runner.invoke(host_group, ["sync", "--apply"], input="n\n")
+
+        assert "Proceed?" in res.output, res.output
+        self._assert_no_raw_hostile(res.output)

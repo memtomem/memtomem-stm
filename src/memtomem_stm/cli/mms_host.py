@@ -61,6 +61,7 @@ from pathlib import Path
 import click
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state
@@ -332,7 +333,9 @@ def _render_text(rows: list[dict]) -> None:
         click.echo(f" {'NAME':<20} {'STATE':<16} SOURCE")
         for row in main_rows:
             source = row["source_label"] or ""
-            click.echo(f" {row['name']:<20} {row['state']:<16} {source}")
+            # Pad the displayed form: escaping lengthens the value, so
+            # measuring the stored one raggeds every column after it (#755).
+            click.echo(f" {_disp(row['name']):<20} {row['state']:<16} {_disp(source)}")
         click.echo("")
     click.echo(f" {n_unchanged} unchanged, {n_changed} changed at host")
     if n_removed:
@@ -461,7 +464,7 @@ def _render_scan_text(rows: list[dict], from_host: str) -> None:
     click.echo(f" {'NAME':<20} {'HOST':<22} IN_REGISTRY")
     for row in rows:
         flag = "Yes" if row["in_registry"] else "No"
-        click.echo(f" {row['name']:<20} {row['host']:<22} {flag}")
+        click.echo(f" {_disp(row['name']):<20} {_disp(row['host']):<22} {flag}")
     click.echo("")
     n_total = len(rows)
     n_in_reg = sum(1 for r in rows if r["in_registry"])
@@ -597,7 +600,7 @@ def _format_server_diff_lines(row: dict) -> list[str]:
     old: state.RegistryServer = row["_old_server"]
     new: state.RegistryServer = row["_new_server"]
     new_source = row["_new_source_label"]
-    lines = [f"  - {row['name']}"]
+    lines = [f"  - {_disp(row['name'])}"]
     same_command = old.command == new.command
     same_args = list(old.args or []) == list(new.args or [])
     same_env_keys = sorted(old.env.keys()) == sorted(new.env.keys())
@@ -634,7 +637,7 @@ def _format_server_diff_lines(row: dict) -> list[str]:
             f"    New: command={new.command}  args={list(new.args or [])}  "
             f"env={_format_env_keys_redacted(new)}"
         )
-    lines.append(f"    Source: {new_source}")
+    lines.append(f"    Source: {_disp(new_source)}")
     return lines
 
 
@@ -668,7 +671,8 @@ def _build_apply_prompt(
         lines.append(_SYNC_REMOVE_PROMPT_HEADER_TEMPLATE.format(n=n, ies_or_y=_ies_or_y(n)))
         for row in removed_rows:
             lines.append(
-                f"  - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})"
+                f"  - {_disp(row['name'])} (last seen: {_disp(row['source_label'])}, "
+                f"{row['last_imported']})"
             )
         lines.append("")
     if restamp_rows:
@@ -756,8 +760,8 @@ def _render_sync_text(
                 cand.server, cand.env_classification, show_imported=False
             )
             w(
-                f"    - {cand.name} [{cand.source_label}]  "
-                f"command={cand.server.command}  {env_summary}"
+                f"    - {_disp(cand.name)} [{_disp(cand.source_label)}]  "
+                f"command={_disp(cand.server.command)}  {env_summary}"
             )
         if _new_has_secret_env(new):
             w(_SYNC_SHOW_IMPORTED_HINT)
@@ -765,17 +769,23 @@ def _render_sync_text(
         n = len(remove_rows)
         w(f"  REMOVE    {n} entr{_ies_or_y(n)} (no longer at any host)")
         for row in remove_rows:
-            w(f"    - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})")
+            w(
+                f"    - {_disp(row['name'])} (last seen: {_disp(row['source_label'])}, "
+                f"{row['last_imported']})"
+            )
     if backfill_rows:
         n = len(backfill_rows)
         w(f"  BACKFILL  {n} entr{_ies_or_y(n)} (re-stamp drift baseline)")
         for row in backfill_rows:
-            w(f"    - {row['name']} [{row['host']}]")
+            w(f"    - {_disp(row['name'])} [{_disp(row['host'])}]")
     if cleanup_rows:
         n = len(cleanup_rows)
         w(f"  CLEANUP   {n} stale sidecar entr{_ies_or_y(n)} (no registry entry)")
         for row in cleanup_rows:
-            w(f"    - {row['name']} (last seen: {row['source_label']}, {row['last_imported']})")
+            w(
+                f"    - {_disp(row['name'])} (last seen: {_disp(row['source_label'])}, "
+                f"{row['last_imported']})"
+            )
     if restamp_rows:
         n = len(restamp_rows)
         w(f"  RESTAMP   {n} entr{_ies_or_y(n)} (registry shape updated to current host)")
@@ -791,7 +801,7 @@ def _render_sync_text(
         n = len(conflict_rows)
         w(f"  Conflicts: {n}  (skipped — first-import-wins)")
         for row in conflict_rows:
-            w(f"    - {row['name']} from {row['host']}: {row['reason']}")
+            w(f"    - {_disp(row['name'])} from {_disp(row['host'])}: {_disp(row['reason'])}")
 
     n_skipped = summary["skipped_changed"]
     if n_skipped:
@@ -1130,7 +1140,9 @@ def sync_cmd(
     ]
     if repo_local_writes and not allow_project_configs:
         click.echo(
-            project_local_gate_message(sorted({cand.name for cand in repo_local_writes})),
+            project_local_gate_message(
+                [_disp(n) for n in sorted({c.name for c in repo_local_writes})]
+            ),
             err=True,
         )
         if json_output:
