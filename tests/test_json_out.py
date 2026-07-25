@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from memtomem_stm.cli._json_out import dumps, has_lone_surrogate
+from memtomem_stm.utils.json_out import dumps, has_lone_surrogate
 
 # One from each end of the high and low surrogate blocks, so a range that is
 # off by one at either boundary fails.

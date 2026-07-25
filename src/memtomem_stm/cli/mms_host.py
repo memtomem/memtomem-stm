@@ -60,7 +60,7 @@ from pathlib import Path
 
 import click
 
-from memtomem_stm.cli._json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state

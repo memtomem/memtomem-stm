@@ -25,7 +25,7 @@ import click
 from pydantic import ValidationError
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
-from memtomem_stm.cli._json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     _has_annotation_policy,

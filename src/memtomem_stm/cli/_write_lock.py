@@ -175,7 +175,7 @@ def with_config_write_lock(
                 if json_envelope and kwargs.get("as_json"):
                     import sys as _sys
 
-                    from memtomem_stm.cli._json_out import dumps as _json_dumps
+                    from memtomem_stm.utils.json_out import dumps as _json_dumps
 
                     ctx = click.get_current_context(silent=True)
                     action = ctx.command.name if ctx and ctx.command.name else f.__name__

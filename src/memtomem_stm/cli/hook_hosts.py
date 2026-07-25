@@ -76,7 +76,7 @@ from typing import Any
 
 import tomli_w
 
-from memtomem_stm.cli._json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
 from memtomem_stm.cli.host_runtime import _shell_tokens
 from memtomem_stm.utils.fileio import atomic_write_text

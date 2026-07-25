@@ -53,7 +53,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from memtomem_stm.cli._json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 
 
 @dataclass(frozen=True, slots=True)

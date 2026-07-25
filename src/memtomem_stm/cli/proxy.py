@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
-from memtomem_stm.cli._json_out import dumps as _json_dumps
-from memtomem_stm.cli._json_out import has_lone_surrogate
+from memtomem_stm.utils.json_out import dumps as _json_dumps
+from memtomem_stm.utils.json_out import has_lone_surrogate
 from memtomem_stm.cli._write_lock import with_config_write_lock
 from memtomem_stm.cli.config_cmd import config_group as _config_group
 from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
