@@ -178,3 +178,69 @@ class TestConfigValidate:
         config.chmod(0o600)
         result = _validate(runner, config)
         assert result.exit_code == 0, result.output
+
+
+class TestDisplayEscaping:
+    """`mms config validate` renders the config's own key names and the paths
+    it was pointed at. Both are unvalidated: an unknown key is whatever the
+    file happens to contain, and the path comes from ``--config`` (argv, so a
+    lone surrogate arrives via POSIX ``surrogateescape``).
+
+    This is the group's clearest inconsistency — the same `config_error` origin
+    is escaped at proxy's three render sites as of #759 (#760).
+    """
+
+    HOSTILE = "ev\x1b[31m\ril"
+
+    @staticmethod
+    def _assert_clean(output: str) -> None:
+        assert "\x1b" not in output
+        assert "\r" not in output
+
+    def test_unknown_key_name_is_escaped(self, runner, config):
+        config.write_text(
+            json.dumps({"upstream_servers": {}, self.HOSTILE: 1}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        res = _validate(runner, config)
+
+        assert "unknown key" in res.output
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        self._assert_clean(res.output)
+
+    def test_validation_error_location_is_escaped(self, runner, config):
+        """The leak here is the ``loc``, not the ``msg``. Pydantic's messages
+        are already value-free by #759's design ("Input should be 'stdio', ..."
+        names the allowed set, not what was given), but ``loc`` is built from
+        the config's own keys — so a hostile *server name* renders inside
+        ``upstream_servers.<name>.prefix``."""
+        config.write_text(
+            json.dumps(
+                {"upstream_servers": {self.HOSTILE: {"command": "x"}}},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        res = _validate(runner, config)
+
+        assert res.exit_code != 0
+        assert "Field required" in res.output
+        self._assert_clean(res.output)
+
+    def test_missing_file_error_escapes_the_path_from_argv(self, runner, tmp_path):
+        missing = tmp_path / f"cfg{self.HOSTILE}.json"
+        res = _validate(runner, missing)
+
+        assert res.exit_code != 0
+        assert "not found" in res.output
+        self._assert_clean(res.output)
+
+    def test_json_leg_keeps_the_key_raw(self, runner, config):
+        config.write_text(
+            json.dumps({"upstream_servers": {}, self.HOSTILE: 1}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        res = _validate(runner, config, "--json")
+
+        payload = json.loads(res.output)
+        assert payload["unknown_keys"] == [self.HOSTILE]

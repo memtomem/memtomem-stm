@@ -74,6 +74,7 @@ from typing import TYPE_CHECKING, Any, Iterator, TextIO
 
 import click
 
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.cli.hook_adapter import (
     CANONICAL_TOOLS,
     READLIKE_SURFACE_TOOLS,
@@ -1037,7 +1038,11 @@ def _emit_hook_change(
     shows what *would* happen and how to apply it."""
     from memtomem_stm.cli.proxy import _hdr, _ok, _warn
 
-    click.echo(f"{_hdr(change.label + ' hook')} — {change.path}")
+    # `change.path` and the backup beside it are filesystem paths; a
+    # directory name can hold anything the filesystem allows. `label`,
+    # `action`, `host_tag` and `notes` are literals this package writes
+    # itself and stay raw. Escape the value, never the styled line (#760).
+    click.echo(f"{_hdr(change.label + ' hook')} — {_disp(str(change.path))}")
 
     if not change.changed:
         no_change = {
@@ -1051,7 +1056,7 @@ def _emit_hook_change(
     if change.action == "install":
         if apply_:
             if backup is not None:
-                click.echo(f"  {_ok('Backed up')} {backup}")
+                click.echo(f"  {_ok('Backed up')} {_disp(str(backup))}")
             click.echo(f"  {_ok('Installed')} memtomem-stm's PostToolUse hook.")
         else:
             verb = "create the config and add" if change.status == "create" else "add"
@@ -1065,14 +1070,14 @@ def _emit_hook_change(
     else:  # uninstall (only reached when changed → status == "remove")
         if apply_:
             if backup is not None:
-                click.echo(f"  {_ok('Backed up')} {backup}")
+                click.echo(f"  {_ok('Backed up')} {_disp(str(backup))}")
             click.echo(f"  {_ok('Removed')} memtomem-stm's PostToolUse hook.")
         else:
             click.echo("  Would remove memtomem-stm's PostToolUse hook.")
 
     if not apply_ and change.fmt == "toml":
         click.echo(
-            f"  {_warn('Note:')} applying rewrites {change.path.name} — TOML "
+            f"  {_warn('Note:')} applying rewrites {_disp(change.path.name)} — TOML "
             "comments/formatting are not preserved (a non-clobbering .bak backup "
             "is kept)."
         )

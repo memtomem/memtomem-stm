@@ -1083,3 +1083,54 @@ def test_cli_compression_default_off_is_passthrough(monkeypatch: pytest.MonkeyPa
     )
     assert result.exit_code == 0
     assert json.loads(result.output) == {}
+
+
+class TestEmitHookChangeDisplayEscaping:
+    """``_emit_hook_change`` renders the host-config path it is about to
+    rewrite. That path is filesystem-derived (it hangs off ``HOME``), and a
+    directory name can hold anything the filesystem allows — including the
+    characters that rewrite the rendered line (#760).
+
+    ``change.notes``, ``label``, ``action`` and ``host_tag`` are literals this
+    package writes itself and deliberately stay raw.
+    """
+
+    HOSTILE = "ev\x1b[31m\ril"
+
+    def _change(self, tmp_path: Path):
+        @dataclass
+        class _Change:
+            path: Path
+            label: str = "Claude Code"
+            status: str = "create"
+            action: str = "install"
+            changed: bool = True
+            fmt: str = "toml"
+            rendered_block: str = "[[hooks]]"
+            notes: tuple = ()
+            host_tag: str = "claude"
+
+        return _Change(path=tmp_path / f"cfg{self.HOSTILE}" / "settings.toml")
+
+    def test_plan_header_and_toml_note_escape_the_path(self, tmp_path, capsys):
+        from memtomem_stm.cli.hook_cmd import _emit_hook_change
+
+        _emit_hook_change(self._change(tmp_path), apply_=False, backup=None)
+        out = capsys.readouterr().out
+
+        # The header renders the full path; the TOML note renders `path.name`.
+        assert "\\u001B" in out and "\\u000D" in out
+        assert "applying rewrites" in out
+        assert "\x1b" not in out
+        assert "\r" not in out
+
+    def test_applied_backup_path_is_escaped(self, tmp_path, capsys):
+        from memtomem_stm.cli.hook_cmd import _emit_hook_change
+
+        backup = tmp_path / f"cfg{self.HOSTILE}" / "settings.toml.bak"
+        _emit_hook_change(self._change(tmp_path), apply_=True, backup=backup)
+        out = capsys.readouterr().out
+
+        assert "Backed up" in out
+        assert "\x1b" not in out
+        assert "\r" not in out
