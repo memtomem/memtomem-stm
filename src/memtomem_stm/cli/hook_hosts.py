@@ -76,6 +76,7 @@ from typing import Any
 
 import tomli_w
 
+from memtomem_stm.cli._json_out import dumps as _json_dumps
 from memtomem_stm.cli.hook_adapter import READLIKE_SURFACE_TOOLS, get_adapter
 from memtomem_stm.cli.host_runtime import _shell_tokens
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -571,7 +572,7 @@ def installed_stm_hook_commands(host_tag: str) -> tuple[str, ...]:
 def _serialize(fmt: str, data: dict[str, Any]) -> str:
     """Serialize merged config back to its on-disk format (trailing newline)."""
     if fmt == "json":
-        return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        return _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
     text = tomli_w.dumps(data)
     return text if text.endswith("\n") else text + "\n"
 

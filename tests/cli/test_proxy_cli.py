@@ -8599,11 +8599,13 @@ class TestRemove:
         assert data["error"] == "config_not_found" and data["path"] == str(missing.resolve())
 
 
-# Lone surrogate: unpaired, so it cannot be encoded to UTF-8. It reaches the
-# CLI only through a hand-edited or imported config — ``"\ud800"`` is a legal
-# JSON escape, and ``_load`` is a plain ``json.loads`` with no character
-# validation — never through argv on a config we wrote ourselves.
+# Lone surrogate: unpaired, so it cannot be encoded to UTF-8. Two ways in.
+# From a config — ``"\ud800"`` is a legal JSON escape and ``_load`` is a plain
+# ``json.loads`` with no character validation — and, on POSIX, from argv: an
+# argument holding a byte that is not valid UTF-8 is decoded with
+# ``surrogateescape``, which produces one in the U+DC80–U+DCFF range.
 SURROGATE_NAME = "sr\ud800v"
+ARGV_SURROGATE_NAME = "sr\udcffv"
 
 
 def _write_surrogate_config(config: Path, *, sibling: bool = False) -> None:
@@ -8660,6 +8662,43 @@ class TestJsonLoneSurrogate:
         data = json.loads(result.stdout)
         assert data["error"] == "server_not_found"
         assert data["name"] == SURROGATE_NAME
+
+    def test_remove_json_rewrites_a_config_holding_a_surrogate_sibling(self, runner, config):
+        """Removing a *clean* server from such a config still had to rewrite
+        the file with the surrogate-bearing sibling in it — which crashed the
+        write itself, before the report. The save is atomic, so no state was
+        lost, but the command still exited 1 with no JSON.
+        """
+        _write_surrogate_config(config, sibling=True)
+        result = runner.invoke(cli, ["remove", "fs", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["removed"] is True
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert "fs" not in saved["upstream_servers"]
+        # The untouched sibling survives the rewrite decoding to the same
+        # name — it is escaped on disk, not dropped or mangled.
+        assert SURROGATE_NAME in saved["upstream_servers"]
+
+    def test_add_json_accepts_a_name_argv_decoded_to_a_surrogate(self, runner, config):
+        """No hand-edited config needed to reach this on POSIX.
+
+        ``mms add $'s\\xffv' ...`` hands Click a name Python already decoded
+        with ``surrogateescape``, and writing it out crashed `_save` — so the
+        command aborted with a traceback having written nothing. CliRunner
+        passes arguments as ``str`` exactly as ``sys.argv`` delivers them, so
+        this is that path, not a simulation of it.
+        """
+        result = runner.invoke(
+            cli,
+            ["add", ARGV_SURROGATE_NAME, "--prefix", "sx", "--command", "echo", "--json"]
+            + _cfg_args(config),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["name"] == ARGV_SURROGATE_NAME
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        assert ARGV_SURROGATE_NAME in saved["upstream_servers"]
 
     def test_list_json_renders_a_surrogate_named_server(self, runner, config):
         """Read-only legs never mutate, but they crashed on any config

@@ -574,7 +574,7 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     ``mode=0o600`` keeps the rendered file out of a permissive listing
     even if the parent directory is shared.
     """
-    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    payload = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
     atomic_write_text(config_path, payload, mode=0o600, durable=True)
 
 
@@ -2924,7 +2924,9 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
         return (False, f"'{name}' not registered in {path}")
     del servers[name]
     try:
-        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True)
+        atomic_write_text(
+            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True
+        )
     except OSError as exc:
         return (False, f"write error: {exc}")
     return (True, None)
@@ -3002,7 +3004,7 @@ def _append_pruned_backup(
     # host env/headers, secrets included.
     try:
         atomic_write_text(
-            path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600, durable=True
+            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", mode=0o600, durable=True
         )
     except OSError as exc:
         return (False, f"backup log write failed: {exc}")
@@ -5189,7 +5191,7 @@ def _json_config_set_entry(
     try:
         atomic_write_text(
             path,
-            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+            _json_dumps(existing, indent=2, ensure_ascii=False) + "\n",
             mode=default_mode,
             durable=True,
         )

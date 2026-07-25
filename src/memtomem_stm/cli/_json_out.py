@@ -15,9 +15,12 @@ from typing import Any
 
 # Every character in this range is, in a Python ``str``, a *lone* surrogate:
 # astral characters are single code points above U+FFFF, so a well-formed
-# string never contains one. They reach us through config files, where
-# ``"\ud800"`` is a legal JSON escape that ``json.loads`` decodes without
-# complaint (#757).
+# string never contains one. Two ways they reach us (#757). From a config
+# file, where ``"\ud800"`` is a legal JSON escape that ``json.loads`` decodes
+# without complaint and no character validation follows. And, on POSIX, from
+# argv: a command-line argument carrying a byte that is not valid UTF-8 is
+# decoded with ``surrogateescape``, which yields one in U+DC80–U+DCFF — so
+# ``mms add`` alone could produce a name it then could not write.
 _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
