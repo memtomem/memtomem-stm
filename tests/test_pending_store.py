@@ -732,3 +732,60 @@ class TestStoreLifecycleCleanup:
 
         assert mgr._progressive_store is first
         assert first.get("missing") is None  # still live, not closed
+
+
+class TestLoneSurrogateDefenseInDepth:
+    """These stores sit behind the ingest scrub, so a surrogate should never
+    reach them in normal operation. They are hardened anyway because their
+    failure mode is bad out of proportion to the cause (#761).
+
+    ``sqlite3`` encodes text parameters to UTF-8, so the raise lands at
+    ``execute`` time — and the guard around the only caller catches
+    ``sqlite3.Error``, which a ``UnicodeEncodeError`` is not. It therefore
+    escaped ``_call_tool_inner`` and discarded an otherwise-successful upstream
+    response as an internal error.
+    """
+
+    def test_put_stores_a_surrogate_bearing_chunk(self, tmp_path: Path):
+        store = SQLitePendingStore(tmp_path / "p.db")
+        store.initialize()
+        try:
+            store.put("k", _make_selection({"sec": "x\ud800y"}))
+            assert store.get("k") is not None
+        finally:
+            store.close()
+
+    def test_get_never_returns_a_raw_surrogate(self, tmp_path: Path):
+        """The write-side escape does not close the loop on its own: the reader
+        is a plain ``json.loads``, which decodes a ``\\ud800`` escape sitting in
+        the stored JSON straight back into the code unit. Written here with raw
+        SQL because that is the only way such a row can exist — a hand-edited
+        or externally-written DB."""
+        store = SQLitePendingStore(tmp_path / "p.db")
+        store.initialize()
+        try:
+            store._get_db().execute(
+                "INSERT OR REPLACE INTO pending_selections VALUES (?,?,?,?,?)",
+                ("k", '{"sec": "x\\ud800y"}', "markdown", time.time(), 10),
+            )
+            store._get_db().commit()
+
+            selection = store.get("k")
+
+            assert selection is not None
+            assert selection.chunks == {"sec": "x\\ud800y"}
+            # The encode every downstream consumer performs on this text.
+            json.dumps(selection.chunks, ensure_ascii=False).encode("utf-8")
+        finally:
+            store.close()
+
+    def test_a_clean_round_trip_is_unchanged(self, tmp_path: Path):
+        store = SQLitePendingStore(tmp_path / "p.db")
+        store.initialize()
+        try:
+            chunks = {"sec": "ordinary 서버 🚀 text"}
+            store.put("k", _make_selection(chunks))
+            got = store.get("k")
+            assert got is not None and got.chunks == chunks
+        finally:
+            store.close()

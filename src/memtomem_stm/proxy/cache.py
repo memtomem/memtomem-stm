@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from memtomem_stm.proxy.privacy import contains_sensitive_content
+from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -424,7 +425,7 @@ class ProxyCache:
         envelope_json: str | None = None
         if structured_content is not None or meta is not None:
             try:
-                envelope_json = json.dumps(
+                envelope_json = _json_dumps(
                     {
                         "schema_version": 1,
                         "structuredContent": structured_content,

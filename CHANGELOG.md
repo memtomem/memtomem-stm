@@ -273,6 +273,17 @@ changes inline only. See the deprecation policy in
   offending field and never its value (env values are routinely secrets and
   this text reaches CI logs) — the same refusal `mms add` and the discovery
   scan have made since #757/#758, now applied to the third create path. (#761)
+- The SQLite response cache, pending store and progressive store are hardened
+  against a lone surrogate reaching them. `sqlite3` encodes text parameters to
+  UTF-8, so the failure landed at `execute` time — and the guard around the
+  only caller catches `sqlite3.Error`, which a `UnicodeEncodeError` is not, so
+  it escaped and discarded an otherwise-successful upstream response as an
+  internal error. The stores' readers are covered too, not just their writers:
+  a `\ud800` escape sitting in a stored row decodes straight back into the code
+  unit through a plain parse, which would then fail at the next encode
+  downstream rather than at the read. With the ingest escaping above in place
+  nothing should reach these in normal operation; they are hardened because
+  their failure mode was bad out of proportion to its cause. (#761)
 
 ## [0.1.42] — 2026-07-25
 
