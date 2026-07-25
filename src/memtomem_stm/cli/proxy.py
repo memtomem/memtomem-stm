@@ -188,10 +188,115 @@ def _cmd_quote(token: str) -> str:
     return "".join(out)
 
 
-# CR/LF/NUL can't be rendered into a safe one-line paste hint, so
-# ``_shell_join`` refuses them on every platform. The failure mode differs by
-# shell, which is why this is a different class from the ``_cmd_quote``
-# metacharacters (#749):
+# The Trojan-Source bidirectional controls — embeddings, overrides, isolates
+# and the terminators that close them. They reorder how the rest of the line
+# *renders* without changing its bytes, so a server name carrying one can forge
+# a second ``Note:`` out of the surrounding prose. The terminators are included
+# conservatively alongside the openers they close: this app never emits a
+# directional embedding or isolate of its own, so a lone PDF or PDI has nothing
+# to terminate here, but its rendering is a property of whatever the enclosing
+# terminal and any neighbouring value have already opened, which is not ours to
+# reason about. The plain marks (LRM/RLM/ALM) are deliberately absent. They are
+# not inert — under UAX #9 a mark supplies a strong direction that can change
+# how *adjacent neutrals* (punctuation, spaces, digits) resolve — but they
+# cannot override a strong run or open a span the way the controls above can,
+# and they are what makes a legitimate RTL name render correctly, so escaping
+# them would regress the case #754 exists to protect. Spelled as escapes: these
+# characters are invisible, and writing them literally would make this source
+# line itself a Trojan-Source hazard.
+_BIDI_CONTROLS = frozenset(
+    "\u202a\u202b\u202c\u202d\u202e"  # LRE RLE PDF LRO RLO
+    "\u2066\u2067\u2068\u2069"  # LRI RLI FSI PDI
+)
+
+
+def _disp_escapes(ch: str) -> bool:
+    """Whether ``ch`` must not reach the terminal as itself (#754).
+
+    **This predicate, together with ``_BIDI_CONTROLS``, is the one canonical
+    definition of the display-hostile set** — the branches below give the ranges
+    and that frozenset gives the bidirectional members. Everything else —
+    :func:`_disp`, :func:`_shell_join`, the CHANGELOG, the docstrings below —
+    refers to "the set :func:`_disp_escapes` defines" and gives examples rather
+    than restating the membership, because four hand-synchronized copies of it
+    drifted apart across review rounds. Read the code here for the exact answer;
+    treat any inventory elsewhere as illustrative.
+
+    The members, and why each is in:
+
+    - **C0** (U+0000–U+001F), which covers CR, LF and NUL — unrenderable or
+      line-breaking — and ESC, the ANSI/CSI introducer.
+    - **DEL and C1** (U+007F–U+009F); U+009B is a single-byte CSI, so it opens
+      an escape sequence on its own.
+    - **Zl/Zp** (U+2028, U+2029) — a line break to enough renderers to split a
+      hint that is supposed to be one line.
+    - **Lone surrogates** (U+D800–U+DFFF) — not encodable to UTF-8 at all, so
+      they raise on output rather than rendering. ``_load`` reads the config as
+      strict UTF-8, so one arrives by the other route JSON allows: a
+      ``\\ud800`` escape in an otherwise-ASCII file.
+    - **``_BIDI_CONTROLS``** — reorder the rendered line without changing bytes.
+
+    Deliberately *not* members: everything else, notably CJK, emoji, ZWJ
+    sequences and variation selectors, plus the plain directional marks
+    LRM/RLM/ALM (see ``_BIDI_CONTROLS``).
+    """
+    return (
+        ch <= "\x1f"  # C0: CR/LF/NUL and ESC, the ANSI/CSI introducer
+        or "\x7f" <= ch <= "\x9f"  # DEL and C1 (U+009B is a one-byte CSI)
+        or "\u2028" <= ch <= "\u2029"  # LINE/PARAGRAPH SEPARATOR (Zl/Zp)
+        or "\ud800" <= ch <= "\udfff"  # lone surrogates: unencodable, not renderable
+        or ch in _BIDI_CONTROLS
+    )
+
+
+def _disp(value: str) -> str:
+    """Escape a config-derived value for display inside human-facing prose (#754).
+
+    The companion to :func:`_shell_join`, for the other half of the same hints.
+    Both act on the same character class — :func:`_disp_escapes` is the single
+    definition of "must not reach the terminal as itself" — but they act on it
+    differently: a runnable command is refused wholesale, because an escaped
+    command would paste as a *different* command, while prose is escaped in
+    place so the sentence around the value still renders. Config is plain
+    ``json.loads`` with no character validation on server names, so an imported
+    or hand-edited config can carry any of these.
+
+    Escapes a member of :func:`_disp_escapes`'s set as ``\\uXXXX``, an inert
+    ASCII representation (every member is BMP, so four hex digits always
+    suffice), and preserves everything else, notably CJK, emoji
+    and ZWJ sequences. That preservation is why the set is written as explicit
+    ranges rather than ``unicodedata.category(ch) in {"Cc","Cf","Cs"}`` (the
+    test :meth:`SurfacingFormatter._sanitize` uses for Markdown): ``Cf``
+    contains ZWJ, and escaping it would split a family emoji apart.
+
+    Two properties the call sites depend on:
+
+    - **Quote-neutral.** Only the value is escaped, never a quote or delimiter,
+      so each site keeps its own convention (``'{name}'`` prose, a
+      ``json.dumps``-encoded key). This is why ``repr()`` was rejected as the
+      primitive: it adds quotes, and it escapes backslashes.
+    - **Identity on clean input.** A value with nothing to escape is returned
+      unchanged, so every ordinary name renders byte-for-byte as before (the
+      same guarantee ``_cmd_quote`` carries since #750).
+
+    Residual (documented, not fixed): ``\\`` is never escaped, which keeps
+    Windows paths readable and leaves any backslash escape ``json.dumps``
+    already produced intact, but makes the encoding non-injective — a name
+    containing the literal text ``\\u001B`` renders like one containing a real
+    ESC. Acceptable on a display-only surface. Apply to the interpolated value, never to an
+    assembled line: the ``_warn``/``_ok``/``_err`` styling wraps *around* these
+    values and its escape codes must stay real.
+    """
+    if not any(_disp_escapes(ch) for ch in value):
+        return value
+    return "".join(f"\\u{ord(ch):04X}" if _disp_escapes(ch) else ch for ch in value)
+
+
+# Two overlapping reasons a value cannot be rendered into a paste hint, both
+# resolved by refusing the whole command rather than quoting or escaping it.
+#
+# CR/LF/NUL break the *paste*, and the failure mode differs by shell — which is
+# why this is a different class from the ``_cmd_quote`` metacharacters (#749):
 #   - Windows cmd.exe / the interactive console consume a pasted newline as
 #     Enter *even inside an open quoted span*, submitting the truncated prefix
 #     as its own command — quoting genuinely cannot defeat this (#751).
@@ -202,7 +307,22 @@ def _cmd_quote(token: str) -> str:
 # Rejecting uniformly (rather than only on win32) keeps the guard testable on
 # both CI legs. A JSON config (plain ``json.loads``, no character validation on
 # server names/``command``/env values) can carry any of these into a token.
+# No longer tested directly — the wider display class below subsumes it — but
+# kept because it records *which* characters would still have to be refused if
+# the display reason ever went away, and a test pins the subset relation so it
+# cannot drift into decoration.
 _HINT_UNSAFE_CHARS = frozenset("\r\n\x00")
+
+# The second reason is display, and it covers a strictly wider set: a rendered
+# command is terminal output before it is anything else, so an ESC, a C1 byte,
+# a line separator or a BiDi override in a token repaints or reorders the very
+# line the user is being asked to read — the #754 hazard, arriving by the other
+# half of the same hint. Prose escapes those in place; a command cannot, since
+# an escaped token would paste as a *different* server name, so the whole
+# command is refused instead. ``_disp_escapes`` is the single definition of the
+# class, and it subsumes ``_HINT_UNSAFE_CHARS`` (CR/LF/NUL are all C0); the two
+# are kept separate because they justify the refusal for different reasons and
+# only the paste-execution one is platform-specific.
 
 # Non-executable fallback (never embeds the raw value). Pasted, the ``#`` line
 # is inert on every target shell but by two routes: bash/fish/POSIX sh treat
@@ -220,7 +340,15 @@ _HINT_UNSAFE_CHARS = frozenset("\r\n\x00")
 # injected newline-tail never survives — but the surrounding app-owned prefix
 # (an errored ``--config``, a benign ``cd``) remains. That prefix is never
 # attacker-controlled, so no injected command runs (see the composition test).
-_HINT_UNRENDERABLE = "# copy/paste hint unavailable: a value contains line-break or NUL characters"
+#
+# The wording covers both reasons and is deliberately broader than #751's
+# original ``line-break or NUL``, since the same diagnostic now stands in for an
+# ESC-, separator- or BiDi-bearing token too (#754). It avoids naming a Unicode
+# category: the class spans several (Cc, Cs, Zl, Zp, Cf), so ``control
+# characters`` would be false for the separators and the lone surrogates.
+_HINT_UNRENDERABLE = (
+    "# copy/paste hint unavailable: a value contains characters that cannot be displayed safely"
+)
 
 
 def _shell_join(args: list[str]) -> str:
@@ -229,14 +357,19 @@ def _shell_join(args: list[str]) -> str:
     The win32 leg is cmd.exe-metacharacter-safe (via ``_cmd_quote``), not just
     argv-safe; the POSIX leg (``shlex.join``) already quotes metacharacters.
 
-    An argv carrying CR/LF/NUL renders as the non-executable
-    ``_HINT_UNRENDERABLE`` diagnostic on *both* legs (#751). On Windows a pasted
-    newline submits the truncated prefix even inside quotes (quoting cannot
-    help); on POSIX ``shlex`` would contain it, but only as a multi-line paste
-    that breaks the one-line hint, and NUL is unrepresentable everywhere. See
-    ``_HINT_UNSAFE_CHARS`` for the per-shell rationale.
+    An argv carrying a character :func:`_disp_escapes` rejects renders as the
+    non-executable ``_HINT_UNRENDERABLE`` diagnostic on *both* legs, for either
+    of two reasons. CR/LF/NUL break the paste itself (#751): on Windows a
+    pasted newline submits the truncated prefix even inside quotes, on POSIX
+    ``shlex`` would contain it but only as a multi-line paste that breaks the
+    one-line hint, and NUL is unrepresentable everywhere. Every other member of
+    the set — ESC and the rest, whatever :func:`_disp_escapes` currently
+    defines — breaks the *display* of the line the user is asked to read
+    (#754); quoting preserves such a character faithfully, which is exactly the
+    problem. See ``_HINT_UNSAFE_CHARS`` for the per-shell paste rationale and
+    :func:`_disp` for why prose escapes where this refuses.
     """
-    if any(_HINT_UNSAFE_CHARS & set(token) for token in args):
+    if any(any(_disp_escapes(ch) for ch in token) for token in args):
         return _HINT_UNRENDERABLE
     if sys.platform == "win32":
         return " ".join(_cmd_quote(a) for a in args)
@@ -2652,13 +2785,20 @@ def _source_removal_hint(name: str, source: str) -> str:
     ``claude mcp remove -s`` flag: ``Claude Code (project)`` is the
     per-project entry in ``~/.claude.json``, which the Claude Code CLI calls
     ``local``.
+
+    The two ``#`` branches are prose, not commands, so ``_shell_join`` never
+    sees them — their config-derived values are display-escaped by ``_disp``
+    instead (#754). ``_desktop_config_path()`` is platform state, not config,
+    and stays as-is.
     """
     spec = _SOURCE_BY_LABEL.get(source)
     if spec is None:
-        return f"# Remove '{name}' from {source}."
+        # Both values are untrusted here: reaching this branch means ``source``
+        # was not one of the known labels either.
+        return f"# Remove '{_disp(name)}' from {_disp(source)}."
     if spec.claude_scope is not None:
         return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
-    return f"# Edit {_desktop_config_path()} and remove '{name}' under mcpServers."
+    return f"# Edit {_desktop_config_path()} and remove '{_disp(name)}' under mcpServers."
 
 
 def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
@@ -3928,6 +4068,12 @@ def _remove_eject_hint(name: str, entry: Any, resolved: Path) -> str | None:
     no-clobber check stays the authoritative guard. The removal itself is
     never blocked — the hint precedes the confirm prompt so a TTY user can
     still abort.
+
+    The two halves of the hint act on one character class — the one
+    ``_disp_escapes`` defines — but differently: ``_shell_join`` refuses the
+    whole runnable ``mms eject`` command (#751/#752, widened by #754), while
+    the surrounding prose keeps rendering with its config-derived values
+    escaped in place by ``_disp``.
     """
     if not isinstance(entry, dict):
         return None
@@ -3941,9 +4087,13 @@ def _remove_eject_hint(name: str, entry: Any, resolved: Path) -> str | None:
         return None
     kind = source.get("kind")
     spec = _SOURCE_BY_KIND.get(kind) if isinstance(kind, str) else None
+    # ``label`` is tainted too when the kind is unrecognized: it then falls
+    # through to the recorded string verbatim, the same display-what-was-stored
+    # policy ``_origin_cell`` documents. ``_disp`` is identity on the app-owned
+    # labels, so it can wrap both branches unconditionally.
     label = spec.label if spec else (kind if isinstance(kind, str) else "its host client")
     return (
-        f"{_warn('Note:')} '{name}' was imported from {label} and the host original "
+        f"{_warn('Note:')} '{_disp(name)}' was imported from {_disp(label)} and the host original "
         "was pruned —\n"
         "  removing it from STM leaves it registered nowhere.\n"
         "  To restore it to the host instead, run: "
@@ -3984,7 +4134,10 @@ def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> Non
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     if name not in servers:
-        click.echo(f"{_err('Error:')} server '{name}' not found.", err=True)
+        # Terminal echo only: the JSON leg's values stay raw — ``json.dumps``
+        # escapes control characters itself, and the ``name`` field is
+        # machine-readable, not display (#754).
+        click.echo(f"{_err('Error:')} server '{_disp(name)}' not found.", err=True)
         if as_json:
             _json_fail("remove", "server_not_found", f"server '{name}' not found", name=name)
         sys.exit(1)
@@ -4002,7 +4155,8 @@ def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> Non
     if not yes:
         if as_json:
             _json_requires_yes("remove")
-        click.confirm(f"Remove server '{name}'?", abort=True)
+        # A CR here would overwrite the rendered ``[y/N]`` the user is answering.
+        click.confirm(f"Remove server '{_disp(name)}'?", abort=True)
 
     del servers[name]
     _save(path, data)
@@ -4018,7 +4172,7 @@ def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> Non
             }
         )
         return
-    click.echo(f"{_ok('Removed')} server '{name}'.")
+    click.echo(f"{_ok('Removed')} server '{_disp(name)}'.")
 
 
 @cli.command()
@@ -5024,6 +5178,16 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
     Prints the full restore JSON (secrets included) — terminal output for
     the operator's own paste-back, per the RFC fallback UX; this is not the
     argv-exposure surface the secret gate covers.
+
+    The ``# Edit`` branch is prose rather than a command, so ``_shell_join``
+    never guards it; its config-derived interpolations are display-escaped by
+    ``_disp`` instead (#754). The name is rendered by ``json.dumps`` — quotes
+    included — rather than wrapped in literal quotes, so a name containing
+    ``"`` or ``\\`` produces a fragment that still parses back to that exact
+    key. Both used to break it, but a backslash broke it two different ways
+    depending on what followed: an undefined JSON escape (``\\s``) made the
+    fragment invalid, while a defined one (``\\b``) parsed silently into a
+    *different* key.
     """
     payload_json = json.dumps(payload, ensure_ascii=False)
     if kind == "claude-user":
@@ -5036,7 +5200,19 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
             f"{_shell_join(['claude', 'mcp', 'add-json', name, payload_json, '-s', 'local'])}"
         )
     target = path if kind == "mcp-json" else str(_desktop_config_path())
-    return f'# Edit {target} and add under mcpServers: "{name}": {payload_json}'
+    # Both JSON halves need ``_disp`` on top of ``json.dumps``:
+    # ``ensure_ascii=False`` escapes only what JSON requires — the C0 subset —
+    # so every other member of ``_disp_escapes``'s set survives raw inside
+    # string values. Applying ``_disp`` after encoding is safe and
+    # order-dependent —
+    # ``\uXXXX`` is itself a JSON string escape and ``_disp`` never touches
+    # backslashes, so ``json.dumps``'s own escapes pass through unchanged and
+    # the fragment still parses back to the identical name and payload.
+    name_json = json.dumps(name, ensure_ascii=False)
+    return (
+        f"# Edit {_disp(str(target))} and add under mcpServers: "
+        f"{_disp(name_json)}: {_disp(payload_json)}"
+    )
 
 
 @dataclass
