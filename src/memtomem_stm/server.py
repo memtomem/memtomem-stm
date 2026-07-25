@@ -41,6 +41,7 @@ from memtomem_stm.surfacing.observability import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
+from memtomem_stm.utils.json_out import escape_lone_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -1099,6 +1100,34 @@ def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _escape_within(value: str, limit: int) -> str | None:
+    """``value`` with lone surrogates escaped, or ``None`` if it exceeds ``limit``.
+
+    Every client string reaching ``stm_memory_propose`` needs escaping before
+    it is used at all: a lone surrogate is unencodable, and the digest's
+    ``.encode()`` and the SDK's serialization of the outbound ``mem_do`` params
+    both refuse one.
+
+    The limit is authoritative on the ESCAPED form, which is the only
+    denomination that holds on both routes. In daemon mode these same three
+    limits are re-applied by ``daemon/server.py`` to what we actually send, and
+    its rejection is an opaque ``status="invalid"`` that reaches the client as
+    ``candidate_submit_failed``. Measuring the pre-escape form would accept
+    here what the far side refuses, so a value near the limit would be
+    delivered or not depending on the transport.
+
+    Hence the two checks. The raw one is not a duplicate: escaping expands a
+    code unit to six characters and so can only ever lengthen a string, which
+    makes an already-oversized input refusable before the scan-and-expand runs
+    rather than after allocating up to six times its size. It therefore refuses
+    exactly what the second check would have, only sooner (#777).
+    """
+    if len(value) > limit:
+        return None
+    escaped = escape_lone_surrogates(value)
+    return None if len(escaped) > limit else escaped
+
+
 @_formation_tool
 async def stm_memory_propose(
     content: str,
@@ -1120,10 +1149,11 @@ async def stm_memory_propose(
     cfg = app.config.formation
     if not cfg.enabled:
         return response({"ok": False, "reason": "formation_disabled"})
-    body = content.strip()
-    if not body:
+    stripped = content.strip()
+    if not stripped:
         return response({"ok": False, "reason": "content_empty"})
-    if len(body) > cfg.max_content_chars:
+    body = _escape_within(stripped, cfg.max_content_chars)
+    if body is None:
         return response(
             {
                 "ok": False,
@@ -1131,15 +1161,13 @@ async def stm_memory_propose(
                 "max_content_chars": cfg.max_content_chars,
             }
         )
-    ref = source_ref.strip()
-    if len(ref) > 512:
+    ref = _escape_within(source_ref.strip(), 512)
+    if ref is None:
         return response({"ok": False, "reason": "source_ref_too_large"})
-    key = (
-        idempotency_key.strip()
-        or hashlib.sha256(f"memtomem-stm\0{ref}\0{body}".encode()).hexdigest()
-    )
-    if len(key) > 256:
+    key = _escape_within(idempotency_key.strip(), 256)
+    if key is None:
         return response({"ok": False, "reason": "idempotency_key_too_large"})
+    key = key or hashlib.sha256(f"memtomem-stm\0{ref}\0{body}".encode()).hexdigest()
     if app.surfacing_engine is None:
         return response({"ok": False, "reason": "ltm_unavailable"})
     try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,6 +14,7 @@ from memtomem_stm.config import STMConfig
 from memtomem_stm.proxy.config import ProxyConfig
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm import server as server_module
 from memtomem_stm.server import STMContext, stm_memory_propose
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -26,6 +28,12 @@ from memtomem_stm.surfacing.mcp_client import (
     decode_context_compose_context,
 )
 from memtomem_stm.surfacing.observability import SurfacingObservability
+
+# One from each end of the high and low surrogate blocks, so a range that is
+# off by one at either boundary fails. Kept in step with the corpus of the
+# same name in ``test_json_out.py``; duplicated rather than imported because
+# nothing else in this suite imports across test modules.
+SURROGATES = ["\ud800", "\udbff", "\udc00", "\udfff"]
 
 
 def _ctx(config: STMConfig, engine: object | None):
@@ -817,6 +825,165 @@ async def test_formation_validation_and_response_whitelist(
     )
     assert result["reason"] == reason
     engine.propose_candidate.assert_not_awaited()
+
+
+async def _propose(config: STMConfig, engine: AsyncMock, **kwargs: str) -> dict:
+    """Run the tool and return its parsed reply."""
+    return json.loads(await stm_memory_propose(**kwargs, ctx=_ctx(config, engine)))
+
+
+def _delivered(engine: AsyncMock) -> dict[str, str]:
+    """The three strings the tool handed to ``propose_candidate``."""
+    args, awaited = engine.propose_candidate.await_args
+    return {
+        "content": args[0],
+        "source_ref": awaited["source_ref"],
+        "idempotency_key": awaited["idempotency_key"],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["content", "source_ref", "idempotency_key"])
+@pytest.mark.parametrize("surrogate", SURROGATES)
+async def test_formation_escapes_lone_surrogates_in_client_arguments(
+    field: str, surrogate: str
+) -> None:
+    """A surrogate in any of the three client strings yields a candidate (#777).
+
+    ``content`` and ``source_ref`` used to raise ``UnicodeEncodeError`` out of
+    the tool: the fallback idempotency hash ``.encode()``\\ s them above the
+    ``try``, so the client saw a traceback rather than a structured reply.
+    ``idempotency_key`` skipped that hash but still reached the SDK's
+    serialization of the outbound ``mem_do`` params. Escaping all three at
+    entry makes the whole outbound path total, so the value is delivered
+    rather than rejected.
+    """
+    config = STMConfig()
+    config.formation.enabled = True
+    engine = AsyncMock()
+    engine.propose_candidate.return_value = {"candidate_id": "candidate-1"}
+    kwargs = {
+        "content": "Decision: use blue-green",
+        "source_ref": "docs/read_file/trace-1",
+        # Empty unless it is the field under test: a client-supplied key skips
+        # the fallback hash, which is the expression that actually raised for
+        # the other two. Passing one here would test neither path.
+        "idempotency_key": "client-key-1" if field == "idempotency_key" else "",
+    }
+    kwargs[field] += surrogate
+
+    result = await _propose(config, engine, **kwargs)
+
+    assert result["candidate_id"] == "candidate-1"
+    engine.propose_candidate.assert_awaited_once()
+    delivered = _delivered(engine)
+    assert f"\\u{ord(surrogate):04x}" in delivered[field]
+    for value in delivered.values():
+        assert surrogate not in value
+        value.encode("utf-8")  # the call that used to raise
+    if field != "idempotency_key":
+        # Reached the fallback at all, and the digest ran over escaped input.
+        assert re.fullmatch(r"[0-9a-f]{64}", delivered["idempotency_key"])
+
+
+@pytest.mark.asyncio
+async def test_formation_refuses_oversize_without_escaping_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The limits bound the WORK, not only the outcome (#777).
+
+    Escaping scans and can expand its input sixfold, so it must not run on a
+    value already known to be too large. Only the raw pre-check enforces that:
+    dropping it leaves every functional assertion in this file passing while
+    restoring the unbounded scan, so this pins the call itself.
+    """
+    seen: list[int] = []
+    real = server_module.escape_lone_surrogates
+
+    def spy(text: str) -> str:
+        seen.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(server_module, "escape_lone_surrogates", spy)
+    config = STMConfig()
+    config.formation.enabled = True
+    engine = AsyncMock()
+
+    oversize = await _propose(
+        config, engine, content="\ud800" * (config.formation.max_content_chars + 1)
+    )
+
+    assert oversize["reason"] == "content_too_large"
+    assert seen == []
+    engine.propose_candidate.assert_not_awaited()
+
+    # The in-limit path still escapes, so the empty list above is the
+    # pre-check refusing and not the spy failing to be installed.
+    engine.propose_candidate.return_value = {"candidate_id": "candidate-1"}
+    await _propose(config, engine, content="Decision: use blue-green")
+    assert seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surrogate", SURROGATES)
+async def test_formation_derived_key_is_deterministic_across_surrogates(surrogate: str) -> None:
+    """Escaping keeps the fallback key idempotent (#777).
+
+    The key exists to deduplicate retries, so the same client input must derive
+    the same digest — and a different one must not collide onto it.
+    """
+    config = STMConfig()
+    config.formation.enabled = True
+    keys = []
+    for content in (f"Decision{surrogate} A", f"Decision{surrogate} A", f"Decision{surrogate} B"):
+        engine = AsyncMock()
+        engine.propose_candidate.return_value = {"candidate_id": "candidate-1"}
+        await _propose(config, engine, content=content)
+        keys.append(_delivered(engine)["idempotency_key"])
+
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "limit", "reason"),
+    [
+        ("content", 2_000, "content_too_large"),
+        ("source_ref", 512, "source_ref_too_large"),
+        ("idempotency_key", 256, "idempotency_key_too_large"),
+    ],
+)
+@pytest.mark.parametrize("surrogate", SURROGATES)
+async def test_formation_limits_measure_the_escaped_form(
+    field: str, limit: int, reason: str, surrogate: str
+) -> None:
+    """Each limit is denominated in what is sent, not in what arrived (#777).
+
+    One code unit escapes to six characters, so the two denominations differ
+    for a surrogate-bearing value. The escaped one is the load-bearing choice:
+    in daemon mode these same three limits are re-applied to the escaped
+    strings by ``daemon/server.py``, and measuring the raw form here would
+    accept a value the daemon then refuses as an opaque ``status="invalid"``.
+    The cross-boundary half of this is pinned in
+    ``tests/daemon/test_shared_ltm.py``.
+    """
+    config = STMConfig()
+    config.formation.enabled = True
+    # Escapes to exactly ``limit`` characters: six per surrogate, plus filler.
+    at_limit = surrogate * (limit // 6) + "a" * (limit % 6)
+    other = {"content": "Decision: use blue-green"} if field != "content" else {}
+
+    engine = AsyncMock()
+    engine.propose_candidate.return_value = {"candidate_id": "candidate-1"}
+    accepted = await _propose(config, engine, **{field: at_limit}, **other)
+    assert accepted["candidate_id"] == "candidate-1"
+    assert len(_delivered(engine)[field]) == limit
+
+    over = AsyncMock()
+    rejected = await _propose(config, over, **{field: at_limit + surrogate}, **other)
+    assert rejected["reason"] == reason
+    over.propose_candidate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

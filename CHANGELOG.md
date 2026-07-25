@@ -284,6 +284,32 @@ changes inline only. See the deprecation policy in
   downstream rather than at the read. With the ingest escaping above in place
   nothing should reach these in normal operation; they are hardened because
   their failure mode was bad out of proportion to its cause. (#761)
+- A lone surrogate in `stm_memory_propose`'s own arguments no longer escapes as
+  a traceback. The tool derives its idempotency key by hashing the client's
+  `content` and `source_ref`, and that `.encode()` sits *above* the tool's
+  `try`, so an unencodable code unit in either raised out of the tool instead of
+  returning one of its structured `{"ok": false, "reason": …}` replies. A
+  client-supplied `idempotency_key` skipped the hash but failed later and worse:
+  all three go verbatim into the outbound `mem_do` params, whose SDK
+  serialization refuses a surrogate, so it degraded to `candidate_submit_failed`
+  — a reason naming Core for a request that never left. All three are now
+  escaped at entry, so an ordinary value carrying a surrogate is delivered
+  rather than refused: the character is escapable, and the surrounding limits
+  are about size.
+  **Behavior change**: `max_content_chars` and the 512/256 limits on
+  `source_ref` and `idempotency_key` now measure the *escaped* form. One code
+  unit becomes six characters, so a value packed with surrogates can now be
+  refused as `content_too_large` where the raw length fit. This is deliberate,
+  and it is the only denomination that holds on both routes: with
+  `surfacing.use_daemon` enabled the daemon re-applies these same three limits
+  to what is actually sent, and its refusal arrives as an opaque
+  `candidate_submit_failed`. Measuring the raw form would have made a value
+  near the limit succeed or fail depending on the transport. Payloads with no
+  surrogate are unaffected — the escaping helper returns them unchanged and
+  every limit behaves exactly as before.
+  This is the request half of the tool whose response half #761 closed; it was
+  left out of that issue deliberately, because a tool argument is not one of the
+  ingest points whose escaping made the rest of `server.py` safe. (#778)
 
 ## [0.1.42] — 2026-07-25
 

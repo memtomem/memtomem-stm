@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from memtomem_stm.config import STMConfig
+from memtomem_stm.proxy.config import ProxyConfig
+from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.server import STMContext, stm_memory_propose
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_LTM_CANDIDATE_PROPOSE,
@@ -46,6 +51,21 @@ def _config(tmp_path: Path) -> STMConfig:
 
 def _request(op: str, payload: dict) -> dict:
     return build_request("unused", op, payload, deadline_monotonic=time.monotonic() + 1.0)
+
+
+def _stm_ctx(config: STMConfig, engine: object) -> SimpleNamespace:
+    """A minimal MCP context for driving the STM tools directly."""
+    tracker = TokenTracker()
+    app = STMContext(
+        config=config,
+        proxy_manager=ProxyManager(ProxyConfig(upstream_servers={}), tracker),
+        tracker=tracker,
+        surfacing_engine=engine,  # type: ignore[arg-type]
+        feedback_tracker=None,
+        compression_feedback_tracker=None,
+        progressive_reads_tracker=None,
+    )
+    return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
 
 
 def test_standalone_adapter_selection_and_identity_snapshot(tmp_path: Path) -> None:
@@ -248,6 +268,91 @@ async def test_daemon_v7_compose_and_candidate_roundtrip_and_validation(tmp_path
             )
         )
         assert invalid == {"v": PROTOCOL_VERSION, "ok": False, "status": "invalid"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+@pytest.mark.parametrize(
+    ("field", "count", "reason"),
+    [
+        # (field under test, surrogates in it, the local refusal expected —
+        # None meaning it must be accepted here AND cross the daemon).
+        ("content", 8, None),
+        ("content", 2_000 // 6, None),
+        ("content", 2_000, "content_too_large"),
+        ("source_ref", 8, None),
+        ("source_ref", 512 // 6, None),
+        ("source_ref", 512, "source_ref_too_large"),
+        ("idempotency_key", 8, None),
+        ("idempotency_key", 256 // 6, None),
+        ("idempotency_key", 256, "idempotency_key_too_large"),
+    ],
+)
+async def test_daemon_accepts_whatever_stm_memory_propose_delivers(
+    tmp_path: Path, surrogate: str, field: str, count: int, reason: str | None
+) -> None:
+    """A proposal is never accepted here only to be refused there (#777).
+
+    ``stm_memory_propose`` escapes a lone surrogate in each client string, and
+    ``DaemonLtmAdapter`` forwards the escaped values verbatim — so the daemon
+    re-applies its 2000/512/256 checks to a string six characters longer per
+    surrogate than the client sent. Its refusal is an opaque
+    ``status="invalid"`` that the adapter raises and the tool reports as
+    ``candidate_submit_failed``, a reason naming the core for a request that
+    never left. So the tool must measure the escaped form: the row where the
+    count equals the field's own limit fits that limit raw and exceeds it
+    escaped, and is the case that fails if the order is reversed.
+
+    The expected local outcome is stated per case rather than accepted either
+    way, so a regression that starts refusing a value that should cross cannot
+    pass by taking the other branch. One field carries the surrogates at a
+    time, so an earlier field's refusal cannot mask a later field's boundary.
+    """
+    config = STMConfig()
+    config.formation.enabled = True
+    engine = AsyncMock()
+    engine.propose_candidate.return_value = {"candidate_id": "candidate-1"}
+    kwargs = {
+        "content": "Decision: use blue-green",
+        "source_ref": "docs/read_file/trace-1",
+        "idempotency_key": "",
+    }
+    kwargs[field] = surrogate * count
+
+    reply = json.loads(await stm_memory_propose(**kwargs, ctx=_stm_ctx(config, engine)))
+
+    if reason is not None:
+        assert reply["reason"] == reason
+        engine.propose_candidate.assert_not_awaited()
+        return
+
+    assert "candidate_id" in reply
+
+    args, awaited = engine.propose_candidate.await_args
+    server = DaemonServer(_config(tmp_path))
+    server._adapter = SimpleNamespace(
+        capabilities=LtmCapabilities(candidate_propose_schema=1),
+        candidate_propose=AsyncMock(
+            return_value={"candidate_id": "candidate-1", "status": "pending"}
+        ),
+    )
+    crossed = await server._dispatch(
+        _request(
+            OP_LTM_CANDIDATE_PROPOSE,
+            {
+                "content": args[0],
+                "source": "memtomem-stm",
+                "source_ref": awaited["source_ref"],
+                "idempotency_key": awaited["idempotency_key"],
+            },
+        )
+    )
+
+    assert crossed == {
+        "v": PROTOCOL_VERSION,
+        "ok": True,
+        "candidate": {"candidate_id": "candidate-1", "status": "pending"},
+    }
 
 
 @pytest.mark.asyncio
