@@ -82,7 +82,6 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "CLI reads, so this is a reachable path and is unaudited — see #761.",
     ),
     "daemon/protocol.py": (1, "Daemon IPC frame, encoded by us — see #761."),
-    "daemon/discovery.py": (1, "Daemon fingerprint, encoded by us — see #761."),
     "server.py": (
         1,
         "MCP tool response text, serializing values parsed out of Core's "

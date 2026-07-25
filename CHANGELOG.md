@@ -195,6 +195,21 @@ changes inline only. See the deprecation policy in
   UTF-8, so the command now reports "server name or payload is not valid
   UTF-8" and leaves both sides intact where it previously raised — after the
   destructive pre-remove, on the `--force` path. (#758)
+- The daemon starts, and every daemon-touching CLI command runs, when
+  `MEMTOMEM_STM_HOOK_SURFACE_TOOLS` holds a byte that is not valid UTF-8. That
+  variable is folded verbatim into the daemon's config fingerprint, which is
+  hashed by encoding it — and on POSIX an environment variable carrying such a
+  byte is decoded with `surrogateescape`, so a lone surrogate reached that
+  encode with no config file involved. The fingerprint is frozen in
+  `DaemonServer.__init__`, before `serve()` and outside any `try`, so the
+  resulting `UnicodeEncodeError` meant the daemon process never started;
+  `mms daemon start`, and `mms daemon status`/`stop` through the client's
+  `_live_handshake_candidate`, exited on an uncaught traceback. The fingerprint
+  now escapes lone surrogates before hashing, the same treatment `--json`
+  payloads have had since #758. It stays a fingerprint: distinct env values
+  still produce distinct digests, so two configs cannot collapse onto one
+  handshake or lock file. A value with nothing to escape hashes byte-identically
+  to before, so no existing daemon is orphaned by this. (#761)
 
 ## [0.1.42] — 2026-07-25
 
