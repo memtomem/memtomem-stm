@@ -3997,6 +3997,16 @@ def init(
                 sys.exit(1)
             entry["url"] = url
 
+        # Third create path, same gate as `add` and the discovery scan: the
+        # name check above does not cover the command or URL typed after it,
+        # and this entry goes straight into the config that gets written.
+        bad_field = unencodable_field(entry)
+        if bad_field is not None:
+            click.echo(
+                f"{_err('Error:')} {bad_field} is not valid UTF-8 (value withheld).", err=True
+            )
+            sys.exit(1)
+
         imported[name] = entry
 
     # Resolve the language preset before validate so the prompt sequence

@@ -8888,6 +8888,33 @@ class TestJsonLoneSurrogate:
         assert "bad\udcffname" not in payload["servers"]
         assert "not valid UTF-8" in result.stderr
 
+    def test_entry_gate_names_the_field_and_withholds_every_value(self):
+        """The contract all three create paths share.
+
+        `init`'s manual branch is gated the same way but cannot be driven
+        end-to-end here — `CliRunner` encodes its `input` to UTF-8, so such a
+        value cannot be typed at its prompt in a test. Pin the helper against
+        the entry shape that branch builds instead; the `add` path covers the
+        wiring end-to-end.
+        """
+        from memtomem_stm.utils.json_out import unencodable_field
+
+        entry = {
+            "prefix": "sx",
+            "transport": "stdio",
+            "command": f"echo{ARGV_SURROGATE_NAME}",
+            "args": ["-y", "@pkg"],
+            "env": {"TOKEN": "sekret"},
+        }
+        found = unencodable_field(entry)
+        assert found == "command"
+        # A clean entry passes, and no value ever appears in the result.
+        entry["command"] = "echo"
+        assert unencodable_field(entry) is None
+        entry["env"]["TOKEN"] = ARGV_SURROGATE_NAME
+        assert unencodable_field(entry) == "env['TOKEN']"
+        assert "sekret" not in str(unencodable_field(entry))
+
     def test_text_mode_read_legs_render_the_name_escaped(self, runner, config):
         """The two escapes meet here, and each covers a leg the other cannot.
 
