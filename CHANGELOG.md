@@ -97,16 +97,26 @@ changes inline only. See the deprecation policy in
   own name echoes and its `--validate` failure text; `mms eject`'s refusal
   reason, plan, warning, secret-gate prompt and failure lines; `mms health`'s
   server lines and, under `--names`, the tool names the upstream advertised
-  over `tools/list`; `mms doctor`'s check labels and details; and the
-  config-validation warning shared by `status`, `health` and `tune --apply`,
-  whose text names the offending config key. Unchanged: every `--json`
+  over `tools/list`; `mms doctor`'s check labels and details; `mms stats`'s
+  per-tool compression table and `mms tune`'s preview, selector and per-tool
+  confirmation prompt, which key on tool names recorded from the upstream at
+  call time; `mms surfacing`'s name echoes; `mms gateway status`/`explain`;
+  the prefix-collision error; and the config-validation warning shared by
+  `status`, `health` and `tune`, whose text names the offending config key.
+  Unchanged: every `--json`
   payload and every `_json_fail` envelope keep raw values — those are decoded
   by a consumer, not read off a terminal — as do the copy/paste hints, which
-  `_shell_join` already refuses wholesale for this character class.
-  Two of these were more than cosmetic. `mms health --names` is the first
-  site where the value is chosen by a *remote* party rather than by whoever
-  wrote the config: a proxied server picks the tool names it advertises, so
-  reaching this output needed no access to any file on the machine. And in
+  `_shell_join` already refuses wholesale for this character class. Also
+  untouched, and not part of this change: values passed as argv by the user
+  running the command, and the same class of site in `mms host`,
+  `mms project`, `mms import`, `mms config validate` and `mms hook`, whose
+  modules have no access to this helper.
+  Three of these were more than cosmetic. `mms health --names` and the two
+  metrics-derived tables are the first sites where the value is chosen by a
+  *remote* party rather than by whoever wrote the config: a proxied server
+  picks the tool names it advertises, so reaching this output needed no
+  access to any file on the machine — and in `mms tune` such a name renders
+  inside the prompt whose answer authorizes a config write. And in
   `mms list`, a name containing a lone surrogate — `"\ud800"` is a legal JSON
   escape, so such a config loads fine — made the command exit 1 with a bare
   `UnicodeEncodeError` and print no table at all; the row now renders with the
