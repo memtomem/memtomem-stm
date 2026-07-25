@@ -669,6 +669,42 @@ class TestDisp:
     the primitive.
     """
 
+    def test_the_leaf_stays_importable_without_the_cli_package(self):
+        """``cli/_display`` exists so every CLI module can import it without a
+        cycle (#760), which only holds while it imports nothing from the
+        package. A single ``from memtomem_stm.cli.proxy import ...`` added here
+        would restore the exact constraint that forced #758's function-local
+        workaround, and would do it silently — ``proxy`` imports this module's
+        siblings, so the cycle only bites the module that imports it *first*.
+        """
+        import ast
+        import inspect
+
+        from memtomem_stm.cli import _display
+
+        tree = ast.parse(inspect.getsource(_display))
+        imported = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module and node.module != "__future__"
+        } | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert not {name for name in imported if name.startswith("memtomem_stm")}
+
+    def test_proxy_still_exports_the_names_it_defined(self):
+        """``cli.proxy`` re-exports both names after the move, which is what
+        keeps this file's own imports — and every other
+        ``from memtomem_stm.cli.proxy import _disp`` — working unchanged."""
+        from memtomem_stm.cli import _display
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        assert proxy_mod._disp is _display._disp
+        assert proxy_mod._disp_escapes is _display._disp_escapes
+
     @pytest.mark.parametrize(
         "value",
         [
@@ -8673,9 +8709,7 @@ def _write_surrogate_config(config: Path, *, sibling: bool = False) -> None:
     servers: dict = {SURROGATE_NAME: {"prefix": "sx", "transport": "stdio", "command": "x"}}
     if sibling:
         servers["fs"] = {"prefix": "fs", "transport": "stdio", "command": "y"}
-    config.write_text(
-        json.dumps({"enabled": True, "upstream_servers": servers}), encoding="utf-8"
-    )
+    config.write_text(json.dumps({"enabled": True, "upstream_servers": servers}), encoding="utf-8")
 
 
 class TestJsonLoneSurrogate:
