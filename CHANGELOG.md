@@ -19,7 +19,7 @@ changes inline only. See the deprecation policy in
   before the consult cache branch, so cold and warm starts have the same
   enforcement posture. Stored SQLite identifiers in compression feedback,
   metrics, progressive-read telemetry, and surfacing feedback are likewise
-  refused rather than rewritten. (#783)
+  refused rather than rewritten. Issue: #783.
 
 ### Fixed
 
@@ -29,7 +29,9 @@ changes inline only. See the deprecation policy in
   them to an existing literal `\udxxx` ID. Query-only digest inputs in
   surfacing cache keys, persisted query hashes, and tool-relevance telemetry
   now hash with `surrogatepass`, preserving clean digest values and keeping a
-  raw surrogate distinct from its six-character literal twin. (#783)
+  raw surrogate distinct from its six-character literal twin. Observability
+  stats filters and surfacing-feedback identifiers are rejected at their
+  response boundary with sanitized, UTF-8-safe errors. Issue: #783.
 
 ## [0.1.43] — 2026-07-26
 

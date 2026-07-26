@@ -598,6 +598,26 @@ class TestFeedbackTracker:
         finally:
             tracker.close()
 
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    @pytest.mark.parametrize("field", ["surfacing_id", "memory_id"])
+    def test_refused_identifier_error_omits_unencodable_value(self, tmp_path, field, surrogate):
+        tracker = FeedbackTracker(
+            SurfacingConfig(), db_path=tmp_path / f"{field}-{ord(surrogate)}.db"
+        )
+        values = {"surfacing_id": "surfacing", "memory_id": "memory"}
+        values[field] += surrogate
+        try:
+            result = tracker.record_feedback(
+                values["surfacing_id"],
+                "helpful",
+                values["memory_id"],
+            )
+            assert result == f"Error: {field} must be a valid UTF-8 identifier"
+            assert surrogate not in result
+            result.encode("utf-8")
+        finally:
+            tracker.close()
+
     def test_valid_feedback_recorded(self, tmp_path: Path):
         tracker = FeedbackTracker(SurfacingConfig(), db_path=tmp_path / "fb.db")
         try:

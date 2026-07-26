@@ -11,6 +11,7 @@ from memtomem_stm.surfacing.feedback_store import (
     FeedbackStore,
     inspect_feedback_db,
 )
+from memtomem_stm.utils.json_out import require_utf8_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,14 @@ class FeedbackTracker:
     ) -> str:
         if rating not in VALID_RATINGS:
             return f"Error: rating must be one of {list(VALID_RATINGS)}"
+        for field, value in (
+            ("surfacing_id", surfacing_id),
+            ("memory_id", memory_id),
+        ):
+            try:
+                require_utf8_identifier(value, field)
+            except ValueError as exc:
+                return f"Error: {exc}"
 
         ok = self._store.record_feedback(surfacing_id, rating, memory_id)
         if not ok:
