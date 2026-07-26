@@ -1661,15 +1661,21 @@ async def test_stats_tool_filters_return_serializable_identifier_errors(surrogat
 
 
 @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
-async def test_surfacing_stats_invalid_since_reply_is_serializable(surrogate):
+async def test_surfacing_stats_invalid_since_repr_is_serializable_and_distinct(surrogate):
     tracker = MagicMock()
-    result = await stm_surfacing_stats(
+    raw_result = await stm_surfacing_stats(
         since=f"invalid{surrogate}",
         ctx=_make_ctx(feedback_tracker=tracker),
     )
-    assert surrogate not in result
-    assert "invalid 'since' timestamp" in result
-    result.encode("utf-8")
+    literal_result = await stm_surfacing_stats(
+        since=f"invalid\\u{ord(surrogate):04x}",
+        ctx=_make_ctx(feedback_tracker=tracker),
+    )
+    assert surrogate not in raw_result
+    assert "invalid 'since' timestamp" in raw_result
+    raw_result.encode("utf-8")
+    literal_result.encode("utf-8")
+    assert raw_result != literal_result
     tracker.get_stats.assert_not_called()
 
 

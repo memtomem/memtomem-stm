@@ -1356,8 +1356,7 @@ async def stm_surfacing_stats(
         try:
             since_ts = datetime.fromisoformat(since).timestamp()
         except ValueError:
-            safe_since = escape_lone_surrogates(since)
-            return f"Error: invalid 'since' timestamp: {safe_since!r} (expected ISO-8601)"
+            return f"Error: invalid 'since' timestamp: {since!r} (expected ISO-8601)"
 
     with traced(
         "stm_surfacing_stats",
