@@ -468,6 +468,37 @@ class TestFeedbackStore:
 
         assert counts == {"m1": 2, "m2": 1}
 
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_negative_feedback_counts_drop_only_the_unencodable_id(
+        self, feedback_store: FeedbackStore, surrogate: str
+    ):
+        """One bad id must not blank the counts for the valid ones.
+
+        The caller (``SurfacingEngine._demoted_ids``) reads a missing/zero
+        count as "not enough negatives", so bailing on the whole batch would
+        resurface a memory already rated past the demotion threshold for as
+        long as one unencodable id rode along in the same candidate set.
+        """
+        feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
+        feedback_store.record_surfacing("s2", "sv", "t", "q", ["m1"], [0.5])
+        feedback_store.record_feedback("s1", "not_relevant", "m1")
+        feedback_store.record_feedback("s2", "already_known", "m1")
+
+        counts = feedback_store.get_negative_feedback_counts([f"bad{surrogate}", "m1", "missing"])
+
+        # The unencodable id is absent rather than 0: it can never match a
+        # stored row, and absent reads identically at the call site.
+        assert counts == {"m1": 2, "missing": 0}
+
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
+    def test_negative_feedback_counts_empty_when_every_id_unencodable(
+        self, feedback_store: FeedbackStore, surrogate: str
+    ):
+        feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
+        feedback_store.record_feedback("s1", "not_relevant", "m1")
+
+        assert feedback_store.get_negative_feedback_counts([f"bad{surrogate}"]) == {}
+
     def test_per_tool_breakdown_includes_feedback_counts(self, feedback_store: FeedbackStore):
         """Per-tool breakdown exposes total, not_relevant, and negative counts."""
         feedback_store.record_surfacing("s_a1", "sv", "tool_a", "q", ["m1"], [0.9])

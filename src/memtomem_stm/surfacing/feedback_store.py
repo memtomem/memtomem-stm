@@ -683,10 +683,23 @@ class FeedbackStore:
         """
         if self._db is None or not memory_ids:
             return {}
-        if any(has_lone_surrogate(str(memory_id)) for memory_id in memory_ids):
-            return {}
 
-        target_ids = list(dict.fromkeys(str(mid) for mid in memory_ids))
+        # Drop the unencodable ids, not the batch. They cannot be bound as
+        # SQLite parameters, but they also cannot match a stored row — the
+        # write paths refuse them — so their count is known to be 0 without
+        # asking. Failing the whole call instead would answer 0 for every
+        # *valid* id too, and the caller reads that as "nothing has enough
+        # negatives": a memory the agent rated ``not_relevant`` past the
+        # threshold would resurface for as long as one bad id rode along in
+        # the same candidate set. Same leaf-filtering shape as
+        # ``_load_safe_memory_ids``.
+        target_ids = [
+            mid
+            for mid in dict.fromkeys(str(mid) for mid in memory_ids)
+            if not has_lone_surrogate(mid)
+        ]
+        if not target_ids:
+            return {}
         event_ids_by_memory: dict[str, set[str]] = {mid: set() for mid in target_ids}
         target_set = set(target_ids)
 
