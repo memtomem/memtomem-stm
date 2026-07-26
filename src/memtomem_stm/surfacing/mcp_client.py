@@ -21,7 +21,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
+from memtomem_stm.utils.json_out import (
+    escape_lone_surrogates,
+    has_lone_surrogate,
+    scrub_content_preserving_identity,
+)
 from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
@@ -211,7 +215,13 @@ def decode_context_compose_context(
         if not isinstance(namespace, str):
             raise ValueError("context compose adjacent chunk namespace must be a string")
         return RemoteContextChunk(
-            id=item["id"],
+            # Escaped, not refused, unlike the retrieved/pinned ids above: an
+            # adjacent chunk's id is never exact-matched — the formatter reads
+            # only ``content`` and the daemon just re-encodes it — so it is
+            # content by destination. It arrives raw only because
+            # ``scrub_content_preserving_identity`` exempts the ``id`` key at
+            # every depth, so re-apply the ordinary ingest escape here (#783).
+            id=escape_lone_surrogates(item["id"]),
             content=item["content"][:max_content_chars],
             source=item["source"],
             namespace=namespace,
@@ -296,10 +306,35 @@ def _core_json_loads(text: str) -> Any:
     fresh code unit, after the point where we escaped. Scrubbing the parsed
     result closes that second route.
 
+    Identity-keyed values are exempt from the scrub and arrive RAW (#783). A
+    blanket scrub here rewrote them *before* the identifier boundaries could
+    refuse them, so a chunk whose id Core sent as a real lone surrogate and one
+    whose id is the six literal characters both reached the engine as the same
+    string — aliased onto each other for demotion, dedup/invalidation,
+    persistence and ``increment_access``. Every site below that assigns such a
+    value to a chunk id therefore checks it and drops the item; see
+    :func:`scrub_content_preserving_identity`.
+
     Raises exactly what ``json.loads`` raises: every call site distinguishes a
     decode error from an empty result, so this must not swallow or re-type one.
     """
-    return scrub_lone_surrogates(json.loads(text))
+    return scrub_content_preserving_identity(json.loads(text))
+
+
+def _has_unencodable_identity(item: dict[str, Any], *keys: str) -> bool:
+    """True when the identity this item would contribute cannot encode to UTF-8.
+
+    ``keys`` must be the caller's OWN precedence order, because pinned and
+    retrieved items disagree on it (``block_id`` first vs. ``id`` first).
+    Resolving a different key than the caller will would either drop an item
+    over a field nobody reads, or clear one whose actual id is unencodable.
+    """
+    identity: Any = None
+    for key in keys:
+        identity = item.get(key)
+        if identity:
+            break
+    return isinstance(identity, str) and has_lone_surrogate(identity)
 
 
 class ResultParser:
@@ -488,6 +523,16 @@ class StructuredResultParser(ResultParser):
             )
             # Preserve chunk_id from core instead of sha256(content)
             chunk_id = item.get("chunk_id")
+            if isinstance(chunk_id, str) and has_lone_surrogate(chunk_id):
+                # Refuse the result, not just the id (#783). Falling back to the
+                # content hash would mint a *different* identity for a chunk core
+                # can still name, and keeping the raw value would carry an
+                # unencodable id into dedup, persistence and increment_access.
+                # One dropped result beats a memory STM cannot honestly track.
+                logger.warning(
+                    "Dropping a core search result whose chunk_id is not UTF-8-encodable"
+                )
+                continue
             if chunk_id:
                 result.chunk.id = chunk_id
             results.append(result)
@@ -1492,6 +1537,11 @@ class McpClientSearchAdapter:
         for item in raw_pinned:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("core context_compose pinned item has invalid shape")
+            if _has_unencodable_identity(item, "block_id", "id"):
+                logger.warning(
+                    "Dropping a core context_compose pinned item whose id is not UTF-8-encodable"
+                )
+                continue
             entry = RemoteSearchResult(
                 item["content"][: self._config.result_content_max_chars],
                 1.0,
@@ -1508,6 +1558,11 @@ class McpClientSearchAdapter:
         for item in raw_retrieved:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 raise ValueError("core context_compose retrieved item has invalid shape")
+            if _has_unencodable_identity(item, "id", "chunk_id"):
+                logger.warning(
+                    "Dropping a core context_compose retrieved item whose id is not UTF-8-encodable"
+                )
+                continue
             context = None
             if self._capabilities.context_compose_schema >= 3 and "context" in item:
                 context = decode_context_compose_context(
