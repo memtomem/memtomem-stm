@@ -590,9 +590,16 @@ class TestConsultCacheMaxScopesWiring:
 
 class TestToolgraphConsultWiring:
     @pytest.mark.parametrize("consult_cache_enabled", [False, True])
-    async def test_unencodable_local_ref_has_same_protocol_refusal_cold_or_warm(
+    async def test_unencodable_local_ref_is_a_protocol_error_cold_or_empty_cache(
         self, tmp_path, consult_cache_enabled
     ):
+        """Cold path only — with the cache enabled this still MISSES.
+
+        Deliberately not evidence for the manager's pre-cache validation: on a
+        miss the eventual full ``eligible_tools(refs)`` performs the same check
+        in the adapter, so this passes either way. The warm-hit case below is
+        what pins the manager copy.
+        """
         mgr, _ = _tg_manager(
             tmp_path,
             servers={"srv": ["bad\ud800"]},
@@ -606,6 +613,66 @@ class TestToolgraphConsultWiring:
             assert status["degraded_reason"] == REASON_TOOLGRAPH_PROTOCOL_ERROR
             assert status["from_cache"] is False
             assert status["external_reject_count"] == 0
+        finally:
+            await mgr.stop()
+
+    async def test_unencodable_local_ref_is_refused_on_a_warm_cache_hit(self, tmp_path):
+        """A seeded, matching row must NOT let the refusal be skipped.
+
+        Without the pre-cache validation in ``_run_consult`` the probe succeeds,
+        the scope hits, and STM comes up clean and un-degraded serving cached
+        rejects for a candidate set it cannot encode — while the same config
+        with the cache disabled raises. That divergence is the whole reason the
+        manager validates before the cache branch, and it is invisible to any
+        test that only ever misses.
+        """
+        bad_ref = "srv::bad\ud800"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["bad\ud800"]},
+            on_protocol_error="open",
+        )
+        cfg = mgr._config.toolgraph
+        cache = GraphConsultCache(tmp_path / "tg_consult.db")
+        cache.initialize()
+        try:
+            cache.put(
+                GraphConsultCache.provider_fingerprint(cfg),
+                cfg.agent_id,
+                cfg.query_profile,
+                GraphConsultCache.candidate_hash([bad_ref]),
+                11,  # the fake graph's generation, as the sibling tests assert
+                rejects={},
+                tool_not_found_refs=[],
+                risk_scores={},
+                had_risk_scores=True,
+            )
+        finally:
+            cache.close()
+        seeded = GraphConsultCache(tmp_path / "tg_consult.db")
+        seeded.initialize()
+        try:
+            # Positive control: the row really is a hit for this exact scope, so
+            # a passing assertion below cannot be an accidental miss.
+            assert (
+                seeded.get(
+                    GraphConsultCache.provider_fingerprint(cfg),
+                    cfg.agent_id,
+                    cfg.query_profile,
+                    GraphConsultCache.candidate_hash([bad_ref]),
+                    11,
+                )
+                is not None
+            )
+        finally:
+            seeded.close()
+
+        try:
+            await mgr._consult_toolgraph()
+            status = mgr.get_toolgraph_status()
+            assert status["degraded"] is True
+            assert status["degraded_reason"] == REASON_TOOLGRAPH_PROTOCOL_ERROR
+            assert status["from_cache"] is False
         finally:
             await mgr.stop()
 
