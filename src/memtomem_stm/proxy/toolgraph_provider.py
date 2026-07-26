@@ -33,6 +33,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import TextContent
 
 from memtomem_stm.proxy.config import ToolgraphConfig
+from memtomem_stm.utils.json_out import has_lone_surrogate
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,59 @@ class ToolgraphProtocolError(ToolgraphConsultError):
     ``on_protocol_error``. Distinct from ``ToolgraphUnreachableError`` so a
     version/contract drift is never silently treated as "the graph is down".
     """
+
+
+def validate_toolgraph_identifier(value: str, path: str) -> None:
+    """Refuse an unencodable Toolgraph identifier without rewriting its identity.
+
+    Toolgraph refs are exact-matched by ``ProxyManager`` and persisted in the
+    consult cache.  ``escape_lone_surrogates`` is deliberately not used here:
+    it is non-injective and would make a graph rejection disappear when only
+    one side of that exact match was escaped (#783).
+
+    ``path`` is an ASCII schema path supplied by the caller.  The offending
+    value is never included in the error because identifiers can originate in
+    external metadata and the error is later exposed in health diagnostics.
+    """
+    if has_lone_surrogate(value):
+        raise ToolgraphProtocolError(f"{path} is not a UTF-8-encodable identifier")
+
+
+def _validate_verdict_identifiers(tool: str, verdict: dict[str, Any]) -> None:
+    """Validate identity-bearing fields in a successful Toolgraph verdict."""
+
+    for field in ("agent", "profile"):
+        value = verdict.get(field)
+        if isinstance(value, str):
+            validate_toolgraph_identifier(value, f"{tool} response {field}")
+
+    eligible = verdict.get("eligible")
+    if isinstance(eligible, list):
+        for index, value in enumerate(eligible):
+            if isinstance(value, str):
+                validate_toolgraph_identifier(value, f"{tool} response eligible[{index}]")
+
+    rows_field = "rejected" if tool == _ELIGIBLE_TOOLS else "features"
+    rows = verdict.get(rows_field)
+    if not isinstance(rows, list):
+        return
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        for field in ("candidate", "tool_key"):
+            value = row.get(field)
+            if isinstance(value, str):
+                validate_toolgraph_identifier(
+                    value, f"{tool} response {rows_field}[{row_index}].{field}"
+                )
+        candidates = row.get("candidates")
+        if isinstance(candidates, list):
+            for candidate_index, value in enumerate(candidates):
+                if isinstance(value, str):
+                    validate_toolgraph_identifier(
+                        value,
+                        f"{tool} response {rows_field}[{row_index}].candidates[{candidate_index}]",
+                    )
 
 
 class ToolgraphConsultAdapter:
@@ -172,10 +226,16 @@ class ToolgraphConsultAdapter:
             ToolgraphProtocolError: untyped/unknown ``isError``, missing tool,
                 or a missing / non-dict structured payload.
         """
+        resolved_agent = self._config.agent_id if agent is None else agent
+        resolved_profile = self._config.query_profile if profile is None else profile
+        validate_toolgraph_identifier(resolved_agent, "eligible_tools request agent")
+        validate_toolgraph_identifier(resolved_profile, "eligible_tools request profile")
+        for index, candidate in enumerate(candidates):
+            validate_toolgraph_identifier(candidate, f"eligible_tools request candidates[{index}]")
         args: dict[str, Any] = {
-            "agent": self._config.agent_id if agent is None else agent,
+            "agent": resolved_agent,
             "candidates": candidates,
-            "profile": self._config.query_profile if profile is None else profile,
+            "profile": resolved_profile,
         }
         return await self._consult(_ELIGIBLE_TOOLS, args)
 
@@ -202,8 +262,12 @@ class ToolgraphConsultAdapter:
             ToolgraphProtocolError: untyped/unknown ``isError``, missing tool,
                 or a missing / non-dict structured payload.
         """
+        resolved_agent = self._config.agent_id if agent is None else agent
+        validate_toolgraph_identifier(resolved_agent, "rank_features request agent")
+        for index, candidate in enumerate(candidates):
+            validate_toolgraph_identifier(candidate, f"rank_features request candidates[{index}]")
         args: dict[str, Any] = {
-            "agent": self._config.agent_id if agent is None else agent,
+            "agent": resolved_agent,
             "candidates": candidates,
         }
         return await self._consult(_RANK_FEATURES, args)
@@ -263,6 +327,7 @@ class ToolgraphConsultAdapter:
                 f"{tool} response carried no parseable verdict "
                 "(neither structuredContent nor a JSON text payload)"
             )
+        _validate_verdict_identifiers(tool, verdict)
         return verdict
 
 

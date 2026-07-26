@@ -233,6 +233,17 @@ class TestFeatures:
         feats = build_candidate_features("hunter2 secret task", "context_query", [])
         assert "hunter2" not in json.dumps(feats)
 
+    def test_lone_surrogate_hashes_with_surrogatepass_without_aliasing_literal(self):
+        raw = "task\udfff"
+        literal = r"task\udfff"
+        raw_features = build_candidate_features(raw, "context_query", [])
+        literal_features = build_candidate_features(literal, "context_query", [])
+        assert (
+            raw_features["query_sha256"]
+            == hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
+        )
+        assert raw_features["query_sha256"] != literal_features["query_sha256"]
+
 
 # ── ProxyManager wire-in ─────────────────────────────────────────────────
 

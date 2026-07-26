@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 
 from memtomem_stm.surfacing.cache import SurfacingCache
@@ -111,3 +112,20 @@ class TestSurfacingCacheHashDeterminism:
         # Behavior preservation: the digest value is unchanged on non-FIPS builds,
         # so existing cache keys keep mapping to the same entries.
         assert SurfacingCache._hash("hello") == "5d41402abc4b2a76b9719d911017c592"
+
+    def test_lone_surrogate_hashes_with_surrogatepass_without_aliasing_literal(self):
+        raw = "query\ud800"
+        literal = r"query\ud800"
+        assert SurfacingCache._hash(raw) != SurfacingCache._hash(literal)
+        assert (
+            SurfacingCache._hash(raw)
+            == hashlib.md5(
+                raw.encode("utf-8", errors="surrogatepass"), usedforsecurity=False
+            ).hexdigest()
+        )
+
+        cache = SurfacingCache(ttl=60.0)
+        cache.set(raw, ["raw"])
+        cache.set(literal, ["literal"])
+        assert cache.get(raw) == ["raw"]
+        assert cache.get(literal) == ["literal"]

@@ -6,7 +6,7 @@ every JSON emitter needs it: ``proxy``, ``mms_host``, ``mms_project``,
 ``proxy``, so the helper cannot live there without a cycle. The daemon and
 the proxy pipeline import it for the same reason.
 
-Two shapes of helper, for two different jobs (#761):
+The boundary policy has three distinct shapes (#761, #783):
 
 - :func:`dumps` for an emitter — a value we are *serializing now*, where the
   escape belongs in the emitted text and a consumer decodes it back.
@@ -15,6 +15,10 @@ Two shapes of helper, for two different jobs (#761):
   or Core, where the surrogate is escaped once on the way in so that every
   later encode (a ``TextContent`` serialization, a SQLite parameter, a
   fingerprint) is total without each of them having to know about this.
+- :func:`require_utf8_identifier` for an exact-match identifier — refuse the
+  value instead of non-injectively rewriting its identity. Digest-only inputs
+  use ``errors="surrogatepass"`` at their call site so hashing remains total
+  and injective without emitting invalid UTF-8.
 """
 
 from __future__ import annotations
@@ -213,3 +217,15 @@ def has_lone_surrogate(value: str) -> bool:
     deferred; a test pins all three.
     """
     return _LONE_SURROGATE.search(value) is not None
+
+
+def require_utf8_identifier(value: str | None, field: str) -> None:
+    """Raise a sanitized ``ValueError`` for an unencodable identifier.
+
+    Unlike content, identifiers participate in equality, cache keys, and
+    relational joins. Escaping one side would change that identity and can
+    make an exact-match safety decision disappear. ``field`` is a trusted
+    ASCII schema label; the offending value is deliberately never exposed.
+    """
+    if value is not None and has_lone_surrogate(value):
+        raise ValueError(f"{field} must be a valid UTF-8 identifier")

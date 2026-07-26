@@ -19,6 +19,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact]:
     """Parse LLM output into ExtractedFact list. Tolerant of markdown wrapping."""
     for candidate in (raw.strip(), *_JSON_ARRAY_RE.findall(raw)):
         try:
-            data = json.loads(candidate)
+            data = scrub_lone_surrogates(json.loads(candidate))
             if isinstance(data, list):
                 facts = []
                 for item in data[:max_facts]:

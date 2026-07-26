@@ -9,6 +9,11 @@ import time
 from pathlib import Path
 
 from memtomem_stm.proxy.metrics import CallMetrics
+from memtomem_stm.utils.json_out import (
+    escape_lone_surrogates,
+    has_lone_surrogate,
+    require_utf8_identifier,
+)
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -101,6 +106,11 @@ def read_compression_summary(
         if "original_chars" not in cols:
             # Missing file would have returned above; an empty column set here
             # means the file exists but isn't a recognizable metrics DB.
+            return summary
+        if (tool is not None and has_lone_surrogate(tool)) or (
+            source is not None and has_lone_surrogate(source)
+        ):
+            summary["available"] = True
             return summary
         has_is_error = "is_error" in cols
         has_source = "source" in cols
@@ -330,6 +340,11 @@ class MetricsStore:
         """
         if self._db is None:
             return
+        require_utf8_identifier(metrics.server, "server")
+        require_utf8_identifier(metrics.tool, "tool")
+        require_utf8_identifier(metrics.trace_id, "trace_id")
+        require_utf8_identifier(metrics.compression_strategy, "compression_strategy")
+        require_utf8_identifier(metrics.source, "source")
         now = time.time()
         with self._lock:
             self._db.execute(
@@ -350,18 +365,34 @@ class MetricsStore:
                     int(metrics.is_error),
                     metrics.error_category.value if metrics.error_category else None,
                     metrics.error_code,
-                    metrics.error_message,
+                    (
+                        escape_lone_surrogates(metrics.error_message)
+                        if metrics.error_message is not None
+                        else None
+                    ),
                     metrics.trace_id,
                     metrics.compression_strategy,
                     int(metrics.ratio_violation),
                     int(metrics.scorer_fallback),
                     _tristate(metrics.index_ok),
-                    metrics.index_error,
+                    (
+                        escape_lone_surrogates(metrics.index_error)
+                        if metrics.index_error is not None
+                        else None
+                    ),
                     metrics.chunks_indexed,
                     _tristate(metrics.extract_ok),
-                    metrics.extract_error,
+                    (
+                        escape_lone_surrogates(metrics.extract_error)
+                        if metrics.extract_error is not None
+                        else None
+                    ),
                     _tristate(metrics.surfacing_on_progressive_ok),
-                    metrics.surface_error,
+                    (
+                        escape_lone_surrogates(metrics.surface_error)
+                        if metrics.surface_error is not None
+                        else None
+                    ),
                     metrics.source,
                     now,
                 ),
@@ -483,6 +514,8 @@ class MetricsStore:
         empty: dict = {"total": 0, "by_server_tool": []}
         if self._db is None:
             return empty
+        if tool is not None and has_lone_surrogate(tool):
+            return empty
         cutoff = time.time() - since_seconds
         # ``source = 'mcp'``: progressive delivery is a proxy-only path; native
         # built-in (``source='hook'``) rows never carry this strategy, but scope
@@ -579,6 +612,11 @@ class MetricsStore:
         tool)`` pair.
         """
         if self._db is None:
+            return None
+        try:
+            require_utf8_identifier(server, "server")
+            require_utf8_identifier(tool, "tool")
+        except ValueError:
             return None
         cutoff = time.time() - within_seconds
         with self._lock:

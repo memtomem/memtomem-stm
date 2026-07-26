@@ -19,6 +19,11 @@ import threading
 import time
 from pathlib import Path
 
+from memtomem_stm.utils.json_out import (
+    escape_lone_surrogates,
+    has_lone_surrogate,
+    require_utf8_identifier,
+)
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -147,12 +152,16 @@ class CompressionFeedbackStore:
         """
         if self._db is None:
             return
+        require_utf8_identifier(server, "server")
+        require_utf8_identifier(tool, "tool")
+        require_utf8_identifier(trace_id, "trace_id")
+        safe_missing = escape_lone_surrogates(missing)
         with self._lock:
             self._db.execute(
                 "INSERT INTO compression_feedback "
                 "(server, tool, trace_id, kind, missing, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (server, tool, trace_id, kind, missing, time.time()),
+                (server, tool, trace_id, kind, safe_missing, time.time()),
             )
             self._db.commit()
 
@@ -207,6 +216,8 @@ class CompressionFeedbackStore:
             return {"total_feedback": 0, "by_kind": {}, "by_tool": {}}
 
         if tool is not None:
+            if has_lone_surrogate(tool):
+                return {"total_feedback": 0, "by_kind": {}, "by_tool": {}}
             kind_rows = self._db.execute(
                 "SELECT kind, COUNT(*) FROM compression_feedback WHERE tool = ? GROUP BY kind",
                 (tool,),

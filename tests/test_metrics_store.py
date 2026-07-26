@@ -217,6 +217,48 @@ class TestRecordPersistsNewFields:
         ).fetchone()
         assert row == (1, None, 5, 1, None)
 
+    @pytest.mark.parametrize(
+        "column",
+        ["error_message", "index_error", "extract_error", "surface_error"],
+    )
+    def test_diagnostic_content_is_escaped_before_sqlite_bind(self, store, column):
+        kwargs = {column: "diagnostic\ud800"}
+        store.record(
+            CallMetrics(
+                server="server",
+                tool="tool",
+                original_chars=1,
+                compressed_chars=1,
+                **kwargs,
+            )
+        )
+        value = store._db.execute(f"SELECT {column} FROM proxy_metrics").fetchone()[0]
+        assert value == r"diagnostic\ud800"
+        value.encode("utf-8")
+
+    @pytest.mark.parametrize(
+        "field",
+        ["server", "tool", "trace_id", "compression_strategy", "source"],
+    )
+    def test_unencodable_identifier_is_refused(self, store, field):
+        kwargs = {
+            "server": "server",
+            "tool": "tool",
+            "trace_id": "trace",
+            "compression_strategy": "truncate",
+            "source": "mcp",
+        }
+        kwargs[field] += "\ud800"
+        with pytest.raises(ValueError, match=rf"^{field} must be a valid UTF-8 identifier$"):
+            store.record(
+                CallMetrics(
+                    original_chars=1,
+                    compressed_chars=1,
+                    **kwargs,
+                )
+            )
+        assert store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0] == 0
+
     def test_index_failure_row(self, store):
         store.record(
             CallMetrics(

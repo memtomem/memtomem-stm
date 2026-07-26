@@ -242,7 +242,7 @@ def build_candidate_features(
     """
     return {
         "query_source": query_source,
-        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "query_sha256": hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest(),
         "query_chars": len(query),
         "ranked_candidates": ranked,
     }

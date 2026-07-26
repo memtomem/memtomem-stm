@@ -59,4 +59,6 @@ class SurfacingCache:
         # as ``error_other``, and proactive surfacing would be silently disabled
         # for 100% of calls on FIPS systems. The digest value is unchanged on
         # non-FIPS builds, so this is behavior-preserving there.
-        return hashlib.md5(query.encode(), usedforsecurity=False).hexdigest()
+        return hashlib.md5(
+            query.encode("utf-8", errors="surrogatepass"), usedforsecurity=False
+        ).hexdigest()

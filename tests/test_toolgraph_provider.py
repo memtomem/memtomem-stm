@@ -324,6 +324,112 @@ class TestToolgraphConsultAdapter:
         assert adapter.is_started is False
 
 
+class TestToolgraphIdentifierBoundary:
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    @pytest.mark.parametrize("field", ["agent", "profile", "candidate"])
+    async def test_request_identifier_is_refused_without_value_leak(self, field, surrogate):
+        adapter = _adapter()
+        kwargs = {"agent": "agent", "profile": "strict"}
+        candidates = ["s::tool"]
+        if field == "candidate":
+            candidates = [f"s::tool{surrogate}"]
+        else:
+            kwargs[field] += surrogate
+        with pytest.raises(ToolgraphProtocolError) as exc_info:
+            await adapter.eligible_tools(candidates, **kwargs)
+        assert surrogate not in str(exc_info.value)
+        assert "UTF-8-encodable identifier" in str(exc_info.value)
+
+    @pytest.mark.parametrize("wire_path", ["structured", "text"])
+    @pytest.mark.parametrize(
+        ("field_path", "mutate"),
+        [
+            ("agent", lambda verdict, value: verdict.__setitem__("agent", value)),
+            ("profile", lambda verdict, value: verdict.__setitem__("profile", value)),
+            ("eligible", lambda verdict, value: verdict["eligible"].append(value)),
+            (
+                "candidate",
+                lambda verdict, value: verdict["rejected"][0].__setitem__("candidate", value),
+            ),
+            (
+                "tool_key",
+                lambda verdict, value: verdict["rejected"][0].__setitem__("tool_key", value),
+            ),
+            (
+                "candidates",
+                lambda verdict, value: verdict["rejected"][0].__setitem__("candidates", [value]),
+            ),
+        ],
+    )
+    async def test_response_identifier_is_protocol_error_on_both_wire_paths(
+        self, wire_path, field_path, mutate
+    ):
+        adapter = _adapter()
+        verdict = {
+            "agent": "agent",
+            "profile": "strict",
+            "eligible": [],
+            "rejected": [
+                {
+                    "candidate": "s::tool",
+                    "tool_key": "s::tool",
+                    "reason": "NOT_GRANTED",
+                }
+            ],
+        }
+        mutate(verdict, "bad\ud800")
+        result = SimpleNamespace(
+            isError=False,
+            structuredContent=verdict if wire_path == "structured" else None,
+            content=(
+                []
+                if wire_path == "structured"
+                else [SimpleNamespace(type="text", text=json.dumps(verdict))]
+            ),
+        )
+        session = AsyncMock()
+        session.call_tool.return_value = result
+        adapter._session = session
+
+        with pytest.raises(ToolgraphProtocolError) as exc_info:
+            await adapter.eligible_tools(["s::tool"])
+        assert "\ud800" not in str(exc_info.value)
+        assert field_path in str(exc_info.value)
+
+    async def test_literal_surrogate_text_is_not_refused_or_rewritten(self):
+        literal = r"s::tool\ud800"
+        verdict = {
+            "agent": "agent",
+            "profile": "strict",
+            "eligible": [literal],
+            "rejected": [],
+        }
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=False,
+            structuredContent=verdict,
+            content=[],
+        )
+        adapter = _adapter()
+        adapter._session = session
+        assert await adapter.eligible_tools([literal]) is verdict
+
+    @pytest.mark.parametrize("field", ["candidate", "tool_key", "candidates"])
+    async def test_rank_feature_response_identifiers_are_refused(self, field):
+        row = {"candidate": "s::tool", "tool_key": "s::tool", "risk_score": 0.5}
+        row[field] = ["bad\udfff"] if field == "candidates" else "bad\udfff"
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=False,
+            structuredContent={"agent": "agent", "features": [row]},
+            content=[],
+        )
+        adapter = _adapter()
+        adapter._session = session
+        with pytest.raises(ToolgraphProtocolError):
+            await adapter.rank_features(["s::tool"])
+
+
 # ── manager startup: the provider is consulted, no longer inert ──────────────
 
 
@@ -483,6 +589,26 @@ class TestConsultCacheMaxScopesWiring:
 
 
 class TestToolgraphConsultWiring:
+    @pytest.mark.parametrize("consult_cache_enabled", [False, True])
+    async def test_unencodable_local_ref_has_same_protocol_refusal_cold_or_warm(
+        self, tmp_path, consult_cache_enabled
+    ):
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["bad\ud800"]},
+            on_protocol_error="open",
+            consult_cache_enabled=consult_cache_enabled,
+        )
+        try:
+            await mgr._consult_toolgraph()
+            status = mgr.get_toolgraph_status()
+            assert status["degraded"] is True
+            assert status["degraded_reason"] == REASON_TOOLGRAPH_PROTOCOL_ERROR
+            assert status["from_cache"] is False
+            assert status["external_reject_count"] == 0
+        finally:
+            await mgr.stop()
+
     async def test_success_rejects_flow_into_exposure_and_telemetry(self, tmp_path):
         mgr, log = _tg_manager(tmp_path)  # tools: read_file, blocked
         await mgr._consult_toolgraph()

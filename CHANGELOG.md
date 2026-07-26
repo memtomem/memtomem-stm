@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Behavior change**: Toolgraph identity-bearing request and verdict fields
+  that contain a lone surrogate are now refused as protocol errors under
+  `on_protocol_error`; they are never non-injectively escaped. Validation runs
+  before the consult cache branch, so cold and warm starts have the same
+  enforcement posture. Stored SQLite identifiers in compression feedback,
+  metrics, progressive-read telemetry, and surfacing feedback are likewise
+  refused rather than rewritten. (#783)
+
+### Fixed
+
+- Lone surrogates in SQLite-bound diagnostic/content fields and nested
+  extraction JSON are escaped once at ingest, while legacy surfacing memory-ID
+  JSON omits unencodable identifiers on display/stat reads without aliasing
+  them to an existing literal `\udxxx` ID. Query-only digest inputs in
+  surfacing cache keys, persisted query hashes, and tool-relevance telemetry
+  now hash with `surrogatepass`, preserving clean digest values and keeping a
+  raw surrogate distinct from its six-character literal twin. (#783)
+
 ## [0.1.43] — 2026-07-26
 
 ### Upgrade notes

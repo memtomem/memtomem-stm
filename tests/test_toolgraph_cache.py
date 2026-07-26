@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from types import SimpleNamespace
@@ -242,6 +243,64 @@ class TestCorruptRow:
         row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
         assert row is not None
         assert row["risk_scores"] == {"s::c": 1.0, "s::d": 0.5}
+
+    @pytest.mark.parametrize(
+        "facts",
+        [
+            {
+                "rejects": {"s::bad\ud800": "NOT_GRANTED"},
+                "tool_not_found_refs": [],
+                "risk_scores": {},
+            },
+            {
+                "rejects": {},
+                "tool_not_found_refs": ["s::bad\udbff"],
+                "risk_scores": {},
+            },
+            {
+                "rejects": {},
+                "tool_not_found_refs": [],
+                "risk_scores": {"s::bad\udfff": 0.5},
+            },
+        ],
+        ids=["reject", "tool_not_found", "risk"],
+    )
+    def test_legacy_unencodable_identifier_row_is_dropped(self, cache, facts):
+        _put(cache)
+        cache._db.execute(
+            "UPDATE toolgraph_consult SET verdict_json = ?",
+            (json.dumps(facts, separators=(",", ":")),),
+        )
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_literal_surrogate_text_remains_a_valid_distinct_identifier(self, cache):
+        literal = r"s::bad\ud800"
+        _put(cache, rejects={literal: "NOT_GRANTED"})
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["rejects"] == {literal: "NOT_GRANTED"}
+
+
+class TestIdentifierWriteBoundary:
+    def test_put_refuses_unencodable_fact_without_rewriting(self, cache):
+        _put(cache, rejects={"s::bad\ud800": "NOT_GRANTED"})
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_scope_identifier_misses_and_is_not_written(self, cache):
+        cache.put(
+            _PROV,
+            "agent\ud800",
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            risk_scores={},
+            had_risk_scores=True,
+        )
+        assert cache.get(_PROV, "agent\ud800", _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
 
 
 class _RaisingConn:

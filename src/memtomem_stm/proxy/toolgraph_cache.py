@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from memtomem_stm.utils.json_out import has_lone_surrogate
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -135,6 +136,8 @@ class GraphConsultCache:
         """
         if self._db is None:
             return None
+        if has_lone_surrogate(agent_id) or has_lone_surrogate(profile):
+            return None
         key = _scope_key(provider_fp, agent_id, profile, candidate_hash, generation)
         try:
             with self._lock:
@@ -200,13 +203,22 @@ class GraphConsultCache:
             isinstance(rejects, dict) and isinstance(refs, list) and isinstance(risk_scores, dict)
         ):
             return False
-        if not all(isinstance(k, str) and isinstance(v, str) for k, v in rejects.items()):
+        if not all(
+            isinstance(k, str)
+            and isinstance(v, str)
+            and not has_lone_surrogate(k)
+            and not has_lone_surrogate(v)
+            for k, v in rejects.items()
+        ):
             return False
-        if not all(isinstance(ref, str) for ref in refs):
+        if not all(isinstance(ref, str) and not has_lone_surrogate(ref) for ref in refs):
             return False
         # ``bool`` is an ``int`` subclass but never a valid risk score.
         return all(
-            isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
+            isinstance(k, str)
+            and not has_lone_surrogate(k)
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
             for k, v in risk_scores.items()
         )
 
@@ -237,13 +249,28 @@ class GraphConsultCache:
         """Persist the raw facts of a successful consult (scope-replacing)."""
         if self._db is None:
             return
+        if has_lone_surrogate(agent_id) or has_lone_surrogate(profile):
+            logger.warning("Tool-graph consult cache write refused unencodable scope identifier")
+            return
+        raw_facts: dict[str, Any] = {
+            "rejects": dict(rejects),
+            "tool_not_found_refs": list(tool_not_found_refs),
+            "risk_scores": dict(risk_scores),
+        }
+        if not self._row_shape_ok(raw_facts):
+            logger.warning(
+                "Tool-graph consult cache write refused malformed or unencodable "
+                "identifier facts — consult not cached"
+            )
+            return
+        raw_facts["risk_scores"] = {
+            key: float(value) for key, value in raw_facts["risk_scores"].items()
+        }
         key = _scope_key(provider_fp, agent_id, profile, candidate_hash, generation)
         verdict_json = json.dumps(
             {
                 "graph_generation": generation,
-                "rejects": dict(rejects),
-                "tool_not_found_refs": list(tool_not_found_refs),
-                "risk_scores": {k: float(v) for k, v in risk_scores.items()},
+                **raw_facts,
             },
             separators=(",", ":"),
         )

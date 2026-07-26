@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
@@ -21,6 +23,68 @@ from memtomem_stm.surfacing.feedback_store import (
 
 
 class TestFeedbackStore:
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_record_surfacing_escapes_content(self, feedback_store, surrogate):
+        feedback_store.record_surfacing(
+            "surfacing",
+            "server",
+            "tool",
+            f"query{surrogate}",
+            ["memory"],
+            [0.5],
+            f"scale{surrogate}",
+        )
+        row = feedback_store._db.execute(
+            "SELECT query, score_scale FROM surfacing_events"
+        ).fetchone()
+        literal = f"\\u{ord(surrogate):04x}"
+        assert row == (f"query{literal}", f"scale{literal}")
+        row[0].encode("utf-8")
+        row[1].encode("utf-8")
+
+    @pytest.mark.parametrize("field", ["surfacing_id", "server", "tool", "memory_id"])
+    def test_record_surfacing_refuses_unencodable_identifiers(self, feedback_store, field):
+        values = {
+            "surfacing_id": "surfacing",
+            "server": "server",
+            "tool": "tool",
+            "memory_id": "memory",
+        }
+        values[field] += "\ud800"
+        with pytest.raises(ValueError, match="must be a valid UTF-8 identifier"):
+            feedback_store.record_surfacing(
+                values["surfacing_id"],
+                values["server"],
+                values["tool"],
+                "query",
+                [values["memory_id"]],
+                [0.5],
+            )
+        assert feedback_store.get_tool_feedback_summary()["total_surfacings"] == 0
+
+    def test_legacy_memory_id_reads_skip_raw_surrogate_without_aliasing_literal(
+        self, feedback_store
+    ):
+        import json
+
+        raw = "memory\ud800"
+        literal = r"memory\ud800"
+        feedback_store.record_surfacing("surfacing", "server", "tool", "query", [literal], [0.5])
+        feedback_store._db.execute(
+            "UPDATE surfacing_events SET memory_ids = ? WHERE id = ?",
+            (json.dumps([raw, literal]), "surfacing"),
+        )
+        feedback_store._db.commit()
+
+        assert feedback_store.get_memory_ids_for_surfacing("surfacing") == [literal]
+        assert feedback_store.get_stats()["recent"][0]["memory_ids"] == [literal]
+        assert feedback_store.get_surfacing_event("surfacing")["memory_ids"] == [
+            raw,
+            literal,
+        ]
+        assert feedback_store.record_feedback("surfacing", "not_relevant", literal)
+        assert not feedback_store.record_feedback("surfacing", "not_relevant", raw)
+
     def test_inspect_feedback_db_missing(self, tmp_path: Path):
         status = inspect_feedback_db(tmp_path / "missing.db")
 
@@ -317,15 +381,11 @@ class TestFeedbackStore:
         assert ratio is not None
         assert abs(ratio - 0.6) < 0.01
 
-    def test_ratio_excludes_feedback_from_nonrrf_scale_events(
-        self, feedback_store: FeedbackStore
-    ):
+    def test_ratio_excludes_feedback_from_nonrrf_scale_events(self, feedback_store: FeedbackStore):
         """AutoTuner-facing ratios move an RRF-calibrated threshold, so
         feedback earned on a scale-gated (core-named non-RRF) surfacing must
         not count; rrf-stamped and unstamped events keep counting."""
-        feedback_store.record_surfacing(
-            "s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf"
-        )
+        feedback_store.record_surfacing("s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf")
         feedback_store.record_surfacing("s-bare", "sv", "t", "q2", ["m2"], [0.02])
         feedback_store.record_surfacing(
             "s-rr", "sv", "t", "q3", ["m3"], [-0.17], score_scale="rerank"
@@ -348,9 +408,7 @@ class TestFeedbackStore:
         """The global (tool=None) cold-start fallback applies the same scale
         scoping, while feedback whose events row was aged out by retention
         (LEFT JOIN → NULL scale) keeps counting as before."""
-        feedback_store.record_surfacing(
-            "s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf"
-        )
+        feedback_store.record_surfacing("s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf")
         feedback_store.record_surfacing(
             "s-rr", "sv", "t", "q2", ["m2"], [-0.17], score_scale="rerank"
         )
@@ -386,9 +444,7 @@ class TestFeedbackStore:
 
         assert counts == {"m1": 2, "missing": 0}
 
-    def test_negative_feedback_counts_expand_blanket_feedback(
-        self, feedback_store: FeedbackStore
-    ):
+    def test_negative_feedback_counts_expand_blanket_feedback(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1", "m2"], [0.5, 0.4])
         feedback_store.record_surfacing("s2", "sv", "t", "q", ["m2"], [0.4])
         feedback_store.record_feedback("s1", "not_relevant")
