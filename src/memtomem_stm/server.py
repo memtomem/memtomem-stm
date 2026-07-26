@@ -854,12 +854,18 @@ async def stm_proxy_cache_clear(
         if proxy_cache is None:
             return "Cache not enabled. Set proxy.cache.enabled = true in stm_proxy.json."
         removed = proxy_cache.clear(server=server, tool=tool)
+        # Escaped for the reply only. These are echoed back to the client, and
+        # the SDK's serialization of a ``TextContent`` refuses a lone
+        # surrogate — so guarding the SQLite bind alone would just move the
+        # failure one step further out (#781).
+        shown_server = escape_lone_surrogates(server or "")
+        shown_tool = escape_lone_surrogates(tool or "")
         if server and tool:
-            return f"Cleared {removed} cache entries for {server}/{tool}."
+            return f"Cleared {removed} cache entries for {shown_server}/{shown_tool}."
         elif server:
-            return f"Cleared {removed} cache entries for server '{server}'."
+            return f"Cleared {removed} cache entries for server '{shown_server}'."
         else:
-            return f"Cleared {removed} cache entries for tool '{tool}'."
+            return f"Cleared {removed} cache entries for tool '{shown_tool}'."
 
     # Unfiltered "clear all": flush each enabled cache independently.
     parts: list[str] = []

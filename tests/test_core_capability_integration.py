@@ -999,3 +999,35 @@ async def test_formation_response_drops_untrusted_keys() -> None:
     result = json.loads(await stm_memory_propose("valid", ctx=_ctx(config, engine)))
     assert result["candidate_id"] == "candidate-1"
     assert "internal_secret" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surrogate", SURROGATES)
+async def test_cache_clear_filter_reply_is_serializable(surrogate: str) -> None:
+    """A filtered clear echoes its filter, so the reply must be encodable (#781).
+
+    Guarding only the SQLite bind moved the failure outward rather than
+    closing it: the identifier is interpolated into the returned text, and the
+    SDK's ``TextContent`` serialization refuses a lone surrogate.
+    """
+    from memtomem_stm.server import stm_proxy_cache_clear
+
+    config = STMConfig()
+    ctx = _ctx(config, None)
+    ctx.request_context.lifespan_context.proxy_manager._cache = _StubCache()
+
+    for kwargs in (
+        {"server": f"srv{surrogate}"},
+        {"tool": f"tool{surrogate}"},
+        {"server": f"srv{surrogate}", "tool": f"tool{surrogate}"},
+    ):
+        reply = await stm_proxy_cache_clear(ctx=ctx, **kwargs)
+        assert surrogate not in reply
+        reply.encode("utf-8")  # the call that used to raise
+
+
+class _StubCache:
+    """Minimal stand-in: the filter never matches, as the real guard ensures."""
+
+    def clear(self, *, server=None, tool=None) -> int:
+        return 0

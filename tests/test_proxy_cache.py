@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import time
 
@@ -713,3 +714,96 @@ class TestEnvelopeSafeMarker:
         self._insert_unmarked_row(proxy_cache, key, "unmarked")
         proxy_cache.set("s", "t", {"a": 1}, "re-marked", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {"a": 1}) == "re-marked"
+
+
+# One from each end of the high and low surrogate blocks, matching the corpus
+# in ``test_json_out.py`` so a range off by one at either boundary fails.
+SURROGATES = ["\ud800", "\udbff", "\udc00", "\udfff"]
+
+
+class TestSurrogateRoundTrip:
+    """A stored lone surrogate must not come back as the code unit (#781).
+
+    The writers escape, but a plain ``json.loads`` on the way out decodes the
+    six characters ``\\ud800`` straight back into the unencodable code unit —
+    which then raises at the next encode downstream rather than here. The
+    pending store has scrubbed on read since #761; these are its siblings.
+    """
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_envelope_survives_the_round_trip(self, proxy_cache: ProxyCache, surrogate: str):
+        proxy_cache.set(
+            "s",
+            "t",
+            {"a": 1},
+            "result",
+            ttl_seconds=60.0,
+            structured_content={"note": f"decision{surrogate}"},
+            meta={"origin": f"trace{surrogate}"},
+        )
+        cached = proxy_cache.get("s", "t", {"a": 1})
+        assert cached is not None and cached.structured_content is not None
+        assert cached.meta is not None
+        note = cached.structured_content["note"]
+        origin = cached.meta["origin"]
+        assert surrogate not in note and surrogate not in origin
+        note.encode("utf-8")  # the call that used to raise
+        origin.encode("utf-8")
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_result_text_is_storable(self, proxy_cache: ProxyCache, surrogate: str):
+        """``sqlite3`` encodes text parameters, so a raw one raised at execute.
+
+        The caller catches ``Exception`` and leaves the response alone, so the
+        cost was a silently uncached response and a warning per call — not a
+        lost one. The body is content rather than an identity, so escaping it
+        is right here where it would be wrong for the two names beside it.
+        """
+        proxy_cache.set("s", "t", {"a": 1}, f"answer{surrogate}", ttl_seconds=60.0)
+        stored = proxy_cache.get("s", "t", {"a": 1})
+        assert stored is not None
+        assert surrogate not in stored
+        stored.encode("utf-8")
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_unencodable_identifier_is_not_cached(self, proxy_cache: ProxyCache, surrogate: str):
+        """An identifier that cannot be a text parameter skips the store.
+
+        Escaping it would be the wrong repair twice over: the row would no
+        longer be reachable by its real name, and it would alias the distinct
+        identifier spelled with those six literal characters. Not caching is
+        the honest outcome, and the caller treats it as "response unaffected".
+        """
+        proxy_cache.set(f"srv{surrogate}", f"tool{surrogate}", {"a": 1}, "r", ttl_seconds=60.0)
+        assert proxy_cache.get(f"srv{surrogate}", f"tool{surrogate}", {"a": 1}) is None
+        assert proxy_cache.clear(server=f"srv{surrogate}") == 0
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_key_does_not_alias_the_literal_escape(self, proxy_cache: ProxyCache, surrogate: str):
+        """The digest must stay injective across the escaping helper's collision.
+
+        ``escape_lone_surrogates`` maps the code unit and the six literal
+        characters onto the same text by design, so deriving the key through
+        it let one identifier's row answer for the other.
+        """
+        literal = f"srv\\u{ord(surrogate):04x}"
+        assert _make_key(f"srv{surrogate}", "t", {}) != _make_key(literal, "t", {})
+
+        proxy_cache.set(literal, "t", {}, "literal-body", ttl_seconds=60.0)
+        assert proxy_cache.get(literal, "t", {}) == "literal-body"
+        assert proxy_cache.get(f"srv{surrogate}", "t", {}) is None
+
+    def test_clean_keys_are_unchanged_by_the_new_encoding(self):
+        """Switching to ``surrogatepass`` must orphan no existing entry.
+
+        Pinned against the pre-change derivation spelled out literally, so
+        this fails both if the encoding stops being byte-compatible for clean
+        input and if the raw shape drifts without a ``_KEY_SCHEMA_VERSION``
+        bump — the two ways an existing entry becomes unreachable.
+        """
+        # The version is spelled out rather than read from the constant on
+        # purpose: reading it would let a ``_KEY_SCHEMA_VERSION`` bump move
+        # both sides together and pass, when a bump is exactly the event that
+        # orphans every stored entry and must be acknowledged deliberately.
+        raw = "\x00".join(["4", "s", "t", '{"a": 1}', "", "null"])
+        assert _make_key("s", "t", {"a": 1}) == hashlib.sha256(raw.encode()).hexdigest()
