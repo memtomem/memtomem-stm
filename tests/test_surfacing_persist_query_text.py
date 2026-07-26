@@ -106,6 +106,15 @@ LONG_RESPONSE = "x" * 200
 
 
 class TestEngineHashesPersistedQuery:
+    def test_lone_surrogate_hashes_without_aliasing_literal(self):
+        raw = "query\ud800"
+        literal = r"query\ud800"
+        assert SurfacingEngine._hashed_query(raw) == (
+            _QUERY_HASH_PREFIX
+            + hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+        )
+        assert SurfacingEngine._hashed_query(raw) != SurfacingEngine._hashed_query(literal)
+
     async def test_default_persists_raw_text(self):
         """``persist_query_text`` defaults to ``True`` — the legacy raw
         query text must reach ``record_surfacing`` unchanged so existing

@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from memtomem_stm.utils.json_out import has_lone_surrogate
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -59,6 +60,23 @@ CREATE TABLE IF NOT EXISTS toolgraph_consult (
 _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_toolgraph_consult_scope
 ON toolgraph_consult (provider_fingerprint, agent_id, query_profile, candidate_hash);
+"""
+
+IDENTITY_POLICY = 1
+"""Version of the identity-validation policy the stored facts were written under.
+
+A hit reconstructs only ``rejects`` / ``tool_not_found_refs`` / ``risk_scores``,
+so the response fields ``_validate_verdict_identifiers`` checks — ``agent``,
+``profile``, ``eligible``, ``tool_key``, auxiliary ``candidates`` — are not in
+the row and cannot be revalidated after an upgrade. A pre-#783 row could
+therefore be minted by a verdict that today's policy refuses, and then serve a
+warm start that skips the full consult entirely: cold would ``fail_start``
+while warm came up clean, the exact divergence the pre-cache validation exists
+to prevent. Stamping the policy and rejecting rows that lack it forces one full
+consult after upgrade, which re-derives the verdict under current rules.
+
+Bump this whenever the set of refused identifier fields changes, for the same
+reason: a row written under a laxer policy is not evidence for a stricter one.
 """
 
 
@@ -135,6 +153,8 @@ class GraphConsultCache:
         """
         if self._db is None:
             return None
+        if has_lone_surrogate(agent_id) or has_lone_surrogate(profile):
+            return None
         key = _scope_key(provider_fp, agent_id, profile, candidate_hash, generation)
         try:
             with self._lock:
@@ -170,8 +190,9 @@ class GraphConsultCache:
         # a fresh row.
         if not self._row_shape_ok(verdict):
             logger.warning(
-                "Tool-graph consult cache row (scope %s) is malformed — treating as "
-                "a miss and dropping it",
+                "Tool-graph consult cache row (scope %s) is malformed, or was written "
+                "before the current identity-validation policy — treating as a miss "
+                "and dropping it",
                 key[:12],
             )
             self._delete_scope(key)
@@ -193,6 +214,12 @@ class GraphConsultCache:
         """
         if not isinstance(verdict, dict):
             return False
+        # A row minted under an older (or absent) identity policy is not
+        # evidence under this one — see ``IDENTITY_POLICY``. Checked here rather
+        # than only in ``get`` so ``put``'s pre-write self-check also proves the
+        # stamp was written.
+        if verdict.get("identity_policy") != IDENTITY_POLICY:
+            return False
         rejects = verdict.get("rejects")
         refs = verdict.get("tool_not_found_refs")
         risk_scores = verdict.get("risk_scores")
@@ -200,13 +227,22 @@ class GraphConsultCache:
             isinstance(rejects, dict) and isinstance(refs, list) and isinstance(risk_scores, dict)
         ):
             return False
-        if not all(isinstance(k, str) and isinstance(v, str) for k, v in rejects.items()):
+        if not all(
+            isinstance(k, str)
+            and isinstance(v, str)
+            and not has_lone_surrogate(k)
+            and not has_lone_surrogate(v)
+            for k, v in rejects.items()
+        ):
             return False
-        if not all(isinstance(ref, str) for ref in refs):
+        if not all(isinstance(ref, str) and not has_lone_surrogate(ref) for ref in refs):
             return False
         # ``bool`` is an ``int`` subclass but never a valid risk score.
         return all(
-            isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
+            isinstance(k, str)
+            and not has_lone_surrogate(k)
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
             for k, v in risk_scores.items()
         )
 
@@ -237,13 +273,29 @@ class GraphConsultCache:
         """Persist the raw facts of a successful consult (scope-replacing)."""
         if self._db is None:
             return
+        if has_lone_surrogate(agent_id) or has_lone_surrogate(profile):
+            logger.warning("Tool-graph consult cache write refused unencodable scope identifier")
+            return
+        raw_facts: dict[str, Any] = {
+            "identity_policy": IDENTITY_POLICY,
+            "rejects": dict(rejects),
+            "tool_not_found_refs": list(tool_not_found_refs),
+            "risk_scores": dict(risk_scores),
+        }
+        if not self._row_shape_ok(raw_facts):
+            logger.warning(
+                "Tool-graph consult cache write refused malformed or unencodable "
+                "identifier facts — consult not cached"
+            )
+            return
+        raw_facts["risk_scores"] = {
+            key: float(value) for key, value in raw_facts["risk_scores"].items()
+        }
         key = _scope_key(provider_fp, agent_id, profile, candidate_hash, generation)
         verdict_json = json.dumps(
             {
                 "graph_generation": generation,
-                "rejects": dict(rejects),
-                "tool_not_found_refs": list(tool_not_found_refs),
-                "risk_scores": {k: float(v) for k, v in risk_scores.items()},
+                **raw_facts,
             },
             separators=(",", ":"),
         )

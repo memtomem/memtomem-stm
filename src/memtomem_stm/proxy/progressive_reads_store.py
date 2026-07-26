@@ -21,6 +21,7 @@ import threading
 import time
 from pathlib import Path
 
+from memtomem_stm.utils.json_out import require_utf8_identifier
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -128,6 +129,10 @@ class ProgressiveReadsStore:
         """
         if self._db is None:
             return
+        require_utf8_identifier(key, "key")
+        require_utf8_identifier(trace_id, "trace_id")
+        require_utf8_identifier(server, "server")
+        require_utf8_identifier(tool, "tool")
         with self._lock:
             self._db.execute(
                 "INSERT INTO progressive_reads "
@@ -184,6 +189,10 @@ class ProgressiveReadsStore:
         where = ""
         params: tuple = ()
         if tool is not None:
+            try:
+                require_utf8_identifier(tool, "tool")
+            except ValueError:
+                return empty
             where = "WHERE tool = ?"
             params = (tool,)
 

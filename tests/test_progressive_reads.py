@@ -64,6 +64,28 @@ class TestProgressiveReadsStore:
         finally:
             store.close()
 
+    @pytest.mark.parametrize("field", ["key", "trace_id", "server", "tool"])
+    def test_unencodable_identifier_is_refused(self, tmp_path: Path, field: str):
+        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store.initialize()
+        values = {"key": "key", "trace_id": "trace", "server": "server", "tool": "tool"}
+        values[field] += "\ud800"
+        try:
+            with pytest.raises(ValueError, match=rf"^{field} must be a valid UTF-8 identifier$"):
+                store.record(
+                    values["key"],
+                    values["trace_id"],
+                    values["server"],
+                    values["tool"],
+                    0,
+                    1,
+                    1,
+                    1,
+                )
+            assert store._db.execute("SELECT COUNT(*) FROM progressive_reads").fetchone()[0] == 0
+        finally:
+            store.close()
+
     def test_startup_purge_deletes_aged_rows(self, tmp_path: Path):
         """#584 — a store opened with retention_days>0 purges rows older than
         the window on initialize(); newer rows and a retention_days=0 store are
@@ -219,6 +241,23 @@ class TestProgressiveReadsStore:
 
 
 class TestProgressiveReadsTracker:
+    def test_unencodable_identifier_is_warned_and_swallowed(self, tmp_path: Path, caplog):
+        tracker = ProgressiveReadsTracker(tmp_path / "pr.db")
+        try:
+            with caplog.at_level("WARNING", logger="memtomem_stm.proxy.progressive_reads"):
+                tracker.record_initial(
+                    key="key\ud800",
+                    trace_id=None,
+                    server="server",
+                    tool="tool",
+                    initial_chars=1,
+                    total_chars=1,
+                )
+            assert tracker.get_stats()["total_reads"] == 0
+            assert any("invalid identifier" in record.message for record in caplog.records)
+        finally:
+            tracker.close()
+
     def test_record_initial_stores_offset_zero(self, tmp_path: Path):
         tracker = ProgressiveReadsTracker(tmp_path / "pr.db")
         try:

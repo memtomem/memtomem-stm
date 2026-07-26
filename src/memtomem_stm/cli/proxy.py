@@ -1975,6 +1975,18 @@ def stats(
     from memtomem_stm.proxy.metrics_store import read_compression_summary
     from memtomem_stm.surfacing.feedback_store import read_surfacing_summary
 
+    # Refuse before the stores are touched or anything is printed. The summary
+    # readers treat an unencodable filter as "matched nothing but the DB is
+    # fine", which reads as a real all-time zero here rather than as a rejected
+    # input; the human form then crashed encoding the filter echo below, so the
+    # two output modes disagreed about the same argv. ``--source`` needs no such
+    # guard: it is a ``click.Choice``. ``!r`` renders the code unit as ASCII
+    # ``\udcff`` — echoing it raw is the crash this is refusing (mirrors the
+    # ``add`` name guard). Reachable from plain argv: on POSIX a byte that is
+    # not valid UTF-8 decodes with ``surrogateescape``.
+    if tool_filter is not None and has_lone_surrogate(tool_filter):
+        raise click.UsageError(f"--tool {tool_filter!r} is not valid UTF-8.")
+
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 

@@ -153,6 +153,37 @@ class TestMmsStats:
         assert data["tool_filter"] == "query-docs"
         assert data["compression"]["total_calls"] == 2
 
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    @pytest.mark.parametrize("as_json", [False, True])
+    def test_unencodable_tool_filter_is_refused_in_both_output_modes(
+        self, runner, tmp_path, monkeypatch, surrogate, as_json
+    ):
+        """An unencodable ``--tool`` is a rejected input, not an all-time zero.
+
+        Both modes must say the same thing about the same argv. Before the
+        boundary guard the human form died encoding its ``Filter :`` echo
+        (exit 1, ``UnicodeEncodeError``) while ``--json`` exited 0 with
+        ``compression.available = true`` and ``total_calls = 0`` — the seeded
+        rows below are what makes that zero a lie rather than an empty store.
+        """
+        set_home(monkeypatch, tmp_path)
+        _seed_metrics(tmp_path)
+        argv = ["stats", "--tool", f"query-docs{surrogate}"]
+
+        result = runner.invoke(cli, [*argv, "--json"] if as_json else argv)
+
+        assert result.exit_code == 2, result.output
+        assert isinstance(result.exception, SystemExit)
+        assert "is not valid UTF-8" in result.output
+        # Sanitized: the offending code unit is echoed only as its ASCII
+        # ``\udxxx`` repr, so the refusal itself can always be printed.
+        assert surrogate not in result.output
+        assert f"\\u{ord(surrogate):04x}" in result.output
+        result.output.encode("utf-8")
+        # Refused before any store read, so no summary reached stdout.
+        assert "Proxy / Compression" not in result.output
+        assert "total_calls" not in result.output
+
     def test_env_enabled_still_honors_file_metrics_path(self, runner, tmp_path, monkeypatch):
         """When ``MEMTOMEM_STM_PROXY__ENABLED`` is set the server now loads
         the JSON file and overlays env on top

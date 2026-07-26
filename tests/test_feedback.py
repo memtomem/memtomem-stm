@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
@@ -21,6 +23,68 @@ from memtomem_stm.surfacing.feedback_store import (
 
 
 class TestFeedbackStore:
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_record_surfacing_escapes_content(self, feedback_store, surrogate):
+        feedback_store.record_surfacing(
+            "surfacing",
+            "server",
+            "tool",
+            f"query{surrogate}",
+            ["memory"],
+            [0.5],
+            f"scale{surrogate}",
+        )
+        row = feedback_store._db.execute(
+            "SELECT query, score_scale FROM surfacing_events"
+        ).fetchone()
+        literal = f"\\u{ord(surrogate):04x}"
+        assert row == (f"query{literal}", f"scale{literal}")
+        row[0].encode("utf-8")
+        row[1].encode("utf-8")
+
+    @pytest.mark.parametrize("field", ["surfacing_id", "server", "tool", "memory_id"])
+    def test_record_surfacing_refuses_unencodable_identifiers(self, feedback_store, field):
+        values = {
+            "surfacing_id": "surfacing",
+            "server": "server",
+            "tool": "tool",
+            "memory_id": "memory",
+        }
+        values[field] += "\ud800"
+        with pytest.raises(ValueError, match="must be a valid UTF-8 identifier"):
+            feedback_store.record_surfacing(
+                values["surfacing_id"],
+                values["server"],
+                values["tool"],
+                "query",
+                [values["memory_id"]],
+                [0.5],
+            )
+        assert feedback_store.get_tool_feedback_summary()["total_surfacings"] == 0
+
+    def test_legacy_memory_id_reads_skip_raw_surrogate_without_aliasing_literal(
+        self, feedback_store
+    ):
+        import json
+
+        raw = "memory\ud800"
+        literal = r"memory\ud800"
+        feedback_store.record_surfacing("surfacing", "server", "tool", "query", [literal], [0.5])
+        feedback_store._db.execute(
+            "UPDATE surfacing_events SET memory_ids = ? WHERE id = ?",
+            (json.dumps([raw, literal]), "surfacing"),
+        )
+        feedback_store._db.commit()
+
+        assert feedback_store.get_memory_ids_for_surfacing("surfacing") == [literal]
+        assert feedback_store.get_stats()["recent"][0]["memory_ids"] == [literal]
+        assert feedback_store.get_surfacing_event("surfacing")["memory_ids"] == [
+            raw,
+            literal,
+        ]
+        assert feedback_store.record_feedback("surfacing", "not_relevant", literal)
+        assert not feedback_store.record_feedback("surfacing", "not_relevant", raw)
+
     def test_inspect_feedback_db_missing(self, tmp_path: Path):
         status = inspect_feedback_db(tmp_path / "missing.db")
 
@@ -317,15 +381,11 @@ class TestFeedbackStore:
         assert ratio is not None
         assert abs(ratio - 0.6) < 0.01
 
-    def test_ratio_excludes_feedback_from_nonrrf_scale_events(
-        self, feedback_store: FeedbackStore
-    ):
+    def test_ratio_excludes_feedback_from_nonrrf_scale_events(self, feedback_store: FeedbackStore):
         """AutoTuner-facing ratios move an RRF-calibrated threshold, so
         feedback earned on a scale-gated (core-named non-RRF) surfacing must
         not count; rrf-stamped and unstamped events keep counting."""
-        feedback_store.record_surfacing(
-            "s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf"
-        )
+        feedback_store.record_surfacing("s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf")
         feedback_store.record_surfacing("s-bare", "sv", "t", "q2", ["m2"], [0.02])
         feedback_store.record_surfacing(
             "s-rr", "sv", "t", "q3", ["m3"], [-0.17], score_scale="rerank"
@@ -348,9 +408,7 @@ class TestFeedbackStore:
         """The global (tool=None) cold-start fallback applies the same scale
         scoping, while feedback whose events row was aged out by retention
         (LEFT JOIN → NULL scale) keeps counting as before."""
-        feedback_store.record_surfacing(
-            "s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf"
-        )
+        feedback_store.record_surfacing("s-rrf", "sv", "t", "q1", ["m1"], [0.02], score_scale="rrf")
         feedback_store.record_surfacing(
             "s-rr", "sv", "t", "q2", ["m2"], [-0.17], score_scale="rerank"
         )
@@ -386,9 +444,7 @@ class TestFeedbackStore:
 
         assert counts == {"m1": 2, "missing": 0}
 
-    def test_negative_feedback_counts_expand_blanket_feedback(
-        self, feedback_store: FeedbackStore
-    ):
+    def test_negative_feedback_counts_expand_blanket_feedback(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1", "m2"], [0.5, 0.4])
         feedback_store.record_surfacing("s2", "sv", "t", "q", ["m2"], [0.4])
         feedback_store.record_feedback("s1", "not_relevant")
@@ -411,6 +467,37 @@ class TestFeedbackStore:
         counts = feedback_store.get_negative_feedback_counts(["m1", "m2"])
 
         assert counts == {"m1": 2, "m2": 1}
+
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_negative_feedback_counts_drop_only_the_unencodable_id(
+        self, feedback_store: FeedbackStore, surrogate: str
+    ):
+        """One bad id must not blank the counts for the valid ones.
+
+        The caller (``SurfacingEngine._demoted_ids``) reads a missing/zero
+        count as "not enough negatives", so bailing on the whole batch would
+        resurface a memory already rated past the demotion threshold for as
+        long as one unencodable id rode along in the same candidate set.
+        """
+        feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
+        feedback_store.record_surfacing("s2", "sv", "t", "q", ["m1"], [0.5])
+        feedback_store.record_feedback("s1", "not_relevant", "m1")
+        feedback_store.record_feedback("s2", "already_known", "m1")
+
+        counts = feedback_store.get_negative_feedback_counts([f"bad{surrogate}", "m1", "missing"])
+
+        # The unencodable id is absent rather than 0: it can never match a
+        # stored row, and absent reads identically at the call site.
+        assert counts == {"m1": 2, "missing": 0}
+
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
+    def test_negative_feedback_counts_empty_when_every_id_unencodable(
+        self, feedback_store: FeedbackStore, surrogate: str
+    ):
+        feedback_store.record_surfacing("s1", "sv", "t", "q", ["m1"], [0.5])
+        feedback_store.record_feedback("s1", "not_relevant", "m1")
+
+        assert feedback_store.get_negative_feedback_counts([f"bad{surrogate}"]) == {}
 
     def test_per_tool_breakdown_includes_feedback_counts(self, feedback_store: FeedbackStore):
         """Per-tool breakdown exposes total, not_relevant, and negative counts."""
@@ -539,6 +626,26 @@ class TestFeedbackTracker:
         try:
             result = tracker.record_feedback("s1", "invalid_rating")
             assert "Error" in result
+        finally:
+            tracker.close()
+
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    @pytest.mark.parametrize("field", ["surfacing_id", "memory_id"])
+    def test_refused_identifier_error_omits_unencodable_value(self, tmp_path, field, surrogate):
+        tracker = FeedbackTracker(
+            SurfacingConfig(), db_path=tmp_path / f"{field}-{ord(surrogate)}.db"
+        )
+        values = {"surfacing_id": "surfacing", "memory_id": "memory"}
+        values[field] += surrogate
+        try:
+            result = tracker.record_feedback(
+                values["surfacing_id"],
+                "helpful",
+                values["memory_id"],
+            )
+            assert result == f"Error: {field} must be a valid UTF-8 identifier"
+            assert surrogate not in result
+            result.encode("utf-8")
         finally:
             tracker.close()
 

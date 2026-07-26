@@ -78,6 +78,37 @@ class TestCompressionFeedbackStore:
         finally:
             store.close()
 
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_record_escapes_content_before_sqlite_bind(self, tmp_path: Path, surrogate: str):
+        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store.initialize()
+        try:
+            store.record("server", "tool", "other", f"missing{surrogate}", None)
+            row = store._db.execute("SELECT missing FROM compression_feedback").fetchone()
+            assert row == (f"missing\\u{ord(surrogate):04x}",)
+            row[0].encode("utf-8")
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("field", ["server", "tool", "trace_id"])
+    def test_record_refuses_unencodable_identifiers(self, tmp_path: Path, field: str):
+        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store.initialize()
+        values = {"server": "server", "tool": "tool", "trace_id": "trace"}
+        values[field] += "\ud800"
+        try:
+            with pytest.raises(ValueError, match=rf"^{field} must be a valid UTF-8 identifier$"):
+                store.record(
+                    values["server"],
+                    values["tool"],
+                    "other",
+                    "missing",
+                    values["trace_id"],
+                )
+            assert store._db.execute("SELECT COUNT(*) FROM compression_feedback").fetchone()[0] == 0
+        finally:
+            store.close()
+
     def test_startup_purge_deletes_aged_rows(self, tmp_path: Path):
         """#584 — a store opened with retention_days>0 purges rows older than
         the window on initialize(); a retention_days=0 store keeps everything."""
@@ -321,6 +352,24 @@ def metrics_store(tmp_path: Path) -> MetricsStore:
 
 
 class TestCompressionFeedbackTracker:
+    @pytest.mark.parametrize("field", ["server", "tool", "trace_id"])
+    def test_unencodable_identifier_returns_sanitized_error(self, tmp_path: Path, field: str):
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        values = {"server": "server", "tool": "tool", "trace_id": "trace"}
+        values[field] += "\udfff"
+        try:
+            result = tracker.record(
+                server=values["server"],
+                tool=values["tool"],
+                missing="missing",
+                trace_id=values["trace_id"],
+            )
+            assert result == f"Error: {field} must be a valid UTF-8 identifier"
+            assert "\udfff" not in result
+            assert tracker.get_stats()["total_feedback"] == 0
+        finally:
+            tracker.close()
+
     def test_invalid_kind_rejected(self, tmp_path: Path):
         tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
         try:
@@ -449,9 +498,7 @@ class TestCompressionFeedbackTracker:
         finally:
             tracker.close()
 
-    def test_get_tool_feedback_summary_splits_same_tool_name_across_servers(
-        self, tmp_path: Path
-    ):
+    def test_get_tool_feedback_summary_splits_same_tool_name_across_servers(self, tmp_path: Path):
         """Two upstreams exposing the same tool name must not pool feedback —
         the tuner keys per-server config recommendations off this aggregate."""
         tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")

@@ -116,6 +116,7 @@ from memtomem_stm.proxy.toolgraph_provider import (
     ToolgraphConsultError,
     ToolgraphProtocolError,
     ToolgraphUnreachableError,
+    validate_toolgraph_identifier,
 )
 from memtomem_stm.proxy.tool_relevance import (
     PENALTY_SOURCE_BOTH,
@@ -1256,6 +1257,13 @@ class ProxyManager:
         actually succeeded (not merely that it was wanted), so a transient
         ``rank_features`` failure is not cached as "no penalties".
         """
+        # Validate before the cache branch: a warm hit otherwise bypasses the
+        # provider's request validation and can diverge from the cold path.
+        validate_toolgraph_identifier(cfg.agent_id, "eligible_tools request agent")
+        validate_toolgraph_identifier(cfg.query_profile, "eligible_tools request profile")
+        for index, ref in enumerate(refs):
+            validate_toolgraph_identifier(ref, f"eligible_tools request candidates[{index}]")
+
         want_risk = cfg.risk_penalty_scale > 0.0
         cache = self._open_consult_cache(cfg)
         if cache is None:

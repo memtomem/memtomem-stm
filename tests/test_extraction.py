@@ -92,6 +92,24 @@ class TestParseFactsJson:
         assert facts[0].confidence == 0.5
         assert facts[0].tags == []
 
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_nested_json_content_is_scrubbed_at_ingest(self, surrogate):
+        raw = json.dumps(
+            [
+                {
+                    "content": f"fact{surrogate}",
+                    "category": f"cat{surrogate}",
+                    "tags": [f"tag{surrogate}"],
+                }
+            ]
+        )
+        fact = _parse_facts_json(raw, max_facts=1)[0]
+        literal = f"\\u{ord(surrogate):04x}"
+        assert fact.content == f"fact{literal}"
+        assert fact.category == f"cat{literal}"
+        assert fact.tags == [f"tag{literal}"]
+        fact.content.encode("utf-8")
+
 
 # ---------------------------------------------------------------------------
 # _extract_heuristic

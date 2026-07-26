@@ -14,9 +14,11 @@ import json
 import pytest
 
 from memtomem_stm.utils.json_out import (
+    IDENTITY_FIELD_NAMES,
     dumps,
     escape_lone_surrogates,
     has_lone_surrogate,
+    scrub_content_preserving_identity,
     scrub_lone_surrogates,
 )
 
@@ -262,3 +264,67 @@ class TestScrubLoneSurrogates:
 
         assert out["n"] == 1 and out["f"] == 1.5
         assert out["b"] is True and out["z"] is None
+
+
+class TestScrubContentPreservingIdentity:
+    """#783 — the ingest scrub must not rewrite the values it is asked to
+    keep injective. Escaping is many-to-one, so applying it to an identifier
+    merges two identities Core can mint separately; content has no such
+    requirement and keeps the ordinary escape."""
+
+    @pytest.mark.parametrize("key", sorted(IDENTITY_FIELD_NAMES))
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    def test_identity_values_arrive_raw(self, key, surrogate):
+        out = scrub_content_preserving_identity({key: f"m{surrogate}"})
+
+        assert out[key] == f"m{surrogate}"
+        assert has_lone_surrogate(out[key])
+
+    @pytest.mark.parametrize("key", sorted(IDENTITY_FIELD_NAMES))
+    def test_raw_and_literal_identity_stay_distinct(self, key):
+        """The whole point: blanket scrubbing collapsed these two onto the
+        literal, so a demotion/dedup/invalidation match landed on the wrong
+        memory. They must survive as different strings."""
+        raw = scrub_content_preserving_identity({key: "m\ud800"})[key]
+        literal = scrub_content_preserving_identity({key: r"m\ud800"})[key]
+
+        assert raw != literal
+        assert literal == r"m\ud800"
+
+    def test_content_beside_an_identity_is_still_escaped(self):
+        out = scrub_content_preserving_identity(
+            {"chunk_id": "m\ud800", "content": "c\ud800", "source": "s\ud800"}
+        )
+
+        assert out["chunk_id"] == "m\ud800"
+        assert out["content"] == r"c\ud800"
+        assert out["source"] == r"s\ud800"
+
+    def test_identity_exemption_applies_at_any_depth(self):
+        out = scrub_content_preserving_identity(
+            {"results": [{"nested": {"chunk_id": "m\ud800", "content": "c\ud800"}}]}
+        )
+        leaf = out["results"][0]["nested"]
+
+        assert leaf["chunk_id"] == "m\ud800"
+        assert leaf["content"] == r"c\ud800"
+
+    def test_non_identity_id_shaped_keys_are_still_escaped(self):
+        """``omitted_block_ids`` is joined into a rendered hint and is never
+        exact-matched, so it is content by destination."""
+        out = scrub_content_preserving_identity({"omitted_block_ids": ["b\ud800"]})
+
+        assert out["omitted_block_ids"] == [r"b\ud800"]
+
+    def test_unencodable_keys_are_still_escaped(self):
+        """An unencodable KEY is a malformed document, not an identity Core
+        meant to mint — and it would break the very next encode."""
+        out = scrub_content_preserving_identity({"k\ud800": {"id": "m\ud800"}})
+
+        assert list(out) == [r"k\ud800"]
+        json.dumps(out[r"k\ud800"]["id"], ensure_ascii=True).encode("utf-8")
+
+    def test_clean_tree_is_returned_unchanged(self):
+        tree = {"results": [{"chunk_id": "m1", "content": "c"}]}
+
+        assert scrub_content_preserving_identity(tree) is tree

@@ -217,6 +217,48 @@ class TestRecordPersistsNewFields:
         ).fetchone()
         assert row == (1, None, 5, 1, None)
 
+    @pytest.mark.parametrize(
+        "column",
+        ["error_message", "index_error", "extract_error", "surface_error"],
+    )
+    def test_diagnostic_content_is_escaped_before_sqlite_bind(self, store, column):
+        kwargs = {column: "diagnostic\ud800"}
+        store.record(
+            CallMetrics(
+                server="server",
+                tool="tool",
+                original_chars=1,
+                compressed_chars=1,
+                **kwargs,
+            )
+        )
+        value = store._db.execute(f"SELECT {column} FROM proxy_metrics").fetchone()[0]
+        assert value == r"diagnostic\ud800"
+        value.encode("utf-8")
+
+    @pytest.mark.parametrize(
+        "field",
+        ["server", "tool", "trace_id", "compression_strategy", "source"],
+    )
+    def test_unencodable_identifier_is_refused(self, store, field):
+        kwargs = {
+            "server": "server",
+            "tool": "tool",
+            "trace_id": "trace",
+            "compression_strategy": "truncate",
+            "source": "mcp",
+        }
+        kwargs[field] += "\ud800"
+        with pytest.raises(ValueError, match=rf"^{field} must be a valid UTF-8 identifier$"):
+            store.record(
+                CallMetrics(
+                    original_chars=1,
+                    compressed_chars=1,
+                    **kwargs,
+                )
+            )
+        assert store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0] == 0
+
     def test_index_failure_row(self, store):
         store.record(
             CallMetrics(
@@ -657,6 +699,33 @@ class TestReadCompressionSummary:
         assert summary["error_count"] == 0  # degraded, not crashed
         assert summary["total_original_chars"] == 100
         assert summary["saved_ratio"] == 0.6
+
+    @pytest.mark.parametrize("filter_field", ["tool", "source"])
+    def test_unencodable_filter_still_reports_pre_migration_schema(self, tmp_path, filter_field):
+        """Both empty-summary exits must describe the DB the same way.
+
+        ``schema_outdated`` is a property of the file, not of the filter — a
+        pre-migration DB is outdated whether the ``tool``/``source`` filter or
+        the pre-``source`` filter is what returned nothing.
+        """
+        db_path = tmp_path / "legacy.db"
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, tool TEXT, "
+            "original_chars INTEGER, compressed_chars INTEGER, "
+            "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+        )
+        db.commit()
+        db.close()
+
+        summary = read_compression_summary(db_path, **{filter_field: "t\ud800"})
+
+        assert summary["available"] is True
+        assert summary["schema_outdated"] is True
+        assert summary["total_calls"] == 0
+        # Baseline: the sibling pre-``source`` guard already agreed.
+        assert read_compression_summary(db_path, source="hook")["schema_outdated"] is True
 
     def test_unrelated_db_is_unavailable(self, tmp_path):
         db_path = tmp_path / "other.db"

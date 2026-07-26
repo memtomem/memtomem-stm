@@ -1633,6 +1633,52 @@ class TestProgressiveStats:
             store.close()
 
 
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+async def test_stats_tool_filters_return_serializable_identifier_errors(surrogate):
+    """Refused filters must not be echoed after a store returns empty stats."""
+    compression = MagicMock()
+    surfacing = MagicMock()
+    progressive = MagicMock()
+    ctx = _make_ctx(
+        compression_feedback_tracker=compression,
+        feedback_tracker=surfacing,
+        progressive_reads_tracker=progressive,
+    )
+
+    for handler in (
+        stm_compression_stats,
+        stm_surfacing_stats,
+        stm_progressive_stats,
+    ):
+        result = await handler(tool=f"tool{surrogate}", ctx=ctx)
+        assert result == "Error: tool must be a valid UTF-8 identifier"
+        assert surrogate not in result
+        result.encode("utf-8")
+
+    compression.get_stats.assert_not_called()
+    surfacing.get_stats.assert_not_called()
+    progressive.get_stats.assert_not_called()
+
+
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+async def test_surfacing_stats_invalid_since_repr_is_serializable_and_distinct(surrogate):
+    tracker = MagicMock()
+    raw_result = await stm_surfacing_stats(
+        since=f"invalid{surrogate}",
+        ctx=_make_ctx(feedback_tracker=tracker),
+    )
+    literal_result = await stm_surfacing_stats(
+        since=f"invalid\\u{ord(surrogate):04x}",
+        ctx=_make_ctx(feedback_tracker=tracker),
+    )
+    assert surrogate not in raw_result
+    assert "invalid 'since' timestamp" in raw_result
+    raw_result.encode("utf-8")
+    literal_result.encode("utf-8")
+    assert raw_result != literal_result
+    tracker.get_stats.assert_not_called()
+
+
 # ── stm_selection_stats ───────────────────────────────────────────────────
 
 

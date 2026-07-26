@@ -758,7 +758,7 @@ class SurfacingEngine:
     @staticmethod
     def _hashed_query(query: str) -> str:
         """Return the stable ``sha256:`` + 16-hex-char digest form of *query*."""
-        digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 
     def _active_min_score(self, tool: str, *, adjust_auto_tuner: bool) -> float:

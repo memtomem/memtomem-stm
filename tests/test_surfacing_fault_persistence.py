@@ -18,6 +18,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import pytest
+
 from memtomem_stm.cli.proxy import _render_surfacing_block
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -334,6 +336,30 @@ class TestSummaryFaults:
         columns = {row[1] for row in store._db.execute("PRAGMA table_info('surfacing_faults')")}
         assert "last_recovered_at" in columns
         store.close()
+
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
+    def test_refused_filter_still_reports_the_recovery_capability(self, tmp_path, surrogate):
+        """``diagnostics_recovery_supported`` describes the FILE, not the filter.
+
+        The unencodable-filter guard returns early, so probing the capability
+        after it would report a pre-``last_recovered_at`` DB as recovery-capable
+        purely because the filter matched nothing. Mirrors the ``schema_outdated``
+        placement rule in ``read_compression_summary``.
+        """
+        db_path = tmp_path / "legacy.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store._db.execute("ALTER TABLE surfacing_faults DROP COLUMN last_recovered_at")
+        store._db.commit()
+        store.close()
+
+        summary = read_surfacing_summary(db_path, tool=f"t{surrogate}")
+
+        assert summary["available"] is True
+        assert summary["diagnostics_recovery_supported"] is False
+        assert summary["events_total"] == 0
+        # Positive control: the unfiltered read already agreed.
+        assert read_surfacing_summary(db_path)["diagnostics_recovery_supported"] is False
 
     def test_summary_includes_recent_faults(self, tmp_path):
         db_path = tmp_path / "f.db"

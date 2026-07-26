@@ -6,7 +6,7 @@ every JSON emitter needs it: ``proxy``, ``mms_host``, ``mms_project``,
 ``proxy``, so the helper cannot live there without a cycle. The daemon and
 the proxy pipeline import it for the same reason.
 
-Two shapes of helper, for two different jobs (#761):
+The boundary policy has three distinct shapes (#761, #783):
 
 - :func:`dumps` for an emitter — a value we are *serializing now*, where the
   escape belongs in the emitted text and a consumer decodes it back.
@@ -15,6 +15,10 @@ Two shapes of helper, for two different jobs (#761):
   or Core, where the surrogate is escaped once on the way in so that every
   later encode (a ``TextContent`` serialization, a SQLite parameter, a
   fingerprint) is total without each of them having to know about this.
+- :func:`require_utf8_identifier` for an exact-match identifier — refuse the
+  value instead of non-injectively rewriting its identity. Digest-only inputs
+  use ``errors="surrogatepass"`` at their call site so hashing remains total
+  and injective without emitting invalid UTF-8.
 """
 
 from __future__ import annotations
@@ -163,6 +167,70 @@ def scrub_lone_surrogates(value: Any) -> Any:
     return value
 
 
+IDENTITY_FIELD_NAMES: frozenset[str] = frozenset({"id", "chunk_id", "block_id"})
+"""Keys under which Core nests a value that can become a chunk identity.
+
+Scoped to the names that actually reach ``chunk.id``, not every id-shaped key.
+``omitted_block_ids`` is joined into a rendered hint and Core's adjacent-context
+``id`` only crosses the daemon wire — neither is ever exact-matched, so both are
+content by destination and keep the ordinary escape. Matching is by key NAME at
+any depth, so an exempted name in a *new* nesting level arrives raw and its
+reader must decide refuse-or-escape explicitly; that is the safe direction to
+fail, but it is why the exemption list stays this short.
+"""
+
+
+def scrub_content_preserving_identity(
+    value: Any, identity_keys: frozenset[str] = IDENTITY_FIELD_NAMES
+) -> Any:
+    """:func:`scrub_lone_surrogates`, except identity values are left RAW.
+
+    Escaping is non-injective, so applying it to an identifier destroys the
+    thing an identifier is for: a raw ``\\ud800`` code unit and the six literal
+    characters ``\\ud800`` — two identities Core can legitimately mint
+    separately — both come out as the latter, and every later exact match
+    (feedback demotion, cross-session dedup, cache invalidation, the
+    ``increment_access`` boost) then acts on whichever arrived last (#783).
+
+    Content still gets escaped once at ingest exactly as before, so the
+    ``TextContent`` / SQLite / digest totality that #761 bought is unchanged.
+    Identity values instead arrive *unmodified*, which is what lets the
+    refusal boundaries downstream see the truth and decline. Callers that
+    assign an identity MUST therefore check it with :func:`has_lone_surrogate`
+    — the value they get here can be unencodable, which is the point.
+
+    Keys are scrubbed like ``scrub_lone_surrogates`` does; an unencodable
+    *key* is a malformed document, not an identity Core meant to mint.
+    """
+    if isinstance(value, str):
+        return escape_lone_surrogates(value)
+    if isinstance(value, dict):
+        replaced: dict[Any, Any] | None = None
+        for key, item in value.items():
+            new_key = escape_lone_surrogates(key) if isinstance(key, str) else key
+            if isinstance(key, str) and key in identity_keys:
+                new_item = item
+            else:
+                new_item = scrub_content_preserving_identity(item, identity_keys)
+            if new_key is not key or new_item is not item:
+                if replaced is None:
+                    replaced = dict(value)
+                if new_key is not key:
+                    del replaced[key]
+                replaced[new_key] = new_item
+        return replaced if replaced is not None else value
+    if isinstance(value, list):
+        replaced_seq2: list[Any] | None = None
+        for index, item in enumerate(value):
+            new_item = scrub_content_preserving_identity(item, identity_keys)
+            if new_item is not item:
+                if replaced_seq2 is None:
+                    replaced_seq2 = list(value)
+                replaced_seq2[index] = new_item
+        return replaced_seq2 if replaced_seq2 is not None else value
+    return value
+
+
 def unencodable_field(entry: object, path: str = "") -> str | None:
     """Path of the first string in *entry* that cannot encode, or ``None``.
 
@@ -213,3 +281,15 @@ def has_lone_surrogate(value: str) -> bool:
     deferred; a test pins all three.
     """
     return _LONE_SURROGATE.search(value) is not None
+
+
+def require_utf8_identifier(value: str | None, field: str) -> None:
+    """Raise a sanitized ``ValueError`` for an unencodable identifier.
+
+    Unlike content, identifiers participate in equality, cache keys, and
+    relational joins. Escaping one side would change that identity and can
+    make an exact-match safety decision disappear. ``field`` is a trusted
+    ASCII schema label; the offending value is deliberately never exposed.
+    """
+    if value is not None and has_lone_surrogate(value):
+        raise ValueError(f"{field} must be a valid UTF-8 identifier")

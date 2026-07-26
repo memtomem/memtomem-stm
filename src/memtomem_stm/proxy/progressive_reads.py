@@ -59,6 +59,8 @@ class ProgressiveReadsTracker:
                 served_to=initial_chars,
                 total_chars=total_chars,
             )
+        except ValueError:
+            logger.warning("progressive_reads record_initial refused invalid identifier")
         except Exception:
             logger.debug("progressive_reads record_initial failed", exc_info=True)
 
@@ -85,6 +87,8 @@ class ProgressiveReadsTracker:
                 served_to=offset + chars,
                 total_chars=total_chars,
             )
+        except ValueError:
+            logger.warning("progressive_reads record_follow_up refused invalid identifier")
         except Exception:
             logger.debug("progressive_reads record_follow_up failed", exc_info=True)
 

@@ -324,6 +324,112 @@ class TestToolgraphConsultAdapter:
         assert adapter.is_started is False
 
 
+class TestToolgraphIdentifierBoundary:
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
+    @pytest.mark.parametrize("field", ["agent", "profile", "candidate"])
+    async def test_request_identifier_is_refused_without_value_leak(self, field, surrogate):
+        adapter = _adapter()
+        kwargs = {"agent": "agent", "profile": "strict"}
+        candidates = ["s::tool"]
+        if field == "candidate":
+            candidates = [f"s::tool{surrogate}"]
+        else:
+            kwargs[field] += surrogate
+        with pytest.raises(ToolgraphProtocolError) as exc_info:
+            await adapter.eligible_tools(candidates, **kwargs)
+        assert surrogate not in str(exc_info.value)
+        assert "UTF-8-encodable identifier" in str(exc_info.value)
+
+    @pytest.mark.parametrize("wire_path", ["structured", "text"])
+    @pytest.mark.parametrize(
+        ("field_path", "mutate"),
+        [
+            ("agent", lambda verdict, value: verdict.__setitem__("agent", value)),
+            ("profile", lambda verdict, value: verdict.__setitem__("profile", value)),
+            ("eligible", lambda verdict, value: verdict["eligible"].append(value)),
+            (
+                "candidate",
+                lambda verdict, value: verdict["rejected"][0].__setitem__("candidate", value),
+            ),
+            (
+                "tool_key",
+                lambda verdict, value: verdict["rejected"][0].__setitem__("tool_key", value),
+            ),
+            (
+                "candidates",
+                lambda verdict, value: verdict["rejected"][0].__setitem__("candidates", [value]),
+            ),
+        ],
+    )
+    async def test_response_identifier_is_protocol_error_on_both_wire_paths(
+        self, wire_path, field_path, mutate
+    ):
+        adapter = _adapter()
+        verdict = {
+            "agent": "agent",
+            "profile": "strict",
+            "eligible": [],
+            "rejected": [
+                {
+                    "candidate": "s::tool",
+                    "tool_key": "s::tool",
+                    "reason": "NOT_GRANTED",
+                }
+            ],
+        }
+        mutate(verdict, "bad\ud800")
+        result = SimpleNamespace(
+            isError=False,
+            structuredContent=verdict if wire_path == "structured" else None,
+            content=(
+                []
+                if wire_path == "structured"
+                else [SimpleNamespace(type="text", text=json.dumps(verdict))]
+            ),
+        )
+        session = AsyncMock()
+        session.call_tool.return_value = result
+        adapter._session = session
+
+        with pytest.raises(ToolgraphProtocolError) as exc_info:
+            await adapter.eligible_tools(["s::tool"])
+        assert "\ud800" not in str(exc_info.value)
+        assert field_path in str(exc_info.value)
+
+    async def test_literal_surrogate_text_is_not_refused_or_rewritten(self):
+        literal = r"s::tool\ud800"
+        verdict = {
+            "agent": "agent",
+            "profile": "strict",
+            "eligible": [literal],
+            "rejected": [],
+        }
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=False,
+            structuredContent=verdict,
+            content=[],
+        )
+        adapter = _adapter()
+        adapter._session = session
+        assert await adapter.eligible_tools([literal]) is verdict
+
+    @pytest.mark.parametrize("field", ["candidate", "tool_key", "candidates"])
+    async def test_rank_feature_response_identifiers_are_refused(self, field):
+        row = {"candidate": "s::tool", "tool_key": "s::tool", "risk_score": 0.5}
+        row[field] = ["bad\udfff"] if field == "candidates" else "bad\udfff"
+        session = AsyncMock()
+        session.call_tool.return_value = SimpleNamespace(
+            isError=False,
+            structuredContent={"agent": "agent", "features": [row]},
+            content=[],
+        )
+        adapter = _adapter()
+        adapter._session = session
+        with pytest.raises(ToolgraphProtocolError):
+            await adapter.rank_features(["s::tool"])
+
+
 # ── manager startup: the provider is consulted, no longer inert ──────────────
 
 
@@ -483,6 +589,93 @@ class TestConsultCacheMaxScopesWiring:
 
 
 class TestToolgraphConsultWiring:
+    @pytest.mark.parametrize("consult_cache_enabled", [False, True])
+    async def test_unencodable_local_ref_is_a_protocol_error_cold_or_empty_cache(
+        self, tmp_path, consult_cache_enabled
+    ):
+        """Cold path only — with the cache enabled this still MISSES.
+
+        Deliberately not evidence for the manager's pre-cache validation: on a
+        miss the eventual full ``eligible_tools(refs)`` performs the same check
+        in the adapter, so this passes either way. The warm-hit case below is
+        what pins the manager copy.
+        """
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["bad\ud800"]},
+            on_protocol_error="open",
+            consult_cache_enabled=consult_cache_enabled,
+        )
+        try:
+            await mgr._consult_toolgraph()
+            status = mgr.get_toolgraph_status()
+            assert status["degraded"] is True
+            assert status["degraded_reason"] == REASON_TOOLGRAPH_PROTOCOL_ERROR
+            assert status["from_cache"] is False
+            assert status["external_reject_count"] == 0
+        finally:
+            await mgr.stop()
+
+    async def test_unencodable_local_ref_is_refused_on_a_warm_cache_hit(self, tmp_path):
+        """A seeded, matching row must NOT let the refusal be skipped.
+
+        Without the pre-cache validation in ``_run_consult`` the probe succeeds,
+        the scope hits, and STM comes up clean and un-degraded serving cached
+        rejects for a candidate set it cannot encode — while the same config
+        with the cache disabled raises. That divergence is the whole reason the
+        manager validates before the cache branch, and it is invisible to any
+        test that only ever misses.
+        """
+        bad_ref = "srv::bad\ud800"
+        mgr, _ = _tg_manager(
+            tmp_path,
+            servers={"srv": ["bad\ud800"]},
+            on_protocol_error="open",
+        )
+        cfg = mgr._config.toolgraph
+        cache = GraphConsultCache(tmp_path / "tg_consult.db")
+        cache.initialize()
+        try:
+            cache.put(
+                GraphConsultCache.provider_fingerprint(cfg),
+                cfg.agent_id,
+                cfg.query_profile,
+                GraphConsultCache.candidate_hash([bad_ref]),
+                11,  # the fake graph's generation, as the sibling tests assert
+                rejects={},
+                tool_not_found_refs=[],
+                risk_scores={},
+                had_risk_scores=True,
+            )
+        finally:
+            cache.close()
+        seeded = GraphConsultCache(tmp_path / "tg_consult.db")
+        seeded.initialize()
+        try:
+            # Positive control: the row really is a hit for this exact scope, so
+            # a passing assertion below cannot be an accidental miss.
+            assert (
+                seeded.get(
+                    GraphConsultCache.provider_fingerprint(cfg),
+                    cfg.agent_id,
+                    cfg.query_profile,
+                    GraphConsultCache.candidate_hash([bad_ref]),
+                    11,
+                )
+                is not None
+            )
+        finally:
+            seeded.close()
+
+        try:
+            await mgr._consult_toolgraph()
+            status = mgr.get_toolgraph_status()
+            assert status["degraded"] is True
+            assert status["degraded_reason"] == REASON_TOOLGRAPH_PROTOCOL_ERROR
+            assert status["from_cache"] is False
+        finally:
+            await mgr.stop()
+
     async def test_success_rejects_flow_into_exposure_and_telemetry(self, tmp_path):
         mgr, log = _tg_manager(tmp_path)  # tools: read_file, blocked
         await mgr._consult_toolgraph()

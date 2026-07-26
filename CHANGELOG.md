@@ -11,6 +11,28 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Behavior change**: Toolgraph identity-bearing request and verdict fields
+  that contain a lone surrogate are now refused as protocol errors under
+  `on_protocol_error`; they are never non-injectively escaped. That knob
+  defaults to `fail_start`, so an `eligible_tools` payload carrying one
+  refuses server startup rather than degrading — and the response check is
+  deliberately whole-payload, covering identity fields STM does not itself
+  read (`eligible`, `tool_key`). Set the knob to `open` or `closed` if you
+  would rather degrade than block on a provider you do not control. Request
+  validation runs before the consult cache branch, so cold and warm starts have
+  the same enforcement posture; because a cached row stores only the verdict's
+  raw facts, response-field identities cannot be revalidated from it, so rows
+  written before this policy are dropped and one full consult re-runs after
+  upgrade. Stored SQLite identifiers in compression feedback, metrics,
+  progressive-read telemetry, and surfacing feedback are likewise refused
+  rather than rewritten. (#788, fixes #783)
+- **Behavior change**: `mms stats --tool` now refuses a filter that is not
+  valid UTF-8 as a usage error (exit 2) instead of reporting an all-time zero
+  (`--json`) or dying with `UnicodeEncodeError` on the filter echo (human
+  form). (#788, fixes #783)
+
 ### Added
 
 - docs: record the ecosystem integration decision as ADR 0001 — per-boundary
@@ -18,6 +40,31 @@ changes inline only. See the deprecation policy in
   syncmill) instead of a generic adapter, plus a `docs/adr/` index and drift
   pins for the paths and claims the ADR makes. Stage ordering/status lives in
   the tracking issue (#789). (#790)
+
+### Fixed
+
+- Lone surrogates in SQLite-bound diagnostic/content fields and nested
+  extraction JSON are escaped once at ingest, while legacy surfacing memory-ID
+  JSON omits unencodable identifiers on display/stat reads without aliasing
+  them to an existing literal `\udxxx` ID. Query-only digest inputs in
+  surfacing cache keys, persisted query hashes, and tool-relevance telemetry
+  now hash with `surrogatepass`, preserving clean digest values and keeping a
+  raw surrogate distinct from its six-character literal twin. Observability
+  stats filters and surfacing-feedback identifiers are rejected at their
+  response boundary with sanitized, UTF-8-safe errors. (#788, fixes #783)
+- Negative-feedback counts now drop only the unencodable memory IDs instead of
+  the whole batch, so one bad ID no longer suppresses surfacing demotion for
+  the valid IDs beside it. A refused stats filter also keeps reporting the
+  schema-capability flags (`schema_outdated`,
+  `diagnostics_recovery_supported`) accurately: they describe the file, not the
+  filter. (#788, fixes #783)
+- Core memory IDs are no longer aliased at ingest. `_core_json_loads` scrubbed
+  the whole parsed payload, so a chunk ID core sent as a real lone surrogate
+  and one sent as the six literal characters `\ud800` arrived as the same
+  value — and the new identifier refusal, running after that rewrite, accepted
+  it. Content is still escaped at ingest, but `id` / `chunk_id` / `block_id`
+  now arrive unmodified and the search and context-compose parsers drop an item
+  whose ID they cannot encode. (#788, fixes #783)
 
 ## [0.1.43] — 2026-07-26
 

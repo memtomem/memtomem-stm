@@ -41,7 +41,7 @@ from memtomem_stm.surfacing.observability import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
-from memtomem_stm.utils.json_out import escape_lone_surrogates
+from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -1342,6 +1342,11 @@ async def stm_surfacing_stats(
                restricts to events whose ``created_at`` is >= this moment.
         limit: Tail size for the ``Recent`` section (default 10, 0 hides).
     """
+    try:
+        require_utf8_identifier(tool, "tool")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     app = _get_ctx(ctx)
     if app.feedback_tracker is None:
         return "Feedback tracking is not enabled."
@@ -1901,6 +1906,11 @@ async def stm_compression_stats(
     Args:
         tool: Optional filter by upstream tool name.
     """
+    try:
+        require_utf8_identifier(tool, "tool")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     app = _get_ctx(ctx)
     if app.compression_feedback_tracker is None:
         return "Compression feedback tracking is not enabled."
@@ -1960,6 +1970,11 @@ async def stm_progressive_stats(
     Args:
         tool: Optional filter by upstream tool name.
     """
+    try:
+        require_utf8_identifier(tool, "tool")
+    except ValueError as exc:
+        return f"Error: {exc}"
+
     app = _get_ctx(ctx)
 
     # Primary-store degradation (a failed PROGRESSIVE store path degrading to

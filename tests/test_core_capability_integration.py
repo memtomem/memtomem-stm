@@ -20,6 +20,7 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.mcp_client import (
     CompactResultParser,
+    StructuredResultParser,
     ContextComposeResult,
     LtmCapabilities,
     LtmTransportError,
@@ -1031,3 +1032,143 @@ class _StubCache:
 
     def clear(self, *, server=None, tool=None) -> int:
         return 0
+
+
+class TestCoreIdentityIsNotAliasedAtIngest:
+    """#783 — ``_core_json_loads`` used to scrub the WHOLE parsed payload, so a
+    chunk id core sent as a real lone surrogate and one sent as the six literal
+    characters ``\\ud800`` both reached the engine as the latter. The engine then
+    keyed feedback demotion, cross-session dedup, cache invalidation, persistence
+    and ``increment_access`` off that aliased value.
+    """
+
+    @staticmethod
+    def _compose_adapter(monkeypatch: pytest.MonkeyPatch, payload: dict):
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        adapter._capabilities = LtmCapabilities(context_compose_schema=3)
+        monkeypatch.setattr(adapter, "_heal_if_needed", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            adapter,
+            "_call_mem_do",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    isError=False,
+                    content=[SimpleNamespace(type="text", text=json.dumps(payload))],
+                )
+            ),
+        )
+        return adapter
+
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    def test_structured_search_keeps_raw_and_literal_ids_distinct(self, surrogate):
+        literal = f"m\\u{ord(surrogate):04x}"
+        text = json.dumps(
+            {
+                "results": [
+                    {"chunk_id": f"m{surrogate}", "content": "raw-id chunk"},
+                    {"chunk_id": literal, "content": "literal-id chunk"},
+                    {"chunk_id": "clean", "content": "clean chunk"},
+                ]
+            }
+        )
+
+        parsed, _hints = StructuredResultParser().parse(text)
+
+        # The unencodable id is refused with its whole result — never aliased
+        # onto the literal, and never silently downgraded to a content hash.
+        assert [r.chunk.id for r in parsed] == [literal, "clean"]
+        assert [r.chunk.content for r in parsed] == ["literal-id chunk", "clean chunk"]
+        for result in parsed:
+            result.chunk.id.encode("utf-8")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    async def test_compose_retrieved_drops_only_the_unencodable_item(
+        self, monkeypatch: pytest.MonkeyPatch, surrogate: str
+    ):
+        literal = f"m\\u{ord(surrogate):04x}"
+        adapter = self._compose_adapter(
+            monkeypatch,
+            {
+                "pinned": [],
+                "retrieved": [
+                    {"id": f"m{surrogate}", "content": "raw", "source": "a.md", "score": 0.9},
+                    {"id": literal, "content": "literal", "source": "b.md", "score": 0.8},
+                    {"id": "clean", "content": "clean", "source": "c.md", "score": 0.7},
+                ],
+            },
+        )
+
+        bundle = await adapter.context_compose("q")
+
+        assert bundle is not None
+        assert [r.chunk.id for r in bundle.retrieved] == [literal, "clean"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("surrogate", SURROGATES)
+    async def test_compose_pinned_drops_only_the_unencodable_item(
+        self, monkeypatch: pytest.MonkeyPatch, surrogate: str
+    ):
+        literal = f"b\\u{ord(surrogate):04x}"
+        adapter = self._compose_adapter(
+            monkeypatch,
+            {
+                "pinned": [
+                    {"block_id": f"b{surrogate}", "content": "raw"},
+                    {"block_id": literal, "content": "literal"},
+                ],
+                "retrieved": [],
+            },
+        )
+
+        bundle = await adapter.context_compose("q")
+
+        assert bundle is not None
+        assert [r.chunk.id for r in bundle.pinned] == [literal]
+
+    @pytest.mark.asyncio
+    async def test_compose_content_beside_a_refused_id_is_still_escaped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Content keeps the #761 ingest escape — only identity changed policy."""
+        adapter = self._compose_adapter(
+            monkeypatch,
+            {
+                "pinned": [],
+                "retrieved": [
+                    {"id": "clean", "content": "c\ud800", "source": "s\ud800", "score": 0.5}
+                ],
+            },
+        )
+
+        bundle = await adapter.context_compose("q")
+
+        assert bundle is not None
+        assert bundle.retrieved[0].chunk.content == r"c\ud800"
+        bundle.retrieved[0].chunk.content.encode("utf-8")
+
+    def test_adjacent_context_chunk_id_is_escaped_not_refused(self):
+        """An adjacent chunk's id is never exact-matched (the formatter reads
+        only ``content``, the daemon re-encodes it), so it is content by
+        destination and must not survive raw just because the key is ``id``."""
+        context = decode_context_compose_context(
+            {
+                "before": [
+                    {
+                        "id": "adj\ud800",
+                        "content": "before text",
+                        "source": "a.md",
+                        "namespace": "default",
+                    }
+                ],
+                "after": [],
+                "chunk_position": 1,
+                "total_chunks_in_file": 2,
+            },
+            max_content_chars=500,
+            context_window=2,
+        )
+
+        assert context is not None
+        assert context.window_before[0].id == r"adj\ud800"
+        context.window_before[0].id.encode("utf-8")

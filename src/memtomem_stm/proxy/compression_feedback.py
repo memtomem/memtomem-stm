@@ -19,6 +19,7 @@ from memtomem_stm.proxy.compression_feedback_store import (
     valid_kinds,
 )
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.utils.json_out import require_utf8_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,11 @@ class CompressionFeedbackTracker:
             return "Error: missing description is required"
         if not is_valid_kind(kind):
             return f"Error: kind must be one of {valid_kinds()}"
+        for field, value in (("server", server), ("tool", tool), ("trace_id", trace_id)):
+            try:
+                require_utf8_identifier(value, field)
+            except ValueError as exc:
+                return f"Error: {exc}"
 
         resolved_trace = trace_id
         if resolved_trace is None and self._metrics_store is not None:
@@ -87,7 +93,11 @@ class CompressionFeedbackTracker:
                 logger.debug("trace_id lookup failed", exc_info=True)
                 resolved_trace = None
 
-        self._store.record(server, tool, kind, missing, resolved_trace)
+        try:
+            require_utf8_identifier(resolved_trace, "trace_id")
+            self._store.record(server, tool, kind, missing, resolved_trace)
+        except ValueError as exc:
+            return f"Error: {exc}"
 
         if resolved_trace is not None:
             return f"Compression feedback recorded ({kind}, trace_id={resolved_trace})"

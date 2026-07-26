@@ -555,7 +555,18 @@ cannot produce a usable verdict:
   returns an incompatible, untyped, unknown, or malformed error response.
   Legacy Toolgraph versions do not declare backend availability separately,
   so their backend failures still surface here and fail startup by default.
-  STM never classifies errors by matching message text.
+  STM never classifies errors by matching message text. Toolgraph agent,
+  profile, candidate, and verdict refs are exact-match identifiers: if one
+  contains a lone surrogate that cannot encode to UTF-8, STM treats it as a
+  protocol error under this knob. It never escapes or rewrites the identifier,
+  and validates it before both cold and cached consult paths. The response
+  check is deliberately whole-payload: every identity-bearing field is
+  validated, including ones this STM version does not itself read (`eligible`,
+  `tool_key`). An unencodable identifier anywhere in the verdict is evidence
+  the provider is emitting identities STM cannot round-trip, and a field that
+  is unread today becomes load-bearing on the next schema. Under this knob's
+  `fail_start` default that refuses startup — set it to `open` or `closed` if
+  you would rather degrade than block on a provider you do not control.
 - **`on_tool_not_found`** (`open` default) — a specific candidate was never
   crawled (the graph's blind spot). `open` keeps the working tool advertised;
   `closed` rejects uncrawled candidates.

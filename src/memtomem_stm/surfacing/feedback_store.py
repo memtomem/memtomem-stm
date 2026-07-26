@@ -11,6 +11,11 @@ import time
 from pathlib import Path
 from typing import TypedDict
 
+from memtomem_stm.utils.json_out import (
+    escape_lone_surrogates,
+    has_lone_surrogate,
+    require_utf8_identifier,
+)
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -41,6 +46,35 @@ Prefix-only matching would misclassify legitimate raw queries that
 happen to start with ``sha256:`` — e.g. a user-typed checksum search —
 and bypass the 80-char preview clip, leaking unbounded user-derived
 text. ``re.fullmatch`` against this pattern is the gate."""
+
+
+def _load_safe_memory_ids(raw: object) -> list[str]:
+    """Decode identity-bearing JSON without rewriting legacy bad IDs."""
+    if not isinstance(raw, (str, bytes, bytearray)):
+        return []
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str) and not has_lone_surrogate(value)]
+
+
+def _load_numeric_scores(raw: object) -> list[int | float]:
+    """Decode only the numeric score leaves this store can safely expose."""
+    if not isinstance(raw, (str, bytes, bytearray)):
+        return []
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return [
+        value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS surfacing_events (
@@ -319,6 +353,25 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         if "surfacing_events" not in tables:
             return summary
 
+        # Schema-capability probe, hoisted above every empty-result early return:
+        # ``diagnostics_recovery_supported`` describes the FILE, not the filter,
+        # so a refused filter must not report a pre-``last_recovered_at`` DB as
+        # recovery-capable. Same placement rule as ``schema_outdated`` in
+        # ``read_compression_summary``.
+        fault_columns: set[str] = set()
+        if "surfacing_faults" in tables:
+            fault_columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
+            }
+            summary["diagnostics_recovery_supported"] = "last_recovered_at" in fault_columns
+
+        if tool is not None and has_lone_surrogate(tool):
+            # Cannot be bound as a SQLite parameter and can never match a stored
+            # row, so report empty-but-available rather than raising.
+            summary["available"] = True
+            return summary
+
         params: list[object] = []
         where = ""
         if tool is not None:
@@ -378,10 +431,6 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             summary["diagnostics"] = {row[0]: row[1] for row in diagnostic_rows}
             summary["diagnostics_last_at"] = max((row[2] for row in diagnostic_rows), default=None)
             summary["diagnostics_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
-            fault_columns = {
-                str(row[1])
-                for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
-            }
             if "last_recovered_at" in fault_columns:
                 kind_placeholders = ", ".join("?" for _ in DIAGNOSTIC_KINDS)
                 active_where = fault_where + f" AND kind IN ({kind_placeholders})"
@@ -393,8 +442,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
                     [*fault_params, *sorted(DIAGNOSTIC_KINDS)],
                 ).fetchall()
                 summary["active_diagnostics"] = {row[0]: row[1] for row in active_rows}
-            else:
-                summary["diagnostics_recovery_supported"] = False
+            # No ``else``: ``diagnostics_recovery_supported`` was already set from
+            # ``fault_columns`` above, before any early return could skip it.
 
         summary["available"] = True
     except sqlite3.Error as exc:
@@ -467,6 +516,13 @@ class FeedbackStore:
     ) -> None:
         if self._db is None:
             return
+        require_utf8_identifier(surfacing_id, "surfacing_id")
+        require_utf8_identifier(server, "server")
+        require_utf8_identifier(tool, "tool")
+        for index, memory_id in enumerate(memory_ids):
+            require_utf8_identifier(memory_id, f"memory_ids[{index}]")
+        safe_query = escape_lone_surrogates(query)
+        safe_score_scale = escape_lone_surrogates(score_scale) if score_scale is not None else None
         with self._lock:
             self._db.execute(
                 "INSERT OR IGNORE INTO surfacing_events "
@@ -476,11 +532,11 @@ class FeedbackStore:
                     surfacing_id,
                     server,
                     tool,
-                    query,
+                    safe_query,
                     json.dumps(memory_ids),
                     json.dumps(scores),
                     time.time(),
-                    score_scale,
+                    safe_score_scale,
                 ),
             )
             self._db.commit()
@@ -514,6 +570,8 @@ class FeedbackStore:
         """Mark all existing rows for one diagnostic episode as recovered."""
         if self._db is None or kind not in DIAGNOSTIC_KINDS:
             return
+        if has_lone_surrogate(server) or has_lone_surrogate(tool):
+            return
         now = time.time()
         with self._lock:
             self._db.execute(
@@ -533,6 +591,8 @@ class FeedbackStore:
         reset_recovery: bool = False,
     ) -> None:
         if self._db is None or kind not in allowed_kinds:
+            return
+        if has_lone_surrogate(server) or has_lone_surrogate(tool):
             return
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
@@ -570,6 +630,10 @@ class FeedbackStore:
     ) -> bool:
         if self._db is None:
             return False
+        if has_lone_surrogate(surfacing_id):
+            return False
+        if memory_id is not None and has_lone_surrogate(memory_id):
+            return False
         with self._lock:
             # Verify surfacing event exists
             event = self._db.execute(
@@ -594,17 +658,14 @@ class FeedbackStore:
 
     def get_memory_ids_for_surfacing(self, surfacing_id: str) -> list[str]:
         """Return memory_ids from a surfacing event."""
-        if self._db is None:
+        if self._db is None or has_lone_surrogate(surfacing_id):
             return []
         row = self._db.execute(
             "SELECT memory_ids FROM surfacing_events WHERE id = ?", (surfacing_id,)
         ).fetchone()
         if not row:
             return []
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            return []
+        return _load_safe_memory_ids(row[0])
 
     def get_feedback_count(self, tool: str | None = None) -> int:
         """Return the durable feedback watermark for auto-tuning."""
@@ -613,6 +674,8 @@ class FeedbackStore:
         if tool is None:
             row = self._db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()
         else:
+            if has_lone_surrogate(tool):
+                return 0
             row = self._db.execute(
                 "SELECT COUNT(*) FROM surfacing_feedback f "
                 "JOIN surfacing_events e ON e.id = f.surfacing_id WHERE e.tool = ?",
@@ -633,7 +696,22 @@ class FeedbackStore:
         if self._db is None or not memory_ids:
             return {}
 
-        target_ids = list(dict.fromkeys(str(mid) for mid in memory_ids))
+        # Drop the unencodable ids, not the batch. They cannot be bound as
+        # SQLite parameters, but they also cannot match a stored row — the
+        # write paths refuse them — so their count is known to be 0 without
+        # asking. Failing the whole call instead would answer 0 for every
+        # *valid* id too, and the caller reads that as "nothing has enough
+        # negatives": a memory the agent rated ``not_relevant`` past the
+        # threshold would resurface for as long as one bad id rode along in
+        # the same candidate set. Same leaf-filtering shape as
+        # ``_load_safe_memory_ids``.
+        target_ids = [
+            mid
+            for mid in dict.fromkeys(str(mid) for mid in memory_ids)
+            if not has_lone_surrogate(mid)
+        ]
+        if not target_ids:
+            return {}
         event_ids_by_memory: dict[str, set[str]] = {mid: set() for mid in target_ids}
         target_set = set(target_ids)
 
@@ -677,7 +755,7 @@ class FeedbackStore:
         in-memory invalidation set against ``SurfacingCache`` entries.
         Returns ``None`` if the event does not exist.
         """
-        if self._db is None:
+        if self._db is None or has_lone_surrogate(surfacing_id):
             return None
         row = self._db.execute(
             "SELECT server, tool, memory_ids FROM surfacing_events WHERE id = ?",
@@ -694,6 +772,8 @@ class FeedbackStore:
     def get_tool_feedback_summary(self, tool: str | None = None) -> dict:
         """Get feedback summary, optionally filtered by tool."""
         if self._db is None:
+            return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
+        if tool is not None and has_lone_surrogate(tool):
             return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
 
         if tool:
@@ -755,6 +835,8 @@ class FeedbackStore:
         }
         if self._db is None:
             return empty
+        if tool is not None and has_lone_surrogate(tool):
+            return empty
 
         event_filters: list[str] = []
         event_params: list[object] = []
@@ -806,28 +888,20 @@ class FeedbackStore:
         # "unknown" so the distribution always sums to events_total.
         score_scale_distribution: dict[str, int] = {}
         for tool_name, memory_ids_json, scores_json, score_scale in rows:
-            scale_key = score_scale if isinstance(score_scale, str) and score_scale else "unknown"
+            scale_key = (
+                escape_lone_surrogates(score_scale)
+                if isinstance(score_scale, str) and score_scale
+                else "unknown"
+            )
             score_scale_distribution[scale_key] = score_scale_distribution.get(scale_key, 0) + 1
-            try:
-                ids = json.loads(memory_ids_json)
-                n = len(ids) if isinstance(ids, list) else 0
-            except (json.JSONDecodeError, TypeError):
-                n = 0
+            n = len(_load_safe_memory_ids(memory_ids_json))
             bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
             bucket["events"] += 1
             bucket["sum_memory_count"] += n
-            try:
-                scores = json.loads(scores_json)
-            except (json.JSONDecodeError, TypeError):
-                scores = []
-            if isinstance(scores, list):
-                for s in scores:
-                    # bool is an int subclass — a corrupt ``true`` in the
-                    # JSON must not masquerade as score 1.0.
-                    if isinstance(s, (int, float)) and not isinstance(s, bool):
-                        score_count += 1
-                        score_min = s if score_min is None else min(score_min, s)
-                        score_max = s if score_max is None else max(score_max, s)
+            for score in _load_numeric_scores(scores_json):
+                score_count += 1
+                score_min = score if score_min is None else min(score_min, score)
+                score_max = score if score_max is None else max(score_max, score)
 
         # Per-tool feedback counts (total + negative) within the same
         # event filter. Powers the AutoTuner readiness signal: with these
@@ -890,14 +964,8 @@ class FeedbackStore:
                 [*event_params, limit],
             ).fetchall()
             for ts, tool_name, query, memory_ids_json, scores_json, score_scale in recent_rows:
-                try:
-                    memory_ids = json.loads(memory_ids_json)
-                except (json.JSONDecodeError, TypeError):
-                    memory_ids = []
-                try:
-                    scores = json.loads(scores_json)
-                except (json.JSONDecodeError, TypeError):
-                    scores = []
+                memory_ids = _load_safe_memory_ids(memory_ids_json)
+                scores = _load_numeric_scores(scores_json)
                 # #352 part 2: ``query`` is now nullable.
                 # ``cleanup_expired_queries`` clears the column on rows
                 # older than ``query_retention_days`` while preserving
@@ -918,7 +986,8 @@ class FeedbackStore:
                 elif _HASHED_QUERY_RE.fullmatch(query):
                     preview = query
                 else:
-                    preview = query if len(query) <= 80 else query[:77] + "..."
+                    safe_query = escape_lone_surrogates(query)
+                    preview = safe_query if len(safe_query) <= 80 else safe_query[:77] + "..."
                 recent.append(
                     {
                         "ts": ts,
@@ -926,7 +995,11 @@ class FeedbackStore:
                         "query_preview": preview,
                         "memory_ids": memory_ids,
                         "scores": scores,
-                        "score_scale": score_scale,
+                        "score_scale": (
+                            escape_lone_surrogates(score_scale)
+                            if isinstance(score_scale, str)
+                            else score_scale
+                        ),
                     }
                 )
 
@@ -948,6 +1021,8 @@ class FeedbackStore:
         """Record memory IDs as surfaced for cross-session dedup."""
         if self._db is None or not memory_ids:
             return
+        for index, memory_id in enumerate(memory_ids):
+            require_utf8_identifier(memory_id, f"memory_ids[{index}]")
         now = time.time()
         with self._lock:
             for mid in memory_ids:
@@ -1042,6 +1117,8 @@ class FeedbackStore:
         scale_pred = "(e.score_scale IS NULL OR e.score_scale = 'rrf')"
         if self._db is None:
             return None
+        if tool is not None and has_lone_surrogate(tool):
+            return None
 
         placeholders = ", ".join("?" for _ in ratings)
         if tool is not None:
@@ -1121,6 +1198,7 @@ class FeedbackStore:
         """Upsert one per-tool min_score adjustment."""
         if self._db is None:
             return
+        require_utf8_identifier(tool, "tool")
         with self._lock:
             self._db.execute(
                 "INSERT INTO auto_tune_adjustments (tool, min_score, updated_at) "
