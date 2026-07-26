@@ -37,16 +37,19 @@ _REGISTRY_EMPTY_MSG = (
 
 
 def _show_no_marker_no_git_text(cwd: Path) -> str:
+    # A path is as unvalidated as argv: on POSIX a byte that is not valid UTF-8
+    # decodes with ``surrogateescape``, so a directory name alone is enough to
+    # put a lone surrogate here — no hostile config required (#780).
     return (
-        f"No project marker (.mms/project.toml) or git repo found at {cwd}.\n"
-        f"Cwd-fallback project: '{cwd.name}' (anonymous, not registered).\n"
+        f"No project marker (.mms/project.toml) or git repo found at {_disp(str(cwd))}.\n"
+        f"Cwd-fallback project: '{_disp(cwd.name)}' (anonymous, not registered).\n"
         f"  Run `mms project init` here to create .mms/project.toml.\n"
     )
 
 
 def _show_git_no_marker_text(root: Path) -> str:
     return (
-        f"Detected via git: {root}\n"
+        f"Detected via git: {_disp(str(root))}\n"
         f"No project marker (.mms/project.toml) yet.\n"
         f"  Run `mms project init` here to create one.\n"
     )

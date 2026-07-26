@@ -2095,3 +2095,64 @@ class TestDisplayEscaping:
 
         assert "Proceed?" in res.output, res.output
         self._assert_no_raw_hostile(res.output)
+
+
+class TestRestampDiffEscapesEveryDisplayedField:
+    """The fields beside the name were left raw by the #760 sweep (#780).
+
+    ``_format_server_diff_lines`` escaped the name and the ``Source:`` line but
+    interpolated ``command`` and the env keys verbatim in all three branches.
+    Those come from a host config with no character validation, and the lines
+    reach ``sync --plan`` *and* the ``--apply`` confirmation prompt — the one
+    that authorizes removing registry entries.
+
+    ``args`` is deliberately left to ``list.__repr__``, which already escapes
+    every character ``_disp`` does — verified over all 1,114,112 code points.
+    Routing it through ``_disp`` as well would only double-escape.
+    """
+
+    HOSTILE = "ev\x1b[31m\ril"
+
+    def _row(self, *, shape: str):
+        """``shape`` selects which of the three render branches is taken."""
+        from memtomem_stm.mms import state
+
+        old = state.RegistryServer(
+            command=self.HOSTILE,
+            args=[self.HOSTILE],
+            env={self.HOSTILE: "v"},
+            prefix="p",
+        )
+        if shape == "identical":
+            new = old
+        elif shape == "env_values_only":
+            # Same command/args/env KEYS, different env value — the collapsed
+            # middle branch, which the two-case version of this test skipped.
+            new = state.RegistryServer(
+                command=self.HOSTILE,
+                args=[self.HOSTILE],
+                env={self.HOSTILE: "v2"},
+                prefix="p",
+            )
+        else:
+            new = state.RegistryServer(
+                command=self.HOSTILE + "2",
+                args=[self.HOSTILE + "2"],
+                env={self.HOSTILE + "2": "v"},
+                prefix="p",
+            )
+        return {
+            "name": "srv",
+            "_old_server": old,
+            "_new_server": new,
+            "_new_source_label": "Claude Code (user)",
+        }
+
+    @pytest.mark.parametrize("shape", ["identical", "env_values_only", "differs"])
+    def test_no_branch_renders_a_raw_control_character(self, shape: str):
+        from memtomem_stm.cli.mms_host import _format_server_diff_lines
+
+        out = "\n".join(_format_server_diff_lines(self._row(shape=shape)))
+
+        assert "\x1b" not in out and "\r" not in out
+        assert "\\u001B" in out and "\\u000D" in out

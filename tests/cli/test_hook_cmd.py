@@ -1134,3 +1134,96 @@ class TestEmitHookChangeDisplayEscaping:
         assert "Backed up" in out
         assert "\x1b" not in out
         assert "\r" not in out
+
+
+class TestHookPreviewAndErrorsEscape:
+    """``rendered_block`` and every ``HookInstallError`` reach the terminal (#780).
+
+    The block embeds the source-checkout command, so a path with a hostile
+    character renders in all four previews. The errors interpolate a config
+    path and a parser's own text; they are escaped at the two ``ClickException``
+    sites rather than at all seven raises, so future messages are covered too.
+    """
+
+    HOSTILE = "ho\x1b[31m\rst"
+
+    def test_preview_keeps_its_line_structure(self, tmp_path, monkeypatch, capsys):
+        """Escaping must not flatten the preview (#780).
+
+        ``_disp`` escapes the newline itself, so escaping the whole block
+        before ``splitlines()`` collapsed a real multi-line preview into one
+        line of ``\\u000A``. Driven off an actual ``plan_install`` rather than a
+        synthetic one-line block, which is what let the first version of this
+        test miss the regression.
+        """
+        from memtomem_stm.cli import hook_cmd, hook_hosts
+
+        # ``CLAUDE_CONFIG_DIR``, not ``HOME``: ``_config_path`` prefers that
+        # override, and its fallback is ``expanduser()``, which reads
+        # ``USERPROFILE`` on Windows. Patching ``HOME`` alone leaves this
+        # reading the developer's real settings on Windows, and on any
+        # platform where ``CLAUDE_CONFIG_DIR`` is exported — where an already
+        # installed hook makes the plan unchanged and skips the preview.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        change = hook_hosts.plan_install("claude", "uv run memtomem-stm hook")
+        expected = len(change.rendered_block.splitlines())
+        assert expected > 1, "fixture must be multi-line to pin anything"
+
+        hook_cmd._emit_hook_change(change, apply_=False, backup=None)
+        out = capsys.readouterr().out
+
+        rendered = [line for line in out.splitlines() if line.startswith("    ")]
+        assert len(rendered) == expected
+        assert "\\u000A" not in out
+
+    def test_preview_escapes_the_rendered_block(self, capsys):
+        from memtomem_stm.cli import hook_cmd
+        from memtomem_stm.cli.hook_hosts import HookChange
+
+        change = HookChange(
+            host_tag="claude",
+            label="Claude Code",
+            path=Path("/tmp/settings.json"),
+            fmt="json",
+            action="install",
+            status="create",
+            changed=True,
+            current_text=None,
+            new_text="{}",
+            rendered_block=f'{{"command": "{self.HOSTILE}"}}',
+            notes=(),
+        )
+
+        hook_cmd._emit_hook_change(change, apply_=False, backup=None)
+
+        out = capsys.readouterr().out
+        assert "\x1b" not in out and "\r" not in out
+        assert "\\u001B" in out and "\\u000D" in out
+
+    @pytest.mark.parametrize(
+        ("subcommand", "planner"), [("install", "plan_install"), ("uninstall", "plan_uninstall")]
+    )
+    def test_error_is_escaped_at_both_click_boundaries(
+        self, tmp_path, monkeypatch, subcommand: str, planner: str
+    ):
+        """Every ``HookInstallError`` becomes terminal text at a choke point.
+
+        Both boundaries are exercised: reverting either one alone survived a
+        test that covered only ``install``.
+        """
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import hook_cmd, hook_hosts
+        from memtomem_stm.cli.hook_hosts import HookInstallError
+
+        def boom(*a, **k):
+            raise HookInstallError(f"cannot read /tmp/{self.HOSTILE}/settings.json")
+
+        # ``hook_cmd`` imports ``hook_hosts`` inside the command body, so the
+        # patch has to land on the source module, not on a module attribute.
+        monkeypatch.setattr(hook_hosts, planner, boom)
+        res = CliRunner().invoke(hook_cmd.hook_command, [subcommand, "--host", "claude"])
+
+        assert res.exit_code != 0
+        assert "\x1b" not in res.output and "\r" not in res.output
+        assert "\\u001B" in res.output and "\\u000D" in res.output

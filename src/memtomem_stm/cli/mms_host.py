@@ -585,15 +585,19 @@ def _format_env_keys_redacted(server: state.RegistryServer) -> str:
     """
     if not server.env:
         return "{}"
-    return "{" + ", ".join(sorted(server.env.keys())) + "}"
+    # Escaped here rather than at the call sites: this is the only renderer of
+    # these keys, and they come verbatim from a host config. Redaction still
+    # decides what is shown — escaping only decides how it renders (#780).
+    return "{" + ", ".join(_disp(k) for k in sorted(server.env.keys())) + "}"
 
 
 def _format_server_diff_lines(row: dict) -> list[str]:
     """Render Old/New shape for one re-stamp entry.
 
     Identical fields collapse to a single line so the prompt stays
-    readable. Env values are redacted (key set only); ``command`` and
-    ``args`` render verbatim. ``row`` carries the in-process keys
+    readable. Env values are redacted (key set only). ``command`` and the
+    env keys are display-escaped; ``args`` is left to ``list.__repr__``,
+    which already escapes the same class of character (#780). ``row`` carries the in-process keys
     ``_old_server`` and ``_new_server`` (excluded from the JSON
     payload — see ``sync_cmd``).
     """
@@ -613,7 +617,7 @@ def _format_server_diff_lines(row: dict) -> list[str]:
         # Fall through to a single-line "unchanged surface" note —
         # users can still re-stamp (e.g. drift_hash_version bump).
         lines.append(
-            f"    command={new.command}  args={list(new.args or [])}  "
+            f"    command={_disp(new.command)}  args={list(new.args or [])}  "
             f"env={_format_env_keys_redacted(new)}"
         )
     elif same_command and same_args and same_env_keys:
@@ -624,17 +628,17 @@ def _format_server_diff_lines(row: dict) -> list[str]:
         # note. User has informed consent that *something* changed,
         # without leaking secrets.
         lines.append(
-            f"    command={new.command}  args={list(new.args or [])}  "
+            f"    command={_disp(new.command)}  args={list(new.args or [])}  "
             f"env={_format_env_keys_redacted(new)}"
         )
         lines.append("    (env values redacted; values changed)")
     else:
         lines.append(
-            f"    Old: command={old.command}  args={list(old.args or [])}  "
+            f"    Old: command={_disp(old.command)}  args={list(old.args or [])}  "
             f"env={_format_env_keys_redacted(old)}"
         )
         lines.append(
-            f"    New: command={new.command}  args={list(new.args or [])}  "
+            f"    New: command={_disp(new.command)}  args={list(new.args or [])}  "
             f"env={_format_env_keys_redacted(new)}"
         )
     lines.append(f"    Source: {_disp(new_source)}")
