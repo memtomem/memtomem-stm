@@ -11,6 +11,51 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.43] — 2026-07-25
+
+### Upgrade notes
+
+- The `# copy/paste hint unavailable: …` diagnostic now reads `a value contains
+  characters that cannot be displayed safely` rather than `a value contains
+  line-break or NUL characters`, and stands in for a command whose values carry
+  any terminal-hostile character, not only CR/LF/NUL. (#756)
+- The JSON snippet printed by `mms register --mcp skip` now renders a
+  terminal-hostile character in the interpolated `command` escaped, so the
+  snippet is copy-pasteable where it previously carried the raw value. The
+  server key beside it is the constant `memtomem-stm` and never carried one.
+  `command` now goes through `json.dumps`, which is `ensure_ascii=True`, so
+  **every** non-ASCII character in it — CJK, emoji, accented paths — renders as
+  a `\uXXXX` escape where 0.1.42 emitted it literally. The snippet still parses
+  to the same string. (#759)
+- A multi-line message from a host client's CLI now renders as one escaped line
+  in `mms eject`'s and `mms prune`'s failure lists, where it previously wrapped
+  across several. (#759)
+- `mms add <name>` now exits 1 with an `invalid_name` error — under `--json`
+  too — for a name that is not valid UTF-8, where 0.1.42 aborted with an
+  `UnicodeEncodeError` traceback having written nothing. The refusal is about
+  encodability, not display: it covers a lone surrogate, not every
+  terminal-hostile character. The same refusal applies to the other commands
+  that create an upstream server. (#758)
+- Across `mms import`, `mms host`, `mms project`, `mms config validate` and
+  `mms hook`, a displayed value carrying a terminal-hostile character now
+  renders escaped rather than raw, and the aligned tables pad by the displayed
+  width. Values with nothing to escape render byte-identically, except
+  `mms project disable`'s no-op line, which now lists MCP names as
+  `none of a, b` instead of the Python list repr `none of ['a', 'b']`.
+  Coverage is the sites listed in the entry below, not these commands
+  wholesale; the rest is closed further down this section by #785, which
+  extends the same escaping to the re-stamp diff's `command` and env keys,
+  `mms project show`'s no-marker branches, and `mms hook`'s preview and errors.
+  (#769, #770, #771, #772, #785)
+- Proxied content is now modified in one case: a lone surrogate in an upstream
+  response is delivered as its escaped `\udxxx` literal rather than failing the
+  response that carries it. Clean responses are byte-identical. (#773)
+- `stm_memory_propose`'s `max_content_chars` and the 512/256 limits on
+  `source_ref` and `idempotency_key` now measure the *escaped* form, so a value
+  packed with lone surrogates can be refused where its raw length fit, under
+  that field's own reason — `content_too_large`, `source_ref_too_large` or
+  `idempotency_key_too_large`. Payloads with no surrogate are unaffected. (#778)
+
 ### Fixed
 
 - Terminal-hostile characters in a config-derived server name, source label or
@@ -18,7 +63,8 @@ changes inline only. See the deprecation policy in
   cannot be rendered or can rewrite the rendered line — control characters
   such as ESC, the line separators, and the bidirectional controls, among
   others. Its single authoritative definition is the `_disp_escapes`
-  predicate in `cli/proxy.py`, whose docstring enumerates the members and
+  predicate — moved to `cli/_display.py` by #768 later in this release, and
+  re-exported from `cli/proxy.py` — whose docstring enumerates the members and
   the reason each is in; read that rather than this sentence for the exact
   membership. Preserved: everything else, so CJK, emoji, ZWJ sequences and
   the plain LRM/RLM marks render as before, and a value with nothing to
@@ -138,6 +184,38 @@ changes inline only. See the deprecation policy in
   renders as one escaped line in `mms eject`'s and `mms prune`'s failure
   lists, where it previously wrapped across several.
   (#759, fixes #755)
+- The same display escaping now reaches the CLI surfaces the earlier sweeps
+  left, closing the sites #760 enumerates plus several they do not name. By
+  command: `mms import`'s plan listing (candidate name, source label, command,
+  the conflict line's `reason`, and the env summary — escaped inside
+  `_format_env_summary`, so `mms host sync` is covered by the same change, and
+  after redaction on the default path — `--show-imported` remains an explicit
+  opt-in that displays real values, escaped but not redacted);
+  `mms host`'s `status` and `scan` tables, every `sync --plan` bucket, the
+  re-stamp diff's name and `Source:` lines, and the `--apply` confirmation
+  prompt; `mms project`'s six echo sites, its marker-backed `show` output, its
+  tab-separated `list`, and eleven error messages;
+  and `mms config validate` and `mms hook`, covering each error, unknown key and
+  warning, the hook change path and the backup path on both apply branches.
+  Column-aligned surfaces pad by the *displayed* width, so an escaped value no
+  longer offsets the columns after it.
+  Two of these are more than cosmetic. The `mms host sync --apply` prompt
+  authorizes removing registry entries, and a CR in a name overwrites the
+  rendered `[y/N]` the user is answering. And `mms project enable` / `show NAME`
+  echo a name straight from argv, where POSIX `surrogateescape` decoding
+  produces a lone surrogate with nothing hostile on disk at all — so the *error*
+  prose is the first place such a value renders.
+  Values this package writes itself stay raw, as do the `--json` legs, which are
+  pinned by tests.
+  Not covered by this sweep, and closed further down this section: the
+  re-stamp diff's `command` and env-key fields, the two `mms project show`
+  fallback branches, and `mms hook`'s preview and error messages.
+  **Behavior change**: on these surfaces a value carrying a terminal-hostile
+  character now renders as its `\uXXXX` escape rather than raw, and the
+  aligned tables pad by that displayed width. A value with nothing to escape
+  renders byte-identically, with one exception: `mms project disable`'s no-op
+  line now lists the MCP names as `none of a, b` rather than the Python list
+  repr `none of ['a', 'b']`. (#769, #770, #771, #772, issue #760)
 - A lone surrogate in a config no longer crashes the CLI's JSON output after
   the write it was reporting. `json.dumps(..., ensure_ascii=False)` — which
   keeps CJK and emoji readable — leaves such a code unit raw in the string it
@@ -209,7 +287,7 @@ changes inline only. See the deprecation policy in
   payloads have had since #758. It stays a fingerprint: distinct env values
   still produce distinct digests, so two configs cannot collapse onto one
   handshake or lock file. A value with nothing to escape hashes byte-identically
-  to before, so no existing daemon is orphaned by this. (#761)
+  to before, so no existing daemon is orphaned by this. (#765, issue #761)
 - A lone surrogate in a hook↔daemon frame no longer fails the connection.
   `encode_line` ends in an explicit `.encode("utf-8")`, so such a frame raised
   and the peer saw the socket close with no response — a hook waiting on a
@@ -222,7 +300,7 @@ changes inline only. See the deprecation policy in
   the receiving process, at whichever encode it reached next. It also covers a
   peer that never escaped it. A frame with nothing to escape is byte-identical
   on the wire and decodes to an equal object, so this is invisible to every
-  existing exchange. (#761)
+  existing exchange. (#766, issue #761)
 - In Toolgraph bundle mode, an upstream tool whose `tools/list` metadata
   carries a lone surrogate is now rejected as drifted instead of taking the
   whole catalog down. The contract fingerprint encodes its canonical JSON, and
@@ -238,7 +316,7 @@ changes inline only. See the deprecation policy in
   producer could have published, which is the fail-closed rejection this path
   is meant to produce. Clean metadata hashes byte-identically to the producer,
   so every existing bundle keeps binding exactly as before — the cross-repo
-  golden-fixture test pins that. (#761)
+  golden-fixture test pins that. (#767, issue #761)
 - An upstream response carrying a lone surrogate is delivered with that
   character escaped instead of being discarded. The MCP SDK decodes a legal
   `"\ud800"` escape out of the upstream's wire JSON into a raw code unit, and
@@ -256,34 +334,36 @@ changes inline only. See the deprecation policy in
   which is also what keeps the compression budgets honest: they measure the
   length of a re-serialized payload, so escaping later would have made them
   count a string six characters shorter per surrogate than the one actually
-  delivered. (#761)
+  delivered. (#773, issue #761)
 - The same escaping now covers replies from the LTM core, so a surrogate in a
   surfaced memory or in a review candidate no longer fails the STM tool
   response carrying it. Two entry points, and each is needed: the SDK decodes a
   surrogate off Core's wire into the text we read, and Core also returns JSON
   *inside* that text, where the six characters `\ud800` are a legal escape
   that survives text-level escaping and then decodes into a fresh code unit
-  when that nested document is parsed. Clean replies are unchanged. (#761)
+  when that nested document is parsed. Clean replies are unchanged. (#774, issue #761)
 - `mms import` skips a host entry it cannot store instead of aborting the whole
   import. A host config is plain `json.loads` with no character validation, so
   a legal `"\ud800"` escape reaches the registry writer as a code unit that the
   drift hash cannot encode and TOML cannot represent. That raise was uncaught
   and left **nothing** imported, so one malformed entry cost every clean entry
   beside it. Such an entry is now reported and skipped per entry, naming the
-  offending field and never its value (env values are routinely secrets and
-  this text reaches CI logs) — the same refusal `mms add` and the discovery
-  scan have made since #757/#758, now applied to the third create path. (#761)
-- The SQLite response cache, pending store and progressive store are hardened
-  against a lone surrogate reaching them. `sqlite3` encodes text parameters to
-  UTF-8, so the failure landed at `execute` time — and the guard around the
-  only caller catches `sqlite3.Error`, which a `UnicodeEncodeError` is not, so
-  it escaped and discarded an otherwise-successful upstream response as an
-  internal error. The stores' readers are covered too, not just their writers:
-  a `\ud800` escape sitting in a stored row decodes straight back into the code
-  unit through a plain parse, which would then fail at the next encode
-  downstream rather than at the read. With the ingest escaping above in place
-  nothing should reach these in normal operation; they are hardened because
-  their failure mode was bad out of proportion to its cause. (#761)
+  offending field, and the server name via `repr`, but never a command,
+  argument or environment value (those are routinely secrets and this text
+  reaches CI logs) — the same refusal `mms add` and the discovery
+  scan have made since #757/#758, now applied to the third create path. (#775, issue #761)
+- The SQLite pending store is hardened against a lone surrogate reaching it in
+  both directions, and the response cache and progressive store on the write
+  path. `sqlite3` encodes text parameters to UTF-8, so the failure landed at
+  `execute` time, where the caller logs it and leaves the response alone — the
+  cost was a silently uncached response and a warning per call. A `\ud800`
+  escape sitting in a stored row also decodes straight back into the code unit
+  through a plain parse, failing at the next encode downstream rather than at
+  the read; the pending store scrubs on read for that reason. With the ingest
+  escaping above in place nothing should reach these in normal operation; they
+  are hardened because their failure mode was bad out of proportion to its
+  cause. The cache and progressive readers are closed further down this
+  section. (#776, issue #761)
 - The response cache and progressive store are now surrogate-safe on read as
   well as write, closing part of the gap #761 left when it hardened only the
   pending store. Both escape on write and then parsed with a plain
@@ -325,7 +405,9 @@ changes inline only. See the deprecation policy in
   **Behavior change**: `max_content_chars` and the 512/256 limits on
   `source_ref` and `idempotency_key` now measure the *escaped* form. One code
   unit becomes six characters, so a value packed with surrogates can now be
-  refused as `content_too_large` where the raw length fit. This is deliberate,
+  refused where the raw length fit — with that field's own reason,
+  `content_too_large`, `source_ref_too_large` or
+  `idempotency_key_too_large`. This is deliberate,
   and it is the only denomination that holds on both routes: with
   `surfacing.use_daemon` enabled the daemon re-applies these same three limits
   to what is actually sent, and its refusal arrives as an opaque
@@ -335,7 +417,8 @@ changes inline only. See the deprecation policy in
   every limit behaves exactly as before.
   This is the request half of the tool whose response half #761 closed; it was
   left out of that issue deliberately, because a tool argument is not one of the
-  ingest points whose escaping made the rest of `server.py` safe. (#778)
+  ingest points whose escaping made the rest of `server.py` safe.
+  (#778, fixes #777)
 
 - The display escaping now reaches the CLI surfaces the #760 sweep left. The
   `mms host` re-stamp diff escaped the server name and the `Source:` line but
