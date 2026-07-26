@@ -11,7 +11,7 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
-## [0.1.43] — 2026-07-25
+## [0.1.43] — 2026-07-26
 
 ### Upgrade notes
 
