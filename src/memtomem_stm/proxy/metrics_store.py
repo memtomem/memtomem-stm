@@ -107,11 +107,6 @@ def read_compression_summary(
             # Missing file would have returned above; an empty column set here
             # means the file exists but isn't a recognizable metrics DB.
             return summary
-        if (tool is not None and has_lone_surrogate(tool)) or (
-            source is not None and has_lone_surrogate(source)
-        ):
-            summary["available"] = True
-            return summary
         has_is_error = "is_error" in cols
         has_source = "source" in cols
         # ``schema_outdated`` flags ONLY the missing ``is_error`` column (its
@@ -121,6 +116,20 @@ def read_compression_summary(
         # handled by the ``source``-filter guard below, not this flag.
         summary["schema_outdated"] = not has_is_error
         error_expr = "SUM(is_error)" if has_is_error else "0"
+
+        if (tool is not None and has_lone_surrogate(tool)) or (
+            source is not None and has_lone_surrogate(source)
+        ):
+            # An unencodable filter cannot be bound as a SQLite parameter and
+            # can never match a stored row (the write path refuses such
+            # identifiers), so report the same empty-but-available shape as the
+            # sibling guard below. Placed AFTER ``schema_outdated`` so the two
+            # empty-summary exits describe the DB identically — a pre-migration
+            # DB is outdated regardless of which filter came back empty.
+            # ``mms stats`` refuses this at the CLI boundary; direct callers of
+            # this reader still land here.
+            summary["available"] = True
+            return summary
 
         if source is not None and not has_source and source != "mcp":
             # Pre-``source`` DB: every row is the legacy ``'mcp'`` default, so a

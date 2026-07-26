@@ -700,6 +700,33 @@ class TestReadCompressionSummary:
         assert summary["total_original_chars"] == 100
         assert summary["saved_ratio"] == 0.6
 
+    @pytest.mark.parametrize("filter_field", ["tool", "source"])
+    def test_unencodable_filter_still_reports_pre_migration_schema(self, tmp_path, filter_field):
+        """Both empty-summary exits must describe the DB the same way.
+
+        ``schema_outdated`` is a property of the file, not of the filter — a
+        pre-migration DB is outdated whether the ``tool``/``source`` filter or
+        the pre-``source`` filter is what returned nothing.
+        """
+        db_path = tmp_path / "legacy.db"
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT, tool TEXT, "
+            "original_chars INTEGER, compressed_chars INTEGER, "
+            "cleaned_chars INTEGER DEFAULT 0, created_at REAL)"
+        )
+        db.commit()
+        db.close()
+
+        summary = read_compression_summary(db_path, **{filter_field: "t\ud800"})
+
+        assert summary["available"] is True
+        assert summary["schema_outdated"] is True
+        assert summary["total_calls"] == 0
+        # Baseline: the sibling pre-``source`` guard already agreed.
+        assert read_compression_summary(db_path, source="hook")["schema_outdated"] is True
+
     def test_unrelated_db_is_unavailable(self, tmp_path):
         db_path = tmp_path / "other.db"
         db = sqlite3.connect(db_path)
