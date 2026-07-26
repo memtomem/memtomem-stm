@@ -352,7 +352,23 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         }
         if "surfacing_events" not in tables:
             return summary
+
+        # Schema-capability probe, hoisted above every empty-result early return:
+        # ``diagnostics_recovery_supported`` describes the FILE, not the filter,
+        # so a refused filter must not report a pre-``last_recovered_at`` DB as
+        # recovery-capable. Same placement rule as ``schema_outdated`` in
+        # ``read_compression_summary``.
+        fault_columns: set[str] = set()
+        if "surfacing_faults" in tables:
+            fault_columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
+            }
+            summary["diagnostics_recovery_supported"] = "last_recovered_at" in fault_columns
+
         if tool is not None and has_lone_surrogate(tool):
+            # Cannot be bound as a SQLite parameter and can never match a stored
+            # row, so report empty-but-available rather than raising.
             summary["available"] = True
             return summary
 
@@ -415,10 +431,6 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             summary["diagnostics"] = {row[0]: row[1] for row in diagnostic_rows}
             summary["diagnostics_last_at"] = max((row[2] for row in diagnostic_rows), default=None)
             summary["diagnostics_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
-            fault_columns = {
-                str(row[1])
-                for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
-            }
             if "last_recovered_at" in fault_columns:
                 kind_placeholders = ", ".join("?" for _ in DIAGNOSTIC_KINDS)
                 active_where = fault_where + f" AND kind IN ({kind_placeholders})"
@@ -430,8 +442,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
                     [*fault_params, *sorted(DIAGNOSTIC_KINDS)],
                 ).fetchall()
                 summary["active_diagnostics"] = {row[0]: row[1] for row in active_rows}
-            else:
-                summary["diagnostics_recovery_supported"] = False
+            # No ``else``: ``diagnostics_recovery_supported`` was already set from
+            # ``fault_columns`` above, before any early return could skip it.
 
         summary["available"] = True
     except sqlite3.Error as exc:
