@@ -1,7 +1,10 @@
 # Selection Telemetry
 
 For the surrounding proxy schema and configuration-source boundary, see the
-[Proxy Configuration Reference](reference/proxy-config.md).
+[Proxy Configuration Reference](reference/proxy-config.md). For how this log
+relates to other cross-tool exchange boundaries (and why it is not an
+observability trace export), see
+[ADR 0001](adr/0001-ecosystem-integration-contracts.md).
 
 Append-only JSONL log of tool selection and execution outcomes (#467). The
 proxy sits in the call path, so it can record what an advisory analyzer never

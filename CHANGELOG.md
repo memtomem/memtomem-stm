@@ -33,6 +33,14 @@ changes inline only. See the deprecation policy in
   (`--json`) or dying with `UnicodeEncodeError` on the filter echo (human
   form). (#788, fixes #783)
 
+### Added
+
+- docs: record the ecosystem integration decision as ADR 0001 — per-boundary
+  contracts with named deferral gates (tracegraph, agent-guard, vigil,
+  syncmill) instead of a generic adapter, plus a `docs/adr/` index and drift
+  pins for the paths and claims the ADR makes. Stage ordering/status lives in
+  the tracking issue (#789). (#790)
+
 ### Fixed
 
 - Lone surrogates in SQLite-bound diagnostic/content fields and nested
