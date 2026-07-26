@@ -1355,3 +1355,56 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         '"compat-smoke"',
     ):
         assert token in smoke, f"released-core advisory lost guide contract token {token!r}"
+
+
+def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
+    """ADR 0001's cited repo paths exist and its ``log_feedback`` claim is true.
+
+    The ADR names concrete repo paths and asserts the selection log's
+    ``feedback`` event has no production call site. Both statements rot
+    silently when code moves; pin them here so the ADR fails CI instead of
+    aging in prose. The explicit expected set below makes a regex miss loud:
+    coverage cannot silently shrink to an easier subset of citations.
+    """
+    body = _read("docs/adr/0001-ecosystem-integration-contracts.md")
+
+    cited = {
+        token
+        for token in re.findall(r"`([^`\n]+)`", body)
+        if token == "CLAUDE.md" or token.startswith(("src/", "tests/", "docs/"))
+    }
+    expected = {
+        "CLAUDE.md",
+        "src/memtomem_stm/data/policy-bundle.schema.json",
+        "src/memtomem_stm/data/toolgraph-contract-v1/",
+        "src/memtomem_stm/proxy/toolgraph_bundle.py",
+        "src/memtomem_stm/proxy/toolgraph_cache.py",
+        "src/memtomem_stm/proxy/toolgraph_provider.py",
+        "src/memtomem_stm/surfacing/mcp_client.py",
+        "src/memtomem_stm/utils/sqlite_private.py",
+        "tests/test_docs_sync.py",
+    }
+    assert expected <= cited, f"ADR 0001 lost expected citations: {sorted(expected - cited)}"
+    for relative in sorted(cited):
+        target = REPO_ROOT / relative.rstrip("/")
+        assert target.exists(), f"ADR 0001 cites missing path {relative}"
+        if relative.endswith("/"):
+            assert target.is_dir(), f"ADR 0001 cites {relative} as a directory"
+
+    from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
+
+    assert callable(SelectionTelemetryLog.log_feedback)
+    callers: list[str] = []
+    for path in sorted((REPO_ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name == "log_feedback":
+                callers.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+    assert callers == [], (
+        f"ADR 0001 claims log_feedback has no production call site, found {callers}; "
+        "update the ADR's matrix note alongside this pin"
+    )

@@ -11,6 +11,14 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- docs: record the ecosystem integration decision as ADR 0001 — per-boundary
+  contracts with named deferral gates (tracegraph, agent-guard, vigil,
+  syncmill) instead of a generic adapter, plus a `docs/adr/` index and drift
+  pins for the paths and claims the ADR makes. Stage ordering/status lives in
+  the tracking issue (#789). (#790)
+
 ## [0.1.43] — 2026-07-26
 
 ### Upgrade notes

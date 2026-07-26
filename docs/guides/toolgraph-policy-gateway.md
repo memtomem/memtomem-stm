@@ -3,7 +3,9 @@
 This guide connects Toolgraph's policy compiler to STM's runtime MCP gateway.
 The two packages stay independent: Toolgraph writes one portable JSON artifact;
 STM validates and enforces it without importing Toolgraph or opening its graph
-database on the call path.
+database on the call path. This boundary is an instance of the integration
+contract pattern recorded in
+[ADR 0001](../adr/0001-ecosystem-integration-contracts.md).
 
 Start in `review`. Rejected tools remain visible and callable while STM records
 what strict mode would block. Move to `strict` only after `status` and `explain`
