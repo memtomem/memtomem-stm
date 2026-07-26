@@ -104,7 +104,23 @@ def validate_toolgraph_identifier(value: str, path: str) -> None:
 
 
 def _validate_verdict_identifiers(tool: str, verdict: dict[str, Any]) -> None:
-    """Validate identity-bearing fields in a successful Toolgraph verdict."""
+    """Validate identity-bearing fields in a successful Toolgraph verdict.
+
+    Deliberately whole-payload rather than scoped to what the caller reads
+    today. ``interpret_verdict`` consumes only ``rejected[].candidate``, and
+    ``parse_risk_scores`` only ``features[].candidate`` — but ``eligible`` and
+    ``tool_key`` are identities too, and a provider that cannot encode one of
+    them is emitting identities STM cannot round-trip anywhere. Scoping the
+    check to today's readers would also let the next field to become
+    load-bearing arrive unvalidated.
+
+    Note the two tools differ in consequence, which is a property of their
+    callers rather than of this check: an ``eligible_tools`` failure rides
+    ``on_protocol_error`` (``fail_start`` by default, so it refuses startup),
+    while a ``rank_features`` failure is caught by
+    ``ProxyManager._fetch_risk_scores`` and degrades to no risk penalties,
+    preserving ``parse_risk_scores``'s never-raises contract.
+    """
 
     for field in ("agent", "profile"):
         value = verdict.get(field)

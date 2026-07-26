@@ -15,11 +15,20 @@ changes inline only. See the deprecation policy in
 
 - **Behavior change**: Toolgraph identity-bearing request and verdict fields
   that contain a lone surrogate are now refused as protocol errors under
-  `on_protocol_error`; they are never non-injectively escaped. Validation runs
-  before the consult cache branch, so cold and warm starts have the same
+  `on_protocol_error`; they are never non-injectively escaped. That knob
+  defaults to `fail_start`, so an `eligible_tools` payload carrying one
+  refuses server startup rather than degrading — and the response check is
+  deliberately whole-payload, covering identity fields STM does not itself
+  read (`eligible`, `tool_key`). Set the knob to `open` or `closed` if you
+  would rather degrade than block on a provider you do not control. Validation
+  runs before the consult cache branch, so cold and warm starts have the same
   enforcement posture. Stored SQLite identifiers in compression feedback,
   metrics, progressive-read telemetry, and surfacing feedback are likewise
   refused rather than rewritten. (#788, fixes #783)
+- **Behavior change**: `mms stats --tool` now refuses a filter that is not
+  valid UTF-8 as a usage error (exit 2) instead of reporting an all-time zero
+  (`--json`) or dying with `UnicodeEncodeError` on the filter echo (human
+  form). (#788, fixes #783)
 
 ### Fixed
 
@@ -32,6 +41,11 @@ changes inline only. See the deprecation policy in
   raw surrogate distinct from its six-character literal twin. Observability
   stats filters and surfacing-feedback identifiers are rejected at their
   response boundary with sanitized, UTF-8-safe errors. (#788, fixes #783)
+- Negative-feedback counts now drop only the unencodable memory IDs instead of
+  the whole batch, so one bad ID no longer suppresses surfacing demotion for
+  the valid IDs beside it. A refused `tool`/`source` stats filter also keeps
+  reporting `schema_outdated` accurately, matching the sibling pre-`source`
+  guard. (#788, fixes #783)
 
 ## [0.1.43] — 2026-07-26
 
