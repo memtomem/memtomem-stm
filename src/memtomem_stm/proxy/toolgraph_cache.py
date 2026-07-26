@@ -62,6 +62,23 @@ CREATE INDEX IF NOT EXISTS idx_toolgraph_consult_scope
 ON toolgraph_consult (provider_fingerprint, agent_id, query_profile, candidate_hash);
 """
 
+IDENTITY_POLICY = 1
+"""Version of the identity-validation policy the stored facts were written under.
+
+A hit reconstructs only ``rejects`` / ``tool_not_found_refs`` / ``risk_scores``,
+so the response fields ``_validate_verdict_identifiers`` checks — ``agent``,
+``profile``, ``eligible``, ``tool_key``, auxiliary ``candidates`` — are not in
+the row and cannot be revalidated after an upgrade. A pre-#783 row could
+therefore be minted by a verdict that today's policy refuses, and then serve a
+warm start that skips the full consult entirely: cold would ``fail_start``
+while warm came up clean, the exact divergence the pre-cache validation exists
+to prevent. Stamping the policy and rejecting rows that lack it forces one full
+consult after upgrade, which re-derives the verdict under current rules.
+
+Bump this whenever the set of refused identifier fields changes, for the same
+reason: a row written under a laxer policy is not evidence for a stricter one.
+"""
+
 
 def _scope_key(
     provider_fp: str, agent_id: str, profile: str, candidate_hash: str, generation: int
@@ -173,8 +190,9 @@ class GraphConsultCache:
         # a fresh row.
         if not self._row_shape_ok(verdict):
             logger.warning(
-                "Tool-graph consult cache row (scope %s) is malformed — treating as "
-                "a miss and dropping it",
+                "Tool-graph consult cache row (scope %s) is malformed, or was written "
+                "before the current identity-validation policy — treating as a miss "
+                "and dropping it",
                 key[:12],
             )
             self._delete_scope(key)
@@ -195,6 +213,12 @@ class GraphConsultCache:
         {str: number}``) guarantees the reconstruction can never raise on a hit.
         """
         if not isinstance(verdict, dict):
+            return False
+        # A row minted under an older (or absent) identity policy is not
+        # evidence under this one — see ``IDENTITY_POLICY``. Checked here rather
+        # than only in ``get`` so ``put``'s pre-write self-check also proves the
+        # stamp was written.
+        if verdict.get("identity_policy") != IDENTITY_POLICY:
             return False
         rejects = verdict.get("rejects")
         refs = verdict.get("tool_not_found_refs")
@@ -253,6 +277,7 @@ class GraphConsultCache:
             logger.warning("Tool-graph consult cache write refused unencodable scope identifier")
             return
         raw_facts: dict[str, Any] = {
+            "identity_policy": IDENTITY_POLICY,
             "rejects": dict(rejects),
             "tool_not_found_refs": list(tool_not_found_refs),
             "risk_scores": dict(risk_scores),

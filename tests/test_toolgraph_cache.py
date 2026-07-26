@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
+from memtomem_stm.proxy.toolgraph_cache import IDENTITY_POLICY, GraphConsultCache
 
 _PROV = "prov-fp"
 _AGENT = "stm-proxy"
@@ -266,14 +266,55 @@ class TestCorruptRow:
         ids=["reject", "tool_not_found", "risk"],
     )
     def test_legacy_unencodable_identifier_row_is_dropped(self, cache, facts):
+        """The stored identifier itself is what must fail the shape check.
+
+        ``identity_policy`` is stamped in deliberately: without it the row
+        would be dropped for being pre-policy and this would pass no matter
+        what the identifiers held.
+        """
         _put(cache)
+        cache._db.execute(
+            "UPDATE toolgraph_consult SET verdict_json = ?",
+            (json.dumps({"identity_policy": IDENTITY_POLICY, **facts}, separators=(",", ":")),),
+        )
+        cache._db.commit()
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    @pytest.mark.parametrize("stamp", [None, 0, "1", IDENTITY_POLICY + 1])
+    def test_row_written_under_another_identity_policy_is_dropped(self, cache, stamp):
+        """A warm hit reconstructs only rejects/refs/risk_scores, so the response
+        fields the provider validates (agent, profile, eligible, tool_key) are
+        not in the row and cannot be revalidated after upgrade. A pre-policy row
+        could have been minted by a verdict today's policy refuses, and serving
+        it would let a warm start come up clean where cold fail_starts."""
+        _put(cache)
+        facts = {
+            "graph_generation": 11,
+            "rejects": {"s::c": "NOT_GRANTED"},
+            "tool_not_found_refs": [],
+            "risk_scores": {},
+        }
+        if stamp is not None:
+            facts["identity_policy"] = stamp
         cache._db.execute(
             "UPDATE toolgraph_consult SET verdict_json = ?",
             (json.dumps(facts, separators=(",", ":")),),
         )
         cache._db.commit()
+
         assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        # Dropped, so the next consult re-mints under the current policy
+        # instead of the stale row being re-read on every later start.
         assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_put_stamps_the_current_identity_policy(self, cache):
+        _put(cache)
+        stored = json.loads(
+            cache._db.execute("SELECT verdict_json FROM toolgraph_consult").fetchone()[0]
+        )
+        assert stored["identity_policy"] == IDENTITY_POLICY
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None
 
     def test_literal_surrogate_text_remains_a_valid_distinct_identifier(self, cache):
         literal = r"s::bad\ud800"
