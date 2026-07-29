@@ -75,7 +75,10 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - proxy: derive the response-cache key from framed components so it is
-  injective over `(server, tool, args, context_query, config_fingerprint)`.
+  injective over the serialized
+  `(server, tool, args, context_query, config_fingerprint)` — `args` by its
+  JSON rendering, which is what the upstream tool receives, so trees that
+  render identically keep sharing one row on purpose.
   The old derivation joined the components on a bare NUL and serialized two of
   them with `ensure_ascii=True`, so two distinct calls could hash to the same
   key and one call's cached body was served for the other: a NUL inside an

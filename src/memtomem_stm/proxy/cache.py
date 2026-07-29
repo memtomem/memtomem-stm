@@ -99,8 +99,16 @@ def _make_key(
     # legitimately map to different cached bodies. ``json.dumps`` keeps ``None``
     # (absent) distinct from ``""`` and the literal string ``"null"``.
     #
-    # The digest input must be injective over the component tuple — a
-    # collision serves one call's cached body for a different call (#784):
+    # The digest input must be injective over the SERIALIZED component tuple —
+    # a collision serves one call's cached body for a different call (#784).
+    # Serialized, not the Python objects: ``args`` is keyed by its JSON form,
+    # so two argument trees that ``json.dumps`` renders identically
+    # deliberately share a row. That is the correct equivalence class, because
+    # the same rendering is what the upstream tool receives — a tuple and a
+    # list both go out as ``[1, 2]``, an int dict key and its string spelling
+    # both as ``"1"`` — so the upstream cannot tell them apart either and owes
+    # them the same response. Widening the key past what the upstream sees
+    # would only split rows that must not be split.
     #
     # - Each component is framed netstring-style (``len:data``) rather than
     #   joined on a separator. A joined string is ambiguous the moment a

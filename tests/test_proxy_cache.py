@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 
@@ -575,6 +576,24 @@ class TestMakeKey:
         k2 = _make_key("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
         assert k1 == k2
 
+    def test_identically_serialized_args_share_a_row_on_purpose(self):
+        """The key is injective over the SERIALIZED tuple, not Python identity.
+
+        Two argument trees that ``json.dumps`` renders identically map to one
+        key by design, because that same rendering is what goes out to the
+        upstream tool: it cannot tell these pairs apart and owes them the same
+        response. Splitting them would split rows that must not be split, so
+        this is pinned as intended behavior rather than left to read as a gap
+        in the framing above.
+        """
+        pairs = [
+            ({"x": (1, 2)}, {"x": [1, 2]}),  # both serialize to [1, 2]
+            ({"x": {1: "a"}}, {"x": {"1": "a"}}),  # int keys coerce to strings
+        ]
+        for left, right in pairs:
+            assert json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+            assert _make_key("s", "t", left) == _make_key("s", "t", right)
+
     def test_component_boundaries_are_framed(self):
         # An unframed join lets a NUL inside one component shift the boundary:
         # ("a\0b", "c") and ("a", "b\0c") joined with "\0" are the same string,
@@ -593,9 +612,10 @@ class TestMakeKey:
         assert k1 != k2
 
     def test_astral_scalar_does_not_alias_a_lone_surrogate_pair(self):
-        # ``ensure_ascii=True`` renders U+10000 as the text ``𐀀`` —
-        # byte-identical to a caller string holding those two lone code units,
-        # so the astral argument collided with the crafted pair (#784 case 2).
+        # ``ensure_ascii=True`` renders U+10000 as the twelve-character
+        # text ``\ud800\udc00`` — byte-identical to what it renders for
+        # a caller string holding those two lone code units, so the astral
+        # argument collided with the crafted pair (#784 case 2).
         # ``chr()`` because a JSON boundary merges the pair on decode; the two
         # code units have to be built in-process, which is also how they reach
         # this function in production.
@@ -668,10 +688,38 @@ class TestKeySchemaVersionPurge:
         finally:
             reopened.close()
 
+    def test_v4_rows_are_purged_by_the_v5_bump(self, tmp_path):
+        """The upgrade THIS release performs, pinned on its own.
+
+        The other legacy fixtures seed ``user_version`` 0 and 2, so a
+        regression that purged only those and left v4 rows in place would pass
+        both — while the v4 rows it left behind are keyed under the pre-framing
+        derivation and unreachable by any v5 lookup, which is exactly the dead
+        weight the purge exists to drop (#784).
+        """
+        db_path = tmp_path / "c.db"
+        cache = ProxyCache(db_path, max_entries=10)
+        cache.initialize()
+        cache.set("s", "t", {"a": 1}, "v4-row", ttl_seconds=None)
+        # The v4 table shape is the current one — only the key derivation
+        # changed — so seeding the version is enough to make this a v4 database.
+        cache._db.execute("PRAGMA user_version = 4")
+        cache._db.commit()
+        cache.close()
+
+        reopened = ProxyCache(db_path, max_entries=10)
+        reopened.initialize()
+        try:
+            assert reopened.stats()["total_entries"] == 0
+            (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
+            assert version == 5
+        finally:
+            reopened.close()
+
     def test_current_version_rows_survive_reopen(self, tmp_path):
         db_path = tmp_path / "c.db"
         cache = ProxyCache(db_path, max_entries=10)
-        cache.initialize()  # stamps user_version = 4
+        cache.initialize()  # stamps user_version = _KEY_SCHEMA_VERSION
         cache.set("s", "t", {"a": 1}, "row", ttl_seconds=None)
         cache.close()
 
@@ -846,8 +894,32 @@ class TestSurrogateRoundTrip:
         # orphans every stored entry and must be acknowledged deliberately.
         # (v4 → v5 was such a bump: the framing fix #784 changed every key,
         # and the startup purge dropped the orphaned rows.)
+        # Components chosen so BYTE length differs from character length in
+        # three ways at once: a 3-byte CJK character, a 2-byte accented one,
+        # and a lone surrogate that only ``surrogatepass`` can encode (3
+        # bytes). A regression from ``len(data)`` to ``len(component)`` would
+        # frame every one of them short and fail here — with ASCII-only
+        # fixtures the two lengths coincide and the pin proves nothing.
+        server, tool = "\uc11c\ubc84", "t\u00e9"
+        args = {"k": "\u4e2d"}
+        fingerprint = "fp\ud800"
+        parts = [
+            "5",
+            server,
+            tool,
+            json.dumps(args, sort_keys=True, ensure_ascii=False),
+            fingerprint,
+            "null",
+        ]
         raw = b"".join(
-            f"{len(part)}:".encode() + part.encode()
-            for part in ["5", "s", "t", '{"a": 1}', "", "null"]
+            f"{len(part.encode('utf-8', errors='surrogatepass'))}:".encode()
+            + part.encode("utf-8", errors="surrogatepass")
+            for part in parts
         )
-        assert _make_key("s", "t", {"a": 1}) == hashlib.sha256(raw).hexdigest()
+        assert any(
+            len(part.encode("utf-8", errors="surrogatepass")) != len(part) for part in parts
+        ), "fixtures must make byte length differ from character length"
+        assert (
+            _make_key(server, tool, args, config_fingerprint=fingerprint)
+            == hashlib.sha256(raw).hexdigest()
+        )
