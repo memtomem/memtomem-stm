@@ -44,6 +44,10 @@ changes inline only. See the deprecation policy in
   upgrade. Stored SQLite identifiers in compression feedback, metrics,
   progressive-read telemetry, and surfacing feedback are likewise refused
   rather than rewritten. (#788, fixes #783)
+- The response cache is upgraded to schema v5 and performs a one-time cache
+  reset on first run after upgrade: the key derivation is now framed, so every
+  stored key changes and the pre-upgrade rows are unreachable. No
+  configuration or API change; entries repopulate on use. (#795, fixes #784)
 - **Behavior change**: `mms stats --tool` now refuses a filter that is not
   valid UTF-8 as a usage error (exit 2) instead of reporting an all-time zero
   (`--json`) or dying with `UnicodeEncodeError` on the filter echo (human
@@ -69,6 +73,20 @@ changes inline only. See the deprecation policy in
   in `stm_proxy_health`. (#789)
 
 ### Fixed
+
+- proxy: derive the response-cache key from framed components so it is
+  injective over the serialized
+  `(server, tool, args, context_query, config_fingerprint)` — `args` by its
+  JSON rendering, which is what the upstream tool receives, so trees that
+  render identically keep sharing one row on purpose.
+  The old derivation joined the components on a bare NUL and serialized two of
+  them with `ensure_ascii=True`, so two distinct calls could hash to the same
+  key and one call's cached body was served for the other: a NUL inside an
+  upstream server or tool name shifted the component boundary (nothing on the
+  path rejects one), and an astral scalar in the arguments rendered as the
+  same escaped text as two lone surrogate code units. Each component is now
+  length-prefixed and serialized with `ensure_ascii=False`, behind a
+  `_KEY_SCHEMA_VERSION` bump to v5. (#795, fixes #784)
 
 - observability: refuse an OTLP endpoint whose path trips the credential
   screen, and narrow the SDK log screen. The HTTP transport logs its request

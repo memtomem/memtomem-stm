@@ -82,6 +82,17 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "than any it audited; ``stm_memory_propose`` escapes its three "
         "strings itself as of #777.",
     ),
+    "proxy/cache.py": (
+        2,
+        "HASHED, and unlike ``selection_eval``'s round-5 case the encode is "
+        "right here and cannot raise: both feed ``_make_key``'s digest, whose "
+        "own ``.encode(errors='surrogatepass')`` is the only encoder either "
+        "string ever reaches. ``ensure_ascii=False`` is load-bearing rather "
+        "than cosmetic — the default escaping renders an astral scalar as the "
+        "same text as two lone surrogate code units, which aliased their two "
+        "cache keys onto one row (#784). The envelope written to SQLite in "
+        "the same module is routed through ``utils.json_out``.",
+    ),
     "cli/hook_cmd.py": (
         1,
         "Renders a tool response into hook text; the hook's own emit fails "

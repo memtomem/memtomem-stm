@@ -80,7 +80,9 @@ class CachedResponse(str):
 # Stored in SQLite's ``PRAGMA user_version``.
 # v4: successful text responses may carry JSON-safe ``structuredContent`` and
 # result-level ``_meta`` in ``envelope_json``.
-_KEY_SCHEMA_VERSION = 4
+# v5: framed (length-prefixed) key derivation, args/context_query serialized
+# with ``ensure_ascii=False`` (#784).
+_KEY_SCHEMA_VERSION = 5
 
 
 def _make_key(
@@ -96,33 +98,50 @@ def _make_key(
     # (BM25 relevance budgets) and config-dependent, so the same tool+args can
     # legitimately map to different cached bodies. ``json.dumps`` keeps ``None``
     # (absent) distinct from ``""`` and the literal string ``"null"``.
-    raw = "\x00".join(
-        [
-            str(_KEY_SCHEMA_VERSION),
-            server,
-            tool,
-            json.dumps(args, sort_keys=True),
-            config_fingerprint,
-            json.dumps(context_query),
-        ]
-    )
-    # ``surrogatepass``, not the escaping helper. ``escape_lone_surrogates`` is
-    # documented as non-injective — it maps the code unit U+D800 and the six
-    # literal characters ``\ud800`` onto the same text — so deriving the key
-    # through it let one identifier's row answer for a different one. Nothing
-    # decodes this byte string, so the usual objection to ``surrogatepass``
-    # (it emits bytes that are not valid UTF-8) has no consumer to bite, and
-    # clean input encodes byte-identically, so no existing key is orphaned.
+    #
+    # The digest input must be injective over the SERIALIZED component tuple —
+    # a collision serves one call's cached body for a different call (#784).
+    # Serialized, not the Python objects: ``args`` is keyed by its JSON form,
+    # so two argument trees that ``json.dumps`` renders identically
+    # deliberately share a row. That is the correct equivalence class, because
+    # the same rendering is what the upstream tool receives — a tuple and a
+    # list both go out as ``[1, 2]``, an int dict key and its string spelling
+    # both as ``"1"`` — so the upstream cannot tell them apart either and owes
+    # them the same response. Widening the key past what the upstream sees
+    # would only split rows that must not be split.
+    #
+    # - Each component is framed netstring-style (``len:data``) rather than
+    #   joined on a separator. A joined string is ambiguous the moment a
+    #   component can contain the separator, and nothing on the path rejects
+    #   a NUL in an upstream server or tool name; frames parse left-to-right
+    #   unambiguously, so no boundary can shift.
+    # - ``ensure_ascii=False``: the default ASCII escaping renders an astral
+    #   scalar as the same ``\uXXXX\uXXXX`` text as the two lone surrogate
+    #   code units spelled separately, aliasing the two. Unescaped, the
+    #   scalar and the lone pair encode to different bytes below.
+    # - ``surrogatepass``, not the escaping helper. ``escape_lone_surrogates``
+    #   is documented as non-injective — it maps the code unit U+D800 and the
+    #   six literal characters ``\ud800`` onto the same text — so deriving
+    #   the key through it let one identifier's row answer for a different
+    #   one. Nothing decodes these bytes, so the usual objection to
+    #   ``surrogatepass`` (it emits bytes that are not valid UTF-8) has no
+    #   consumer to bite.
+    #
     # All three derivations — ``get``, ``set`` and ``invalidate`` — come
     # through here, so they cannot disagree.
-    #
-    # This closes that one aliasing; it does NOT make the key injective. The
-    # serialization above is unframed, so ``server="a\0b"`` collides with
-    # ``tool="b\0c"``, and ``json.dumps``'s ``ensure_ascii`` renders a non-BMP
-    # character as the same surrogate pair a caller could send as two lone
-    # ones. Both predate this change and both need a framed derivation behind
-    # a ``_KEY_SCHEMA_VERSION`` bump — see #784 (#781).
-    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()
+    digest = hashlib.sha256()
+    for component in (
+        str(_KEY_SCHEMA_VERSION),
+        server,
+        tool,
+        json.dumps(args, sort_keys=True, ensure_ascii=False),
+        config_fingerprint,
+        json.dumps(context_query, ensure_ascii=False),
+    ):
+        data = component.encode("utf-8", errors="surrogatepass")
+        digest.update(f"{len(data)}:".encode())
+        digest.update(data)
+    return digest.hexdigest()
 
 
 # Substrings that flag a response embedding a TRANSIENT retrieval key pointing

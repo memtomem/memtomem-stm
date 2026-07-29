@@ -4987,7 +4987,7 @@ class ProxyManager:
         (so memories stay fresh and surfacing re-runs on a hit).
 
         Successful text responses may include JSON-safe result-level
-        ``structuredContent``/``_meta``; cache v4 stores and reconstructs that
+        ``structuredContent``/``_meta``; cache v5 stores and reconstructs that
         envelope. Non-text/mixed content remains unstorable. Rows written here
         are marked ``envelope_safe`` by ``ProxyCache.set``.
 
@@ -5210,7 +5210,7 @@ class ProxyManager:
         # attribute, MagicMock fabricates a truthy non-dict) as well as
         # spec-noncompliant upstreams. When either field is present the
         # return shape below is a full ``CallToolResult`` so the fields reach
-        # the client verbatim. Cache v4 reproduces them for successful text-only
+        # the client verbatim. Cache v5 reproduces them for successful text-only
         # results; mixed/non-text envelopes remain live-call-only.
         raw_structured = getattr(result, "structuredContent", None)
         raw_meta = getattr(result, "meta", None)
