@@ -679,6 +679,43 @@ class TestConfig:
     @pytest.mark.parametrize(
         "endpoint",
         [
+            "http://{s}.collector.example/v1/traces",
+            "http://collector.example/custom/{s}",
+            "http://collector.example/custom/%73k-{s}",
+        ],
+    )
+    def test_credential_shaped_endpoints_are_refused(self, endpoint):
+        """The transport logs `scheme://host:port "POST path"` on every
+        successful export, so host and path are both loggable."""
+        planted = endpoint.format(s=SECRET)
+        assert SECRET in planted
+
+        with pytest.raises(ValueError) as excinfo:
+            OtlpExportConfig(enabled=True, endpoint=planted)
+
+        assert SECRET not in str(excinfo.value)
+
+    def test_redirects_are_refused_so_headers_cannot_walk_hosts(self):
+        """requests keeps non-Authorization headers across hosts.
+
+        Verified against a local redirecting server: without this the second
+        hop received `x-api-key` in full.
+        """
+        emitter = init_otlp(
+            OtlpExportConfig(
+                enabled=True,
+                endpoint="http://localhost:4318",
+                headers={"x-api-key": "token-123"},
+            )
+        )
+        assert emitter is not None
+        processor = emitter._provider._active_span_processor._span_processors[0]
+
+        assert processor.span_exporter._delegate._session.max_redirects == 0
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
             "not a url",
             "ftp://collector:4318",
             "localhost:4318",
@@ -1011,8 +1048,152 @@ print("exited-cleanly")
 # ── Health surface ───────────────────────────────────────────────────────
 
 
+def _installed_screen():
+    """The _LogScreen currently attached to the SDK trace-exporter logger."""
+    from memtomem_stm.observability.otlp import _LogScreen
+
+    return next(
+        f
+        for f in logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter").filters
+        if isinstance(f, _LogScreen)
+    )
+
+
+def _log_with_stack_info(logger_obj, secret):
+    """stack_info is its own formatter-visible channel."""
+    record = logger_obj.makeRecord(
+        logger_obj.name, logging.ERROR, "f", 1, "export failed", None, None
+    )
+    record.stack_info = f"Stack (most recent call last):\n  token {secret}"
+    logger_obj.handle(record)
+
+
+def _log_with_cached_exc_text(logger_obj, secret):
+    """The formatter appends exc_text even when exc_info is gone."""
+    record = logger_obj.makeRecord(
+        logger_obj.name, logging.ERROR, "f", 1, "export failed", None, None
+    )
+    record.exc_text = f"RuntimeError: token {secret}"
+    logger_obj.handle(record)
+
+
+def _log_with_exc(logger_obj, secret):
+    try:
+        raise RuntimeError(f"token {secret}")
+    except RuntimeError:
+        logger_obj.exception("export failed")
+
+
+class _CapturingHandler(logging.Handler):
+    """Renders through a real Formatter, as a deployed handler would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rendered: list[str] = []
+        self.setFormatter(logging.Formatter("%(message)s %(exc_text)s"))
+
+    def emit(self, record):
+        try:
+            self.rendered.append(self.format(record) + str(vars(record)))
+        except Exception:
+            self.rendered.append("<unformattable>")
+
+
 class TestSdkLogScreen:
     """The SDK logs before the exporter wrapper can sanitize what it says."""
+
+    @pytest.mark.parametrize(
+        "emit",
+        [
+            pytest.param(lambda lg, s: lg.error("reason: %s", s), id="message-args"),
+            pytest.param(lambda lg, s: lg.error(f"reason: {s}"), id="message-literal"),
+            pytest.param(lambda lg, s: _log_with_exc(lg, s), id="exc_info"),
+            pytest.param(lambda lg, s: lg.error("x", extra={"tok": s}), id="extra"),
+            pytest.param(lambda lg, s: _log_with_stack_info(lg, s), id="stack_info"),
+            pytest.param(lambda lg, s: _log_with_cached_exc_text(lg, s), id="exc_text"),
+        ],
+    )
+    def test_every_formatter_visible_channel_is_screened(self, emitter_and_exporter, emit):
+        """A formatter can render more than the message.
+
+        `getMessage()` alone leaves `exc_info`, `stack_info` and `extra=`
+        fields untouched, and a custom formatter renders all of them.
+        """
+        emitter, _ = emitter_and_exporter
+        sdk_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+        captured = _CapturingHandler()
+        sdk_logger.addHandler(captured)
+        try:
+            emit(sdk_logger, SECRET)
+        finally:
+            sdk_logger.removeHandler(captured)
+
+        assert all(SECRET not in text for text in captured.rendered)
+
+    def test_an_unformattable_record_is_dropped(self, emitter_and_exporter):
+        """Fail closed: a record we cannot read is one we cannot clear."""
+        emitter, _ = emitter_and_exporter
+        sdk_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+        captured = _CapturingHandler()
+        sdk_logger.addHandler(captured)
+        try:
+            sdk_logger.error("needs two %s %s", "only-one")
+        finally:
+            sdk_logger.removeHandler(captured)
+
+        assert captured.rendered == []
+        assert emitter.snapshot()["logs_redacted"] == 1
+
+    def test_shutdown_detaches_the_screen(self, emitter_and_exporter):
+        """A filter left on a third-party logger would outlive the exporter."""
+        emitter, _ = emitter_and_exporter
+        from memtomem_stm.observability.otlp import _LogScreen
+
+        shutdown_otlp(emitter, timeout_seconds=1.0)
+
+        sdk_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+        assert not any(isinstance(f, _LogScreen) for f in sdk_logger.filters)
+
+    @pytest.mark.parametrize("bad", [object(), 42, b"\xff"])
+    def test_a_nonstring_channel_never_raises_out_of_the_filter(self, emitter_and_exporter, bad):
+        """A filter that raises takes the whole log call down with it.
+
+        The scan therefore runs inside the guard and every channel is coerced
+        to text first. Whether logging's own formatter later chokes on a
+        malformed record is its business, not the screen's — the contract here
+        is that the screen itself is total.
+        """
+        emitter, _ = emitter_and_exporter
+        screen = _installed_screen()
+        record = logging.LogRecord("x", logging.ERROR, "f", 1, "msg", None, None)
+        record.stack_info = bad
+
+        assert screen.filter(record) in (True, False)
+
+    def test_a_channel_that_cannot_be_read_is_dropped(self, emitter_and_exporter):
+        """Fail closed: a record we cannot read is one we cannot clear."""
+        emitter, _ = emitter_and_exporter
+        screen = _installed_screen()
+
+        class Explodes:
+            def __str__(self):
+                raise RuntimeError("cannot render")
+
+        record = logging.LogRecord("x", logging.ERROR, "f", 1, "msg", None, None)
+        record.stack_info = Explodes()
+
+        assert screen.filter(record) is False
+        assert emitter.snapshot()["logs_redacted"] == 1
+
+    def test_shared_transport_loggers_are_left_alone(self):
+        """urllib3/requests are shared by the whole process — not STM's to filter.
+
+        The endpoint that would appear in their request-line logs is refused
+        at config instead.
+        """
+        from memtomem_stm.observability.otlp import _SDK_LOGGERS
+
+        assert not any(name.startswith(("urllib3", "requests")) for name in _SDK_LOGGERS)
 
     def test_a_reflected_secret_in_an_sdk_log_is_redacted(self, emitter_and_exporter, caplog):
         """A collector echoing the token into its reason phrase must not log it.
@@ -1026,8 +1207,10 @@ class TestSdkLogScreen:
         with caplog.at_level("DEBUG"):
             sdk_logger.error("Failed to export span batch code: 401, reason: token %s", SECRET)
 
+        # Dropped, not rewritten: a partially-cleared record is a record we
+        # are guessing about, and the counter is the operator's signal that
+        # something was withheld.
         assert all(SECRET not in record.getMessage() for record in caplog.records)
-        assert any("withheld" in record.getMessage() for record in caplog.records)
         assert emitter.snapshot()["logs_redacted"] == 1
 
     def test_a_clean_sdk_log_is_left_alone(self, emitter_and_exporter, caplog):

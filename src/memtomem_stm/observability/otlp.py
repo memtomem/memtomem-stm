@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Iterator, cast
@@ -183,26 +184,56 @@ class _LogScreen(logging.Filter):
         """Point an already-installed screen at the current emitter's counters."""
         self._counters = counters
 
+    def owns(self, counters: _Counters) -> bool:
+        """Whether this screen currently reports to *counters*."""
+        return self._counters is counters
+
     def filter(self, record: logging.LogRecord) -> bool:
+        """Return False to drop a record; True to let a clean one through.
+
+        Fails closed. Every channel a formatter can render is inspected —
+        the message, ``exc_info``, ``stack_info`` — and anything that cannot
+        be rendered for inspection is dropped rather than passed on, since a
+        record we could not read is one we cannot clear.
+        """
         try:
-            message = record.getMessage()
-        except Exception:  # pragma: no cover - malformed record
+            channels = [record.getMessage()]
+            # `exc_text` is the formatter's cache and is appended even when
+            # exc_info is gone, so it is its own channel.
+            channels.extend(str(v) for v in (record.stack_info, record.exc_text) if v)
+            if record.exc_info:
+                channels.append("".join(traceback.format_exception(*record.exc_info)))
+            # `extra=` lands in __dict__; a custom formatter can render it.
+            channels.extend(
+                str(value)
+                for key, value in vars(record).items()
+                if key not in _LOG_RECORD_STANDARD_ATTRS
+            )
+            # The scan is inside the guard too: a non-string channel would
+            # otherwise raise out of the filter and take the log call with it.
+            clean = not any(contains_sensitive_content(text) for text in channels)
+        except Exception:
+            self._counters.bump("logs_redacted")
+            return False
+        if clean:
             return True
-        if not contains_sensitive_content(message):
-            return True
-        record.msg = (
-            "OTLP exporter reported a failure whose detail matched the privacy "
-            "screen and was withheld (level %s)" % record.levelname
-        )
-        record.args = ()
         self._counters.bump("logs_redacted")
-        return True
+        return False
 
 
-# The SDK loggers that can render exporter-supplied text.
+# Attributes logging itself puts on every record; anything else came from an
+# `extra=` mapping and is formatter-visible.
+_LOG_RECORD_STANDARD_ATTRS = frozenset(
+    vars(logging.LogRecord("", 0, "", 0, "", None, None)).keys()
+) | {"message", "asctime"}
+
+# Only the loggers that render text STM cannot otherwise control — chiefly a
+# peer-supplied HTTP reason phrase. Deliberately NOT urllib3 or requests:
+# those are shared by every library in the process, and silently dropping
+# another consumer's log lines is not STM's call. The endpoint and headers,
+# which those transports would render, are refused at config instead.
 _SDK_LOGGERS = (
     "opentelemetry.exporter.otlp.proto.http.trace_exporter",
-    "opentelemetry.exporter.otlp.proto.http",
     "opentelemetry.util.re",
 )
 
@@ -221,6 +252,20 @@ def _install_log_screen(counters: _Counters) -> None:
             existing.retarget(counters)
             continue
         logger_obj.addFilter(_LogScreen(counters))
+
+
+def _remove_log_screen(counters: _Counters) -> None:
+    """Detach only the screen this emitter owns.
+
+    Removing every ``_LogScreen`` by type would let an older emitter's
+    shutdown strip protection from a live one after a re-init retargeted the
+    filter — so ownership is checked by identity of the counters it reports to.
+    """
+    for name in _SDK_LOGGERS:
+        logger_obj = logging.getLogger(name)
+        for existing in list(logger_obj.filters):
+            if isinstance(existing, _LogScreen) and existing.owns(counters):
+                logger_obj.removeFilter(existing)
 
 
 class _CountingExporter:
@@ -310,10 +355,18 @@ class OtlpEmitter:
         self._state = threading.Condition(threading.Lock())
         self._closing = False
         self._active = 0
+        # False until shutdown proves the flush worker finished; an abandoned
+        # worker can still emit exporter records, so the screen must stay.
+        self._drained_cleanly = False
 
     @property
     def counters(self) -> _Counters:
         return self._counters
+
+    @property
+    def drained_cleanly(self) -> bool:
+        """Whether shutdown's flush worker finished inside the deadline."""
+        return self._drained_cleanly
 
     def snapshot(self) -> dict[str, int]:
         return self._counters.snapshot()
@@ -465,7 +518,8 @@ class OtlpEmitter:
         worker.start()
         worker.join(timeout=max(deadline - time.monotonic(), 0))
 
-        if not drained or not done.is_set() or not flushed.is_set():
+        self._drained_cleanly = bool(drained and done.is_set() and flushed.is_set())
+        if not self._drained_cleanly:
             self._counters.bump("shutdown_flush_timeout")
             logger.warning(
                 "OTLP shutdown exceeded its %.1fs budget — remaining spans abandoned",
@@ -500,7 +554,6 @@ def init_otlp(config: OtlpExportConfig, *, span_processor: Any = None) -> OtlpEm
     from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
     counters = _Counters()
-    _install_log_screen(counters)
     provider = TracerProvider(
         # Resource(...) directly, never Resource.create(): the latter runs the
         # environment detector, and OTEL_RESOURCE_ATTRIBUTES would then reach
@@ -525,6 +578,16 @@ def init_otlp(config: OtlpExportConfig, *, span_processor: Any = None) -> OtlpEm
             headers=dict(config.headers) or None,
             timeout=config.timeout_seconds,
         )
+        # Requests follows up to 30 redirects by default and keeps
+        # non-Authorization headers across hosts, so a collector answering 3xx
+        # could walk STM's `x-api-key` to a host the operator never configured
+        # — and the transport logs each hop's host and path. A telemetry
+        # endpoint has no business redirecting: a 3xx is now just a failed
+        # export.
+        # (`allow_redirects` is a per-request kwarg, not a session setting, so
+        # `max_redirects` is what actually holds here — verified against a
+        # local redirecting server: the second hop never receives the header.)
+        exporter._session.max_redirects = 0
         span_processor = BatchSpanProcessor(
             # Duck-typed rather than subclassed: the SDK is an optional extra,
             # so `SpanExporter` cannot be a module-level base class here.
@@ -535,6 +598,9 @@ def init_otlp(config: OtlpExportConfig, *, span_processor: Any = None) -> OtlpEm
         )
     provider.add_span_processor(span_processor)
 
+    # Installed last: a screen left behind by a failed construction would
+    # keep filtering a logger for an exporter that never existed.
+    _install_log_screen(counters)
     _emitter = OtlpEmitter(provider, counters)
     return _emitter
 
@@ -564,6 +630,13 @@ def shutdown_otlp(emitter: OtlpEmitter | None = None, *, timeout_seconds: float 
     if target is None:
         return
     try:
+        # The screen stays installed across shutdown: the final flush runs on
+        # a worker that still emits exporter records, and a worker that
+        # outlives the deadline keeps emitting after this returns. Removing it
+        # first would leave exactly those records unscreened.
         target.shutdown(timeout_seconds)
     except Exception:
         logger.warning("OTLP shutdown failed", exc_info=True)
+    finally:
+        if target.drained_cleanly:
+            _remove_log_screen(target.counters)

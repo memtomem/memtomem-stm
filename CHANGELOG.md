@@ -70,6 +70,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- observability: refuse an OTLP endpoint whose path trips the credential
+  screen, and narrow the SDK log screen. The HTTP transport logs its request
+  line on every *successful* export, so a token in the endpoint path was
+  written out in full by a logger STM does not own — refusing the endpoint is
+  the boundary STM controls, and `urllib3`/`requests` are deliberately left
+  unfiltered since the whole process shares them. The screen on the two
+  OpenTelemetry loggers now inspects every formatter-visible channel
+  (`exc_info`, `stack_info`, `extra=`, not just the message), drops rather
+  than rewrites a record that trips it, fails closed on a record it cannot
+  render, and is detached at shutdown. (#789)
+
 - Lone surrogates in SQLite-bound diagnostic/content fields and nested
   extraction JSON are escaped once at ingest, while legacy surfacing memory-ID
   JSON omits unencodable identifiers on display/stat reads without aliasing
