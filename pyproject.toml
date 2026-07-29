@@ -36,6 +36,14 @@ dependencies = [
 
 [project.optional-dependencies]
 langfuse = ["langfuse>=4.0", "urllib3>=2.7.0"]
+# OTLP span export (#789 stage 2). HTTP/protobuf exporter only — the gRPC
+# exporter pulls grpcio, whose wheels are the Windows/py3.12 pain point and
+# CI runs the suite there too.
+otlp = [
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "urllib3>=2.7.0",
+]
 langchain = [
     "langchain>=1.0",
     "langchain-mcp-adapters>=0.1",
@@ -77,6 +85,10 @@ dev = [
     "ipykernel>=6.29",
     "nbclient>=0.10",
     "nbmake>=1.5",
+    # Exercised by tests/test_observability_otlp.py via an in-memory span
+    # exporter — no network. Mirrors the `otlp` extra.
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
 ]
 audit = ["pip-audit==2.10.1"]
 

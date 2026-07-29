@@ -247,6 +247,28 @@ an index span; the bundled `mms` server does not wire that stage.
 
 Setting `MEMTOMEM_STM_LANGFUSE__ENABLED=true` without first installing the `[langfuse]` extra raises a `ValueError` at startup (fail-fast since v0.1.16) — install the extra first, or leave `enabled=false` / unset. The old silent-disable-with-WARNING behavior is gone, so a typo in your config no longer leaves tracing quietly off.
 
+### OTLP Span Export (optional)
+
+```bash
+pip install "memtomem-stm[otlp]"
+# or with uv:
+uv pip install "memtomem-stm[otlp]"
+
+export MEMTOMEM_STM_OTLP__ENABLED=true
+export MEMTOMEM_STM_OTLP__ENDPOINT=http://localhost:4318   # or a full .../v1/traces URL
+export MEMTOMEM_STM_OTLP__SAMPLING_RATE=1.0                # 0.0–1.0
+export MEMTOMEM_STM_OTLP__FLUSH_TIMEOUT_SECONDS=5          # whole-shutdown budget
+```
+
+Exports STM's spans over OTLP/HTTP to any OpenTelemetry collector, with real
+trace/span ids and real parentage (`proxy_call` → `upstream_rpc` and the
+pipeline stages). Attributes are body-free by construction: no response
+content, no error messages, no tool arguments.
+Independent of Langfuse — both can run at once. Same fail-fast contract as
+above: `ENABLED=true` without the extra, or with a malformed endpoint, raises
+at startup. Full key list, attribute vocabulary and degradation policy:
+[otlp-export.md](otlp-export.md).
+
 ## Config File: `~/.memtomem/stm_proxy.json`
 
 Representative configuration (see the linked reference for omitted fields):

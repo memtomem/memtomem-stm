@@ -13,6 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
+- **Behavior change**: STM can now export its own spans over OTLP/HTTP to an
+  OpenTelemetry collector (`MEMTOMEM_STM_OTLP__ENABLED=1`). This is a new
+  **outbound network path** and is off by default; enabling it requires the
+  new `otlp` extra. Exported attributes are body-free by construction — no
+  response content, no error messages, no tool arguments. See
+  [OTLP Span Export](docs/otlp-export.md).
+- **Behavior change**: root STM startup-configuration validation errors no
+  longer render pydantic's `input_value`. A block that failed to coerce as a
+  whole previously echoed it verbatim in the error the server logs and
+  surfaces to MCP clients, which could include `otlp.headers` or
+  `langfuse.secret_key`. Two limits worth knowing: it covers errors raised
+  through `STMConfig` (validating a sub-model directly still renders
+  `input_value`), and it covers that field only — a validator that
+  deliberately interpolates a value into its own message (e.g. `daemon.host`)
+  still shows it.
+
 - **Behavior change**: Toolgraph identity-bearing request and verdict fields
   that contain a lone surrogate are now refused as protocol errors under
   `on_protocol_error`; they are never non-injectively escaped. That knob
@@ -40,6 +56,17 @@ changes inline only. See the deprecation policy in
   syncmill) instead of a generic adapter, plus a `docs/adr/` index and drift
   pins for the paths and claims the ADR makes. Stage ordering/status lives in
   the tracking issue (#789). (#790)
+- observability: opt-in OTLP/HTTP span export, satisfying ADR 0001's
+  `otlp-telemetry-export` gate. Spans carry real W3C trace/span ids and real
+  in-process parentage — `proxy_call` with the pipeline stages and a new
+  `upstream_rpc` span nested under it — rather than anything reconstructed
+  from the selection log. Attributes are admitted per span and only when STM
+  itself derived the value, so response content, error messages, tool
+  arguments and configured header values never become telemetry. (Headers are
+  still sent as HTTP headers on the export request — that is what
+  authenticates STM to the collector.)
+  Enable with the `otlp` extra and `MEMTOMEM_STM_OTLP__*`; counters surface
+  in `stm_proxy_health`. (#789)
 
 ### Fixed
 

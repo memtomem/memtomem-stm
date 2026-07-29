@@ -106,7 +106,7 @@ be satisfied before the planned work starts.
 | Toolgraph policy bundle | in | Toolgraph | JSON file | Immutable whole-file artifact | `schema_version` (int, owner-declared) | decision metadata only — no tool-call content | `graph_state` (`instance_id`, `generation`), catalog/governance digests, `bundle_digest` (exact-byte integrity identifier, not a signature) | shipped |
 | Toolgraph stdio consult | in | Toolgraph | stdio MCP | Live MCP consult | **unversioned** (consumed as-is) | tool names/metadata only — no tool-call content | `graph_generation` | shipped |
 | Selection log | out | STM | JSONL file | Append-only event stream | `schema_version` (int) | structural redaction (args as digest + length) + privacy screen | `selection_id` (selection/execution join key); `trace_id` (application correlation id, propagated across MCP boundaries — not an OpenTelemetry trace/span identity) | shipped (no external consumer yet) |
-| tracegraph telemetry | out | external standard | OTLP/OpenInference | Outbound telemetry | adopt-external-standard | body-free attributes (design round to confirm) | real span/parent/links (TBD at design) | `otlp-telemetry-export` |
+| OTLP span export (tracegraph) | out | external standard | OTLP/HTTP | Outbound telemetry | adopt-external-standard | body-free by construction — per-span attribute map admitting only STM-derived values (spans whose metadata comes from MCP arguments export none), surviving strings privacy-screened, no tool arguments in any form, error class names only, explicit resource (no `OTEL_RESOURCE_ATTRIBUTES`) | real W3C trace/span ids with in-process parentage (`src/memtomem_stm/observability/otlp.py`); the app-level `trace_id` rides as an attribute and is never promoted to trace identity; `read_more` is a root correlated by attribute, link deferred | shipped |
 | agent-guard consult | in | agent-guard | MCP | Live MCP consult | unversioned today — **inventoried, not integrated** | **content-bearing** (request-time tool I/O leaves the proxy) — TBD, gate-controlled | TBD | `content-egress-consult` |
 | vigil | — | — | — | no contract defined yet | — | — | — | `vigil-trigger` |
 | syncmill `serve` | in | syncmill | MCP | Ordinary proxied upstream | peer-owned; no ecosystem contract applies | content-bearing, no general ingress redaction — credential scanning gates the enabled persistence/egress paths (external-LLM compression, response-cache writes, auto-index/extraction), not passthrough | generic `_trace_id` on live calls; no syncmill-specific identifier | none needed |
@@ -128,7 +128,9 @@ Two statements the matrix makes explicit:
 ## Deferral gates
 
 - **`otlp-telemetry-export`** — criteria: none; no additional external
-  evidence is required before designing the tracegraph exporter.
+  evidence was required before designing the exporter. **Satisfied**: shipped
+  as `src/memtomem_stm/observability/otlp.py`, operator documentation in
+  [OTLP Span Export](../otlp-export.md).
 - **`content-egress-consult`** — agent-guard publishes a versioned
   result/error contract, **and** the operator approves the new
   content-egress boundary (request-time tool I/O leaving the proxy: opt-in

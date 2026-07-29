@@ -412,13 +412,20 @@ class TestLangfuseTracing:
     """MVP wiring: call_tool() wraps the pipeline in a Langfuse observation.
 
     These tests patch the module-level ``_langfuse_client`` singleton in
-    ``memtomem_stm.observability.tracing``. When no client is set (default),
-    ``traced()`` returns ``nullcontext()`` — which is the path every other
-    test in this file already exercises implicitly.
+    ``memtomem_stm.observability.tracing``. They also pin the OTLP emitter to
+    ``None`` (the autouse fixture below): with no client *and* no emitter,
+    ``traced()`` returns ``nullcontext()`` — the path every other test in this
+    file already exercises implicitly. Stating that as "no client means
+    nullcontext" would be false since the fan-out gained a second consumer.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_otlp_emitter(self, monkeypatch):
+        """Isolate these Langfuse-only assertions from the OTLP consumer."""
+        monkeypatch.setattr("memtomem_stm.observability.otlp._emitter", None)
+
     def test_traced_no_client_returns_nullcontext(self, monkeypatch):
-        """Without a configured Langfuse client, traced() is a no-op context manager."""
+        """With neither consumer producing a leg, traced() is a no-op."""
         monkeypatch.setattr("memtomem_stm.observability.tracing._langfuse_client", None)
         from memtomem_stm.observability.tracing import traced
 
@@ -502,10 +509,15 @@ class TestLangfuseTracing:
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
 
-        mock_client.start_as_current_observation.assert_called_once()
-        call = mock_client.start_as_current_observation.call_args
-        assert call.kwargs["name"] == "proxy_call"
-        assert call.kwargs["metadata"]["server"] == "srv"
+        # The outer proxy_call span is still opened first, and the upstream
+        # RPC gets its own nested span even on the failure path (#789) —
+        # upstream-vs-pipeline time is exactly what a failure is worth
+        # attributing.
+        calls = mock_client.start_as_current_observation.call_args_list
+        span_names = [c.kwargs["name"] for c in calls]
+        assert span_names[0] == "proxy_call"
+        assert "upstream_rpc" in span_names
+        assert calls[0].kwargs["metadata"]["server"] == "srv"
 
 
 # ── Surfacing tool spans ─────────────────────────────────────────────────

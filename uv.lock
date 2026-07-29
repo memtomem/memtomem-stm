@@ -1633,6 +1633,11 @@ langfuse = [
     { name = "langfuse" },
     { name = "urllib3" },
 ]
+otlp = [
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+    { name = "urllib3" },
+]
 
 [package.dev-dependencies]
 audit = [
@@ -1644,6 +1649,8 @@ dev = [
     { name = "mypy" },
     { name = "nbclient" },
     { name = "nbmake" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -1662,6 +1669,8 @@ requires-dist = [
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=4.0" },
     { name = "langsmith", marker = "extra == 'langchain'", specifier = ">=0.8.18" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.28.1" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otlp'", specifier = ">=1.30" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otlp'", specifier = ">=1.30" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "pyjwt", specifier = ">=2.13.0" },
@@ -1671,8 +1680,9 @@ requires-dist = [
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "urllib3", marker = "extra == 'langchain'", specifier = ">=2.7.0" },
     { name = "urllib3", marker = "extra == 'langfuse'", specifier = ">=2.7.0" },
+    { name = "urllib3", marker = "extra == 'otlp'", specifier = ">=2.7.0" },
 ]
-provides-extras = ["langfuse", "langchain"]
+provides-extras = ["langfuse", "otlp", "langchain"]
 
 [package.metadata.requires-dev]
 audit = [{ name = "pip-audit", specifier = "==2.10.1" }]
@@ -1682,6 +1692,8 @@ dev = [
     { name = "mypy", specifier = ">=1.14" },
     { name = "nbclient", specifier = ">=0.10" },
     { name = "nbmake", specifier = ">=1.5" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.30" },
+    { name = "opentelemetry-sdk", specifier = ">=1.30" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "pytest-cov", specifier = ">=6.0" },

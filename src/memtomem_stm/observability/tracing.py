@@ -2,10 +2,11 @@
 
 The mechanism, in the three terms the rest of this module uses:
 
-- A **consumer factory** (``_langfuse_leg()`` today) is called once per
-  ``traced()`` call and returns either a **leg** — a context manager for that
-  one consumer — or ``None``, which means that consumer contributes nothing to
-  this call. A factory decides on its own what makes it return ``None``.
+- A **consumer factory** (``_langfuse_leg()`` and ``_otlp_leg()``) is called
+  once per ``traced()`` call and returns either a **leg** — a context manager
+  for that one consumer — or ``None``, which means that consumer contributes
+  nothing to this call. A factory decides on its own what makes it return
+  ``None``.
 - ``traced()`` calls every factory, discards the ``None``s, and returns
   ``nullcontext()`` when no factory produced a leg. Otherwise it returns a
   ``_FanOut`` over the legs it did get.
@@ -15,9 +16,10 @@ The mechanism, in the three terms the rest of this module uses:
 The factory list is deliberately hard-wired here — no registry, no adapter
 base class, no shared event format. Each consumer keeps its own construction,
 sampling and failure policy. This is the per-boundary shape ADR 0001
-prescribes, not the generic provider registry it defers. Langfuse is the only
-consumer today; the fan-out exists so a second one can be added without
-touching the call sites.
+prescribes, not the generic provider registry it defers. There are two
+consumers: Langfuse (``_langfuse_leg``) and OTLP span export
+(``_otlp_leg``), and neither knows about the other — they do not share a data
+shape, and what one exports is decided entirely in its own module.
 
 Every leg must be *self-safe*: entering or exiting it may never raise, because
 ``traced()`` wraps the proxy and surfacing hot paths and tracing must never
@@ -196,6 +198,25 @@ def _langfuse_leg(name: str, **kwargs: Any) -> Any:
         return None
 
 
+def _otlp_leg(name: str, **kwargs: Any) -> Any:
+    """The OTLP consumer factory: return a leg, or None for this call.
+
+    Returns ``None`` when no emitter is running (export disabled, SDK absent,
+    or shutdown already detached it). The emitter applies its own head
+    sampling through the SDK sampler, so there is no sampling check here.
+    """
+    from memtomem_stm.observability.otlp import get_otlp
+
+    emitter = get_otlp()
+    if emitter is None:
+        return None
+    try:
+        return emitter.span(name, kwargs.get("metadata"))
+    except Exception:
+        _log_observation_failure("otlp creation")
+        return None
+
+
 def traced(name: str, **kwargs: Any) -> Any:
     """Return a context manager over every leg the consumer factories built.
 
@@ -206,7 +227,9 @@ def traced(name: str, **kwargs: Any) -> Any:
     degrades to a no-op — per the module contract, tracing failures must
     never break the traced call.
     """
-    legs = [leg for leg in (_langfuse_leg(name, **kwargs),) if leg is not None]
+    legs = [
+        leg for leg in (_langfuse_leg(name, **kwargs), _otlp_leg(name, **kwargs)) if leg is not None
+    ]
     if not legs:
         return nullcontext()
     return _FanOut(legs)
