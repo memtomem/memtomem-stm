@@ -686,6 +686,85 @@ class TestDisplayEscaping:
         self._assert_clean(res.output)
 
 
+class TestRemainingRawRendersEscape:
+    """The three surfaces the #785 sweep left raw in this module (#786).
+
+    ``last_seen`` is typed as a bare ``str``, so ``projects.toml`` decides its
+    contents; TOML basic strings admit ``\\r`` and ``\\u001B`` escapes, which is
+    the reachability that gives this a severity (a lone surrogate is *not*
+    reachable here — ``tomllib`` refuses a non-scalar escape). The two error
+    renders carry a HOME-derived path, where an undecodable byte does become a
+    lone surrogate via ``surrogateescape``.
+    """
+
+    HOSTILE = "20\x1b[31m\r26-01-01T00:00:00Z"
+
+    def test_list_escapes_last_seen(self, runner, sandbox):
+        runner.invoke(project_group, ["init", "--name", "clean"])
+        idx = state.load_projects_index()
+        idx.projects[0].last_seen = self.HOSTILE
+        state.save_projects_index(idx)
+
+        res = runner.invoke(project_group, ["list"])
+
+        assert res.exit_code == 0, res.output
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        assert "\x1b" not in res.output and "\r" not in res.output
+
+    def test_list_last_seen_survives_a_toml_round_trip(self, runner, sandbox):
+        """The escape is at the render, so the stored value stays verbatim.
+
+        Deliberately NOT a render test, and the only one here that isn't: it
+        stays green when the render above is reverted to raw, because what it
+        pins is the opposite direction — the constraint carried over from #785
+        that escaping a value which is also *written* would rewrite
+        ``projects.toml`` on the next save. It doubles as the reachability
+        proof that TOML really does deliver these characters rather than
+        rejecting them at load.
+        """
+        runner.invoke(project_group, ["init", "--name", "clean"])
+        idx = state.load_projects_index()
+        idx.projects[0].last_seen = self.HOSTILE
+        state.save_projects_index(idx)
+
+        assert state.load_projects_index().projects[0].last_seen == self.HOSTILE
+
+    def test_list_prune_write_lock_timeout_escapes_the_lock_path(
+        self, runner, sandbox, monkeypatch
+    ):
+        """``list --prune`` catches the timeout itself, not via the decorator.
+
+        Targeted at that catch specifically: routing through a decorated
+        command instead would pass even with this site left raw, since
+        ``_write_lock`` escapes on its own.
+        """
+        hostile_lock = Path("/tmp") / "lo\x1b[31m\rck" / ".mms.lock"
+
+        def _boom(*args, **kwargs):
+            raise state.WriteLockTimeout(hostile_lock, 5.0)
+
+        monkeypatch.setattr(state, "write_lock", _boom)
+        res = runner.invoke(project_group, ["list", "--prune"])
+
+        assert res.exit_code != 0
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        assert "\x1b" not in res.output and "\r" not in res.output
+
+    def test_config_error_escapes_the_rendered_path(self, runner, sandbox, monkeypatch):
+        hostile = "/tmp/re\x1b[31m\rgistry.toml"
+
+        def _boom(*args, **kwargs):
+            raise state.MmsConfigError(f"unreadable: {hostile}")
+
+        runner.invoke(project_group, ["init", "--name", "clean"])
+        monkeypatch.setattr(state, "load_registry", _boom)
+        res = runner.invoke(project_group, ["route"])
+
+        assert res.exit_code != 0
+        assert "\\u001B" in res.output and "\\u000D" in res.output
+        assert "\x1b" not in res.output and "\r" not in res.output
+
+
 class TestShowFallbackBranchesEscapePaths:
     """The two no-marker branches rendered ``cwd`` and the git root raw (#780).
 

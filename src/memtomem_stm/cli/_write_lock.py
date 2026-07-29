@@ -17,6 +17,7 @@ from typing import Any, TypeVar
 
 import click
 
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.mms import state
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -67,7 +68,7 @@ def with_write_lock(f: F) -> F:
             with state.write_lock(enabled=enabled):
                 return f(*args, **kwargs)
         except state.WriteLockTimeout as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(_disp(str(exc))) from exc
 
     return wrapper  # type: ignore[return-value]
 
@@ -120,7 +121,7 @@ def hook_hosts_write_lock(*, enabled: bool) -> Iterator[None]:
         ):
             yield
     except state.WriteLockTimeout as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(_disp(str(exc))) from exc
 
 
 def with_config_write_lock(
@@ -179,7 +180,7 @@ def with_config_write_lock(
 
                     ctx = click.get_current_context(silent=True)
                     action = ctx.command.name if ctx and ctx.command.name else f.__name__
-                    click.echo(f"Error: {exc}", err=True)
+                    click.echo(f"Error: {_disp(str(exc))}", err=True)
                     click.echo(
                         _json_dumps(
                             {
@@ -193,7 +194,7 @@ def with_config_write_lock(
                         )
                     )
                     _sys.exit(1)
-                raise click.ClickException(str(exc)) from exc
+                raise click.ClickException(_disp(str(exc))) from exc
 
         return wrapper  # type: ignore[return-value]
 

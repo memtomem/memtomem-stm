@@ -323,7 +323,7 @@ def list_cmd(prune: bool, json_output: bool) -> None:
                     state.save_projects_index(new_idx)
                     idx = new_idx
     except state.WriteLockTimeout as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(_disp(str(exc))) from exc
 
     def _is_current(entry: state.ProjectIndexEntry) -> bool:
         return Path(entry.path).resolve() == cwd
@@ -354,7 +354,8 @@ def list_cmd(prune: bool, json_output: bool) -> None:
     for entry in idx.projects:
         marker = "*" if _is_current(entry) else " "
         click.echo(
-            f"{marker} {_disp(entry.name)}\t{_disp(str(entry.path))}\t(last seen {entry.last_seen})"
+            f"{marker} {_disp(entry.name)}\t{_disp(str(entry.path))}\t"
+            f"(last seen {_disp(entry.last_seen)})"
         )
 
 
@@ -463,7 +464,7 @@ def route_cmd(
         project = _resolve_project_for_mutation(project_name)
         registry = state.load_registry()
     except state.MmsConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(_disp(str(exc))) from exc
 
     assert project.config is not None and project.marker_path is not None
     enabled = list(project.config.mcp.enabled)

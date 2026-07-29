@@ -676,7 +676,7 @@ def _build_apply_prompt(
         for row in removed_rows:
             lines.append(
                 f"  - {_disp(row['name'])} (last seen: {_disp(row['source_label'])}, "
-                f"{row['last_imported']})"
+                f"{_disp(row['last_imported'])})"
             )
         lines.append("")
     if restamp_rows:
@@ -775,7 +775,7 @@ def _render_sync_text(
         for row in remove_rows:
             w(
                 f"    - {_disp(row['name'])} (last seen: {_disp(row['source_label'])}, "
-                f"{row['last_imported']})"
+                f"{_disp(row['last_imported'])})"
             )
     if backfill_rows:
         n = len(backfill_rows)
@@ -788,7 +788,7 @@ def _render_sync_text(
         for row in cleanup_rows:
             w(
                 f"    - {_disp(row['name'])} (last seen: {_disp(row['source_label'])}, "
-                f"{row['last_imported']})"
+                f"{_disp(row['last_imported'])})"
             )
     if restamp_rows:
         n = len(restamp_rows)
@@ -852,29 +852,30 @@ def _render_sync_text(
         if summary["added"]:
             w(
                 f"Wrote {summary['added']} new entr{_ies_or_y(summary['added'])} "
-                f"to {state.registry_path()}"
+                f"to {_disp(str(state.registry_path()))}"
             )
         if summary["removed"]:
             w(
                 f"Removed {summary['removed']} entr{_ies_or_y(summary['removed'])} "
-                f"from {state.registry_path()}"
+                f"from {_disp(str(state.registry_path()))}"
             )
         if summary["backfilled"]:
             w(
                 f"Backfilled {summary['backfilled']} sidecar "
                 f"row{'' if summary['backfilled'] == 1 else 's'} "
-                f"in {state.import_state_path()}"
+                f"in {_disp(str(state.import_state_path()))}"
             )
         if summary["cleanup"]:
             w(
                 f"Removed {summary['cleanup']} stale sidecar "
                 f"entr{_ies_or_y(summary['cleanup'])} "
-                f"from {state.import_state_path()}"
+                f"from {_disp(str(state.import_state_path()))}"
             )
         if summary["restamped"]:
             w(
                 f"Re-stamped {summary['restamped']} entr{_ies_or_y(summary['restamped'])} "
-                f"(registry + sidecar) — {state.registry_path()}, {state.import_state_path()}"
+                f"(registry + sidecar) — {_disp(str(state.registry_path()))}, "
+                f"{_disp(str(state.import_state_path()))}"
             )
 
 
