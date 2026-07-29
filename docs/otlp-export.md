@@ -159,13 +159,24 @@ Never exported, by policy:
 STM config wins wherever it is set; the standard `OTEL_EXPORTER_OTLP_*`
 environment variables still supply what it does not (TLS material,
 compression). That is the "adopt the external standard" contract of ADR
-0001 — with the resource exception above.
+0001 — with two exceptions, both for the same reason.
+
+The resource, as above. And **headers**: with `otlp.enabled=true`, setting
+`OTEL_EXPORTER_OTLP_HEADERS` or `OTEL_EXPORTER_OTLP_TRACES_HEADERS` is a
+startup error telling you to use `MEMTOMEM_STM_OTLP__HEADERS` instead. The
+exporter resolves headers as "STM's mapping, or else the environment", so an
+empty mapping would hand the credential-bearing channel to a parser that logs
+a malformed value verbatim — bypassing the syntax check below. Refusing the
+variable is simpler to reason about than validating around it.
 
 ## Degradation
 
 Invalid configuration fails startup. Everything at runtime degrades open: a
 telemetry consumer is never a dependency of the calls it accounts for.
 
+- The standard header environment variables are refused when export is
+  enabled (see *What is exported* above) so every header STM sends has passed
+  the check below.
 - Header syntax is checked at startup. A value carrying a control character
   — a newline in an `authorization` token, say — would otherwise be rejected
   deep in the export path by a layer that logs the rejection *with the value*.

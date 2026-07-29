@@ -117,6 +117,37 @@ class OtlpExportConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _reject_standard_header_env(self) -> "OtlpExportConfig":
+        """Own the header channel outright when export is enabled.
+
+        The exporter resolves headers as ``headers or parse_env_headers(...)``,
+        so an empty STM mapping hands the channel to
+        ``OTEL_EXPORTER_OTLP_HEADERS`` / ``..._TRACES_HEADERS`` — bypassing
+        :meth:`_validate_header_syntax`, and letting the SDK's parser log a
+        malformed value verbatim while it constructs the exporter. Since that
+        value is the one carrying the credential, STM refuses the variables
+        rather than validating around them.
+
+        This is the one place STM narrows the "standard OTel env fills what
+        config does not" contract; TLS material, compression and the rest are
+        untouched.
+        """
+        if not self.enabled:
+            return self
+        import os
+
+        for name in ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "OTEL_EXPORTER_OTLP_HEADERS"):
+            if os.environ.get(name):
+                raise ValueError(
+                    f"{name} is set, but STM owns the OTLP header channel when "
+                    "otlp.enabled=true — the SDK would consume it without the "
+                    "syntax check that keeps a malformed credential out of the "
+                    "logs. Move it to MEMTOMEM_STM_OTLP__HEADERS and unset "
+                    f"{name} (value withheld)."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _validate_header_syntax(self) -> "OtlpExportConfig":
         """Reject headers the HTTP layer would refuse — before it sees them.
 
@@ -181,9 +212,13 @@ class OtlpExportConfig(BaseModel):
         return self
 
 
-# RFC 7230: a header name is a token; a value is visible ASCII plus space and
-# horizontal tab, with no leading or trailing whitespace. Notably this excludes
-# CR and LF, which is the case that would otherwise reach a logger.
+# A header name must be an RFC 7230 token. For values STM is deliberately
+# *stricter* than the HTTP stack: visible ASCII plus space and horizontal tab,
+# no leading or trailing whitespace. RFC 7230 also permits obs-text
+# (\x80-\xff) and the requests stack accepts it, but a Latin-1 header value has
+# no use here and narrowing the grammar keeps this check easy to reason about.
+# What matters is the exclusion of CR and LF — the case that would otherwise
+# reach a logger.
 _HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _HEADER_VALUE_RE = re.compile(r"[\x21-\x7e]([\x20\x09\x21-\x7e]*[\x21-\x7e])?|")
 

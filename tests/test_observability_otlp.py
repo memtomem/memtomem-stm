@@ -621,6 +621,36 @@ class TestConfig:
         assert SECRET not in str(excinfo.value)
 
     @pytest.mark.parametrize(
+        "var", ["OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"]
+    )
+    def test_standard_header_env_is_refused_when_enabled(self, monkeypatch, var, caplog):
+        """The SDK would consume these without STM's syntax check.
+
+        `headers or parse_env_headers(...)` means an empty STM mapping hands
+        the channel to the environment, and the SDK's parser logs a malformed
+        value verbatim while constructing the exporter — the same credential
+        leak the syntax check closes, through a different door.
+        """
+        monkeypatch.setenv(var, f"authorization={SECRET}\ninvalid")
+
+        with caplog.at_level("DEBUG"):
+            with pytest.raises(ValueError) as excinfo:
+                OtlpExportConfig(enabled=True, endpoint="http://localhost:4318")
+
+        assert var in str(excinfo.value)
+        assert SECRET not in str(excinfo.value)
+        assert all(SECRET not in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        "var", ["OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"]
+    )
+    def test_standard_header_env_is_ignored_when_disabled(self, monkeypatch, var):
+        """Positive control: the refusal is scoped to enabled export."""
+        monkeypatch.setenv(var, f"authorization={SECRET}")
+
+        assert OtlpExportConfig().enabled is False
+
+    @pytest.mark.parametrize(
         "headers",
         [
             {"authorization": "Bearer token-123"},

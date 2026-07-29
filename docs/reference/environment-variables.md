@@ -65,6 +65,12 @@ daemon across standalone proxy processes.
 Off by default and requires the `otlp` extra. Read once at startup. Full
 attribute vocabulary and degradation policy: [OTLP Span Export](../otlp-export.md).
 
+Standard `OTEL_EXPORTER_OTLP_*` variables still supply what STM's config does
+not (TLS material, compression) — except the header ones:
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` are a
+startup error when `MEMTOMEM_STM_OTLP__ENABLED=1`, because the SDK would
+consume them without STM's syntax check and could log a malformed credential.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `MEMTOMEM_STM_OTLP__ENABLED` | `false` | Export STM's spans over OTLP/HTTP |
