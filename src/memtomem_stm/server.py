@@ -1118,6 +1118,7 @@ def _otlp_health_lines() -> list[str]:
         f"  spans: {counters['spans_started']} started, {counters['spans_ended']} ended",
         f"  export failures: {counters['export_failures']}",
         f"  attributes redacted: {counters['attributes_redacted']}",
+        f"  logs redacted: {counters['logs_redacted']}",
         f"  shutdown flush timeouts: {counters['shutdown_flush_timeout']}",
     ]
 

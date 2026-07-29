@@ -13,6 +13,7 @@ directly.
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 import sys
 import threading
@@ -620,6 +621,13 @@ class TestConfig:
 
         assert SECRET not in str(excinfo.value)
 
+    def test_a_secret_shaped_header_name_is_withheld_too(self):
+        """A credential is itself a valid RFC 7230 token, so it can be the name."""
+        with pytest.raises(ValueError) as excinfo:
+            OtlpExportConfig(enabled=True, endpoint="http://localhost:4318", headers={SECRET: "\n"})
+
+        assert SECRET not in str(excinfo.value)
+
     @pytest.mark.parametrize(
         "var", ["OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"]
     )
@@ -1001,6 +1009,49 @@ print("exited-cleanly")
 
 
 # ── Health surface ───────────────────────────────────────────────────────
+
+
+class TestSdkLogScreen:
+    """The SDK logs before the exporter wrapper can sanitize what it says."""
+
+    def test_a_reflected_secret_in_an_sdk_log_is_redacted(self, emitter_and_exporter, caplog):
+        """A collector echoing the token into its reason phrase must not log it.
+
+        Reproduced against the locked SDK before the screen existed: the whole
+        token appeared in `Failed to export span batch code: 401, reason: …`.
+        """
+        emitter, _ = emitter_and_exporter
+        sdk_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+
+        with caplog.at_level("DEBUG"):
+            sdk_logger.error("Failed to export span batch code: 401, reason: token %s", SECRET)
+
+        assert all(SECRET not in record.getMessage() for record in caplog.records)
+        assert any("withheld" in record.getMessage() for record in caplog.records)
+        assert emitter.snapshot()["logs_redacted"] == 1
+
+    def test_a_clean_sdk_log_is_left_alone(self, emitter_and_exporter, caplog):
+        """Positive control: the retry detail an operator needs must survive."""
+        emitter, _ = emitter_and_exporter
+        sdk_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+
+        with caplog.at_level("DEBUG"):
+            sdk_logger.error("Failed to export span batch code: 503, reason: Service Unavailable")
+
+        assert any("Service Unavailable" in record.getMessage() for record in caplog.records)
+        assert emitter.snapshot()["logs_redacted"] == 0
+
+    def test_the_screen_is_installed_once(self, emitter_and_exporter):
+        """Re-initialization must not stack filters on the SDK logger."""
+        from memtomem_stm.observability.otlp import _LogScreen
+
+        init_otlp(
+            OtlpExportConfig(enabled=True, endpoint="http://localhost:4318"),
+            span_processor=SimpleSpanProcessor(InMemorySpanExporter()),
+        )
+
+        sdk_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+        assert sum(isinstance(f, _LogScreen) for f in sdk_logger.filters) == 1
 
 
 class TestHealthLines:

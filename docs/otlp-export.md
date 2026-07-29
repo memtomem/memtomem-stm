@@ -189,11 +189,17 @@ telemetry consumer is never a dependency of the calls it accounts for.
 - A failed export is counted (`export_failures`). STM's own warning about it
   is emitted **once** per process and then drops to DEBUG. That rate limit
   covers STM's message only — the OpenTelemetry exporter logs its own ERROR
-  for every failed batch, and those are left alone deliberately: they carry
-  the retry and status detail an operator needs to diagnose a collector
-  outage. To quieten them, raise the level of the
-  `opentelemetry.exporter.otlp` logger. Proxied calls are unaffected either
-  way.
+  for every failed batch, and those are kept: they carry the retry and status
+  detail an operator needs to diagnose a collector outage. To quieten them,
+  raise the level of the `opentelemetry.exporter.otlp` logger. Proxied calls
+  are unaffected either way.
+- Those SDK records are **screened before they are emitted**. The exporter
+  logs before returning, so the wrapper that counts failures cannot sanitize
+  what it says — and what it says is not always STM's: a collector that
+  reflects your token into its HTTP reason phrase would otherwise have it
+  logged verbatim. A record whose text trips the privacy screen is replaced
+  with a withheld-detail message and counted as `logs_redacted`; a clean
+  record is passed through untouched.
 - Queue-overflow drops are logged by the SDK and are deliberately *not*
   folded into `export_failures` — that counter means "an export attempt
   failed", not "a span was lost".
@@ -210,6 +216,7 @@ OTLP Span Export
   spans: 128 started, 128 ended
   export failures: 0
   attributes redacted: 0
+  logs redacted: 0
   shutdown flush timeouts: 0
 ```
 

@@ -165,10 +165,13 @@ class OtlpExportConfig(BaseModel):
                     "(RFC 7230 token characters only; name and value withheld)."
                 )
             if not _HEADER_VALUE_RE.fullmatch(value):
+                # The name is withheld too: a credential is itself a valid
+                # RFC 7230 token, so `headers={"<token>": "\n"}` would print
+                # the secret while reporting that its value is malformed.
                 raise ValueError(
-                    f"OtlpExportConfig.headers[{name!r}] has an invalid value — "
-                    "no control characters, and no leading or trailing "
-                    "whitespace (value withheld)."
+                    "OtlpExportConfig.headers contains an invalid value — no "
+                    "control characters, and no leading or trailing whitespace "
+                    "(name and value withheld)."
                 )
         return self
 

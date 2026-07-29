@@ -160,6 +160,69 @@ def _screen_attributes(
     return attributes, redacted
 
 
+class _LogScreen(logging.Filter):
+    """Redact SDK log records whose text trips the privacy screen.
+
+    The exporter logs before returning, so :class:`_CountingExporter` cannot
+    sanitize what it says — and what it says is not always ours. A collector
+    that reflects the configured token into its HTTP reason phrase gets it
+    logged verbatim (reproduced against the locked SDK), and any future SDK
+    message could carry an endpoint path or header the same way.
+
+    Screening the records themselves closes the channel rather than the one
+    instance: a clean message is left completely alone, so the retry and
+    status detail an operator needs survives, while a message carrying
+    secret-shaped text is replaced.
+    """
+
+    def __init__(self, counters: _Counters) -> None:
+        super().__init__()
+        self._counters = counters
+
+    def retarget(self, counters: _Counters) -> None:
+        """Point an already-installed screen at the current emitter's counters."""
+        self._counters = counters
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # pragma: no cover - malformed record
+            return True
+        if not contains_sensitive_content(message):
+            return True
+        record.msg = (
+            "OTLP exporter reported a failure whose detail matched the privacy "
+            "screen and was withheld (level %s)" % record.levelname
+        )
+        record.args = ()
+        self._counters.bump("logs_redacted")
+        return True
+
+
+# The SDK loggers that can render exporter-supplied text.
+_SDK_LOGGERS = (
+    "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+    "opentelemetry.exporter.otlp.proto.http",
+    "opentelemetry.util.re",
+)
+
+
+def _install_log_screen(counters: _Counters) -> None:
+    """Attach the screen once per logger, rebinding it to the live counters.
+
+    Idempotent across re-inits: adding a second filter would double-count, but
+    leaving the first one bound to a dead emitter's counters would report
+    redactions nobody can read. So an existing screen is retargeted instead.
+    """
+    for name in _SDK_LOGGERS:
+        logger_obj = logging.getLogger(name)
+        existing = next((f for f in logger_obj.filters if isinstance(f, _LogScreen)), None)
+        if existing is not None:
+            existing.retarget(counters)
+            continue
+        logger_obj.addFilter(_LogScreen(counters))
+
+
 class _CountingExporter:
     """Wrap a ``SpanExporter`` so export failures are observable.
 
@@ -205,6 +268,7 @@ class _Counters:
         "spans_ended",
         "export_failures",
         "attributes_redacted",
+        "logs_redacted",
         "shutdown_flush_timeout",
     )
 
@@ -436,6 +500,7 @@ def init_otlp(config: OtlpExportConfig, *, span_processor: Any = None) -> OtlpEm
     from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
     counters = _Counters()
+    _install_log_screen(counters)
     provider = TracerProvider(
         # Resource(...) directly, never Resource.create(): the latter runs the
         # environment detector, and OTEL_RESOURCE_ATTRIBUTES would then reach
