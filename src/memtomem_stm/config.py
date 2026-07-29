@@ -280,6 +280,25 @@ def normalize_otlp_endpoint(endpoint: str) -> str:
     if any(char.isspace() for char in host):
         raise ValueError("OTLP endpoint host must not contain whitespace (value withheld).")
     path = parts.path if parts.path not in ("", "/") else "/v1/traces"
+    # The transport logs its request line — `POST <path> HTTP/1.1` — at DEBUG
+    # on every *successful* export, so a credential in the path is written out
+    # in full by a logger STM does not own. Screening that logger would mean
+    # mutating urllib3 process-wide for every library sharing it; refusing the
+    # endpoint is the boundary STM actually controls. Credentials belong in
+    # otlp.headers, which is validated and never logged.
+    from urllib.parse import unquote
+
+    from memtomem_stm.proxy.privacy import contains_sensitive_content
+
+    # urllib3's successful-request DEBUG record renders `scheme://host:port
+    # "METHOD path HTTP/1.1"`, so the host is as loggable as the path.
+    for candidate in (path, unquote(path), parts.netloc, unquote(parts.netloc)):
+        if contains_sensitive_content(candidate):
+            raise ValueError(
+                "OTLP endpoint looks like it carries a credential in its host "
+                "or path — the HTTP transport logs both, so put it in "
+                "otlp.headers instead (value withheld)."
+            )
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 

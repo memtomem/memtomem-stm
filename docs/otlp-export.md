@@ -57,7 +57,15 @@ itself when the path is empty or `/`.
 
 The endpoint is validated at startup, not at first export: it must be
 `http`/`https`, must carry a host, must not embed credentials (put those in
-`headers`), and must not carry a query or fragment. A malformed endpoint
+`headers`), and must not carry a query or fragment. Its **host and path** are screened
+too, because the HTTP transport logs `scheme://host:port "POST path"` on every
+successful export — a token in either would be written out in full by a
+logger STM does not own.
+
+**Redirects are refused.** A telemetry endpoint has no business answering
+3xx, and requests keeps non-`Authorization` headers across hosts — so a
+redirecting collector could otherwise walk your `x-api-key` to a host you
+never configured. A 3xx is a failed export. A malformed endpoint
 fails startup rather than becoming a permanent, quiet export failure.
 
 ## What is exported
@@ -193,13 +201,19 @@ telemetry consumer is never a dependency of the calls it accounts for.
   detail an operator needs to diagnose a collector outage. To quieten them,
   raise the level of the `opentelemetry.exporter.otlp` logger. Proxied calls
   are unaffected either way.
-- Those SDK records are **screened before they are emitted**. The exporter
-  logs before returning, so the wrapper that counts failures cannot sanitize
-  what it says — and what it says is not always STM's: a collector that
-  reflects your token into its HTTP reason phrase would otherwise have it
-  logged verbatim. A record whose text trips the privacy screen is replaced
-  with a withheld-detail message and counted as `logs_redacted`; a clean
-  record is passed through untouched.
+- Those SDK records are **screened before they are emitted**, on the two
+  OpenTelemetry loggers that render peer-supplied text. The exporter logs
+  before returning, so the wrapper that counts failures cannot sanitize what
+  it says — and what it says is not always STM's: a collector that reflects
+  your token into its HTTP reason phrase would otherwise have it logged
+  verbatim. Every channel a formatter can render is inspected (message,
+  `exc_info`, `stack_info`, `extra=` fields); a record that trips the screen
+  is **dropped** and counted as `logs_redacted`, and so is one that cannot be
+  rendered for inspection. A clean record passes through untouched.
+- The shared transport loggers (`urllib3`, `requests`) are deliberately *not*
+  filtered: every library in the process shares them, and silently dropping
+  another consumer's records is not STM's call. The material they would
+  render — the endpoint and the headers — is refused at config instead.
 - Queue-overflow drops are logged by the SDK and are deliberately *not*
   folded into `export_failures` — that counter means "an export attempt
   failed", not "a span was lost".
