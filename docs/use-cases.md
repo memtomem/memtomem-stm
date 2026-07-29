@@ -47,7 +47,7 @@ Caching avoids upstream I/O and latency. Model-input reduction comes from the
 cached compressed response, not from the cache hit itself. Write-like,
 credential-bearing, mixed-content, error, and transient-key responses are not
 assumed cacheable. Successful text responses with JSON-safe
-`structuredContent` or result `_meta` should hit cache v4 and reproduce the
+`structuredContent` or result `_meta` should hit cache v5 and reproduce the
 envelope exactly.
 
 ## Share one local LTM connection across agents

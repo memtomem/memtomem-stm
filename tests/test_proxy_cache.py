@@ -575,6 +575,38 @@ class TestMakeKey:
         k2 = _make_key("s", "t", {"a": 1}, context_query="q", config_fingerprint="fp")
         assert k1 == k2
 
+    def test_component_boundaries_are_framed(self):
+        # An unframed join lets a NUL inside one component shift the boundary:
+        # ("a\0b", "c") and ("a", "b\0c") joined with "\0" are the same string,
+        # so one call's cached row answered the other's (#784 case 1). Nothing
+        # on the path rejects a NUL in an upstream server or tool name.
+        assert _make_key("a\0b", "c", {}) != _make_key("a", "b\0c", {})
+
+    def test_nul_cannot_shift_across_distant_boundaries(self):
+        # The framing property must hold across EVERY boundary, not just the
+        # adjacent server/tool pair. ``json.dumps`` never emits a raw NUL of
+        # its own, so before framing, tool and config_fingerprint could trade
+        # content straight across the args serialization sitting between them:
+        # both of these joined to ``4\0s\0t\0{}\0{}\0f\0null``.
+        k1 = _make_key("s", "t\0{}", {}, config_fingerprint="f")
+        k2 = _make_key("s", "t", {}, config_fingerprint="{}\0f")
+        assert k1 != k2
+
+    def test_astral_scalar_does_not_alias_a_lone_surrogate_pair(self):
+        # ``ensure_ascii=True`` renders U+10000 as the text ``𐀀`` —
+        # byte-identical to a caller string holding those two lone code units,
+        # so the astral argument collided with the crafted pair (#784 case 2).
+        # ``chr()`` because a JSON boundary merges the pair on decode; the two
+        # code units have to be built in-process, which is also how they reach
+        # this function in production.
+        pair = chr(0xD800) + chr(0xDC00)
+        scalar = chr(0x10000)
+        assert pair != scalar
+        assert _make_key("s", "t", {"x": pair}) != _make_key("s", "t", {"x": scalar})
+        assert _make_key("s", "t", {}, context_query=pair) != _make_key(
+            "s", "t", {}, context_query=scalar
+        )
+
 
 class TestKeyComponentsRoundtrip:
     def test_same_args_different_query_are_separate_entries(self, proxy_cache: ProxyCache):
@@ -583,6 +615,15 @@ class TestKeyComponentsRoundtrip:
         assert proxy_cache.get("s", "t", {"a": 1}, context_query="q1") == "for-q1"
         assert proxy_cache.get("s", "t", {"a": 1}, context_query="q2") == "for-q2"
         assert proxy_cache.get("s", "t", {"a": 1}) is None  # no-query key untouched
+
+    def test_nul_shifted_names_are_separate_rows(self, proxy_cache: ProxyCache):
+        # The live shape of the framing collision (#784): before the framed
+        # derivation the second write landed on the first's row and the first
+        # caller read back the second's body.
+        proxy_cache.set("a\0b", "c", {}, "first", ttl_seconds=60.0)
+        proxy_cache.set("a", "b\0c", {}, "second", ttl_seconds=60.0)
+        assert proxy_cache.get("a\0b", "c", {}) == "first"
+        assert proxy_cache.get("a", "b\0c", {}) == "second"
 
     def test_fingerprint_mismatch_is_a_miss(self, proxy_cache: ProxyCache):
         proxy_cache.set("s", "t", {"a": 1}, "old-config", ttl_seconds=60.0, config_fingerprint="v1")
@@ -623,7 +664,7 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 4
+            assert version == 5
         finally:
             reopened.close()
 
@@ -677,7 +718,7 @@ class TestKeySchemaVersionPurge:
             assert "envelope_safe" in columns
             assert "envelope_json" in columns
             (version,) = cache._db.execute("PRAGMA user_version").fetchone()
-            assert version == 4
+            assert version == 5
         finally:
             cache.close()
 
@@ -793,17 +834,20 @@ class TestSurrogateRoundTrip:
         assert proxy_cache.get(literal, "t", {}) == "literal-body"
         assert proxy_cache.get(f"srv{surrogate}", "t", {}) is None
 
-    def test_clean_keys_are_unchanged_by_the_new_encoding(self):
-        """Switching to ``surrogatepass`` must orphan no existing entry.
+    def test_key_derivation_matches_the_pinned_v5_shape(self):
+        """The framed derivation, spelled out literally.
 
-        Pinned against the pre-change derivation spelled out literally, so
-        this fails both if the encoding stops being byte-compatible for clean
-        input and if the raw shape drifts without a ``_KEY_SCHEMA_VERSION``
-        bump — the two ways an existing entry becomes unreachable.
+        Fails if the raw shape drifts without a ``_KEY_SCHEMA_VERSION`` bump —
+        the way an existing entry becomes silently unreachable.
         """
         # The version is spelled out rather than read from the constant on
         # purpose: reading it would let a ``_KEY_SCHEMA_VERSION`` bump move
         # both sides together and pass, when a bump is exactly the event that
         # orphans every stored entry and must be acknowledged deliberately.
-        raw = "\x00".join(["4", "s", "t", '{"a": 1}', "", "null"])
-        assert _make_key("s", "t", {"a": 1}) == hashlib.sha256(raw.encode()).hexdigest()
+        # (v4 → v5 was such a bump: the framing fix #784 changed every key,
+        # and the startup purge dropped the orphaned rows.)
+        raw = b"".join(
+            f"{len(part)}:".encode() + part.encode()
+            for part in ["5", "s", "t", '{"a": 1}', "", "null"]
+        )
+        assert _make_key("s", "t", {"a": 1}) == hashlib.sha256(raw).hexdigest()
