@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.utils.json_out import has_lone_surrogate
+from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
@@ -62,6 +63,23 @@ CREATE INDEX IF NOT EXISTS idx_toolgraph_consult_scope
 ON toolgraph_consult (provider_fingerprint, agent_id, query_profile, candidate_hash);
 """
 
+# Schema bookkeeping in a table of our own rather than in ``PRAGMA
+# user_version``. That pragma is a property of the DATABASE, not of a table,
+# and ``consult_cache_path`` takes an arbitrary path — point it at the response
+# cache's file (which stamps its own version) and this cache reads a number it
+# never wrote, so the migration below silently does not run. Verified: with the
+# response cache's stamp of 5 already present, a pre-#794 row survived a purge
+# that should have dropped it. A private table cannot be read or written by
+# another component sharing the file.
+_CREATE_META_TABLE = """
+CREATE TABLE IF NOT EXISTS toolgraph_meta (
+    key   TEXT    PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+"""
+
+_SCOPE_KEY_VERSION_KEY = "scope_key_version"
+
 IDENTITY_POLICY = 1
 """Version of the identity-validation policy the stored facts were written under.
 
@@ -80,11 +98,41 @@ reason: a row written under a laxer policy is not evidence for a stricter one.
 """
 
 
+# Bump when the scope-key derivation changes shape, so ``initialize()`` can
+# purge rows written under an older one. Such rows are opaque hashes no current
+# lookup can produce: unreachable, therefore never read, therefore never
+# dropped by the ``IDENTITY_POLICY`` check in ``_row_shape_ok`` (which only
+# fires on a row that IS read) — they would just occupy scope slots against
+# ``max_scopes`` until ``_trim`` aged them out. Stored in ``toolgraph_meta``,
+# NOT in ``PRAGMA user_version`` — see ``_CREATE_META_TABLE``.
+# v1: framed scope-key derivation (#794).
+_SCOPE_KEY_SCHEMA_VERSION = 1
+
+
 def _scope_key(
     provider_fp: str, agent_id: str, profile: str, candidate_hash: str, generation: int
 ) -> str:
-    raw = f"{provider_fp}\x00{agent_id}\x00{profile}\x00{candidate_hash}\x00{generation}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+    # Framed, not joined: ``agent_id`` and ``profile`` are free-form strings
+    # sitting next to each other, and nothing on the path rejects a NUL in
+    # either (``validate_toolgraph_identifier`` refuses lone surrogates only),
+    # so ``agent_id="a\0b", profile="c"`` and ``agent_id="a", profile="b\0c"``
+    # used to produce the same key — and a collision here serves one scope's
+    # cached consult facts for a different scope, i.e. a policy decision made
+    # from the wrong row. Same defect the response cache had (#784, #794).
+    #
+    # ``generation`` is stringified rather than framed as an int because
+    # ``framed_digest`` takes strings; ``str(int)`` is injective, so this adds
+    # no aliasing of its own.
+    return framed_digest(
+        (
+            str(_SCOPE_KEY_SCHEMA_VERSION),
+            provider_fp,
+            agent_id,
+            profile,
+            candidate_hash,
+            str(generation),
+        )
+    )
 
 
 class GraphConsultCache:
@@ -126,6 +174,23 @@ class GraphConsultCache:
             tune_connection(db)
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
+            db.execute(_CREATE_META_TABLE)
+            # One-time purge on a scope-key shape change. The tables are
+            # created first because the purge reads and writes both; on a fresh
+            # database the version reads as 0 and the DELETE is a no-op. DELETE
+            # rather than DROP: the row shape is unchanged, only the derivation
+            # moved, so there is nothing to recreate.
+            row = db.execute(
+                "SELECT value FROM toolgraph_meta WHERE key = ?", (_SCOPE_KEY_VERSION_KEY,)
+            ).fetchone()
+            scope_key_version = row[0] if row is not None else 0
+            if scope_key_version < _SCOPE_KEY_SCHEMA_VERSION:
+                db.execute("DELETE FROM toolgraph_consult")
+                db.execute(
+                    "INSERT INTO toolgraph_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_SCOPE_KEY_VERSION_KEY, _SCOPE_KEY_SCHEMA_VERSION),
+                )
             db.commit()
         except Exception:
             db.close()

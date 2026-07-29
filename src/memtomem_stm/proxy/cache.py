@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from memtomem_stm.proxy.privacy import contains_sensitive_content
+from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
@@ -110,38 +110,32 @@ def _make_key(
     # them the same response. Widening the key past what the upstream sees
     # would only split rows that must not be split.
     #
-    # - Each component is framed netstring-style (``len:data``) rather than
-    #   joined on a separator. A joined string is ambiguous the moment a
-    #   component can contain the separator, and nothing on the path rejects
-    #   a NUL in an upstream server or tool name; frames parse left-to-right
-    #   unambiguously, so no boundary can shift.
+    # - ``framed_digest`` length-prefixes each component instead of joining
+    #   them, so no boundary can shift — nothing on the path rejects a NUL in
+    #   an upstream server or tool name. It also owns the ``surrogatepass``
+    #   encode; see its docstring for why neither is optional.
     # - ``ensure_ascii=False``: the default ASCII escaping renders an astral
     #   scalar as the same ``\uXXXX\uXXXX`` text as the two lone surrogate
     #   code units spelled separately, aliasing the two. Unescaped, the
     #   scalar and the lone pair encode to different bytes below.
-    # - ``surrogatepass``, not the escaping helper. ``escape_lone_surrogates``
-    #   is documented as non-injective — it maps the code unit U+D800 and the
-    #   six literal characters ``\ud800`` onto the same text — so deriving
-    #   the key through it let one identifier's row answer for a different
-    #   one. Nothing decodes these bytes, so the usual objection to
-    #   ``surrogatepass`` (it emits bytes that are not valid UTF-8) has no
-    #   consumer to bite.
+    # - The identifiers go in RAW, not through ``escape_lone_surrogates``.
+    #   That helper is documented as non-injective — it maps the code unit
+    #   U+D800 and the six literal characters ``\ud800`` onto the same text —
+    #   so deriving the key through it let one identifier's row answer for a
+    #   different one.
     #
     # All three derivations — ``get``, ``set`` and ``invalidate`` — come
     # through here, so they cannot disagree.
-    digest = hashlib.sha256()
-    for component in (
-        str(_KEY_SCHEMA_VERSION),
-        server,
-        tool,
-        json.dumps(args, sort_keys=True, ensure_ascii=False),
-        config_fingerprint,
-        json.dumps(context_query, ensure_ascii=False),
-    ):
-        data = component.encode("utf-8", errors="surrogatepass")
-        digest.update(f"{len(data)}:".encode())
-        digest.update(data)
-    return digest.hexdigest()
+    return framed_digest(
+        (
+            str(_KEY_SCHEMA_VERSION),
+            server,
+            tool,
+            json.dumps(args, sort_keys=True, ensure_ascii=False),
+            config_fingerprint,
+            json.dumps(context_query, ensure_ascii=False),
+        )
+    )
 
 
 # Substrings that flag a response embedding a TRANSIENT retrieval key pointing
