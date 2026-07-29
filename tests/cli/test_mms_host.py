@@ -2097,6 +2097,120 @@ class TestDisplayEscaping:
         self._assert_no_raw_hostile(res.output)
 
 
+def _empty_summary() -> dict:
+    """Every counter ``_render_sync_text`` / ``_build_apply_prompt`` reads."""
+    return {
+        "added": 0,
+        "removed": 0,
+        "backfilled": 0,
+        "cleanup": 0,
+        "restamped": 0,
+        "unchanged": 0,
+        "skipped_changed": 0,
+    }
+
+
+def _empty_plan_payload() -> dict:
+    """Every bucket ``_render_sync_text`` indexes, all empty."""
+    return {
+        "add": [],
+        "remove": [],
+        "backfill": [],
+        "cleanup": [],
+        "conflicts": [],
+        "skipped_changed": [],
+    }
+
+
+class TestRemainingRawRendersEscape:
+    """The two surfaces the #785 sweep left raw in this module (#786).
+
+    ``last_imported`` is a bare ``str`` on the sidecar model, so
+    ``import_state.toml`` decides its contents and TOML basic strings admit
+    ``\\r`` / ``\\u001B`` escapes. It renders beside two fields #785 already
+    escaped, including inside the ``--apply`` confirmation prompt — the same
+    consent argument as #770/#785, since a CR rewrites the question being
+    answered.
+
+    The post-apply summary renders the registry and sidecar paths, which are
+    HOME-derived. Those carry the stronger hazard: on POSIX an undecodable
+    byte in ``HOME`` decodes to a lone surrogate via ``surrogateescape``, and
+    an unencodable render raises *after* the mutation has already been written
+    — the worst ordering. Asserted through a patched path rather than a
+    hostile directory so the test is not POSIX-only.
+    """
+
+    HOSTILE = "20\x1b[31m\r26-01-01T00:00:00Z"
+    HOSTILE_PATH = "/tmp/ho\x1b[31m\rme/.mms/registry.toml"
+
+    @staticmethod
+    def _assert_clean(out: str) -> None:
+        assert "\x1b" not in out and "\r" not in out
+        assert "\\u001B" in out and "\\u000D" in out
+
+    def _row(self) -> dict:
+        return {
+            "name": "srv",
+            "source_label": "Claude Code (user)",
+            "last_imported": self.HOSTILE,
+            "baseline_hash": "sha256:0123456789abcdef",
+        }
+
+    def test_apply_prompt_escapes_last_imported(self):
+        from memtomem_stm.cli.mms_host import _build_apply_prompt
+
+        out = _build_apply_prompt([self._row()], [], _empty_summary())
+
+        self._assert_clean(out)
+
+    @pytest.mark.parametrize("bucket", ["remove", "cleanup"])
+    def test_sync_text_escapes_last_imported_in_both_buckets(self, capsys, bucket: str):
+        from memtomem_stm.cli.mms_host import _render_sync_text
+
+        payload = _empty_plan_payload()
+        payload[bucket] = [self._row()]
+        _render_sync_text(
+            "plan",
+            payload,
+            _empty_summary(),
+            new=[],
+        )
+
+        self._assert_clean(capsys.readouterr().out)
+
+    @pytest.mark.parametrize(
+        "summary_key",
+        ["added", "removed", "backfilled", "cleanup", "restamped"],
+    )
+    def test_post_apply_summary_escapes_the_written_paths(
+        self, capsys, monkeypatch, summary_key: str
+    ):
+        """Every one of the five mutated-outcome lines, not just the first.
+
+        Parametrized per line because they interpolate different path helpers
+        in different combinations, and a sweep that fixed four of five would
+        otherwise pass.
+        """
+        from memtomem_stm.cli import mms_host
+        from memtomem_stm.mms import state as mms_state
+
+        monkeypatch.setattr(mms_state, "registry_path", lambda: Path(self.HOSTILE_PATH))
+        monkeypatch.setattr(
+            mms_state, "import_state_path", lambda: Path(self.HOSTILE_PATH + ".sidecar")
+        )
+        summary = _empty_summary()
+        summary[summary_key] = 1
+        mms_host._render_sync_text(
+            "apply",
+            _empty_plan_payload(),
+            summary,
+            new=[],
+            apply_outcome="mutated",
+        )
+
+        self._assert_clean(capsys.readouterr().out)
+
+
 class TestRestampDiffEscapesEveryDisplayedField:
     """The fields beside the name were left raw by the #760 sweep (#780).
 

@@ -74,6 +74,19 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: display-escape the remaining raw terminal renders in `mms host`, `mms
+  project` and the shared write lock — the timestamp fields `last_imported`
+  and `last_seen`, the registry/sidecar paths in the five `mms host sync
+  --apply` summary lines, the `mms project list --prune` lock-timeout and
+  `mms project route` config-error messages, and all four write-lock
+  boundaries. The timestamps are typed as bare `str`, so a hand-edited or
+  imported TOML can put a CR or ESC in one (a lone surrogate it cannot — TOML
+  refuses a non-scalar escape); the paths are `HOME`-derived, where an
+  undecodable byte becomes a lone surrogate and the render raises *after* the
+  write has already landed. `--json` output is unchanged: the escape is at the
+  human render, and the config-lock JSON envelope still carries the logical
+  raw message. (#796, fixes #786)
+
 - proxy: derive the response-cache key from framed components so it is
   injective over the serialized
   `(server, tool, args, context_query, config_fingerprint)` — `args` by its
