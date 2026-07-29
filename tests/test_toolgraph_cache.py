@@ -38,6 +38,154 @@ def _put(cache, *, generation=11, cand="hashA", rejects=None, tnf=None, risk=Non
     )
 
 
+class TestScopeKeyIsFramed:
+    """A scope-key collision serves one scope's consult facts for another (#794).
+
+    ``agent_id`` and ``profile`` are free-form and adjacent, and
+    ``validate_toolgraph_identifier`` refuses lone surrogates but not NUL, so
+    before framing a NUL in either shifted the component boundary. The result
+    is a policy decision made from the wrong row, which is why this is pinned
+    live (both rows readable) and not only at the digest.
+    """
+
+    def test_nul_shifted_scope_identifiers_do_not_collide(self):
+        from memtomem_stm.proxy.toolgraph_cache import _scope_key
+
+        assert _scope_key(_PROV, "a\x00b", "c", "h", 1) != _scope_key(_PROV, "a", "b\x00c", "h", 1)
+
+    def test_nul_cannot_shift_across_distant_boundaries(self):
+        """Not just the adjacent pair — every boundary must hold.
+
+        The shift here crosses TWO boundaries: content moves from
+        ``provider_fp`` all the way into ``candidate_hash``, with ``agent_id``
+        and ``profile`` in between. Both tuples joined to the identical
+        ``p\\x00a\\x00b\\x00c\\x00h\\x001`` under the old derivation, so a
+        framing that only separated the adjacent free-form pair would still
+        let these two share a row.
+
+        ``provider_fp`` and ``candidate_hash`` are hex digests in production,
+        which is why this is the weaker of the two cases — but the derivation
+        takes plain strings and must not depend on its callers for injectivity.
+        """
+        from memtomem_stm.proxy.toolgraph_cache import _scope_key
+
+        assert _scope_key("p\x00a", "b", "c", "h", 1) != _scope_key("p", "a", "b", "c\x00h", 1)
+
+    def test_generation_stays_distinguishing(self):
+        from memtomem_stm.proxy.toolgraph_cache import _scope_key
+
+        assert _scope_key(_PROV, "a", "b", "h", 1) != _scope_key(_PROV, "a", "b", "h", 2)
+
+    def test_shifted_scopes_are_separate_rows(self, cache):
+        """The live shape: before framing the second write took the first's row."""
+        cache.put(
+            _PROV,
+            "a\x00b",
+            "c",
+            "hashA",
+            1,
+            rejects={"s::first": "TOOLGRAPH_NOT_GRANTED"},
+            tool_not_found_refs=[],
+            risk_scores={},
+            had_risk_scores=True,
+        )
+        cache.put(
+            _PROV,
+            "a",
+            "b\x00c",
+            "hashA",
+            1,
+            rejects={"s::second": "TOOLGRAPH_NOT_GRANTED"},
+            tool_not_found_refs=[],
+            risk_scores={},
+            had_risk_scores=True,
+        )
+
+        first = cache.get(_PROV, "a\x00b", "c", "hashA", 1)
+        second = cache.get(_PROV, "a", "b\x00c", "hashA", 1)
+        assert first is not None and second is not None
+        assert first["rejects"] == {"s::first": "TOOLGRAPH_NOT_GRANTED"}
+        assert second["rejects"] == {"s::second": "TOOLGRAPH_NOT_GRANTED"}
+
+
+class TestScopeKeySchemaPurge:
+    """Rows keyed under the pre-framing derivation are unreachable, so nothing
+    else ever drops them.
+
+    The ``IDENTITY_POLICY`` stamp in ``_row_shape_ok`` cannot: it only fires on
+    a row that is actually read, and an orphaned row is by definition never
+    looked up. Without this purge they sit against ``max_scopes`` until
+    ``_trim`` ages them out.
+    """
+
+    @staticmethod
+    def _seed_pre_794(db_path, *, user_version: int = 0):
+        """A database as #794 found it: rows, and no ``toolgraph_meta`` at all."""
+        c = GraphConsultCache(db_path)
+        c.initialize()
+        _put(c)
+        c._db.execute("DROP TABLE toolgraph_meta")
+        c._db.execute(f"PRAGMA user_version = {user_version}")
+        c._db.commit()
+        c.close()
+
+    def test_pre_versioning_rows_are_purged_once(self, tmp_path):
+        db_path = tmp_path / "tg.db"
+        self._seed_pre_794(db_path)
+
+        reopened = GraphConsultCache(db_path)
+        reopened.initialize()
+        try:
+            count = reopened._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0]
+            assert count == 0
+            (version,) = reopened._db.execute(
+                "SELECT value FROM toolgraph_meta WHERE key = 'scope_key_version'"
+            ).fetchone()
+            assert version == 1
+        finally:
+            reopened.close()
+
+    def test_purge_still_runs_when_the_file_carries_another_component_version(self, tmp_path):
+        """``PRAGMA user_version`` belongs to the DATABASE, not to this table.
+
+        ``consult_cache_path`` takes an arbitrary path, so the file can be one
+        another component already stamped — the response cache stamps 5. Keying
+        the migration on that pragma made ``5 < 1`` false and skipped the purge,
+        leaving rows that no lookup can reach. Pinned with a bare number rather
+        than by opening a real ``ProxyCache`` so this keeps testing the sharing
+        hazard even if that cache's own version changes.
+        """
+        db_path = tmp_path / "tg.db"
+        self._seed_pre_794(db_path, user_version=5)
+
+        reopened = GraphConsultCache(db_path)
+        reopened.initialize()
+        try:
+            count = reopened._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0]
+            assert count == 0
+            # The foreign stamp is left exactly as found — not ours to rewrite.
+            (pragma,) = reopened._db.execute("PRAGMA user_version").fetchone()
+            assert pragma == 5
+        finally:
+            reopened.close()
+
+    def test_current_version_rows_survive_reopen(self, tmp_path):
+        db_path = tmp_path / "tg.db"
+        c = GraphConsultCache(db_path)
+        c.initialize()
+        _put(c, rejects={"s::a": "TOOLGRAPH_NOT_GRANTED"})
+        c.close()
+
+        reopened = GraphConsultCache(db_path)
+        reopened.initialize()
+        try:
+            row = reopened.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+            assert row is not None
+            assert row["rejects"] == {"s::a": "TOOLGRAPH_NOT_GRANTED"}
+        finally:
+            reopened.close()
+
+
 class TestRoundTrip:
     def test_put_get_round_trip(self, cache):
         _put(

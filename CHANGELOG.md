@@ -74,6 +74,22 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- proxy: derive the tool-graph consult cache's scope key from framed
+  components, closing the same collision #784 fixed in the response cache. The
+  old derivation joined five components on a bare NUL, and `agent_id` /
+  `query_profile` are free-form and adjacent — nothing on the path rejects a
+  NUL in either, since `validate_toolgraph_identifier` refuses lone surrogates
+  only — so two distinct scopes could share one row and a consult's cached
+  facts could decide policy for a different scope. The framing primitive is now
+  shared by both caches (`utils/digest.framed_digest`) rather than written
+  twice; the response cache's derivation is byte-identical and its rows are not
+  affected. The consult cache gains a private `toolgraph_meta` table stamping
+  its scope-key version, so the rows orphaned by this change are purged once on
+  first start instead of occupying scope slots until `_trim` ages them out —
+  deliberately not `PRAGMA user_version`, which belongs to the database rather
+  than the table and so would skip the purge whenever `consult_cache_path`
+  points at a file another component already stamped. (#797, fixes #794)
+
 - cli: display-escape the remaining raw terminal renders in `mms host`, `mms
   project` and the shared write lock — the timestamp fields `last_imported`
   and `last_seen`, the registry/sidecar paths in the five `mms host sync
