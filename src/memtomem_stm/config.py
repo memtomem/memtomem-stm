@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from pathlib import Path
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from memtomem_stm.proxy.config import ProxyConfig
@@ -46,6 +47,202 @@ class LangfuseConfig(BaseModel):
                     "or `pip install 'memtomem-stm[langfuse]'`)."
                 )
         return self
+
+
+class OtlpExportConfig(BaseModel):
+    """Outbound OTLP span export (#789 stage 2, ADR 0001 gate ``otlp-telemetry-export``).
+
+    Named for the standard, not for any one consumer: STM exports OTLP spans
+    and any OTLP receiver can consume them (tracegraph is the motivating one).
+    Startup-only, like :class:`LangfuseConfig` — the exporter owns a
+    background worker and a shutdown flush, so it is not part of the proxy's
+    hot-reload domain. Env keys are ``MEMTOMEM_STM_OTLP__<field>``.
+
+    Invalid *configuration* fails startup; every *runtime* export failure
+    degrades open (dropped and counted, never raised) — a telemetry consumer
+    is not a dependency of the calls it accounts for. The exported attribute
+    vocabulary is body-free by construction; see ``docs/otlp-export.md``.
+    """
+
+    model_config = ConfigDict(
+        # A ValidationError renders `input_value`, and server.py logs config
+        # validation exceptions — `headers` can carry an authorization token.
+        hide_input_in_errors=True,
+        # pydantic's `gt=0` admits `+inf` (#722): a non-finite timeout would
+        # be legal here and then hang a shutdown deadline.
+        allow_inf_nan=False,
+    )
+
+    enabled: bool = False
+    """Opt-in (default ``False``). Read once at startup, not hot-reloaded."""
+    endpoint: str = ""
+    """OTLP/HTTP traces endpoint, e.g. ``http://localhost:4318`` (a bare base
+    URL gets ``/v1/traces`` appended) or ``http://collector/custom/path``
+    (used verbatim). Required when ``enabled``; validated structurally so a
+    malformed URL fails startup instead of becoming a permanent export
+    error."""
+    headers: dict[str, str] = Field(default_factory=dict)
+    """Extra OTLP/HTTP headers, e.g. an authorization token. Values are never
+    logged and never exported as span attributes."""
+    timeout_seconds: float = Field(default=10.0, gt=0.0)
+    """Per-export HTTP timeout."""
+    sampling_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Head sampling ratio, ``ParentBased(TraceIdRatioBased)``. ``0.0`` is
+    legal and means "sample nothing" — use ``enabled=false`` to also skip
+    building the exporter."""
+    max_queue_size: int = Field(default=2048, gt=0)
+    """Batch processor queue depth. Spans beyond it are dropped by the SDK."""
+    max_export_batch_size: int = Field(default=512, gt=0)
+    """Spans per export request. Must not exceed ``max_queue_size``."""
+    schedule_delay_ms: int = Field(default=5000, gt=0)
+    """Batch processor flush interval."""
+    flush_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    """Wall-clock ceiling for the whole shutdown sequence (drain of open
+    spans + final flush). Exceeding it abandons the remaining spans by
+    design; see ``shutdown_otlp``."""
+
+    @model_validator(mode="after")
+    def _require_endpoint_when_enabled(self) -> "OtlpExportConfig":
+        if self.enabled and not self.endpoint:
+            raise ValueError(
+                "OtlpExportConfig.enabled=true requires endpoint to be set "
+                "(e.g. http://localhost:4318)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_endpoint_shape(self) -> "OtlpExportConfig":
+        if self.endpoint:
+            normalize_otlp_endpoint(self.endpoint)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_header_syntax(self) -> "OtlpExportConfig":
+        """Reject headers the HTTP layer would refuse — before it sees them.
+
+        An `authorization` value carrying a newline passes every other check
+        here, and is then rejected deep in the export path by a layer that
+        quotes the offending value into an ERROR log. A credential logged in
+        full is exactly what the rest of this block exists to prevent, so the
+        syntax check happens at startup, where the failure can be reported
+        without echoing anything.
+        """
+        for name, value in self.headers.items():
+            if not name or not _HEADER_NAME_RE.fullmatch(name):
+                raise ValueError(
+                    "OtlpExportConfig.headers contains an invalid header name "
+                    "(RFC 7230 token characters only; name and value withheld)."
+                )
+            if not _HEADER_VALUE_RE.fullmatch(value):
+                raise ValueError(
+                    f"OtlpExportConfig.headers[{name!r}] has an invalid value — "
+                    "no control characters, and no leading or trailing "
+                    "whitespace (value withheld)."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _batch_fits_queue(self) -> "OtlpExportConfig":
+        if self.max_export_batch_size > self.max_queue_size:
+            raise ValueError(
+                "OtlpExportConfig.max_export_batch_size "
+                f"({self.max_export_batch_size}) must not exceed max_queue_size "
+                f"({self.max_queue_size})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_otlp_packages_when_enabled(self) -> "OtlpExportConfig":
+        if self.enabled:
+            from importlib.util import find_spec
+
+            # find_spec raises ModuleNotFoundError when a *parent* package is
+            # absent — which is the ordinary "extra not installed" case, so
+            # treating it as anything but "missing" would replace this
+            # actionable error with a traceback.
+            def _absent(name: str) -> bool:
+                try:
+                    return find_spec(name) is None
+                except (ModuleNotFoundError, ImportError, ValueError):
+                    return True
+
+            missing = [
+                name
+                for name in ("opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.http")
+                if _absent(name)
+            ]
+            if missing:
+                raise ValueError(
+                    "OtlpExportConfig.enabled=true but the OpenTelemetry packages are "
+                    f"not installed (missing: {', '.join(missing)}). Install the otlp "
+                    "extra (e.g. `uv tool install --reinstall 'memtomem-stm[otlp]'` "
+                    "or `pip install 'memtomem-stm[otlp]'`)."
+                )
+        return self
+
+
+# RFC 7230: a header name is a token; a value is visible ASCII plus space and
+# horizontal tab, with no leading or trailing whitespace. Notably this excludes
+# CR and LF, which is the case that would otherwise reach a logger.
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_HEADER_VALUE_RE = re.compile(r"[\x21-\x7e]([\x20\x09\x21-\x7e]*[\x21-\x7e])?|")
+
+
+def normalize_otlp_endpoint(endpoint: str) -> str:
+    """Validate an OTLP/HTTP endpoint and return the traces URL to POST to.
+
+    OpenTelemetry appends ``/v1/traces`` to ``OTEL_EXPORTER_OTLP_ENDPOINT``
+    but uses ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` — and an endpoint passed
+    to the exporter constructor — verbatim. STM takes a base URL *or* a full
+    signal URL, so it applies that suffix itself: a path of ``""`` or ``/``
+    becomes ``/v1/traces``, any other path is kept as given.
+
+    Raises ``ValueError`` (surfacing as a startup config error) rather than
+    letting a malformed URL become a permanent runtime export failure. The
+    messages never echo the endpoint: a rejected URL is exactly the one most
+    likely to carry the credential or token that got it rejected, and these
+    errors are logged.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    # Nothing derived from the endpoint is interpolated into any message
+    # below — not the scheme, not the port, not a parser exception. urlsplit
+    # embeds the netloc in its own errors (invalid IPv6, NFKC normalization),
+    # and the port parser quotes the offending text, so both are caught and
+    # re-raised generically rather than allowed to surface.
+    try:
+        parts = urlsplit(endpoint)
+    except ValueError:
+        raise ValueError("OTLP endpoint is not a parseable URL (value withheld).") from None
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("OTLP endpoint must use http or https (value withheld).")
+    # ``is not None``, not truthiness: ``http://@host`` parses to an *empty*
+    # username, which is still userinfo syntax and still not a valid endpoint.
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(
+            "OTLP endpoint must not embed credentials — put them in "
+            "otlp.headers instead (value withheld)."
+        )
+    if parts.query or parts.fragment:
+        raise ValueError("OTLP endpoint must not carry a query or fragment (value withheld).")
+    # ``.port`` only validates when read; an out-of-range or non-numeric port
+    # otherwise sails through to become a permanent connection failure.
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError(
+            "OTLP endpoint has an invalid port — must be an integer in 0-65535 (value withheld)."
+        ) from None
+    try:
+        host = parts.hostname
+    except ValueError:
+        raise ValueError("OTLP endpoint has an invalid host (value withheld).") from None
+    if not host:
+        raise ValueError("OTLP endpoint must include a host (value withheld).")
+    if any(char.isspace() for char in host):
+        raise ValueError("OTLP endpoint host must not contain whitespace (value withheld).")
+    path = parts.path if parts.path not in ("", "/") else "/v1/traces"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
 class FormationConfig(BaseModel):
@@ -220,6 +417,12 @@ class STMConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="MEMTOMEM_STM_",
         env_nested_delimiter="__",
+        # A child model's `hide_input_in_errors` does not govern an error
+        # raised on the *parent* field, so a whole block that fails to coerce
+        # renders here verbatim — including `otlp.headers` and
+        # `langfuse.secret_key`. These errors are logged (server.py) and
+        # surfaced to MCP clients, so the setting belongs at the root.
+        hide_input_in_errors=True,
     )
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
@@ -235,6 +438,7 @@ class STMConfig(BaseSettings):
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     formation: FormationConfig = Field(default_factory=FormationConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
+    otlp: OtlpExportConfig = Field(default_factory=OtlpExportConfig)
     hook: HookConfig = Field(default_factory=HookConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     data_dir: Path = Path("~/.memtomem")

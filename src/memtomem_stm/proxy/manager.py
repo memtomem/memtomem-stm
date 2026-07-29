@@ -3321,12 +3321,13 @@ class ProxyManager:
         (``structuredContent`` / result-level ``_meta``) that a bare
         text/list return would drop.
 
-        Wraps the entire call pipeline in a Langfuse observation span when
-        Langfuse is configured. The span carries ``server``, ``tool``, and
-        ``trace_id`` metadata so it can be correlated with the matching row
-        in ``proxy_metrics.db``. When Langfuse is not configured, ``traced()``
-        returns ``nullcontext()`` and the wrapper is a no-op — no perf cost,
-        no behavior change for users who don't opt in.
+        Wraps the entire call pipeline in a tracing span for whichever
+        consumers are configured (Langfuse, OTLP export, or both). The span
+        carries ``server``, ``tool``, and ``trace_id`` metadata so it can be
+        correlated with the matching row in ``proxy_metrics.db``. When no
+        consumer produced a leg, ``traced()`` returns ``nullcontext()`` and
+        the wrapper is a no-op — no perf cost, no behavior change for users
+        who don't opt in.
 
         ``trace_id`` is keyword-only and defaults to a fresh
         ``uuid.uuid4().hex[:16]``. Callers (e.g. the bench_qa harness) may
@@ -5173,9 +5174,15 @@ class ProxyManager:
         # metric (and ``_mark_recorded``-ing the exception so the outer
         # ``call_tool`` does not double-record). ``conn``/``cfg``/``delay`` are
         # owned entirely by the helper — nothing after the fetch reads them.
-        result = await self._fetch_upstream(
-            server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
-        )
+        # Traced here at the call site rather than inside the helper: the span
+        # must cover the whole retry/reconnect loop, and this is the one place
+        # that is true regardless of how the helper returns or raises. It is
+        # the split a call-graph consumer cares about — upstream time versus
+        # STM pipeline time.
+        with traced("upstream_rpc", metadata={"server": server, "tool": tool}):
+            result = await self._fetch_upstream(
+                server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
+            )
 
         # ── Stage 2: INGEST SCRUB (lone surrogates) ──
         # Escape here, once, rather than at each place the text is later

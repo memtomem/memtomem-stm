@@ -1357,6 +1357,41 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         assert token in smoke, f"released-core advisory lost guide contract token {token!r}"
 
 
+def test_otlp_export_doc_matches_the_shipped_span_vocabulary() -> None:
+    """The published attribute table must be exactly what the code emits.
+
+    This drifted once already: the guide promised ``stm.selection_id``,
+    ``stm.cache_hit``, an argument digest and an OpenInference marker that no
+    call site emitted. A privacy claim that overstates what is *withheld* is
+    the benign direction; one that understates what is *sent* is not, so pin
+    both directions.
+    """
+    from memtomem_stm.observability.otlp import _SPAN_ATTRIBUTES
+
+    doc = (REPO_ROOT / "docs" / "otlp-export.md").read_text(encoding="utf-8")
+    table = doc.split("### Attribute vocabulary", 1)[1].split("`error.type`", 1)[0]
+
+    documented: dict[str, set[str]] = {}
+    for line in table.splitlines():
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) != 2 or not cells[0].startswith("`"):
+            continue
+        documented[cells[0].strip("`")] = {
+            token.strip().strip("`") for token in cells[1].split(",") if token.strip()
+        }
+
+    emitted = {
+        span: {attribute for attribute, _type in mapping.values()}
+        for span, mapping in _SPAN_ATTRIBUTES.items()
+    }
+
+    assert documented == emitted, (
+        "docs/otlp-export.md's attribute table and _SPAN_ATTRIBUTES disagree.\n"
+        f"documented-only: { {k: v - emitted.get(k, set()) for k, v in documented.items() if v - emitted.get(k, set())} }\n"
+        f"emitted-only: { {k: v - documented.get(k, set()) for k, v in emitted.items() if v - documented.get(k, set())} }"
+    )
+
+
 def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     """ADR 0001's cited repo paths exist and its ``log_feedback`` claim is true.
 
@@ -1377,6 +1412,7 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
         "CLAUDE.md",
         "src/memtomem_stm/data/policy-bundle.schema.json",
         "src/memtomem_stm/data/toolgraph-contract-v1/",
+        "src/memtomem_stm/observability/otlp.py",
         "src/memtomem_stm/proxy/toolgraph_bundle.py",
         "src/memtomem_stm/proxy/toolgraph_cache.py",
         "src/memtomem_stm/proxy/toolgraph_provider.py",

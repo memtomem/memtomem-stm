@@ -163,6 +163,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     compression_feedback_tracker: CompressionFeedbackTracker | None = None
     progressive_reads_tracker: ProgressiveReadsTracker | None = None
     langfuse_client = None
+    otlp_emitter: Any = None
     tracker = TokenTracker()
     proxy_manager: ProxyManager | None = None
     warmup_task: asyncio.Task[None] | None = None
@@ -367,6 +368,23 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                     "Enable the proxy or set surfacing.enabled=false to silence."
                 )
 
+        # OTLP span export (optional, #789). Deliberately OUTSIDE the
+        # ``config.proxy.enabled`` branch above: ``traced()`` also wraps the
+        # STM control tools (e.g. stm_surfacing_feedback), so gating this on
+        # the proxy would make ``otlp.enabled=true`` silently inert in
+        # control-only mode.
+        #
+        # Initialization failures are NOT degraded away when export is
+        # enabled. Degrade-open covers export failures *after* a working
+        # exporter exists; swallowing a construction error instead would leave
+        # explicitly-enabled telemetry silently inert — the exact failure the
+        # fail-fast config contract exists to prevent. (An invalid standard
+        # `OTEL_EXPORTER_OTLP_*` value, e.g. a bad compression setting, raises
+        # here rather than at config validation, so this is reachable.)
+        from memtomem_stm.observability.otlp import init_otlp
+
+        otlp_emitter = init_otlp(config.otlp)
+
         # Initialize proxy manager (always created for STM control tools like stm_proxy_stats)
         proxy_manager = ProxyManager(
             config.proxy,
@@ -473,6 +491,16 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 shutdown_langfuse(langfuse_client)
             except Exception:
                 pass
+        if otlp_emitter is not None:
+            # Last: every span-producing component above has stopped, so the
+            # drain has a finite set to wait on. Bounded by its own config —
+            # a hung collector delays shutdown by at most that budget.
+            try:
+                from memtomem_stm.observability.otlp import shutdown_otlp
+
+                shutdown_otlp(otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds)
+            except Exception:
+                logger.warning("Failed to shut down OTLP export", exc_info=True)
 
 
 mcp = FastMCP(
@@ -919,10 +947,15 @@ async def stm_proxy_health(
     # ``tools/list`` and an MCP client cannot reach it; with the flag on there
     # is nothing to hint. The reachable operator surface is ``mms health`` (a
     # CLI command, always available), which carries the hint instead.
+    # OTLP export state belongs in BOTH branches: it is independent of the
+    # proxy block, so a control-only server with export enabled must still
+    # show it here rather than appearing to have no telemetry at all.
+    otlp_lines = _otlp_health_lines()
+
     health = pm.get_upstream_health()
     if not health:
         head = "No upstream servers configured."
-        return "\n".join([*config_warning, head, *bootstrap_lines])
+        return "\n".join([*config_warning, head, *bootstrap_lines, *otlp_lines])
 
     lines = [*config_warning, "Upstream Server Health", "====================="]
     for name, info in health.items():
@@ -960,6 +993,7 @@ async def stm_proxy_health(
     lines.extend(_toolgraph_health_lines(pm.get_toolgraph_status()))
 
     lines.extend(bootstrap_lines)
+    lines.extend(otlp_lines)
     return "\n".join(lines)
 
 
@@ -1059,6 +1093,33 @@ def _toolgraph_bind_failure_lines(status: dict) -> list[str]:
             f"  ({stats.get('stm_unmapped', 0)} unmapped, {stats.get('stm_drifted', 0)} drifted)"
         )
     return lines
+
+
+def _otlp_health_lines() -> list[str]:
+    """Render the OTLP exporter's counters, or nothing when export is off.
+
+    ``export_failures`` counts failed export attempts, not lost spans — the
+    batch processor's own queue-overflow drops are logged by the SDK and are
+    deliberately not folded in here.
+    """
+    try:
+        from memtomem_stm.observability.otlp import get_otlp
+
+        emitter = get_otlp()
+        if emitter is None:
+            return []
+        counters = emitter.snapshot()
+    except Exception:
+        return []
+    return [
+        "",
+        "OTLP Span Export",
+        "================",
+        f"  spans: {counters['spans_started']} started, {counters['spans_ended']} ended",
+        f"  export failures: {counters['export_failures']}",
+        f"  attributes redacted: {counters['attributes_redacted']}",
+        f"  shutdown flush timeouts: {counters['shutdown_flush_timeout']}",
+    ]
 
 
 def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:

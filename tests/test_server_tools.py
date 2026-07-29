@@ -1811,6 +1811,8 @@ class TestLifespan:
             mock_cfg.surfacing.enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             async with app_lifespan(mcp) as _ctx:
                 # ProxyManager.start() should NOT be called when proxy is disabled
@@ -1852,6 +1854,8 @@ class TestLifespan:
                 mock_cfg.surfacing.model_fields_set = fields_set
                 mock_cfg.langfuse = MagicMock()
                 mock_cfg.langfuse.enabled = False
+                mock_cfg.otlp = MagicMock()
+                mock_cfg.otlp.enabled = False
 
                 with caplog.at_level("WARNING", logger="memtomem_stm.server"):
                     async with app_lifespan(mcp) as _ctx:
@@ -1913,6 +1917,8 @@ class TestLifespan:
             mock_cfg.surfacing.warmup_enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             async with app_lifespan(mcp) as ctx:
                 assert ctx.feedback_tracker is None
@@ -1951,6 +1957,8 @@ class TestLifespan:
             mock_cfg.surfacing.enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             async with app_lifespan(mcp) as ctx:
                 # Server came up; the tracker just has no backing store.
@@ -1995,6 +2003,8 @@ class TestLifespan:
             mock_cfg.surfacing.enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             async with app_lifespan(mcp) as _ctx:
                 assert captured_pm_kwargs.get("cache") is None
@@ -2050,6 +2060,8 @@ class TestLifespan:
             mock_cfg.surfacing.warmup_enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             with pytest.raises(RuntimeError, match="upstream down"):
                 async with app_lifespan(mcp) as _ctx:
@@ -2097,6 +2109,8 @@ class TestLifespan:
             mock_cfg.surfacing.warmup_enabled = warmup_enabled
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             async with app_lifespan(mcp) as _ctx:
                 # Give the spawned warm-up task a turn to run.
@@ -2147,6 +2161,8 @@ class TestLifespan:
             mock_cfg.surfacing.enabled = False
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
 
             async with app_lifespan(mcp) as _ctx:
                 pass
@@ -2620,6 +2636,8 @@ class TestAdvertiseOrder:
                 mock_cfg.surfacing.enabled = False
                 mock_cfg.langfuse = MagicMock()
                 mock_cfg.langfuse.enabled = False
+                mock_cfg.otlp = MagicMock()
+                mock_cfg.otlp.enabled = False
 
                 async with app_lifespan(mcp) as _ctx:
                     advertised = [t.name for t in await mcp.list_tools()]

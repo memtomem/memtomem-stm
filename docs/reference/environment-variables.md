@@ -6,7 +6,7 @@ Nested settings use Pydantic's double-underscore convention, for example
 ## Configuration-source boundary
 
 `~/.memtomem/stm_proxy.json` loads `ProxyConfig` only. Root, surfacing,
-formation, hook, daemon, and Langfuse settings are environment/default-only; placing those
+formation, hook, daemon, Langfuse, and OTLP settings are environment/default-only; placing those
 blocks in `stm_proxy.json` has no effect. The proxy's `consumer_model` is the
 documented propagation exception used by surfacing model-budget resolution.
 
@@ -59,6 +59,23 @@ daemon across standalone proxy processes.
 | `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS` | `false` | Persist hook surfacing feedback events |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | `false` | Enable Claude Bash output replacement |
 | `MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS` | `32` | Bound admitted hook and standalone surfacing requests |
+
+## OTLP span export
+
+Off by default and requires the `otlp` extra. Read once at startup. Full
+attribute vocabulary and degradation policy: [OTLP Span Export](../otlp-export.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEMTOMEM_STM_OTLP__ENABLED` | `false` | Export STM's spans over OTLP/HTTP |
+| `MEMTOMEM_STM_OTLP__ENDPOINT` | — | Required when enabled; a bare base URL gets `/v1/traces` appended, any other path is used verbatim. Validated at startup |
+| `MEMTOMEM_STM_OTLP__HEADERS` | `{}` | Extra HTTP headers (JSON object), e.g. an auth token. Sent as request headers to authenticate to the collector; syntax-checked at startup so a malformed value cannot reach a logger; never turned into span or resource attributes |
+| `MEMTOMEM_STM_OTLP__TIMEOUT_SECONDS` | `10` | Per-export HTTP timeout |
+| `MEMTOMEM_STM_OTLP__SAMPLING_RATE` | `1.0` | `ParentBased(TraceIdRatioBased)` head sampling |
+| `MEMTOMEM_STM_OTLP__MAX_QUEUE_SIZE` | `2048` | Batch queue depth |
+| `MEMTOMEM_STM_OTLP__MAX_EXPORT_BATCH_SIZE` | `512` | Spans per request; must not exceed the queue size |
+| `MEMTOMEM_STM_OTLP__SCHEDULE_DELAY_MS` | `5000` | Batch flush interval |
+| `MEMTOMEM_STM_OTLP__FLUSH_TIMEOUT_SECONDS` | `5` | Whole-shutdown budget (drain + final flush) |
 
 ## Langfuse
 
