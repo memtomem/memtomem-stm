@@ -70,7 +70,7 @@ changes inline only. See the deprecation policy in
   still sent as HTTP headers on the export request — that is what
   authenticates STM to the collector.)
   Enable with the `otlp` extra and `MEMTOMEM_STM_OTLP__*`; counters surface
-  in `stm_proxy_health`. (#789)
+  in `stm_proxy_health`. (#791, #792)
 
 ### Fixed
 
@@ -126,7 +126,7 @@ changes inline only. See the deprecation policy in
   OpenTelemetry loggers now inspects every formatter-visible channel
   (`exc_info`, `stack_info`, `extra=`, not just the message), drops rather
   than rewrites a record that trips it, fails closed on a record it cannot
-  render, and is detached at shutdown. (#789)
+  render, and is detached at shutdown. (#793)
 
 - Lone surrogates in SQLite-bound diagnostic/content fields and nested
   extraction JSON are escaped once at ingest, while legacy surfacing memory-ID
