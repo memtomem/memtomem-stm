@@ -11,6 +11,8 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.44] — 2026-07-30
+
 ### Upgrade notes
 
 - **Behavior change**: STM can now export its own spans over OTLP/HTTP to an
@@ -18,7 +20,7 @@ changes inline only. See the deprecation policy in
   **outbound network path** and is off by default; enabling it requires the
   new `otlp` extra. Exported attributes are body-free by construction — no
   response content, no error messages, no tool arguments. See
-  [OTLP Span Export](docs/otlp-export.md).
+  [OTLP Span Export](docs/otlp-export.md). (#791, #792)
 - **Behavior change**: root STM startup-configuration validation errors no
   longer render pydantic's `input_value`. A block that failed to coerce as a
   whole previously echoed it verbatim in the error the server logs and
@@ -27,8 +29,7 @@ changes inline only. See the deprecation policy in
   through `STMConfig` (validating a sub-model directly still renders
   `input_value`), and it covers that field only — a validator that
   deliberately interpolates a value into its own message (e.g. `daemon.host`)
-  still shows it.
-
+  still shows it. (#792)
 - **Behavior change**: Toolgraph identity-bearing request and verdict fields
   that contain a lone surrogate are now refused as protocol errors under
   `on_protocol_error`; they are never non-injectively escaped. That knob
@@ -127,6 +128,17 @@ changes inline only. See the deprecation policy in
   (`exc_info`, `stack_info`, `extra=`, not just the message), drops rather
   than rewrites a record that trips it, fails closed on a record it cannot
   render, and is detached at shutdown. (#793)
+
+- config: keep a configured credential out of the startup validation error the
+  server logs and surfaces to MCP clients. A child model's
+  `hide_input_in_errors` does not govern an error raised on the *parent* field,
+  so a block that failed to coerce as a whole — `otlp` carrying its `headers`,
+  `langfuse` carrying its `secret_key` — rendered verbatim as pydantic's
+  `input_value`. The setting is now on `STMConfig` itself, which is the path
+  every startup validation takes; `OtlpExportConfig` sets it too, so validating
+  that one model directly is covered as well. The other sub-models are not, and
+  a validator that interpolates a value into its own message (e.g.
+  `DaemonConfig.host`) still shows it either way. (#792)
 
 - Lone surrogates in SQLite-bound diagnostic/content fields and nested
   extraction JSON are escaped once at ingest, while legacy surfacing memory-ID
