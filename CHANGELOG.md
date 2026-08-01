@@ -11,6 +11,17 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.45] — 2026-08-01
+
+Emergency patch: a fresh, unconstrained install of 0.1.44 or earlier from
+PyPI fails at import once `mcp` 2.0.0 is the newest release. The dependency
+declared no upper bound, so resolution picked up an SDK that had removed both
+`streamablehttp_client` and `mcp.server.fastmcp`. Installs that pinned `mcp`
+themselves — including the `uvx` command in the reviewed-resume guide, which
+already carries `mcp<2` — are unaffected, as is any environment already
+resolved against 1.x. Upgrade if your install is broken; nothing else in this
+release changes observable behavior.
+
 ### Security
 
 - docs: `SECURITY.md` corrects two published claims that were broader than the
