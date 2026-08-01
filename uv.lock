@@ -1669,7 +1669,7 @@ requires-dist = [
     { name = "langchain-mcp-adapters", marker = "extra == 'langchain'", specifier = ">=0.1" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=4.0" },
     { name = "langsmith", marker = "extra == 'langchain'", specifier = ">=0.8.18" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.28.1" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.28.1,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otlp'", specifier = ">=1.30" },
     { name = "opentelemetry-sdk", marker = "extra == 'otlp'", specifier = ">=1.30" },
     { name = "pydantic", specifier = ">=2.10" },
