@@ -75,6 +75,12 @@ jobs:
           from packaging.requirements import Requirement
           from packaging.version import Version
 
+          def _series_end(release: tuple[int, ...]) -> str:
+              """First version above the ``X.Y.*`` series ``release`` describes."""
+              parts = list(release) or [0]
+              parts[-1] += 1
+              return ".".join(str(part) for part in parts)
+
           pin_spec = Requirement(os.environ["MCP_PIN"]).specifier
           core_python, _, raw = open(sys.argv[1], encoding="utf-8").read().partition("\n")
 
@@ -90,25 +96,48 @@ jobs:
                   continue
               # Evaluate in the CORE venv's environment, and with no extra: the
               # install step requests no extras, so an `extra == "..."` guarded
-              # requirement is not active and must not be judged.
+              # requirement is not active and must not be judged. Both python
+              # fields are supplied — packaging would otherwise fill the one we
+              # omit from *this* interpreter, which is not the one Core runs on.
               if requirement.marker is not None and not requirement.marker.evaluate(
-                  {"python_version": ".".join(core_python.split(".")[:2]), "extra": ""}
+                  {
+                      "python_version": ".".join(core_python.split(".")[:2]),
+                      "python_full_version": core_python,
+                      "extra": "",
+                  }
               ):
                   continue
               declared.append(requirement)
 
-          # The pin excludes an open-ended range, not one version, so membership
-          # of a single boundary is not enough: `mcp!=2` rejects the boundary yet
-          # still admits 3.x. Probe several versions the pin rejects and require
-          # Core to reject every one of them. (packaging 26.0 in the frozen lock
-          # has no SpecifierSet.is_subset, which would express this directly.)
-          probes = [v for v in ("2.0.0", "2.99.99", "3.0.0", "99.0.0") if v not in pin_spec]
-          assert probes, f"mcp_pin {os.environ['MCP_PIN']!r} rejects none of the probe versions"
-          redundant = declared and all(
-              Version(probe) not in requirement.specifier
-              for requirement in declared
-              for probe in probes
-          )
+          # The pin excludes an open-ended range, so no finite set of sample
+          # versions can prove Core already excludes it: `mcp<2.1,!=2.0.0`
+          # rejects every plausible sample yet still admits 2.0.1. packaging has
+          # no SpecifierSet subset test, so prove a *sufficient* condition
+          # instead — one active specifier whose accepted set provably ends at
+          # or below the pin's boundary. Anything this cannot prove keeps the
+          # pin. That direction matters: a missed notice costs a stale hint, a
+          # wrong notice removes a pin the build still needs.
+          boundaries = [s.version for s in pin_spec if s.operator in ("<", "<=")]
+          assert boundaries, f"mcp_pin {os.environ['MCP_PIN']!r} declares no upper bound"
+          boundary = Version(boundaries[0])
+
+          def caps_below(specifier) -> bool:
+              operator, raw_version = specifier.operator, specifier.version
+              if operator == "<":
+                  return Version(raw_version) <= boundary
+              if operator == "<=":
+                  return Version(raw_version) < boundary
+              if operator == "==" and not raw_version.endswith(".*"):
+                  return Version(raw_version) < boundary
+              if operator in ("==", "~=") and raw_version.endswith(".*"):
+                  release = Version(raw_version[:-2]).release
+                  return Version(_series_end(release)) <= boundary
+              if operator == "~=":
+                  # ``~=X.Y`` means ``>=X.Y, ==X.*`` — one component shorter.
+                  return Version(_series_end(Version(raw_version).release[:-1])) <= boundary
+              return False
+
+          redundant = any(caps_below(s) for r in declared for s in r.specifier)
           if redundant:
               print(f"::notice::Core now caps mcp itself ({declared}); drop mcp_pin for this row")
           else:

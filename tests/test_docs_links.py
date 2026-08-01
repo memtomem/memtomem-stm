@@ -93,14 +93,25 @@ def _strip_code_spans(text: str) -> str:
             out.append("`" * run)
             index = opener_end
             continue
-        # Keep only the newlines from inside the span; drop everything else so a
-        # link written as sample syntax is not checked as a live link.
-        out.append("\n" * text.count("\n", opener_end, closer[0]))
+        # Drop the span's text so sample link syntax is not checked as a live
+        # link, but leave a space and the interior newlines behind. Stripping to
+        # zero width would let the neighbours fuse into a different token: in
+        # ``!`x`[bad](y)`` the surviving ``!`` would turn a real link into an
+        # image, which the link regex skips — a hidden broken link.
+        out.append(" " + "\n" * text.count("\n", opener_end, closer[0]))
         index = closer[1]
     return "".join(out)
 
 
 _HEADING_LINE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
+
+# An autolink or raw HTML tag. These have the same precedence as code spans and
+# are resolved left to right, so a backtick they consume cannot also open a
+# span. Masking those backticks is enough to keep the scanner from pairing them;
+# the construct itself is left in place because _anchors() reads ``<a name=...>``
+# out of this same output.
+_INLINE_ANGLE_CONSTRUCT = re.compile(r"<[^<>\n]*>")
+_MASKED_BACKTICK = "\x00"
 
 
 def _outside_fences(text: str) -> str:
@@ -124,16 +135,32 @@ def _outside_fences(text: str) -> str:
     # span inside a heading would change the generated anchor. Code spans are
     # stripped from maximal runs of non-heading lines, so a span may still wrap
     # across lines within such a run.
+    #
+    # Known limitation, verified to fail only in the safe direction: a code span
+    # that wraps across a line which *looks* like an ATX heading is split here,
+    # so both halves become unclosed runs and nothing inside is stripped. That
+    # can only surface a link the checker would otherwise skip (a spurious
+    # failure someone must look at), never hide a broken one.
+    #
+    # CommonMark resolves blocks before inlines, so a span can never span a
+    # block boundary. Flushing at blank lines is what enforces that — and it is
+    # also what stops the blanked lines of a fenced block from letting stray
+    # backticks on either side of the fence pair with each other.
     result: list[str] = []
     block: list[str] = []
 
     def flush() -> None:
         if block:
-            result.extend(_strip_code_spans("\n".join(block)).split("\n"))
+            masked = _INLINE_ANGLE_CONSTRUCT.sub(
+                lambda match: match.group(0).replace("`", _MASKED_BACKTICK),
+                "\n".join(block),
+            )
+            stripped = _strip_code_spans(masked).replace(_MASKED_BACKTICK, "`")
+            result.extend(stripped.split("\n"))
             block.clear()
 
     for line in lines:
-        if _HEADING_LINE.match(line):
+        if _HEADING_LINE.match(line) or not line.strip():
             flush()
             result.append(line)
         else:
@@ -197,8 +224,33 @@ def test_outside_fences_strips_inline_code_without_eating_real_links() -> None:
     assert "[bad](missing.md)" in wrapped
     assert wrapped.count("\n") == 2, "line alignment must survive span stripping"
 
+    # A span cannot cross a block boundary, so two unclosed backticks in
+    # different blocks are literal text and the link between them is real.
+    assert "[bad](missing.md)" in _outside_fences("`open\n\n[bad](missing.md) `")
+    assert "[bad](missing.md)" in _outside_fences("`open\n```\nsample\n```\n[bad](missing.md) `"), (
+        "a fenced block's blanked lines must not let backticks pair across it"
+    )
+
+    # A stripped span must not fuse its neighbours into a different token: the
+    # surviving `!` would make this an image, which the link regex skips.
+    assert "[bad](missing.md)" in _outside_fences("!`sample`[bad](missing.md)")
+    assert "![bad](missing.md)" not in _outside_fences("!`sample`[bad](missing.md)")
+
+    # An autolink consumes its own backtick, so it cannot open a span.
+    assert "[bad](missing.md)" in _outside_fences(
+        "<https://example.com/`tick>\n[bad](missing.md) `"
+    )
+    # ...while the HTML the anchor scanner reads out of this text is untouched.
+    assert '<a name="x">' in _outside_fences('<a name="x"></a> text')
+
     # An unclosed run is literal text, not an open span swallowing the rest.
     assert "[CLI](cli.md#init)" in _outside_fences("see ` and [CLI](cli.md#init)")
+
+    # A span wrapping across a heading-looking line is split, so nothing inside
+    # is stripped. Pin the direction of that miss: it must expose the link (a
+    # visible spurious failure), never hide one.
+    across_heading = _outside_fences("`code\n# not a heading\n` [x](nope.md)")
+    assert "[x](nope.md)" in across_heading
 
     # Headings keep their backticks so heading slugs stay byte-faithful.
     assert _outside_fences("## `mms doctor`") == "## `mms doctor`"

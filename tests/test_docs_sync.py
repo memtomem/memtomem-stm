@@ -1712,13 +1712,18 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     assert workflow.count("MCP_PIN: ${{ matrix.mcp_pin }}") == 2, (
         "the matrix pin must reach both the install step and the expiry probe"
     )
-    # Every row that declares a pin must be judged by the probe, and every row
-    # must declare its expectation, so a new row cannot silently skip either.
-    rows = re.findall(
-        r"- core: \"([^\"]+)\"\n\s+expected: (\w+)(\n\s+mcp_pin: \"[^\"]+\")?", workflow
+    # Every matrix row must declare an expectation. Counting matches of a regex
+    # that *requires* ``expected`` proves nothing on its own — a malformed row
+    # simply would not match — so compare against the number of rows present.
+    declared_rows = workflow.count('- core: "')
+    well_formed = re.findall(
+        r"- core: \"([^\"]+)\"\n\s+expected: (\w+)(?:\n\s+mcp_pin: \"[^\"]+\")?\n", workflow
     )
-    assert len(rows) >= 5, "core-compat matrix rows became unparseable"
-    assert all(expected for _, expected, _ in rows)
+    assert declared_rows >= 5, "core-compat matrix lost rows"
+    assert len(well_formed) == declared_rows, (
+        f"{declared_rows - len(well_formed)} core-compat row(s) do not declare "
+        "`expected` immediately after `core`"
+    )
 
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (
