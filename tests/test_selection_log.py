@@ -424,7 +424,7 @@ def _text_content(text: str):
 
 
 def _make_result(text: str):
-    return SimpleNamespace(content=[_text_content(text)], isError=False)
+    return SimpleNamespace(content=[_text_content(text)], is_error=False)
 
 
 def _make_manager(
@@ -445,7 +445,7 @@ def _make_manager(
     mgr = ProxyManager(proxy_cfg, TokenTracker(), cache=cache, selection_log=log)
 
     session = AsyncMock()
-    tool = SimpleNamespace(name="tool", description="a tool", inputSchema={"type": "object"})
+    tool = SimpleNamespace(name="tool", description="a tool", input_schema={"type": "object"})
     conn = UpstreamConnection(name="srv", config=server_cfg, session=session, tools=[tool])
     mgr._connections["srv"] = conn
     return mgr, log

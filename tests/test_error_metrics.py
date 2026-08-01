@@ -384,7 +384,7 @@ def _text_content(text: str):
 
 
 def _make_result(text: str, is_error: bool = False):
-    return SimpleNamespace(content=[_text_content(text)], isError=is_error)
+    return SimpleNamespace(content=[_text_content(text)], is_error=is_error)
 
 
 def _make_manager(max_retries: int = 0) -> ProxyManager:
@@ -455,7 +455,7 @@ class TestManagerErrorRecording:
             "Error: not found", is_error=True
         )
         result = await mgr.call_tool("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         s = mgr.tracker.get_summary()
         assert s["errors_by_category"]["upstream_error"] == 1
 
@@ -561,7 +561,7 @@ class TestErrorMessagePersistence:
             "Error: page slug 'foo' not found", is_error=True
         )
         result = await mgr.call_tool("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "upstream_error"
         assert msg == "Error: page slug 'foo' not found"
@@ -573,7 +573,7 @@ class TestErrorMessagePersistence:
             long_text, is_error=True
         )
         result = await mgr.call_tool("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         _cat, _code, msg = _read_error_row(mgr)
         assert msg is not None
         assert len(msg) == MAX_ERROR_MESSAGE_CHARS

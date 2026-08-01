@@ -1176,7 +1176,7 @@ class TestProxyManagerIntegration:
 
         mock_result = MagicMock()
         mock_result.content = [mock_content]
-        mock_result.isError = False
+        mock_result.is_error = False
 
         mock_session = AsyncMock()
         mock_session.call_tool = AsyncMock(return_value=mock_result)

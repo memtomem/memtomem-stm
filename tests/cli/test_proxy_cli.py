@@ -9851,9 +9851,9 @@ asyncio.run(main())
         bare_server.write_text(
             textwrap.dedent(
                 """\
-                from mcp.server.fastmcp import FastMCP
+                from mcp.server.mcpserver import MCPServer
 
-                mcp = FastMCP("bare-no-mem-search")
+                mcp = MCPServer("bare-no-mem-search")
 
                 @mcp.tool()
                 async def unrelated_tool() -> str:
@@ -9946,9 +9946,9 @@ asyncio.run(main())
             textwrap.dedent(
                 """\
                 import asyncio
-                from mcp.server.fastmcp import FastMCP
+                from mcp.server.mcpserver import MCPServer
 
-                mcp = FastMCP("stall-version")
+                mcp = MCPServer("stall-version")
 
                 @mcp.tool()
                 async def mem_search(query: str) -> str:
@@ -10087,23 +10087,19 @@ asyncio.run(main())
         assert data["servers"]["bad"]["error"]
         assert "surfacing" in data
 
-    @pytest.mark.parametrize(
-        ("transport", "client_path"),
-        [
-            ("sse", "mcp.client.sse.sse_client"),
-            ("streamable_http", "mcp.client.streamable_http.streamablehttp_client"),
-        ],
-    )
-    def test_upstream_probe_timeout_bounds_transport_enter(
-        self, monkeypatch, transport, client_path
-    ):
+    @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+    def test_upstream_probe_timeout_bounds_transport_enter(self, monkeypatch, transport):
         """#398 gave ``_probe_ltm_mcp_server`` an end-to-end deadline, but
         the older upstream probe ``_probe_one`` only bounded
         ``initialize()`` — a network upstream hanging on TCP connect
         blocked ``mms health --timeout N`` / ``mms add --validate``
-        indefinitely, and no ``timeout=``/``sse_read_timeout=`` reached
-        the SDK client. Mirrors
-        ``test_sse_ltm_probe_timeout_bounds_transport_enter``."""
+        indefinitely, and no timeout reached the SDK client. Mirrors
+        ``test_sse_ltm_probe_timeout_bounds_transport_enter``.
+
+        The two transports carry their budget differently under mcp 2.0: sse
+        still takes ``timeout=``/``sse_read_timeout=`` kwargs, while
+        streamable-http takes an ``httpx2.Timeout`` on the injected client,
+        which is what ``streamable_http_transport`` builds."""
         import time
 
         from memtomem_stm.cli import proxy as proxy_mod
@@ -10117,18 +10113,69 @@ asyncio.run(main())
             async def __aexit__(self, *_args):
                 return None
 
-        def fake_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
-            captured.update(
-                {
-                    "url": url,
-                    "headers": headers,
-                    "timeout": timeout,
-                    "sse_read_timeout": sse_read_timeout,
-                }
-            )
-            return HangingTransport()
+        if transport == "sse":
+            client_path = "mcp.client.sse.sse_client"
 
-        monkeypatch.setattr(client_path, fake_client)
+            def fake_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
+                captured.update(
+                    {
+                        "url": url,
+                        "headers": headers,
+                        "timeout": timeout,
+                        "sse_read_timeout": sse_read_timeout,
+                    }
+                )
+                return HangingTransport()
+        else:
+            # Keep ``streamable_http_transport`` REAL and fake only the two
+            # SDK calls beneath it — otherwise the test proves nothing about
+            # the timeout reaching the httpx2 client, that client being the
+            # one handed to the transport, or the teardown order.
+            class FakeAsyncClient:
+                def __init__(self, headers, timeout):
+                    self.headers = headers or {}
+                    self.timeout = timeout
+                    self.closed = False
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    self.closed = True
+                    return None
+
+            def fake_create_client(headers=None, timeout=None, auth=None):
+                client = FakeAsyncClient(headers, timeout)
+                captured["client"] = client
+                return client
+
+            def fake_client(url, *, http_client=None, terminate_on_close=True):
+                # Every leg of the httpx2 timeout carries the probe budget,
+                # which is what the old ``timeout=``/``sse_read_timeout=``
+                # pair expressed.
+                captured.update(
+                    {
+                        "url": url,
+                        "headers": dict(http_client.headers),
+                        "timeout": http_client.timeout.connect,
+                        "sse_read_timeout": http_client.timeout.read,
+                        "same_client": http_client is captured.get("client"),
+                        # The wrapper must not have closed the client before
+                        # handing it to the transport.
+                        "client_open_at_transport_enter": not http_client.closed,
+                    }
+                )
+                return HangingTransport()
+
+            monkeypatch.setattr(
+                "memtomem_stm.utils.mcp_transport.create_mcp_http_client", fake_create_client
+            )
+            monkeypatch.setattr(
+                "memtomem_stm.utils.mcp_transport.streamable_http_client", fake_client
+            )
+
+        if transport == "sse":
+            monkeypatch.setattr(client_path, fake_client)
 
         cfg = {
             "transport": transport,
@@ -10147,6 +10194,13 @@ asyncio.run(main())
         assert captured["headers"] == {"X-Api-Key": "k"}
         assert captured["timeout"] == pytest.approx(0.1, rel=0.1)
         assert captured["sse_read_timeout"] == pytest.approx(0.1, rel=0.1)
+        if transport == "streamable_http":
+            # The client the wrapper built is the one the SDK transport got,
+            # it was open at hand-over, and the wrapper still closed it on the
+            # way out even though the budget cancelled the transport enter.
+            assert captured["same_client"] is True
+            assert captured["client_open_at_transport_enter"] is True
+            assert captured["client"].closed is True
 
     def test_upstream_probe_timeout_bounds_list_tools(self, monkeypatch):
         """An upstream that connects and initializes fine but stalls on

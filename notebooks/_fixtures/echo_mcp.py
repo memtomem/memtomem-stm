@@ -9,9 +9,9 @@ Run with: ``python echo_mcp.py``
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("echo")
+mcp = MCPServer("echo")
 
 
 @mcp.tool()

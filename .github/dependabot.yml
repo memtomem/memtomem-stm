@@ -19,13 +19,9 @@ updates:
     groups:
       python-minor-patch:
         update-types: ["minor", "patch"]
-    # mcp 2.0 removed `streamablehttp_client` and `mcp.server.fastmcp`, both
-    # imported at module scope here, so the requirement is capped at `<2`
-    # (#802). This updater edits the manifest, so it read that cap as a
-    # constraint to widen and proposed `<3` within hours — see the closed
-    # PR #805, whose lockfile moved to mcp 2.0.0 and failed 8 CI jobs. The
-    # cap is deliberate, not stale; drop this ignore as part of the #801
-    # migration that makes 2.x actually work.
-    ignore:
-      - dependency-name: "mcp"
-        update-types: ["version-update:semver-major"]
+    # The `mcp` major-version ignore added in #807 is gone: it existed only to
+    # stop this updater widening the deliberate `<2` cap (PR #805 did exactly
+    # that and failed 8 CI jobs), and #801 migrated the package to the 2.0
+    # SDK. A future mcp major should surface as a PR again, not be silently
+    # withheld — it needs review, not suppression, because the proxy rides SDK
+    # internals in `proxy/_fastmcp_compat.py`.
