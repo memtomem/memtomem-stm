@@ -56,6 +56,13 @@ changes inline only. See the deprecation policy in
   command STM uses to launch the LTM server. `uvx` resolves its own
   environment, so pinning only the `uv tool install` left the actual Core
   process free to resolve `mcp` 2.x. (#800)
+- deps: STM's own `mcp[cli]` requirement is capped at `<2`, so a fresh install
+  from the index no longer resolves `mcp` 2.x. 2.0 removed both
+  `streamablehttp_client` and `mcp.server.fastmcp`, which the proxy imports at
+  module scope — every install of 0.1.44 and earlier made after 2.0 shipped
+  failed at import. `uv.lock` pinned 1.x, so CI and checkout-based development
+  never resolved 2.0 and the break was visible only on the install-from-index
+  path. The cap is a stopgap; #801 tracks the migration that lifts it. (#802)
 
 ## [0.1.44] — 2026-07-30
 
