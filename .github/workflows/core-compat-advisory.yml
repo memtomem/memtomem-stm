@@ -60,41 +60,59 @@ jobs:
           MCP_PIN: ${{ matrix.mcp_pin }}
         run: |
           # Read Core's own requirement from its venv (stdlib only — packaging is
-          # not guaranteed there), then judge it in STM's venv, which has it.
-          "$RUNNER_TEMP/core/bin/python" -c \
-            'import importlib.metadata as m; print("\n".join(m.requires("memtomem") or ()))' \
-            > "$RUNNER_TEMP/core-requires.txt"
+          # not guaranteed there; 0.3.10 has none), then judge it in STM's venv,
+          # whose packaging is pinned by the frozen lock.
+          {
+            "$RUNNER_TEMP/core/bin/python" -c \
+              'import sys; print(".".join(str(p) for p in sys.version_info[:3]))'
+            "$RUNNER_TEMP/core/bin/python" -c \
+              'import importlib.metadata as m; print("\n".join(m.requires("memtomem") or ()))'
+          } > "$RUNNER_TEMP/core-requires.txt"
           uv run python - "$RUNNER_TEMP/core-requires.txt" <<'PY'
           import os
           import sys
 
           from packaging.requirements import Requirement
+          from packaging.version import Version
 
-          pin = os.environ["MCP_PIN"]
+          pin_spec = Requirement(os.environ["MCP_PIN"]).specifier
+          core_python, _, raw = open(sys.argv[1], encoding="utf-8").read().partition("\n")
+
           declared = []
-          for line in open(sys.argv[1], encoding="utf-8").read().splitlines():
+          for line in raw.splitlines():
               if not line.strip():
                   continue
               try:
                   requirement = Requirement(line)
-              except Exception:  # a marker/extra shape packaging cannot parse
+              except Exception:  # a shape packaging cannot parse
                   continue
-              if requirement.name.lower() == "mcp":
-                  declared.append(requirement)
+              if requirement.name.lower() != "mcp":
+                  continue
+              # Evaluate in the CORE venv's environment, and with no extra: the
+              # install step requests no extras, so an `extra == "..."` guarded
+              # requirement is not active and must not be judged.
+              if requirement.marker is not None and not requirement.marker.evaluate(
+                  {"python_version": ".".join(core_python.split(".")[:2]), "extra": ""}
+              ):
+                  continue
+              declared.append(requirement)
 
-          # The pin exists to exclude one boundary version; it is redundant once
-          # Core's own specifier already excludes that same version. Testing the
-          # boundary rather than grepping for "<" accepts `~=1.28` (an equivalent
-          # cap) and correctly rejects `<3` (which still admits what we exclude).
-          uppers = [s.version for s in Requirement(pin).specifier if s.operator in ("<", "<=")]
-          if not uppers:
-              sys.exit(f"mcp_pin {pin!r} declares no upper bound; this probe cannot judge it")
-          boundary = uppers[0]
-          covered = [r for r in declared if boundary not in r.specifier]
-          if covered:
-              print(f"::notice::Core now caps mcp itself ({covered}); drop mcp_pin for this row")
+          # The pin excludes an open-ended range, not one version, so membership
+          # of a single boundary is not enough: `mcp!=2` rejects the boundary yet
+          # still admits 3.x. Probe several versions the pin rejects and require
+          # Core to reject every one of them. (packaging 26.0 in the frozen lock
+          # has no SpecifierSet.is_subset, which would express this directly.)
+          probes = [v for v in ("2.0.0", "2.99.99", "3.0.0", "99.0.0") if v not in pin_spec]
+          assert probes, f"mcp_pin {os.environ['MCP_PIN']!r} rejects none of the probe versions"
+          redundant = declared and all(
+              Version(probe) not in requirement.specifier
+              for requirement in declared
+              for probe in probes
+          )
+          if redundant:
+              print(f"::notice::Core now caps mcp itself ({declared}); drop mcp_pin for this row")
           else:
-              print(f"{pin} still required; Core declares {declared or 'no mcp requirement'}")
+              print(f"{os.environ['MCP_PIN']} still required; Core declares {declared or 'nothing'}")
           PY
       - name: Run stdio capability smoke
         env:

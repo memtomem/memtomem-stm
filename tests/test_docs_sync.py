@@ -9,6 +9,7 @@ in local testing and only surfaces through user confusion.
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
 import json
 import os
@@ -1438,16 +1439,23 @@ def test_stmconfig_env_walker_refuses_a_shape_it_would_undercount() -> None:
     assert _stmconfig_environment_defaults(_ScalarUnion) == {"MEMTOMEM_STM_VALUE": None}
 
 
-def test_environment_reference_warns_that_extractor_llm_defaults_differ() -> None:
+def test_environment_reference_warns_that_extractor_llm_defaults_differ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A tabulated field default is not the extractor's absent-block behavior.
 
     ``ExtractionConfig.llm`` defaults to ``None`` and ``effective_llm()`` then
     substitutes a different profile, so every ``EXTRACTION__LLM__*`` row in the
     table describes a config the extractor only uses once someone materializes
-    the block. Materializing it through one leaf also flips the provider and
-    installs a prompt the extraction path cannot format. Pin all three facts.
+    the block. Drive that materialization through the *environment*, the way a
+    reader of this table would, and take the prompt failure from the production
+    call rather than restating its keyword here.
     """
-    from memtomem_stm.proxy.config import ExtractionConfig, LLMCompressorConfig, LLMProvider
+    import pydantic
+
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.proxy.config import ExtractionConfig, LLMProvider
+    from memtomem_stm.proxy.extraction import FactExtractor
 
     absent = ExtractionConfig()
     assert absent.llm is None
@@ -1455,13 +1463,29 @@ def test_environment_reference_warns_that_extractor_llm_defaults_differ() -> Non
     assert effective.provider is LLMProvider.OLLAMA
     assert effective.model == "qwen3:4b"
     assert effective.max_tokens == 1000
-    # The absent-block prompt formats on the extraction path; the field default
-    # (the compression prompt) does not.
-    effective.system_prompt.format(max_facts=10)
-    materialized = ExtractionConfig(llm=LLMCompressorConfig(api_key="x")).effective_llm()
-    assert materialized.provider is LLMProvider.OPENAI
+
+    # One leaf, set the way the table invites, materializes the whole block:
+    # provider defaults to openai and startup then demands a credential.
+    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MODEL", "docs-test-model")
+    with pytest.raises(pydantic.ValidationError, match="api_key is required"):
+        STMConfig()
+
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__API_KEY", "docs-test-key")
+    materialized = STMConfig().proxy.extraction
+    assert materialized.llm is not None
+    assert materialized.effective_llm().provider is LLMProvider.OPENAI
+    assert materialized.effective_llm().model == "docs-test-model"
+
+    # The production formatting call is what raises; the absent-block profile
+    # survives the very same call.
     with pytest.raises(KeyError, match="max_chars"):
-        materialized.system_prompt.format(max_facts=10)
+        asyncio.run(FactExtractor(materialized)._call_api("payload"))
+    absent_extractor = FactExtractor(absent)
+    assert absent_extractor._llm_cfg.system_prompt.format(max_facts=absent.max_facts), (
+        "the absent-block prompt must format on the same path"
+    )
 
     body = _read("docs/reference/environment-variables.md")
     caveat = body.split("### Caveat: `EXTRACTION__LLM__*` defaults", 1)[1]
@@ -1469,11 +1493,19 @@ def test_environment_reference_warns_that_extractor_llm_defaults_differ() -> Non
         "provider `ollama`",
         "`qwen3:4b`",
         "`max_tokens` 1000",
-        "the provider flips to `openai`",
+        # The rule is categorical: a sibling left unset takes its field default.
+        # An "any single variable flips the provider" claim would be false for
+        # `__PROVIDER=ollama`, so the doc must name the per-sibling outcomes.
+        "every sibling you did not set then takes the",
+        "| `__PROVIDER` | `openai` |",
+        "| `__SYSTEM_PROMPT` |",
         "`{max_chars}`",
         "`{max_facts}`",
     ):
         assert phrase in caveat, f"extractor-LLM caveat lost {phrase!r}"
+    assert "the provider flips to `openai`" not in caveat, (
+        "the unconditional phrasing is false when __PROVIDER is the leaf that is set"
+    )
 
 
 def test_environment_reference_is_complete_and_default_accurate() -> None:
@@ -1665,9 +1697,28 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     for version in ('core: "0.3.12"', 'core: "0.3.13"'):
         assert version in workflow
     # The pin is per matrix row, so a newly added Core does not inherit it, and
-    # it announces its own expiry rather than outliving the Core gap.
+    # it announces its own expiry rather than outliving the Core gap. Pin every
+    # link of that wiring: declaring the field is worthless if the install step
+    # stops consuming it or the probe stops being conditional on it.
     assert 'mcp_pin: "mcp<2"' in workflow
-    assert "drop mcp_pin for this row" in workflow
+    for wiring in (
+        '${MCP_PIN:+"$MCP_PIN"}',  # an empty pin adds no install argument
+        "if: ${{ matrix.mcp_pin != '' }}",  # probe only runs for pinned rows
+        "drop mcp_pin for this row",  # ...and says what to do when it expires
+    ):
+        assert wiring in workflow, f"core-compat advisory lost mcp_pin wiring: {wiring}"
+    # Both consumers need the field: the install step to apply the pin and the
+    # probe step to judge it. A membership check would survive losing either.
+    assert workflow.count("MCP_PIN: ${{ matrix.mcp_pin }}") == 2, (
+        "the matrix pin must reach both the install step and the expiry probe"
+    )
+    # Every row that declares a pin must be judged by the probe, and every row
+    # must declare its expectation, so a new row cannot silently skip either.
+    rows = re.findall(
+        r"- core: \"([^\"]+)\"\n\s+expected: (\w+)(\n\s+mcp_pin: \"[^\"]+\")?", workflow
+    )
+    assert len(rows) >= 5, "core-compat matrix rows became unparseable"
+    assert all(expected for _, expected, _ in rows)
 
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (

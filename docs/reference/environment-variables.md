@@ -207,17 +207,19 @@ extraction profile: provider `ollama`, model `qwen3:4b`, base URL
 `http://localhost:11434`, `max_tokens` 1000, and an extraction-specific prompt.
 
 Setting any single `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__*` variable
-materializes the whole block from the tabulated field defaults, which has two
-consequences worth stating plainly:
+materializes the whole block, and **every sibling you did not set then takes the
+field default from the table above** — not the extraction profile. Which
+consequences you get therefore depends on which siblings you leave unset:
 
-- the provider flips to `openai`, so startup fails with a validation error
-  unless `API_KEY` or `OPENAI_API_KEY` is also set;
-- the default `SYSTEM_PROMPT` is the compression prompt and contains
-  `{max_chars}`, which the extraction path does not substitute — it substitutes
-  `{max_facts}` — so extraction raises and falls back to heuristic extraction.
+| Sibling left unset | Value it takes | Consequence |
+|---|---|---|
+| `__PROVIDER` | `openai` | Startup raises a validation error unless `__API_KEY` or `OPENAI_API_KEY` is set. Setting `__PROVIDER=ollama` avoids both. |
+| `__SYSTEM_PROMPT` | the compression prompt, which contains `{max_chars}` | The extraction path substitutes `{max_facts}` only, so formatting raises and extraction falls back to heuristic extraction. Setting an extraction prompt avoids this. |
+| `__MODEL`, `__MAX_TOKENS` | `gpt-4.1-mini`, `500` | Silent change from the extraction profile's `qwen3:4b` / `1000`. |
 
-Configure the block wholesale (as a JSON object at
-`MEMTOMEM_STM_PROXY__EXTRACTION__LLM`, or with every field set explicitly)
+So no single variable is safe to set alone unless you also set the siblings it
+implicates. Configure the block wholesale — as a JSON object at
+`MEMTOMEM_STM_PROXY__EXTRACTION__LLM`, or with every field set explicitly —
 rather than by overriding one leaf.
 
 Unknown proxy keys are ignored by the permissive file loader but reported by

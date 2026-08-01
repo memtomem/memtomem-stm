@@ -26,13 +26,81 @@ def _public_markdown() -> list[Path]:
     return sorted([*roots, *docs])
 
 
-# An inline code span, delimited by a run of backticks that is not backslash
-# escaped. Non-greedy so two spans on one line do not merge and swallow a real
-# link between them; the lookbehinds keep an escaped ``\``` (a literal backtick,
-# not a delimiter) from opening or closing a span. Deliberately line-scoped: a
-# code span wrapped across lines is not tracked, which can only make the checker
-# noisier — it never hides a link.
-_CODE_SPAN = re.compile(r"(?<!\\)(`+).*?(?<!\\)\1")
+def _strip_code_spans(text: str) -> str:
+    """Blank CommonMark inline code spans, preserving line structure.
+
+    A regex cannot do this correctly. A code span opens on a backtick run and
+    closes on the next run of *exactly* the same length, the span may contain a
+    line ending, and backslash escapes do not apply inside one. Any line-scoped
+    or escape-aware pattern therefore mispairs delimiters and can delete a real
+    link — both directions were observed:
+
+    * ``\\`x\\`` on line 1, ``\\`` then a link then ``\\`y`` on line 2, ``\\``
+      on line 3: the middle line's two backticks close span one and open span
+      two, so the link between them is real, but a line-scoped matcher pairs
+      them and removes it.
+    * ``\\`code\\\\\\` [link](x) \\``: the backtick after the backslash closes
+      the span (escapes are inert inside it), so the link is real, but an
+      escape-aware lookbehind skips that closer and pairs the outermost pair.
+
+    Newlines inside a span are preserved so the caller's line-oriented passes
+    keep their alignment. An unclosed run stays literal text, as CommonMark
+    specifies.
+    """
+
+    def escaped(position: int) -> bool:
+        """True when the character at ``position`` is backslash escaped."""
+        backslashes = 0
+        while position - backslashes - 1 >= 0 and text[position - backslashes - 1] == "\\":
+            backslashes += 1
+        return backslashes % 2 == 1
+
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] != "`":
+            out.append(text[index])
+            index += 1
+            continue
+        # Escapes are honoured in ordinary text, so an escaped backtick cannot
+        # OPEN a span. They are inert inside a span, so the closer scan below
+        # deliberately does not consult this.
+        if escaped(index):
+            out.append(text[index])
+            index += 1
+            continue
+        opener_end = index
+        while opener_end < length and text[opener_end] == "`":
+            opener_end += 1
+        run = opener_end - index
+
+        closer: tuple[int, int] | None = None
+        cursor = opener_end
+        while cursor < length:
+            if text[cursor] != "`":
+                cursor += 1
+                continue
+            candidate_end = cursor
+            while candidate_end < length and text[candidate_end] == "`":
+                candidate_end += 1
+            if candidate_end - cursor == run:
+                closer = (cursor, candidate_end)
+                break
+            cursor = candidate_end
+
+        if closer is None:
+            out.append("`" * run)
+            index = opener_end
+            continue
+        # Keep only the newlines from inside the span; drop everything else so a
+        # link written as sample syntax is not checked as a live link.
+        out.append("\n" * text.count("\n", opener_end, closer[0]))
+        index = closer[1]
+    return "".join(out)
+
+
+_HEADING_LINE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
 
 
 def _outside_fences(text: str) -> str:
@@ -48,10 +116,30 @@ def _outside_fences(text: str) -> str:
                 fence = None
             lines.append("")
         elif fence is None:
-            lines.append(line if line.lstrip().startswith("#") else _CODE_SPAN.sub("", line))
+            lines.append(line)
         else:
             lines.append("")
-    return "\n".join(lines)
+
+    # Heading lines keep their backticks: _anchors() slugs them, and blanking a
+    # span inside a heading would change the generated anchor. Code spans are
+    # stripped from maximal runs of non-heading lines, so a span may still wrap
+    # across lines within such a run.
+    result: list[str] = []
+    block: list[str] = []
+
+    def flush() -> None:
+        if block:
+            result.extend(_strip_code_spans("\n".join(block)).split("\n"))
+            block.clear()
+
+    for line in lines:
+        if _HEADING_LINE.match(line):
+            flush()
+            result.append(line)
+        else:
+            block.append(line)
+    flush()
+    return "\n".join(result)
 
 
 def _github_slug(title: str) -> str:
@@ -98,6 +186,20 @@ def test_outside_fences_strips_inline_code_without_eating_real_links() -> None:
     escaped = _outside_fences(r"\`[CLI](cli.md#init)\`")
     assert "[CLI](cli.md#init)" in escaped
 
+    # ...but escapes are inert INSIDE a span, so the backtick after the
+    # backslash closes it and the link that follows is outside and real.
+    assert "[bad](missing.md)" in _outside_fences("`code\\` [bad](missing.md) `")
+
+    # A span may wrap across lines. The middle line's two backticks close the
+    # first span and open the second, so the link between them is real — a
+    # line-scoped matcher pairs them and silently deletes it.
+    wrapped = _outside_fences("`first span\n` [bad](missing.md) `second span\n`")
+    assert "[bad](missing.md)" in wrapped
+    assert wrapped.count("\n") == 2, "line alignment must survive span stripping"
+
+    # An unclosed run is literal text, not an open span swallowing the rest.
+    assert "[CLI](cli.md#init)" in _outside_fences("see ` and [CLI](cli.md#init)")
+
     # Headings keep their backticks so heading slugs stay byte-faithful.
     assert _outside_fences("## `mms doctor`") == "## `mms doctor`"
 
@@ -131,6 +233,13 @@ def test_link_checker_still_catches_breakage_after_code_span_stripping(
     assert _check_links_of(tmp_path, monkeypatch, "`[gone](missing.md)`\n") is None
     # An escaped backtick does not open a span, so this breakage is still caught.
     assert _check_links_of(tmp_path, monkeypatch, "\\`[gone](missing.md)\\`\n") is not None
+    # End to end, both delimiter-pairing traps must still surface real breakage.
+    assert _check_links_of(tmp_path, monkeypatch, "`a\n` [gone](missing.md) `b\n`\n") is not None, (
+        "a link between two multiline spans is real and its breakage must be caught"
+    )
+    assert _check_links_of(tmp_path, monkeypatch, "`code\\` [gone](missing.md) `\n") is not None, (
+        "escapes are inert inside a span, so the following link is real"
+    )
 
 
 def test_public_markdown_relative_links_and_anchors_resolve() -> None:
