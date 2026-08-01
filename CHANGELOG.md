@@ -11,6 +11,25 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- docs: refresh the public documentation for Core 0.3.13 and rebuild the drift
+  checks that guard it. The environment reference is now a complete `STMConfig`
+  inventory compared against the model itself, `docs/compression.md` states what
+  `consumer_model` actually does (one-directional ceilings, not strategy
+  selection), and the reviewed-resume guide gains a cleanup section whose
+  commands the released-core advisory executes rather than substring-matches.
+  Documentation only — no runtime behavior change. (#800)
+
+### Fixed
+
+- docs: `mms hook --host auto` does resolve Codex from a non-empty `turn_id`;
+  the docstring and CLI help claimed it could not. (#800)
+- docs: `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__*` are documented for the first
+  time, with the caveat that the block is absent by default and the extractor
+  then uses a different profile (`ollama` / `qwen3:4b` / 1000 tokens) than the
+  field defaults the table lists. (#800)
+
 ## [0.1.44] — 2026-07-30
 
 ### Upgrade notes
