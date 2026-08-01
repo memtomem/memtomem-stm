@@ -62,13 +62,59 @@ def _link_targets(text: str) -> list[str]:
 
 
 def _headings(text: str) -> list[str]:
-    """Raw source text of each ATX/setext heading, in document order."""
+    """Rendered text of each ATX/setext heading, in document order.
+
+    GitHub slugs what a heading *renders* to, not its source, so a heading
+    containing a link or emphasis must contribute only its visible text —
+    ``## [X](y.md) title`` is ``x-title``, not ``xymd-title``.
+    """
     titles: list[str] = []
     tokens = _PARSER.parse(text)
     for index, token in enumerate(tokens):
-        if token.type == "heading_open" and index + 1 < len(tokens):
-            titles.append(tokens[index + 1].content)
+        if token.type != "heading_open" or index + 1 >= len(tokens):
+            continue
+        inline = tokens[index + 1]
+        titles.append(
+            "".join(
+                child.content
+                for child in (inline.children or [])
+                if child.type in ("text", "code_inline")
+            )
+            or inline.content
+        )
     return titles
+
+
+_CANONICAL_PREFIXES = (
+    "https://github.com/memtomem/memtomem-stm/blob/main/",
+    "https://github.com/memtomem/memtomem-stm/tree/main/",
+)
+_BARE_CANONICAL = re.compile(
+    r"https://github\.com/memtomem/memtomem-stm/(?:blob|tree)/main/[^\s)<>\]`\"']*"
+)
+
+
+def _bare_canonical_urls(text: str) -> list[str]:
+    """Canonical repo URLs GitHub linkifies but CommonMark leaves as text.
+
+    The parser is a CommonMark one and GitHub renders GFM, whose autolink
+    extension turns a bare URL into a link. Only canonical repo URLs matter:
+    every other absolute URL is skipped by the checker anyway. Written as raw
+    text, so a URL inside a code span is excluded by asking the parser what it
+    already accounted for.
+    """
+    accounted = set(_link_targets(text))
+    accounted.update(
+        token.content
+        for token in _tokens(text)
+        if token.type in ("code_inline", "fence", "code_block")
+    )
+    return [
+        match.group(0)
+        for match in _BARE_CANONICAL.finditer(text)
+        if match.group(0) not in accounted
+        and not any(match.group(0) in content for content in accounted)
+    ]
 
 
 def _github_slug(title: str) -> str:
@@ -226,6 +272,15 @@ def test_link_checker_catches_breakage_the_delimiter_traps_used_to_hide(
     assert _check_links_of(tmp_path, monkeypatch, "!`x`[gone](missing.md)\n") is not None, (
         "a bang beside a span must not turn the link into an ignored image"
     )
+    # GitHub linkifies a bare canonical URL; a CommonMark parser does not, so
+    # the checker adds them back rather than leaving them unvalidated.
+    canonical = "https://github.com/memtomem/memtomem-stm/blob/main/"
+    assert _check_links_of(tmp_path, monkeypatch, f"See {canonical}nope.md today\n") is not None, (
+        "a bare canonical URL is a live link on GitHub and must be checked"
+    )
+    assert _check_links_of(tmp_path, monkeypatch, f"Run `{canonical}nope.md` today\n") is None, (
+        "...but the same URL inside a code span is sample text"
+    )
 
 
 def test_public_markdown_relative_links_and_anchors_resolve() -> None:
@@ -234,16 +289,13 @@ def test_public_markdown_relative_links_and_anchors_resolve() -> None:
         # The parser already resolved which targets are live links: code spans,
         # fenced blocks and images never reach this loop, and an angle-bracket
         # destination arrives unwrapped.
-        for raw in _link_targets(source.read_text(encoding="utf-8")):
+        body = source.read_text(encoding="utf-8")
+        for raw in [*_link_targets(body), *_bare_canonical_urls(body)]:
             raw = raw.strip()
             if not raw:
                 continue
-            canonical_prefixes = (
-                "https://github.com/memtomem/memtomem-stm/blob/main/",
-                "https://github.com/memtomem/memtomem-stm/tree/main/",
-            )
             canonical = next(
-                (prefix for prefix in canonical_prefixes if raw.startswith(prefix)),
+                (prefix for prefix in _CANONICAL_PREFIXES if raw.startswith(prefix)),
                 None,
             )
             if canonical is not None:
