@@ -11,6 +11,15 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.1.45] — 2026-08-01
+
+Emergency patch: every install of 0.1.44 or earlier made from PyPI after
+`mcp` 2.0.0 shipped fails at import. The dependency declared no upper bound,
+so a fresh resolve picked up an SDK that had removed both
+`streamablehttp_client` and `mcp.server.fastmcp`. Anyone whose install is
+currently broken should upgrade; anyone already running is unaffected, and
+nothing else in this release changes observable behavior.
+
 ### Security
 
 - docs: `SECURITY.md` corrects two published claims that were broader than the
