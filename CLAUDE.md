@@ -13,6 +13,8 @@ uv sync                                                    # install deps
 uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"  # tests (CI filter)
 uv run ruff check src && uv run ruff format --check src    # lint (required)
 uv run mypy src                                            # typecheck (required)
+uv run pytest tests/test_docs_sync.py tests/test_docs_links.py  # docs contracts
+uv run pytest --nbmake notebooks/01_quickstart_proxy_setup.ipynb --nbmake-timeout=180  # public tutorial
 ```
 
 `ruff`, `mypy`, and tests gate merge — on **Windows too**, so POSIX-only stdlib

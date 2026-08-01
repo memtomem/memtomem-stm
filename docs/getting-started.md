@@ -18,6 +18,20 @@ without installing with `uvx memtomem-stm --help`. The three console scripts
 guide uses `mms` for operator commands and the explicit `memtomem-stm` server
 command in MCP client registrations.
 
+For an existing installation, upgrade and validate it before changing any
+client registration:
+
+```bash
+uv tool upgrade memtomem-stm                 # uv tool installation
+python -m pip install --upgrade memtomem-stm # virtualenv / pip installation
+mms version
+mms doctor
+```
+
+Read the target release's [Upgrade notes](../CHANGELOG.md) first. Restart the
+current config's daemon only when an upgrade note requires it. Existing client
+registrations are preserved unless `--replace-registration` is explicit.
+
 ## 2. Add an upstream
 
 The shortest path uses a bundled read-only server, needs no Node.js or network,
@@ -27,6 +41,10 @@ and can register STM with the detected client:
 mms init --demo --client auto
 mms doctor
 ```
+
+After restarting the selected client, ask it to call
+`demo__demo_search({"query": "cache"})`. The demo path exposes
+`demo__demo_search`; it does not expose filesystem tools.
 
 On Windows 11, run the same commands in PowerShell (`py -m pip install
 memtomem-stm` is an alternative when `pip` is not on PATH). Native Windows and
@@ -40,6 +58,17 @@ mms add filesystem \
   --command npx \
   --args "-y @modelcontextprotocol/server-filesystem /home/user/projects" \
   --prefix fs
+mms register --client auto
+mms doctor
+```
+
+PowerShell uses the same arguments on one line; replace the path with a native
+Windows absolute path:
+
+```powershell
+mms add filesystem --command npx --args "-y @modelcontextprotocol/server-filesystem C:\Users\you\projects" --prefix fs
+mms register --client auto
+mms doctor
 ```
 
 The prefix becomes the public tool namespace, such as `fs__read_file`. It must
@@ -102,13 +131,18 @@ mms health   # live upstream and surfacing probes
 
 ## 5. Call a proxied tool
 
-Ask the client to use a proxied alias such as `fs__read_file`. Calls made
-through a client's built-in `Read`, `Bash`, or similar tools do not cross the
-MCP proxy boundary. The optional [`mms hook`](guides/native-hooks.md) observes
-some native PostToolUse events, but it is not a replacement for the proxy.
+For the bundled demo, ask the client to use `demo__demo_search`. For the
+separately registered filesystem server, ask it to use `fs__read_file`. STM
+advertises these wire aliases as `<prefix>__<tool>`; a client may display them
+with its own prefix, for example
+`mcp__memtomem-stm__fs__read_file`. Calls made through a client's built-in
+`Read`, `Bash`, or similar tools do not cross the MCP proxy boundary. The
+optional [`mms hook`](guides/native-hooks.md) observes some native PostToolUse
+events, but it is not a replacement for the proxy.
 
 ## Next steps
 
+- [Browse the documentation by task](README.md)
 - [한국어: Claude Code와 Codex CLI를 위한 시작 가이드](guides/vibe-coding-getting-started-ko.md)
 - [Enforce Toolgraph policy bundles through the STM gateway](guides/toolgraph-policy-gateway.md)
 - [Operate and troubleshoot STM](guides/operations.md)

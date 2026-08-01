@@ -6,7 +6,7 @@ One quick-start notebook is kept here as a runnable demo of memtomem-stm:
 
 | # | Notebook | Scenario | External deps |
 |---|----------|----------|---------------|
-| 01 | [`01_quickstart_proxy_setup.ipynb`](01_quickstart_proxy_setup.ipynb) | Register an upstream MCP server, call a proxied tool, read `stm_proxy_stats` with tutorial-local observability enabled | None |
+| 01 | [`01_quickstart_proxy_setup.ipynb`](01_quickstart_proxy_setup.ipynb) | Call a proxied tool, follow selective compression with `stm_proxy_select_chunks`, and inspect tutorial-local stats | None |
 
 For the real-client path—installation, registration, `mms doctor`, and the
 first proxied call—use the public [Getting Started guide](../docs/getting-started.md).
@@ -37,7 +37,7 @@ uv run pytest --nbmake \
 
 ## State isolation
 
-The notebook's first code cell calls `isolate_stm_state()` from
+The notebook's setup code cell calls `isolate_stm_state()` from
 `_helpers.py`, which points STM's proxy config, cache, metrics, and
 all three feedback/telemetry database families at a fresh temp directory via
 environment variables:
@@ -62,11 +62,11 @@ notebooks/
 ├── _helpers.py                                 # shared isolation + MCP session utilities
 ├── _fixtures/
 │   ├── echo_mcp.py                             # trivial echo MCP server (used by 01)
-│   ├── doc_mcp.py                              # structured doc MCP server (used by archived notebooks)
+│   ├── doc_mcp.py                              # structured doc MCP server (used by 01)
 │   └── fake_ltm.py                             # fake memtomem LTM (used by archived notebooks)
 └── 01_quickstart_proxy_setup.ipynb
 ```
 
-`_fixtures/doc_mcp.py` and `_fixtures/fake_ltm.py` are kept for
-completeness even though `01` only uses `echo_mcp.py` — they're tiny and
-the archived notebooks (and any future re-promotion) depend on them.
+`_fixtures/fake_ltm.py` is kept for the archived surfacing scenario and any
+future re-promotion; the public quick-start uses both `echo_mcp.py` and
+`doc_mcp.py` without external services.

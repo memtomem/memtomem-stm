@@ -120,8 +120,8 @@ def _init_legacy_or_schema_two(
     )
 
 
-def _init_schema_three_guide(mm: Path, *, project: Path, env: dict[str, str]) -> None:
-    """Run the core CLI portion of the reviewed-memory-resume guide."""
+def _init_current_guide(mm: Path, *, project: Path, env: dict[str, str]) -> None:
+    """Bootstrap a clean temp home, then run the reviewed-resume CLI flow."""
     _run(
         [
             str(mm),
@@ -195,7 +195,7 @@ def _init_schema_three_guide(mm: Path, *, project: Path, env: dict[str, str]) ->
     )
 
 
-async def _assert_schema_three_review_flow(
+async def _assert_current_review_flow(
     adapter: McpClientSearchAdapter,
     mm: Path,
     *,
@@ -248,8 +248,8 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
         project.mkdir()
         _run(["git", "init", "--quiet"], env=env, cwd=project)
 
-        if expected == "schema3":
-            _init_schema_three_guide(mm, project=project, env=env)
+        if expected in {"schema3", "schema4"}:
+            _init_current_guide(mm, project=project, env=env)
         else:
             _init_legacy_or_schema_two(
                 mm,
@@ -302,7 +302,8 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                     )
                     assert hit.context is None
                 else:
-                    assert adapter.capabilities.context_compose_schema == 3
+                    expected_schema = 4 if expected == "schema4" else 3
+                    assert adapter.capabilities.context_compose_schema == expected_schema
                     bundle = await adapter.context_compose(
                         "resume-window-sentinel",
                         max_chars=15_000,
@@ -321,7 +322,13 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                     assert hit.context is not None
                     assert "Phase 3" in hit.context.window_before[-1].content
                     assert "Phase 5" in hit.context.window_after[0].content
-                    await _assert_schema_three_review_flow(
+                    if expected == "schema4":
+                        assert bundle.score_scale is not None
+                        assert hit.score_scale == bundle.score_scale
+                    else:
+                        assert bundle.score_scale is None
+                        assert hit.score_scale is None
+                    await _assert_current_review_flow(
                         adapter,
                         mm,
                         project=project,
@@ -334,7 +341,11 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--core-bin-dir", type=Path, required=True)
-    parser.add_argument("--expect", choices=("legacy", "schema2", "schema3"), required=True)
+    parser.add_argument(
+        "--expect",
+        choices=("legacy", "schema2", "schema3", "schema4"),
+        required=True,
+    )
     args = parser.parse_args()
     asyncio.run(_smoke(args.core_bin_dir, args.expect))
 

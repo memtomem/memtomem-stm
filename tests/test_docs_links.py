@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _public_markdown() -> list[Path]:
     roots = [
         REPO_ROOT / "README.md",
+        REPO_ROOT / "CHANGELOG.md",
         REPO_ROOT / "CLA.md",
         REPO_ROOT / "CONTRIBUTING.md",
         REPO_ROOT / "SECURITY.md",
@@ -36,7 +37,7 @@ def _outside_fences(text: str) -> str:
                 fence = None
             lines.append("")
         elif fence is None:
-            lines.append(line)
+            lines.append(line if line.lstrip().startswith("#") else re.sub(r"(`+).*?\1", "", line))
         else:
             lines.append("")
     return "\n".join(lines)
@@ -71,6 +72,30 @@ def test_public_markdown_relative_links_and_anchors_resolve() -> None:
             raw = match.group(1).strip()
             if raw.startswith("<") and raw.endswith(">"):
                 raw = raw[1:-1]
+            canonical_prefixes = (
+                "https://github.com/memtomem/memtomem-stm/blob/main/",
+                "https://github.com/memtomem/memtomem-stm/tree/main/",
+            )
+            canonical = next(
+                (prefix for prefix in canonical_prefixes if raw.startswith(prefix)),
+                None,
+            )
+            if canonical is not None:
+                target_part, _, fragment = raw[len(canonical) :].partition("#")
+                target = REPO_ROOT / unquote(target_part)
+                if not target.exists():
+                    failures.append(
+                        f"{source.relative_to(REPO_ROOT)} missing canonical target: {raw}"
+                    )
+                elif (
+                    fragment
+                    and target.suffix.lower() == ".md"
+                    and unquote(fragment) not in _anchors(target)
+                ):
+                    failures.append(
+                        f"{source.relative_to(REPO_ROOT)} broken canonical anchor: {raw}"
+                    )
+                continue
             if re.match(r"^(?:https?|mailto):", raw) or raw.startswith("#"):
                 if raw.startswith("#") and raw[1:] not in _anchors(source):
                     failures.append(f"{source.relative_to(REPO_ROOT)} -> {raw}")
@@ -98,6 +123,9 @@ def test_public_markdown_relative_links_and_anchors_resolve() -> None:
 def test_public_markdown_has_no_duplicate_generated_anchors() -> None:
     failures: list[str] = []
     for source in _public_markdown():
+        if source.name == "CHANGELOG.md":
+            # Keep-a-Changelog intentionally repeats category headings.
+            continue
         text = _outside_fences(source.read_text(encoding="utf-8"))
         seen: set[str] = set()
         for line in text.splitlines():

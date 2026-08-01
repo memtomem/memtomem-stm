@@ -344,46 +344,31 @@ When an agent provides `_context_query` in tool arguments, compression allocates
 }
 ```
 
-## Model-Aware Defaults
+## Model-Aware Ceilings
 
-When `consumer_model` is set, STM automatically scales settings for the consuming model's context window. Set it once and the compression budget, surfacing injection size, and result count all adjust.
+`consumer_model` applies conservative, one-directional ceilings. It can reduce
+an effective budget for a known small-context model, but it never raises an
+explicitly configured limit and does not choose a strategy or context window.
 
 ```bash
 export MEMTOMEM_STM_PROXY__CONSUMER_MODEL=claude-sonnet-4
 ```
 
-| Setting | SLM (≤32K) | Medium (32K-200K) | LLM (>200K) |
-|---------|------------|-------------------|--------------|
-| `max_result_chars` | ~5,600 | ~16,000 | ~16,000 (capped at `default_max_result_chars`, default 16,000; raise it for a larger budget) |
-| `max_injection_chars` | 1,500 | 3,000 | 5,000 |
-| `max_results` (surfacing) | 2 | 3 | 5 |
-| `context_window` | 0-1 | 1-2 | 2-5 |
-| Compression strategy | skeleton / truncate | auto (default) | auto / none |
+| Setting | Known model at ≤32K | Known model above 32K | Unknown or unset model |
+|---------|---------------------|-----------------------|------------------------|
+| Proxy `max_result_chars` | `min(context_tokens × context_budget_ratio × chars_per_token, configured default_max_result_chars)` | Same formula and configured ceiling | Configured `default_max_result_chars` |
+| Surfacing `max_injection_chars` | `min(configured value, 1500)` | Configured value | Configured value |
+| Surfacing `max_results` | `min(configured value, 2)` | Configured value | Configured value |
+| `context_window_size` | Configured value | Configured value | Configured value |
+| Compression strategy | Configured/content-selected value | Configured/content-selected value | Configured/content-selected value |
 
-### Model Examples
+With the defaults (`context_budget_ratio=0.05`, `chars_per_token=3.5`, and a
+16,000-character configured ceiling), a known 32K model gets a proxy budget of
+5,600 characters. A 200K model remains capped at 16,000. A zero calculated
+model budget falls back to the configured ceiling rather than suppressing the
+response.
 
-| Model | Context | Tier | Notes |
-|-------|---------|------|-------|
-| `claude-opus-4` | 200K | Medium | Default settings work well |
-| `claude-sonnet-4` | 200K | Medium | Default settings work well |
-| `claude-haiku-4` | 200K | Medium | Default settings work well |
-| `gpt-4.1` | 1M | LLM | Generous budget, more surfacing |
-| `gpt-4.1-mini` | 1M | LLM | **Default LLM compression model**; generous budget |
-| `gpt-4.1-nano` | 1M | LLM | Generous budget, more surfacing |
-| `gpt-4o` | 128K | Medium | Default settings work well |
-| `gpt-4o-mini` | 128K | Medium | Default settings work well |
-| `o4-mini` | 200K | Medium | Reasoning model, default settings |
-| `o3` / `o3-pro` / `o3-mini` | 200K | Medium | Reasoning models, default settings |
-| `o1` / `o1-pro` | 200K | Medium | Reasoning models, default settings |
-| `o1-mini` | 128K | Medium | Default settings work well |
-| `gemini-2.5-pro` | 1M | LLM | Generous budget, more surfacing |
-| `gemini-2.5-flash` | 1M | LLM | Generous budget, more surfacing |
-| `llama-4-maverick` | 1M | LLM | Open-weight, generous budget |
-| `llama-4-scout` | 512K | LLM | Open-weight, generous budget |
-| `deepseek-r1` / `deepseek-v3` | 131K | Medium | Default settings work well |
-| `qwen-3` | 131K | Medium | Default settings work well |
-| `mistral-large` | 131K | Medium | Default settings work well |
-| `codestral` | 262K | Medium | Code-focused model |
-| `command-a` | 262K | Medium | Cohere, default settings |
-
-Prefix-matched: `claude-sonnet-4-20250514` matches `claude-sonnet-4`. All scaling is automatic when `consumer_model` is set. Override any value explicitly to disable auto-scaling for that setting.
+Model names are prefix-matched against the runtime registry, so a dated name
+such as `claude-sonnet-4-20250514` can match its base entry. The proxy-level
+`consumer_model` propagates to surfacing only when surfacing has no explicit
+consumer model of its own.

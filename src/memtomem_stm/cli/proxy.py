@@ -3752,8 +3752,10 @@ def init(
 ) -> None:
     """Guided first-time setup for memtomem-stm.
 
-    Prompts for a single upstream server and writes the config file. Aborts
-    when the config already exists — use ``mms add`` to append more servers.
+    Prompts for a single upstream server and writes the config file. Without
+    ``--resume``, aborts when the config already exists; ``--resume`` preserves
+    that config and continues client registration. Use ``mms add`` to append
+    more servers.
     """
     path = Path(config_path)
     resolved = path.expanduser().resolve()

@@ -80,19 +80,20 @@ original `max_injection_chars` model-injection limit; schema 2 and disabled
 windows retain the original request budget.
 
 Core 0.3.8 is the tested legacy baseline, 0.3.9 carries schema 2, and 0.3.10 is
-the first release to carry schema 3. Core 0.3.12 is the planned first release
-to carry schema 4. The intermediate schema 1 contract was never included in a
-tagged PyPI release, although source-installed builds may exist. Capability
-negotiation, not these version labels, controls runtime behavior; until a Core
-advertises schema 4, STM keeps the schema 3-or-older path.
+the first release to carry schema 3. Core 0.3.12 is the first release to carry
+schema 4, and the released-Core smoke also covers Core 0.3.13. The intermediate
+schema 1 contract was never included in a tagged PyPI release, although
+source-installed builds may exist. Capability negotiation, not these version
+labels, controls runtime behavior; a Core that does not advertise schema 4
+keeps STM on the schema 3-or-older path.
 
 To force a rollback, configure the actual LTM command rather than installing
 an older core into an unrelated environment:
 
 ```bash
+mms daemon stop
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=uvx
 export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem==0.3.8","memtomem-server"]'
-mms daemon stop --all
 ```
 
 Restart a direct STM process as well, if used, so the next session negotiates
@@ -224,7 +225,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
 | `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
-| `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Only sent when the core advertises the parameter in its `mem_search` schema (planned for Core 0.3.12) — on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
+| `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Core 0.3.12+ advertises this parameter; on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
 | `scale_gated_min_score` | `true` | Suspend the RRF-calibrated `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Both structured `mem_search` (core #1781) and a compose schema-4 core (core #1796) report the scale, so the gate covers both retrieval paths. Batches with no reported scale (`compact` format, pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
@@ -699,7 +700,7 @@ hit:
   intentional, set `context_tools.<name>.min_score` explicitly. The
   diagnostic never lowers the threshold automatically.
 
-  Core 0.3.12 is planned to name the scale its scores are on (`score_scale`:
+  Core 0.3.12+ names the scale its scores are on (`score_scale`:
   `rrf` / `bm25` / `dense` / `none` / `rerank`, core #1781) in structured
   `mem_search` output, and STM stamps it onto every parsed result. A core
   advertising compose schema 4 (core #1796) names the same scale on the

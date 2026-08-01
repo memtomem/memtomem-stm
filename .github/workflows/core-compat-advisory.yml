@@ -23,6 +23,10 @@ jobs:
             expected: schema2
           - core: "0.3.10"
             expected: schema3
+          - core: "0.3.12"
+            expected: schema4
+          - core: "0.3.13"
+            expected: schema4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,7 +40,10 @@ jobs:
           CORE_VERSION: ${{ matrix.core }}
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/core"
-          uv pip install --python "$RUNNER_TEMP/core/bin/python" "memtomem==$CORE_VERSION"
+          # Core 0.3.x imports mcp.server.fastmcp, which mcp 2.x removed.
+          # Pin the released wire/runtime family until Core declares its cap.
+          uv pip install --python "$RUNNER_TEMP/core/bin/python" \
+            "memtomem==$CORE_VERSION" "mcp<2"
       - name: Run stdio capability smoke
         env:
           EXPECTED: ${{ matrix.expected }}

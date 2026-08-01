@@ -3,7 +3,7 @@
 ## Choose a reference
 
 - [Environment variables](reference/environment-variables.md): root,
-  surfacing, hook, daemon, and Langfuse settings
+  surfacing, formation, hook, daemon, Langfuse, and OTLP settings
 - [Proxy JSON](reference/proxy-config.md): upstreams, compression, cache,
   telemetry, exposure, and toolgraph
 - [Surfacing behavior](surfacing.md): retrieval gates, feedback, tuning, and
@@ -14,7 +14,8 @@ This page retains the detailed legacy sections and anchors used by existing
 links. The split references above are the faster entrypoints for new readers.
 
 > **Configuration-source boundary:** `stm_proxy.json` is parsed strictly as a
-> `ProxyConfig`. Root, surfacing, hook, daemon, and Langfuse settings are
+> `ProxyConfig`. Root, surfacing, formation, hook, daemon, Langfuse, and OTLP
+> settings are
 > environment/default-only; adding those blocks to the JSON file has no
 > effect. The proxy `consumer_model` propagation into surfacing budget
 > resolution is the documented exception.
@@ -29,8 +30,9 @@ flowchart LR
     Merge --> STM["STM runtime"]
 ```
 
-1. **Environment variables** — root/process settings and all surfacing, hook,
-   daemon, and Langfuse settings; proxy fields can also be overridden here.
+1. **Environment variables** — root/process settings and all surfacing,
+   formation, hook, daemon, Langfuse, and OTLP settings; proxy fields can also
+   be overridden here.
 2. **Config file** — `~/.memtomem/stm_proxy.json`, parsed as `ProxyConfig`
    only and hot-reloaded for supported fields.
 3. **Defaults** — baseline values for both domains.

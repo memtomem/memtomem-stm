@@ -82,8 +82,9 @@ The installed command includes `mms hook --host <name>`. On the runtime bridge,
 could block a host action. An unrecognized or bare value warns and falls back
 to auto-detection. `install` and `uninstall` remain strict operator commands.
 
-Auto-detection cannot distinguish Claude from Codex payloads, so Codex
-registrations must keep the explicit `--host codex` argument.
+Auto-detection recognizes Codex when the payload carries a non-empty `turn_id`.
+An otherwise Claude/Codex-ambiguous payload falls back to Claude, so installed
+Codex registrations still keep the explicit `--host codex` argument.
 
 ## Daemon and fallback
 
@@ -113,9 +114,11 @@ mms stats --source hook
 ```
 
 Rows contain source/tool identity, sizes, timing, and compression outcome—not
-the native tool's content. Set the variable to `false` to disable recording.
-Feedback-event recording, which can retain query metadata, remains separately
-opt-in through `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS`.
+the native tool's content. Set the variable to `false` to disable hook metrics.
+`MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS` is a separate feedback-loop gate:
+when false it disables the rating prompt, durable-demotion reads, and auto-tune
+feedback processing. Surfacing telemetry events are still written with the
+configured query persistence policy.
 
 Claude's `updatedToolOutput` changes what the model sees; it does not guarantee
 that the original output was absent from Claude Code telemetry recorded before

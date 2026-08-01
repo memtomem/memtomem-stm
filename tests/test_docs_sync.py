@@ -13,9 +13,11 @@ import importlib.util
 import json
 import os
 import re
+from enum import Enum
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,6 +49,38 @@ def _fwd_slash(obj: object) -> object:
     if isinstance(obj, list):
         return [_fwd_slash(v) for v in obj]
     return obj
+
+
+def _stmconfig_environment_defaults(
+    model: type[BaseModel], prefix: tuple[str, ...] = ()
+) -> dict[str, object]:
+    """Flatten direct nested models using STM's settings delimiter."""
+    result: dict[str, object] = {}
+    for name, field in model.model_fields.items():
+        path = (*prefix, name)
+        annotation = field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            result.update(_stmconfig_environment_defaults(annotation, path))
+            continue
+        suffix = "__".join(part.upper() for part in path)
+        result[f"MEMTOMEM_STM_{suffix}"] = field.get_default(call_default_factory=True)
+    return result
+
+
+def _documented_default(value: object) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, Enum):
+        value = value.value
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, str):
+        return value if value else "empty"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, separators=(",", ":"), default=str)
+    return str(value)
 
 
 def _canonical_ci_test_filter() -> str:
@@ -157,6 +191,7 @@ def test_cli_docs_track_platform_aware_desktop_discovery() -> None:
         "~/.config/Claude",
     ):
         assert path in cli_md
+    assert "macOS-only" not in cli_md
 
 
 def test_configuration_full_example_documents_upstream_timeouts() -> None:
@@ -1131,8 +1166,8 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
         assert token in env_ref, f"environment reference lost {token}"
     assert "MEMTOMEM_STM_ENABLED" not in env_ref
     assert "MEMTOMEM_STM_CONFIG_PATH" not in env_ref
-    assert "| `MEMTOMEM_STM_PROXY__ENABLED` | `false` |" in env_ref
-    assert "daemon handshakes" in env_ref
+    assert "| `MEMTOMEM_STM_PROXY__ENABLED` | boolean | `false` |" in env_ref
+    assert "daemon handshakes" in env_ref.lower()
     assert "default state paths" not in env_ref
 
     from memtomem_stm.proxy.config import ProxyConfig
@@ -1225,11 +1260,152 @@ def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
         assert phrase in surfacing, f"surfacing guide lost {phrase!r}"
     for body in (readme, surfacing):
         assert "Core 0.3.12" in body
+        assert "Core 0.3.13" in body
         assert "schema 4" in body
-    assert "planned first release" in surfacing
+        assert "planned first release" not in body
+    assert "planned for Core 0.3.12" not in surfacing
     assert "Cores newer than v0.3.11" not in surfacing
     assert "expected to carry schema 3" not in surfacing
     assert '"surfacing": {' not in surfacing
+
+
+def test_first_success_guides_use_real_separate_upstreams() -> None:
+    """The copyable happy paths must not promise filesystem tools from demo."""
+    for relative in (
+        "README.md",
+        "docs/getting-started.md",
+        "docs/guides/vibe-coding-getting-started-ko.md",
+    ):
+        body = _read(relative)
+        assert "demo__demo_search" in body
+        assert "mms add filesystem" in body
+        assert "fs__read_file" in body
+        assert "mcp__memtomem-stm__" in body
+
+
+def test_cli_docs_track_live_init_doctor_and_auto_hook_contracts() -> None:
+    """Pin safety-sensitive help behavior rather than a stale option snapshot."""
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.hook_cmd import hook_command
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    init_help = CliRunner().invoke(mms_cli, ["init", "--help"], terminal_width=200)
+    assert init_help.exit_code == 0
+    assert "--resume" in init_help.output
+    assert "aborts when the config already exists" in init_help.output
+
+    doctor = mms_cli.commands["doctor"]
+    live_doctor_options = {
+        option
+        for param in doctor.params
+        for option in getattr(param, "opts", ())
+        if option.startswith("--")
+    }
+    doctor_section = re.search(
+        r"### `doctor`\n(.*?)(?=\n### |\n## |\Z)",
+        _read("docs/cli.md"),
+        re.DOTALL,
+    )
+    assert doctor_section is not None
+    for option in live_doctor_options:
+        assert option in doctor_section.group(1)
+    assert "default doctor run is passive" in doctor_section.group(1)
+
+    hook_help = CliRunner().invoke(hook_command, ["--help"], terminal_width=200)
+    assert hook_help.exit_code == 0
+    for body in (
+        hook_help.output,
+        _read("docs/cli.md"),
+        _read("docs/guides/native-hooks.md"),
+    ):
+        assert "turn_id" in body
+        assert "Claude" in body
+
+
+def test_model_aware_ceiling_docs_match_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from memtomem_stm.proxy.config import MODEL_CONTEXT_WINDOWS, ProxyConfig
+    from memtomem_stm.surfacing.config import SurfacingConfig
+
+    small_model = "docs-test-small-model"
+    monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, small_model, 32_000)
+    surfacing = SurfacingConfig(
+        consumer_model=small_model,
+        max_injection_chars=4_000,
+        max_results=5,
+    )
+    assert surfacing.effective_max_injection_chars() == 1_500
+    assert surfacing.effective_max_results() == 2
+    assert (
+        SurfacingConfig(
+            consumer_model="unknown-model",
+            max_injection_chars=4_000,
+            max_results=5,
+        ).effective_max_injection_chars()
+        == 4_000
+    )
+
+    proxy = ProxyConfig(
+        consumer_model=small_model,
+        default_max_result_chars=99_999,
+    )
+    calculated = int(
+        MODEL_CONTEXT_WINDOWS[small_model] * proxy.context_budget_ratio * proxy.chars_per_token
+    )
+    assert proxy.effective_max_result_chars() == min(calculated, 99_999)
+
+    compression = _read("docs/compression.md")
+    for phrase in (
+        "Model-Aware Ceilings",
+        "min(configured value, 1500)",
+        "min(configured value, 2)",
+        "does not choose a strategy or context window",
+    ):
+        assert phrase in compression
+
+
+def test_environment_reference_is_complete_and_default_accurate() -> None:
+    """Every STMConfig leaf must appear once with its actual model default."""
+    from memtomem_stm.config import STMConfig
+
+    body = _read("docs/reference/environment-variables.md")
+    table = body.split("<!-- stmconfig-env:start -->", 1)[1].split("<!-- stmconfig-env:end -->", 1)[
+        0
+    ]
+    documented: dict[str, str] = {}
+    duplicates: list[str] = []
+    for line in table.splitlines():
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) != 5 or not cells[0].startswith("`MEMTOMEM_STM_"):
+            continue
+        name = cells[0].strip("`")
+        if name in documented:
+            duplicates.append(name)
+        default = cells[2]
+        documented[name] = default[1:-1] if default.startswith("`") else default
+
+    expected = _stmconfig_environment_defaults(STMConfig)
+    assert duplicates == []
+    assert documented.keys() == expected.keys()
+    assert documented == {name: _documented_default(default) for name, default in expected.items()}
+
+    for direct_name in (
+        "MEMTOMEM_STM_HOOK_SURFACE_TOOLS",
+        "MMS_CLIENT_SERVER_NAME",
+        "MMS_NO_TUI",
+        "NO_COLOR",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "APPDATA",
+        "OTEL_SERVICE_NAME",
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    ):
+        assert f"`{direct_name}`" in body
 
 
 def test_public_notebook_inventory_and_state_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1280,13 +1456,24 @@ def test_public_notebook_inventory_and_state_isolation(monkeypatch: pytest.Monke
 
     notebook = json.loads(public_notebooks[0].read_text(encoding="utf-8"))
     notebook_source = "".join(line for cell in notebook["cells"] for line in cell.get("source", []))
-    assert '"mms", "add"' in notebook_source
+    assert notebook_source.count('"mms"') >= 2
+    assert notebook_source.count('"add"') >= 2
     assert "env=isolated_cli_env(config_path)" in notebook_source
+    for token in (
+        '"--compression"',
+        '"selective"',
+        '"doc__get_document"',
+        '"stm_proxy_select_chunks"',
+        "parse_toc_response",
+        'assert toc is not None, "Expected a selective-compression TOC"',
+    ):
+        assert token in notebook_source
 
 
 def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
     """The journey/reference split remains discoverable from stable entrypoints."""
     readme = _read("README.md")
+    assert "docs/README.md" in readme
     assert "docs/getting-started.md" in readme
     assert "docs/guides/operations.md" in readme
     assert "docs/guides/vibe-coding-getting-started-ko.md" in readme
@@ -1310,6 +1497,18 @@ def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
     ):
         assert target in config_hub
 
+    docs_hub = _read("docs/README.md")
+    for target in (
+        "getting-started.md",
+        "guides/vibe-coding-getting-started-ko.md",
+        "reference/environment-variables.md",
+        "guides/operations.md",
+        "compression.md",
+        "surfacing.md",
+        "adr/README.md",
+    ):
+        assert target in docs_hub
+
 
 def test_toolgraph_gateway_guide_pins_observability_contract() -> None:
     """Keep gateway onboarding literals tied to their runtime sources."""
@@ -1327,7 +1526,6 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     """Keep the copy/paste core CLI flow tied to the released-core advisory."""
     guide = _read("docs/guides/reviewed-memory-resume.md")
     for snippet in (
-        "mm init --non-interactive --preset minimal --namespace resume-demo --mcp skip",
         "mm mem init",
         "mm pinned set resume-contract",
         "--scope project_local",
@@ -1338,13 +1536,27 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         "mm index .memtomem/memories.local/resume-demo.md --namespace resume-demo --force",
         "mm review list",
         "mm review show CANDIDATE_ID",
-        'mm review approve CANDIDATE_ID --reviewer "$USER"',
+        "mm review reject CANDIDATE_ID",
+        "mm pinned delete resume-contract --scope project_local",
+        "mm gc orphan-sources --apply",
+        "mms remove resume_fs --yes",
     ):
         assert snippet in guide, f"reviewed-memory-resume guide lost {snippet!r}"
 
+    assert "--with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'" in guide
+    assert "memtomem>=0.3.12,<0.4" in guide
+    assert "does not approve" in guide and "one implicitly." in guide
+    assert "\nmms daemon stop --all\n" not in guide
+    assert "schema 4" in guide
+
+    workflow = _read(".github/workflows/core-compat-advisory.yml")
+    for version in ('core: "0.3.12"', 'core: "0.3.13"'):
+        assert version in workflow
+    assert '"mcp<2"' in workflow
+
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (
-        "_init_schema_three_guide",
+        "_init_current_guide",
         '"resume-contract"',
         '"project_local"',
         '"resume-demo"',
