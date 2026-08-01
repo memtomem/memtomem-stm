@@ -17,12 +17,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ``mcp_pin`` exists because Core 0.3.x imports mcp.server.fastmcp,
+          # which mcp 2.x removed, while declaring no upper bound of its own.
+          # A newly added row must NOT inherit it: leave mcp_pin empty so a Core
+          # that caps mcp itself resolves on its own, and a Core that needs
+          # mcp>=2 is not held back by a pin it never asked for.
           - core: "0.3.8"
             expected: legacy
+            mcp_pin: "mcp<2"
           - core: "0.3.9"
             expected: schema2
+            mcp_pin: "mcp<2"
           - core: "0.3.10"
             expected: schema3
+            mcp_pin: "mcp<2"
+          - core: "0.3.12"
+            expected: schema4
+            mcp_pin: "mcp<2"
+          - core: "0.3.13"
+            expected: schema4
+            mcp_pin: "mcp<2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,9 +48,29 @@ jobs:
       - name: Install exact core release
         env:
           CORE_VERSION: ${{ matrix.core }}
+          MCP_PIN: ${{ matrix.mcp_pin }}
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/core"
-          uv pip install --python "$RUNNER_TEMP/core/bin/python" "memtomem==$CORE_VERSION"
+          # shellcheck disable=SC2086 # an empty MCP_PIN must expand to no argument
+          uv pip install --python "$RUNNER_TEMP/core/bin/python" \
+            "memtomem==$CORE_VERSION" ${MCP_PIN:+"$MCP_PIN"}
+      - name: Report whether this row still needs its mcp pin
+        if: ${{ matrix.mcp_pin != '' }}
+        env:
+          MCP_PIN: ${{ matrix.mcp_pin }}
+        run: |
+          # Read Core's own requirement from its venv (stdlib only — packaging
+          # is not guaranteed there; 0.3.10 has none), then judge it with the
+          # tracked helper, which is unit-tested in tests/test_docs_sync.py.
+          {
+            "$RUNNER_TEMP/core/bin/python" -c \
+              'import sys; print(".".join(str(p) for p in sys.version_info[:3]))'
+            "$RUNNER_TEMP/core/bin/python" -c \
+              'import importlib.metadata as m; print("\n".join(m.requires("memtomem") or ()))'
+          } > "$RUNNER_TEMP/core-requires.txt"
+          uv run python scripts/core_compat_smoke.py \
+            --check-mcp-pin "$MCP_PIN" \
+            --core-requires "$RUNNER_TEMP/core-requires.txt"
       - name: Run stdio capability smoke
         env:
           EXPECTED: ${{ matrix.expected }}

@@ -36,6 +36,8 @@ uv run mypy src
 - `tests/` — pytest suite
   - `tests/bench/` — `bench_qa` scenario harness (see "Adding a bench_qa scenario" below)
 - `docs/` — User-facing guides (surfacing, compression, caching, configuration, cli, selection-telemetry)
+  - `docs/README.md` — Canonical task-oriented documentation hub
+  - `docs/reference/environment-variables.md` — Complete environment inventory; keep it synchronized with `STMConfig`
 
 The LTM core lives in a separate repository: [memtomem/memtomem](https://github.com/memtomem/memtomem). Communication between STM and LTM happens entirely through the MCP protocol — there is no Python-level dependency.
 
@@ -49,6 +51,18 @@ The LTM core lives in a separate repository: [memtomem/memtomem](https://github.
 6. Ensure `uv run mypy src` passes (required in CI on both Linux and Windows)
 7. Write a clear commit message describing the "why"
 8. Sign the CLA on your first pull request (see below)
+
+For documentation changes, also run:
+
+```bash
+uv run pytest tests/test_docs_sync.py tests/test_docs_links.py
+uv run pytest --nbmake notebooks/01_quickstart_proxy_setup.ipynb --nbmake-timeout=180
+```
+
+Compare CLI examples with live `mms <command> --help`, and update the released
+Core compatibility smoke when a documented capability schema changes. The
+root README is rendered on PyPI: keep its repository-document links canonical
+and absolute, while pages under `docs/` should use relative links.
 
 We do not accept third-party automated promotional or badge PRs (for example,
 vendor security-scan badges); these will be closed.

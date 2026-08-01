@@ -51,6 +51,20 @@ PowerShell에서 `python`이나 `pip`가 보이지 않으면 `py --version`과
 사람이 실행하는 관리 명령은 짧은 `mms`를 사용하고, MCP 클라이언트에는
 서버 명령인 `memtomem-stm`을 등록합니다.
 
+기존 설치를 업그레이드할 때는 등록부터 교체하지 말고 다음 순서로
+확인합니다.
+
+```bash
+uv tool upgrade memtomem-stm
+mms version
+mms doctor
+```
+
+`pip` 설치였다면 `python -m pip install --upgrade memtomem-stm`을 사용합니다.
+먼저 [CHANGELOG의 Upgrade notes](../../CHANGELOG.md)를 읽고, 안내가 있는
+경우에만 현재 설정의 daemon을 재시작하세요. 기존 MCP 등록은 유지되며
+의도적으로 갱신할 때만 `--replace-registration`을 사용합니다.
+
 ## 2. STM이 감쌀 MCP 서버 정하기
 
 처음 설정할 때는 원본 MCP 등록을 바로 지우지 마세요. 먼저 STM 경유
@@ -82,6 +96,23 @@ mms doctor
 
 prefix는 공개 도구 이름이 됩니다. 예를 들어 `fs`를 사용하면
 `fs__read_file` 같은 도구가 만들어집니다.
+
+마법사 대신 filesystem을 직접 등록하려면 다음 명령을 실행합니다.
+
+```bash
+mms add filesystem \
+  --command npx \
+  --args "-y @modelcontextprotocol/server-filesystem /절대/경로/프로젝트" \
+  --prefix fs
+mms register --client auto
+```
+
+PowerShell에서는 실제 Windows 경로로 바꿔 한 줄로 실행합니다.
+
+```powershell
+mms add filesystem --command npx --args "-y @modelcontextprotocol/server-filesystem C:\Users\you\project" --prefix fs
+mms register --client auto
+```
 
 > Codex CLI: `mms import --from codex`는 `CODEX_HOME`(기본 `~/.codex`)의 기존 MCP를 탐색합니다.
 > 신뢰된 프로젝트의 `.codex/config.toml`은 `--allow-project-configs`로
@@ -145,17 +176,26 @@ mms doctor
 뜻입니다. 프록시, 압축, 캐시는 계속 동작하고 Claude Code/Codex 자체
 memory는 영향을 받지 않습니다.
 
-Claude Code 또는 Codex CLI에 다음처럼 요청합니다.
+내장 데모를 선택했다면 Claude Code 또는 Codex CLI에 먼저 다음처럼
+요청합니다.
+
+```text
+memtomem-stm의 demo__demo_search MCP 도구로 "cache"를 검색하고 결과를 요약해줘.
+```
+
+filesystem을 별도로 등록한 경우에만 다음 요청을 사용합니다.
 
 ```text
 내장 Read 대신 memtomem-stm의 fs__read_file MCP 도구를 사용해서
 README.md의 첫 40줄을 읽고 핵심을 세 문장으로 정리해줘.
 ```
 
-클라이언트는 전체 이름을
-`mcp__memtomem-stm__fs__read_file`처럼 표시할 수도 있습니다. 핵심은
-내장 파일 읽기 도구가 아니라 `memtomem-stm` 아래의 `fs__...` 도구가
-실제로 호출되는 것입니다.
+STM이 MCP wire에 공개하는 이름은 `demo__demo_search`나
+`fs__read_file`입니다. 클라이언트 UI는 같은 도구를
+`mcp__memtomem-stm__demo__demo_search` 또는
+`mcp__memtomem-stm__fs__read_file`처럼 표시할 수도 있습니다. 앞의
+`mcp__<client-server>__` 부분은 일부 클라이언트가 표시할 때 붙이는
+namespace입니다.
 
 호출 뒤에는 durable 지표를 확인합니다.
 
@@ -167,7 +207,7 @@ mms stats --source mcp
 
 - `mms doctor`가 종료 코드 0이다.
 - 클라이언트의 `/mcp`에 `memtomem-stm`이 보인다.
-- `fs__...` 같은 proxied alias로 실제 도구를 한 번 호출했다.
+- `demo__...` 또는 별도로 등록한 `fs__...` proxied alias로 도구를 호출했다.
 - `mms stats --source mcp`에 해당 MCP 호출이 기록됐다.
 
 ## 6. 검증 후 원본 MCP 정리하기
@@ -241,7 +281,7 @@ upstream 이름이 안정된 뒤 `strict`로 전환하는 흐름을 권장합니
 
 | 증상 | 확인할 것 |
 |---|---|
-| `mms init`이 기존 설정 때문에 중단됨 | `mms list`로 확인하고 `mms add` 또는 `mms register` 사용 |
+| `mms init`이 기존 설정 때문에 중단됨 | `mms init --resume --client auto`로 등록 단계를 이어가거나 `mms add` 사용 |
 | `/mcp`에 STM이 없음 | 호스트 등록 명령 재확인, 클라이언트 재시작, `mms doctor` 실행 |
 | STM은 보이지만 `fs__...`가 없음 | `mms list`, `mms health --names`, upstream command/args 확인 |
 | `ltm server` WARN | 프록시에는 문제 없음; 기억 기능이 필요할 때만 LTM 설정 |

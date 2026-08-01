@@ -89,6 +89,10 @@ dev = [
     # exporter — no network. Mirrors the `otlp` extra.
     "opentelemetry-sdk>=1.30",
     "opentelemetry-exporter-otlp-proto-http>=1.30",
+    # tests/test_docs_links.py parses the public docs with a real CommonMark
+    # parser instead of hand-rolling one. Declared rather than leaned on as
+    # rich's transitive dependency, which could drop it at any release.
+    "markdown-it-py>=3.0",
 ]
 audit = ["pip-audit==2.10.1"]
 

@@ -9,13 +9,18 @@ in local testing and only surfaces through user confusion.
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
 import json
 import os
 import re
+from enum import Enum
 from pathlib import Path
+from types import UnionType
+from typing import Union, get_args, get_origin
 
 import pytest
+from pydantic import BaseModel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,6 +52,72 @@ def _fwd_slash(obj: object) -> object:
     if isinstance(obj, list):
         return [_fwd_slash(v) for v in obj]
     return obj
+
+
+def _load_core_compat_smoke() -> object:
+    """Import the tracked advisory script by path (``scripts/`` is not a package)."""
+    path = REPO_ROOT / "scripts" / "core_compat_smoke.py"
+    spec = importlib.util.spec_from_file_location("core_compat_smoke", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stmconfig_environment_defaults(
+    model: type[BaseModel], prefix: tuple[str, ...] = ()
+) -> dict[str, object]:
+    """Flatten nested models using STM's settings delimiter.
+
+    ``SubModel | None`` is traversed exactly like a bare ``SubModel``, because
+    pydantic-settings builds the optional block from its ``__``-suffixed
+    variables too. Collapsing such a field into one leaf would let the
+    completeness assertion below stay green with a whole block undocumented, so
+    ``SubModel | None`` is the *only* union this walker accepts: any other arm
+    alongside a model (a second model, or a scalar the walker would silently
+    ignore) is a hard failure rather than a silent leaf.
+    """
+    result: dict[str, object] = {}
+    for name, field in model.model_fields.items():
+        path = (*prefix, name)
+        annotation = field.annotation
+        nested: type[BaseModel] | None = None
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            nested = annotation
+        elif get_origin(annotation) in (Union, UnionType):
+            args = get_args(annotation)
+            models = [arg for arg in args if isinstance(arg, type) and issubclass(arg, BaseModel)]
+            others = [arg for arg in args if arg not in models and arg is not type(None)]
+            if models and (len(models) > 1 or others):
+                raise AssertionError(
+                    f"{'.'.join(path)} unions a nested model with {len(models) - 1} other "
+                    f"model(s) and {len(others)} non-None arm(s); teach this walker which "
+                    "shape pydantic-settings builds before the environment reference can "
+                    "claim completeness"
+                )
+            nested = models[0] if models else None
+        if nested is not None:
+            result.update(_stmconfig_environment_defaults(nested, path))
+            continue
+        suffix = "__".join(part.upper() for part in path)
+        result[f"MEMTOMEM_STM_{suffix}"] = field.get_default(call_default_factory=True)
+    return result
+
+
+def _documented_default(value: object) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, Enum):
+        value = value.value
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, str):
+        return value if value else "empty"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, separators=(",", ":"), default=str)
+    return str(value)
 
 
 def _canonical_ci_test_filter() -> str:
@@ -157,6 +228,7 @@ def test_cli_docs_track_platform_aware_desktop_discovery() -> None:
         "~/.config/Claude",
     ):
         assert path in cli_md
+    assert "macOS-only" not in cli_md
 
 
 def test_configuration_full_example_documents_upstream_timeouts() -> None:
@@ -1131,8 +1203,8 @@ def test_new_reference_docs_pin_high_risk_public_fields() -> None:
         assert token in env_ref, f"environment reference lost {token}"
     assert "MEMTOMEM_STM_ENABLED" not in env_ref
     assert "MEMTOMEM_STM_CONFIG_PATH" not in env_ref
-    assert "| `MEMTOMEM_STM_PROXY__ENABLED` | `false` |" in env_ref
-    assert "daemon handshakes" in env_ref
+    assert "| `MEMTOMEM_STM_PROXY__ENABLED` | boolean | `false` |" in env_ref
+    assert "daemon handshakes" in env_ref.lower()
     assert "default state paths" not in env_ref
 
     from memtomem_stm.proxy.config import ProxyConfig
@@ -1225,11 +1297,269 @@ def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
         assert phrase in surfacing, f"surfacing guide lost {phrase!r}"
     for body in (readme, surfacing):
         assert "Core 0.3.12" in body
+        assert "Core 0.3.13" in body
         assert "schema 4" in body
-    assert "planned first release" in surfacing
+        assert "planned first release" not in body
+    assert "planned for Core 0.3.12" not in surfacing
     assert "Cores newer than v0.3.11" not in surfacing
     assert "expected to carry schema 3" not in surfacing
     assert '"surfacing": {' not in surfacing
+
+
+def test_first_success_guides_use_real_separate_upstreams() -> None:
+    """The copyable happy paths must not promise filesystem tools from demo."""
+    for relative in (
+        "README.md",
+        "docs/getting-started.md",
+        "docs/guides/vibe-coding-getting-started-ko.md",
+    ):
+        body = _read(relative)
+        assert "demo__demo_search" in body
+        assert "mms add filesystem" in body
+        assert "fs__read_file" in body
+        assert "mcp__memtomem-stm__" in body
+
+
+def test_cli_docs_track_live_init_doctor_and_auto_hook_contracts() -> None:
+    """Pin safety-sensitive help behavior rather than a stale option snapshot."""
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.hook_cmd import hook_command
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    init_help = CliRunner().invoke(mms_cli, ["init", "--help"], terminal_width=200)
+    assert init_help.exit_code == 0
+    assert "--resume" in init_help.output
+    assert "aborts when the config already exists" in init_help.output
+
+    doctor = mms_cli.commands["doctor"]
+    live_doctor_options = {
+        option
+        for param in doctor.params
+        for option in getattr(param, "opts", ())
+        if option.startswith("--")
+    }
+    doctor_section = re.search(
+        r"### `doctor`\n(.*?)(?=\n### |\n## |\Z)",
+        _read("docs/cli.md"),
+        re.DOTALL,
+    )
+    assert doctor_section is not None
+    for option in live_doctor_options:
+        assert option in doctor_section.group(1)
+    assert "default doctor run is passive" in doctor_section.group(1)
+
+    hook_help = CliRunner().invoke(hook_command, ["--help"], terminal_width=200)
+    assert hook_help.exit_code == 0
+    for body in (
+        hook_help.output,
+        _read("docs/cli.md"),
+        _read("docs/guides/native-hooks.md"),
+    ):
+        assert "turn_id" in body
+        assert "Claude" in body
+
+
+def test_model_aware_ceiling_docs_match_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from memtomem_stm.proxy.config import MODEL_CONTEXT_WINDOWS, ProxyConfig
+    from memtomem_stm.surfacing.config import SurfacingConfig
+
+    small_model = "docs-test-small-model"
+    monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, small_model, 32_000)
+    surfacing = SurfacingConfig(
+        consumer_model=small_model,
+        max_injection_chars=4_000,
+        max_results=5,
+    )
+    assert surfacing.effective_max_injection_chars() == 1_500
+    assert surfacing.effective_max_results() == 2
+    assert (
+        SurfacingConfig(
+            consumer_model="unknown-model",
+            max_injection_chars=4_000,
+            max_results=5,
+        ).effective_max_injection_chars()
+        == 4_000
+    )
+
+    proxy = ProxyConfig(
+        consumer_model=small_model,
+        default_max_result_chars=99_999,
+    )
+    calculated = int(
+        MODEL_CONTEXT_WINDOWS[small_model] * proxy.context_budget_ratio * proxy.chars_per_token
+    )
+    assert proxy.effective_max_result_chars() == min(calculated, 99_999)
+
+    compression = _read("docs/compression.md")
+    for phrase in (
+        "Model-Aware Ceilings",
+        "min(configured value, 1500)",
+        "min(configured value, 2)",
+        "does not choose a strategy or context window",
+    ):
+        assert phrase in compression
+
+
+def test_stmconfig_env_walker_refuses_a_shape_it_would_undercount() -> None:
+    """The completeness walker must fail loudly, not silently lose a block."""
+
+    class _Nested(BaseModel):
+        alpha: int = 1
+        beta: str = "b"
+
+    class _Direct(BaseModel):
+        nested: _Nested = _Nested()
+
+    assert _stmconfig_environment_defaults(_Direct) == {
+        "MEMTOMEM_STM_NESTED__ALPHA": 1,
+        "MEMTOMEM_STM_NESTED__BETA": "b",
+    }
+
+    class _Optional(BaseModel):
+        nested: _Nested | None = None
+
+    # pydantic-settings builds an optional block from the same suffixed
+    # variables, so the walker must not collapse it into one leaf.
+    assert _stmconfig_environment_defaults(_Optional) == {
+        "MEMTOMEM_STM_NESTED__ALPHA": 1,
+        "MEMTOMEM_STM_NESTED__BETA": "b",
+    }
+
+    class _Other(BaseModel):
+        gamma: int = 2
+
+    class _Ambiguous(BaseModel):
+        nested: _Nested | _Other = _Nested()
+
+    with pytest.raises(AssertionError, match=r"1 other model\(s\) and 0 non-None"):
+        _stmconfig_environment_defaults(_Ambiguous)
+
+    # A scalar arm is just as ambiguous: traversing would silently drop it.
+    class _ModelOrScalar(BaseModel):
+        nested: _Nested | str = "s"
+
+    with pytest.raises(AssertionError, match=r"0 other model\(s\) and 1 non-None"):
+        _stmconfig_environment_defaults(_ModelOrScalar)
+
+    # A union with no model at all stays an ordinary leaf.
+    class _ScalarUnion(BaseModel):
+        value: int | None = None
+
+    assert _stmconfig_environment_defaults(_ScalarUnion) == {"MEMTOMEM_STM_VALUE": None}
+
+
+def test_environment_reference_warns_that_extractor_llm_defaults_differ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tabulated field default is not the extractor's absent-block behavior.
+
+    ``ExtractionConfig.llm`` defaults to ``None`` and ``effective_llm()`` then
+    substitutes a different profile, so every ``EXTRACTION__LLM__*`` row in the
+    table describes a config the extractor only uses once someone materializes
+    the block. Drive that materialization through the *environment*, the way a
+    reader of this table would, and take the prompt failure from the production
+    call rather than restating its keyword here.
+    """
+    import pydantic
+
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.proxy.config import ExtractionConfig, LLMProvider
+    from memtomem_stm.proxy.extraction import FactExtractor
+
+    absent = ExtractionConfig()
+    assert absent.llm is None
+    effective = absent.effective_llm()
+    assert effective.provider is LLMProvider.OLLAMA
+    assert effective.model == "qwen3:4b"
+    assert effective.max_tokens == 1000
+
+    # One leaf, set the way the table invites, materializes the whole block:
+    # provider defaults to openai and startup then demands a credential.
+    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MODEL", "docs-test-model")
+    with pytest.raises(pydantic.ValidationError, match="api_key is required"):
+        STMConfig()
+
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__API_KEY", "docs-test-key")
+    materialized = STMConfig().proxy.extraction
+    assert materialized.llm is not None
+    assert materialized.effective_llm().provider is LLMProvider.OPENAI
+    assert materialized.effective_llm().model == "docs-test-model"
+
+    # The production formatting call is what raises; the absent-block profile
+    # survives the very same call.
+    with pytest.raises(KeyError, match="max_chars"):
+        asyncio.run(FactExtractor(materialized)._call_api("payload"))
+    absent_extractor = FactExtractor(absent)
+    assert absent_extractor._llm_cfg.system_prompt.format(max_facts=absent.max_facts), (
+        "the absent-block prompt must format on the same path"
+    )
+
+    body = _read("docs/reference/environment-variables.md")
+    caveat = body.split("### Caveat: `EXTRACTION__LLM__*` defaults", 1)[1]
+    for phrase in (
+        "provider `ollama`",
+        "`qwen3:4b`",
+        "`max_tokens` 1000",
+        # The rule is categorical: a sibling left unset takes its field default.
+        # An "any single variable flips the provider" claim would be false for
+        # `__PROVIDER=ollama`, so the doc must name the per-sibling outcomes.
+        "every sibling you did not set then takes the",
+        "| `__PROVIDER` | `openai` |",
+        "| `__SYSTEM_PROMPT` |",
+        "`{max_chars}`",
+        "`{max_facts}`",
+    ):
+        assert phrase in caveat, f"extractor-LLM caveat lost {phrase!r}"
+    assert "the provider flips to `openai`" not in caveat, (
+        "the unconditional phrasing is false when __PROVIDER is the leaf that is set"
+    )
+
+
+def test_environment_reference_is_complete_and_default_accurate() -> None:
+    """Every STMConfig leaf must appear once with its actual model default."""
+    from memtomem_stm.config import STMConfig
+
+    body = _read("docs/reference/environment-variables.md")
+    table = body.split("<!-- stmconfig-env:start -->", 1)[1].split("<!-- stmconfig-env:end -->", 1)[
+        0
+    ]
+    documented: dict[str, str] = {}
+    duplicates: list[str] = []
+    for line in table.splitlines():
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) != 5 or not cells[0].startswith("`MEMTOMEM_STM_"):
+            continue
+        name = cells[0].strip("`")
+        if name in documented:
+            duplicates.append(name)
+        default = cells[2]
+        documented[name] = default[1:-1] if default.startswith("`") else default
+
+    expected = _stmconfig_environment_defaults(STMConfig)
+    assert duplicates == []
+    assert documented.keys() == expected.keys()
+    assert documented == {name: _documented_default(default) for name, default in expected.items()}
+
+    for direct_name in (
+        "MEMTOMEM_STM_HOOK_SURFACE_TOOLS",
+        "MMS_CLIENT_SERVER_NAME",
+        "MMS_NO_TUI",
+        "NO_COLOR",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "APPDATA",
+        "OTEL_SERVICE_NAME",
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    ):
+        assert f"`{direct_name}`" in body
 
 
 def test_public_notebook_inventory_and_state_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1280,13 +1610,24 @@ def test_public_notebook_inventory_and_state_isolation(monkeypatch: pytest.Monke
 
     notebook = json.loads(public_notebooks[0].read_text(encoding="utf-8"))
     notebook_source = "".join(line for cell in notebook["cells"] for line in cell.get("source", []))
-    assert '"mms", "add"' in notebook_source
+    assert notebook_source.count('"mms"') >= 2
+    assert notebook_source.count('"add"') >= 2
     assert "env=isolated_cli_env(config_path)" in notebook_source
+    for token in (
+        '"--compression"',
+        '"selective"',
+        '"doc__get_document"',
+        '"stm_proxy_select_chunks"',
+        "parse_toc_response",
+        'assert toc is not None, "Expected a selective-compression TOC"',
+    ):
+        assert token in notebook_source
 
 
 def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
     """The journey/reference split remains discoverable from stable entrypoints."""
     readme = _read("README.md")
+    assert "docs/README.md" in readme
     assert "docs/getting-started.md" in readme
     assert "docs/guides/operations.md" in readme
     assert "docs/guides/vibe-coding-getting-started-ko.md" in readme
@@ -1310,6 +1651,18 @@ def test_readme_and_compatibility_hubs_link_to_split_docs() -> None:
     ):
         assert target in config_hub
 
+    docs_hub = _read("docs/README.md")
+    for target in (
+        "getting-started.md",
+        "guides/vibe-coding-getting-started-ko.md",
+        "reference/environment-variables.md",
+        "guides/operations.md",
+        "compression.md",
+        "surfacing.md",
+        "adr/README.md",
+    ):
+        assert target in docs_hub
+
 
 def test_toolgraph_gateway_guide_pins_observability_contract() -> None:
     """Keep gateway onboarding literals tied to their runtime sources."""
@@ -1323,11 +1676,63 @@ def test_toolgraph_gateway_guide_pins_observability_contract() -> None:
     assert counter in guide and counter in manager
 
 
+# (pin, Core's declared mcp requirement, redundant?) — the shapes the advisory
+# will actually meet. The unsafe direction is a wrong "drop the pin", so every
+# ambiguous shape must land on False.
+_MCP_PIN_CASES: tuple[tuple[str, str, bool], ...] = (
+    ("mcp<2", "mcp[cli]>=1.28.1", False),  # Core 0.3.8-0.3.13 today
+    ("mcp<2", "mcp<3", False),  # a cap, but above ours
+    ("mcp<2", "mcp!=2", False),  # rejects the boundary, admits 3.x
+    ("mcp<2", "mcp!=2.*", False),
+    ("mcp<2", "mcp<2.1,!=2.0.0", False),  # rejects samples, admits 2.0.1
+    ("mcp<2", "mcp<3\nmcp!=2.*", False),  # jointly sufficient, singly not
+    ("mcp<2", "mcp==1!0.*", False),  # epoch 1 sorts above every epoch 0
+    ("mcp<2", "mcp~=1!0.5", False),
+    ("mcp<2", "httpx>=1.0", False),  # no mcp requirement at all
+    ("mcp<2", "mcp<2", True),
+    ("mcp<2", "mcp~=1.28", True),  # >=1.28, ==1.*
+    ("mcp<2", "mcp~=1.28.1", True),
+    ("mcp<2", "mcp==1.*", True),
+    ("mcp<2", "mcp<=1.99", True),
+    ("mcp<2", "mcp>=1.28.1,<2", True),
+)
+
+
+@pytest.mark.parametrize(("pin", "requires", "redundant"), _MCP_PIN_CASES)
+def test_mcp_pin_expiry_probe_only_certifies_a_proven_cap(
+    pin: str, requires: str, redundant: bool
+) -> None:
+    """The advisory's pin probe, exercised as code rather than as a substring."""
+    smoke = _load_core_compat_smoke()
+    assert smoke.mcp_pin_is_redundant(pin, requires, "3.12.8")[0] is redundant
+
+
+def test_mcp_pin_expiry_probe_evaluates_markers_against_core_python() -> None:
+    """An inactive marker must not be judged, and packaging must not guess.
+
+    packaging fills any environment key it is not given from the *running*
+    interpreter, which is STM's, not the Core venv's — so a requirement gated
+    on a python version Core does not have could otherwise certify a drop.
+    """
+    smoke = _load_core_compat_smoke()
+    gated = 'mcp<2; python_full_version >= "3.12.6"'
+    assert smoke.mcp_pin_is_redundant("mcp<2", gated, "3.12.8")[0] is True
+    assert smoke.mcp_pin_is_redundant("mcp<2", gated, "3.12.4") == (False, [])
+    # An extra-gated requirement is not active: the workflow installs no extras.
+    assert smoke.mcp_pin_is_redundant("mcp<2", 'mcp<2; extra == "cli"', "3.12.8") == (False, [])
+
+
+def test_mcp_pin_expiry_probe_refuses_a_pin_it_cannot_judge() -> None:
+    """A pin with no upper bound has no boundary to prove anything against."""
+    smoke = _load_core_compat_smoke()
+    with pytest.raises(ValueError, match="declares no upper bound"):
+        smoke.mcp_pin_is_redundant("mcp>=1", "mcp<2", "3.12.8")
+
+
 def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     """Keep the copy/paste core CLI flow tied to the released-core advisory."""
     guide = _read("docs/guides/reviewed-memory-resume.md")
     for snippet in (
-        "mm init --non-interactive --preset minimal --namespace resume-demo --mcp skip",
         "mm mem init",
         "mm pinned set resume-contract",
         "--scope project_local",
@@ -1338,13 +1743,61 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         "mm index .memtomem/memories.local/resume-demo.md --namespace resume-demo --force",
         "mm review list",
         "mm review show CANDIDATE_ID",
-        'mm review approve CANDIDATE_ID --reviewer "$USER"',
+        "mm review reject CANDIDATE_ID",
+        "mm pinned delete resume-contract --scope project_local",
+        "mm gc orphan-sources --apply",
+        "mms remove resume_fs --yes",
     ):
         assert snippet in guide, f"reviewed-memory-resume guide lost {snippet!r}"
 
+    assert "--with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'" in guide
+    assert "memtomem>=0.3.12,<0.4" in guide
+    assert "does not approve" in guide and "one implicitly." in guide
+    assert "\nmms daemon stop --all\n" not in guide
+    assert "schema 4" in guide
+
+    workflow = _read(".github/workflows/core-compat-advisory.yml")
+    for version in ('core: "0.3.12"', 'core: "0.3.13"'):
+        assert version in workflow
+    # The pin is per matrix row, so a newly added Core does not inherit it, and
+    # it announces its own expiry rather than outliving the Core gap. Pin every
+    # link of that wiring: declaring the field is worthless if the install step
+    # stops consuming it or the probe stops being conditional on it.
+    assert 'mcp_pin: "mcp<2"' in workflow
+    for wiring in (
+        '${MCP_PIN:+"$MCP_PIN"}',  # an empty pin adds no install argument
+        "if: ${{ matrix.mcp_pin != '' }}",  # probe only runs for pinned rows
+        # ...and the judgement runs the tracked, unit-tested helper rather than
+        # inline YAML no test can reach.
+        "scripts/core_compat_smoke.py",
+        "--check-mcp-pin",
+        "--core-requires",
+    ):
+        assert wiring in workflow, f"core-compat advisory lost mcp_pin wiring: {wiring}"
+    # Both consumers need the field: the install step to apply the pin and the
+    # probe step to judge it. A membership check would survive losing either.
+    assert workflow.count("MCP_PIN: ${{ matrix.mcp_pin }}") == 2, (
+        "the matrix pin must reach both the install step and the expiry probe"
+    )
+    # Every matrix row must declare an expectation. Counting matches of a regex
+    # that *requires* ``expected`` proves nothing on its own — a malformed row
+    # simply would not match — so compare against the number of rows present.
+    # Both patterns accept any YAML scalar spelling: counting only `- core: "`
+    # would let `- core: '0.3.14'` or an unquoted value slip past both sides.
+    scalar = r"[\"']?[^\"'\s]+[\"']?"
+    declared_rows = len(re.findall(r"^\s*- core:\s*\S", workflow, re.MULTILINE))
+    well_formed = re.findall(
+        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", workflow
+    )
+    assert declared_rows >= 5, "core-compat matrix lost rows"
+    assert len(well_formed) == declared_rows, (
+        f"{declared_rows - len(well_formed)} core-compat row(s) do not declare "
+        "`expected` immediately after `core`"
+    )
+
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (
-        "_init_schema_three_guide",
+        "_init_current_guide",
         '"resume-contract"',
         '"project_local"',
         '"resume-demo"',
@@ -1353,8 +1806,32 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         '"review", "show"',
         '"review", "approve"',
         '"compat-smoke"',
+        # The guide's destructive cleanup commands must be *executed* by the
+        # advisory, not merely pinned as guide substrings above.
+        "_assert_guide_cleanup",
+        '"review", "reject"',
+        '"demo-operator"',
+        '"pinned", "delete", "resume-contract", "--scope", "project_local"',
+        '"gc", "orphan-sources"',
+        '"gc", "orphan-sources", "--apply", "--yes"',
     ):
         assert token in smoke, f"released-core advisory lost guide contract token {token!r}"
+
+    # ``--apply`` prompts; the guide has to say so, because the copyable form
+    # omits ``--yes`` while any non-interactive caller needs it.
+    assert "add `--yes` only in a" in guide
+
+    # The guide's STM-side cleanup commands, checked against the live CLI.
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    remove_help = CliRunner().invoke(mms_cli, ["remove", "--help"], terminal_width=200)
+    assert remove_help.exit_code == 0
+    assert "--yes" in remove_help.output
+    daemon_stop_help = CliRunner().invoke(mms_cli, ["daemon", "stop", "--help"], terminal_width=200)
+    assert daemon_stop_help.exit_code == 0
+    assert "--all" in daemon_stop_help.output
 
 
 def test_otlp_export_doc_matches_the_shipped_span_vocabulary() -> None:

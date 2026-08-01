@@ -128,7 +128,10 @@ Interactive wizard for the first-time setup. Prompts for a single upstream serve
 
 Use `--mcp claude|json|skip` to pre-answer the prompt from scripts, CI, or any caller where stdin isn't a TTY — interactive callers should omit the flag.
 
-Aborts if the config file already exists — use [`register`](#register) to re-run the registration prompt, [`add`](#add) to register additional servers, or [`list`](#list) to inspect the current state. This makes `init` safe to run without clobbering existing configuration.
+Without `--resume`, aborts if the config file already exists. `--resume`
+preserves the config and re-enters client registration; use [`register`](#register)
+to run registration directly, [`add`](#add) to add servers, or [`list`](#list)
+to inspect the current state. No path silently clobbers existing configuration.
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
@@ -231,7 +234,16 @@ A `--prefix` already used by another registered server is rejected before anythi
 
 With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `header_requires_http`, `malformed_args`, `invalid_env`, `invalid_header`, `validation_failed`). `--json` is a usage error with `--from-clients` — the import path is an interactive selection flow.
 
-Use `--from-clients` (alias `--import`) to bulk-pick additional servers from the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`, and `~/Library/Application Support/Claude/claude_desktop_config.json`. Claude Desktop discovery is **macOS-only** — on Linux/Windows the Claude Desktop file isn't scanned, so register those servers with `mms add` instead (paste hints elsewhere in the wizard are OS-aware; only the Desktop scan path is pinned to macOS). This is the post-init equivalent of the `init` discovery step — servers already registered in this config are filtered out by name and by `(transport, command, args)` / `(transport, url)` signature before the selection UI. `--validate` and `--timeout` work on the selected subset.
+Use `--from-clients` (alias `--import`) to bulk-pick additional servers from
+the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`,
+and the OS-specific Claude Desktop config — macOS
+`~/Library/Application Support/Claude/claude_desktop_config.json`, Windows
+`%APPDATA%\Claude\claude_desktop_config.json`, or Linux
+`~/.config/Claude/claude_desktop_config.json`. This is the post-init equivalent
+of the `init` discovery step — servers already registered in this config are
+filtered out by name and by `(transport, command, args)` / `(transport, url)`
+signature before the selection UI. `--validate` and `--timeout` work on the
+selected subset.
 
 To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or Claude Desktop edit to retry. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
@@ -462,6 +474,9 @@ Options:
   --json                   Output as JSON for scripting.
   --timeout INTEGER RANGE  Per-server connection timeout in seconds.
                            [default: 10; x>=1]
+  --measure-ltm            Run five synthetic searches against an existing
+                           shared daemon to refresh latency advice. A cold
+                           daemon may receive one additional prime search.
 ```
 
 One read-only diagnostic pass over the whole setup, designed for "I just installed this — why isn't it working?". Every check prints `PASS` / `WARN` / `FAIL`, a short cause, and — for anything that isn't a `PASS` — a `next:` line you can run as-is. **Exit code is 1 when any check FAILs; WARN-only runs exit 0.** That makes `mms doctor` the scriptable success gate for a fresh install: [`health`](#health) stays the always-exit-0 connectivity inspection, [`config validate`](#config-validate) stays the strict schema lint.
@@ -476,12 +491,22 @@ Checks, in order:
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
 | `prefixes` | the shared `proxy/prefixes.py` validators the runtime load path enforces | FAIL: empty or duplicate prefixes (same wording as the server's load rejection) |
 | `upstream: <name>` | the same staged probe as `health` | FAIL: probe failed — names the stage reached; a dead stdio binary gets a `command -v <cmd>` next action |
+| `host registration` | Codex, Claude Code, and project `.mcp.json` discovery | WARN: STM registration not detected |
 | `cache policy` | the `config validate` advisory predicate | WARN: cache enabled but `tool_annotation_policy` unset (conservative default caches unclassified tools) |
-| `ltm server` | the `health` LTM probe | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features (memory surfacing) are disabled, the proxy core is unaffected |
+| `compression tuning` | proxy metrics sample inventory | PASS with readiness or collection status; never writes tuning |
+| `ltm server` | the `health` LTM probe | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features are disabled |
+| `ltm runtime profile` / `dependencies` | Core runtime-profile schema 1 | FAIL when active dense/rerank dependencies are missing or Core cannot read effective config; older Core is WARN |
+| `ltm retrieval mode` | Core configured/effective search mode | FAIL on disabled or unexpected dense-to-BM25 degradation; intentional BM25-only is WARN |
+| `ltm score scale` | feedback diagnostics | FAIL while a recent score-scale mismatch episode remains unrecovered |
+| `ltm measurement` / timeout checks | daemon latency telemetry | WARN when measurement cannot run or configured surfacing/hook deadlines are too small |
 
 `--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Short-circuited runs contain only the checks that executed. Secrets never appear: probe errors are pre-sanitized and `env`/`headers` values are never printed.
 
-Doctor changes nothing — no config writes, no state mutation — so it's safe to run at any time, including against a live proxy's config.
+The default doctor run is passive: it performs no search and changes no state.
+`--measure-ltm` explicitly performs five synthetic searches against an already
+running shared daemon (plus one prime search when cold), discards their content,
+and updates daemon latency telemetry. It never starts a missing daemon and never
+edits STM configuration or LTM content.
 
 ### `status`
 
@@ -614,9 +639,10 @@ Code 2.1.121+, and is opt-in via
 `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED=1`, returning `updatedToolOutput` while
 preserving stderr, exit status, interruption state, and image markers.
 
-Runtime `--host TEXT` selects the adapter; `auto` (the default) infers it from
-the payload shape and falls back to Claude, but cannot tell Codex from Claude.
-An unrecognized or bare value warns and falls back to auto-detection instead of
+Runtime `--host TEXT` selects the adapter; `auto` (the default) recognizes
+Cursor and Kimi shapes and a non-empty Codex `turn_id`. A payload that remains
+Claude/Codex-ambiguous falls back to Claude. An unrecognized or bare value
+warns and falls back to auto-detection instead of
 exiting with a usage error, because a host treats non-zero hook exits as a
 block. The operator-facing install/uninstall subcommands keep the strict
 `[claude|codex|cursor|kimi]` choice. Per-host registration writes an explicit
@@ -648,6 +674,11 @@ Options:
   --apply                         Write the change (default: dry-run preview).
                                   Backs up any prior file to <path>.bak
                                   (.bak.1, … if one already exists).
+  --surfacing-timeout SECONDS     Pin the LTM search deadline. [x>0.0]
+  --daemon                        Install an explicit shared-daemon route.
+  --no-daemon                     Install an explicit cold/in-process route.
+  --inherit-runtime-env           Do not serialize daemon, timeout, or query-
+                                  persistence settings.
 ```
 
 The merge is idempotent — an existing STM block (recognized by command shape,

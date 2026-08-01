@@ -2,8 +2,8 @@
 
 The file at `~/.memtomem/stm_proxy.json` is a `ProxyConfig` document. It
 contains proxy, upstream, compression, cache, metrics, exposure, telemetry, and
-toolgraph settings. It does not contain root, surfacing, hook, daemon, or
-Langfuse settings; those are covered by the
+toolgraph settings. It does not contain root, surfacing, formation, hook,
+daemon, Langfuse, or OTLP settings; those are covered by the
 [environment-variable reference](environment-variables.md).
 
 ## Representative configuration

@@ -68,10 +68,26 @@ memtomem-stm is **independent**: it has no Python-level dependency on memtomem c
 | `context_compose` schema 4+ | Schema 3 behavior plus score-scale and reranker metadata |
 | `candidate_propose` schema 1+ | Optional review-first proposal submission |
 
-Core 0.3.8 is the tested legacy baseline, 0.3.9 first advertises schema 2, and
-0.3.10 first advertises schema 3. Core 0.3.12 is planned as the first schema 4
-release. Runtime behavior always follows the advertised capability, not the
-package version; do not assume schema 4 until the connected core advertises it.
+Core 0.3.8 is the tested legacy baseline, 0.3.9 first advertises schema 2,
+Core 0.3.10 first advertises schema 3, and Core 0.3.12 first advertises schema
+4. Runtime behavior always follows the connected server's advertised
+capability, not its package version. The released-Core compatibility smoke also
+covers the current Core 0.3.13 release.
+
+## Upgrade
+
+```bash
+uv tool upgrade memtomem-stm                 # uv tool installation
+python -m pip install --upgrade memtomem-stm # virtualenv / pip installation
+mms version
+mms doctor
+```
+
+Read the target release's [Upgrade notes](https://github.com/memtomem/memtomem-stm/blob/main/CHANGELOG.md)
+before upgrading. Restart only the daemon for the current configuration with
+`mms daemon restart` when an upgrade note requires it. Client registration is
+kept unchanged by default; use `mms register --replace-registration` only when
+you intentionally want to refresh it.
 
 ## Quick Start
 
@@ -84,7 +100,14 @@ mms init --demo --client auto  # no-network read-only first-success path
 mms doctor    # exit 0 (WARNs allowed) means the proxy setup is usable
 ```
 
-Without the wizard, add an upstream and register STM explicitly:
+Restart the selected client and ask it to call `demo__demo_search`, for example
+with `{"query": "cache"}`. A client may display the same MCP wire tool as
+`mcp__memtomem-stm__demo__demo_search`; `demo__demo_search` is the alias STM
+advertises, while the leading `mcp__<client-server>__` portion is added only by
+some client UIs.
+
+The filesystem path is separate from the bundled demo. Register it before
+asking for `fs__read_file`:
 
 ```bash
 mms add filesystem \
@@ -95,10 +118,11 @@ mms register
 mms doctor
 ```
 
-Your client should now list a proxied tool such as `fs__read_file`. An LTM
-warning is expected when no memtomem server is configured; it disables memory
-surfacing only, not proxying, compression, caching, or Claude Code/Codex's own
-client-managed memory.
+Your client should now list `fs__read_file` (possibly displayed with a client
+prefix as `mcp__memtomem-stm__fs__read_file`). An LTM warning is expected when
+no memtomem server is configured; it disables memory surfacing only, not
+proxying, compression, caching, or Claude Code/Codex's own client-managed
+memory.
 
 Continue with the complete
 [Getting Started guide](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md),
@@ -110,7 +134,10 @@ Korean-speaking Claude Code and Codex CLI users can follow the
 
 STM is an MCP proxy: it sees a tool call only if the client routes that call through the MCP protocol. Coverage depends on **how your client invokes the tool**, not on what the tool does.
 
-**STM sees:** any MCP server you register with `mms add` — every tool under the `mcp__<server>__<prefix>__<tool>` namespace — plus LTM surfacing calls to a configured memtomem server.
+**STM sees:** any MCP server you register with `mms add` — STM advertises each
+tool on the MCP wire as `<prefix>__<tool>`, while some clients display it as
+`mcp__<client-server>__<prefix>__<tool>` — plus LTM surfacing calls to a
+configured memtomem server.
 
 **STM does NOT see through the MCP proxy path:**
 - **Claude Code's built-in tools** — `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebFetch`. They run inside the client and never reach an MCP server, so their token spend is invisible to STM and unaffected by compression or caching.
@@ -156,12 +183,13 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 
 ## Tutorial notebooks
 
-> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](notebooks/01_quickstart_proxy_setup.ipynb) registers an upstream MCP server, calls a proxied tool, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
+> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](https://github.com/memtomem/memtomem-stm/blob/main/notebooks/01_quickstart_proxy_setup.ipynb) registers upstream MCP servers, calls proxied tools, verifies selective compression, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
 
 ## Documentation
 
 | Guide | Topic |
 |-------|-------|
+| [Documentation hub](https://github.com/memtomem/memtomem-stm/blob/main/docs/README.md) | First success → scenarios → operations → reference → architecture |
 | [Getting started](https://github.com/memtomem/memtomem-stm/blob/main/docs/getting-started.md) | Install → register → doctor → first proxied tool |
 | [한국어 바이브코딩 시작 가이드](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/vibe-coding-getting-started-ko.md) | Claude Code·Codex CLI 설치 → 연결 → 첫 proxied tool |
 | [Operations](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/operations.md) | Diagnose setup, upstreams, surfacing, and hooks |
@@ -175,6 +203,8 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 | [Use cases](https://github.com/memtomem/memtomem-stm/blob/main/docs/use-cases.md) | Reproducible scenarios and honest measurement boundaries |
 | [Reviewed project resume](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/reviewed-memory-resume.md) | Project-local Pinned Context, visible adjacent context, and optional review-first memory |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
+| [Environment variables](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/environment-variables.md) | Complete startup/runtime variable inventory and precedence |
+| [Architecture decisions](https://github.com/memtomem/memtomem-stm/blob/main/docs/adr/README.md) | Accepted contracts, status, and deferral gates |
 
 STM advertises four model-facing MCP tools by default. Eight observability and
 admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, etc.)

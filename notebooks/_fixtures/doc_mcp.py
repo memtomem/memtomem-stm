@@ -1,6 +1,6 @@
 """FastMCP server returning a large structured document.
 
-Used by the archived selective-compression scenario: the doc is
+Used by the public quick-start selective-compression branch: the doc is
 big enough to exceed the default ``max_result_chars`` budget, and it is
 structured (markdown sections) so the selective compressor produces a TOC
 response that the notebook can follow up on via ``stm_proxy_select_chunks``.
@@ -37,17 +37,16 @@ _SECTIONS: dict[str, str] = {
     )
     * 10,
     "Pipeline": (
-        "Each upstream tool call flows through a four-stage pipeline: "
-        "CLEAN strips noise, COMPRESS applies one of ten strategies, "
-        "SURFACE injects relevant memories, and INDEX stores the result "
-        "in the response cache for future hits.\n\n"
+        "After a cache miss, STM calls the upstream, cleans the result, "
+        "applies the configured compression strategy, optionally surfaces "
+        "memory context, and writes an eligible result to the cache.\n\n"
     )
     * 10,
     "Compression": (
         "Ten strategies are available: auto, truncate, extract_fields, "
         "schema_pruning, skeleton, llm_summary, selective, hybrid, "
         "progressive, and none. The auto strategy picks one based on "
-        "content shape and the consumer model's context window.\n\n"
+        "content shape. Consumer-model settings only constrain budgets.\n\n"
     )
     * 10,
     "Selective": (
@@ -67,7 +66,7 @@ _SECTIONS: dict[str, str] = {
     "Surfacing": (
         "When an upstream tool returns, STM optionally queries a "
         "long-term memory server for chunks relevant to the call and "
-        "injects them at the top of the response. The feedback tool "
+        "injects them according to the configured placement. The feedback tool "
         "lets the agent rate helpfulness and auto-tune future scoring.\n\n"
     )
     * 10,

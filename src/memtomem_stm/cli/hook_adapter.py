@@ -548,17 +548,16 @@ def detect_host(payload: Any) -> str:
     * **Cursor** uniquely uses the camelCase event ``postToolUse``.
     * **Kimi** carries the tool output under ``tool_output`` (so does Cursor, but
       its camelCase event is matched first) with a PascalCase ``PostToolUse``.
-    * Everything else — including a payload carrying ``tool_response`` — resolves
-      to **Claude**.
+    * **Codex** carries a non-empty string ``turn_id``.
+    * Everything else — including an otherwise ambiguous payload carrying
+      ``tool_response`` — resolves to **Claude**.
 
-    Claude and Codex payloads are **shape-identical** (snake_case keys,
-    ``tool_response``, ``PostToolUse``), so this can never return ``"codex"``;
-    Codex users must pass ``--host codex`` explicitly. Resolving an ambiguous
-    payload to Claude is safe: the Claude adapter parses a Codex payload
-    identically and its surfacing envelope is the same; only compression differs,
-    and Codex harmlessly ignores the ``updatedToolOutput`` field it does not
-    support. A non-dict / unrecognized payload also falls back to ``"claude"`` (the
-    adapter then no-ops on the unusable payload, as today).
+    Claude and Codex otherwise share the snake_case ``tool_response`` /
+    ``PostToolUse`` shape. Per-host registration therefore still writes
+    ``--host codex`` explicitly. Resolving an ambiguous payload to Claude is safe:
+    the Claude adapter parses it identically and automatic routing never authorizes
+    Claude-only output replacement. A non-dict / unrecognized payload also falls
+    back to ``"claude"`` (the adapter then no-ops on the unusable payload).
 
     Caveat for raw-stdout hosts: with a *malformed* payload ``auto`` cannot see
     it is Kimi and resolves to Claude, which serializes ``{}`` — non-empty stdout

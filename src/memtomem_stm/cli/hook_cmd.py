@@ -866,9 +866,10 @@ def _runtime_registration_env(overrides: dict[str, str]) -> Iterator[None]:
     flag_value="auto",
     help=(
         "Host whose PostToolUse payload/output shape to use. 'auto' infers it from "
-        "the payload shape (falls back to Claude). 'auto' cannot tell Codex from "
-        "Claude — their payloads are identical — so pass --host codex explicitly "
-        "for Codex. A plain string with an optional value: an unrecognized value is "
+        "the payload shape (falls back to Claude). A non-empty Codex turn_id is "
+        "recognized; an otherwise Claude/Codex-ambiguous payload falls back to "
+        "Claude, so installed Codex hooks still pass --host codex explicitly. A "
+        "plain string with an optional value: an unrecognized value is "
         "NOT a usage error here, and a bare --host (no value) resolves to 'auto' — "
         "the host fires this non-interactively and treats a non-zero exit as a "
         "block, so a bad/missing value logs a warning and falls back to auto-detect "
@@ -941,7 +942,8 @@ def hook_command(
     Claude — backward-compatible with the original ``mms hook`` Claude
     registration. An explicit ``--host`` is authoritative; per-host registration
     writes it so raw-stdout (Kimi) and Codex routing are unambiguous (``auto``
-    cannot tell Codex from Claude, nor identify Kimi from a malformed payload). An
+    recognizes a non-empty Codex ``turn_id`` but otherwise cannot tell Codex from
+    Claude, nor identify Kimi from a malformed payload). An
     *unrecognized* ``--host`` is not a usage error on this path — a host fires it
     non-interactively and reads a non-zero exit as a block — so it warns and falls
     back to auto-detect (:func:`_resolve_host_tag`, #526); only ``install`` /
