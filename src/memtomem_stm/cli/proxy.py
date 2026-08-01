@@ -2676,7 +2676,8 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     )
                 )
 
-    # 3. Claude Desktop (macOS path only; non-macOS → file absent → skipped).
+    # 3. Claude Desktop (platform-specific path from `_desktop_config_path`;
+    #    absent file → skipped).
     desktop = _read_json_safely(_desktop_config_path())
     if desktop and isinstance(desktop.get("mcpServers"), dict):
         sources.append((_SOURCE_BY_LABEL["Claude Desktop"], None, desktop["mcpServers"]))

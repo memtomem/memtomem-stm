@@ -89,7 +89,7 @@ your normal thresholds afterwards.
 
 ```bash
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=uvx
-export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem>=0.3.12,<0.4","memtomem-server"]'
+export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--with","mcp<2","--from","memtomem>=0.3.12,<0.4","memtomem-server"]'
 export MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE=resume-demo
 export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=1
 export MEMTOMEM_STM_SURFACING__MIN_SCORE=0
@@ -101,6 +101,10 @@ mms add resume_fs \
   --prefix resume_fs
 mms daemon stop
 ```
+`uvx` resolves its own environment, so the `mcp<2` constraint from step 1 has
+to be repeated here — the tool you installed and the server STM launches are
+two different environments.
+
 Restart the AI client so it reloads STM and its environment. Ask it to call the
 proxied `resume_fs__read_file` tool for
 `.memtomem/memories.local/resume-demo.md`. A client-native `Read` tool bypasses

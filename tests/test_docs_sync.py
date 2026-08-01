@@ -54,6 +54,16 @@ def _fwd_slash(obj: object) -> object:
     return obj
 
 
+def _load_core_compat_smoke() -> object:
+    """Import the tracked advisory script by path (``scripts/`` is not a package)."""
+    path = REPO_ROOT / "scripts" / "core_compat_smoke.py"
+    spec = importlib.util.spec_from_file_location("core_compat_smoke", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _stmconfig_environment_defaults(
     model: type[BaseModel], prefix: tuple[str, ...] = ()
 ) -> dict[str, object]:
@@ -1666,6 +1676,59 @@ def test_toolgraph_gateway_guide_pins_observability_contract() -> None:
     assert counter in guide and counter in manager
 
 
+# (pin, Core's declared mcp requirement, redundant?) — the shapes the advisory
+# will actually meet. The unsafe direction is a wrong "drop the pin", so every
+# ambiguous shape must land on False.
+_MCP_PIN_CASES: tuple[tuple[str, str, bool], ...] = (
+    ("mcp<2", "mcp[cli]>=1.28.1", False),  # Core 0.3.8-0.3.13 today
+    ("mcp<2", "mcp<3", False),  # a cap, but above ours
+    ("mcp<2", "mcp!=2", False),  # rejects the boundary, admits 3.x
+    ("mcp<2", "mcp!=2.*", False),
+    ("mcp<2", "mcp<2.1,!=2.0.0", False),  # rejects samples, admits 2.0.1
+    ("mcp<2", "mcp<3\nmcp!=2.*", False),  # jointly sufficient, singly not
+    ("mcp<2", "mcp==1!0.*", False),  # epoch 1 sorts above every epoch 0
+    ("mcp<2", "mcp~=1!0.5", False),
+    ("mcp<2", "httpx>=1.0", False),  # no mcp requirement at all
+    ("mcp<2", "mcp<2", True),
+    ("mcp<2", "mcp~=1.28", True),  # >=1.28, ==1.*
+    ("mcp<2", "mcp~=1.28.1", True),
+    ("mcp<2", "mcp==1.*", True),
+    ("mcp<2", "mcp<=1.99", True),
+    ("mcp<2", "mcp>=1.28.1,<2", True),
+)
+
+
+@pytest.mark.parametrize(("pin", "requires", "redundant"), _MCP_PIN_CASES)
+def test_mcp_pin_expiry_probe_only_certifies_a_proven_cap(
+    pin: str, requires: str, redundant: bool
+) -> None:
+    """The advisory's pin probe, exercised as code rather than as a substring."""
+    smoke = _load_core_compat_smoke()
+    assert smoke.mcp_pin_is_redundant(pin, requires, "3.12.8")[0] is redundant
+
+
+def test_mcp_pin_expiry_probe_evaluates_markers_against_core_python() -> None:
+    """An inactive marker must not be judged, and packaging must not guess.
+
+    packaging fills any environment key it is not given from the *running*
+    interpreter, which is STM's, not the Core venv's — so a requirement gated
+    on a python version Core does not have could otherwise certify a drop.
+    """
+    smoke = _load_core_compat_smoke()
+    gated = 'mcp<2; python_full_version >= "3.12.6"'
+    assert smoke.mcp_pin_is_redundant("mcp<2", gated, "3.12.8")[0] is True
+    assert smoke.mcp_pin_is_redundant("mcp<2", gated, "3.12.4") == (False, [])
+    # An extra-gated requirement is not active: the workflow installs no extras.
+    assert smoke.mcp_pin_is_redundant("mcp<2", 'mcp<2; extra == "cli"', "3.12.8") == (False, [])
+
+
+def test_mcp_pin_expiry_probe_refuses_a_pin_it_cannot_judge() -> None:
+    """A pin with no upper bound has no boundary to prove anything against."""
+    smoke = _load_core_compat_smoke()
+    with pytest.raises(ValueError, match="declares no upper bound"):
+        smoke.mcp_pin_is_redundant("mcp>=1", "mcp<2", "3.12.8")
+
+
 def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     """Keep the copy/paste core CLI flow tied to the released-core advisory."""
     guide = _read("docs/guides/reviewed-memory-resume.md")
@@ -1704,7 +1767,11 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     for wiring in (
         '${MCP_PIN:+"$MCP_PIN"}',  # an empty pin adds no install argument
         "if: ${{ matrix.mcp_pin != '' }}",  # probe only runs for pinned rows
-        "drop mcp_pin for this row",  # ...and says what to do when it expires
+        # ...and the judgement runs the tracked, unit-tested helper rather than
+        # inline YAML no test can reach.
+        "scripts/core_compat_smoke.py",
+        "--check-mcp-pin",
+        "--core-requires",
     ):
         assert wiring in workflow, f"core-compat advisory lost mcp_pin wiring: {wiring}"
     # Both consumers need the field: the install step to apply the pin and the

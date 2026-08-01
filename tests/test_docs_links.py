@@ -106,21 +106,19 @@ def _bare_canonical_urls(text: str) -> list[str]:
 
     The parser is a CommonMark one and GitHub renders GFM, whose autolink
     extension turns a bare URL into a link. Only canonical repo URLs matter:
-    every other absolute URL is skipped by the checker anyway. Written as raw
-    text, so a URL inside a code span is excluded by asking the parser what it
-    already accounted for.
+    every other absolute URL is skipped by the checker anyway.
+
+    Scans the ``text`` tokens rather than the raw source. Code spans, fenced
+    and indented blocks are their own token types, so they are excluded by
+    construction and *by position* — subtracting matched substrings instead
+    would let one sample occurrence inside a code span silence every live
+    occurrence of the same URL elsewhere in the file.
     """
-    accounted = set(_link_targets(text))
-    accounted.update(
-        token.content
-        for token in _tokens(text)
-        if token.type in ("code_inline", "fence", "code_block")
-    )
     return [
         match.group(0)
-        for match in _BARE_CANONICAL.finditer(text)
-        if match.group(0) not in accounted
-        and not any(match.group(0) in content for content in accounted)
+        for token in _tokens(text)
+        if token.type == "text"
+        for match in _BARE_CANONICAL.finditer(token.content)
     ]
 
 
@@ -309,6 +307,12 @@ def test_link_checker_catches_breakage_the_delimiter_traps_used_to_hide(
     assert _check_links_of(tmp_path, monkeypatch, f"Run `{canonical}nope.md` today\n") is None, (
         "...but the same URL inside a code span is sample text"
     )
+    assert (
+        _check_links_of(
+            tmp_path, monkeypatch, f"Sample `{canonical}nope.md`\n\nLive {canonical}nope.md\n"
+        )
+        is not None
+    ), "one sample occurrence must not silence the same URL used live elsewhere"
 
 
 def test_public_markdown_avoids_constructs_this_checker_cannot_model() -> None:

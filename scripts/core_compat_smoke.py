@@ -407,15 +407,121 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                 await adapter.stop()
 
 
+def mcp_pin_is_redundant(pin: str, requires: str, core_python: str) -> tuple[bool, list[str]]:
+    """Is ``pin`` already implied by Core's own declared ``mcp`` requirement?
+
+    ``pin`` is the workflow's ``mcp_pin`` (e.g. ``mcp<2``); ``requires`` is the
+    newline-joined output of ``importlib.metadata.requires("memtomem")`` read
+    from the Core venv, and ``core_python`` its ``X.Y.Z``.
+
+    Returns ``(redundant, active_requirement_strings)``.
+
+    The pin excludes an open-ended range, so no finite set of sample versions
+    can prove Core already excludes it — ``mcp<2.1,!=2.0.0`` rejects every
+    plausible sample yet still admits ``2.0.1``. packaging exposes no subset
+    test, so this proves a *sufficient* condition instead: one active specifier
+    whose accepted set provably ends at or below the pin's boundary. Anything
+    it cannot prove keeps the pin. That direction matters — a missed notice
+    costs a stale hint, a wrong one removes a pin the build still needs.
+    """
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+
+    def series_end(version: Version, components: int | None = None) -> Version:
+        """First version above the series ``version`` describes.
+
+        The epoch has to be carried through. ``Version.release`` drops it, and
+        every epoch-1 version sorts above every epoch-0 one, so rebuilding from
+        the release tuple alone would certify ``==1!0.*`` as capped below ``2``
+        while ``1!0.1`` satisfies it.
+        """
+        parts = list(version.release[:components] if components else version.release) or [0]
+        parts[-1] += 1
+        tail = ".".join(str(part) for part in parts)
+        return Version(f"{version.epoch}!{tail}")
+
+    pin_spec = Requirement(pin).specifier
+    boundaries = [s.version for s in pin_spec if s.operator in ("<", "<=")]
+    if not boundaries:
+        raise ValueError(f"mcp_pin {pin!r} declares no upper bound; this probe cannot judge it")
+    boundary = Version(boundaries[0])
+
+    declared = []
+    for line in requires.splitlines():
+        if not line.strip():
+            continue
+        try:
+            requirement = Requirement(line)
+        except Exception:  # a shape packaging cannot parse
+            continue
+        if requirement.name.lower() != "mcp":
+            continue
+        # Evaluate in the CORE venv's environment, and with no extra: the
+        # install step requests no extras, so an ``extra == "..."`` guarded
+        # requirement is not active and must not be judged. Both python fields
+        # are supplied — packaging would otherwise fill the omitted one from
+        # the *running* interpreter, which is not the one Core runs on.
+        if requirement.marker is not None and not requirement.marker.evaluate(
+            {
+                "python_version": ".".join(core_python.split(".")[:2]),
+                "python_full_version": core_python,
+                "extra": "",
+            }
+        ):
+            continue
+        declared.append(requirement)
+
+    def caps_below(specifier: Any) -> bool:
+        operator, raw_version = specifier.operator, specifier.version
+        if operator == "<":
+            return Version(raw_version) <= boundary
+        if operator == "<=":
+            return Version(raw_version) < boundary
+        if operator == "==" and not raw_version.endswith(".*"):
+            return Version(raw_version) < boundary
+        if operator in ("==", "~=") and raw_version.endswith(".*"):
+            return series_end(Version(raw_version[:-2])) <= boundary
+        if operator == "~=":
+            # ``~=X.Y`` means ``>=X.Y, ==X.*`` — one component shorter.
+            parsed = Version(raw_version)
+            return series_end(parsed, len(parsed.release) - 1) <= boundary
+        return False
+
+    redundant = any(caps_below(s) for r in declared for s in r.specifier)
+    return redundant, [str(r) for r in declared]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--core-bin-dir", type=Path, required=True)
+    parser.add_argument("--core-bin-dir", type=Path)
+    parser.add_argument("--expect", choices=("legacy", "schema2", "schema3", "schema4"))
     parser.add_argument(
-        "--expect",
-        choices=("legacy", "schema2", "schema3", "schema4"),
-        required=True,
+        "--check-mcp-pin",
+        metavar="PIN",
+        help="Report whether PIN is already implied by Core's own mcp requirement.",
+    )
+    parser.add_argument(
+        "--core-requires",
+        type=Path,
+        help="File holding the Core venv's python version then its requires() lines.",
     )
     args = parser.parse_args()
+
+    if args.check_mcp_pin:
+        if args.core_requires is None:
+            parser.error("--check-mcp-pin requires --core-requires")
+        core_python, _, requires = args.core_requires.read_text(encoding="utf-8").partition("\n")
+        redundant, declared = mcp_pin_is_redundant(
+            args.check_mcp_pin, requires, core_python.strip()
+        )
+        if redundant:
+            print(f"::notice::Core now caps mcp itself ({declared}); drop mcp_pin for this row")
+        else:
+            print(f"{args.check_mcp_pin} still required; Core declares {declared or 'nothing'}")
+        return
+
+    if args.core_bin_dir is None or args.expect is None:
+        parser.error("--core-bin-dir and --expect are required for the stdio smoke")
     asyncio.run(_smoke(args.core_bin_dir, args.expect))
 
 

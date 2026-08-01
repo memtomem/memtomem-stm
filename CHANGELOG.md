@@ -11,6 +11,21 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Security
+
+- docs: `SECURITY.md` corrects two published claims that were broader than the
+  code. "No SSRF concerns" is replaced by an explicit statement that STM ships
+  no arbitrary end-user URL-fetch tool but that operator-configured outbound
+  endpoints — SSE/streamable-HTTP upstreams, network LTM, hosted compression or
+  relevance providers, Langfuse, OTLP — remain in scope for egress and
+  SSRF-style network-boundary review. Secret auto-detection is documented as
+  excluding matches from the response cache; the additional claim that it also
+  excludes them from LTM indexing only holds for the library-mode
+  `ProxyManager(index_engine=...)` extension, since the bundled `mms` server
+  does not index tool responses at all. **Behavior change**: none external —
+  the code is unchanged, the previously documented guarantees were overstated.
+  (#800)
+
 ### Changed
 
 - docs: refresh the public documentation for Core 0.3.13 and rebuild the drift
@@ -18,8 +33,16 @@ changes inline only. See the deprecation policy in
   inventory compared against the model itself, `docs/compression.md` states what
   `consumer_model` actually does (one-directional ceilings, not strategy
   selection), and the reviewed-resume guide gains a cleanup section whose
-  commands the released-core advisory executes rather than substring-matches.
-  Documentation only — no runtime behavior change. (#800)
+  Core-side commands (`mm review reject`, `mm pinned delete`,
+  `mm gc orphan-sources`) the released-Core advisory now executes rather than
+  substring-matches. **Behavior change**: none external — `mms init --help` and
+  `mms hook --help` render corrected text for options that already existed.
+  (#800)
+- tests: the public-docs link checker is rebuilt on `markdown-it-py` (new
+  **dev-group** dependency; the shipped wheel gains nothing) and now refuses two
+  GFM constructs a CommonMark parser reads differently — footnote definitions,
+  and an unescaped `|` inside a table-cell link text. Contributors writing
+  either will see `tests/test_docs_links.py` fail with the reason. (#800)
 
 ### Fixed
 
@@ -29,6 +52,10 @@ changes inline only. See the deprecation policy in
   time, with the caveat that the block is absent by default and the extractor
   then uses a different profile (`ollama` / `qwen3:4b` / 1000 tokens) than the
   field defaults the table lists. (#800)
+- docs: the reviewed-resume guide repeats its `mcp<2` constraint on the `uvx`
+  command STM uses to launch the LTM server. `uvx` resolves its own
+  environment, so pinning only the `uv tool install` left the actual Core
+  process free to resolve `mcp` 2.x. (#800)
 
 ## [0.1.44] — 2026-07-30
 
