@@ -32,13 +32,20 @@ _PARSER = MarkdownIt("commonmark")
 
 
 def _tokens(text: str) -> list[Token]:
-    """Flatten the parsed document, descending into inline children."""
+    """Flatten the parsed document, descending into inline children.
+
+    An ``image`` token's children are its alt text. Markdown-it still parses
+    link and HTML syntax in there so a renderer can flatten it to a string, but
+    none of it is live: ``![foo [bar](x.md)](pic.png)`` renders one image and no
+    clickable link. Descending into it would resurrect exactly the class of
+    false link this module exists to avoid, so alt text is not walked.
+    """
     flat: list[Token] = []
 
     def walk(tokens: list[Token]) -> None:
         for token in tokens:
             flat.append(token)
-            if token.children:
+            if token.children and token.type != "image":
                 walk(list(token.children))
 
     walk(_PARSER.parse(text))
@@ -130,6 +137,10 @@ def _anchors(path: Path) -> set[str]:
     html = "".join(
         token.content for token in _tokens(text) if token.type in ("html_block", "html_inline")
     )
+    # ...but an HTML *comment* is also an html token, and an anchor commented
+    # out inside one renders nothing. Counting it would let a fragment pointing
+    # at a deleted anchor pass.
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
     anchors = set(re.findall(r"<a\s+(?:name|id)=[\"']([^\"']+)", html, re.IGNORECASE))
     counts: dict[str, int] = {}
     for title in _headings(text):
@@ -179,6 +190,11 @@ _LINK_EXTRACTION_CASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     ("an image, which is not a link", "![img](pic.png)", ()),
     (
+        "a link inside image alt text, which renders no clickable link",
+        "![foo [bar](missing.md)](pic.png)",
+        (),
+    ),
+    (
         "a backtick consumed by an autolink, which cannot also open a span",
         "<https://example.com/x>\n[bad](missing.md) `",
         ("https://example.com/x", "missing.md"),
@@ -227,6 +243,18 @@ def test_anchors_come_from_rendered_headings_and_live_html(tmp_path: Path) -> No
     # Nothing inside a fenced block is a heading or a live anchor.
     assert "fenced-heading" not in anchors
     assert "fenced" not in anchors
+
+    # An anchor commented out renders nothing, so a fragment pointing at it is
+    # broken and must not be accepted.
+    commented = tmp_path / "commented.md"
+    commented.write_text('<!-- <a name="ghost"></a> -->\n\n# Real\n', encoding="utf-8")
+    assert "ghost" not in _anchors(commented)
+    assert "real" in _anchors(commented)
+
+    # Image alt text is not live HTML either.
+    alt = tmp_path / "alt.md"
+    alt.write_text('![<a name="alt-ghost"></a>](pic.png)\n', encoding="utf-8")
+    assert "alt-ghost" not in _anchors(alt)
 
 
 def _check_links_of(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> str | None:
@@ -281,6 +309,38 @@ def test_link_checker_catches_breakage_the_delimiter_traps_used_to_hide(
     assert _check_links_of(tmp_path, monkeypatch, f"Run `{canonical}nope.md` today\n") is None, (
         "...but the same URL inside a code span is sample text"
     )
+
+
+def test_public_markdown_avoids_constructs_this_checker_cannot_model() -> None:
+    """Refuse the two GFM shapes a CommonMark parser reads differently.
+
+    Neither appears in the docs today, and the checker would not merely miss
+    them — it would extract the *wrong* target:
+
+    * ``See[^1].`` with ``[^1]: note`` is a GitHub footnote, but CommonMark
+      reads it as a shortcut reference link whose destination is ``note``.
+    * ``| [text | continued](x.md) |`` is split at the unescaped pipe by GFM
+      and renders no link at all, while CommonMark returns ``x.md``.
+
+    Failing loudly beats silently checking something GitHub does not render.
+    Escape the pipe as ``\\|`` inside a table cell; footnotes have no
+    workaround here, so adding one means teaching this module GFM first.
+    """
+    footnote = re.compile(r"^\s{0,3}\[\^[^\]]+\]:", re.MULTILINE)
+    pipe_in_link_text = re.compile(r"^\s*\|.*\[[^\]]*(?<!\\)\|[^\]]*\]\(", re.MULTILINE)
+    failures: list[str] = []
+    for source in _public_markdown():
+        body = source.read_text(encoding="utf-8")
+        name = source.relative_to(REPO_ROOT)
+        if footnote.search(body):
+            failures.append(f"{name}: GFM footnote definition")
+        if pipe_in_link_text.search(body):
+            failures.append(f"{name}: unescaped pipe inside a table-cell link text")
+    if failures:
+        pytest.fail(
+            "Public docs use markdown this CommonMark-based checker misreads:\n"
+            + "\n".join(failures)
+        )
 
 
 def test_public_markdown_relative_links_and_anchors_resolve() -> None:

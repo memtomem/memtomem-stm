@@ -75,11 +75,18 @@ jobs:
           from packaging.requirements import Requirement
           from packaging.version import Version
 
-          def _series_end(release: tuple[int, ...]) -> str:
-              """First version above the ``X.Y.*`` series ``release`` describes."""
-              parts = list(release) or [0]
+          def _series_end(version: Version, components: int | None = None) -> Version:
+              """First version above the series ``version`` describes.
+
+              The epoch has to be carried through. ``Version.release`` drops it,
+              and every epoch-1 version sorts above every epoch-0 one, so
+              rebuilding from the release tuple alone would certify ``==1!0.*``
+              as capped below ``2`` while ``1!0.1`` satisfies it.
+              """
+              parts = list(version.release[:components] if components else version.release) or [0]
               parts[-1] += 1
-              return ".".join(str(part) for part in parts)
+              tail = ".".join(str(part) for part in parts)
+              return Version(f"{version.epoch}!{tail}")
 
           pin_spec = Requirement(os.environ["MCP_PIN"]).specifier
           core_python, _, raw = open(sys.argv[1], encoding="utf-8").read().partition("\n")
@@ -130,11 +137,11 @@ jobs:
               if operator == "==" and not raw_version.endswith(".*"):
                   return Version(raw_version) < boundary
               if operator in ("==", "~=") and raw_version.endswith(".*"):
-                  release = Version(raw_version[:-2]).release
-                  return Version(_series_end(release)) <= boundary
+                  return _series_end(Version(raw_version[:-2])) <= boundary
               if operator == "~=":
                   # ``~=X.Y`` means ``>=X.Y, ==X.*`` — one component shorter.
-                  return Version(_series_end(Version(raw_version).release[:-1])) <= boundary
+                  parsed = Version(raw_version)
+                  return _series_end(parsed, len(parsed.release) - 1) <= boundary
               return False
 
           redundant = any(caps_below(s) for r in declared for s in r.specifier)

@@ -1715,9 +1715,12 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # Every matrix row must declare an expectation. Counting matches of a regex
     # that *requires* ``expected`` proves nothing on its own — a malformed row
     # simply would not match — so compare against the number of rows present.
-    declared_rows = workflow.count('- core: "')
+    # Both patterns accept any YAML scalar spelling: counting only `- core: "`
+    # would let `- core: '0.3.14'` or an unquoted value slip past both sides.
+    scalar = r"[\"']?[^\"'\s]+[\"']?"
+    declared_rows = len(re.findall(r"^\s*- core:\s*\S", workflow, re.MULTILINE))
     well_formed = re.findall(
-        r"- core: \"([^\"]+)\"\n\s+expected: (\w+)(?:\n\s+mcp_pin: \"[^\"]+\")?\n", workflow
+        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", workflow
     )
     assert declared_rows >= 5, "core-compat matrix lost rows"
     assert len(well_formed) == declared_rows, (
