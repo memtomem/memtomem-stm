@@ -20,6 +20,19 @@ class TestLifespanConnection:
 
         assert mcp.settings.lifespan is app_lifespan
 
+    def test_server_version_matches_package_version(self):
+        """``serverInfo.version`` must be this package's version.
+
+        Without an explicit ``version=`` the SDK fills the field itself —
+        1.x with ``importlib.metadata.version("mcp")`` (so every handshake
+        advertised the MCP SDK's version as ours), 2.0 with an empty string.
+        Both mislead anything keying off the handshake, so the constructor
+        argument is pinned here."""
+        import memtomem_stm
+        from memtomem_stm.server import mcp
+
+        assert mcp.version == memtomem_stm.__version__
+
     def test_mcp_server_lifespan_is_not_default(self):
         from memtomem_stm.server import mcp
 

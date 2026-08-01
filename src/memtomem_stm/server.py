@@ -23,6 +23,7 @@ from mcp.server.mcpserver import Context, MCPServer
 # every proxied tool down the registration degradation path.
 from mcp.types import CallToolResult
 
+from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
@@ -506,6 +507,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 logger.warning("Failed to shut down OTLP export", exc_info=True)
 
 
+# ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to
+# this package's version. It has never been right without it: 1.x substituted
+# ``importlib.metadata.version("mcp")``, so handshakes advertised the MCP SDK
+# version as ours, and 2.0 substitutes an empty string. Mirrors the fix core
+# made in memtomem#383.
 mcp = MCPServer(
     "memtomem-stm",
     instructions=(
@@ -513,6 +519,7 @@ mcp = MCPServer(
         "Proxies upstream MCP servers with response compression and caching, "
         "and automatically surfaces relevant memories from memtomem LTM."
     ),
+    version=_stm_version,
     lifespan=app_lifespan,
 )
 
