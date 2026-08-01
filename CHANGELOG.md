@@ -13,12 +13,14 @@ changes inline only. See the deprecation policy in
 
 ## [0.1.45] — 2026-08-01
 
-Emergency patch: every install of 0.1.44 or earlier made from PyPI after
-`mcp` 2.0.0 shipped fails at import. The dependency declared no upper bound,
-so a fresh resolve picked up an SDK that had removed both
-`streamablehttp_client` and `mcp.server.fastmcp`. Anyone whose install is
-currently broken should upgrade; anyone already running is unaffected, and
-nothing else in this release changes observable behavior.
+Emergency patch: a fresh, unconstrained install of 0.1.44 or earlier from
+PyPI fails at import once `mcp` 2.0.0 is the newest release. The dependency
+declared no upper bound, so resolution picked up an SDK that had removed both
+`streamablehttp_client` and `mcp.server.fastmcp`. Installs that pinned `mcp`
+themselves — including the `uvx` command in the reviewed-resume guide, which
+already carries `mcp<2` — are unaffected, as is any environment already
+resolved against 1.x. Upgrade if your install is broken; nothing else in this
+release changes observable behavior.
 
 ### Security
 
