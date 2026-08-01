@@ -29,11 +29,12 @@ if TYPE_CHECKING:
     from memtomem_stm.surfacing.engine import SurfacingEngine
     from memtomem_stm.surfacing.observability import SkipReason
 
+import httpx2
+
 from mcp import ClientSession
 from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
 
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy.cache import _make_key as _cache_key
@@ -153,6 +154,10 @@ from memtomem_stm.proxy.metrics import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
+from memtomem_stm.utils.mcp_transport import (
+    SSE_READ_TIMEOUT_SECONDS,
+    streamable_http_transport,
+)
 from memtomem_stm.utils.redact import redact_exception_text
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
@@ -456,7 +461,7 @@ def _scrub_result_surrogates(result: Any) -> None:
                     # A frozen or read-only block: leave it. The response is
                     # then no worse off than before this scrub existed.
                     logger.debug("Could not scrub a read-only content block", exc_info=True)
-    for envelope_field in ("structuredContent", "meta"):
+    for envelope_field in ("structured_content", "meta"):
         value = getattr(result, envelope_field, None)
         if isinstance(value, dict):
             scrubbed = scrub_lone_surrogates(value)
@@ -967,7 +972,7 @@ class ProxyManager:
                     server=graph_server,
                     name=tool.name,
                     description=tool.description,
-                    input_schema=tool.inputSchema,
+                    input_schema=tool.input_schema,
                     annotations=getattr(tool, "annotations", None),
                 )
                 if digest != decision.contract_digest:
@@ -1052,7 +1057,7 @@ class ProxyManager:
         if reason is None:
             return
         if self._config.exposure.profile is ExposureProfile.STRICT:
-            from mcp.server.fastmcp.exceptions import ToolError
+            from mcp.server.mcpserver.exceptions import ToolError
 
             raise ToolError(
                 f"Policy denied tool call '{server}/{tool}' ({reason}); "
@@ -1430,17 +1435,21 @@ class ProxyManager:
                 )
 
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
-        # ``timeout=`` is the httpx connect budget (the transport-socket leg of
-        # the timeout contract); ``sse_read_timeout`` is deliberately left at
-        # the SDK default — long-lived streams must not inherit the connect
-        # budget or legitimately slow tool calls (bounded separately by
+        # The connect budget is the transport-socket leg of the timeout
+        # contract; the read leg is deliberately left at the SDK's long
+        # default — long-lived streams must not inherit the connect budget or
+        # legitimately slow tool calls (bounded separately by
         # ``call_timeout_seconds``) would be killed mid-read.
         match cfg.transport:
             case TransportType.SSE:
                 return sse_client(cfg.url, headers=cfg.headers, timeout=cfg.connect_timeout_seconds)
             case TransportType.STREAMABLE_HTTP:
-                return streamablehttp_client(
-                    cfg.url, headers=cfg.headers, timeout=cfg.connect_timeout_seconds
+                return streamable_http_transport(
+                    cfg.url,
+                    headers=cfg.headers,
+                    timeout=httpx2.Timeout(
+                        cfg.connect_timeout_seconds, read=SSE_READ_TIMEOUT_SECONDS
+                    ),
                 )
             case _:
                 return stdio_client(
@@ -1726,11 +1735,13 @@ class ProxyManager:
         """
 
         async def _handler(message: Any) -> None:
-            # ``ServerNotification`` is a RootModel; requests arrive as
-            # ``RequestResponder`` and stream errors as ``Exception``, neither
-            # of which carries a ``root`` attribute.
-            root = getattr(message, "root", None)
-            if isinstance(root, mcp_types.ToolListChangedNotification):
+            # mcp 2.0 turned ``ServerNotification`` from a RootModel into a
+            # plain union, so a notification arrives as the member type itself
+            # — there is no ``.root`` to unwrap any more, and reaching for one
+            # would silently drop every notification. Requests arrive as
+            # ``RequestResponder`` and stream errors as ``Exception``; both
+            # fail the isinstance check and fall through.
+            if isinstance(message, mcp_types.ToolListChangedNotification):
                 self._schedule_tools_refresh(name)
 
         return _handler
@@ -2047,7 +2058,7 @@ class ProxyManager:
                     desc = desc + suffix
 
                 # Resolve schema
-                schema = t.inputSchema or {"type": "object"}
+                schema = t.input_schema or {"type": "object"}
                 if strip:
                     schema = self._distill_schema(schema, True)
                 if self._config.advertise_context_query:
@@ -2062,11 +2073,11 @@ class ProxyManager:
                             server=conn.name,
                             original_name=t.name,
                             annotations=getattr(t, "annotations", None),
-                            output_schema=getattr(t, "outputSchema", None),
+                            output_schema=getattr(t, "output_schema", None),
                             meta=getattr(t, "meta", None),
                         ),
                         raw_description=t.description or "",
-                        raw_schema=t.inputSchema,
+                        raw_schema=t.input_schema,
                         server_config=cfg,
                     )
                 )
@@ -3300,7 +3311,7 @@ class ProxyManager:
 
                 return mcp_types.CallToolResult(
                     content=[TextContent(type="text", text=surfaced)],
-                    structuredContent=structured_content,
+                    structured_content=structured_content,
                     _meta=result_meta,
                 )
             return surfaced
@@ -3419,10 +3430,10 @@ class ProxyManager:
                 selected_tool,
                 trace_id,
                 started,
-                ok=not (isinstance(result, mcp_types.CallToolResult) and result.isError is True),
+                ok=not (isinstance(result, mcp_types.CallToolResult) and result.is_error is True),
                 error_type=(
                     "UpstreamToolError"
-                    if isinstance(result, mcp_types.CallToolResult) and result.isError is True
+                    if isinstance(result, mcp_types.CallToolResult) and result.is_error is True
                     else None
                 ),
                 ranker_version=ranker_version,
@@ -3807,7 +3818,7 @@ class ProxyManager:
                     trace_id=trace_id,
                 )
             )
-            from mcp.server.fastmcp.exceptions import ToolError
+            from mcp.server.mcpserver.exceptions import ToolError
 
             tool_err = ToolError(msg)
             _mark_recorded(tool_err)
@@ -4827,8 +4838,8 @@ class ProxyManager:
         if policy == "ignore":
             return True
         ann = self._tool_annotations(conn, tool)
-        read_only = getattr(ann, "readOnlyHint", None)
-        destructive = getattr(ann, "destructiveHint", None)
+        read_only = getattr(ann, "read_only_hint", None)
+        destructive = getattr(ann, "destructive_hint", None)
         if policy == "strict":
             # Only an explicit read-only declaration qualifies; a missing
             # readOnlyHint defaults to may-mutate per the MCP spec.
@@ -4895,8 +4906,8 @@ class ProxyManager:
         if policy == "ignore":
             return True
         ann = self._tool_annotations(conn, tool)
-        read_only = getattr(ann, "readOnlyHint", None)
-        destructive = getattr(ann, "destructiveHint", None)
+        read_only = getattr(ann, "read_only_hint", None)
+        destructive = getattr(ann, "destructive_hint", None)
         return read_only is True and destructive is not True
 
     def _invalidate_disabled_cache(
@@ -5212,7 +5223,7 @@ class ProxyManager:
         # return shape below is a full ``CallToolResult`` so the fields reach
         # the client verbatim. Cache v5 reproduces them for successful text-only
         # results; mixed/non-text envelopes remain live-call-only.
-        raw_structured = getattr(result, "structuredContent", None)
+        raw_structured = getattr(result, "structured_content", None)
         raw_meta = getattr(result, "meta", None)
         structured_content: dict[str, Any] | None = (
             raw_structured if isinstance(raw_structured, dict) else None
@@ -5223,7 +5234,7 @@ class ProxyManager:
         # The isError check runs BEFORE the no-text passthrough early-return:
         # a non-text-only (or empty-content) error must surface as an error,
         # not as a passthrough success (previously it leaked as one).
-        if result.isError:
+        if result.is_error:
             error_text = original_text or _NON_TEXT_ERROR_TEXT
             self.tracker.record_error(
                 CallMetrics(
@@ -5259,9 +5270,9 @@ class ProxyManager:
                     content.append(vars(block))
             return mcp_types.CallToolResult(
                 content=content,
-                structuredContent=structured_content,
+                structured_content=structured_content,
                 _meta=result_meta,
-                isError=True,
+                is_error=True,
             )
 
         if shaped.passthrough is not None:
@@ -5296,7 +5307,7 @@ class ProxyManager:
                 # (``populate_by_name`` is unset on mcp types).
                 return mcp_types.CallToolResult(
                     content=list(non_text_content),
-                    structuredContent=structured_content,
+                    structured_content=structured_content,
                     _meta=result_meta,
                 )
             if shaped.passthrough.has_non_text:
@@ -5473,7 +5484,7 @@ class ProxyManager:
             if has_result_envelope:
                 return mcp_types.CallToolResult(
                     content=content_blocks,
-                    structuredContent=structured_content,
+                    structured_content=structured_content,
                     _meta=result_meta,
                 )
             return content_blocks
@@ -5483,7 +5494,7 @@ class ProxyManager:
 
             return mcp_types.CallToolResult(
                 content=[TextContent(type="text", text=final_result)],
-                structuredContent=structured_content,
+                structured_content=structured_content,
                 _meta=result_meta,
             )
         return final_result

@@ -9851,9 +9851,9 @@ asyncio.run(main())
         bare_server.write_text(
             textwrap.dedent(
                 """\
-                from mcp.server.fastmcp import FastMCP
+                from mcp.server.mcpserver import MCPServer
 
-                mcp = FastMCP("bare-no-mem-search")
+                mcp = MCPServer("bare-no-mem-search")
 
                 @mcp.tool()
                 async def unrelated_tool() -> str:
@@ -9946,9 +9946,9 @@ asyncio.run(main())
             textwrap.dedent(
                 """\
                 import asyncio
-                from mcp.server.fastmcp import FastMCP
+                from mcp.server.mcpserver import MCPServer
 
-                mcp = FastMCP("stall-version")
+                mcp = MCPServer("stall-version")
 
                 @mcp.tool()
                 async def mem_search(query: str) -> str:
@@ -10087,23 +10087,19 @@ asyncio.run(main())
         assert data["servers"]["bad"]["error"]
         assert "surfacing" in data
 
-    @pytest.mark.parametrize(
-        ("transport", "client_path"),
-        [
-            ("sse", "mcp.client.sse.sse_client"),
-            ("streamable_http", "mcp.client.streamable_http.streamablehttp_client"),
-        ],
-    )
-    def test_upstream_probe_timeout_bounds_transport_enter(
-        self, monkeypatch, transport, client_path
-    ):
+    @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+    def test_upstream_probe_timeout_bounds_transport_enter(self, monkeypatch, transport):
         """#398 gave ``_probe_ltm_mcp_server`` an end-to-end deadline, but
         the older upstream probe ``_probe_one`` only bounded
         ``initialize()`` — a network upstream hanging on TCP connect
         blocked ``mms health --timeout N`` / ``mms add --validate``
-        indefinitely, and no ``timeout=``/``sse_read_timeout=`` reached
-        the SDK client. Mirrors
-        ``test_sse_ltm_probe_timeout_bounds_transport_enter``."""
+        indefinitely, and no timeout reached the SDK client. Mirrors
+        ``test_sse_ltm_probe_timeout_bounds_transport_enter``.
+
+        The two transports carry their budget differently under mcp 2.0: sse
+        still takes ``timeout=``/``sse_read_timeout=`` kwargs, while
+        streamable-http takes an ``httpx2.Timeout`` on the injected client,
+        which is what ``streamable_http_transport`` builds."""
         import time
 
         from memtomem_stm.cli import proxy as proxy_mod
@@ -10117,16 +10113,35 @@ asyncio.run(main())
             async def __aexit__(self, *_args):
                 return None
 
-        def fake_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
-            captured.update(
-                {
-                    "url": url,
-                    "headers": headers,
-                    "timeout": timeout,
-                    "sse_read_timeout": sse_read_timeout,
-                }
-            )
-            return HangingTransport()
+        if transport == "sse":
+            client_path = "mcp.client.sse.sse_client"
+
+            def fake_client(url, *, headers=None, timeout=None, sse_read_timeout=None):
+                captured.update(
+                    {
+                        "url": url,
+                        "headers": headers,
+                        "timeout": timeout,
+                        "sse_read_timeout": sse_read_timeout,
+                    }
+                )
+                return HangingTransport()
+        else:
+            client_path = "memtomem_stm.utils.mcp_transport.streamable_http_transport"
+
+            def fake_client(url, *, headers=None, timeout=None):
+                # Every leg of the httpx2 timeout carries the probe budget,
+                # which is what the old ``timeout=``/``sse_read_timeout=``
+                # pair expressed.
+                captured.update(
+                    {
+                        "url": url,
+                        "headers": headers,
+                        "timeout": timeout.connect,
+                        "sse_read_timeout": timeout.read,
+                    }
+                )
+                return HangingTransport()
 
         monkeypatch.setattr(client_path, fake_client)
 

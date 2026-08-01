@@ -57,7 +57,7 @@ def _result(
     if blocks is None:
         blocks = [_text_content(text)] if text is not None else []
     return SimpleNamespace(
-        content=blocks, isError=is_error, structuredContent=structured, meta=meta
+        content=blocks, is_error=is_error, structured_content=structured, meta=meta
     )
 
 
@@ -137,9 +137,9 @@ class TestEnvelopePreservation:
         _set_upstream(mgr, _result("payload text", structured={"a": 1}, meta={"trace": "x"}))
         res = await mgr._call_tool_inner("srv", "tool", {})
         assert isinstance(res, CallToolResult)
-        assert res.structuredContent == {"a": 1}
+        assert res.structured_content == {"a": 1}
         assert res.meta == {"trace": "x"}
-        assert res.isError is False
+        assert res.is_error is False
         assert len(res.content) == 1
         assert isinstance(res.content[0], TextContent)
         assert "payload text" in res.content[0].text
@@ -150,14 +150,14 @@ class TestEnvelopePreservation:
         res = await mgr._call_tool_inner("srv", "tool", {})
         assert isinstance(res, CallToolResult)
         assert res.meta == {"m": 2}
-        assert res.structuredContent is None
+        assert res.structured_content is None
 
     async def test_structured_only_empty_content_returns_envelope_not_sentinel(self, make_mgr):
         mgr, store, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[], structured={"only": "structured"}))
         res = await mgr._call_tool_inner("srv", "tool", {})
         assert isinstance(res, CallToolResult)
-        assert res.structuredContent == {"only": "structured"}
+        assert res.structured_content == {"only": "structured"}
         assert res.content == []  # no "[empty response]" fabricated into the envelope
         row = store._db.execute(
             "SELECT original_chars, compressed_chars FROM proxy_metrics ORDER BY id DESC LIMIT 1"
@@ -170,7 +170,7 @@ class TestEnvelopePreservation:
         _set_upstream(mgr, _result(blocks=[img, _text_content("txt")], structured={"a": 1}))
         res = await mgr._call_tool_inner("srv", "tool", {})
         assert isinstance(res, CallToolResult)
-        assert res.structuredContent == {"a": 1}
+        assert res.structured_content == {"a": 1}
         assert res.content[0] is img  # leading image stays leading
         assert isinstance(res.content[1], TextContent)
         assert "txt" in res.content[1].text
@@ -209,7 +209,7 @@ class TestIsErrorOrdering:
         mgr, store, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[_image_content()], is_error=True))
         result = await mgr._call_tool_inner("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content[0].type == "image"
         err = _latest_error(store)
         assert err is not None
@@ -220,22 +220,22 @@ class TestIsErrorOrdering:
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[], is_error=True))
         result = await mgr._call_tool_inner("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content == []
 
     async def test_error_with_text_and_structured_preserves_both(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("boom", is_error=True, structured={"detail": 1}))
         result = await mgr._call_tool_inner("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content[0].text == "boom"
-        assert result.structuredContent == {"detail": 1}
+        assert result.structured_content == {"detail": 1}
 
     async def test_error_never_becomes_success_after_compression(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("x" * 5000, is_error=True))
         result = await mgr._call_tool_inner("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         assert len(result.content[0].text) == 5000
 
 
@@ -257,7 +257,7 @@ class TestEnvelopeCache:
         assert session.call_tool.await_count == 1
         assert isinstance(first, CallToolResult)
         assert isinstance(second, CallToolResult)
-        assert second.structuredContent == structured
+        assert second.structured_content == structured
         assert second.meta == meta
         assert second.content[0].text == first.content[0].text
 
