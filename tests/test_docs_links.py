@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
+from _pytest.outcomes import Failed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +26,15 @@ def _public_markdown() -> list[Path]:
     return sorted([*roots, *docs])
 
 
+# An inline code span, delimited by a run of backticks that is not backslash
+# escaped. Non-greedy so two spans on one line do not merge and swallow a real
+# link between them; the lookbehinds keep an escaped ``\``` (a literal backtick,
+# not a delimiter) from opening or closing a span. Deliberately line-scoped: a
+# code span wrapped across lines is not tracked, which can only make the checker
+# noisier — it never hides a link.
+_CODE_SPAN = re.compile(r"(?<!\\)(`+).*?(?<!\\)\1")
+
+
 def _outside_fences(text: str) -> str:
     lines: list[str] = []
     fence: str | None = None
@@ -38,7 +48,7 @@ def _outside_fences(text: str) -> str:
                 fence = None
             lines.append("")
         elif fence is None:
-            lines.append(line if line.lstrip().startswith("#") else re.sub(r"(`+).*?\1", "", line))
+            lines.append(line if line.lstrip().startswith("#") else _CODE_SPAN.sub("", line))
         else:
             lines.append("")
     return "\n".join(lines)
@@ -83,6 +93,11 @@ def test_outside_fences_strips_inline_code_without_eating_real_links() -> None:
     assert "[CLI](cli.md#init)" in between
     assert "a" not in between and "b" not in between
 
+    # A backslash-escaped backtick is a literal character, not a delimiter, so
+    # the link between two of them is real and must survive.
+    escaped = _outside_fences(r"\`[CLI](cli.md#init)\`")
+    assert "[CLI](cli.md#init)" in escaped
+
     # Headings keep their backticks so heading slugs stay byte-faithful.
     assert _outside_fences("## `mms doctor`") == "## `mms doctor`"
 
@@ -99,7 +114,9 @@ def _check_links_of(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) 
     monkeypatch.setattr(module, "_public_markdown", lambda: [source])
     try:
         test_public_markdown_relative_links_and_anchors_resolve()
-    except BaseException as exc:  # pytest.fail raises Failed, not Exception
+    except Failed as exc:
+        # Only the checker's own ``pytest.fail`` counts as "it caught it" — an
+        # unrelated crash must propagate, not read as a detected broken link.
         return str(exc)
     return None
 
@@ -112,6 +129,8 @@ def test_link_checker_still_catches_breakage_after_code_span_stripping(
     assert _check_links_of(tmp_path, monkeypatch, "# Title\n\n`x` [bad](doc.md#nope)\n") is not None
     # ...while the same link inside a code span is correctly ignored.
     assert _check_links_of(tmp_path, monkeypatch, "`[gone](missing.md)`\n") is None
+    # An escaped backtick does not open a span, so this breakage is still caught.
+    assert _check_links_of(tmp_path, monkeypatch, "\\`[gone](missing.md)\\`\n") is not None
 
 
 def test_public_markdown_relative_links_and_anchors_resolve() -> None:

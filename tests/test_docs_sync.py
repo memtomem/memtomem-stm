@@ -62,8 +62,9 @@ def _stmconfig_environment_defaults(
     pydantic-settings builds the optional block from its ``__``-suffixed
     variables too. Collapsing such a field into one leaf would let the
     completeness assertion below stay green with a whole block undocumented, so
-    a union this walker cannot resolve to a single model is a hard failure
-    rather than a silent leaf.
+    ``SubModel | None`` is the *only* union this walker accepts: any other arm
+    alongside a model (a second model, or a scalar the walker would silently
+    ignore) is a hard failure rather than a silent leaf.
     """
     result: dict[str, object] = {}
     for name, field in model.model_fields.items():
@@ -73,16 +74,15 @@ def _stmconfig_environment_defaults(
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             nested = annotation
         elif get_origin(annotation) in (Union, UnionType):
-            models = [
-                arg
-                for arg in get_args(annotation)
-                if isinstance(arg, type) and issubclass(arg, BaseModel)
-            ]
-            if len(models) > 1:
+            args = get_args(annotation)
+            models = [arg for arg in args if isinstance(arg, type) and issubclass(arg, BaseModel)]
+            others = [arg for arg in args if arg not in models and arg is not type(None)]
+            if models and (len(models) > 1 or others):
                 raise AssertionError(
-                    f"{'.'.join(path)} unions {len(models)} nested models; teach this "
-                    "walker which one pydantic-settings builds before the environment "
-                    "reference can claim completeness"
+                    f"{'.'.join(path)} unions a nested model with {len(models) - 1} other "
+                    f"model(s) and {len(others)} non-None arm(s); teach this walker which "
+                    "shape pydantic-settings builds before the environment reference can "
+                    "claim completeness"
                 )
             nested = models[0] if models else None
         if nested is not None:
@@ -1421,8 +1421,59 @@ def test_stmconfig_env_walker_refuses_a_shape_it_would_undercount() -> None:
     class _Ambiguous(BaseModel):
         nested: _Nested | _Other = _Nested()
 
-    with pytest.raises(AssertionError, match="unions 2 nested models"):
+    with pytest.raises(AssertionError, match=r"1 other model\(s\) and 0 non-None"):
         _stmconfig_environment_defaults(_Ambiguous)
+
+    # A scalar arm is just as ambiguous: traversing would silently drop it.
+    class _ModelOrScalar(BaseModel):
+        nested: _Nested | str = "s"
+
+    with pytest.raises(AssertionError, match=r"0 other model\(s\) and 1 non-None"):
+        _stmconfig_environment_defaults(_ModelOrScalar)
+
+    # A union with no model at all stays an ordinary leaf.
+    class _ScalarUnion(BaseModel):
+        value: int | None = None
+
+    assert _stmconfig_environment_defaults(_ScalarUnion) == {"MEMTOMEM_STM_VALUE": None}
+
+
+def test_environment_reference_warns_that_extractor_llm_defaults_differ() -> None:
+    """A tabulated field default is not the extractor's absent-block behavior.
+
+    ``ExtractionConfig.llm`` defaults to ``None`` and ``effective_llm()`` then
+    substitutes a different profile, so every ``EXTRACTION__LLM__*`` row in the
+    table describes a config the extractor only uses once someone materializes
+    the block. Materializing it through one leaf also flips the provider and
+    installs a prompt the extraction path cannot format. Pin all three facts.
+    """
+    from memtomem_stm.proxy.config import ExtractionConfig, LLMCompressorConfig, LLMProvider
+
+    absent = ExtractionConfig()
+    assert absent.llm is None
+    effective = absent.effective_llm()
+    assert effective.provider is LLMProvider.OLLAMA
+    assert effective.model == "qwen3:4b"
+    assert effective.max_tokens == 1000
+    # The absent-block prompt formats on the extraction path; the field default
+    # (the compression prompt) does not.
+    effective.system_prompt.format(max_facts=10)
+    materialized = ExtractionConfig(llm=LLMCompressorConfig(api_key="x")).effective_llm()
+    assert materialized.provider is LLMProvider.OPENAI
+    with pytest.raises(KeyError, match="max_chars"):
+        materialized.system_prompt.format(max_facts=10)
+
+    body = _read("docs/reference/environment-variables.md")
+    caveat = body.split("### Caveat: `EXTRACTION__LLM__*` defaults", 1)[1]
+    for phrase in (
+        "provider `ollama`",
+        "`qwen3:4b`",
+        "`max_tokens` 1000",
+        "the provider flips to `openai`",
+        "`{max_chars}`",
+        "`{max_facts}`",
+    ):
+        assert phrase in caveat, f"extractor-LLM caveat lost {phrase!r}"
 
 
 def test_environment_reference_is_complete_and_default_accurate() -> None:
@@ -1613,10 +1664,10 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     workflow = _read(".github/workflows/core-compat-advisory.yml")
     for version in ('core: "0.3.12"', 'core: "0.3.13"'):
         assert version in workflow
-    assert '"mcp<2"' in workflow
-    # The pin has to announce its own expiry, or it outlives the Core gap that
-    # justified it.
-    assert "drop the mcp<2 pin" in workflow
+    # The pin is per matrix row, so a newly added Core does not inherit it, and
+    # it announces its own expiry rather than outliving the Core gap.
+    assert 'mcp_pin: "mcp<2"' in workflow
+    assert "drop mcp_pin for this row" in workflow
 
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (

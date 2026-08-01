@@ -65,12 +65,12 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__AUTO_INDEX__NAMESPACE` | template string | `proxy-{server}` | Library-mode namespace template. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED` | boolean | `false` | Enable library-mode fact extraction. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__STRATEGY` | extraction strategy | `llm` | Fact-extraction strategy. | Library |
-| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__PROVIDER` | `openai / anthropic / ollama` | `openai` | Extractor LLM provider. | Library |
-| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MODEL` | string | `gpt-4.1-mini` | Extractor LLM model. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__PROVIDER` | `openai / anthropic / ollama` | `openai` | Provider **once the block exists** — not the extractor's absent-block default. See the caveat below. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MODEL` | string | `gpt-4.1-mini` | Model once the block exists; the absent-block extractor uses `qwen3:4b`. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__API_KEY` | secret string | empty | Extractor credential; falls back to the provider's own key variable. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__BASE_URL` | URL | empty | Optional extractor endpoint override. | Library |
-| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__SYSTEM_PROMPT` | string | `Summarize the following content concisely, preserving all key information. Keep the summary under {max_chars} characters.` | Extractor system prompt; `{max_chars}` is substituted. | Library |
-| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MAX_TOKENS` | positive integer | `500` | Extractor completion budget. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__SYSTEM_PROMPT` | string | `Summarize the following content concisely, preserving all key information. Keep the summary under {max_chars} characters.` | Shared field default written for the *compression* path. Extraction substitutes `{max_facts}` only, so this default raises on the extraction path — set an extraction prompt whenever you materialize this block. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MAX_TOKENS` | positive integer | `500` | Completion budget once the block exists; the absent-block extractor uses `1000`. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS` | positive float | `60.0` | Extractor request timeout. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__PRIVACY_SCAN_ENABLED` | boolean | `true` | Scan extractor input for credentials before sending. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__MAX_FACTS` | positive integer | `10` | Maximum facts extracted per response. | Library |
@@ -198,6 +198,27 @@ Status meanings:
 | `MEMTOMEM_STM_DATA_DIR` | path | `~/.memtomem` | Daemon handshakes, locks, and detached-log directory. | Startup |
 | `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | boolean | `false` | Advertise eight operator/admin MCP tools at import time. | Startup |
 <!-- stmconfig-env:end -->
+
+### Caveat: `EXTRACTION__LLM__*` defaults are not the extractor's defaults
+
+The `llm` block is **absent** by default, and while it is absent the extractor
+does not use the field defaults tabulated above. It falls back to a separate
+extraction profile: provider `ollama`, model `qwen3:4b`, base URL
+`http://localhost:11434`, `max_tokens` 1000, and an extraction-specific prompt.
+
+Setting any single `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__*` variable
+materializes the whole block from the tabulated field defaults, which has two
+consequences worth stating plainly:
+
+- the provider flips to `openai`, so startup fails with a validation error
+  unless `API_KEY` or `OPENAI_API_KEY` is also set;
+- the default `SYSTEM_PROMPT` is the compression prompt and contains
+  `{max_chars}`, which the extraction path does not substitute — it substitutes
+  `{max_facts}` — so extraction raises and falls back to heuristic extraction.
+
+Configure the block wholesale (as a JSON object at
+`MEMTOMEM_STM_PROXY__EXTRACTION__LLM`, or with every field set explicitly)
+rather than by overriding one leaf.
 
 Unknown proxy keys are ignored by the permissive file loader but reported by
 `mms config validate`; unknown environment suffixes are not supported. See

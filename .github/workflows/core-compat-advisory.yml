@@ -17,16 +17,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ``mcp_pin`` exists because Core 0.3.x imports mcp.server.fastmcp,
+          # which mcp 2.x removed, while declaring no upper bound of its own.
+          # A newly added row must NOT inherit it: leave mcp_pin empty so a Core
+          # that caps mcp itself resolves on its own, and a Core that needs
+          # mcp>=2 is not held back by a pin it never asked for.
           - core: "0.3.8"
             expected: legacy
+            mcp_pin: "mcp<2"
           - core: "0.3.9"
             expected: schema2
+            mcp_pin: "mcp<2"
           - core: "0.3.10"
             expected: schema3
+            mcp_pin: "mcp<2"
           - core: "0.3.12"
             expected: schema4
+            mcp_pin: "mcp<2"
           - core: "0.3.13"
             expected: schema4
+            mcp_pin: "mcp<2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,24 +48,53 @@ jobs:
       - name: Install exact core release
         env:
           CORE_VERSION: ${{ matrix.core }}
+          MCP_PIN: ${{ matrix.mcp_pin }}
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/core"
-          # Core 0.3.x imports mcp.server.fastmcp, which mcp 2.x removed, and
-          # its own metadata declares no upper bound. Pin the compatible family
-          # here; the next step reports when Core makes the pin redundant.
+          # shellcheck disable=SC2086 # an empty MCP_PIN must expand to no argument
           uv pip install --python "$RUNNER_TEMP/core/bin/python" \
-            "memtomem==$CORE_VERSION" "mcp<2"
-      - name: Report whether the mcp<2 pin is still needed
+            "memtomem==$CORE_VERSION" ${MCP_PIN:+"$MCP_PIN"}
+      - name: Report whether this row still needs its mcp pin
+        if: ${{ matrix.mcp_pin != '' }}
+        env:
+          MCP_PIN: ${{ matrix.mcp_pin }}
         run: |
-          "$RUNNER_TEMP/core/bin/python" - <<'PY'
-          import importlib.metadata as md
+          # Read Core's own requirement from its venv (stdlib only — packaging is
+          # not guaranteed there), then judge it in STM's venv, which has it.
+          "$RUNNER_TEMP/core/bin/python" -c \
+            'import importlib.metadata as m; print("\n".join(m.requires("memtomem") or ()))' \
+            > "$RUNNER_TEMP/core-requires.txt"
+          uv run python - "$RUNNER_TEMP/core-requires.txt" <<'PY'
+          import os
+          import sys
 
-          required = [r for r in md.requires("memtomem") or () if r.lower().startswith("mcp")]
-          capped = [r for r in required if "<" in r]
-          if capped:
-              print(f"::notice::Core now caps mcp ({capped}); drop the mcp<2 pin in this workflow")
+          from packaging.requirements import Requirement
+
+          pin = os.environ["MCP_PIN"]
+          declared = []
+          for line in open(sys.argv[1], encoding="utf-8").read().splitlines():
+              if not line.strip():
+                  continue
+              try:
+                  requirement = Requirement(line)
+              except Exception:  # a marker/extra shape packaging cannot parse
+                  continue
+              if requirement.name.lower() == "mcp":
+                  declared.append(requirement)
+
+          # The pin exists to exclude one boundary version; it is redundant once
+          # Core's own specifier already excludes that same version. Testing the
+          # boundary rather than grepping for "<" accepts `~=1.28` (an equivalent
+          # cap) and correctly rejects `<3` (which still admits what we exclude).
+          uppers = [s.version for s in Requirement(pin).specifier if s.operator in ("<", "<=")]
+          if not uppers:
+              sys.exit(f"mcp_pin {pin!r} declares no upper bound; this probe cannot judge it")
+          boundary = uppers[0]
+          covered = [r for r in declared if boundary not in r.specifier]
+          if covered:
+              print(f"::notice::Core now caps mcp itself ({covered}); drop mcp_pin for this row")
           else:
-              print(f"mcp<2 pin still required; Core declares {required}")
+              print(f"{pin} still required; Core declares {declared or 'no mcp requirement'}")
           PY
       - name: Run stdio capability smoke
         env:
