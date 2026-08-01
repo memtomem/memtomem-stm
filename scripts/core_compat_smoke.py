@@ -215,6 +215,34 @@ async def _assert_current_review_flow(
     assert any(item["id"] == candidate_id for item in pending)
     shown = _run_json([str(mm), "review", "show", candidate_id], env=env, cwd=project)
     assert shown["status"] == "pending"
+    rejected = _run_json(
+        [
+            str(mm),
+            "review",
+            "reject",
+            candidate_id,
+            "--reviewer",
+            "demo-operator",
+            "--reason",
+            "reviewed-memory-resume demonstration",
+        ],
+        env=env,
+        cwd=project,
+    )
+    assert rejected == {"ok": True, "status": "rejected"}
+    shown = _run_json([str(mm), "review", "show", candidate_id], env=env, cwd=project)
+    assert shown["status"] == "rejected"
+    assert shown["reviewer"] == "demo-operator"
+    assert shown["decision_reason"] == "reviewed-memory-resume demonstration"
+
+    candidate = await adapter.candidate_propose(
+        "Decision: keep the blue-green rollback threshold at 2%.",
+        source="memtomem-stm",
+        source_ref="reviewed-memory-resume",
+        idempotency_key="reviewed-memory-resume-approve-v1",
+    )
+    assert candidate is not None and candidate["status"] == "pending"
+    candidate_id = candidate["candidate_id"]
     approved = _run_json(
         [
             str(mm),
@@ -231,6 +259,43 @@ async def _assert_current_review_flow(
     shown = _run_json([str(mm), "review", "show", candidate_id], env=env, cwd=project)
     assert shown["status"] == "approved"
     assert shown["reviewer"] == "compat-smoke"
+
+
+def _assert_guide_cleanup(mm: Path, *, project: Path, env: dict[str, str]) -> None:
+    """Execute the guide's cleanup step against the released core.
+
+    The guide hands operators destructive commands (``pinned delete``, a source
+    unlink, ``gc orphan-sources --apply``). Running them here keeps their
+    spelling, ordering, and confirmation contract tied to a real core instead of
+    to a docs substring pin.
+    """
+    _run(
+        [str(mm), "pinned", "delete", "resume-contract", "--scope", "project_local"],
+        env=env,
+        cwd=project,
+        capture_output=True,
+    )
+    assert _run_json([str(mm), "pinned", "list", "--json"], env=env, cwd=project) == []
+
+    source = project / ".memtomem" / "memories.local" / "resume-demo.md"
+    source.unlink()
+    # The live core watcher may reap the orphan before GC sees it, so assert only
+    # that the read-only preview runs and reports on orphans — not a racy hit
+    # count, and not the listing-only "Run with --apply" hint.
+    preview = _run([str(mm), "gc", "orphan-sources"], env=env, cwd=project, capture_output=True)
+    assert "orphan" in preview.stdout.lower()
+
+    # ``--apply`` alone confirms interactively; the guide documents that, and a
+    # non-interactive caller must add ``--yes`` (an EOF prompt exits non-zero).
+    applied = _run(
+        [str(mm), "gc", "orphan-sources", "--apply", "--yes"],
+        env=env,
+        cwd=project,
+        capture_output=True,
+    )
+    assert "orphan" in applied.stdout.lower()
+    after = _run([str(mm), "gc", "orphan-sources"], env=env, cwd=project, capture_output=True)
+    assert source.name not in after.stdout
 
 
 async def _smoke(core_bin_dir: Path, expected: str) -> None:
@@ -334,6 +399,10 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                         project=project,
                         env=env,
                     )
+                    if expected == "schema4":
+                        # The guide declares a 0.3.12 floor and its cleanup uses
+                        # ``gc orphan-sources``, which 0.3.10 does not ship.
+                        _assert_guide_cleanup(mm, project=project, env=env)
             finally:
                 await adapter.stop()
 

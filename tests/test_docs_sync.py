@@ -15,6 +15,8 @@ import os
 import re
 from enum import Enum
 from pathlib import Path
+from types import UnionType
+from typing import Union, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel
@@ -54,13 +56,37 @@ def _fwd_slash(obj: object) -> object:
 def _stmconfig_environment_defaults(
     model: type[BaseModel], prefix: tuple[str, ...] = ()
 ) -> dict[str, object]:
-    """Flatten direct nested models using STM's settings delimiter."""
+    """Flatten nested models using STM's settings delimiter.
+
+    ``SubModel | None`` is traversed exactly like a bare ``SubModel``, because
+    pydantic-settings builds the optional block from its ``__``-suffixed
+    variables too. Collapsing such a field into one leaf would let the
+    completeness assertion below stay green with a whole block undocumented, so
+    a union this walker cannot resolve to a single model is a hard failure
+    rather than a silent leaf.
+    """
     result: dict[str, object] = {}
     for name, field in model.model_fields.items():
         path = (*prefix, name)
         annotation = field.annotation
+        nested: type[BaseModel] | None = None
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            result.update(_stmconfig_environment_defaults(annotation, path))
+            nested = annotation
+        elif get_origin(annotation) in (Union, UnionType):
+            models = [
+                arg
+                for arg in get_args(annotation)
+                if isinstance(arg, type) and issubclass(arg, BaseModel)
+            ]
+            if len(models) > 1:
+                raise AssertionError(
+                    f"{'.'.join(path)} unions {len(models)} nested models; teach this "
+                    "walker which one pydantic-settings builds before the environment "
+                    "reference can claim completeness"
+                )
+            nested = models[0] if models else None
+        if nested is not None:
+            result.update(_stmconfig_environment_defaults(nested, path))
             continue
         suffix = "__".join(part.upper() for part in path)
         result[f"MEMTOMEM_STM_{suffix}"] = field.get_default(call_default_factory=True)
@@ -1364,6 +1390,41 @@ def test_model_aware_ceiling_docs_match_runtime(monkeypatch: pytest.MonkeyPatch)
         assert phrase in compression
 
 
+def test_stmconfig_env_walker_refuses_a_shape_it_would_undercount() -> None:
+    """The completeness walker must fail loudly, not silently lose a block."""
+
+    class _Nested(BaseModel):
+        alpha: int = 1
+        beta: str = "b"
+
+    class _Direct(BaseModel):
+        nested: _Nested = _Nested()
+
+    assert _stmconfig_environment_defaults(_Direct) == {
+        "MEMTOMEM_STM_NESTED__ALPHA": 1,
+        "MEMTOMEM_STM_NESTED__BETA": "b",
+    }
+
+    class _Optional(BaseModel):
+        nested: _Nested | None = None
+
+    # pydantic-settings builds an optional block from the same suffixed
+    # variables, so the walker must not collapse it into one leaf.
+    assert _stmconfig_environment_defaults(_Optional) == {
+        "MEMTOMEM_STM_NESTED__ALPHA": 1,
+        "MEMTOMEM_STM_NESTED__BETA": "b",
+    }
+
+    class _Other(BaseModel):
+        gamma: int = 2
+
+    class _Ambiguous(BaseModel):
+        nested: _Nested | _Other = _Nested()
+
+    with pytest.raises(AssertionError, match="unions 2 nested models"):
+        _stmconfig_environment_defaults(_Ambiguous)
+
+
 def test_environment_reference_is_complete_and_default_accurate() -> None:
     """Every STMConfig leaf must appear once with its actual model default."""
     from memtomem_stm.config import STMConfig
@@ -1553,6 +1614,9 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     for version in ('core: "0.3.12"', 'core: "0.3.13"'):
         assert version in workflow
     assert '"mcp<2"' in workflow
+    # The pin has to announce its own expiry, or it outlives the Core gap that
+    # justified it.
+    assert "drop the mcp<2 pin" in workflow
 
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (
@@ -1565,8 +1629,32 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         '"review", "show"',
         '"review", "approve"',
         '"compat-smoke"',
+        # The guide's destructive cleanup commands must be *executed* by the
+        # advisory, not merely pinned as guide substrings above.
+        "_assert_guide_cleanup",
+        '"review", "reject"',
+        '"demo-operator"',
+        '"pinned", "delete", "resume-contract", "--scope", "project_local"',
+        '"gc", "orphan-sources"',
+        '"gc", "orphan-sources", "--apply", "--yes"',
     ):
         assert token in smoke, f"released-core advisory lost guide contract token {token!r}"
+
+    # ``--apply`` prompts; the guide has to say so, because the copyable form
+    # omits ``--yes`` while any non-interactive caller needs it.
+    assert "add `--yes` only in a" in guide
+
+    # The guide's STM-side cleanup commands, checked against the live CLI.
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    remove_help = CliRunner().invoke(mms_cli, ["remove", "--help"], terminal_width=200)
+    assert remove_help.exit_code == 0
+    assert "--yes" in remove_help.output
+    daemon_stop_help = CliRunner().invoke(mms_cli, ["daemon", "stop", "--help"], terminal_width=200)
+    assert daemon_stop_help.exit_code == 0
+    assert "--all" in daemon_stop_help.output
 
 
 def test_otlp_export_doc_matches_the_shipped_span_vocabulary() -> None:

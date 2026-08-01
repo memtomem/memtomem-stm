@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -62,6 +63,55 @@ def _anchors(path: Path) -> set[str]:
         counts[base] = count + 1
         anchors.add(base if count == 0 else f"{base}-{count}")
     return anchors
+
+
+def test_outside_fences_strips_inline_code_without_eating_real_links() -> None:
+    """``_outside_fences`` narrows what the checker sees, so pin both directions."""
+    stripped = _outside_fences("See `mms init` then [CLI](cli.md#init) for details.")
+    # Positive control: the real link on a code-span line is still visible.
+    assert "[CLI](cli.md#init)" in stripped
+    assert "mms init" not in stripped
+
+    # A link written *inside* a code span is documentation of syntax, not a link.
+    assert "[x](nope.md)" not in _outside_fences("Write `[x](nope.md)` to link.")
+    # Double-backtick spans close on their own run length.
+    assert "[x](nope.md)" not in _outside_fences("Use ``[x](nope.md)`` verbatim.")
+
+    # Two code spans must not merge into one greedy match that eats the link
+    # between them.
+    between = _outside_fences("`a` [CLI](cli.md#init) `b`")
+    assert "[CLI](cli.md#init)" in between
+    assert "a" not in between and "b" not in between
+
+    # Headings keep their backticks so heading slugs stay byte-faithful.
+    assert _outside_fences("## `mms doctor`") == "## `mms doctor`"
+
+    # Fenced blocks are still blanked wholesale.
+    assert _outside_fences("```\n[x](nope.md)\n```") == "\n\n"
+
+
+def _check_links_of(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> str | None:
+    """Run the real link check over one synthetic doc; return its failure text."""
+    module = sys.modules[__name__]
+    source = tmp_path / "doc.md"
+    source.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "_public_markdown", lambda: [source])
+    try:
+        test_public_markdown_relative_links_and_anchors_resolve()
+    except BaseException as exc:  # pytest.fail raises Failed, not Exception
+        return str(exc)
+    return None
+
+
+def test_link_checker_still_catches_breakage_after_code_span_stripping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control for the inline-code strip: real breakage must still fail."""
+    assert _check_links_of(tmp_path, monkeypatch, "`x` [gone](missing.md)\n") is not None
+    assert _check_links_of(tmp_path, monkeypatch, "# Title\n\n`x` [bad](doc.md#nope)\n") is not None
+    # ...while the same link inside a code span is correctly ignored.
+    assert _check_links_of(tmp_path, monkeypatch, "`[gone](missing.md)`\n") is None
 
 
 def test_public_markdown_relative_links_and_anchors_resolve() -> None:

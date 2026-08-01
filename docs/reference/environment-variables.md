@@ -4,6 +4,10 @@ This is the authoritative inventory of memtomem-stm environment settings.
 Root settings use `MEMTOMEM_STM_<FIELD>`; nested settings use Pydantic's
 double-underscore convention, for example
 `MEMTOMEM_STM_SURFACING__MIN_SCORE=0.03`. Complex lists and mappings are JSON.
+The table below lists one row per leaf setting. A whole nested block can also be
+supplied as one JSON object at its parent name — `MEMTOMEM_STM_PROXY__CACHE` for
+every `MEMTOMEM_STM_PROXY__CACHE__*` leaf — including optional blocks such as
+`MEMTOMEM_STM_PROXY__EXTRACTION__LLM`.
 
 Environment values have the highest precedence. `~/.memtomem/stm_proxy.json`
 loads `ProxyConfig` only; root, surfacing, formation, hook, daemon, Langfuse,
@@ -61,7 +65,14 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__AUTO_INDEX__NAMESPACE` | template string | `proxy-{server}` | Library-mode namespace template. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__ENABLED` | boolean | `false` | Enable library-mode fact extraction. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__STRATEGY` | extraction strategy | `llm` | Fact-extraction strategy. | Library |
-| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM` | JSON object or `null` | — | Optional extractor LLM configuration. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__PROVIDER` | `openai / anthropic / ollama` | `openai` | Extractor LLM provider. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MODEL` | string | `gpt-4.1-mini` | Extractor LLM model. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__API_KEY` | secret string | empty | Extractor credential; falls back to the provider's own key variable. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__BASE_URL` | URL | empty | Optional extractor endpoint override. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__SYSTEM_PROMPT` | string | `Summarize the following content concisely, preserving all key information. Keep the summary under {max_chars} characters.` | Extractor system prompt; `{max_chars}` is substituted. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__MAX_TOKENS` | positive integer | `500` | Extractor completion budget. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS` | positive float | `60.0` | Extractor request timeout. | Library |
+| `MEMTOMEM_STM_PROXY__EXTRACTION__LLM__PRIVACY_SCAN_ENABLED` | boolean | `true` | Scan extractor input for credentials before sending. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__MAX_FACTS` | positive integer | `10` | Maximum facts extracted per response. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__MIN_RESPONSE_CHARS` | non-negative integer | `500` | Minimum response size eligible for extraction. | Library |
 | `MEMTOMEM_STM_PROXY__EXTRACTION__DEDUP_THRESHOLD` | float `0..1` | `0.92` | Extracted-fact similarity threshold. | Library |

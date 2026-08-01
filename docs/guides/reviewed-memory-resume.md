@@ -187,8 +187,12 @@ mms daemon stop
 ```
 
 The first GC command is a preview; inspect it before authorizing `--apply`.
-Do not use `mms daemon stop --all` for routine cleanup because it also targets
-daemons belonging to other configuration fingerprints.
+`--apply` then asks for an interactive confirmation — add `--yes` only in a
+non-interactive caller, where an unanswered prompt exits non-zero. A running
+Core may also reap the deleted source through its own file watcher, so an
+empty GC preview here is a success, not a missed cleanup. Do not use
+`mms daemon stop --all` for routine cleanup because it also targets daemons
+belonging to other configuration fingerprints.
 
 Finally remove the process-local overrides:
 

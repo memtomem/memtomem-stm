@@ -40,10 +40,23 @@ jobs:
           CORE_VERSION: ${{ matrix.core }}
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/core"
-          # Core 0.3.x imports mcp.server.fastmcp, which mcp 2.x removed.
-          # Pin the released wire/runtime family until Core declares its cap.
+          # Core 0.3.x imports mcp.server.fastmcp, which mcp 2.x removed, and
+          # its own metadata declares no upper bound. Pin the compatible family
+          # here; the next step reports when Core makes the pin redundant.
           uv pip install --python "$RUNNER_TEMP/core/bin/python" \
             "memtomem==$CORE_VERSION" "mcp<2"
+      - name: Report whether the mcp<2 pin is still needed
+        run: |
+          "$RUNNER_TEMP/core/bin/python" - <<'PY'
+          import importlib.metadata as md
+
+          required = [r for r in md.requires("memtomem") or () if r.lower().startswith("mcp")]
+          capped = [r for r in required if "<" in r]
+          if capped:
+              print(f"::notice::Core now caps mcp ({capped}); drop the mcp<2 pin in this workflow")
+          else:
+              print(f"mcp<2 pin still required; Core declares {required}")
+          PY
       - name: Run stdio capability smoke
         env:
           EXPECTED: ${{ matrix.expected }}
