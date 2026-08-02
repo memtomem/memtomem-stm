@@ -33,13 +33,13 @@ def _text_content(text: str):
 
 def _make_result(text: str, is_error: bool = False):
     """Create a mock call_tool result."""
-    return SimpleNamespace(content=[_text_content(text)], isError=is_error)
+    return SimpleNamespace(content=[_text_content(text)], is_error=is_error)
 
 
 def _ann(*, read_only=None, destructive=None):
     """A stand-in for MCP ``ToolAnnotations`` (``getattr``-based consumers, so a
     SimpleNamespace matches the real model). Mirrors test_cache_eligibility."""
-    return SimpleNamespace(readOnlyHint=read_only, destructiveHint=destructive)
+    return SimpleNamespace(read_only_hint=read_only, destructive_hint=destructive)
 
 
 def _tool(name, ann=None):
@@ -519,7 +519,7 @@ class TestUnknownServer:
             await mgr.call_tool("nonexistent", "tool", {})
 
 
-# ── Error result from upstream (isError=True) ────────────────────────────
+# ── Error result from upstream (is_error=True) ────────────────────────────
 
 
 class TestErrorResult:
@@ -531,7 +531,7 @@ class TestErrorResult:
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
             result = await mgr.call_tool("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content[0].text == long_error
 
 
@@ -542,7 +542,7 @@ class TestEdgeResponses:
     async def test_empty_response(self):
         mgr = _make_manager()
         session = _get_session(mgr)
-        session.call_tool.return_value = SimpleNamespace(content=[], isError=False)
+        session.call_tool.return_value = SimpleNamespace(content=[], is_error=False)
 
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
@@ -555,7 +555,7 @@ class TestEdgeResponses:
         """
         mgr = _make_manager()
         session = _get_session(mgr)
-        session.call_tool.return_value = SimpleNamespace(content=None, isError=False)
+        session.call_tool.return_value = SimpleNamespace(content=None, is_error=False)
 
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
@@ -574,7 +574,7 @@ class TestEdgeResponses:
         mgr = _make_manager()
         session = _get_session(mgr)
         none_text = SimpleNamespace(type="text", text=None)
-        session.call_tool.return_value = SimpleNamespace(content=[none_text], isError=False)
+        session.call_tool.return_value = SimpleNamespace(content=[none_text], is_error=False)
 
         # Should not raise; concrete return value is implementation-defined
         # (the empty text passes through compression as an empty payload).
@@ -585,7 +585,7 @@ class TestEdgeResponses:
         mgr = _make_manager()
         session = _get_session(mgr)
         img = SimpleNamespace(type="image", data="base64data")
-        session.call_tool.return_value = SimpleNamespace(content=[img], isError=False)
+        session.call_tool.return_value = SimpleNamespace(content=[img], is_error=False)
 
         result = await mgr.call_tool("srv", "tool", {})
         assert isinstance(result, list)
@@ -596,7 +596,7 @@ class TestEdgeResponses:
         session = _get_session(mgr)
         text = _text_content("hello world")
         img = SimpleNamespace(type="image", data="png")
-        session.call_tool.return_value = SimpleNamespace(content=[text, img], isError=False)
+        session.call_tool.return_value = SimpleNamespace(content=[text, img], is_error=False)
 
         result = await mgr.call_tool("srv", "tool", {})
         assert isinstance(result, list)
@@ -648,7 +648,7 @@ class TestMaxUpstreamChars:
         # Two 30-char blocks → 60 chars total > 50 cap
         block_a = _text_content("a" * 30)
         block_b = _text_content("b" * 30)
-        session.call_tool.return_value = SimpleNamespace(content=[block_a, block_b], isError=False)
+        session.call_tool.return_value = SimpleNamespace(content=[block_a, block_b], is_error=False)
 
         result = await mgr.call_tool("srv", "tool", {})
 
@@ -738,7 +738,7 @@ class TestPipelineExceptionMetrics:
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
             result = await mgr.call_tool("srv", "tool", {})
-        assert result.isError is True
+        assert result.is_error is True
 
         assert mgr.tracker._errors_by_category[ErrorCategory.UPSTREAM_ERROR.value] == 1
         assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
@@ -1111,7 +1111,7 @@ class TestTimeoutReplayGuard:
     retryable for every tool."""
 
     async def test_writer_timeout_not_retried(self):
-        """A tool annotated ``readOnlyHint=False`` that times out is invoked
+        """A tool annotated ``read_only_hint=False`` that times out is invoked
         exactly once, reconnected for the next call, and raises."""
         mgr = _make_manager(
             max_retries=3,
@@ -1260,7 +1260,7 @@ class TestTimeoutReplayGuard:
         assert attempts == 2
 
     async def test_contradictory_annotation_treated_as_writer(self):
-        """``readOnlyHint=True`` AND ``destructiveHint=True`` is a mis-annotation;
+        """``read_only_hint=True`` AND ``destructive_hint=True`` is a mis-annotation;
         the guard treats it as a writer (unknown → don't replay)."""
         mgr = _make_manager(
             max_retries=3,
@@ -1483,7 +1483,7 @@ class TestUpstreamCircuitBreaker:
     an open breaker fast-fails without touching the upstream."""
 
     async def test_opens_after_terminal_failures_and_fast_fails(self):
-        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp.server.mcpserver.exceptions import ToolError
 
         mgr = _make_manager(max_retries=0, circuit_max_failures=2)
         session = _get_session(mgr)
@@ -1504,7 +1504,7 @@ class TestUpstreamCircuitBreaker:
     async def test_fast_fail_counters_stay_reconciled(self):
         """Wire-in counters (#558 invariant): the fast-fail records exactly
         one ``circuit_open`` error row and nothing else."""
-        from mcp.server.fastmcp.exceptions import ToolError
+        from mcp.server.mcpserver.exceptions import ToolError
 
         from memtomem_stm.proxy.metrics import ErrorCategory
 
@@ -1574,7 +1574,7 @@ class TestUpstreamCircuitBreaker:
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
             result = await mgr.call_tool("srv", "tool", {})
-            assert result.isError is True
+            assert result.is_error is True
 
         breaker = mgr._connections["srv"].breaker
         assert breaker.failure_count == 0

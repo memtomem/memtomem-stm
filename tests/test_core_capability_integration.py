@@ -175,7 +175,7 @@ async def test_direct_schema_two_compose_forwards_scope_fields(
     monkeypatch.setattr(adapter, "_heal_if_needed", AsyncMock(return_value=True))
     call = AsyncMock(
         return_value=SimpleNamespace(
-            isError=False,
+            is_error=False,
             content=[
                 SimpleNamespace(
                     type="text",
@@ -232,7 +232,7 @@ def _compose_adapter(monkeypatch: pytest.MonkeyPatch, payload: object, *, schema
         "_call_mem_do",
         AsyncMock(
             return_value=SimpleNamespace(
-                isError=False,
+                is_error=False,
                 content=[SimpleNamespace(type="text", text=json.dumps(payload))],
             )
         ),
@@ -389,7 +389,7 @@ async def test_direct_schema_three_compose_parses_adjacent_context(
         "_call_mem_do",
         AsyncMock(
             return_value=SimpleNamespace(
-                isError=False,
+                is_error=False,
                 content=[
                     SimpleNamespace(
                         type="text",
@@ -538,7 +538,7 @@ async def test_direct_schema_three_rejects_malformed_context(
         "_call_mem_do",
         AsyncMock(
             return_value=SimpleNamespace(
-                isError=False,
+                is_error=False,
                 content=[
                     SimpleNamespace(
                         type="text",
@@ -1052,7 +1052,7 @@ class TestCoreIdentityIsNotAliasedAtIngest:
             "_call_mem_do",
             AsyncMock(
                 return_value=SimpleNamespace(
-                    isError=False,
+                    is_error=False,
                     content=[SimpleNamespace(type="text", text=json.dumps(payload))],
                 )
             ),

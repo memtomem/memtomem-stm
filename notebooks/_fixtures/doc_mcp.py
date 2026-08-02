@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("docfix")
+mcp = MCPServer("docfix")
 
 
 # 8 labeled sections, each ~1.2KB → total ~10KB (well above the 8000-char

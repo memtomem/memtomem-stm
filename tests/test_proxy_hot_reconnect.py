@@ -223,7 +223,7 @@ class TestPrepareFirstSwap:
 def _ok_result(text="ok"):
     from types import SimpleNamespace
 
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=False)
 
 
 async def _fetch(mgr: ProxyManager, server: str = "srv", tool: str = "t"):
@@ -640,9 +640,9 @@ _ECHO_SERVER_SRC = """
 import os
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("echo")
+mcp = MCPServer("echo")
 TAG = sys.argv[1] if len(sys.argv) > 1 else "noarg"
 
 
