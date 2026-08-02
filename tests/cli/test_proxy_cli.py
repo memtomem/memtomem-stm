@@ -12279,6 +12279,17 @@ class TestDoctor:
         solo = site_ids(("one", "p1", "http://u:1@ollama.test:11434"))
         assert solo["one"] == before["one"]
 
+        # Mixed 1 -> 2 -> 1: an UNCREDENTIALED endpoint's bare base ID is
+        # already distinct from every suffixed credentialed ID, so a
+        # credentialed twin appearing or disappearing must not move it.
+        plain_solo = site_ids(("one", "p1", "http://ollama.test:11434"))
+        mixed = site_ids(
+            ("one", "p1", "http://ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert mixed["one"] == plain_solo["one"]
+        assert mixed["two"] != mixed["one"]
+
         # Real 8-hex sha256 prefix collision: the use sites "server '39153'"
         # and "server '74347'" share the prefix 1597babb. The full-length
         # site digest must keep these twins' IDs distinct.

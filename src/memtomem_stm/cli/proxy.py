@@ -7799,10 +7799,13 @@ def doctor(
                             p.dependency.usages,
                         )
                     )
-                    stripped_id_counts: dict[str, int] = {}
+                    uncredentialed_id_counts: dict[str, int] = {}
                     for ollama_probe in ollama_probes:
-                        base_id = _ollama_check_id(ollama_probe.dependency.base_url)
-                        stripped_id_counts[base_id] = stripped_id_counts.get(base_id, 0) + 1
+                        if not _OllamaEndpoint.parse(ollama_probe.dependency.base_url).has_userinfo:
+                            base_id = _ollama_check_id(ollama_probe.dependency.base_url)
+                            uncredentialed_id_counts[base_id] = (
+                                uncredentialed_id_counts.get(base_id, 0) + 1
+                            )
                     for probe in ollama_probes:
                         dependency = probe.dependency
                         display_url = redact_url_userinfo(dependency.base_url)
@@ -7811,16 +7814,19 @@ def doctor(
                         # A credentialed endpoint carries its use-site suffix
                         # from FIRST publication (userinfo presence, not a
                         # later collision, triggers it) so a twin appearing or
-                        # disappearing never flips an existing ID. The digest
-                        # is full-length: a use site names exactly one
-                        # endpoint, so full sha256 makes the suffix unique —
-                        # 8-hex prefixes provably collide (e.g. the sites
-                        # "server '39153'" / "server '74347'"). The count
-                        # fallback covers stripped-identity collisions that
-                        # arise without credentials (URL-normalization edge).
+                        # disappearing never flips an existing ID — including
+                        # an UNCREDENTIALED sibling's bare base ID, which is
+                        # already distinct from every suffixed credentialed ID
+                        # and so only needs a suffix when multiple
+                        # uncredentialed identities themselves collide (a
+                        # URL-normalization edge). The digest is full-length:
+                        # a use site names exactly one endpoint, so full
+                        # sha256 makes the suffix unique — 8-hex prefixes
+                        # provably collide (e.g. the sites "server '39153'" /
+                        # "server '74347'").
                         if (
                             _OllamaEndpoint.parse(dependency.base_url).has_userinfo
-                            or stripped_id_counts[check_id] > 1
+                            or uncredentialed_id_counts.get(check_id, 0) > 1
                         ):
                             site_digest = hashlib.sha256(
                                 "|".join(dependency.usages).encode("utf-8", errors="surrogatepass")
