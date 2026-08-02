@@ -26,9 +26,10 @@ from typing import TYPE_CHECKING, Any, NoReturn, TextIO
 from urllib.parse import unquote, urlsplit
 
 import click
-import httpx
 
 if TYPE_CHECKING:
+    import httpx
+
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
@@ -7201,6 +7202,9 @@ async def _probe_ollama_dependencies(
     dependencies: list[_OllamaDependency], timeout: int
 ) -> list[_OllamaProbeResult]:
     """Read each unique Ollama model inventory once, concurrently."""
+    # HTTP clients import at call time in this module (see the httpx2 sites);
+    # the CLI's own load path must not require one.
+    import httpx
 
     async def probe(client: httpx.AsyncClient, dependency: _OllamaDependency) -> _OllamaProbeResult:
         inventory_url = f"{dependency.base_url}/api/tags"

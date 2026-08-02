@@ -11747,17 +11747,61 @@ class TestDoctor:
             client_options.update(kwargs)
             return real_async_client(transport=transport, **kwargs)
 
-        monkeypatch.setattr(
-            proxy_mod.httpx,
-            "AsyncClient",
-            client_factory,
-        )
+        # The probe imports httpx lazily (hook startup cost), so patch the
+        # real module attribute rather than a name on proxy_mod.
+        monkeypatch.setattr(httpx, "AsyncClient", client_factory)
 
         results = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))
         assert results[0].error is None
         assert results[0].available_models == frozenset({"nomic-embed-text:latest"})
         assert [request.url.path for request in requests] == ["/api/tags"]
         assert client_options == {"timeout": 3.0, "follow_redirects": False}
+
+    def test_ollama_inventory_malformed_payloads_fail_closed(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            ("nomic-embed-text",),
+            ("embedding scorer",),
+        )
+        real_async_client = httpx.AsyncClient
+        cases = [
+            (httpx.Response(200, text="not json"), "returned invalid JSON"),
+            (httpx.Response(200, json=["nope"]), "returned invalid model inventory"),
+            (httpx.Response(200, json={"models": "nope"}), "returned invalid model inventory"),
+            (httpx.Response(200, json={"models": ["nope"]}), "returned invalid model inventory"),
+            (
+                httpx.Response(200, json={"models": [{"size": 1}]}),
+                "returned invalid model inventory",
+            ),
+            (httpx.Response(500), "HTTP 500"),
+        ]
+        for response, expected in cases:
+            transport = httpx.MockTransport(lambda request, response=response: response)
+            monkeypatch.setattr(
+                httpx,
+                "AsyncClient",
+                lambda transport=transport, **kwargs: real_async_client(
+                    transport=transport, **kwargs
+                ),
+            )
+            result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+            assert result.error == expected
+            assert result.available_models == frozenset()
+
+    def test_ollama_model_key_normalizes_implicit_latest_only(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        assert proxy_mod._ollama_model_key("nomic-embed-text") == "nomic-embed-text:latest"
+        assert proxy_mod._ollama_model_key("qwen3:4b") == "qwen3:4b"
+        # A registry host with a port must not read as an explicit model tag.
+        assert (
+            proxy_mod._ollama_model_key("registry.test:5000/ns/gemma3")
+            == "registry.test:5000/ns/gemma3:latest"
+        )
 
     def test_ollama_probe_error_redacts_url_credentials(self, monkeypatch):
         import httpx
@@ -11780,7 +11824,7 @@ class TestDoctor:
 
         transport = httpx.MockTransport(handler)
         monkeypatch.setattr(
-            proxy_mod.httpx,
+            httpx,
             "AsyncClient",
             lambda **kwargs: real_async_client(transport=transport, **kwargs),
         )

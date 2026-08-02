@@ -13,7 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
-- **`mms doctor` now diagnoses active Ollama model dependencies** (#818).
+- **`mms doctor` now diagnoses active Ollama model dependencies** (#820,
+  closes #818).
   The env-overlaid effective config is inspected for embedding relevance and
   explicit `llm_summary` compression, shared base URLs receive one passive
   `/api/tags` inventory request, and missing models get an `ollama pull` next
