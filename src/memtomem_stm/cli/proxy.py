@@ -7122,6 +7122,11 @@ class _OllamaEndpoint:
     stripped: str
     hostname: str | None
     valid: bool
+    # Userinfo *presence* is not secret-derived: the redacted display form
+    # ("***@host") already reveals it. It decides whether the check ID needs
+    # a discriminating suffix from the endpoint's FIRST publication, so the
+    # ID cannot flip when a credential-only twin later appears or disappears.
+    has_userinfo: bool
 
     @classmethod
     def parse(cls, base_url: str) -> "_OllamaEndpoint":
@@ -7130,15 +7135,19 @@ class _OllamaEndpoint:
             hostname = parts.hostname
         except ValueError:
             parts, hostname = None, None
+        has_userinfo = True
         if parts is not None and parts.netloc:
             stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+            has_userinfo = "@" in parts.netloc
         elif parts is not None and "@" not in base_url:
             stripped = base_url
+            has_userinfo = False
         else:
             # No parseable authority: a scheme-less or single-slash form
             # parses its credentials into scheme/path, so an '@'-bearing value
             # we cannot decompose maps to a fixed sentinel instead — mirroring
-            # redact_url_userinfo's wholesale fallback.
+            # redact_url_userinfo's wholesale fallback. It may hide
+            # credentials, so it keeps has_userinfo.
             stripped = "<unparseable url>"
         port_ok = True
         if parts is not None:
@@ -7149,7 +7158,13 @@ class _OllamaEndpoint:
         valid = bool(
             parts is not None and parts.scheme.lower() in {"http", "https"} and hostname and port_ok
         )
-        return cls(raw=base_url, stripped=stripped, hostname=hostname, valid=valid)
+        return cls(
+            raw=base_url,
+            stripped=stripped,
+            hostname=hostname,
+            valid=valid,
+            has_userinfo=has_userinfo,
+        )
 
     @property
     def loopback(self) -> bool:
@@ -7312,11 +7327,19 @@ async def _probe_ollama_dependencies(
             # with a byte cap keeps a fast oversized body from exhausting
             # memory before JSON validation would reject it.
             async with asyncio.timeout(timeout):
-                async with client.stream("GET", inventory_url) as response:
+                # Identity encoding + raw-byte accounting: aiter_bytes()
+                # transparently DECOMPRESSES, so a compression bomb would
+                # materialize its decoded size before any cap applied to the
+                # decoded chunks could reject it. Counting wire bytes bounds
+                # memory; a server that compresses anyway just fails JSON
+                # parsing below.
+                async with client.stream(
+                    "GET", inventory_url, headers={"Accept-Encoding": "identity"}
+                ) as response:
                     if not 200 <= response.status_code < 300:
                         return _OllamaProbeResult(dependency, error=f"HTTP {response.status_code}")
                     body = bytearray()
-                    async for chunk in response.aiter_bytes():
+                    async for chunk in response.aiter_raw():
                         body += chunk
                         if len(body) > _OLLAMA_INVENTORY_MAX_BYTES:
                             return _OllamaProbeResult(
@@ -7785,17 +7808,23 @@ def doctor(
                         display_url = redact_url_userinfo(dependency.base_url)
                         usages = ", ".join(dependency.usages)
                         check_id = _ollama_check_id(dependency.base_url)
-                        if stripped_id_counts[check_id] > 1:
-                            # Credential-only twins share a stripped identity.
-                            # Discriminate by the config-source use sites — a
-                            # use site names exactly one endpoint, so the
-                            # digest is unique, stable under password changes,
-                            # and unaffected by another twin's insertion or
-                            # removal (ordinals were not), with no
-                            # secret-derived data.
+                        # A credentialed endpoint carries its use-site suffix
+                        # from FIRST publication (userinfo presence, not a
+                        # later collision, triggers it) so a twin appearing or
+                        # disappearing never flips an existing ID. The digest
+                        # is full-length: a use site names exactly one
+                        # endpoint, so full sha256 makes the suffix unique —
+                        # 8-hex prefixes provably collide (e.g. the sites
+                        # "server '39153'" / "server '74347'"). The count
+                        # fallback covers stripped-identity collisions that
+                        # arise without credentials (URL-normalization edge).
+                        if (
+                            _OllamaEndpoint.parse(dependency.base_url).has_userinfo
+                            or stripped_id_counts[check_id] > 1
+                        ):
                             site_digest = hashlib.sha256(
                                 "|".join(dependency.usages).encode("utf-8", errors="surrogatepass")
-                            ).hexdigest()[:8]
+                            ).hexdigest()
                             check_id = f"{check_id}-{site_digest}"
                         if probe.error:
                             check(

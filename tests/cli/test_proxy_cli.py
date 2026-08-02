@@ -11720,6 +11720,21 @@ class TestDoctor:
         assert result.exit_code == 0, result.output
         assert "Ollama endpoint" not in result.output
 
+    @staticmethod
+    def _ollama_stream_response(status_code, body=b"", headers=None):
+        """Build a Response whose stream is NOT pre-consumed.
+
+        The probe reads via ``aiter_raw()`` (wire-byte accounting); a
+        ``Response(content=bytes)`` arrives with its stream already consumed,
+        which only a mock — never a live transport — produces.
+        """
+        import httpx
+
+        async def agen():
+            yield body
+
+        return httpx.Response(status_code, content=agen(), headers=headers)
+
     def test_ollama_inventory_get_parses_implicit_latest(self, monkeypatch):
         import httpx
 
@@ -11735,9 +11750,9 @@ class TestDoctor:
 
         def handler(request):
             requests.append(request)
-            return httpx.Response(
+            return self._ollama_stream_response(
                 200,
-                json={"models": [{"name": "nomic-embed-text:latest"}]},
+                json.dumps({"models": [{"name": "nomic-embed-text:latest"}]}).encode(),
             )
 
         transport = httpx.MockTransport(handler)
@@ -11767,18 +11782,22 @@ class TestDoctor:
         )
         real_async_client = httpx.AsyncClient
         cases = [
-            (httpx.Response(200, text="not json"), "returned invalid JSON"),
-            (httpx.Response(200, json=["nope"]), "returned invalid model inventory"),
-            (httpx.Response(200, json={"models": "nope"}), "returned invalid model inventory"),
-            (httpx.Response(200, json={"models": ["nope"]}), "returned invalid model inventory"),
+            ((200, b"not json"), "returned invalid JSON"),
+            ((200, json.dumps(["nope"]).encode()), "returned invalid model inventory"),
+            ((200, json.dumps({"models": "nope"}).encode()), "returned invalid model inventory"),
+            ((200, json.dumps({"models": ["nope"]}).encode()), "returned invalid model inventory"),
             (
-                httpx.Response(200, json={"models": [{"size": 1}]}),
+                (200, json.dumps({"models": [{"size": 1}]}).encode()),
                 "returned invalid model inventory",
             ),
-            (httpx.Response(500), "HTTP 500"),
+            ((500, b""), "HTTP 500"),
         ]
-        for response, expected in cases:
-            transport = httpx.MockTransport(lambda request, response=response: response)
+        for (status_code, body), expected in cases:
+            transport = httpx.MockTransport(
+                lambda request, status_code=status_code, body=body: self._ollama_stream_response(
+                    status_code, body
+                )
+            )
             monkeypatch.setattr(
                 httpx,
                 "AsyncClient",
@@ -12085,7 +12104,10 @@ class TestDoctor:
             assert len(ollama_ids) == 1
             ids.append(ollama_ids[0])
         assert ids[0] == ids[1]
-        assert ids[0] == proxy_mod._ollama_check_id("http://ollama.test:11434")
+        # The credentialed ID = the credential-free base + a use-site digest;
+        # nothing in it may derive from the password.
+        base = proxy_mod._ollama_check_id("http://ollama.test:11434")
+        assert ids[0].startswith(f"{base}-")
 
     def test_ollama_credential_only_twin_endpoints_get_distinct_ids(
         self, runner, config, monkeypatch
@@ -12154,7 +12176,8 @@ class TestDoctor:
             prefix, digest_part = check_id.split(":", 1)
             assert prefix == "ollama_endpoint"
             base, dash, site_digest = digest_part.partition("-")
-            assert dash and len(base) == 12 and len(site_digest) == 8
+            # Full-length site digest: 8-hex prefixes provably collide.
+            assert dash and len(base) == 12 and len(site_digest) == 64
             bases.add(base)
             for secret in ("alice", "pw1", "bob", "pw2"):
                 assert secret not in check_id
@@ -12251,6 +12274,20 @@ class TestDoctor:
         assert grown["two"] == before["two"]
         assert grown["a-early"] not in {before["one"], before["two"]}
 
+        # 1 -> 2 -> 1: a credentialed endpoint carries its suffix from first
+        # publication, so gaining and losing its only twin never flips its ID.
+        solo = site_ids(("one", "p1", "http://u:1@ollama.test:11434"))
+        assert solo["one"] == before["one"]
+
+        # Real 8-hex sha256 prefix collision: the use sites "server '39153'"
+        # and "server '74347'" share the prefix 1597babb. The full-length
+        # site digest must keep these twins' IDs distinct.
+        collided = site_ids(
+            ("39153", "p1", "http://u:1@ollama.test:11434"),
+            ("74347", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert len(set(collided.values())) == 2
+
     def test_remote_hint_escapes_hostile_model_names(self):
         from memtomem_stm.cli import proxy as proxy_mod
 
@@ -12283,7 +12320,7 @@ class TestDoctor:
         monkeypatch.setattr(proxy_mod, "_OLLAMA_INVENTORY_MAX_BYTES", 64)
 
         def handler(request):
-            return httpx.Response(200, content=b"x" * 200)
+            return self._ollama_stream_response(200, b"x" * 200)
 
         transport = httpx.MockTransport(handler)
         monkeypatch.setattr(
@@ -12293,6 +12330,46 @@ class TestDoctor:
         )
         result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
         assert result.error == "inventory response exceeds 64 bytes"
+
+    def test_ollama_probe_counts_wire_bytes_not_decoded(self, monkeypatch):
+        """A compression bomb must not materialize its decoded size.
+
+        The probe requests identity encoding and accounts raw wire bytes. If
+        it decompressed (aiter_bytes) instead, this gzip body would decode to
+        VALID inventory JSON and the probe would PASS — so the invalid-JSON
+        failure proves the decoded form never materialized.
+        """
+        import gzip
+
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+        seen_accept_encoding = []
+
+        def handler(request):
+            seen_accept_encoding.append(request.headers.get("accept-encoding"))
+            body = json.dumps({"models": [{"name": "nomic-embed-text:latest"}]}).encode()
+            return self._ollama_stream_response(
+                200,
+                gzip.compress(body),
+                headers={"Content-Encoding": "gzip"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert seen_accept_encoding == ["identity"]
+        assert result.error == "returned invalid JSON"
 
     def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
         """LTM 미설정 scenario: WARN with the ratified messaging — names
