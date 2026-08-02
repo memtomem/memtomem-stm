@@ -15,6 +15,7 @@ home directory is touched.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import shlex
@@ -2834,17 +2835,6 @@ class TestInit:
         assert payload["error"] == "setup_failed"
         assert "stdin ended" in payload["message"]
 
-    def test_init_demo_json_without_client_still_one_document(
-        self, runner, config, no_discovery
-    ):
-        """No --client on a non-TTY falls back to the hint-only registration
-        path; the run must stay a single parseable JSON document."""
-        result = runner.invoke(cli, ["init", "--demo", "--json", *_cfg_args(config)], input="")
-        assert result.exit_code == 0, result.output
-        payload = json.loads(result.stdout)
-        assert payload["ok"] is True
-        assert payload["servers"] == ["demo"]
-
     def test_init_demo_eof_at_validate_confirm_validates_by_default(
         self, runner, config, no_discovery
     ):
@@ -2858,6 +2848,21 @@ class TestInit:
         assert result.exit_code == 0, result.output
         assert "validating by default" in result.output
         assert "Saved to:" in result.output
+
+    def test_init_demo_sigint_at_validate_confirm_aborts(self, runner, config, no_discovery):
+        """Ctrl-C on piped stdin must cancel rather than masquerade as EOF."""
+
+        class InterruptingInput(io.BytesIO):
+            def read1(self, size=-1):  # noqa: ANN001, ANN202
+                raise KeyboardInterrupt
+
+        result = runner.invoke(
+            cli,
+            ["init", "--demo", "--client", "skip", "--lang", "en", *_cfg_args(config)],
+            input=InterruptingInput(),
+        )
+        assert result.exit_code != 0
+        assert not config.exists()
 
     @pytest.mark.parametrize(
         ("freshness", "expected_ttl"),
@@ -4389,6 +4394,20 @@ class TestInitMcpRegistration:
     def _init_input(self, mcp_choice: str) -> str:
         """Build input for the manual-flow init with an explicit MCP choice."""
         return f"filesystem\nfs\nstdio\nnpx\n-y @mcp/fs\n{mcp_choice}\n"
+
+    def test_init_demo_json_without_client_uses_real_skip_fallback(self, runner, config):
+        """No explicit client in JSON mode resolves without prompting.
+
+        This intentionally runs the real ``_run_mcp_integration`` rather than
+        the ``TestInit`` autouse stub; ``client=skip`` proves that its
+        non-destructive fallback executed.
+        """
+        result = runner.invoke(cli, ["init", "--demo", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["servers"] == ["demo"]
+        assert payload["client"] == "skip"
 
     def test_choice_1_calls_claude_mcp_add_with_expected_args(
         self, runner, config, no_discovery, fake_claude

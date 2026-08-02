@@ -1130,6 +1130,12 @@ def _run_mcp_integration(
     ``keep`` (non-destructive) rather than prompting, so CI / scripted
     callers don't hit ``click.Abort`` on EOF.
     """
+    if preselected is None and client_mode is None and _SETUP_JSON_MODE.get():
+        # JSON setup output captures stdout, making the interactive choice
+        # invisible. With no explicit client, choose the non-destructive
+        # fallback and leave manual registration hints available for later.
+        preselected = 3
+
     if client_mode == "auto":
         if shutil.which("codex"):
             client_mode = "codex"
@@ -3671,6 +3677,33 @@ def _prompt_language() -> str:
     )
 
 
+def _confirm_validation() -> bool:
+    """Confirm validation, taking the default only on piped stdin EOF.
+
+    Click deliberately converts both ``EOFError`` and ``KeyboardInterrupt``
+    into ``click.Abort``, so catching that exception cannot tell a closed pipe
+    from Ctrl-C. Read non-TTY stdin directly to preserve interrupts while
+    retaining the confirm's default-yes behavior at EOF.
+    """
+    if sys.stdin.isatty():
+        return click.confirm("Validate connection(s) now?", default=True)
+
+    while True:
+        click.echo("Validate connection(s) now? [Y/n]: ", nl=False)
+        answer = sys.stdin.readline()
+        click.echo("")
+        if answer == "":
+            click.echo("No answer on stdin — validating by default (--no-validate to skip).")
+            return True
+
+        value = answer.strip().lower()
+        if value in ("", "y", "yes"):
+            return True
+        if value in ("n", "no"):
+            return False
+        click.echo("Error: invalid input")
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option(
@@ -3974,22 +4007,7 @@ def init(
                 # the resolved budget but kept visible in the saved config.
                 entry.setdefault(key, value)
 
-    do_validate = False
-    if not no_validate:
-        if json_mode:
-            # No prompt in ``--json`` mode: take the confirm's default.
-            do_validate = True
-        else:
-            try:
-                do_validate = click.confirm("Validate connection(s) now?", default=True)
-            except click.Abort:
-                # EOF on a piped/closed stdin used to kill the whole wizard
-                # with a bare "Aborted!"; a TTY Ctrl-C still aborts.
-                if sys.stdin.isatty():
-                    raise
-                click.echo("")
-                click.echo("No answer on stdin — validating by default (--no-validate to skip).")
-                do_validate = True
+    do_validate = not no_validate and (json_mode or _confirm_validation())
     if do_validate:
         probe_map = {n: e for n, e in imported.items()}
         click.echo(f"Validating {len(probe_map)} server(s) (timeout=10s)...")
