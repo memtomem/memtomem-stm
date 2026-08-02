@@ -1921,3 +1921,33 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
         f"ADR 0001 claims log_feedback has no production call site, found {callers}; "
         "update the ADR's matrix note alongside this pin"
     )
+
+
+def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
+    """docs/cli.md's --freshness table pins three numbers: the ``live`` and
+    ``reuse`` TTLs written by ``mms init`` and the schema default that
+    ``balanced`` leaves in place. All three live in code; a drift in either
+    direction must fail here, not in a user's cache behavior."""
+    import re
+
+    from memtomem_stm.proxy.config import CacheConfig
+
+    cli_md = (REPO_ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+    table = re.search(
+        r"`--freshness` picks.*?see \[caching\]\(caching\.md\)", cli_md, re.DOTALL
+    )
+    assert table, "docs/cli.md lost the --freshness preset table"
+    text = table.group(0)
+
+    source = (REPO_ROOT / "src" / "memtomem_stm" / "cli" / "proxy.py").read_text(encoding="utf-8")
+    mapping = re.search(r'\{"live": (\d+), "reuse": (\d+)\}\[freshness\]', source)
+    assert mapping, "init's freshness mapping literal moved; update this pin"
+    live_ttl, reuse_ttl = mapping.group(1), mapping.group(2)
+
+    assert f"`{live_ttl}`" in text, f"documented live TTL != code ({live_ttl})"
+    assert f"`{reuse_ttl}`" in text, f"documented reuse TTL != code ({reuse_ttl})"
+    schema_default = CacheConfig().default_ttl_seconds
+    assert schema_default is not None
+    assert f"{schema_default:g} s" in text.replace("3600 s", f"{schema_default:g} s") or str(
+        int(schema_default)
+    ) in text, f"documented balanced default != schema default ({schema_default})"
