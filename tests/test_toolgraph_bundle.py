@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from click.testing import CliRunner
 from jsonschema import Draft202012Validator
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
@@ -49,12 +49,12 @@ def _tool(name: str = "read", *, description: str = "Read data") -> SimpleNamesp
     return SimpleNamespace(
         name=name,
         description=description,
-        inputSchema={"type": "object"},
+        input_schema={"type": "object"},
         annotations=SimpleNamespace(
-            readOnlyHint=True,
-            destructiveHint=None,
-            idempotentHint=None,
-            openWorldHint=None,
+            read_only_hint=True,
+            destructive_hint=None,
+            idempotent_hint=None,
+            open_world_hint=None,
         ),
     )
 
@@ -64,7 +64,7 @@ def _bundle(tool: SimpleNamespace, *, profile: str = "strict", decision: str = "
         server="graph-srv",
         name=tool.name,
         description=tool.description,
-        input_schema=tool.inputSchema,
+        input_schema=tool.input_schema,
         annotations=tool.annotations,
     )
     row = {
@@ -161,10 +161,10 @@ def test_toolgraph_golden_fixtures_pin_cross_repo_bytes_and_digest():
     fixture = json.loads(root.joinpath("tool-contract-v1.json").read_text(encoding="utf-8"))
     contract = fixture["contract"]
     annotations = SimpleNamespace(
-        readOnlyHint=contract["read_only_hint"],
-        destructiveHint=contract["destructive_hint"],
-        idempotentHint=contract["idempotent_hint"],
-        openWorldHint=contract["open_world_hint"],
+        read_only_hint=contract["read_only_hint"],
+        destructive_hint=contract["destructive_hint"],
+        idempotent_hint=contract["idempotent_hint"],
+        open_world_hint=contract["open_world_hint"],
     )
     digest = tool_contract_digest(
         server=contract["server"],
@@ -1573,7 +1573,7 @@ def test_metadata_drifting_to_a_surrogate_drifts_one_tool_not_the_catalog(tmp_pa
                 server="graph-srv",
                 name=clean_publish.name,
                 description=clean_publish.description,
-                input_schema=clean_publish.inputSchema,
+                input_schema=clean_publish.input_schema,
                 annotations=clean_publish.annotations,
             ),
             "decision": "eligible",

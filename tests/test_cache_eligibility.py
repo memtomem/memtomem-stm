@@ -33,7 +33,7 @@ from memtomem_stm.proxy.metrics_store import MetricsStore
 def _ann(*, read_only=None, destructive=None):
     """A stand-in for MCP ``ToolAnnotations`` carrying only the two hints the gate
     reads (``getattr``-based, so a SimpleNamespace matches the real model)."""
-    return SimpleNamespace(readOnlyHint=read_only, destructiveHint=destructive)
+    return SimpleNamespace(read_only_hint=read_only, destructive_hint=destructive)
 
 
 def _tool(name, ann=None):
@@ -41,7 +41,7 @@ def _tool(name, ann=None):
 
 
 def _text_result(text="ok"):
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=False)
 
 
 def _image_content():
@@ -51,29 +51,29 @@ def _image_content():
 
 
 def _nontext_result():
-    return SimpleNamespace(content=[_image_content()], isError=False)
+    return SimpleNamespace(content=[_image_content()], is_error=False)
 
 
 def _mixed_result(text="payload"):
     return SimpleNamespace(
         content=[SimpleNamespace(type="text", text=text), _image_content()],
-        isError=False,
+        is_error=False,
     )
 
 
 def _error_result(text="boom"):
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=True)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=True)
 
 
 def _mixed_error_result(text="boom"):
     return SimpleNamespace(
         content=[SimpleNamespace(type="text", text=text), _image_content()],
-        isError=True,
+        is_error=True,
     )
 
 
 def _empty_result():
-    return SimpleNamespace(content=[], isError=False)
+    return SimpleNamespace(content=[], is_error=False)
 
 
 def _fp(mgr, tool, server="srv"):
@@ -197,6 +197,38 @@ class TestConservativePolicy:
         assert _eligible(mgr, "t") is False
 
 
+class TestRealToolAnnotations:
+    """The stand-ins above spell the hints by hand, so a wrong attribute name
+    in ``_tool_cache_eligible`` would be mirrored by the test and pass. These
+    two run the same gate against real ``mcp.types`` models — built through
+    the camelCase wire aliases, read through the snake_case attributes mcp
+    2.0 exposes — so a spelling drift makes ``getattr`` return ``None``,
+    a declared writer look unannotated, and this test fail."""
+
+    def test_real_declared_writer_is_not_eligible(self, build):
+        from mcp.types import Tool, ToolAnnotations
+
+        tool = Tool(
+            name="t",
+            inputSchema={"type": "object"},
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+        )
+        assert tool.annotations.read_only_hint is False
+        mgr, _, _ = build(tools=[tool])
+        assert _eligible(mgr, "t") is False
+
+    def test_real_read_only_tool_is_eligible(self, build):
+        from mcp.types import Tool, ToolAnnotations
+
+        tool = Tool(
+            name="t",
+            inputSchema={"type": "object"},
+            annotations=ToolAnnotations(readOnlyHint=True),
+        )
+        mgr, _, _ = build(tools=[tool])
+        assert _eligible(mgr, "t") is True
+
+
 class TestStrictPolicy:
     """Cache ONLY explicit read-only tools; a missing hint defaults to may-mutate."""
 
@@ -240,7 +272,7 @@ class TestOverridePrecedence:
 
     def test_tool_override_true_beats_contradictory_annotations(self, build):
         # Pins the escape hatch promised for the contradictory pair
-        # (readOnlyHint=True + destructiveHint=True → writer; see the NOTE in
+        # (read_only_hint=True + destructive_hint=True → writer; see the NOTE in
         # ``_tool_cache_eligible`` and docs/caching.md): a per-tool
         # ``cache: true`` must stay ahead of the annotation policy even for
         # this combination, or the documented opt-back-in silently breaks.
@@ -297,7 +329,7 @@ class TestUnknownServer:
 @pytest.mark.asyncio
 class TestCallToolHonoursEligibility:
     async def test_writer_is_force_forwarded_each_call(self, build):
-        """A readOnlyHint=False tool called twice with identical args must hit the
+        """A read_only_hint=False tool called twice with identical args must hit the
         upstream BOTH times (side effect re-executes) and never be cached."""
         mgr, _, cache = build(tools=[_tool("writer", _ann(read_only=False))])
         session = mgr._connections["srv"].session
@@ -310,7 +342,7 @@ class TestCallToolHonoursEligibility:
         assert _get(mgr, cache, "writer", {"x": 1}) is None  # not stored
 
     async def test_read_only_tool_is_served_from_cache(self, build):
-        """A readOnlyHint=True tool hits the upstream once; the identical repeat is
+        """A read_only_hint=True tool hits the upstream once; the identical repeat is
         served from cache (regression guard: the gate must not over-block)."""
         mgr, _, cache = build(tools=[_tool("reader", _ann(read_only=True))])
         session = mgr._connections["srv"].session
@@ -776,7 +808,7 @@ class TestTtlZeroErrorAndEmptyInvalidation:
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _mixed_error_result("boom")
         result = await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert result.isError is True
+        assert result.is_error is True
 
         assert _get(mgr, cache, "reader", {"q": "a"}) is None  # stale text row gone
 
@@ -791,7 +823,7 @@ class TestTtlZeroErrorAndEmptyInvalidation:
         mgr._config.cache.default_ttl_seconds = 0
         session.call_tool.return_value = _error_result("boom")
         result = await mgr.call_tool("srv", "reader", {"q": "a"})
-        assert result.isError is True
+        assert result.is_error is True
 
         assert _get(mgr, cache, "reader", {"q": "a"}) is None
 
@@ -928,7 +960,7 @@ class TestTtlZeroRaisedFailureInvalidation:
         session.call_tool.return_value = _error_result("boom")
         with mock_patch.object(cache, "invalidate", wraps=cache.invalidate) as spy:
             result = await mgr.call_tool("srv", "reader", {"q": "a"})
-            assert result.isError is True
+            assert result.is_error is True
 
         assert spy.call_count == 1  # isError site only; backstop skipped via marker
         assert _get(mgr, cache, "reader", {"q": "a"}) is None

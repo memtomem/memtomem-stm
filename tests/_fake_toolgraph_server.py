@@ -46,10 +46,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent
 
-mcp = FastMCP("fake-toolgraph")
+mcp = MCPServer("fake-toolgraph")
 
 _BACKEND_UNAVAILABLE_MESSAGE = "Toolgraph backend is temporarily unavailable; retry later."
 
@@ -62,8 +62,8 @@ def _backend_unavailable() -> CallToolResult:
     }
     return CallToolResult(
         content=[TextContent(type="text", text=_BACKEND_UNAVAILABLE_MESSAGE)],
-        structuredContent=payload,
-        isError=True,
+        structured_content=payload,
+        is_error=True,
     )
 
 

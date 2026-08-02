@@ -496,7 +496,7 @@ class TestGetToolErrorStats:
 
 
 def _make_result(text: str):
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=False)
 
 
 def _make_manager(
@@ -526,12 +526,12 @@ def _make_manager(
         SimpleNamespace(
             name="send_message",
             description="Send a message to a Slack channel",
-            inputSchema={"type": "object", "properties": {"channel": {"type": "string"}}},
+            input_schema={"type": "object", "properties": {"channel": {"type": "string"}}},
         ),
         SimpleNamespace(
             name="read_file",
             description="Read a file from the local filesystem",
-            inputSchema={"type": "object"},
+            input_schema={"type": "object"},
         ),
     ]
     session = AsyncMock()
@@ -683,12 +683,12 @@ class TestManagerWireIn:
                 SimpleNamespace(
                     name="broken",
                     description="A flaky tool",
-                    inputSchema={"type": "object"},
+                    input_schema={"type": "object"},
                 ),
                 SimpleNamespace(
                     name="send_message",
                     description="Send a message to a Slack channel",
-                    inputSchema={"type": "object"},
+                    input_schema={"type": "object"},
                 ),
             ],
         )
