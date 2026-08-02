@@ -80,7 +80,7 @@ def _bg_manager(
     session = AsyncMock()
     session.call_tool.return_value = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="upstream content " * 100)],
-        isError=False,
+        is_error=False,
     )
     mgr._connections["srv"] = UpstreamConnection(
         name="srv",
@@ -122,7 +122,7 @@ class TestBackgroundAutoIndex:
         mgr, indexer = _bg_manager(tmp_path, background=True)
         mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
             content=[SimpleNamespace(type="text", text="config dump: password=hunter2 " * 10)],
-            isError=False,
+            is_error=False,
         )
         try:
             result = await mgr.call_tool("srv", "some_tool", {})

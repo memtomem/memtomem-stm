@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-mcp = FastMCP("memtomem-stm-demo")
+mcp = MCPServer("memtomem-stm-demo")
 
 
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Demo project search",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     )
 )
 def demo_search(topic: str = "windows") -> str:

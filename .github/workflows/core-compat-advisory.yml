@@ -17,8 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ``mcp_pin`` exists because Core 0.3.x imports mcp.server.fastmcp,
-          # which mcp 2.x removed, while declaring no upper bound of its own.
+          # ``mcp_pin`` exists because Core 0.3.13 and earlier import
+          # mcp.server.fastmcp, which mcp 2.x removed, while declaring no upper
+          # bound of their own. Those rows keep the pin even though STM itself
+          # now runs on mcp 2.x: the pin applies to the *Core* venv
+          # ($RUNNER_TEMP/core), a separate process STM talks to over the MCP
+          # protocol, so the two SDK majors never share an interpreter here.
           # A newly added row must NOT inherit it: leave mcp_pin empty so a Core
           # that caps mcp itself resolves on its own, and a Core that needs
           # mcp>=2 is not held back by a pin it never asked for.
@@ -37,6 +41,13 @@ jobs:
           - core: "0.3.13"
             expected: schema4
             mcp_pin: "mcp<2"
+          # 0.3.14 caps mcp below 2.0 itself, so no pin is needed — the
+          # "still needs its mcp pin" probe below is what surfaced that.
+          - core: "0.3.14"
+            expected: schema4
+            mcp_pin: ""
+          # The first mcp-2.x Core (0.4.0) gets its row when it publishes;
+          # adding it before the artifact exists only reddens this job.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

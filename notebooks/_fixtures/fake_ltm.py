@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import uuid
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("fake-ltm-notebook")
+mcp = MCPServer("fake-ltm-notebook")
 
 
 @mcp.tool()

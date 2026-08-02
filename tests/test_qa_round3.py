@@ -13,18 +13,33 @@ import pytest
 
 
 class TestLifespanConnection:
-    """Verify app_lifespan is properly wired to FastMCP via constructor."""
+    """Verify app_lifespan is properly wired to the SDK via constructor."""
 
     def test_mcp_has_lifespan_in_settings(self):
         from memtomem_stm.server import app_lifespan, mcp
 
         assert mcp.settings.lifespan is app_lifespan
 
+    def test_server_version_matches_package_version(self):
+        """``serverInfo.version`` must be this package's version.
+
+        Without an explicit ``version=`` the SDK fills the field itself —
+        1.x with ``importlib.metadata.version("mcp")`` (so every handshake
+        advertised the MCP SDK's version as ours), 2.0 with an empty string.
+        Both mislead anything keying off the handshake, so the constructor
+        argument is pinned here."""
+        import memtomem_stm
+        from memtomem_stm.server import mcp
+
+        assert mcp.version == memtomem_stm.__version__
+
     def test_mcp_server_lifespan_is_not_default(self):
         from memtomem_stm.server import mcp
 
-        # The low-level server should have a wrapped lifespan, not the no-op default
-        assert mcp._mcp_server.lifespan.__name__ != "lifespan"
+        # The low-level server should have a wrapped lifespan, not the no-op
+        # default. mcp 2.0 renamed the attribute ``_mcp_server`` ->
+        # ``_lowlevel_server``.
+        assert mcp._lowlevel_server.lifespan.__name__ != "lifespan"
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +209,7 @@ class TestIsErrorPropagation:
         # Create a fake connection
         fake_session = AsyncMock()
         fake_result = MagicMock()
-        fake_result.isError = True
+        fake_result.is_error = True
         fake_text = MagicMock()
         fake_text.type = "text"
         fake_text.text = "upstream error message"
@@ -209,7 +224,7 @@ class TestIsErrorPropagation:
         )
 
         result = await pm.call_tool("test", "some_tool", {})
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content[0].text == "upstream error message"
 
 
@@ -230,7 +245,7 @@ class TestNonTextMetrics:
 
         fake_session = AsyncMock()
         fake_result = MagicMock()
-        fake_result.isError = False
+        fake_result.is_error = False
         # Only non-text content (image)
         fake_img = MagicMock()
         fake_img.type = "image"
@@ -259,11 +274,11 @@ class TestNonTextMetrics:
 class TestFastMCPCompatGuard:
     def test_add_tool_failure_handled_gracefully(self):
         """If add_tool itself fails (API change), register_proxy_tool logs and returns."""
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
         from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
 
-        server = FastMCP("test")
+        server = MCPServer("test")
         handler = AsyncMock()
         info = MagicMock()
         info.prefixed_name = "test__tool"
@@ -278,11 +293,11 @@ class TestFastMCPCompatGuard:
 
     def test_schema_override_works_normally(self):
         """Normal case: tool registered and schema overridden."""
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
         from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
 
-        server = FastMCP("test")
+        server = MCPServer("test")
         handler = AsyncMock()
         info = MagicMock()
         info.prefixed_name = "test__tool"

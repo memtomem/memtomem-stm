@@ -35,7 +35,7 @@ from memtomem_stm.proxy.metrics_store import MetricsStore
 def _ann(*, read_only=None, destructive=None):
     """A stand-in for MCP ``ToolAnnotations`` carrying only the two hints the gate
     reads (``getattr``-based, so a SimpleNamespace matches the real model)."""
-    return SimpleNamespace(readOnlyHint=read_only, destructiveHint=destructive)
+    return SimpleNamespace(read_only_hint=read_only, destructive_hint=destructive)
 
 
 def _tool(name, ann=None):
@@ -238,7 +238,9 @@ class TestHandlerAndScheduling:
         conn.session.list_tools.return_value = _list_result(_tool("new"))
         handler = mgr._make_message_handler("srv")
 
-        await handler(mcp_types.ServerNotification(mcp_types.ToolListChangedNotification()))
+        # mcp 2.0 delivers the notification itself, not a ``ServerNotification``
+        # wrapper — that union is no longer a RootModel and is not constructible.
+        await handler(mcp_types.ToolListChangedNotification())
         await asyncio.gather(*mgr._background_tasks)
 
         assert [t.name for t in conn.tools] == ["new"]
@@ -249,7 +251,7 @@ class TestHandlerAndScheduling:
         conn = mgr._connections["srv"]
         handler = mgr._make_message_handler("srv")
 
-        await handler(mcp_types.ServerNotification(mcp_types.PromptListChangedNotification()))
+        await handler(mcp_types.PromptListChangedNotification())
         await handler(RuntimeError("stream error"))
 
         assert not mgr._background_tasks
