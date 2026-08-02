@@ -15,6 +15,7 @@ home directory is touched.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import shlex
@@ -2803,6 +2804,66 @@ class TestInit:
             "client": "skip",
         }
 
+    def test_init_demo_json_never_prompts_and_validates_by_default(
+        self, runner, config, no_discovery
+    ):
+        """--json with no --no-validate and no --lang must not read stdin:
+        the validate confirm takes its default (yes) and the language preset
+        defaults to 'en'. Before the fix this call hung on the invisible
+        (stdout-captured) confirm, or died as a bare "Aborted!" on EOF."""
+        result = runner.invoke(
+            cli,
+            ["init", "--demo", "--client", "skip", "--json", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["servers"] == ["demo"]
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert "chars_per_token" not in data  # lang defaulted to 'en', no prompt
+
+    def test_init_json_eof_at_prompt_still_renders_envelope(self, runner, config, no_discovery):
+        """EOF at a wizard prompt under --json (here: the manual server-name
+        prompt) must produce the JSON envelope, not Click's bare "Aborted!"
+        with an empty stdout."""
+        result = runner.invoke(
+            cli, ["init", "--client", "skip", "--json", *_cfg_args(config)], input=""
+        )
+        assert result.exit_code != 0
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["error"] == "setup_failed"
+        assert "stdin ended" in payload["message"]
+
+    def test_init_demo_eof_at_validate_confirm_validates_by_default(
+        self, runner, config, no_discovery
+    ):
+        """Text mode, closed stdin: EOF at the validate confirm used to abort
+        the whole wizard (exit 1, "Aborted!"). It now takes the default."""
+        result = runner.invoke(
+            cli,
+            ["init", "--demo", "--client", "skip", "--lang", "en", *_cfg_args(config)],
+            input="",
+        )
+        assert result.exit_code == 0, result.output
+        assert "validating by default" in result.output
+        assert "Saved to:" in result.output
+
+    def test_init_demo_sigint_at_validate_confirm_aborts(self, runner, config, no_discovery):
+        """Ctrl-C on piped stdin must cancel rather than masquerade as EOF."""
+
+        class InterruptingInput(io.BytesIO):
+            def read1(self, size=-1):  # noqa: ANN001, ANN202
+                raise KeyboardInterrupt
+
+        result = runner.invoke(
+            cli,
+            ["init", "--demo", "--client", "skip", "--lang", "en", *_cfg_args(config)],
+            input=InterruptingInput(),
+        )
+        assert result.exit_code != 0
+        assert not config.exists()
+
     @pytest.mark.parametrize(
         ("freshness", "expected_ttl"),
         [("live", 0), ("reuse", 86400)],
@@ -4333,6 +4394,20 @@ class TestInitMcpRegistration:
     def _init_input(self, mcp_choice: str) -> str:
         """Build input for the manual-flow init with an explicit MCP choice."""
         return f"filesystem\nfs\nstdio\nnpx\n-y @mcp/fs\n{mcp_choice}\n"
+
+    def test_init_demo_json_without_client_uses_real_skip_fallback(self, runner, config):
+        """No explicit client in JSON mode resolves without prompting.
+
+        This intentionally runs the real ``_run_mcp_integration`` rather than
+        the ``TestInit`` autouse stub; ``client=skip`` proves that its
+        non-destructive fallback executed.
+        """
+        result = runner.invoke(cli, ["init", "--demo", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["servers"] == ["demo"]
+        assert payload["client"] == "skip"
 
     def test_choice_1_calls_claude_mcp_add_with_expected_args(
         self, runner, config, no_discovery, fake_claude

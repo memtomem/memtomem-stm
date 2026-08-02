@@ -283,6 +283,13 @@ def _shell_join(args: list[str]) -> str:
 
 _SETUP_RESOLVED_CLIENT: ContextVar[str | None] = ContextVar("setup_resolved_client", default=None)
 
+# Whether the current setup command runs in ``--json`` mode. The
+# ``_setup_json_result`` decorator pops ``as_json`` before calling the command
+# body, so the body reads this instead of a parameter. JSON mode must never
+# block on stdin: with stdout redirected into the capture buffer a prompt is
+# invisible and hangs the caller (or dies as a bare "Aborted!" on EOF).
+_SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False)
+
 
 def _setup_json_result(action: str):  # noqa: ANN201
     """Capture a setup command and emit one secret-safe JSON result document."""
@@ -291,6 +298,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
         @wraps(fn)
         def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
             as_json = bool(kwargs.pop("as_json", False))
+            _SETUP_JSON_MODE.set(as_json)
             if not as_json:
                 return fn(*args, **kwargs)
 
@@ -303,6 +311,18 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     fn(*args, **kwargs)
                 except SystemExit as exc:
                     exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+                except click.exceptions.Abort:
+                    # EOF at an interactive prompt. Without this the Abort
+                    # escapes to Click's top level, which prints a bare
+                    # "Aborted!" and exits 1 with NO JSON document — exactly
+                    # the output mode automation parses.
+                    exit_code = 1
+                    click.echo(
+                        "stdin ended before an interactive prompt was answered; "
+                        "pipe answers or pre-answer with flags "
+                        "(--demo/--client/--no-validate)",
+                        err=True,
+                    )
                 except click.ClickException as exc:
                     exit_code = exc.exit_code
                     click.echo(exc.format_message(), err=True)
@@ -1110,6 +1130,12 @@ def _run_mcp_integration(
     ``keep`` (non-destructive) rather than prompting, so CI / scripted
     callers don't hit ``click.Abort`` on EOF.
     """
+    if preselected is None and client_mode is None and _SETUP_JSON_MODE.get():
+        # JSON setup output captures stdout, making the interactive choice
+        # invisible. With no explicit client, choose the non-destructive
+        # fallback and leave manual registration hints available for later.
+        preselected = 3
+
     if client_mode == "auto":
         if shutil.which("codex"):
             client_mode = "codex"
@@ -3651,6 +3677,33 @@ def _prompt_language() -> str:
     )
 
 
+def _confirm_validation() -> bool:
+    """Confirm validation, taking the default only on piped stdin EOF.
+
+    Click deliberately converts both ``EOFError`` and ``KeyboardInterrupt``
+    into ``click.Abort``, so catching that exception cannot tell a closed pipe
+    from Ctrl-C. Read non-TTY stdin directly to preserve interrupts while
+    retaining the confirm's default-yes behavior at EOF.
+    """
+    if sys.stdin.isatty():
+        return click.confirm("Validate connection(s) now?", default=True)
+
+    while True:
+        click.echo("Validate connection(s) now? [Y/n]: ", nl=False)
+        answer = sys.stdin.readline()
+        click.echo("")
+        if answer == "":
+            click.echo("No answer on stdin — validating by default (--no-validate to skip).")
+            return True
+
+        value = answer.strip().lower()
+        if value in ("", "y", "yes"):
+            return True
+        if value in ("n", "no"):
+            return False
+        click.echo("Error: invalid input")
+
+
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option(
@@ -3764,6 +3817,13 @@ def init(
     if client_mode is not None and mcp_mode is not None:
         raise click.UsageError("use either --client or the legacy --mcp flag, not both")
     selected_client = client_mode or mcp_mode
+
+    # ``--json`` still allows stdin-scripted prompts (#758 pins the discovery
+    # selection flow), but prompts with a safe default must not read stdin:
+    # with stdout captured the prompt text is invisible, so an unanswered
+    # confirm hangs the caller. See the validate confirm and language preset
+    # below, plus the decorator's ``click.Abort`` envelope for EOF.
+    json_mode = _SETUP_JSON_MODE.get()
 
     if resolved.exists():
         if resume:
@@ -3931,7 +3991,7 @@ def init(
     # stays predictable for scripted callers ("which prompt fires next?").
     # Non-TTY callers without ``--lang`` get "en" silently — see
     # ``_prompt_language``.
-    selected_lang = lang if lang is not None else _prompt_language()
+    selected_lang = lang if lang is not None else ("en" if json_mode else _prompt_language())
     preset = _LANG_PRESETS[selected_lang]
     proxy_fields = {k: v for k, v in preset.items() if not k.startswith("_")}
     per_server_fields = preset.get("_per_server", {})
@@ -3947,7 +4007,8 @@ def init(
                 # the resolved budget but kept visible in the saved config.
                 entry.setdefault(key, value)
 
-    if not no_validate and click.confirm("Validate connection(s) now?", default=True):
+    do_validate = not no_validate and (json_mode or _confirm_validation())
+    if do_validate:
         probe_map = {n: e for n, e in imported.items()}
         click.echo(f"Validating {len(probe_map)} server(s) (timeout=10s)...")
         probes = asyncio.run(_probe_servers(probe_map, 10))
