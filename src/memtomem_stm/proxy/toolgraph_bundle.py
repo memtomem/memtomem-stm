@@ -358,10 +358,10 @@ def tool_contract_digest(
         "name": name,
         "description": description,
         "input_schema": input_schema,
-        "read_only_hint": getattr(annotations, "readOnlyHint", None),
-        "destructive_hint": getattr(annotations, "destructiveHint", None),
-        "idempotent_hint": getattr(annotations, "idempotentHint", None),
-        "open_world_hint": getattr(annotations, "openWorldHint", None),
+        "read_only_hint": getattr(annotations, "read_only_hint", None),
+        "destructive_hint": getattr(annotations, "destructive_hint", None),
+        "idempotent_hint": getattr(annotations, "idempotent_hint", None),
+        "open_world_hint": getattr(annotations, "open_world_hint", None),
     }
     return _sha256(canonical_json_bytes(contract))
 

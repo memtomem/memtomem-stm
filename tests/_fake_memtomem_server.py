@@ -41,9 +41,9 @@ import json
 import time
 import uuid
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("fake-memtomem")
+mcp = MCPServer("fake-memtomem")
 
 # Populated once at startup when ``--seeds`` is passed. Reads like a
 # constant after that — ``mem_search`` branches on ``is not None``.

@@ -1,11 +1,13 @@
-"""Compatibility layer for registering proxy tools with correct schema in FastMCP.
+"""Compatibility layer for registering proxy tools with the correct schema.
 
-FastMCP infers tool parameter schemas from the handler's function signature.
-Proxy handlers use **kwargs, which produces an incorrect schema (single "kwargs"
-param). This module overrides both the schema AND the validation model so that:
+The SDK's ``MCPServer`` (``FastMCP`` before mcp 2.0 — hence this module's
+name) infers tool parameter schemas from the handler's function signature.
+Proxy handlers use **kwargs, which produces an incorrect schema (single
+"kwargs" param). This module overrides both the schema AND the validation
+model so that:
   - Claude sees the upstream tool's actual parameter names
-  - FastMCP validation passes any arguments through to the handler
-  - Tool annotations (readOnlyHint, destructiveHint) are preserved
+  - SDK validation passes any arguments through to the handler
+  - Tool annotations (read_only_hint, destructive_hint) are preserved
 """
 
 from __future__ import annotations
@@ -14,21 +16,21 @@ from typing import Any
 
 from pydantic import ConfigDict
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata
 from mcp.types import CallToolResult, TextContent
 
 
 def to_call_tool_result(result: str | list | CallToolResult) -> CallToolResult:
     """Normalize a ``ProxyManager.call_tool`` return into a ``CallToolResult``.
 
-    The proxy handler always returns a full ``CallToolResult`` to FastMCP:
+    The proxy handler always returns a full ``CallToolResult`` to the SDK:
     both ``FuncMetadata.convert_result`` and the lowlevel ``call_tool`` handler
     pass a ``CallToolResult`` through verbatim, which is what preserves
-    ``structuredContent``/``_meta`` and the content-block order end to end.
-    The ``str``/``list`` shapes wrap into exactly the envelope the lowlevel
-    server would synthesize for them (single ``TextContent`` / the blocks,
-    ``structuredContent=None``, ``isError=False``) — wire-identical to the
+    ``structuredContent``/``_meta`` on the wire and the content-block order end
+    to end. The ``str``/``list`` shapes wrap into exactly the envelope the
+    lowlevel server would synthesize for them (single ``TextContent`` / the
+    blocks, no structured content, not an error) — wire-identical to the
     pre-envelope behavior.
     """
     if isinstance(result, CallToolResult):
@@ -51,7 +53,7 @@ class _ProxyPassthroughArgs(ArgModelBase):
 
 
 class _ProxyFuncMetadata(FuncMetadata):
-    """FuncMetadata that may CARRY an upstream ``outputSchema`` (FastMCP's
+    """FuncMetadata that may CARRY an upstream ``outputSchema`` (the SDK's
     ``Tool.output_schema`` cached_property reads ``fn_metadata.output_schema``,
     which is how the schema reaches tools/list) but never VALIDATES results
     against it: we cannot build a pydantic output model from an arbitrary
@@ -60,6 +62,10 @@ class _ProxyFuncMetadata(FuncMetadata):
     whenever ``output_schema`` is — which would turn every proxied call into
     an AssertionError. The proxy handler always returns a ``CallToolResult``
     (see ``to_call_tool_result``), so the ``super()`` tail is defensive-only.
+
+    ``InputRequiredResult`` (mcp 2.0's multi-round flow) is not special-cased
+    here on purpose: it fails the ``CallToolResult`` check and reaches
+    ``super()``, which passes it through before touching ``output_model``.
     """
 
     def convert_result(self, result: Any) -> Any:
@@ -125,7 +131,7 @@ def _tag_annotations_title(annotations: Any, server_name: str) -> Any:
 
 
 def register_proxy_tool(
-    server: FastMCP,
+    server: MCPServer,
     handler: Any,
     info: Any,  # ProxyToolInfo
 ) -> None:
@@ -145,7 +151,7 @@ def register_proxy_tool(
         "annotations": tagged_annotations,
     }
     if tool_meta is not None:
-        # ``meta=`` is public FastMCP API (mcp >= 1.12) and flows to
+        # ``meta=`` is public ``add_tool`` API and flows to
         # tools/list as ``_meta``. Passed only when the upstream set it, so
         # meta-less tools produce exactly the pre-envelope call — and an SDK
         # that drops the kwarg fails only meta-bearing tools into the
@@ -157,7 +163,7 @@ def register_proxy_tool(
         import logging
 
         logging.getLogger(__name__).warning(
-            "Failed to register proxy tool '%s' — FastMCP API may have changed",
+            "Failed to register proxy tool '%s' — MCPServer API may have changed",
             info.prefixed_name,
             exc_info=True,
         )
@@ -168,7 +174,7 @@ def register_proxy_tool(
         import logging
 
         logging.getLogger(__name__).warning(
-            "Cannot override schema for '%s' — FastMCP internal API changed. "
+            "Cannot override schema for '%s' — MCPServer internal API changed. "
             "Tool is registered but may show incorrect parameter schema.",
             info.prefixed_name,
         )
@@ -202,7 +208,7 @@ def register_proxy_tool(
             import logging
 
             logging.getLogger(__name__).warning(
-                "Cannot override schema for '%s' — FastMCP internal API changed. "
+                "Cannot override schema for '%s' — MCPServer internal API changed. "
                 "Tool is registered but may show incorrect parameter schema.",
                 info.prefixed_name,
                 exc_info=True,

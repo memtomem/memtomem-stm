@@ -49,7 +49,7 @@ def _inject_connection(mgr: ProxyManager, text: str = "ok") -> AsyncMock:
     session = AsyncMock()
     session.call_tool.return_value = SimpleNamespace(
         content=[SimpleNamespace(type="text", text=text)],
-        isError=False,
+        is_error=False,
     )
     conn = UpstreamConnection(
         name="srv",
