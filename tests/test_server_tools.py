@@ -2933,3 +2933,22 @@ asyncio.run(main())
 
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert any("unhandled exception" in r.getMessage() for r in error_records)
+
+
+def test_initialize_advertises_package_version_not_sdk_version():
+    """serverInfo.version must be memtomem-stm's own release. FastMCP has no
+    version parameter, and the low-level server's unset version falls back to
+    the mcp SDK's package version — clients then see e.g. "1.28.1" for a
+    0.1.x STM. Exercised through the same InitializationOptions the stdio
+    initialize handshake serializes."""
+    import memtomem_stm
+    from memtomem_stm.server import mcp as stm_mcp
+
+    opts = stm_mcp._mcp_server.create_initialization_options()
+    assert opts.server_version == memtomem_stm.__version__
+
+    import importlib.metadata
+
+    sdk_version = importlib.metadata.version("mcp")
+    if sdk_version != memtomem_stm.__version__:  # pragma: no branch
+        assert opts.server_version != sdk_version

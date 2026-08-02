@@ -24,6 +24,7 @@ from mcp.server.session import ServerSession
 # every proxied tool down the registration degradation path.
 from mcp.types import CallToolResult
 
+from memtomem_stm import __version__
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
@@ -512,6 +513,11 @@ mcp = FastMCP(
     ),
     lifespan=app_lifespan,
 )
+# FastMCP exposes no ``version`` parameter, and the low-level server's
+# unset version falls back to the *mcp SDK's* package version — so
+# ``initialize`` advertised e.g. serverInfo.version "1.28.1" instead of
+# memtomem-stm's own release.
+mcp._mcp_server.version = __version__
 
 
 def _should_advertise_obs_tools() -> bool:
