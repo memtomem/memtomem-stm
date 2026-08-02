@@ -1921,3 +1921,104 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
         f"ADR 0001 claims log_feedback has no production call site, found {callers}; "
         "update the ADR's matrix note alongside this pin"
     )
+
+
+def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
+    """docs/cli.md's --freshness table pins three numbers: the ``live`` and
+    ``reuse`` TTLs written by ``mms init`` and the schema default that
+    ``balanced`` leaves in place. All three live in code; a drift in either
+    direction must fail here, not in a user's cache behavior."""
+    from memtomem_stm.proxy.config import CacheConfig
+
+    cli_md = (REPO_ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+    table = re.search(
+        r"`--freshness` picks.*?see \[caching\]\(caching\.md\)", cli_md, re.DOTALL
+    )
+    assert table, "docs/cli.md lost the --freshness preset table"
+    text = table.group(0)
+
+    source = (REPO_ROOT / "src" / "memtomem_stm" / "cli" / "proxy.py").read_text(encoding="utf-8")
+    mapping = re.search(r'\{"live": (\d+), "reuse": (\d+)\}\[freshness\]', source)
+    assert mapping, "init's freshness mapping literal moved; update this pin"
+    live_ttl, reuse_ttl = mapping.group(1), mapping.group(2)
+
+    # Bind each TTL to its own row. Searching the whole table for both values
+    # would still pass with the two swapped — the readers most likely to be
+    # hurt by that are the ones who came here to learn which is which.
+    for preset, ttl in (("live", live_ttl), ("reuse", reuse_ttl)):
+        row = re.search(rf"^\|\s*`{preset}`[^|]*\|([^|]*)\|", text, re.MULTILINE)
+        assert row, f"docs/cli.md lost the `{preset}` row of the --freshness table"
+        assert f"`{ttl}`" in row.group(1), (
+            f"documented {preset} TTL != code ({ttl}); row says {row.group(1).strip()!r}"
+        )
+    schema_default = CacheConfig().default_ttl_seconds
+    assert schema_default is not None
+    # Compare against the table as written. An earlier form of this line
+    # searched `text.replace("3600 s", f"{schema_default:g} s")`, which
+    # rewrote a stale documented value into the live one and then found it —
+    # so a changed schema default passed the guard it was meant to trip.
+    assert f"{schema_default:g} s" in text, (
+        f"documented balanced default != schema default ({schema_default})"
+    )
+
+
+def test_list_json_keys_are_documented(tmp_path: Path) -> None:
+    """Every top-level key ``mms list --json`` emits must appear in the docs'
+    ``### list`` section.
+
+    Pinned against the live command rather than the prose alone: #811 added
+    ``config_valid`` / ``config_error`` while ``docs/cli.md`` still described
+    the output as ``{config_path, servers}``, and nothing failed. A key that
+    scripts branch on is exactly what a reader looks up in the docs.
+    """
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+    result = CliRunner().invoke(mms_cli, ["list", "--json", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    emitted = set(json.loads(result.stdout))
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `list`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    if not section_match:
+        pytest.fail("docs/cli.md must have a ### `list` section")
+    section = section_match.group(1)
+    # Either spelling counts: the shape blob quotes keys (`"config_path": ...`)
+    # while the surrounding prose backticks them.
+    undocumented = sorted(
+        key for key in emitted if f'"{key}"' not in section and f"`{key}`" not in section
+    )
+    assert not undocumented, (
+        f"docs/cli.md `list` section does not mention {undocumented} — "
+        "`mms list --json` emits them; document the key alongside the change."
+    )
+
+
+def test_uninstall_runbook_puts_hook_backups_where_the_writer_puts_them() -> None:
+    """The uninstall runbook must not imply `rm -rf ~/.memtomem ~/.mms` clears
+    the host-settings backups.
+
+    ``_write_backup`` writes beside the *host's* config (``path.parent /
+    (path.name + ".bak")``), so an ``--apply`` leaves e.g.
+    ``~/.claude/settings.json.bak`` — outside both STM directories, and a
+    verbatim copy of a config that can hold API keys. An earlier revision of
+    this runbook told users those files were swept up with the data dirs.
+    """
+    source = _read("src/memtomem_stm/cli/hook_hosts.py")
+    assert 'path.parent / (path.name + (".bak"' in source, (
+        "hook backup naming moved; re-check what docs/guides/operations.md tells users to delete"
+    )
+
+    operations = _read("docs/guides/operations.md")
+    section = re.search(r"## Uninstalling completely\n(.*?)(?=\n## |\Z)", operations, re.DOTALL)
+    assert section, "operations.md lost the 'Uninstalling completely' runbook"
+    body = section.group(1)
+    assert "settings.json.bak" in body, (
+        "the uninstall runbook must name the host-adjacent hook backup path"
+    )
+    assert not re.search(r"rm -rf[^\n]*\n[^\n]*hook[^\n]*\.bak", body), (
+        "the runbook implies `rm -rf` removes hook backups; it does not"
+    )

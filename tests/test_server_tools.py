@@ -2461,7 +2461,7 @@ class TestAdvertiseOrder:
     dict and reinserts it, placing proxied tools first."""
 
     def _make_server(self, tool_names):
-        """Build a stand-in FastMCP with an insertion-ordered `_tool_manager._tools`.
+        """Build a stand-in server with an insertion-ordered `_tool_manager._tools`.
 
         Only the attribute path `_tool_manager._tools` matters — the
         function pops/inserts string keys and does not touch tool values,
@@ -2523,8 +2523,8 @@ class TestAdvertiseOrder:
         assert final[0] == "fs__read_file"
         assert set(final) == set(initial)  # nothing added or dropped
 
-    def test_reorder_survives_fastmcp_api_shift(self, caplog):
-        """If FastMCP renames/removes the private ``_tool_manager._tools``
+    def test_reorder_survives_sdk_api_shift(self, caplog):
+        """If the SDK renames/removes the private ``_tool_manager._tools``
         attribute, the reorder must degrade to a warning-and-skip rather
         than crashing server startup. Surfacing as a warning gives
         operators a visible signal in the log."""
@@ -2538,15 +2538,15 @@ class TestAdvertiseOrder:
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
             _move_stm_tools_to_end(server)  # must not raise
-        assert any("FastMCP internal API changed" in rec.message for rec in caplog.records), [
+        assert any("MCPServer internal API changed" in rec.message for rec in caplog.records), [
             r.message for r in caplog.records
         ]
 
-    async def test_reorder_pins_order_through_real_fastmcp_list_tools(self):
-        """End-to-end #228 pin against the real FastMCP instance.
+    async def test_reorder_pins_order_through_real_sdk_list_tools(self):
+        """End-to-end #228 pin against the real ``MCPServer`` instance.
 
         The stand-in tests above validate the helper's dict surgery, but a
-        FastMCP upgrade could change what ``_tool_manager._tools`` insertion
+        SDK upgrade could change what ``_tool_manager._tools`` insertion
         order *means* — e.g. a ``list_tools()`` that re-sorts, or a tool
         manager that stops preserving insertion order — and every stand-in
         test would stay green while the #228 advertise order silently
@@ -2936,19 +2936,29 @@ asyncio.run(main())
 
 
 def test_initialize_advertises_package_version_not_sdk_version():
-    """serverInfo.version must be memtomem-stm's own release. FastMCP has no
-    version parameter, and the low-level server's unset version falls back to
-    the mcp SDK's package version — clients then see e.g. "1.28.1" for a
-    0.1.x STM. Exercised through the same InitializationOptions the stdio
-    initialize handshake serializes."""
+    """serverInfo.version must be memtomem-stm's own release.
+
+    Passing ``version=`` to the server constructor is the only thing that
+    makes this true, and it has never been right by default: an e2e bare
+    ``initialize`` handshake caught the 1.x SDK substituting
+    ``importlib.metadata.version("mcp")`` — clients saw "1.28.1" for a 0.1.x
+    STM — and 2.0 substitutes an empty string instead, which is quieter
+    still. Both wrong answers are asserted against by name below, because a
+    future SDK gets to pick a third one.
+
+    Exercised through the same ``InitializationOptions`` the stdio
+    handshake serializes, not through the constructor argument, so removing
+    the argument fails here rather than only on the wire.
+    """
+    import importlib.metadata
+
     import memtomem_stm
     from memtomem_stm.server import mcp as stm_mcp
 
-    opts = stm_mcp._mcp_server.create_initialization_options()
+    opts = stm_mcp._lowlevel_server.create_initialization_options()
     assert opts.server_version == memtomem_stm.__version__
 
-    import importlib.metadata
-
+    assert opts.server_version, "2.0's unset default is an empty string"
     sdk_version = importlib.metadata.version("mcp")
     if sdk_version != memtomem_stm.__version__:  # pragma: no branch
-        assert opts.server_version != sdk_version
+        assert opts.server_version != sdk_version, "1.x's unset default was the SDK version"

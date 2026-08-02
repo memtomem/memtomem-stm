@@ -102,12 +102,13 @@ class TestLtmTransportSelection:
         captured = {}
         sentinel = object()
 
-        def fake_streamablehttp_client(url, *, headers=None):
+        def fake_streamable_http_transport(url, *, headers=None, timeout=None):
             captured["url"] = url
             captured["headers"] = headers
+            captured["timeout"] = timeout
             return sentinel
 
-        monkeypatch.setattr(mod, "streamablehttp_client", fake_streamablehttp_client)
+        monkeypatch.setattr(mod, "streamable_http_transport", fake_streamable_http_transport)
 
         adapter = McpClientSearchAdapter(
             SurfacingConfig(
@@ -121,6 +122,9 @@ class TestLtmTransportSelection:
         assert captured == {
             "url": "https://ltm.example/mcp",
             "headers": {"X-Project": "stm"},
+            # No timeout override here, same as before the mcp 2.0 port: the
+            # SDK's own client defaults apply.
+            "timeout": None,
         }
 
 

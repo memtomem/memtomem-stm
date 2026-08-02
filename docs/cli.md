@@ -58,11 +58,11 @@ Commands:
   gateway    Inspect and configure Toolgraph-backed gateway policy.
   health     Check upstream server connectivity.
   hook       Bridge a host's built-in tool calls into STM (PostToolUse...
-  host       Host-config inspection and sync (RFC §7.3).
+  host       Host-config inspection and sync.
   import     Import MCP definitions from host configs into the mms registry.
   init       Guided first-time setup for memtomem-stm.
   list       List configured upstream servers.
-  project    Project-scoped MCP management (RFC §7.1).
+  project    Project-scoped MCP management.
   prune      Remove direct registrations for STM upstreams that are...
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
@@ -83,7 +83,7 @@ output as the source of truth.
 
 Output is colorized when writing to a terminal; set `NO_COLOR=1` to disable. JSON output (`--json`) and non-TTY streams (pipes, CI) are never colored.
 
-The `--json` single-document contract covers well-formed invocations: success and operational failures (including a config write-lock timeout) emit exactly one JSON object on stdout. **Usage errors are outside it** — a malformed invocation (unknown flag, missing argument, an incompatible flag combination such as `add --json --from-clients` or `tune --json --apply`) gets Click's standard plain-text usage message on stderr with exit 2 and an empty stdout, same as every read-only `--json` command today. One precedence note: the config write lock wraps the whole command (as it does for every mutator), so under contention a malformed invocation can surface the exit-1 lock-timeout error before argument validation ever runs. For the four mutating result-summary commands (`add` / `remove` / `prune` / `eject`) that timeout is itself rendered in `--json` mode as the JSON envelope (`"error": "config_lock_timeout"`); `tune --json` is a preview-only mode and keeps the plain-text timeout rendering.
+The `--json` single-document contract covers well-formed invocations: success and operational failures (including a config write-lock timeout) emit exactly one JSON object on stdout. **Usage errors are outside it** — a malformed invocation (unknown flag, missing argument, an incompatible flag combination such as `add --json --from-clients` without `--all`/`--select`, or `tune --json --apply`) gets Click's standard plain-text usage message on stderr with exit 2 and an empty stdout, same as every read-only `--json` command today. One precedence note: the config write lock wraps the whole command (as it does for every mutator), so under contention a malformed invocation can surface the exit-1 lock-timeout error before argument validation ever runs. For the four mutating result-summary commands (`add` / `remove` / `prune` / `eject`) that timeout is itself rendered in `--json` mode as the JSON envelope (`"error": "config_lock_timeout"`); `tune --json` is a preview-only mode and keeps the plain-text timeout rendering.
 
 ### `init`
 
@@ -132,6 +132,16 @@ Without `--resume`, aborts if the config file already exists. `--resume`
 preserves the config and re-enters client registration; use [`register`](#register)
 to run registration directly, [`add`](#add) to add servers, or [`list`](#list)
 to inspect the current state. No path silently clobbers existing configuration.
+
+`--freshness` picks the response cache's global TTL (`cache.default_ttl_seconds`) for the new config:
+
+| Preset | TTL written | Meaning |
+|--------|-------------|---------|
+| `live` | `0` | never serve a cached response — every call hits the upstream |
+| `balanced` (default) | *(none written)* | schema default of 3600 s (1 h) applies |
+| `reuse` | `86400` | serve cached responses for up to a day — cheapest, staleness-tolerant |
+
+It only seeds the initial value; edit `cache.default_ttl_seconds` (or per-tool/per-server `cache_ttl_seconds`) later — see [caching](caching.md).
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
@@ -216,6 +226,16 @@ Options:
                                   Incompatible with NAME / --prefix /
                                   --command / --args / --url / --env /
                                   --header.
+  --all                           With --from-clients/--import: import every
+                                  newly discovered server without prompting,
+                                  assigning each a suggested prefix. Non-
+                                  interactive even on a TTY. Mutually
+                                  exclusive with --select.
+  --select NAME[,NAME...]         With --from-clients/--import: import only
+                                  the named discovered servers, without
+                                  prompting. Repeatable and comma-separated.
+                                  A name no client advertises is an error;
+                                  one already registered here is skipped.
   --prune                         After a successful --import, remove the
                                   direct registrations from source MCP
                                   clients so tools are reachable via STM
@@ -232,7 +252,7 @@ For `sse`/`streamable_http` servers that need HTTP authentication, pass `--heade
 
 A `--prefix` already used by another registered server is rejected before anything is written (`duplicate_prefix`): the proxy's config loader refuses duplicate prefixes, so saving one would leave a config the server can't start with. The interactive flows (`mms init`, `add --from-clients`) re-prompt on a colliding prefix for the same reason.
 
-With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `header_requires_http`, `malformed_args`, `invalid_env`, `invalid_header`, `validation_failed`). `--json` is a usage error with `--from-clients` — the import path is an interactive selection flow.
+With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `header_requires_http`, `malformed_args`, `invalid_env`, `invalid_header`, `validation_failed`). With `--from-clients`, `--json` requires `--all` or `--select` (see below) and emits the bulk-import shape instead — `{"action": "add", "ok": true, "mode": "from_clients", "config_path": ..., "imported": [{"name", "prefix", "source", "server", …}], "skipped": [{"name", "reason"}], "validated": ..., "warnings": [...], "prune": null | {"pruned": [...], "failed": [...]}}` — with `unknown_server` as its one additional failure code. Bare `--from-clients --json` stays a usage error: a formatting flag must not turn the selection prompt into a guess about what to import.
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from
 the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`,
@@ -244,6 +264,21 @@ of the `init` discovery step — servers already registered in this config are
 filtered out by name and by `(transport, command, args)` / `(transport, url)`
 signature before the selection UI. `--validate` and `--timeout` work on the
 selected subset.
+
+For scripts and CI, `--all` (import everything newly discovered) or `--select
+NAME[,NAME...]` (import only the named servers, repeatable and comma-separated)
+replaces both prompts. Either flag makes the whole run non-interactive — even
+on a TTY, and including the `--prune` confirmation, where the flag then becomes
+the only way to consent. Each prefix comes from the same suggestion the
+interactive flow offers as a default: the server name with non-alphanumerics
+folded to `_`, plus a numeric suffix (`filesystem2`) when that collides with a
+prefix already in the config, truncated if it would not fit the 64-char MCP
+tool-name budget. To choose a prefix yourself, use the interactive flow or
+register the server with `mms add NAME --prefix ...`. `--select` treats its two
+failure modes differently: a name no MCP client advertises is a typo, so the
+run exits 1 (`unknown_server`) before writing anything, while a name already
+registered here is skipped with a warning and exit 0 — re-running the same
+scripted import stays idempotent.
 
 To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or Claude Desktop edit to retry. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
@@ -261,7 +296,7 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
 
 The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
@@ -318,9 +353,13 @@ mms add --import            # or --from-clients; skips anything already register
 mms add --import --prune    # TTY: per-entry confirm prompt (default No)
                             # non-TTY: unconditional — pass --prune to opt in
 
+# Scripted bulk-import: no prompts, machine-readable result
+mms add --import --all --json
+mms add --import --select filesystem,github
+
 # List configured upstreams (per-server detail: prefix, transport, surfacing, origin)
 mms list
-mms list --json            # machine-readable: {config_path, servers}
+mms list --json            # machine-readable: {config_path, config_valid, config_error, servers}
 
 # Config summary (path, enabled flag, server count)
 mms status
@@ -522,7 +561,7 @@ Shows a config summary: the configuration file path, enabled flag, schema-valida
 
 `status --json` is unchanged by that split: it still carries the full redacted `servers` map (plus additive `server_count` / `pruned_count` keys), so scripted consumers keep working. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
-When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `health` print a warning naming the first error — exit code unchanged. Use `mms config validate` for the strict check.
+When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status`, `list`, and `health` print a warning naming the first error — exit code unchanged. All three validate the file *with* the `MEMTOMEM_STM_PROXY__*` env overlay applied, so the warning matches what a running server would actually do rather than firing on a file an env var already repairs. Use `mms config validate` for the strict check.
 
 ### `config validate`
 
@@ -739,27 +778,27 @@ and Windows hosts without sending them an incompatible frame.
 
 ## `mms project` — project-scoped MCP management
 
-`mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) — see RFC §5 for the full data model.
+`mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap).
 
 The group ships six subcommands. State lives in three TOML files plus the
 explicit route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
-| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add` in W1) | **No** — gitignore |
+| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add`) | **No** — gitignore |
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
 
 ```
 Usage: mms project [OPTIONS] COMMAND [ARGS]...
 
-  Project-scoped MCP management (RFC §7.1).
+  Project-scoped MCP management.
 
 Commands:
   init     Create <path>/.mms/project.toml (default path = cwd) and add to index.
   show     Show the detected (or named) project, with init hints when no marker.
   list     List known projects from the index. Mark current cwd's project with `*`.
-  enable   Add MCP names to the project's enabled list (RFC §7.1).
+  enable   Add MCP names to the project's enabled list.
   disable  Remove MCP names from the project's enabled list.
   route    Preview or apply selected registry entries as STM proxy upstreams.
 ```
@@ -868,7 +907,7 @@ Missing configs are silently treated as "no candidates" so `--from all` works ac
 
 ### Secret classification
 
-The env block of each entry runs through a two-signal classifier (RFC §7.2.1):
+The env block of each entry runs through a two-signal classifier:
 
 1. **Key pattern** (case-insensitive substring): `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*PASS*`, `*AUTH*`, `*CREDENTIAL*`, `*API_KEY*`. Hits even if the value is short (`API_KEY=test` is still classified — pattern beats value).
 2. **Value heuristic**: length ≥ 32 AND the value is mostly base64- or hex-charset (catches opaque tokens stored under unusual key names).

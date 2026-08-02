@@ -14,17 +14,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.session import ServerSession
+from mcp.server.mcpserver import Context, MCPServer
 
 # Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
 # annotation is a STRING under ``from __future__ import annotations``, and
-# FastMCP's ``func_metadata`` resolves it against this module's globals at
+# the SDK's ``func_metadata`` resolves it against this module's globals at
 # ``add_tool`` time — a function-local import would NameError there and send
 # every proxied tool down the registration degradation path.
 from mcp.types import CallToolResult
 
-from memtomem_stm import __version__
+from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
@@ -83,7 +82,11 @@ class STMContext:
     ``stm_proxy_health`` so the failure is visible from inside the client."""
 
 
-CtxType = Context[ServerSession, STMContext]
+# mcp 2.0 reordered the parameters: 1.x was ``Context[ServerSessionT,
+# LifespanContextT]``, 2.0 is ``Context[LifespanContextT, RequestT]`` —
+# ``RequestT`` being the transport request object, which no handler here
+# touches.
+CtxType = Context[STMContext, Any]
 
 
 def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, Any]) -> str | None:
@@ -140,7 +143,7 @@ def _build_ltm_adapter(config: STMConfig, daemon_config: STMConfig) -> Any:
 
 
 @asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
+async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     config = STMConfig()
     # Daemon discovery/spawn must use the same env/default-only basis the
     # detached daemon loads. The proxy file may later propagate a file-only
@@ -407,7 +410,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             )
 
             def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
-                # The bare ``-> CallToolResult`` annotation matters: FastMCP's
+                # The bare ``-> CallToolResult`` annotation matters: the SDK's
                 # ``func_metadata`` special-cases it (return without output
                 # validation) but REJECTS a Union containing it, and the
                 # returned envelope passes through ``convert_result`` and the
@@ -504,20 +507,21 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 logger.warning("Failed to shut down OTLP export", exc_info=True)
 
 
-mcp = FastMCP(
+# ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to
+# this package's version. It has never been right without it: 1.x substituted
+# ``importlib.metadata.version("mcp")``, so handshakes advertised the MCP SDK
+# version as ours, and 2.0 substitutes an empty string. Mirrors the fix core
+# made in memtomem#383.
+mcp = MCPServer(
     "memtomem-stm",
     instructions=(
         "Short-term memory proxy gateway with proactive memory surfacing. "
         "Proxies upstream MCP servers with response compression and caching, "
         "and automatically surfaces relevant memories from memtomem LTM."
     ),
+    version=_stm_version,
     lifespan=app_lifespan,
 )
-# FastMCP exposes no ``version`` parameter, and the low-level server's
-# unset version falls back to the *mcp SDK's* package version — so
-# ``initialize`` advertised e.g. serverInfo.version "1.28.1" instead of
-# memtomem-stm's own release.
-mcp._mcp_server.version = __version__
 
 
 def _should_advertise_obs_tools() -> bool:
@@ -620,13 +624,13 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
 ) + (("stm_memory_propose",) if _should_advertise_formation_tool() else ())
 
 
-def _move_stm_tools_to_end(server: FastMCP) -> None:
+def _move_stm_tools_to_end(server: MCPServer) -> None:
     """Re-insert STM utility tools so proxied tools advertise first (#228).
 
     STM utility tools are registered at module import via ``@_obs_tool`` /
     ``@mcp.tool()`` decorators, before ``app_lifespan`` runs; proxied tools
     are registered inside the lifespan once upstream servers are reachable.
-    FastMCP's ``_tool_manager._tools`` is an insertion-ordered dict, so
+    The SDK's ``_tool_manager._tools`` is an insertion-ordered dict, so
     without this step ``tools/list`` yields STM utility tools before the
     domain tools users are actually reaching for — a picker-UX papercut
     reported in #228.
@@ -636,7 +640,7 @@ def _move_stm_tools_to_end(server: FastMCP) -> None:
     entries (e.g. observability tools hidden by
     ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false``) are skipped
     silently. Touches the same private ``_tool_manager._tools`` the proxy
-    already reaches into in ``_fastmcp_compat.py``; any FastMCP API shift
+    already reaches into in ``_fastmcp_compat.py``; any SDK API shift
     surfaces as a ``AttributeError`` and the reorder is skipped with a
     warning rather than breaking server startup.
     """
@@ -644,7 +648,7 @@ def _move_stm_tools_to_end(server: FastMCP) -> None:
         tools_dict = server._tool_manager._tools
     except AttributeError:
         logger.warning(
-            "Cannot reorder advertise list — FastMCP internal API changed. "
+            "Cannot reorder advertise list — MCPServer internal API changed. "
             "Tools are registered, but STM utility tools may appear before "
             "proxied tools in the picker (#228)."
         )
