@@ -517,4 +517,13 @@ def restart_cmd(ctx: click.Context) -> None:
             ctx.invoke(start_cmd)
             return
         time.sleep(0.2)
-    click.echo(_warn("previous daemon still shutting down — try `mms daemon start` again shortly"))
+    # Exit nonzero: the docs recommend `mms daemon restart` after an upgrade,
+    # and a script (or a user skimming the output) must not read "stopped and
+    # never came back" as success.
+    click.echo(
+        _warn(
+            "daemon NOT restarted: previous daemon still shutting down — "
+            "run `mms daemon start` again shortly"
+        )
+    )
+    raise SystemExit(1)

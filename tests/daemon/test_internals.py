@@ -1326,7 +1326,10 @@ class TestDaemonRestartCli:
             assert held is True
             result = CliRunner().invoke(_cli(), ["daemon", "restart"])
 
-        assert result.exit_code == 0, result.output
+        # Exit 1: the daemon is down and did not come back — a script driving
+        # the documented upgrade flow must see the failure (was exit 0).
+        assert result.exit_code == 1, result.output
+        assert "NOT restarted" in result.output
         assert "still shutting down" in result.output
 
 
