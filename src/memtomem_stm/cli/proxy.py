@@ -424,26 +424,38 @@ def _load(config_path: Path) -> dict[str, Any]:
     return data
 
 
-def _schema_validation_error(data: dict[str, Any]) -> str | None:
-    """First schema-validation error for a raw config dict, or ``None``.
+def _schema_validation_error(
+    data: dict[str, Any], *, env_overrides: dict[str, Any] | None = None
+) -> str | None:
+    """First schema-validation error for a config dict, or ``None``.
 
     ``_load`` only guards JSON syntax and coarse shape; valid-JSON-but-
     invalid-schema is exactly the case a running server silently degrades to
-    env/defaults on (#611). ``status`` / ``health`` warn on it — exit code
-    unchanged, since inspection commands stay lenient and strictness lives in
-    ``mms config validate``.
+    env/defaults on (#611). When supplied, ``env_overrides`` is deep-merged
+    with the file data before validation, matching the server's documented
+    env > file precedence. Callers that inspect or mutate the file *as
+    written* deliberately omit it.
     """
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.config import ProxyConfig, _deep_merge
+
+    effective_data = _deep_merge(data, env_overrides) if env_overrides else data
 
     try:
-        ProxyConfig.model_validate(data)
+        ProxyConfig.model_validate(effective_data)
     except ValidationError as exc:
         first = exc.errors()[0]
         loc = ".".join(str(part) for part in first["loc"])
         return f"{loc}: {first['msg']}" if loc else first["msg"]
     return None
+
+
+def _runtime_schema_validation_error(data: dict[str, Any]) -> str | None:
+    """Validate file data with the same proxy env overlay as the server."""
+    from memtomem_stm.proxy.config import collect_proxy_env_overrides
+
+    return _schema_validation_error(data, env_overrides=collect_proxy_env_overrides())
 
 
 _CONFIG_INVALID_WARNING = (
@@ -1746,7 +1758,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     data = _load(path)
     enabled = data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    config_error = _schema_validation_error(data)
+    config_error = _runtime_schema_validation_error(data)
     tuning = _tuning_readiness(data)
     # Same predicate as the `mms list` pruned marker (via _origin_cell), so
     # this count and list's `*` rows can never disagree on what "pruned" means.
@@ -6963,7 +6975,7 @@ def health(
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
-    config_error = _schema_validation_error(data)
+    config_error = _runtime_schema_validation_error(data)
     if config_error:
         # A schema error can echo the rejected input_value (or a validator
         # message quoting it), so scrub it against configured server secrets
@@ -7300,7 +7312,7 @@ def doctor(
             # fall back to env/defaults) but does NOT short-circuit: the
             # transport/prefix/probe checks operate on the raw dicts and
             # stay meaningful.
-            schema_error = _schema_validation_error(data)
+            schema_error = _runtime_schema_validation_error(data)
             if schema_error:
                 # A pydantic error can echo the rejected input_value (or a
                 # validator message quoting it), so scrub it against every

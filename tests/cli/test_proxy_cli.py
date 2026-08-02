@@ -1063,8 +1063,11 @@ class TestStatus:
         )
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
 
+        human_result = runner.invoke(cli, ["status", *_cfg_args(config)])
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
 
+        assert human_result.exit_code == 0, human_result.output
+        assert "falls back to env/defaults" not in human_result.output
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert data["config_valid"] is True
