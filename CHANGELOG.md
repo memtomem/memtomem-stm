@@ -11,6 +11,28 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- **`mms add --from-clients` gained a non-interactive selection path: `--all`
+  and `--select NAME[,NAME...]`** (#819, closes #817). The bulk-import flow was
+  interactive-only — a numbered selection prompt plus a per-server prefix
+  prompt — so scripts had to drive it through stdin, where a stray line
+  silently becomes the *prefix*. Either flag replaces both prompts and makes
+  the run non-interactive even on a TTY, including the `--prune` confirmation
+  (there `--prune` becomes the only way to consent). `--json` is now accepted
+  with a selection flag and emits one document listing the imported and
+  skipped servers with `env`/`headers` redacted; without one it remains a
+  usage error. `--select` distinguishes its two failure modes: a name no MCP
+  client advertises exits 1 (`unknown_server`) before anything is written,
+  while a name already registered here is skipped with a warning and exit 0,
+  so re-running the same import stays idempotent. Prefixes come from the
+  existing suggestion rule (name sanitized, numeric suffix on collision).
+  **Behavior change**: suggested prefixes now collapse underscore runs with
+  `_{2,}` instead of a single `replace("__", "_")` pass, which left `__`
+  behind on odd-length runs (`a___b` → `a__b`) — a value the proxy refuses to
+  load; and an over-budget suggestion is truncated to the tool-name hard limit
+  rather than offered to a prompt.
+
 ### Changed
 
 - **Migrated to the `mcp` 2.0 SDK; the requirement is now `mcp[cli]>=2,<3`**
