@@ -1928,8 +1928,6 @@ def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
     ``reuse`` TTLs written by ``mms init`` and the schema default that
     ``balanced`` leaves in place. All three live in code; a drift in either
     direction must fail here, not in a user's cache behavior."""
-    import re
-
     from memtomem_stm.proxy.config import CacheConfig
 
     cli_md = (REPO_ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
@@ -1948,9 +1946,13 @@ def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
     assert f"`{reuse_ttl}`" in text, f"documented reuse TTL != code ({reuse_ttl})"
     schema_default = CacheConfig().default_ttl_seconds
     assert schema_default is not None
-    assert f"{schema_default:g} s" in text.replace("3600 s", f"{schema_default:g} s") or str(
-        int(schema_default)
-    ) in text, f"documented balanced default != schema default ({schema_default})"
+    # Compare against the table as written. An earlier form of this line
+    # searched `text.replace("3600 s", f"{schema_default:g} s")`, which
+    # rewrote a stale documented value into the live one and then found it —
+    # so a changed schema default passed the guard it was meant to trip.
+    assert f"{schema_default:g} s" in text, (
+        f"documented balanced default != schema default ({schema_default})"
+    )
 
 
 def test_list_json_keys_are_documented(tmp_path: Path) -> None:
