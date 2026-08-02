@@ -1956,3 +1956,30 @@ def test_list_json_keys_are_documented(tmp_path: Path) -> None:
         f"docs/cli.md `list` section does not mention {undocumented} — "
         "`mms list --json` emits them; document the key alongside the change."
     )
+
+
+def test_uninstall_runbook_puts_hook_backups_where_the_writer_puts_them() -> None:
+    """The uninstall runbook must not imply `rm -rf ~/.memtomem ~/.mms` clears
+    the host-settings backups.
+
+    ``_write_backup`` writes beside the *host's* config (``path.parent /
+    (path.name + ".bak")``), so an ``--apply`` leaves e.g.
+    ``~/.claude/settings.json.bak`` — outside both STM directories, and a
+    verbatim copy of a config that can hold API keys. An earlier revision of
+    this runbook told users those files were swept up with the data dirs.
+    """
+    source = _read("src/memtomem_stm/cli/hook_hosts.py")
+    assert 'path.parent / (path.name + (".bak"' in source, (
+        "hook backup naming moved; re-check what docs/guides/operations.md tells users to delete"
+    )
+
+    operations = _read("docs/guides/operations.md")
+    section = re.search(r"## Uninstalling completely\n(.*?)(?=\n## |\Z)", operations, re.DOTALL)
+    assert section, "operations.md lost the 'Uninstalling completely' runbook"
+    body = section.group(1)
+    assert "settings.json.bak" in body, (
+        "the uninstall runbook must name the host-adjacent hook backup path"
+    )
+    assert not re.search(r"rm -rf[^\n]*\n[^\n]*hook[^\n]*\.bak", body), (
+        "the runbook implies `rm -rf` removes hook backups; it does not"
+    )

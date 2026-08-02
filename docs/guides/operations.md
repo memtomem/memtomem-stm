@@ -73,8 +73,10 @@ ways with different symptoms:
 
 Recovery order:
 
-1. `mms config validate` — names the first error (line/column for JSON errors,
-   `section.key: message` for schema errors) and every unknown key.
+1. `mms config validate` — lists *every* error, one line each (line/column for
+   JSON errors, `key: message` — dotted for nested sections — for schema
+   errors), plus every unknown key. This is the only command that reports
+   them all; `status` and `list` name just the first.
 2. Fix the named line, or restore a backup. Backups that may already exist:
    - `stm_proxy.json.bak-<UTC>` next to the config — written by every
      `mms tune --apply`.
@@ -96,7 +98,12 @@ mms daemon stop --all
 ```
 
 1. **Hooks** — `mms hook uninstall --host <host> --apply` removes the
-   PostToolUse hook after backing up the host settings file.
+   PostToolUse hook after backing up the host settings file. Every install
+   and uninstall leaves that backup **next to the host's own config**, not
+   under STM's directories — `~/.claude/settings.json.bak`,
+   `~/.codex/config.toml.bak`, and so on (`.bak.1`, `.bak.2`, … for later
+   writes). They are verbatim copies of a host config, which can carry API
+   keys, so delete them here rather than assuming step 5 catches them.
 2. **Upstreams** — if you pruned direct registrations, `mms eject NAME` first
    restores each upstream to its original host client; plain `mms remove NAME`
    just drops it from STM.
@@ -105,9 +112,10 @@ mms daemon stop --all
    eject` when the last upstream leaves).
 4. **Daemon** — `mms daemon stop --all` also reaps daemons left by older
    configs.
-5. **State on disk** — remove the data directories; nothing else writes there:
-   `rm -rf ~/.memtomem ~/.mms` (configs, metrics/feedback DBs, locks, logs,
-   prune backups; also removes hook/tune `.bak` files kept under them).
+5. **State on disk** — remove the data directories: `rm -rf ~/.memtomem
+   ~/.mms` (configs, metrics/feedback DBs, locks, logs, prune backups, and
+   the `stm_proxy.json.bak-<UTC>` copies each `mms tune --apply` leaves next
+   to the config). Host-settings backups are **not** here — see step 1.
 6. **Package** — `uv tool uninstall memtomem-stm` or `pip uninstall
    memtomem-stm`.
 
