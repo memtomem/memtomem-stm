@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from functools import wraps
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
 
@@ -7292,8 +7292,19 @@ async def _probe_ollama_dependencies(
 
 
 def _ollama_check_id(base_url: str) -> str:
-    """Stable endpoint check ID without exposing URL credentials."""
-    digest = hashlib.sha256(base_url.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    """Stable endpoint check ID derived from the credential-STRIPPED URL.
+
+    Hashing the raw URL would publish a truncated digest of the credentials
+    in ``--json`` — enough for an offline password-guessing verifier once the
+    host is known. Two endpoints differing only by userinfo therefore share
+    an ID; the caller disambiguates with an ordinal suffix.
+    """
+    try:
+        parts = urlsplit(base_url)
+        stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+    except ValueError:
+        stripped = "<unparseable url>"
+    digest = hashlib.sha256(stripped.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
     return f"ollama_endpoint:{digest}"
 
 
@@ -7311,7 +7322,8 @@ def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
         # "ollama pull" cannot fix it.
         return f"set a valid base_url for this endpoint; see {_OLLAMA_SETUP_DOC}"
     if not _is_loopback_ollama(base_url):
-        return f"verify the remote Ollama host and models; see {_OLLAMA_SETUP_DOC}"
+        target = f" serves model(s) {', '.join(missing_models)}" if missing_models else ""
+        return f"verify the remote Ollama host{target}; see {_OLLAMA_SETUP_DOC}"
     return (
         _shell_join(["ollama", "pull", missing_models[0]])
         if missing_models
@@ -7697,6 +7709,7 @@ def doctor(
                     )
 
                 if ollama_dependencies:
+                    seen_ollama_check_ids: dict[str, int] = {}
                     for probe in asyncio.run(
                         _probe_ollama_dependencies(ollama_dependencies, timeout)
                     ):
@@ -7704,6 +7717,13 @@ def doctor(
                         display_url = redact_url_userinfo(dependency.base_url)
                         usages = ", ".join(dependency.usages)
                         check_id = _ollama_check_id(dependency.base_url)
+                        # Credential-stripped IDs can collide when endpoints
+                        # differ only by userinfo; keep them distinct without
+                        # reintroducing secret-derived data.
+                        ordinal = seen_ollama_check_ids.get(check_id, 0)
+                        seen_ollama_check_ids[check_id] = ordinal + 1
+                        if ordinal:
+                            check_id = f"{check_id}-{ordinal + 1}"
                         if probe.error:
                             check(
                                 check_id,

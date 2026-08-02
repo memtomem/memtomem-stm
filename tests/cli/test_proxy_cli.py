@@ -12035,6 +12035,124 @@ class TestDoctor:
         missing_clause = result.output.split("missing model(s):", 1)[1].split(";", 1)[0]
         assert "embedding scorer" not in missing_clause
 
+    def test_ollama_json_check_id_is_credential_independent(self, runner, config, monkeypatch):
+        """The published check ID must not be an offline password verifier.
+
+        A digest of the raw URL would leak 48 credential-derived bits into
+        ``--json``; the ID has to be identical whatever the password is.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        ids = []
+        for password in ("hunter2", "correct horse"):
+            config.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "cache": {"tool_annotation_policy": "strict"},
+                        "relevance_scorer": {
+                            "scorer": "embedding",
+                            "embedding_base_url": f"http://alice:{password}@ollama.test:11434",
+                        },
+                        "upstream_servers": {
+                            "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+            assert result.exit_code == 0, result.output
+            payload = json.loads(result.output)
+            ollama_ids = [
+                check["id"]
+                for check in payload["checks"]
+                if check["id"].startswith("ollama_endpoint:")
+            ]
+            assert len(ollama_ids) == 1
+            ids.append(ollama_ids[0])
+        assert ids[0] == ids[1]
+        assert ids[0] == proxy_mod._ollama_check_id("http://ollama.test:11434")
+
+    def test_ollama_credential_only_twin_endpoints_get_distinct_ids(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "one": {
+                            "prefix": "p1",
+                            "transport": "stdio",
+                            "command": "x",
+                            "compression": "llm_summary",
+                            "llm": {
+                                "provider": "ollama",
+                                "model": "qwen3:4b",
+                                "base_url": "http://alice:pw1@ollama.test:11434",
+                            },
+                        },
+                        "two": {
+                            "prefix": "p2",
+                            "transport": "stdio",
+                            "command": "x",
+                            "compression": "llm_summary",
+                            "llm": {
+                                "provider": "ollama",
+                                "model": "qwen3:4b",
+                                "base_url": "http://bob:pw2@ollama.test:11434",
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(dependency, frozenset({"qwen3:4b"}))
+                for dependency in dependencies
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        ollama_ids = [
+            check["id"] for check in payload["checks"] if check["id"].startswith("ollama_endpoint:")
+        ]
+        assert len(ollama_ids) == 2
+        # Same stripped identity, so the second gets an ordinal suffix rather
+        # than a secret-derived discriminator.
+        assert len(set(ollama_ids)) == 2
+        assert sorted(ollama_ids)[1] == f"{sorted(ollama_ids)[0]}-2"
+        for check_id in ollama_ids:
+            for secret in ("alice", "pw1", "bob", "pw2"):
+                assert secret not in check_id
+
     def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
         """LTM 미설정 scenario: WARN with the ratified messaging — names
         surfacing as the only casualty, never reads as an install failure."""
