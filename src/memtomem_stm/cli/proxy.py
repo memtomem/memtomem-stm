@@ -1798,17 +1798,29 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
+    # Same lenient warning as ``status`` (#611): on a schema-invalid config a
+    # running server ignores the whole file, so this table shows servers that
+    # are NOT being proxied (or none at all when the key itself is mangled) —
+    # without the warning a typo'd config makes them silently vanish here.
+    config_error = _schema_validation_error(data)
 
     if as_json:
         click.echo(
             _json_dumps(
-                {"config_path": str(resolved), "servers": _redacted_servers_json(servers)},
+                {
+                    "config_path": str(resolved),
+                    "config_valid": config_error is None,
+                    "config_error": config_error,
+                    "servers": _redacted_servers_json(servers),
+                },
                 indent=2,
                 ensure_ascii=False,
             )
         )
         return
 
+    if config_error:
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
     if not servers:
         click.echo("No upstream servers configured.")
         return

@@ -908,6 +908,50 @@ class TestConfigLoad:
         assert data["error"] == "config_not_found"
         assert str(config) in data["path"]
 
+    def test_list_warns_on_schema_invalid_config(self, runner, config):
+        """A schema-invalid config makes a running server ignore the whole
+        file, so this table shows servers that are NOT being proxied.
+        ``status`` has warned since #611; ``list`` used to render silently —
+        with a mangled ``upstream_servers`` value the servers just vanished
+        from the one command users run to see them."""
+        config.write_text(
+            json.dumps({"enabled": "yes-please", "upstream_servers": {}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "fails validation" in result.output
+        assert "falls back to env/defaults" in result.output
+        assert "No upstream servers configured" in result.output
+
+    def test_list_json_flags_schema_invalid_config(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": "yes-please",
+                    "upstream_servers": {"a": {"prefix": "a", "command": "a"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert "enabled" in data["config_error"]
+        assert "a" in data["servers"]
+
+    def test_list_json_valid_config_reports_valid(self, runner, config):
+        config.write_text(
+            json.dumps({"upstream_servers": {"a": {"prefix": "a", "command": "a"}}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is True
+        assert data["config_error"] is None
+
 
 # ── status command ───────────────────────────────────────────────────────
 
