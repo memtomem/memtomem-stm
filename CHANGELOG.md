@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **`mms doctor` now diagnoses active Ollama model dependencies** (#818).
+  The env-overlaid effective config is inspected for embedding relevance and
+  explicit `llm_summary` compression, shared base URLs receive one passive
+  `/api/tags` inventory request, and missing models get an `ollama pull` next
+  action. Dormant LLM blocks, `auto`, extraction (unwired in the bundled
+  server), and non-Ollama providers are not probed. Live-Ollama CI remains out
+  of scope; coverage uses mocked inventories and a dead port. **Behavior
+  change**: a configured Ollama endpoint that is unreachable or lacks its
+  configured model now makes `mms doctor` exit 1 instead of silently passing
+  while runtime falls back to BM25 or truncation.
 - **`mms add --from-clients` gained a non-interactive selection path: `--all`
   and `--select NAME[,NAME...]`** (#819, closes #817). The bulk-import flow was
   interactive-only — a numbered selection prompt plus a per-server prefix
