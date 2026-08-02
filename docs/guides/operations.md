@@ -25,6 +25,20 @@ An unavailable LTM server disables proactive memory surfacing only. Proxying,
 compression, and caching remain available, so `doctor` treats this as WARN. It
 does not change Claude Code or Codex client-managed memory.
 
+### Ollama endpoint failure
+
+Unlike optional LTM surfacing, an Ollama endpoint is checked only after the
+effective configuration explicitly selects embedding relevance or
+Ollama-backed LLM compression. A dead endpoint or missing configured model is
+therefore a `doctor` FAIL. For the default local endpoint
+(`http://localhost:11434`), start the service with `ollama serve`, pull the
+model named by the `next:` line, and rerun `mms doctor`; a remote or
+non-default endpoint's `next:` line instead asks you to verify that endpoint
+and its models (plain `ollama` commands would act on the default instance,
+not the configured one). For installation,
+model selection, or a remote Ollama host, follow the
+[local Ollama setup](../compression.md#local-ollama-setup).
+
 ### Proxied tools are missing
 
 Run `mms health --names` to check discovery and composed-name overflow, then

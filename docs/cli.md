@@ -511,7 +511,7 @@ Usage: mms doctor [OPTIONS]
 Options:
   --config TEXT            [default: ~/.memtomem/stm_proxy.json]
   --json                   Output as JSON for scripting.
-  --timeout INTEGER RANGE  Per-server connection timeout in seconds.
+  --timeout INTEGER RANGE  Per-connection probe timeout in seconds.
                            [default: 10; x>=1]
   --measure-ltm            Run five synthetic searches against an existing
                            shared daemon to refresh latency advice. A cold
@@ -530,6 +530,8 @@ Checks, in order:
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
 | `prefixes` | the shared `proxy/prefixes.py` validators the runtime load path enforces | FAIL: empty or duplicate prefixes (same wording as the server's load rejection) |
 | `upstream: <name>` | the same staged probe as `health` | FAIL: probe failed — names the stage reached; a dead stdio binary gets a `command -v <cmd>` next action |
+| `LLM compression` | effective global → server → tool compression inheritance | FAIL: an active `llm_summary` site has no effective `llm` block |
+| `Ollama endpoint` | env-overlaid active model config + read-only `/api/tags` inventory | FAIL: endpoint timeout/error/malformed inventory, or a configured model is missing |
 | `host registration` | Codex, Claude Code, and project `.mcp.json` discovery | WARN: STM registration not detected |
 | `cache policy` | the `config validate` advisory predicate | WARN: cache enabled but `tool_annotation_policy` unset (conservative default caches unclassified tools) |
 | `compression tuning` | proxy metrics sample inventory | PASS with readiness or collection status; never writes tuning |
@@ -539,9 +541,9 @@ Checks, in order:
 | `ltm score scale` | feedback diagnostics | FAIL while a recent score-scale mismatch episode remains unrecovered |
 | `ltm measurement` / timeout checks | daemon latency telemetry | WARN when measurement cannot run or configured surfacing/hook deadlines are too small |
 
-`--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Short-circuited runs contain only the checks that executed. Secrets never appear: probe errors are pre-sanitized and `env`/`headers` values are never printed.
+`--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Active Ollama dependencies add one grouped `ollama_endpoint:<digest>` check per unique base URL (the digest covers the credential-stripped URL; a credentialed endpoint appends a digest of its own use sites, so credential-only twins stay distinct and IDs never depend on a secret); duplicate models and use sites share its single inventory request. Short-circuited runs contain only the checks that executed. Secrets never appear: probe errors are pre-sanitized, URL credentials are removed, and `env`/`headers` values are never printed.
 
-The default doctor run is passive: it performs no search and changes no state.
+The default doctor run is passive: it performs no search or inference and changes no state. It may issue a read-only Ollama `/api/tags` GET for an active embedding or LLM-compression dependency; it never starts Ollama or pulls a model. See [Local Ollama setup](compression.md#local-ollama-setup).
 `--measure-ltm` explicitly performs five synthetic searches against an already
 running shared daemon (plus one prime search when cold), discards their content,
 and updates daemon latency telemetry. It never starts a missing daemon and never

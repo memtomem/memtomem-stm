@@ -1348,6 +1348,14 @@ def test_cli_docs_track_live_init_doctor_and_auto_hook_contracts() -> None:
     for option in live_doctor_options:
         assert option in doctor_section.group(1)
     assert "default doctor run is passive" in doctor_section.group(1)
+    assert "Per-connection probe timeout" in doctor_section.group(1)
+    assert "Ollama endpoint" in doctor_section.group(1)
+    assert "/api/tags" in doctor_section.group(1)
+    assert "compression.md#local-ollama-setup" in doctor_section.group(1)
+
+    doctor_help = CliRunner().invoke(mms_cli, ["doctor", "--help"], terminal_width=200)
+    assert doctor_help.exit_code == 0
+    assert "Per-connection probe timeout" in doctor_help.output
 
     hook_help = CliRunner().invoke(hook_command, ["--help"], terminal_width=200)
     assert hook_help.exit_code == 0
@@ -1358,6 +1366,28 @@ def test_cli_docs_track_live_init_doctor_and_auto_hook_contracts() -> None:
     ):
         assert "turn_id" in body
         assert "Claude" in body
+
+
+def test_local_ollama_setup_documents_doctor_recovery_commands() -> None:
+    """The doctor hints must point at a complete, copyable recovery journey."""
+    compression = _read("docs/compression.md")
+    section = re.search(
+        r"### Local Ollama setup\n(.*?)(?=\n### |\n## |\Z)",
+        compression,
+        re.DOTALL,
+    )
+    assert section, "docs/compression.md lost the doctor Ollama target"
+    body = section.group(1)
+    for command in (
+        "ollama serve",
+        "ollama pull nomic-embed-text",
+        "ollama pull qwen3:4b",
+        "curl http://localhost:11434/api/tags",
+        "mms doctor",
+    ):
+        assert command in body
+    assert "never runs inference or pulls models" in body
+    assert "remote Ollama server" in body
 
 
 def test_model_aware_ceiling_docs_match_runtime(monkeypatch: pytest.MonkeyPatch) -> None:

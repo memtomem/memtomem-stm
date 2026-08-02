@@ -11420,6 +11420,1007 @@ class TestDoctor:
         assert "2 tool(s)" in result.output
         assert "Summary: 0 FAIL, 1 WARN," in result.output
 
+    def test_active_ollama_embedding_inventory_passes(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {
+                        "scorer": "embedding",
+                        "embedding_provider": "ollama",
+                        "embedding_model": "nomic-embed-text",
+                    },
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            assert timeout == 10
+            assert len(dependencies) == 1
+            assert dependencies[0].base_url == "http://localhost:11434"
+            assert dependencies[0].models == ("nomic-embed-text",)
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        ollama_line = next(line for line in result.output.splitlines() if "Ollama endpoint" in line)
+        assert "PASS" in ollama_line
+        assert "nomic-embed-text" in ollama_line
+
+        json_result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert json_result.exit_code == 0
+        payload = json.loads(json_result.output)
+        ollama_checks = [
+            check for check in payload["checks"] if check["id"].startswith("ollama_endpoint:")
+        ]
+        assert len(ollama_checks) == 1
+        assert ollama_checks[0]["status"] == "PASS"
+
+    def test_env_overlay_can_activate_ollama_embedding(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER", "embedding")
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        seen = False
+
+        async def fake_probe_ollama(dependencies, timeout):
+            nonlocal seen
+            seen = True
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert seen is True
+
+    def test_dead_ollama_embedding_endpoint_fails(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {
+                        "scorer": "embedding",
+                        "embedding_base_url": "http://127.0.0.1:9",
+                    },
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["doctor", "--timeout", "1", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "FAIL" in result.output
+        assert "Ollama endpoint" in result.output
+        # A non-default port must NOT get plain `ollama serve` — that would
+        # start the default instance while doctor keeps probing this one.
+        assert "ollama serve" not in result.output
+        assert "verify the local Ollama at http://127.0.0.1:9" in result.output
+
+    def test_missing_ollama_model_fails_with_safe_pull_hint(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        model = "nomic-embed-text;echo not-run"
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {
+                        "scorer": "embedding",
+                        "embedding_model": model,
+                    },
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [proxy_mod._OllamaProbeResult(dependencies[0], frozenset())]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        next_line = next(line for line in result.output.splitlines() if "ollama pull" in line)
+        assert shlex.split(next_line.split("next: ", 1)[1]) == [
+            "ollama",
+            "pull",
+            model,
+        ]
+
+    def test_shared_ollama_endpoint_groups_embedding_and_llm_models(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {"scorer": "embedding"},
+                    "default_compression": "llm_summary",
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fk",
+                            "transport": "stdio",
+                            "command": "x",
+                            "llm": {
+                                "provider": "ollama",
+                                "model": "qwen3:4b",
+                                "base_url": "http://localhost:11434/",
+                            },
+                            "tool_overrides": {
+                                "special": {
+                                    "llm": {
+                                        "provider": "ollama",
+                                        "model": "gemma3",
+                                        "base_url": "http://localhost:11434",
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        calls = 0
+
+        async def fake_probe_ollama(dependencies, timeout):
+            nonlocal calls
+            calls += 1
+            assert len(dependencies) == 1
+            assert dependencies[0].models == (
+                "gemma3",
+                "nomic-embed-text",
+                "qwen3:4b",
+            )
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0],
+                    frozenset({"gemma3:latest", "nomic-embed-text:latest", "qwen3:4b"}),
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert calls == 1
+        assert result.output.count("Ollama endpoint") == 1
+
+    def test_llm_summary_without_llm_block_fails_without_provider_probe(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "default_compression": "llm_summary",
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def unexpected_probe(*_args, **_kwargs):
+            pytest.fail("missing LLM config must fail without an endpoint request")
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", unexpected_probe)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "llm_summary has no effective llm block" in result.output
+
+    def test_extraction_and_non_ollama_providers_are_not_probed(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {
+                        "scorer": "embedding",
+                        "embedding_provider": "openai",
+                    },
+                    "extraction": {"enabled": True},
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fk",
+                            "transport": "stdio",
+                            "command": "x",
+                            "llm": {"provider": "ollama", "model": "qwen3:4b"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def unexpected_probe(*_args, **_kwargs):
+            pytest.fail("doctor must not probe extraction or non-Ollama providers")
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", unexpected_probe)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "Ollama endpoint" not in result.output
+
+    @staticmethod
+    def _ollama_stream_response(status_code, body=b"", headers=None):
+        """Build a Response whose stream is NOT pre-consumed.
+
+        The probe reads via ``aiter_raw()`` (wire-byte accounting); a
+        ``Response(content=bytes)`` arrives with its stream already consumed,
+        which only a mock — never a live transport — produces.
+        """
+        import httpx
+
+        async def agen():
+            yield body
+
+        return httpx.Response(status_code, content=agen(), headers=headers)
+
+    def test_ollama_inventory_get_parses_implicit_latest(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+        requests = []
+        client_options = {}
+
+        def handler(request):
+            requests.append(request)
+            return self._ollama_stream_response(
+                200,
+                json.dumps({"models": [{"name": "nomic-embed-text:latest"}]}).encode(),
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            client_options.update(kwargs)
+            return real_async_client(transport=transport, **kwargs)
+
+        # The probe imports httpx lazily (hook startup cost), so patch the
+        # real module attribute rather than a name on proxy_mod.
+        monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+        results = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))
+        assert results[0].error is None
+        assert results[0].available_models == frozenset({"nomic-embed-text:latest"})
+        assert [request.url.path for request in requests] == ["/api/tags"]
+        assert client_options == {"timeout": 3.0, "follow_redirects": False}
+
+    def test_ollama_inventory_malformed_payloads_fail_closed(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+        cases = [
+            ((200, b"not json"), "returned invalid JSON"),
+            ((200, json.dumps(["nope"]).encode()), "returned invalid model inventory"),
+            ((200, json.dumps({"models": "nope"}).encode()), "returned invalid model inventory"),
+            ((200, json.dumps({"models": ["nope"]}).encode()), "returned invalid model inventory"),
+            (
+                (200, json.dumps({"models": [{"size": 1}]}).encode()),
+                "returned invalid model inventory",
+            ),
+            ((500, b""), "HTTP 500"),
+        ]
+        for (status_code, body), expected in cases:
+            transport = httpx.MockTransport(
+                lambda request, status_code=status_code, body=body: self._ollama_stream_response(
+                    status_code, body
+                )
+            )
+            monkeypatch.setattr(
+                httpx,
+                "AsyncClient",
+                lambda transport=transport, **kwargs: real_async_client(
+                    transport=transport, **kwargs
+                ),
+            )
+            result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+            assert result.error == expected
+            assert result.available_models == frozenset()
+
+    def test_ollama_model_key_normalizes_implicit_latest_only(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        assert proxy_mod._ollama_model_key("nomic-embed-text") == "nomic-embed-text:latest"
+        assert proxy_mod._ollama_model_key("qwen3:4b") == "qwen3:4b"
+        # A registry host with a port must not read as an explicit model tag.
+        assert (
+            proxy_mod._ollama_model_key("registry.test:5000/ns/gemma3")
+            == "registry.test:5000/ns/gemma3:latest"
+        )
+
+    def test_ollama_probe_error_redacts_url_credentials(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        # A password httpx must percent-encode: its exception text embeds the
+        # NORMALIZED request URL, which plain configured-string replacement
+        # misses — the round-trippable encoded form must be scrubbed too.
+        base_url = "http://alice:super secret@ollama.test:11434"
+        dependency = proxy_mod._OllamaDependency(
+            base_url,
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+
+        def handler(request):
+            raise httpx.ConnectError(
+                f"could not connect to {request.url}",
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert result.error is not None
+        assert "super secret" not in result.error
+        assert "super%20secret" not in result.error
+        assert "***@ollama.test" in result.error
+
+    def test_ollama_client_setup_failure_renders_fail_not_crash(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+
+        def broken_client(**kwargs):
+            raise FileNotFoundError("/nonexistent/ca-bundle.pem")
+
+        monkeypatch.setattr(httpx, "AsyncClient", broken_client)
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert result.error is not None
+        assert result.error.startswith("FileNotFoundError")
+
+    def test_ollama_stalled_response_hits_whole_request_deadline(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+
+        # MockTransport bypasses socket I/O, so httpx's per-phase timeouts
+        # never fire — only the probe's whole-request deadline can end this.
+        async def handler(request):
+            await asyncio.sleep(5)
+            return httpx.Response(200, json={"models": []})
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 1))[0]
+        assert result.error is not None
+        assert result.error.startswith("TimeoutError")
+
+    def test_collect_ollama_dependencies_matches_runtime_precedence(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        def collect(config_dict):
+            return proxy_mod._collect_ollama_dependencies(ProxyConfig.model_validate(config_dict))
+
+        base_server = {"prefix": "fk", "transport": "stdio", "command": "x"}
+        llm = {"provider": "ollama", "model": "qwen3:4b"}
+
+        # Explicit `compression: auto` wins over a global llm_summary default:
+        # the attached llm block is dormant (mirrors _resolve_tool_config).
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "default_compression": "llm_summary",
+                "upstream_servers": {"fake": {**base_server, "compression": "auto", "llm": llm}},
+            }
+        )
+        assert (deps, missing) == ([], [])
+
+        # An omitted server compression inherits the global default.
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "default_compression": "llm_summary",
+                "upstream_servers": {"fake": {**base_server, "llm": llm}},
+            }
+        )
+        assert missing == []
+        assert [dep.models for dep in deps] == [("qwen3:4b",)]
+
+        # A tool override steering compression away drops that site; one
+        # adding only a model rides the inherited llm_summary strategy.
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "upstream_servers": {
+                    "fake": {
+                        **base_server,
+                        "compression": "llm_summary",
+                        "llm": llm,
+                        "tool_overrides": {
+                            "plain": {"compression": "truncate"},
+                            "special": {"llm": {"provider": "ollama", "model": "gemma3"}},
+                        },
+                    }
+                },
+            }
+        )
+        assert missing == []
+        assert [dep.models for dep in deps] == [("gemma3", "qwen3:4b")]
+        usage_by_model = dict(deps[0].model_usages)
+        assert usage_by_model["gemma3"] == ("server 'fake' tool 'special'",)
+
+        # An empty embedding_base_url is preserved verbatim — the runtime
+        # scorer uses the configured value as written (and would fall back to
+        # BM25), so doctor must not substitute localhost and PASS.
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "relevance_scorer": {"scorer": "embedding", "embedding_base_url": ""},
+                "upstream_servers": {"fake": dict(base_server)},
+            }
+        )
+        assert missing == []
+        assert [(dep.base_url, dep.models) for dep in deps] == [("", ("nomic-embed-text",))]
+        assert "base_url" in proxy_mod._ollama_next_action("", [])
+
+    def test_missing_llm_block_fails_that_site_but_still_probes_others(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "default_compression": "llm_summary",
+                    "relevance_scorer": {"scorer": "embedding"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        probed = []
+
+        async def fake_probe_ollama(dependencies, timeout):
+            probed.extend(dep.base_url for dep in dependencies)
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "llm_summary has no effective llm block" in result.output
+        # The embedding dependency is independent of the misconfigured LLM
+        # site and is still probed — the FAIL is per site, not global.
+        assert probed == ["http://localhost:11434"]
+
+    def test_missing_model_message_names_only_its_use_sites(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {"scorer": "embedding"},
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fk",
+                            "transport": "stdio",
+                            "command": "x",
+                            "compression": "llm_summary",
+                            "llm": {"provider": "ollama", "model": "qwen3:4b"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "qwen3:4b (used by server 'fake')" in result.output
+        missing_clause = result.output.split("missing model(s):", 1)[1].split(";", 1)[0]
+        assert "embedding scorer" not in missing_clause
+
+    def test_ollama_json_check_id_is_credential_independent(self, runner, config, monkeypatch):
+        """The published check ID must not be an offline password verifier.
+
+        A digest of the raw URL would leak 48 credential-derived bits into
+        ``--json``; the ID has to be identical whatever the password is.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        ids = []
+        for password in ("hunter2", "correct horse"):
+            config.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "cache": {"tool_annotation_policy": "strict"},
+                        "relevance_scorer": {
+                            "scorer": "embedding",
+                            "embedding_base_url": f"http://alice:{password}@ollama.test:11434",
+                        },
+                        "upstream_servers": {
+                            "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+            assert result.exit_code == 0, result.output
+            payload = json.loads(result.output)
+            ollama_ids = [
+                check["id"]
+                for check in payload["checks"]
+                if check["id"].startswith("ollama_endpoint:")
+            ]
+            assert len(ollama_ids) == 1
+            ids.append(ollama_ids[0])
+        assert ids[0] == ids[1]
+        # The credentialed ID = the credential-free base + a use-site digest;
+        # nothing in it may derive from the password.
+        base = proxy_mod._ollama_check_id("http://ollama.test:11434")
+        assert ids[0].startswith(f"{base}-")
+
+    def test_ollama_credential_only_twin_endpoints_get_distinct_ids(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "one": {
+                            "prefix": "p1",
+                            "transport": "stdio",
+                            "command": "x",
+                            "compression": "llm_summary",
+                            "llm": {
+                                "provider": "ollama",
+                                "model": "qwen3:4b",
+                                "base_url": "http://alice:pw1@ollama.test:11434",
+                            },
+                        },
+                        "two": {
+                            "prefix": "p2",
+                            "transport": "stdio",
+                            "command": "x",
+                            "compression": "llm_summary",
+                            "llm": {
+                                "provider": "ollama",
+                                "model": "qwen3:4b",
+                                "base_url": "http://bob:pw2@ollama.test:11434",
+                            },
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(dependency, frozenset({"qwen3:4b"}))
+                for dependency in dependencies
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        ollama_ids = [
+            check["id"] for check in payload["checks"] if check["id"].startswith("ollama_endpoint:")
+        ]
+        assert len(ollama_ids) == 2
+        assert len(set(ollama_ids)) == 2
+        # Same stripped identity: both twins carry a use-site digest suffix
+        # on a shared credential-free base (never ordinals, whose numbering
+        # shifted when an unrelated twin appeared).
+        bases = set()
+        for check_id in ollama_ids:
+            prefix, digest_part = check_id.split(":", 1)
+            assert prefix == "ollama_endpoint"
+            base, dash, site_digest = digest_part.partition("-")
+            # Full-length site digest: 8-hex prefixes provably collide.
+            assert dash and len(base) == 12 and len(site_digest) == 64
+            bases.add(base)
+            for secret in ("alice", "pw1", "bob", "pw2"):
+                assert secret not in check_id
+        assert len(bases) == 1
+
+    def test_ollama_check_id_unparseable_authority_hides_credentials(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        schemeless = proxy_mod._ollama_check_id("alice:hunter2@ollama.test:11434")
+        rotated = proxy_mod._ollama_check_id("alice:rotated@ollama.test:11434")
+        single_slash = proxy_mod._ollama_check_id("http:/alice:hunter2@ollama.test:11434")
+        # These parse without a netloc (credentials land in scheme/path), so
+        # the digest must come from a fixed sentinel — nothing
+        # password-dependent survives.
+        assert schemeless == rotated == single_slash
+
+    def test_ollama_twin_id_mapping_survives_rotation_and_insertion(
+        self, runner, config, monkeypatch
+    ):
+        """Each use site must keep its ID across password and twin changes.
+
+        The twin discriminator derives from the use sites, so neither a
+        rotated password (which flips a raw-URL sort) nor an inserted twin
+        that sorts first (which renumbered ordinals) may move an existing ID.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(dependency, frozenset()) for dependency in dependencies
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        def site_ids(*servers):
+            config.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "cache": {"tool_annotation_policy": "strict"},
+                        "upstream_servers": {
+                            name: {
+                                "prefix": prefix,
+                                "transport": "stdio",
+                                "command": "x",
+                                "compression": "llm_summary",
+                                "llm": {
+                                    "provider": "ollama",
+                                    "model": "qwen3:4b",
+                                    "base_url": url,
+                                },
+                            }
+                            for name, prefix, url in servers
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+            payload = json.loads(result.output)
+            mapping = {}
+            for check in payload["checks"]:
+                if check["id"].startswith("ollama_endpoint:"):
+                    site = next(n for n, _, _ in servers if f"'{n}'" in check["detail"])
+                    mapping[site] = check["id"]
+            return mapping
+
+        before = site_ids(
+            ("one", "p1", "http://u:1@ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert len(set(before.values())) == 2
+
+        # Rotating site one's password from 1 to 9 flips a raw-URL sort
+        # (u:1@ < u:2@ but u:9@ > u:2@); the mapping must not move.
+        rotated = site_ids(
+            ("one", "p1", "http://u:9@ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert rotated == before
+
+        # A third twin whose use site sorts before the others must get its
+        # own ID without renumbering theirs.
+        grown = site_ids(
+            ("one", "p1", "http://u:1@ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+            ("a-early", "p0", "http://u:3@ollama.test:11434"),
+        )
+        assert grown["one"] == before["one"]
+        assert grown["two"] == before["two"]
+        assert grown["a-early"] not in {before["one"], before["two"]}
+
+        # 1 -> 2 -> 1: a credentialed endpoint carries its suffix from first
+        # publication, so gaining and losing its only twin never flips its ID.
+        solo = site_ids(("one", "p1", "http://u:1@ollama.test:11434"))
+        assert solo["one"] == before["one"]
+
+        # Mixed 1 -> 2 -> 1: an UNCREDENTIALED endpoint's bare base ID is
+        # already distinct from every suffixed credentialed ID, so a
+        # credentialed twin appearing or disappearing must not move it.
+        plain_solo = site_ids(("one", "p1", "http://ollama.test:11434"))
+        mixed = site_ids(
+            ("one", "p1", "http://ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert mixed["one"] == plain_solo["one"]
+        assert mixed["two"] != mixed["one"]
+
+        # Two uncredentialed URLs that normalize to one stripped identity (an
+        # empty query marker survives the raw grouping key but not
+        # urlunsplit) exercise the uncredentialed collision fallback: both
+        # must come back suffixed and distinct.
+        uncred_twins = site_ids(
+            ("one", "p1", "http://ollama.test:11434"),
+            ("two", "p2", "http://ollama.test:11434?"),
+        )
+        assert len(set(uncred_twins.values())) == 2
+        for check_id in uncred_twins.values():
+            assert "-" in check_id.split(":", 1)[1]
+
+        # Real 8-hex sha256 prefix collision: the use sites "server '39153'"
+        # and "server '74347'" share the prefix 1597babb. The full-length
+        # site digest must keep these twins' IDs distinct.
+        collided = site_ids(
+            ("39153", "p1", "http://u:1@ollama.test:11434"),
+            ("74347", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert len(set(collided.values())) == 2
+
+    def test_remote_hint_escapes_hostile_model_names(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        hint = proxy_mod._ollama_next_action("http://ollama.remote:11434", ["evil\x1b[31mmodel"])
+        assert "\x1b" not in hint
+        assert "\\u001B" in hint
+        assert hint.startswith("verify the remote Ollama host serves model(s) ")
+
+    def test_ollama_next_action_scheme_and_host_validation(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        # Scheme matching is case-insensitive (httpx accepts HTTP://).
+        assert proxy_mod._ollama_next_action("HTTP://LOCALHOST:11434", []) == "ollama serve"
+        # Loopback but not the CLI's default target: plain ollama commands
+        # would act on the default instance, so the hint names the endpoint.
+        for url in (
+            "http://127.0.0.1:9",
+            "https://localhost:11434",
+            "http://localhost:11434/v1",
+            "http://u:pw@localhost:11434",
+        ):
+            hint = proxy_mod._ollama_next_action(url, ["qwen3:4b"])
+            assert hint.startswith("verify the local Ollama at "), url
+            assert "ollama pull" not in hint
+            assert "pw" not in hint
+            assert "qwen3:4b" in hint
+        # Hostless, non-HTTP, or badly-ported endpoints cannot be fixed by
+        # serve/pull — the client would reject the URL before connecting.
+        assert "base_url" in proxy_mod._ollama_next_action("http://", [])
+        assert "base_url" in proxy_mod._ollama_next_action("ftp://ollama.test:11434", [])
+        assert "base_url" in proxy_mod._ollama_next_action("http://localhost:notaport", [])
+        # An empty '?' / '#' delimiter is erased by urlsplit but survives in
+        # the raw value the probe appends /api/tags to, so the endpoint can
+        # never be reached as configured — no runnable command applies.
+        for url in (
+            "http://localhost:11434?",
+            "http://localhost:11434#",
+            "http://localhost:11434/?",
+        ):
+            hint = proxy_mod._ollama_next_action(url, [])
+            assert "base_url" in hint, url
+            assert "ollama serve" not in hint, url
+
+    def test_ollama_oversized_inventory_fails_without_buffering(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+        monkeypatch.setattr(proxy_mod, "_OLLAMA_INVENTORY_MAX_BYTES", 64)
+
+        def handler(request):
+            return self._ollama_stream_response(200, b"x" * 200)
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert result.error == "inventory response exceeds 64 bytes"
+
+    def test_ollama_probe_counts_wire_bytes_not_decoded(self, monkeypatch):
+        """A compression bomb must not materialize its decoded size.
+
+        The probe requests identity encoding and accounts raw wire bytes. If
+        it decompressed (aiter_bytes) instead, this gzip body would decode to
+        VALID inventory JSON and the probe would PASS — so the invalid-JSON
+        failure proves the decoded form never materialized.
+        """
+        import gzip
+
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+        seen_accept_encoding = []
+
+        def handler(request):
+            seen_accept_encoding.append(request.headers.get("accept-encoding"))
+            body = json.dumps({"models": [{"name": "nomic-embed-text:latest"}]}).encode()
+            return self._ollama_stream_response(
+                200,
+                gzip.compress(body),
+                headers={"Content-Encoding": "gzip"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert seen_accept_encoding == ["identity"]
+        assert result.error == "returned invalid JSON"
+
     def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
         """LTM 미설정 scenario: WARN with the ratified messaging — names
         surfacing as the only casualty, never reads as an install failure."""

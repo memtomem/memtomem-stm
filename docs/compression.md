@@ -288,6 +288,51 @@ Routes through an external LLM for intelligent summarization:
 
 Providers: `openai`, `anthropic`, `ollama`. `base_url` (default `""`) overrides the provider endpoint — required to point `ollama` at a non-default host, and how OpenAI/Anthropic get aimed at a compatible gateway. `llm_timeout_seconds` (default 60.0) bounds the per-call LLM wait. On timeout, privacy-pattern hit, circuit-breaker open, or any other API failure, compression falls back to `TruncateCompressor` and records the strategy as `llm_summary→{timeout,privacy,circuit_breaker,llm_error}_fallback` in `proxy_metrics` for observability. A successful call whose summary still exceeds `max_chars` is clamped by the same truncation and recorded as `llm_summary→llm_overlength_fallback` — the model overshot the length instruction; the endpoint is fine, so the circuit breaker is unaffected.
 
+### Local Ollama setup
+
+Install Ollama using its [official platform guide](https://docs.ollama.com/quickstart), then make sure the local API is running. The macOS and Windows apps normally start it for you; otherwise run:
+
+```bash
+ollama serve
+```
+
+Pull only the models needed by the features you enable:
+
+```bash
+# relevance_scorer.scorer="embedding"
+ollama pull nomic-embed-text
+
+# example model for llm_summary compression
+ollama pull qwen3:4b
+```
+
+LLM compression has no implicit Ollama configuration. Select it explicitly and name the model you pulled:
+
+```json
+{
+  "upstream_servers": {
+    "docs": {
+      "prefix": "docs",
+      "compression": "llm_summary",
+      "llm": {
+        "provider": "ollama",
+        "model": "qwen3:4b",
+        "base_url": "http://localhost:11434"
+      }
+    }
+  }
+}
+```
+
+Verify the read-only model inventory, then run the complete setup verdict:
+
+```bash
+curl http://localhost:11434/api/tags
+mms doctor
+```
+
+`mms doctor` reads `/api/tags` only when an effective config enables the embedding scorer or Ollama-backed `llm_summary`. It never runs inference or pulls models. A dead endpoint or missing configured model is a `FAIL`. For a remote Ollama server, set the relevant `embedding_base_url` or `llm.base_url`, and run `ollama pull` on that remote host rather than on the STM machine.
+
 > **`api_key` is validated eagerly.** Every `llm` block in the config is validated when the config loads — for `provider: openai` / `anthropic`, a missing `api_key` (and missing `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env var) fails the load even if nothing currently selects the `llm_summary` strategy. The same rule applies to the reserved extraction block used by custom `ProxyManager(index_engine=...)` integrations. This keeps startup fail-fast for configurations that do use an LLM. Don't leave placeholder `llm` blocks you aren't using — remove them, or point them at `provider: ollama` (no key required).
 
 Credential-bearing content (API keys, passwords, provider tokens, JWTs, private keys) is auto-detected and **never** sent to external LLMs — falls back to local truncation. This scan is governed by `privacy_scan_enabled` (default `true`); an operator who flips `compression: llm_summary` gets the protection without remembering a second knob. Email addresses alone do **not** trigger this fallback: they appear in ordinary compressible content (git logs, issue threads, contact pages), and routing on them silently degraded the chosen strategy to truncation. Emails remain protected where storage is at stake — surfacing query persistence hashes any query matching the full sensitive set (credentials *and* emails) before it reaches disk.

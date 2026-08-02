@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import io
 import json
 import logging
@@ -22,11 +23,13 @@ from datetime import datetime
 from pathlib import Path
 from functools import wraps
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
 
 if TYPE_CHECKING:
+    import httpx
+
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
@@ -7094,6 +7097,351 @@ def health(
 
 _DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
 
+_DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+# Real /api/tags payloads are a few KB; the cap only guards doctor's memory
+# against a hostile or misconfigured endpoint streaming an unbounded body.
+_OLLAMA_INVENTORY_MAX_BYTES = 5 * 1024 * 1024
+_OLLAMA_SETUP_DOC = (
+    "https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md#local-ollama-setup"
+)
+
+
+@dataclass(frozen=True)
+class _OllamaEndpoint:
+    """One parse of a configured base URL, shared by identity/hints/validity.
+
+    Independently parsed views of the same endpoint kept disagreeing across
+    review rounds (the identity hashed credentials the display redacted; the
+    hint recommended ``ollama serve`` for URLs the client rejects). Every
+    URL-derived doctor behavior except the probe itself — which must use the
+    raw value exactly as the runtime clients do — derives from this single
+    parse so the views cannot drift apart.
+    """
+
+    raw: str
+    stripped: str
+    hostname: str | None
+    valid: bool
+    # Userinfo *presence* is not secret-derived: the redacted display form
+    # ("***@host") already reveals it. It decides whether the check ID needs
+    # a discriminating suffix from the endpoint's FIRST publication, so the
+    # ID cannot flip when a credential-only twin later appears or disappears.
+    has_userinfo: bool
+    # Whether plain `ollama serve` / `ollama pull` would act on THIS endpoint:
+    # the CLI targets http://127.0.0.1:11434 by default, so any other scheme,
+    # host, port, path, or a credentialed URL must not get those commands —
+    # they would start or modify the default instance while doctor keeps
+    # probing a different address.
+    default_local: bool
+
+    @classmethod
+    def parse(cls, base_url: str) -> "_OllamaEndpoint":
+        try:
+            parts = urlsplit(base_url)
+            hostname = parts.hostname
+        except ValueError:
+            parts, hostname = None, None
+        has_userinfo = True
+        if parts is not None and parts.netloc:
+            stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+            has_userinfo = "@" in parts.netloc
+        elif parts is not None and "@" not in base_url:
+            stripped = base_url
+            has_userinfo = False
+        else:
+            # No parseable authority: a scheme-less or single-slash form
+            # parses its credentials into scheme/path, so an '@'-bearing value
+            # we cannot decompose maps to a fixed sentinel instead — mirroring
+            # redact_url_userinfo's wholesale fallback. It may hide
+            # credentials, so it keeps has_userinfo.
+            stripped = "<unparseable url>"
+        port_ok = True
+        if parts is not None:
+            try:
+                parts.port
+            except ValueError:
+                port_ok = False
+        valid = bool(
+            parts is not None
+            and parts.scheme.lower() in {"http", "https"}
+            and hostname
+            and port_ok
+            # urlsplit erases an EMPTY '?' / '#' delimiter, but the probe (and
+            # the runtime clients) append /api/... to the raw value, where the
+            # delimiter turns the path into a query/fragment — such an
+            # endpoint can never be reached as configured, so no runnable
+            # command can repair it.
+            and "?" not in base_url
+            and "#" not in base_url
+        )
+        default_local = bool(
+            valid
+            and parts is not None
+            and parts.scheme.lower() == "http"
+            and hostname in {"localhost", "127.0.0.1", "::1"}
+            and parts.port == 11434
+            and not has_userinfo
+            and parts.path in ("", "/")
+            and not parts.query
+            and not parts.fragment
+        )
+        return cls(
+            raw=base_url,
+            stripped=stripped,
+            hostname=hostname,
+            valid=valid,
+            has_userinfo=has_userinfo,
+            default_local=default_local,
+        )
+
+    @property
+    def loopback(self) -> bool:
+        return (self.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+
+
+@dataclass(frozen=True)
+class _OllamaDependency:
+    """One unique Ollama inventory endpoint needed by active proxy features."""
+
+    base_url: str
+    model_usages: tuple[tuple[str, tuple[str, ...]], ...]
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        return tuple(model for model, _ in self.model_usages)
+
+    @property
+    def usages(self) -> tuple[str, ...]:
+        merged: set[str] = set()
+        for _, usages in self.model_usages:
+            merged.update(usages)
+        return tuple(sorted(merged))
+
+
+@dataclass(frozen=True)
+class _OllamaProbeResult:
+    dependency: _OllamaDependency
+    available_models: frozenset[str] = frozenset()
+    error: str | None = None
+
+
+def _effective_ollama_base_url(base_url: str | None, default: str) -> str:
+    """Mirror the runtime clients: fall back only where they do, then rstrip.
+
+    The LLM compressor substitutes the Ollama default for a falsy ``base_url``;
+    the embedding scorer uses the configured value verbatim (its omitted-field
+    default lives in the config validator, which never rewrites ``""``). Doctor
+    must not normalize further — an empty or whitespace-bearing URL has to
+    probe exactly as brokenly as it runs, or doctor passes a config the
+    runtime silently degrades on.
+    """
+    return (base_url or default).rstrip("/")
+
+
+def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], list[str]]:
+    """Collect active Ollama models using the manager's compression precedence.
+
+    Attached but dormant LLM blocks and ``auto`` compression are intentionally
+    ignored. Extraction is also omitted: the bundled ``mms`` server has no
+    index engine, so that stage cannot call its configured provider.
+    """
+    from memtomem_stm.proxy.config import CompressionStrategy, LLMProvider
+
+    if not config.enabled or not config.upstream_servers:
+        return [], []
+
+    groups: dict[str, dict[str, set[str]]] = {}
+    missing_llm_sites: set[str] = set()
+
+    def add(endpoint: str, model: str, usage: str) -> None:
+        groups.setdefault(endpoint, {}).setdefault(model, set()).add(usage)
+
+    scorer = config.relevance_scorer
+    if scorer.scorer == "embedding" and scorer.embedding_provider == "ollama":
+        add(
+            _effective_ollama_base_url(scorer.embedding_base_url, default=""),
+            scorer.embedding_model,
+            "embedding scorer",
+        )
+
+    def collect_llm_site(strategy: Any, llm: Any, usage: str) -> None:
+        if strategy != CompressionStrategy.LLM_SUMMARY:
+            return
+        if llm is None:
+            missing_llm_sites.add(usage)
+        elif llm.provider == LLMProvider.OLLAMA:
+            add(
+                _effective_ollama_base_url(llm.base_url, default=_DEFAULT_OLLAMA_BASE_URL),
+                llm.model,
+                usage,
+            )
+
+    for server_name, server in config.upstream_servers.items():
+        server_strategy = (
+            server.compression
+            if "compression" in server.model_fields_set
+            else config.default_compression
+        )
+        server_usage = f"server {server_name!r}"
+        collect_llm_site(server_strategy, server.llm, server_usage)
+
+        for tool_name, override in server.tool_overrides.items():
+            # A tool override unrelated to compression/LLM inherits the
+            # already-collected server dependency and needs no duplicate site.
+            if override.compression is None and override.llm is None:
+                continue
+            tool_strategy = override.compression or server_strategy
+            tool_llm = override.llm or server.llm
+            collect_llm_site(
+                tool_strategy,
+                tool_llm,
+                f"server {server_name!r} tool {tool_name!r}",
+            )
+
+    dependencies = [
+        _OllamaDependency(
+            base_url=base_url,
+            model_usages=tuple(
+                (model, tuple(sorted(usages))) for model, usages in sorted(group.items())
+            ),
+        )
+        for base_url, group in sorted(groups.items())
+    ]
+    return dependencies, sorted(missing_llm_sites)
+
+
+def _ollama_model_key(model: str) -> str:
+    """Canonicalize Ollama's implicit ``:latest`` tag for inventory matching.
+
+    The configured name is otherwise compared verbatim — the runtime sends it
+    as written, so doctor must not repair (e.g. whitespace-strip) a name the
+    server would reject.
+    """
+    tail = model.rsplit("/", 1)[-1]
+    return model if ":" in tail else f"{model}:latest"
+
+
+async def _probe_ollama_dependencies(
+    dependencies: list[_OllamaDependency], timeout: int
+) -> list[_OllamaProbeResult]:
+    """Read each unique Ollama model inventory once, concurrently."""
+    # HTTP clients import at call time in this module (see the httpx2 sites);
+    # the CLI's own load path must not require one.
+    import httpx
+
+    def redact(text: str, base_url: str) -> str:
+        # httpx normalizes userinfo (e.g. percent-encodes a password), so the
+        # configured URL alone can miss the variant its errors embed.
+        out = redact_exception_text(text, base_url)
+        try:
+            normalized = str(httpx.URL(base_url))
+        except Exception:
+            return out
+        return redact_exception_text(out, normalized)
+
+    def failure(dependency: _OllamaDependency, exc: Exception) -> _OllamaProbeResult:
+        detail = redact(str(exc), dependency.base_url)
+        return _OllamaProbeResult(
+            dependency,
+            error=f"{type(exc).__name__}: {detail or 'request failed'}",
+        )
+
+    async def probe(client: httpx.AsyncClient, dependency: _OllamaDependency) -> _OllamaProbeResult:
+        inventory_url = f"{dependency.base_url}/api/tags"
+        try:
+            # httpx timeouts are per phase (connect/read/...); this outer
+            # deadline is the whole-request bound ``--timeout`` promises, so a
+            # trickling inventory body cannot stall doctor past it. Streaming
+            # with a byte cap keeps a fast oversized body from exhausting
+            # memory before JSON validation would reject it.
+            async with asyncio.timeout(timeout):
+                # Identity encoding + raw-byte accounting: aiter_bytes()
+                # transparently DECOMPRESSES, so a compression bomb would
+                # materialize its decoded size before any cap applied to the
+                # decoded chunks could reject it. Counting wire bytes bounds
+                # memory; a server that compresses anyway just fails JSON
+                # parsing below.
+                async with client.stream(
+                    "GET", inventory_url, headers={"Accept-Encoding": "identity"}
+                ) as response:
+                    if not 200 <= response.status_code < 300:
+                        return _OllamaProbeResult(dependency, error=f"HTTP {response.status_code}")
+                    body = bytearray()
+                    async for chunk in response.aiter_raw():
+                        body += chunk
+                        if len(body) > _OLLAMA_INVENTORY_MAX_BYTES:
+                            return _OllamaProbeResult(
+                                dependency,
+                                error="inventory response exceeds "
+                                f"{_OLLAMA_INVENTORY_MAX_BYTES} bytes",
+                            )
+        except Exception as exc:  # external endpoint boundary; doctor must render, not crash
+            return failure(dependency, exc)
+
+        try:
+            payload = json.loads(bytes(body))
+        except ValueError:
+            return _OllamaProbeResult(dependency, error="returned invalid JSON")
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return _OllamaProbeResult(dependency, error="returned invalid model inventory")
+
+        available: set[str] = set()
+        for entry in models:
+            if not isinstance(entry, dict):
+                return _OllamaProbeResult(dependency, error="returned invalid model inventory")
+            name = entry.get("name") or entry.get("model")
+            if not isinstance(name, str):
+                return _OllamaProbeResult(dependency, error="returned invalid model inventory")
+            available.add(_ollama_model_key(name))
+        return _OllamaProbeResult(dependency, frozenset(available))
+
+    try:
+        async with httpx.AsyncClient(timeout=float(timeout), follow_redirects=False) as client:
+            return list(await asyncio.gather(*(probe(client, dep) for dep in dependencies)))
+    except Exception as exc:
+        # Client construction/teardown can raise before any probe runs (e.g.
+        # an invalid SSL_CERT_FILE); render it as endpoint FAILs, not a crash.
+        return [failure(dependency, exc) for dependency in dependencies]
+
+
+def _ollama_check_id(base_url: str) -> str:
+    """Stable endpoint check ID derived from the credential-STRIPPED URL.
+
+    Hashing the raw URL would publish a truncated digest of the credentials
+    in ``--json`` — enough for an offline password-guessing verifier once the
+    host is known. Two endpoints differing only by userinfo therefore share
+    an ID; the caller appends a use-site digest to disambiguate.
+    """
+    stripped = _OllamaEndpoint.parse(base_url).stripped
+    digest = hashlib.sha256(stripped.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    return f"ollama_endpoint:{digest}"
+
+
+def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
+    endpoint = _OllamaEndpoint.parse(base_url)
+    if not endpoint.valid:
+        # An empty/relative/hostless/badly-ported URL never reaches a server;
+        # "ollama serve" or "ollama pull" cannot fix it.
+        return f"set a valid base_url for this endpoint; see {_OLLAMA_SETUP_DOC}"
+    # Prose branches, not commands, so config-derived values must be
+    # display-escaped here (the render loop deliberately prints next_action
+    # raw — every other one is a literal template or goes through
+    # _shell_join, which refuses hostile characters).
+    target = f" serves model(s) {_disp(', '.join(missing_models))}" if missing_models else ""
+    if not endpoint.loopback:
+        return f"verify the remote Ollama host{target}; see {_OLLAMA_SETUP_DOC}"
+    if not endpoint.default_local:
+        # Plain `ollama serve` / `ollama pull` target the CLI default
+        # (http://127.0.0.1:11434), not this endpoint.
+        display = _disp(redact_url_userinfo(endpoint.raw))
+        return f"verify the local Ollama at {display}{target}; see {_OLLAMA_SETUP_DOC}"
+    return (
+        _shell_join(["ollama", "pull", missing_models[0]])
+        if missing_models
+        else _shell_join(["ollama", "serve"])
+    )
+
 
 def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, str, str | None]]:
     """Translate the additive core runtime profile into stable doctor checks."""
@@ -7226,7 +7574,7 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     default=10,
     show_default=True,
     type=click.IntRange(min=1),
-    help="Per-server connection timeout in seconds.",
+    help="Per-connection probe timeout in seconds.",
 )
 @click.option(
     "--measure-ltm",
@@ -7328,6 +7676,7 @@ def doctor(
             # transport/prefix/probe checks operate on the raw dicts and
             # stay meaningful.
             schema_error = _runtime_schema_validation_error(data)
+            effective_config: Any | None = None
             if schema_error:
                 # A pydantic error can echo the rejected input_value (or a
                 # validator message quoting it), so scrub it against every
@@ -7342,6 +7691,18 @@ def doctor(
                 )
             else:
                 check("config_schema", "config schema", "PASS", "valid")
+                # Build the same env-overlaid typed snapshot the running
+                # server consumes. Provider diagnostics must reflect env >
+                # file precedence and model defaults, not the raw JSON alone.
+                from memtomem_stm.proxy.config import (
+                    ProxyConfig,
+                    _deep_merge,
+                    collect_proxy_env_overrides,
+                )
+
+                effective_config = ProxyConfig.model_validate(
+                    _deep_merge(data, collect_proxy_env_overrides())
+                )
 
             raw_servers = data.get("upstream_servers", {})
             servers = (
@@ -7440,6 +7801,109 @@ def doctor(
                     "no upstream servers configured",
                     f"mms add <name> --prefix <prefix> --command <command> {cfg_arg}",
                 )
+
+            # Active model endpoints. This remains passive: Ollama's model
+            # inventory is a read-only GET, and doctor never runs inference or
+            # pulls a missing model. Only a schema-valid effective config can
+            # launch these probes.
+            if effective_config is not None:
+                ollama_dependencies, missing_llm_sites = _collect_ollama_dependencies(
+                    effective_config
+                )
+                if missing_llm_sites:
+                    check(
+                        "llm_compression_config",
+                        "LLM compression",
+                        "FAIL",
+                        "llm_summary has no effective llm block at: "
+                        + ", ".join(missing_llm_sites),
+                        f"add an llm block; see {_OLLAMA_SETUP_DOC}",
+                    )
+
+                if ollama_dependencies:
+                    ollama_probes = asyncio.run(
+                        _probe_ollama_dependencies(ollama_dependencies, timeout)
+                    )
+                    # Render in credential-independent order (the collection
+                    # order sorts by the raw, credential-bearing URL).
+                    ollama_probes.sort(
+                        key=lambda p: (
+                            _ollama_check_id(p.dependency.base_url),
+                            p.dependency.usages,
+                        )
+                    )
+                    uncredentialed_id_counts: dict[str, int] = {}
+                    for ollama_probe in ollama_probes:
+                        if not _OllamaEndpoint.parse(ollama_probe.dependency.base_url).has_userinfo:
+                            base_id = _ollama_check_id(ollama_probe.dependency.base_url)
+                            uncredentialed_id_counts[base_id] = (
+                                uncredentialed_id_counts.get(base_id, 0) + 1
+                            )
+                    for probe in ollama_probes:
+                        dependency = probe.dependency
+                        display_url = redact_url_userinfo(dependency.base_url)
+                        usages = ", ".join(dependency.usages)
+                        check_id = _ollama_check_id(dependency.base_url)
+                        # A credentialed endpoint carries its use-site suffix
+                        # from FIRST publication (userinfo presence, not a
+                        # later collision, triggers it) so a twin appearing or
+                        # disappearing never flips an existing ID — including
+                        # an UNCREDENTIALED sibling's bare base ID, which is
+                        # already distinct from every suffixed credentialed ID
+                        # and so only needs a suffix when multiple
+                        # uncredentialed identities themselves collide (a
+                        # URL-normalization edge). The digest is full-length:
+                        # a use site names exactly one endpoint, so full
+                        # sha256 makes the suffix unique — 8-hex prefixes
+                        # provably collide (e.g. the sites "server '39153'" /
+                        # "server '74347'").
+                        if (
+                            _OllamaEndpoint.parse(dependency.base_url).has_userinfo
+                            or uncredentialed_id_counts.get(check_id, 0) > 1
+                        ):
+                            site_digest = hashlib.sha256(
+                                "|".join(dependency.usages).encode("utf-8", errors="surrogatepass")
+                            ).hexdigest()
+                            check_id = f"{check_id}-{site_digest}"
+                        if probe.error:
+                            check(
+                                check_id,
+                                "Ollama endpoint",
+                                "FAIL",
+                                f"{display_url}/api/tags: {probe.error}; used by {usages}; "
+                                f"see {_OLLAMA_SETUP_DOC}",
+                                _ollama_next_action(dependency.base_url, []),
+                            )
+                            continue
+
+                        missing = [
+                            (model, model_usages)
+                            for model, model_usages in dependency.model_usages
+                            if _ollama_model_key(model) not in probe.available_models
+                        ]
+                        if missing:
+                            described = ", ".join(
+                                f"{model} (used by {', '.join(model_usages)})"
+                                for model, model_usages in missing
+                            )
+                            check(
+                                check_id,
+                                "Ollama endpoint",
+                                "FAIL",
+                                f"{display_url}: missing model(s): {described}; "
+                                f"see {_OLLAMA_SETUP_DOC}",
+                                _ollama_next_action(
+                                    dependency.base_url, [model for model, _ in missing]
+                                ),
+                            )
+                        else:
+                            check(
+                                check_id,
+                                "Ollama endpoint",
+                                "PASS",
+                                f"{display_url}: required model(s) available: "
+                                + ", ".join(dependency.models),
+                            )
 
             # Downstream host registration: config + healthy upstreams are
             # insufficient if no MCP client launches this gateway.
