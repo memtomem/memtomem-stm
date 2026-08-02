@@ -283,6 +283,13 @@ def _shell_join(args: list[str]) -> str:
 
 _SETUP_RESOLVED_CLIENT: ContextVar[str | None] = ContextVar("setup_resolved_client", default=None)
 
+# Whether the current setup command runs in ``--json`` mode. The
+# ``_setup_json_result`` decorator pops ``as_json`` before calling the command
+# body, so the body reads this instead of a parameter. JSON mode must never
+# block on stdin: with stdout redirected into the capture buffer a prompt is
+# invisible and hangs the caller (or dies as a bare "Aborted!" on EOF).
+_SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False)
+
 
 def _setup_json_result(action: str):  # noqa: ANN201
     """Capture a setup command and emit one secret-safe JSON result document."""
@@ -291,6 +298,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
         @wraps(fn)
         def wrapped(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
             as_json = bool(kwargs.pop("as_json", False))
+            _SETUP_JSON_MODE.set(as_json)
             if not as_json:
                 return fn(*args, **kwargs)
 
@@ -303,6 +311,18 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     fn(*args, **kwargs)
                 except SystemExit as exc:
                     exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+                except click.exceptions.Abort:
+                    # EOF at an interactive prompt. Without this the Abort
+                    # escapes to Click's top level, which prints a bare
+                    # "Aborted!" and exits 1 with NO JSON document — exactly
+                    # the output mode automation parses.
+                    exit_code = 1
+                    click.echo(
+                        "stdin ended before an interactive prompt was answered; "
+                        "pipe answers or pre-answer with flags "
+                        "(--demo/--client/--no-validate)",
+                        err=True,
+                    )
                 except click.ClickException as exc:
                     exit_code = exc.exit_code
                     click.echo(exc.format_message(), err=True)
@@ -404,26 +424,38 @@ def _load(config_path: Path) -> dict[str, Any]:
     return data
 
 
-def _schema_validation_error(data: dict[str, Any]) -> str | None:
-    """First schema-validation error for a raw config dict, or ``None``.
+def _schema_validation_error(
+    data: dict[str, Any], *, env_overrides: dict[str, Any] | None = None
+) -> str | None:
+    """First schema-validation error for a config dict, or ``None``.
 
     ``_load`` only guards JSON syntax and coarse shape; valid-JSON-but-
     invalid-schema is exactly the case a running server silently degrades to
-    env/defaults on (#611). ``status`` / ``health`` warn on it — exit code
-    unchanged, since inspection commands stay lenient and strictness lives in
-    ``mms config validate``.
+    env/defaults on (#611). When supplied, ``env_overrides`` is deep-merged
+    with the file data before validation, matching the server's documented
+    env > file precedence. Callers that inspect or mutate the file *as
+    written* deliberately omit it.
     """
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.config import ProxyConfig, _deep_merge
+
+    effective_data = _deep_merge(data, env_overrides) if env_overrides else data
 
     try:
-        ProxyConfig.model_validate(data)
+        ProxyConfig.model_validate(effective_data)
     except ValidationError as exc:
         first = exc.errors()[0]
         loc = ".".join(str(part) for part in first["loc"])
         return f"{loc}: {first['msg']}" if loc else first["msg"]
     return None
+
+
+def _runtime_schema_validation_error(data: dict[str, Any]) -> str | None:
+    """Validate file data with the same proxy env overlay as the server."""
+    from memtomem_stm.proxy.config import collect_proxy_env_overrides
+
+    return _schema_validation_error(data, env_overrides=collect_proxy_env_overrides())
 
 
 _CONFIG_INVALID_WARNING = (
@@ -1110,6 +1142,12 @@ def _run_mcp_integration(
     ``keep`` (non-destructive) rather than prompting, so CI / scripted
     callers don't hit ``click.Abort`` on EOF.
     """
+    if preselected is None and client_mode is None and _SETUP_JSON_MODE.get():
+        # JSON setup output captures stdout, making the interactive choice
+        # invisible. With no explicit client, choose the non-destructive
+        # fallback and leave manual registration hints available for later.
+        preselected = 3
+
     if client_mode == "auto":
         if shutil.which("codex"):
             client_mode = "codex"
@@ -1720,7 +1758,7 @@ def status(config_path: str, *, as_json: bool = False) -> None:
     data = _load(path)
     enabled = data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    config_error = _schema_validation_error(data)
+    config_error = _runtime_schema_validation_error(data)
     tuning = _tuning_readiness(data)
     # Same predicate as the `mms list` pruned marker (via _origin_cell), so
     # this count and list's `*` rows can never disagree on what "pruned" means.
@@ -1798,17 +1836,32 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
+    # Same lenient warning as ``status`` (#611): on a schema-invalid config a
+    # running server ignores the whole file, so this table shows servers that
+    # are NOT being proxied. The env-overlaid validator, not the file-only
+    # one: the warning claims what a *running server* would do, and an env
+    # var can make a malformed subtree irrelevant — validating the file
+    # alone would warn here while `status` and `health` stay silent on the
+    # very same config.
+    config_error = _runtime_schema_validation_error(data)
 
     if as_json:
         click.echo(
             _json_dumps(
-                {"config_path": str(resolved), "servers": _redacted_servers_json(servers)},
+                {
+                    "config_path": str(resolved),
+                    "config_valid": config_error is None,
+                    "config_error": config_error,
+                    "servers": _redacted_servers_json(servers),
+                },
                 indent=2,
                 ensure_ascii=False,
             )
         )
         return
 
+    if config_error:
+        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
     if not servers:
         click.echo("No upstream servers configured.")
         return
@@ -2142,6 +2195,24 @@ def stats(
     "/ --header.",
 )
 @click.option(
+    "--all",
+    "select_all",
+    is_flag=True,
+    default=False,
+    help="With --from-clients/--import: import every newly discovered server "
+    "without prompting, assigning each a suggested prefix. Non-interactive "
+    "even on a TTY. Mutually exclusive with --select.",
+)
+@click.option(
+    "--select",
+    "select_names",
+    multiple=True,
+    metavar="NAME[,NAME...]",
+    help="With --from-clients/--import: import only the named discovered "
+    "servers, without prompting. Repeatable and comma-separated. A name no "
+    "client advertises is an error; one already registered here is skipped.",
+)
+@click.option(
     "--prune",
     "prune",
     is_flag=True,
@@ -2168,19 +2239,32 @@ def add(
     validate: bool,
     validate_timeout: int,
     from_clients: bool,
+    select_all: bool,
+    select_names: tuple[str, ...],
     prune: bool,
     as_json: bool = False,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
     path = Path(config_path)
 
+    # ``--select a,b --select c`` and ``--select a --select b`` are the same
+    # request: flatten both spellings into one ordered tuple.
+    selected = tuple(n.strip() for value in select_names for n in value.split(",") if n.strip())
+    if select_all and selected:
+        raise click.UsageError("--all cannot be combined with --select.")
+    if (select_all or selected) and not from_clients:
+        raise click.UsageError("--all / --select require --from-clients/--import.")
+
     if from_clients:
-        if as_json:
-            # The import path is an interactive TUI selection flow — no
-            # non-interactive contract to serialize yet (mirrors `mms tune`
-            # rejecting --json with --apply).
+        noninteractive = select_all or bool(selected)
+        if as_json and not noninteractive:
+            # Without a selection flag the import path is an interactive TUI
+            # flow, and a formatting flag must not turn prompts into
+            # guesses — there is no document to serialize until the caller
+            # says *what* to import.
             raise click.UsageError(
-                "--json is not supported with --from-clients/--import (interactive selection)."
+                "--json is not supported with --from-clients/--import without a "
+                "non-interactive selection; pass --all or --select NAME[,NAME...]."
             )
         # Guard against mixing interactive-import with single-server manual
         # flags — silently ignoring them would be surprising. `--validate` /
@@ -2205,7 +2289,15 @@ def add(
             raise click.UsageError(
                 f"--from-clients cannot be combined with: {', '.join(conflicts)}."
             )
-        _add_from_clients(path, validate=validate, validate_timeout=validate_timeout, prune=prune)
+        _add_from_clients(
+            path,
+            validate=validate,
+            validate_timeout=validate_timeout,
+            prune=prune,
+            select_all=select_all,
+            select_names=selected,
+            as_json=as_json,
+        )
         return
 
     if prune:
@@ -3127,8 +3219,10 @@ def _handle_source_prune(
     prune: bool,
     config_path: Path,
     data: dict[str, Any],
-) -> None:
-    """Post-import prune + reporting.
+    interactive: bool = True,
+    quiet: bool = False,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
+    """Post-import prune + reporting. Returns ``(pruned, failed)``.
 
     Three paths based on the caller's ``prune`` flag and the TTY gate:
 
@@ -3136,6 +3230,13 @@ def _handle_source_prune(
     * ``prune=False`` + TTY → interactive prompt, default No.
     * ``prune=False`` + non-TTY → skip prune entirely, fall through to the
       #203 hint-only warning.
+
+    ``interactive=False`` (``add --from-clients --all/--select``, #817)
+    suppresses the prompt even on a TTY, so a scripted import never blocks:
+    there, ``--prune`` is the only way to consent. ``quiet`` is the
+    ``--json`` mode — it drops the stdout hint block and success report,
+    which the returned pairs carry into the payload instead; stderr failure
+    diagnostics still print.
 
     Partial failures (e.g. one source prunes, another fails) surface a
     per-entry warning plus the manual-command fallback for the failed rows
@@ -3150,18 +3251,19 @@ def _handle_source_prune(
     a failed ③ only loses the metadata flip, never the origin or backup.
     """
     if not imported_candidates:
-        return
+        return [], []
 
     if prune:
         should_prune = True
-    elif _should_use_tui():
+    elif interactive and _should_use_tui():
         should_prune = _confirm_prune_prompt(imported_candidates)
     else:
         should_prune = False
 
     if not should_prune:
-        _print_source_removal_hints(imported_candidates)
-        return
+        if not quiet:
+            _print_source_removal_hints(imported_candidates)
+        return [], []
 
     pruned_at = utc_now_iso()
     pruned, failed = _prune_imported_candidates(imported_candidates, pruned_at=pruned_at)
@@ -3170,7 +3272,8 @@ def _handle_source_prune(
         servers, imported_candidates, pruned, pruned_at
     ):
         _save(config_path, data)
-    _report_prune_results(pruned, failed)
+    _report_prune_results(pruned, failed, quiet_success=quiet)
+    return pruned, failed
 
 
 def _report_prune_results(
@@ -3248,21 +3351,56 @@ def _find_dual_registered(
 
 
 def _suggest_prefix(name: str, taken: set[str]) -> str:
-    """Derive a valid-ish default prefix from a server name.
+    """Derive a default prefix from a server name.
 
-    Not authoritative — the user is re-prompted if invalid. Avoids clashing
-    with prefixes already chosen in the current init run.
+    Always satisfies :func:`prefixes.prefix_format_error` — the
+    non-interactive import path (``add --from-clients --all/--select``)
+    saves the suggestion with no operator to re-prompt, so an invalid one
+    would strand the user with a config the runtime refuses to load.
+    Underscore runs collapse with ``_{2,}`` rather than a single
+    ``replace("__", "_")`` pass, which leaves ``__`` behind on odd-length
+    runs (``a___b`` → ``a__b``). Avoids clashing with prefixes already
+    chosen in the current run.
     """
     base = re.sub(r"[^a-zA-Z0-9_]", "_", name).strip("_") or "srv"
     if not base[0].isalpha():
         base = "s_" + base
-    base = base.replace("__", "_")
+    base = re.sub(r"_{2,}", "_", base)
     candidate = base
     n = 2
     while candidate in taken:
         candidate = f"{base}{n}"
         n += 1
     return candidate
+
+
+def _auto_prefix(name: str, taken: set[str], warnings: list[str]) -> str:
+    """Prefix for the non-interactive import path — no prompt, no re-prompt.
+
+    The interactive flow leans on :func:`_prompt_prefix`'s loop to catch a
+    suggestion that is too long for the ``<client>__<prefix>__<tool>`` tool
+    name budget (#261); with nobody at the keyboard the same rule has to
+    hold up front, so an over-budget suggestion is truncated rather than
+    saved or refused. Truncation happens on the *base*, before the
+    collision suffix is re-applied, so the shortened value stays unique.
+    """
+    hard_limit = tool_name_budget.prefix_hard_limit()
+    prefix = _suggest_prefix(name, taken)
+    if len(prefix) > hard_limit:
+        base = _suggest_prefix(name, set())[: max(hard_limit - 2, 1)].rstrip("_") or "srv"
+        prefix = _suggest_prefix(base, taken)
+    warn_at = tool_name_budget.prefix_warn_threshold()
+    if len(prefix) > warn_at:
+        max_tool = tool_name_budget.TOOL_NAME_LIMIT - tool_name_budget.overhead() - len(prefix)
+        warn_msg = (
+            f"prefix '{prefix}' ({len(prefix)} chars) leaves only {max_tool} chars for "
+            "upstream tool names — longer ones will be silently dropped by clients. "
+            "Re-register the server with a shorter --prefix, or register STM as 'mms' "
+            "in your client config. Proceeding."
+        )
+        click.echo(f"{_warn('Warning:')} {warn_msg}", err=True)
+        warnings.append(warn_msg)
+    return prefix
 
 
 def _parse_selection(raw: str, count: int) -> list[int] | None:
@@ -3471,21 +3609,85 @@ def _add_from_clients(
     validate: bool,
     validate_timeout: int,
     prune: bool = False,
+    select_all: bool = False,
+    select_names: tuple[str, ...] = (),
+    as_json: bool = False,
 ) -> None:
-    """Interactive bulk-import path for ``mms add --from-clients``.
+    """Bulk-import path for ``mms add --from-clients``.
 
     Reuses init's discovery + selection + prefix-prompt helpers. Difference
     from init: merges into an existing config (rather than creating one) and
-    filters out candidates that match servers already registered, so the TUI
-    only shows *new* options.
+    filters out candidates that match servers already registered, so the
+    selection only shows *new* options.
+
+    ``select_all`` / ``select_names`` (#817) replace both prompts with a
+    scripted contract: the selection comes from the flag, each prefix from
+    :func:`_auto_prefix`. That mode never prompts — not for the selection,
+    not for a prefix, not for the post-import prune — even on a TTY, because
+    a caller who named the servers on the command line has nobody waiting to
+    answer. ``as_json`` then serializes the outcome; there every human line
+    goes to stderr so stdout carries exactly one document.
     """
+    noninteractive = select_all or bool(select_names)
+    resolved = config_path.expanduser().resolve()
+
+    def info(message: str = "") -> None:
+        """Human-facing line: stdout normally, stderr under ``--json``."""
+        click.echo(message, err=as_json)
+
+    def emit(
+        imported_rows: list[dict[str, Any]],
+        skipped: list[dict[str, str]],
+        warnings: list[str],
+        prune_result: dict[str, Any] | None = None,
+    ) -> None:
+        if not as_json:
+            return
+        _echo_json(
+            {
+                "action": "add",
+                "ok": True,
+                "mode": "from_clients",
+                "config_path": str(resolved),
+                "imported": imported_rows,
+                "skipped": skipped,
+                "validated": validate,
+                "warnings": warnings,
+                "prune": prune_result,
+            }
+        )
+
     data = _load(config_path)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
+    skipped: list[dict[str, str]] = []
+    warnings_json: list[str] = []
 
     all_candidates = _discover_candidates(Path.cwd())
+
+    if select_names:
+        # Resolve the requested names against *everything* discovered, not
+        # just the importable remainder: a name no client advertises is a
+        # typo, and a typo must not half-succeed by importing the names that
+        # did resolve. Checked before any write.
+        discovered = {cand["name"] for cand in all_candidates}
+        unknown = [n for n in dict.fromkeys(select_names) if n not in discovered]
+        if unknown:
+            available = sorted(discovered)
+            msg = (
+                f"--select named server(s) no MCP client advertises: {', '.join(unknown)}. "
+                f"Discovered: {', '.join(available) if available else '(none)'}"
+            )
+            click.echo(f"{_err('Error:')} {_disp(msg)}", err=True)
+            if as_json:
+                _json_fail("add", "unknown_server", msg, unknown=unknown, available=available)
+            sys.exit(1)
+        requested = set(select_names)
+        all_candidates = [cand for cand in all_candidates if cand["name"] in requested]
+
     if not all_candidates:
-        click.echo("No MCP servers found in Claude Desktop / Code / .mcp.json.")
-        click.echo("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
+        info("No MCP servers found in Claude Desktop / Code / .mcp.json.")
+        info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
+        emit([], skipped, warnings_json)
         return
 
     existing_names = set(servers.keys())
@@ -3502,6 +3704,7 @@ def _add_from_clients(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — already registered.",
                 err=True,
             )
+            skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
         sig = _server_signature(entry)
         if sig is not None and sig in existing_signatures:
@@ -3510,80 +3713,119 @@ def _add_from_clients(
                 "by command/url.",
                 err=True,
             )
+            skipped.append({"name": cand_name, "reason": "duplicate_signature"})
             continue
         new_candidates.append(cand)
 
     if not new_candidates:
-        click.echo("All discovered servers are already registered.")
+        # Everything requested is already registered. Not an error: re-running
+        # the same scripted import has to stay idempotent.
+        info("All discovered servers are already registered.")
+        emit([], skipped, warnings_json)
         return
 
-    resolved = config_path.expanduser().resolve()
-    click.echo(_hdr(f"Found {len(new_candidates)} new MCP server(s) to import:"))
-    for i, cand in enumerate(new_candidates, 1):
-        dup = cand.get("duplicate_in")
-        dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
-        click.echo(
-            f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
-            f"    — from {cand['source']}{dup_hint}"
-        )
-    click.echo("")
-    picks = _pick_imports(new_candidates)
-
-    if not picks:
+    if noninteractive:
+        picks = list(range(len(new_candidates)))
+    else:
+        click.echo(_hdr(f"Found {len(new_candidates)} new MCP server(s) to import:"))
+        for i, cand in enumerate(new_candidates, 1):
+            dup = cand.get("duplicate_in")
+            dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
+            click.echo(
+                f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
+                f"    — from {cand['source']}{dup_hint}"
+            )
         click.echo("")
-        click.echo(f"{_ok('No servers selected.')} Config unchanged.")
-        return
+        picks = _pick_imports(new_candidates)
+
+        if not picks:
+            click.echo("")
+            click.echo(f"{_ok('No servers selected.')} Config unchanged.")
+            return
 
     # Seed the "taken prefixes" set with what's already in the config so
     # suggestions don't collide with prior registrations.
     used_prefixes: set[str] = {p for srv_cfg in servers.values() if (p := srv_cfg.get("prefix"))}
     imported: dict[str, dict[str, Any]] = {}
+    imported_rows: list[dict[str, Any]] = []
     imported_at = utc_now_iso()
-    click.echo("")
+    info("")
     for idx in picks:
         cand = new_candidates[idx]
-        # Escape the value, never the styled result: ``_hdr`` wraps this
-        # line in a bold SGR span whose own escapes must stay real (#755).
-        click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
-        suggested = _suggest_prefix(cand["name"], used_prefixes)
-        prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
+        if noninteractive:
+            prefix = _auto_prefix(cand["name"], used_prefixes, warnings_json)
+        else:
+            # Escape the value, never the styled result: ``_hdr`` wraps this
+            # line in a bold SGR span whose own escapes must stay real (#755).
+            click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
+            suggested = _suggest_prefix(cand["name"], used_prefixes)
+            prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
         used_prefixes.add(prefix)
         entry = {"prefix": prefix, **cand["entry"]}
         origin = _build_origin(cand, imported_at)
         if origin is not None:
             entry["origin"] = origin
         imported[cand["name"]] = entry
+        imported_rows.append(
+            {"name": cand["name"], "prefix": prefix, "source": cand["source"], "server": None}
+        )
 
     if validate:
-        click.echo("")
-        click.echo(f"Validating {len(imported)} server(s) (timeout={validate_timeout}s)...")
+        info("")
+        info(f"Validating {len(imported)} server(s) (timeout={validate_timeout}s)...")
         probes = asyncio.run(_probe_servers(imported, validate_timeout))
+        rows_by_name = {row["name"]: row for row in imported_rows}
         for n, probe in probes.items():
+            rows_by_name[n]["reachable"] = probe.connected
+            rows_by_name[n]["tools_reachable"] = probe.tools if probe.connected else None
             if probe.connected:
-                click.echo(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
+                info(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
             else:
-                click.echo(
-                    f"  {_warn('Warning:')} {_disp(n)} — probe failed: {_disp(probe.error or '')}",
-                    err=True,
-                )
+                # One message string for both surfaces so the stderr wording
+                # and the --json ``warnings`` entry cannot fork.
+                warn_msg = f"{n} — probe failed: {probe.error or ''}"
+                warnings_json.append(warn_msg)
+                click.echo(f"  {_warn('Warning:')} {_disp(warn_msg)}", err=True)
                 click.echo("  Saving anyway. Run `mms health` later to retry.", err=True)
 
     servers.update(imported)
     _save(config_path, data)
 
-    click.echo("")
-    click.echo(f"{_ok('Added')} {len(imported)} server(s) to {resolved}:")
+    # Redacted like the manual `add --json` path: env/header values are
+    # secret-bearing and --json output is routinely piped to logs.
+    redacted = _redacted_servers_json(imported)
+    for row in imported_rows:
+        row["server"] = redacted[row["name"]]
+
+    info("")
+    info(f"{_ok('Added')} {len(imported)} server(s) to {resolved}:")
     for n, e in imported.items():
-        click.echo(f"  {_disp(n):<20} prefix={_disp(e['prefix'])}  {_format_candidate_detail(e)}")
+        info(f"  {_disp(n):<20} prefix={_disp(e['prefix'])}  {_format_candidate_detail(e)}")
 
     # Source clients still hold the direct registrations. Without a prune,
     # tools surface on two paths (client → upstream and client → STM →
     # upstream) and the direct path bypasses compression, caching, and LTM
     # surfacing. ``_handle_source_prune`` picks between the --prune flag,
     # the interactive prompt (TTY), and the hint-only fallback (non-TTY /
-    # user declined).
-    _handle_source_prune(
-        [new_candidates[i] for i in picks], prune=prune, config_path=config_path, data=data
+    # non-interactive selection / user declined).
+    pruned, failed = _handle_source_prune(
+        [new_candidates[i] for i in picks],
+        prune=prune,
+        config_path=config_path,
+        data=data,
+        interactive=not noninteractive,
+        quiet=as_json,
+    )
+    emit(
+        imported_rows,
+        skipped,
+        warnings_json,
+        {
+            "pruned": [{"name": n, "source": src} for n, src in pruned],
+            "failed": [{"name": n, "source": src, "error": err} for n, src, err in failed],
+        }
+        if prune
+        else None,
     )
 
 
@@ -3649,6 +3891,33 @@ def _prompt_language() -> str:
         default="en",
         show_default=True,
     )
+
+
+def _confirm_validation() -> bool:
+    """Confirm validation, taking the default only on piped stdin EOF.
+
+    Click deliberately converts both ``EOFError`` and ``KeyboardInterrupt``
+    into ``click.Abort``, so catching that exception cannot tell a closed pipe
+    from Ctrl-C. Read non-TTY stdin directly to preserve interrupts while
+    retaining the confirm's default-yes behavior at EOF.
+    """
+    if sys.stdin.isatty():
+        return click.confirm("Validate connection(s) now?", default=True)
+
+    while True:
+        click.echo("Validate connection(s) now? [Y/n]: ", nl=False)
+        answer = sys.stdin.readline()
+        click.echo("")
+        if answer == "":
+            click.echo("No answer on stdin — validating by default (--no-validate to skip).")
+            return True
+
+        value = answer.strip().lower()
+        if value in ("", "y", "yes"):
+            return True
+        if value in ("n", "no"):
+            return False
+        click.echo("Error: invalid input")
 
 
 @cli.command()
@@ -3764,6 +4033,13 @@ def init(
     if client_mode is not None and mcp_mode is not None:
         raise click.UsageError("use either --client or the legacy --mcp flag, not both")
     selected_client = client_mode or mcp_mode
+
+    # ``--json`` still allows stdin-scripted prompts (#758 pins the discovery
+    # selection flow), but prompts with a safe default must not read stdin:
+    # with stdout captured the prompt text is invisible, so an unanswered
+    # confirm hangs the caller. See the validate confirm and language preset
+    # below, plus the decorator's ``click.Abort`` envelope for EOF.
+    json_mode = _SETUP_JSON_MODE.get()
 
     if resolved.exists():
         if resume:
@@ -3931,7 +4207,7 @@ def init(
     # stays predictable for scripted callers ("which prompt fires next?").
     # Non-TTY callers without ``--lang`` get "en" silently — see
     # ``_prompt_language``.
-    selected_lang = lang if lang is not None else _prompt_language()
+    selected_lang = lang if lang is not None else ("en" if json_mode else _prompt_language())
     preset = _LANG_PRESETS[selected_lang]
     proxy_fields = {k: v for k, v in preset.items() if not k.startswith("_")}
     per_server_fields = preset.get("_per_server", {})
@@ -3947,7 +4223,8 @@ def init(
                 # the resolved budget but kept visible in the saved config.
                 entry.setdefault(key, value)
 
-    if not no_validate and click.confirm("Validate connection(s) now?", default=True):
+    do_validate = not no_validate and (json_mode or _confirm_validation())
+    if do_validate:
         probe_map = {n: e for n, e in imported.items()}
         click.echo(f"Validating {len(probe_map)} server(s) (timeout=10s)...")
         probes = asyncio.run(_probe_servers(probe_map, 10))
@@ -5935,10 +6212,13 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     ``env``/``headers`` values (and URL credentials) before being stored —
     ``health``/``doctor`` render ``error`` verbatim.
     """
+    import httpx2
+
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
+
+    from memtomem_stm.utils.mcp_transport import streamable_http_transport
 
     deadline = asyncio.get_running_loop().time() + timeout
 
@@ -5973,11 +6253,14 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
             )
         else:
             sdk_timeout = remaining()
-            ctx = streamablehttp_client(
+            # ``Timeout(sdk_timeout)`` sets connect/write/pool, and the
+            # explicit ``read=`` keeps the probe's single deadline on every
+            # leg — the 1.x call passed ``timeout`` and ``sse_read_timeout``
+            # the same way.
+            ctx = streamable_http_transport(
                 cfg.get("url", ""),
                 headers=cfg.get("headers"),
-                timeout=sdk_timeout,
-                sse_read_timeout=sdk_timeout,
+                timeout=httpx2.Timeout(sdk_timeout, read=sdk_timeout),
             )
 
         async with AsyncExitStack() as stack:
@@ -6093,10 +6376,13 @@ async def _probe_ltm_mcp_server(
     fd-backed sink — ``stdio_client`` forwards this to
     ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
     """
+    import httpx2
+
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
+
+    from memtomem_stm.utils.mcp_transport import streamable_http_transport
 
     deadline = asyncio.get_running_loop().time() + timeout
 
@@ -6115,11 +6401,11 @@ async def _probe_ltm_mcp_server(
             sse_read_timeout=sdk_timeout,
         )
     elif transport == "streamable_http":
-        ctx = streamablehttp_client(
+        # Same mapping as ``_probe_one``: one probe deadline on every leg.
+        ctx = streamable_http_transport(
             url,
             headers=headers,
-            timeout=sdk_timeout,
-            sse_read_timeout=sdk_timeout,
+            timeout=httpx2.Timeout(sdk_timeout, read=sdk_timeout),
         )
     else:
         params = StdioServerParameters(command=command, args=args)
@@ -6704,7 +6990,7 @@ def health(
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     surfacing_status = _surfacing_bootstrap_status(float(timeout))
-    config_error = _schema_validation_error(data)
+    config_error = _runtime_schema_validation_error(data)
     if config_error:
         # A schema error can echo the rejected input_value (or a validator
         # message quoting it), so scrub it against configured server secrets
@@ -7041,7 +7327,7 @@ def doctor(
             # fall back to env/defaults) but does NOT short-circuit: the
             # transport/prefix/probe checks operate on the raw dicts and
             # stay meaningful.
-            schema_error = _schema_validation_error(data)
+            schema_error = _runtime_schema_validation_error(data)
             if schema_error:
                 # A pydantic error can echo the rejected input_value (or a
                 # validator message quoting it), so scrub it against every

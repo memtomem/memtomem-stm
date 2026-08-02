@@ -32,7 +32,7 @@ def _text_content(text: str):
 
 
 def _make_result(text: str):
-    return SimpleNamespace(content=[_text_content(text)], isError=False)
+    return SimpleNamespace(content=[_text_content(text)], is_error=False)
 
 
 def _make_manager(

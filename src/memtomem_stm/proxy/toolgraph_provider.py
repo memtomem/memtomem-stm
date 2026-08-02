@@ -315,8 +315,8 @@ class ToolgraphConsultAdapter:
             # tool) is a contract problem, not an availability one.
             raise ToolgraphProtocolError(str(exc)) from exc
 
-        if result.isError:
-            error = getattr(result, "structuredContent", None)
+        if result.is_error:
+            error = getattr(result, "structured_content", None)
             if (
                 isinstance(error, dict)
                 and error.get("error_kind") == _BACKEND_UNAVAILABLE_KIND
@@ -335,7 +335,7 @@ class ToolgraphConsultAdapter:
         # so text-JSON is the actual production path today. ``structuredContent``
         # stays the preferred path in case the upstream switches to a typed
         # (BaseModel / TypedDict) return.
-        verdict = result.structuredContent
+        verdict = result.structured_content
         if not isinstance(verdict, dict):
             verdict = _parse_text_verdict(result)
         if not isinstance(verdict, dict):

@@ -236,8 +236,8 @@ class TestToolgraphConsultAdapter:
         adapter = _adapter()
         session = AsyncMock()
         session.call_tool.return_value = SimpleNamespace(
-            isError=True,
-            structuredContent=structured,
+            is_error=True,
+            structured_content=structured,
             content=[
                 SimpleNamespace(
                     type="text",
@@ -254,8 +254,8 @@ class TestToolgraphConsultAdapter:
         adapter = _adapter()
         session = AsyncMock()
         session.call_tool.return_value = SimpleNamespace(
-            isError=True,
-            structuredContent={
+            is_error=True,
+            structured_content={
                 "error_kind": "backend_unavailable",
                 "retryable": True,
                 "message": "unknown profile contract failure",
@@ -379,8 +379,8 @@ class TestToolgraphIdentifierBoundary:
         }
         mutate(verdict, "bad\ud800")
         result = SimpleNamespace(
-            isError=False,
-            structuredContent=verdict if wire_path == "structured" else None,
+            is_error=False,
+            structured_content=verdict if wire_path == "structured" else None,
             content=(
                 []
                 if wire_path == "structured"
@@ -406,8 +406,8 @@ class TestToolgraphIdentifierBoundary:
         }
         session = AsyncMock()
         session.call_tool.return_value = SimpleNamespace(
-            isError=False,
-            structuredContent=verdict,
+            is_error=False,
+            structured_content=verdict,
             content=[],
         )
         adapter = _adapter()
@@ -420,8 +420,8 @@ class TestToolgraphIdentifierBoundary:
         row[field] = ["bad\udfff"] if field == "candidates" else "bad\udfff"
         session = AsyncMock()
         session.call_tool.return_value = SimpleNamespace(
-            isError=False,
-            structuredContent={"agent": "agent", "features": [row]},
+            is_error=False,
+            structured_content={"agent": "agent", "features": [row]},
             content=[],
         )
         adapter = _adapter()
@@ -514,7 +514,7 @@ class TestParseTextVerdict:
 
 
 def _tool_result(text: str = "ok"):
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=False)
 
 
 def _tg_manager(tmp_path, *, servers=None, exposure=None, **tg_overrides):
@@ -557,7 +557,7 @@ def _tg_manager(tmp_path, *, servers=None, exposure=None, **tg_overrides):
     mgr = ProxyManager(proxy_cfg, TokenTracker(), selection_log=log)
     for name, tool_names in servers.items():
         tools = [
-            SimpleNamespace(name=n, description=f"{n} description", inputSchema={"type": "object"})
+            SimpleNamespace(name=n, description=f"{n} description", input_schema={"type": "object"})
             for n in tool_names
         ]
         session = AsyncMock()

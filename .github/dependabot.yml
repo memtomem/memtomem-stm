@@ -19,3 +19,9 @@ updates:
     groups:
       python-minor-patch:
         update-types: ["minor", "patch"]
+    # The `mcp` major-version ignore added in #807 is gone: it existed only to
+    # stop this updater widening the deliberate `<2` cap (PR #805 did exactly
+    # that and failed 8 CI jobs), and #801 migrated the package to the 2.0
+    # SDK. A future mcp major should surface as a PR again, not be silently
+    # withheld — it needs review, not suppression, because the proxy rides SDK
+    # internals in `proxy/_fastmcp_compat.py`.
