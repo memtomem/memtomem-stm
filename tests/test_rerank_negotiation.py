@@ -21,13 +21,13 @@ from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
 
 def _search_response() -> SimpleNamespace:
     return SimpleNamespace(
-        isError=False,
+        is_error=False,
         content=[SimpleNamespace(type="text", text=json.dumps({"results": []}))],
     )
 
 
 def _tool(name: str, properties: dict[str, object]) -> SimpleNamespace:
-    return SimpleNamespace(name=name, inputSchema={"type": "object", "properties": properties})
+    return SimpleNamespace(name=name, input_schema={"type": "object", "properties": properties})
 
 
 def _session(*, rerank_capable: bool) -> AsyncMock:
@@ -126,7 +126,7 @@ async def test_compact_format_still_gets_the_bypass() -> None:
     adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
     session = _session(rerank_capable=True)
     session.call_tool.return_value = SimpleNamespace(
-        isError=False, content=[SimpleNamespace(type="text", text="")]
+        is_error=False, content=[SimpleNamespace(type="text", text="")]
     )
     await adapter._probe_rerank_support(session)
     args = await _searched_args(adapter, session)
@@ -144,7 +144,7 @@ async def test_compose_params_carry_rerank_only_when_supported() -> None:
         adapter._rerank_param_supported = supported
         session = AsyncMock()
         session.call_tool.return_value = SimpleNamespace(
-            isError=False,
+            is_error=False,
             content=[
                 SimpleNamespace(type="text", text=json.dumps({"pinned": [], "retrieved": []}))
             ],
@@ -220,7 +220,7 @@ async def test_compose_retry_after_reconnect_reevaluates_the_latch() -> None:
     async def succeed(tool: str, args: dict[str, object]) -> SimpleNamespace:
         sent.append(json.loads(json.dumps(args)))
         return SimpleNamespace(
-            isError=False,
+            is_error=False,
             content=[
                 SimpleNamespace(type="text", text=json.dumps({"pinned": [], "retrieved": []}))
             ],

@@ -58,7 +58,7 @@ def _text_content(text: str):
 
 
 def _result(text: str, *, is_error: bool = False):
-    return SimpleNamespace(content=[_text_content(text)], isError=is_error)
+    return SimpleNamespace(content=[_text_content(text)], is_error=is_error)
 
 
 def _build_mgr(
@@ -532,7 +532,7 @@ class TestEarlyReturnMetrics:
         mgr, store, _ = make_mgr()
         img = SimpleNamespace(type="image", data="x", mimeType="image/png")
         mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
-            content=[img], isError=False
+            content=[img], is_error=False
         )
         result = await mgr.call_tool("srv", "tool", {})
         assert isinstance(result, list)
@@ -549,7 +549,7 @@ class TestEarlyReturnMetrics:
         # matching call and the invocation reconciliation would be false.
         mgr, store, _ = make_mgr()
         mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
-            content=[], isError=False
+            content=[], is_error=False
         )
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
@@ -638,14 +638,14 @@ class TestUpstreamSurrogateScrub:
         mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
         upstream = SimpleNamespace(
             content=[_text_content("plain")],
-            isError=False,
-            structuredContent={f"k{self.SURROGATE}": f"v{self.SURROGATE}"},
+            is_error=False,
+            structured_content={f"k{self.SURROGATE}": f"v{self.SURROGATE}"},
             meta={"note": f"m{self.SURROGATE}"},
         )
         mgr._connections["srv"].session.call_tool.return_value = upstream
         result = await mgr.call_tool("srv", "tool", {})
 
-        assert result.structuredContent == {"k\\ud800": "v\\ud800"}
+        assert result.structured_content == {"k\\ud800": "v\\ud800"}
         assert result.meta == {"note": "m\\ud800"}
         result.model_dump_json()
 
@@ -659,7 +659,7 @@ class TestUpstreamSurrogateScrub:
         )
         result = await mgr.call_tool("srv", "tool", {})
 
-        assert result.isError is True
+        assert result.is_error is True
         assert result.content[0].text == "boom\\ud800"
         # An error result is serialized by the same model a success is.
         result.model_dump_json()

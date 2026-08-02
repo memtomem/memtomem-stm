@@ -515,7 +515,7 @@ class TestStructuredScoreScale:
 
         session = AsyncMock()
         session.call_tool.return_value = SimpleNamespace(
-            isError=False,
+            is_error=False,
             content=[SimpleNamespace(type="text", text=STRUCTURED_TWO_RESULTS_WITH_SCALE)],
         )
         adapter = McpClientSearchAdapter(SurfacingConfig())
