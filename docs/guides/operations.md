@@ -58,6 +58,59 @@ Run `mms daemon status`, verify the installed host path, and check the host's
 capability in the [native-hook guide](native-hooks.md). Cursor and Kimi hooks
 are metrics-only by design.
 
+## Recovering from a broken config file
+
+`~/.memtomem/stm_proxy.json` is plain JSON, and hand edits can break it two
+ways with different symptoms:
+
+- **Invalid JSON** (truncated file, stray comma): `status`, `list`, and most
+  commands fail with the parse position; `doctor` FAILs at the `config JSON`
+  check. Nothing else is damaged — fix or restore the file.
+- **Valid JSON, invalid schema** (wrong type, misspelled key): the running
+  server silently falls back to env/defaults, and `status`/`list` print a
+  `fails validation` warning. Misspelled keys are *ignored* at runtime; only
+  `mms config validate` reports them, with the dotted path.
+
+Recovery order:
+
+1. `mms config validate` — names the first error (line/column for JSON errors,
+   `section.key: message` for schema errors) and every unknown key.
+2. Fix the named line, or restore a backup. Backups that may already exist:
+   - `stm_proxy.json.bak-<UTC>` next to the config — written by every
+     `mms tune --apply`.
+   - `~/.memtomem/pruned_upstreams.json` — the prune backup log; `mms eject`
+     can rebuild host entries from it.
+3. Re-run `mms config validate` until it prints `OK`, then `mms doctor`.
+4. If the file is beyond repair, delete it and re-run `mms init` (or
+   `mms add --from-clients` to re-import from host configs).
+
+## Uninstalling completely
+
+There is no single wipe command; the pieces are independent and each step is
+optional depending on how far you want to roll back.
+
+```bash
+mms hook uninstall --host claude --apply   # repeat per host you installed
+mms list                                   # see what to eject or remove
+mms daemon stop --all
+```
+
+1. **Hooks** — `mms hook uninstall --host <host> --apply` removes the
+   PostToolUse hook after backing up the host settings file.
+2. **Upstreams** — if you pruned direct registrations, `mms eject NAME` first
+   restores each upstream to its original host client; plain `mms remove NAME`
+   just drops it from STM.
+3. **Client registration** — remove STM itself from the client, e.g.
+   `claude mcp remove memtomem-stm` (the exact command is printed by `mms
+   eject` when the last upstream leaves).
+4. **Daemon** — `mms daemon stop --all` also reaps daemons left by older
+   configs.
+5. **State on disk** — remove the data directories; nothing else writes there:
+   `rm -rf ~/.memtomem ~/.mms` (configs, metrics/feedback DBs, locks, logs,
+   prune backups; also removes hook/tune `.bak` files kept under them).
+6. **Package** — `uv tool uninstall memtomem-stm` or `pip uninstall
+   memtomem-stm`.
+
 ## Safe changes
 
 - `mms tune` previews recommendations; `--apply` writes after creating a
