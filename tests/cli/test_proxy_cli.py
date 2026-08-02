@@ -11540,7 +11540,10 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
         assert "Ollama endpoint" in result.output
-        assert "ollama serve" in result.output
+        # A non-default port must NOT get plain `ollama serve` — that would
+        # start the default instance while doctor keeps probing this one.
+        assert "ollama serve" not in result.output
+        assert "verify the local Ollama at http://127.0.0.1:9" in result.output
 
     def test_missing_ollama_model_fails_with_safe_pull_hint(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -12290,6 +12293,18 @@ class TestDoctor:
         assert mixed["one"] == plain_solo["one"]
         assert mixed["two"] != mixed["one"]
 
+        # Two uncredentialed URLs that normalize to one stripped identity (an
+        # empty query marker survives the raw grouping key but not
+        # urlunsplit) exercise the uncredentialed collision fallback: both
+        # must come back suffixed and distinct.
+        uncred_twins = site_ids(
+            ("one", "p1", "http://ollama.test:11434"),
+            ("two", "p2", "http://ollama.test:11434?"),
+        )
+        assert len(set(uncred_twins.values())) == 2
+        for check_id in uncred_twins.values():
+            assert "-" in check_id.split(":", 1)[1]
+
         # Real 8-hex sha256 prefix collision: the use sites "server '39153'"
         # and "server '74347'" share the prefix 1597babb. The full-length
         # site digest must keep these twins' IDs distinct.
@@ -12312,6 +12327,19 @@ class TestDoctor:
 
         # Scheme matching is case-insensitive (httpx accepts HTTP://).
         assert proxy_mod._ollama_next_action("HTTP://LOCALHOST:11434", []) == "ollama serve"
+        # Loopback but not the CLI's default target: plain ollama commands
+        # would act on the default instance, so the hint names the endpoint.
+        for url in (
+            "http://127.0.0.1:9",
+            "https://localhost:11434",
+            "http://localhost:11434/v1",
+            "http://u:pw@localhost:11434",
+        ):
+            hint = proxy_mod._ollama_next_action(url, ["qwen3:4b"])
+            assert hint.startswith("verify the local Ollama at "), url
+            assert "ollama pull" not in hint
+            assert "pw" not in hint
+            assert "qwen3:4b" in hint
         # Hostless, non-HTTP, or badly-ported endpoints cannot be fixed by
         # serve/pull — the client would reject the URL before connecting.
         assert "base_url" in proxy_mod._ollama_next_action("http://", [])

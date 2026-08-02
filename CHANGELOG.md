@@ -18,8 +18,9 @@ changes inline only. See the deprecation policy in
   The env-overlaid effective config is inspected for embedding relevance and
   explicit `llm_summary` compression, shared base URLs receive one passive
   `/api/tags` inventory request, and missing models get an `ollama pull` next
-  action on local endpoints (remote endpoints get a verify-the-host hint
-  naming the models). Dormant LLM blocks, `auto`, extraction (unwired in the bundled
+  action on the default local endpoint (any other endpoint gets a verify hint
+  naming the endpoint and models, since plain `ollama` commands act only on
+  the default instance). Dormant LLM blocks, `auto`, extraction (unwired in the bundled
   server), and non-Ollama providers are not probed. Live-Ollama CI remains out
   of scope; coverage uses mocked inventories and a dead port. **Behavior
   change**: a configured Ollama endpoint that is unreachable or lacks its

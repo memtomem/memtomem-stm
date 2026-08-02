@@ -7127,6 +7127,12 @@ class _OllamaEndpoint:
     # a discriminating suffix from the endpoint's FIRST publication, so the
     # ID cannot flip when a credential-only twin later appears or disappears.
     has_userinfo: bool
+    # Whether plain `ollama serve` / `ollama pull` would act on THIS endpoint:
+    # the CLI targets http://127.0.0.1:11434 by default, so any other scheme,
+    # host, port, path, or a credentialed URL must not get those commands —
+    # they would start or modify the default instance while doctor keeps
+    # probing a different address.
+    default_local: bool
 
     @classmethod
     def parse(cls, base_url: str) -> "_OllamaEndpoint":
@@ -7158,12 +7164,24 @@ class _OllamaEndpoint:
         valid = bool(
             parts is not None and parts.scheme.lower() in {"http", "https"} and hostname and port_ok
         )
+        default_local = bool(
+            valid
+            and parts is not None
+            and parts.scheme.lower() == "http"
+            and hostname in {"localhost", "127.0.0.1", "::1"}
+            and parts.port == 11434
+            and not has_userinfo
+            and parts.path in ("", "/")
+            and not parts.query
+            and not parts.fragment
+        )
         return cls(
             raw=base_url,
             stripped=stripped,
             hostname=hostname,
             valid=valid,
             has_userinfo=has_userinfo,
+            default_local=default_local,
         )
 
     @property
@@ -7396,13 +7414,18 @@ def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
         # An empty/relative/hostless/badly-ported URL never reaches a server;
         # "ollama serve" or "ollama pull" cannot fix it.
         return f"set a valid base_url for this endpoint; see {_OLLAMA_SETUP_DOC}"
+    # Prose branches, not commands, so config-derived values must be
+    # display-escaped here (the render loop deliberately prints next_action
+    # raw — every other one is a literal template or goes through
+    # _shell_join, which refuses hostile characters).
+    target = f" serves model(s) {_disp(', '.join(missing_models))}" if missing_models else ""
     if not endpoint.loopback:
-        # Prose, not a command, so config-derived model names must be
-        # display-escaped here (the render loop deliberately prints
-        # next_action raw — every other one is a literal template or goes
-        # through _shell_join, which refuses hostile characters).
-        target = f" serves model(s) {_disp(', '.join(missing_models))}" if missing_models else ""
         return f"verify the remote Ollama host{target}; see {_OLLAMA_SETUP_DOC}"
+    if not endpoint.default_local:
+        # Plain `ollama serve` / `ollama pull` target the CLI default
+        # (http://127.0.0.1:11434), not this endpoint.
+        display = _disp(redact_url_userinfo(endpoint.raw))
+        return f"verify the local Ollama at {display}{target}; see {_OLLAMA_SETUP_DOC}"
     return (
         _shell_join(["ollama", "pull", missing_models[0]])
         if missing_models
