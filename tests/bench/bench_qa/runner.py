@@ -224,7 +224,7 @@ def make_surfacing_proxy_manager(
 
 def make_tool_result(text: str) -> SimpleNamespace:
     """Wrap a string in the MCP CallToolResult shape the proxy expects."""
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=False)
 
 
 def latest_metrics_row(store: MetricsStore) -> dict:

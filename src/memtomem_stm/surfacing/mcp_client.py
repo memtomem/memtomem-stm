@@ -14,13 +14,14 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 import httpx
+import httpx2
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
@@ -749,7 +750,8 @@ class McpClientSearchAdapter:
                     headers=self._config.ltm_mcp_headers,
                 )
             case "streamable_http":
-                return streamablehttp_client(
+                # No ``timeout=``: keeps the SDK's own defaults, as before.
+                return streamable_http_transport(
                     self._config.ltm_mcp_url,
                     headers=self._config.ltm_mcp_headers,
                 )
@@ -880,7 +882,7 @@ class McpClientSearchAdapter:
             for tool in getattr(listing, "tools", None) or []:
                 if tool.name != "mem_search":
                     continue
-                schema = tool.inputSchema
+                schema = tool.input_schema
                 properties = schema.get("properties") if isinstance(schema, dict) else None
                 if isinstance(properties, dict) and "rerank" in properties:
                     self._rerank_param_supported = True
@@ -1140,12 +1142,17 @@ class McpClientSearchAdapter:
     # Transient failure modes that warrant tearing down and rebuilding the
     # connection. stdio pipe failures surface as OSError / EOFError /
     # BrokenPipeError; the sse and streamable_http clients (#398) raise
-    # httpx.TransportError subclasses (ConnectError, ReadTimeout,
+    # TransportError subclasses (ConnectError, ReadTimeout,
     # RemoteProtocolError, ...) whose MRO has no OSError ancestor — without
-    # the httpx entry a network blip fell through to the generic handler,
+    # a transport entry a network blip fell through to the generic handler,
     # which never reconnects, leaving surfacing dead until restart.
-    # httpx.HTTPStatusError / DecodingError stay OUT: the server answered,
-    # so the transport is healthy and reconnecting would mask real errors.
+    # HTTPStatusError / DecodingError stay OUT: the server answered, so the
+    # transport is healthy and reconnecting would mask real errors.
+    #
+    # BOTH client libraries are listed. The mcp 2.0 SDK issues its requests
+    # through ``httpx2``, so that is what a live upstream failure raises now;
+    # ``httpx`` stays because this package's own HTTP calls still use it and
+    # the two exception hierarchies are unrelated classes.
     _TRANSPORT_ERRORS = (
         OSError,
         ConnectionError,
@@ -1153,6 +1160,7 @@ class McpClientSearchAdapter:
         BrokenPipeError,
         asyncio.TimeoutError,
         httpx.TransportError,
+        httpx2.TransportError,
     )
 
     async def _reconnect(self, expected_generation: int | None = None) -> None:
@@ -1383,7 +1391,7 @@ class McpClientSearchAdapter:
         # MagicMock/fake results often omit the optional field and fabricate a
         # truthy attribute on access. Only the protocol's literal boolean true
         # is an error envelope.
-        if getattr(result, "isError", False) is True:
+        if getattr(result, "is_error", False) is True:
             logger.warning("MCP mem_search returned isError=true")
             return [], [], "upstream_error"
 
@@ -1512,7 +1520,7 @@ class McpClientSearchAdapter:
             )
         except self._TRANSPORT_ERRORS as exc:
             raise LtmTransportError("core context_compose transport unavailable") from exc
-        if getattr(result, "isError", False) is True:
+        if getattr(result, "is_error", False) is True:
             raise RuntimeError("core context_compose returned isError=true")
         try:
             payload = _core_json_loads(self._result_text(result))
@@ -1621,7 +1629,7 @@ class McpClientSearchAdapter:
             },
             trace_id=trace_id,
         )
-        if getattr(result, "isError", False) is True:
+        if getattr(result, "is_error", False) is True:
             raise RuntimeError("core candidate_propose returned isError=true")
         try:
             payload = _core_json_loads(self._result_text(result))

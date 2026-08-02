@@ -1951,3 +1951,38 @@ def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
     assert f"{schema_default:g} s" in text.replace("3600 s", f"{schema_default:g} s") or str(
         int(schema_default)
     ) in text, f"documented balanced default != schema default ({schema_default})"
+
+
+def test_list_json_keys_are_documented(tmp_path: Path) -> None:
+    """Every top-level key ``mms list --json`` emits must appear in the docs'
+    ``### list`` section.
+
+    Pinned against the live command rather than the prose alone: #811 added
+    ``config_valid`` / ``config_error`` while ``docs/cli.md`` still described
+    the output as ``{config_path, servers}``, and nothing failed. A key that
+    scripts branch on is exactly what a reader looks up in the docs.
+    """
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+    result = CliRunner().invoke(mms_cli, ["list", "--json", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    emitted = set(json.loads(result.stdout))
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `list`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    if not section_match:
+        pytest.fail("docs/cli.md must have a ### `list` section")
+    section = section_match.group(1)
+    # Either spelling counts: the shape blob quotes keys (`"config_path": ...`)
+    # while the surrounding prose backticks them.
+    undocumented = sorted(
+        key for key in emitted if f'"{key}"' not in section and f"`{key}`" not in section
+    )
+    assert not undocumented, (
+        f"docs/cli.md `list` section does not mention {undocumented} — "
+        "`mms list --json` emits them; document the key alongside the change."
+    )

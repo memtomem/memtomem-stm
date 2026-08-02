@@ -2461,7 +2461,7 @@ class TestAdvertiseOrder:
     dict and reinserts it, placing proxied tools first."""
 
     def _make_server(self, tool_names):
-        """Build a stand-in FastMCP with an insertion-ordered `_tool_manager._tools`.
+        """Build a stand-in server with an insertion-ordered `_tool_manager._tools`.
 
         Only the attribute path `_tool_manager._tools` matters — the
         function pops/inserts string keys and does not touch tool values,
@@ -2523,8 +2523,8 @@ class TestAdvertiseOrder:
         assert final[0] == "fs__read_file"
         assert set(final) == set(initial)  # nothing added or dropped
 
-    def test_reorder_survives_fastmcp_api_shift(self, caplog):
-        """If FastMCP renames/removes the private ``_tool_manager._tools``
+    def test_reorder_survives_sdk_api_shift(self, caplog):
+        """If the SDK renames/removes the private ``_tool_manager._tools``
         attribute, the reorder must degrade to a warning-and-skip rather
         than crashing server startup. Surfacing as a warning gives
         operators a visible signal in the log."""
@@ -2538,15 +2538,15 @@ class TestAdvertiseOrder:
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
             _move_stm_tools_to_end(server)  # must not raise
-        assert any("FastMCP internal API changed" in rec.message for rec in caplog.records), [
+        assert any("MCPServer internal API changed" in rec.message for rec in caplog.records), [
             r.message for r in caplog.records
         ]
 
-    async def test_reorder_pins_order_through_real_fastmcp_list_tools(self):
-        """End-to-end #228 pin against the real FastMCP instance.
+    async def test_reorder_pins_order_through_real_sdk_list_tools(self):
+        """End-to-end #228 pin against the real ``MCPServer`` instance.
 
         The stand-in tests above validate the helper's dict surgery, but a
-        FastMCP upgrade could change what ``_tool_manager._tools`` insertion
+        SDK upgrade could change what ``_tool_manager._tools`` insertion
         order *means* — e.g. a ``list_tools()`` that re-sorts, or a tool
         manager that stops preserving insertion order — and every stand-in
         test would stay green while the #228 advertise order silently

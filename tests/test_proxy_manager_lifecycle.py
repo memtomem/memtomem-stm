@@ -885,7 +885,7 @@ class TestConnectServerOverflowSkip:
             Tool(
                 name=n,
                 description=f"upstream tool {n}",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             )
             for n in tool_names
         ]
@@ -1285,11 +1285,11 @@ class TestOpenTransportHeaders:
         captured = {}
         sentinel = object()
 
-        def fake_streamablehttp_client(url, *, headers=None, timeout=30):
+        def fake_streamable_http_transport(url, *, headers=None, timeout=None):
             captured.update({"url": url, "headers": headers, "timeout": timeout})
             return sentinel
 
-        monkeypatch.setattr(mod, "streamablehttp_client", fake_streamablehttp_client)
+        monkeypatch.setattr(mod, "streamable_http_transport", fake_streamable_http_transport)
 
         cfg = UpstreamServerConfig(
             prefix="api",
@@ -1301,8 +1301,14 @@ class TestOpenTransportHeaders:
         mgr = _make_manager(servers={"api": cfg})
 
         assert mgr._open_transport(cfg) is sentinel
-        assert captured == {
-            "url": "https://up.example/mcp",
-            "headers": {"X-Project": "stm"},
-            "timeout": 12.0,
-        }
+        assert captured["url"] == "https://up.example/mcp"
+        assert captured["headers"] == {"X-Project": "stm"}
+        # mcp 2.0 carries the timeouts on an httpx2 client rather than as
+        # ``timeout=`` / ``sse_read_timeout=`` kwargs. All four legs are pinned:
+        # the connect budget applies to connect/write/pool, while the read leg
+        # keeps the SDK's long default so a live stream is not killed by it.
+        timeout = captured["timeout"]
+        assert timeout.connect == 12.0
+        assert timeout.write == 12.0
+        assert timeout.pool == 12.0
+        assert timeout.read == 300.0

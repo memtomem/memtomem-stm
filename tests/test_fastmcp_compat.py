@@ -1,4 +1,4 @@
-"""Unit tests for the FastMCP compatibility layer.
+"""Unit tests for the MCPServer compatibility layer.
 
 Focused on the ``_tag_annotations_title`` helper that prepends a ``[server]``
 scope tag to ``ToolAnnotations.title`` for ``/mcp`` picker disambiguation.
@@ -8,14 +8,14 @@ from __future__ import annotations
 
 # CallToolResult is module-level so the ``-> CallToolResult`` string
 # annotation on test handlers resolves in this module's globals when
-# FastMCP's func_metadata eval's it.
-from mcp.types import CallToolResult, ToolAnnotations
+# the SDK's func_metadata eval's it.
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from memtomem_stm.proxy._fastmcp_compat import _tag_annotations_title
 
 
 def test_tag_title_prepends_server_when_title_present() -> None:
-    annotations = ToolAnnotations(title="Close browser", destructiveHint=True)
+    annotations = ToolAnnotations(title="Close browser", destructive_hint=True)
     tagged = _tag_annotations_title(annotations, "playwright")
     assert tagged is not annotations  # copy-on-write
     assert tagged.title == "[playwright] Close browser"
@@ -24,16 +24,16 @@ def test_tag_title_prepends_server_when_title_present() -> None:
 def test_tag_title_preserves_other_hint_fields() -> None:
     annotations = ToolAnnotations(
         title="Read file",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     )
     tagged = _tag_annotations_title(annotations, "fs")
-    assert tagged.readOnlyHint is True
-    assert tagged.destructiveHint is False
-    assert tagged.idempotentHint is True
-    assert tagged.openWorldHint is False
+    assert tagged.read_only_hint is True
+    assert tagged.destructive_hint is False
+    assert tagged.idempotent_hint is True
+    assert tagged.open_world_hint is False
 
 
 def test_tag_title_returns_none_unchanged_when_annotations_is_none() -> None:
@@ -41,13 +41,13 @@ def test_tag_title_returns_none_unchanged_when_annotations_is_none() -> None:
 
 
 def test_tag_title_passthrough_when_title_missing() -> None:
-    annotations = ToolAnnotations(readOnlyHint=True)
+    annotations = ToolAnnotations(read_only_hint=True)
     tagged = _tag_annotations_title(annotations, "Context7")
     assert tagged is annotations
 
 
 def test_tag_title_passthrough_when_title_empty_string() -> None:
-    annotations = ToolAnnotations(title="", readOnlyHint=True)
+    annotations = ToolAnnotations(title="", read_only_hint=True)
     tagged = _tag_annotations_title(annotations, "Context7")
     assert tagged is annotations
 
@@ -150,8 +150,8 @@ def test_to_call_tool_result_wraps_str_like_lowlevel_synthesis() -> None:
     # Exactly the envelope the lowlevel server synthesizes for a str return.
     assert res == CallToolResult(
         content=[TextContent(type="text", text="hello")],
-        structuredContent=None,
-        isError=False,
+        structured_content=None,
+        is_error=False,
     )
 
 
@@ -163,8 +163,8 @@ def test_to_call_tool_result_wraps_block_list() -> None:
     blocks = [TextContent(type="text", text="a"), TextContent(type="text", text="b")]
     res = to_call_tool_result(blocks)
     assert res.content == blocks
-    assert res.structuredContent is None
-    assert res.isError is False
+    assert res.structured_content is None
+    assert res.is_error is False
 
 
 def test_to_call_tool_result_passes_envelope_through_identically() -> None:
@@ -174,9 +174,9 @@ def test_to_call_tool_result_passes_envelope_through_identically() -> None:
 
     envelope = CallToolResult(
         content=[TextContent(type="text", text="t")],
-        structuredContent={"a": 1},
+        structured_content={"a": 1},
         _meta={"m": 2},
-        isError=True,
+        is_error=True,
     )
     assert to_call_tool_result(envelope) is envelope
 
@@ -197,12 +197,12 @@ def test_proxy_func_metadata_never_validates_call_tool_result() -> None:
         output_model=None,
         wrap_output=False,
     )
-    envelope = CallToolResult(content=[], structuredContent={"unvalidated": True})
+    envelope = CallToolResult(content=[], structured_content={"unvalidated": True})
     assert md.convert_result(envelope) is envelope
 
 
 class _RecordingTool:
-    """Plain-attribute stand-in for FastMCP's registered Tool."""
+    """Plain-attribute stand-in for the SDK's registered Tool."""
 
 
 def _register(info):
@@ -262,14 +262,14 @@ def test_register_carries_output_schema_on_fn_metadata() -> None:
 
 
 async def test_real_fastmcp_advertises_output_schema_and_meta() -> None:
-    # End-to-end through a real FastMCP: tools/list must carry the upstream
+    # End-to-end through a real MCPServer: tools/list must carry the upstream
     # outputSchema (via the fn_metadata overwrite feeding the Tool.output_schema
     # cached_property) and the tool-level _meta (via add_tool meta=). The
     # handler's bare ``-> CallToolResult`` annotation mirrors the real
     # server.py handler, including that CallToolResult resolves in the
     # DEFINING module's globals — a function-local import NameErrors inside
     # func_metadata and silently degrades registration (caught here first).
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
     from memtomem_stm.proxy.manager import ProxyToolInfo
@@ -280,7 +280,7 @@ async def test_real_fastmcp_advertises_output_schema_and_meta() -> None:
     async def handler(**kwargs: object) -> CallToolResult:
         raise NotImplementedError
 
-    server = FastMCP("test")
+    server = MCPServer("test")
     register_proxy_tool(
         server,
         handler,
@@ -296,5 +296,78 @@ async def test_real_fastmcp_advertises_output_schema_and_meta() -> None:
     )
     tools = await server.list_tools()
     (tool,) = [t for t in tools if t.name == "srv__tool"]
-    assert tool.outputSchema == schema
+    assert tool.output_schema == schema
     assert tool.meta == meta
+
+
+async def test_proxy_tool_round_trips_over_the_wire() -> None:
+    """The registration tests above assert what the shim *writes*; this one
+    asserts the SDK still *reads* it.
+
+    ``register_proxy_tool`` overwrites private attributes (``fn_metadata``,
+    ``parameters``) on a registered Tool. Those writes can keep succeeding
+    while an SDK release quietly stops consulting them — the schema surgery
+    would then be a no-op that no attribute-level assertion notices. Driving
+    a real client through an in-memory transport is the only shape that
+    catches it: it pins the advertised schemas AND that arbitrary kwargs
+    (which the signature-derived model would reject) reach the handler.
+
+    Uses ``mcp.client._memory``, a private module — deliberately, and no
+    worse than the SDK internals the shim itself rides on.
+    """
+    from mcp import ClientSession
+    from mcp.client._memory import InMemoryTransport
+    from mcp.server.mcpserver import MCPServer
+
+    from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+    from memtomem_stm.proxy.manager import ProxyToolInfo
+
+    input_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}, "opts": {"type": "object"}},
+        "required": ["query"],
+    }
+    output_schema = {"type": "object", "properties": {"answer": {"type": "integer"}}}
+    seen: dict[str, object] = {}
+
+    async def handler(**kwargs: object) -> CallToolResult:
+        seen.update(kwargs)
+        # Structured content is required of a tool that advertises an output
+        # schema — the mcp 2.0 *client* validates that pairing on receipt.
+        return CallToolResult(
+            content=[TextContent(type="text", text="ok")],
+            structured_content={"answer": 42},
+        )
+
+    server = MCPServer("wire-test")
+    register_proxy_tool(
+        server,
+        handler,
+        ProxyToolInfo(
+            prefixed_name="srv__tool",
+            description="desc",
+            input_schema=input_schema,
+            server="srv",
+            original_name="tool",
+            output_schema=output_schema,
+            meta={"origin": "upstream"},
+        ),
+    )
+
+    async with InMemoryTransport(server) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+            (tool,) = [t for t in listed.tools if t.name == "srv__tool"]
+            assert tool.input_schema == input_schema
+            assert tool.output_schema == output_schema
+
+            result = await session.call_tool(
+                "srv__tool", {"query": "hello", "opts": {"nested": [1, 2]}}
+            )
+
+    assert result.is_error is not True
+    assert result.structured_content == {"answer": 42}
+    # The signature-derived model would have collapsed these into a single
+    # ``kwargs`` field (or rejected them outright).
+    assert seen == {"query": "hello", "opts": {"nested": [1, 2]}}

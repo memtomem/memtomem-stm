@@ -112,7 +112,7 @@ def _text_content(text: str):
 
 
 def _make_result(text: str, is_error: bool = False):
-    return SimpleNamespace(content=[_text_content(text)], isError=is_error)
+    return SimpleNamespace(content=[_text_content(text)], is_error=is_error)
 
 
 def _make_manager() -> ProxyManager:
@@ -611,7 +611,7 @@ class TestTraceIdUpstreamPropagation:
         mgr = _make_manager()
         session = mgr._connections["srv"].session
         session.call_tool.return_value = SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="ok")], isError=False
+            content=[SimpleNamespace(type="text", text="ok")], is_error=False
         )
 
         await mgr.call_tool("srv", "tool", {"q": "test"})
