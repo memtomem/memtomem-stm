@@ -60,16 +60,20 @@ are metrics-only by design.
 
 ## Recovering from a broken config file
 
-`~/.memtomem/stm_proxy.json` is plain JSON, and hand edits can break it two
-ways with different symptoms:
+`~/.memtomem/stm_proxy.json` is plain JSON, and hand edits break it in three
+ways with sharply different symptoms — the third one is silent:
 
 - **Invalid JSON** (truncated file, stray comma): `status`, `list`, and most
   commands fail with the parse position; `doctor` FAILs at the `config JSON`
   check. Nothing else is damaged — fix or restore the file.
-- **Valid JSON, invalid schema** (wrong type, misspelled key): the running
-  server silently falls back to env/defaults, and `status`/`list` print a
-  `fails validation` warning. Misspelled keys are *ignored* at runtime; only
-  `mms config validate` reports them, with the dotted path.
+- **Valid JSON, invalid schema** (a wrong *type* — `"enabled": "yes"`): the
+  running server silently falls back to env/defaults, and `status`, `list`,
+  and `health` print a `fails validation` warning.
+- **Valid JSON, unknown key** (a misspelling — `"compresion"`): a different
+  and quieter failure. The schema is `extra="ignore"` for forward
+  compatibility, so an unknown key is neither an error nor a fallback — the
+  setting you meant to change simply never takes effect, and nothing warns.
+  `mms config validate` is the only command that reports it.
 
 Recovery order:
 
@@ -79,9 +83,14 @@ Recovery order:
    them all; `status` and `list` name just the first.
 2. Fix the named line, or restore a backup. Backups that may already exist:
    - `stm_proxy.json.bak-<UTC>` next to the config — written by every
-     `mms tune --apply`.
-   - `~/.memtomem/pruned_upstreams.json` — the prune backup log; `mms eject`
-     can rebuild host entries from it.
+     `mms tune --apply`. This is the one you can restore from directly
+     (`cp` it back over the config; a running proxy hot-reloads it).
+   - `~/.memtomem/pruned_upstreams.json` — an append-only record of host
+     entries removed by `--prune`. Read it by hand to recover what an
+     upstream looked like. It is not a restore path for *this* file, and
+     `mms eject` only reads it to *suggest* a `--to` target — it never
+     adopts a row automatically, and it cannot run at all while the config
+     is unparseable.
 3. Re-run `mms config validate` until it prints `OK`, then `mms doctor`.
 4. If the file is beyond repair, delete it and re-run `mms init` (or
    `mms add --from-clients` to re-import from host configs).
@@ -112,10 +121,13 @@ mms daemon stop --all
    eject` when the last upstream leaves).
 4. **Daemon** — `mms daemon stop --all` also reaps daemons left by older
    configs.
-5. **State on disk** — remove the data directories: `rm -rf ~/.memtomem
+5. **State on disk** — remove the home data directories: `rm -rf ~/.memtomem
    ~/.mms` (configs, metrics/feedback DBs, locks, logs, prune backups, and
    the `stm_proxy.json.bak-<UTC>` copies each `mms tune --apply` leaves next
-   to the config). Host-settings backups are **not** here — see step 1.
+   to the config). Two kinds of state live outside them: host-settings
+   backups (step 1), and any per-project `<project>/.mms/project.toml`
+   written by `mms project init` — that one is a committed file, so remove
+   it in the project repo rather than with a blanket `rm`.
 6. **Package** — `uv tool uninstall memtomem-stm` or `pip uninstall
    memtomem-stm`.
 
