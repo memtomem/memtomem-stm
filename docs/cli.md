@@ -133,6 +133,16 @@ preserves the config and re-enters client registration; use [`register`](#regist
 to run registration directly, [`add`](#add) to add servers, or [`list`](#list)
 to inspect the current state. No path silently clobbers existing configuration.
 
+`--freshness` picks the response cache's global TTL (`cache.default_ttl_seconds`) for the new config:
+
+| Preset | TTL written | Meaning |
+|--------|-------------|---------|
+| `live` | `0` | never serve a cached response — every call hits the upstream |
+| `balanced` (default) | *(none written)* | schema default of 3600 s (1 h) applies |
+| `reuse` | `86400` | serve cached responses for up to a day — cheapest, staleness-tolerant |
+
+It only seeds the initial value; edit `cache.default_ttl_seconds` (or per-tool/per-server `cache_ttl_seconds`) later — see [caching](caching.md).
+
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
 When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop), `init` leaves the direct registrations in place by default — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
