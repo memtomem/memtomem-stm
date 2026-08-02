@@ -11727,8 +11727,7 @@ class TestDoctor:
 
         dependency = proxy_mod._OllamaDependency(
             "http://ollama.test:11434",
-            ("nomic-embed-text",),
-            ("embedding scorer",),
+            (("nomic-embed-text", ("embedding scorer",)),),
         )
         real_async_client = httpx.AsyncClient
         requests = []
@@ -11764,8 +11763,7 @@ class TestDoctor:
 
         dependency = proxy_mod._OllamaDependency(
             "http://ollama.test:11434",
-            ("nomic-embed-text",),
-            ("embedding scorer",),
+            (("nomic-embed-text", ("embedding scorer",)),),
         )
         real_async_client = httpx.AsyncClient
         cases = [
@@ -11808,17 +11806,19 @@ class TestDoctor:
 
         from memtomem_stm.cli import proxy as proxy_mod
 
-        base_url = "http://alice:super-secret@ollama.test:11434"
+        # A password httpx must percent-encode: its exception text embeds the
+        # NORMALIZED request URL, which plain configured-string replacement
+        # misses — the round-trippable encoded form must be scrubbed too.
+        base_url = "http://alice:super secret@ollama.test:11434"
         dependency = proxy_mod._OllamaDependency(
             base_url,
-            ("nomic-embed-text",),
-            ("embedding scorer",),
+            (("nomic-embed-text", ("embedding scorer",)),),
         )
         real_async_client = httpx.AsyncClient
 
         def handler(request):
             raise httpx.ConnectError(
-                f"could not connect to {base_url}",
+                f"could not connect to {request.url}",
                 request=request,
             )
 
@@ -11831,8 +11831,209 @@ class TestDoctor:
 
         result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
         assert result.error is not None
-        assert "super-secret" not in result.error
+        assert "super secret" not in result.error
+        assert "super%20secret" not in result.error
         assert "***@ollama.test" in result.error
+
+    def test_ollama_client_setup_failure_renders_fail_not_crash(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+
+        def broken_client(**kwargs):
+            raise FileNotFoundError("/nonexistent/ca-bundle.pem")
+
+        monkeypatch.setattr(httpx, "AsyncClient", broken_client)
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert result.error is not None
+        assert result.error.startswith("FileNotFoundError")
+
+    def test_ollama_stalled_response_hits_whole_request_deadline(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+
+        # MockTransport bypasses socket I/O, so httpx's per-phase timeouts
+        # never fire — only the probe's whole-request deadline can end this.
+        async def handler(request):
+            await asyncio.sleep(5)
+            return httpx.Response(200, json={"models": []})
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 1))[0]
+        assert result.error is not None
+        assert result.error.startswith("TimeoutError")
+
+    def test_collect_ollama_dependencies_matches_runtime_precedence(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+        from memtomem_stm.proxy.config import ProxyConfig
+
+        def collect(config_dict):
+            return proxy_mod._collect_ollama_dependencies(ProxyConfig.model_validate(config_dict))
+
+        base_server = {"prefix": "fk", "transport": "stdio", "command": "x"}
+        llm = {"provider": "ollama", "model": "qwen3:4b"}
+
+        # Explicit `compression: auto` wins over a global llm_summary default:
+        # the attached llm block is dormant (mirrors _resolve_tool_config).
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "default_compression": "llm_summary",
+                "upstream_servers": {"fake": {**base_server, "compression": "auto", "llm": llm}},
+            }
+        )
+        assert (deps, missing) == ([], [])
+
+        # An omitted server compression inherits the global default.
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "default_compression": "llm_summary",
+                "upstream_servers": {"fake": {**base_server, "llm": llm}},
+            }
+        )
+        assert missing == []
+        assert [dep.models for dep in deps] == [("qwen3:4b",)]
+
+        # A tool override steering compression away drops that site; one
+        # adding only a model rides the inherited llm_summary strategy.
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "upstream_servers": {
+                    "fake": {
+                        **base_server,
+                        "compression": "llm_summary",
+                        "llm": llm,
+                        "tool_overrides": {
+                            "plain": {"compression": "truncate"},
+                            "special": {"llm": {"provider": "ollama", "model": "gemma3"}},
+                        },
+                    }
+                },
+            }
+        )
+        assert missing == []
+        assert [dep.models for dep in deps] == [("gemma3", "qwen3:4b")]
+        usage_by_model = dict(deps[0].model_usages)
+        assert usage_by_model["gemma3"] == ("server 'fake' tool 'special'",)
+
+        # An empty embedding_base_url is preserved verbatim — the runtime
+        # scorer uses the configured value as written (and would fall back to
+        # BM25), so doctor must not substitute localhost and PASS.
+        deps, missing = collect(
+            {
+                "enabled": True,
+                "relevance_scorer": {"scorer": "embedding", "embedding_base_url": ""},
+                "upstream_servers": {"fake": dict(base_server)},
+            }
+        )
+        assert missing == []
+        assert [(dep.base_url, dep.models) for dep in deps] == [("", ("nomic-embed-text",))]
+        assert "base_url" in proxy_mod._ollama_next_action("", [])
+
+    def test_missing_llm_block_fails_that_site_but_still_probes_others(
+        self, runner, config, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "default_compression": "llm_summary",
+                    "relevance_scorer": {"scorer": "embedding"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        probed = []
+
+        async def fake_probe_ollama(dependencies, timeout):
+            probed.extend(dep.base_url for dep in dependencies)
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "llm_summary has no effective llm block" in result.output
+        # The embedding dependency is independent of the misconfigured LLM
+        # site and is still probed — the FAIL is per site, not global.
+        assert probed == ["http://localhost:11434"]
+
+    def test_missing_model_message_names_only_its_use_sites(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "relevance_scorer": {"scorer": "embedding"},
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fk",
+                            "transport": "stdio",
+                            "command": "x",
+                            "compression": "llm_summary",
+                            "llm": {"provider": "ollama", "model": "qwen3:4b"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(
+                    dependencies[0], frozenset({"nomic-embed-text:latest"})
+                )
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1
+        assert "qwen3:4b (used by server 'fake')" in result.output
+        missing_clause = result.output.split("missing model(s):", 1)[1].split(";", 1)[0]
+        assert "embedding scorer" not in missing_clause
 
     def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
         """LTM 미설정 scenario: WARN with the ratified messaging — names

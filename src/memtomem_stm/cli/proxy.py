@@ -7108,8 +7108,18 @@ class _OllamaDependency:
     """One unique Ollama inventory endpoint needed by active proxy features."""
 
     base_url: str
-    models: tuple[str, ...]
-    usages: tuple[str, ...]
+    model_usages: tuple[tuple[str, tuple[str, ...]], ...]
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        return tuple(model for model, _ in self.model_usages)
+
+    @property
+    def usages(self) -> tuple[str, ...]:
+        merged: set[str] = set()
+        for _, usages in self.model_usages:
+            merged.update(usages)
+        return tuple(sorted(merged))
 
 
 @dataclass(frozen=True)
@@ -7119,10 +7129,17 @@ class _OllamaProbeResult:
     error: str | None = None
 
 
-def _effective_ollama_base_url(base_url: str | None) -> str:
-    """Match the runtime clients' empty-URL fallback and trailing-slash handling."""
-    value = (base_url or "").strip().rstrip("/")
-    return value or _DEFAULT_OLLAMA_BASE_URL
+def _effective_ollama_base_url(base_url: str | None, default: str) -> str:
+    """Mirror the runtime clients: fall back only where they do, then rstrip.
+
+    The LLM compressor substitutes the Ollama default for a falsy ``base_url``;
+    the embedding scorer uses the configured value verbatim (its omitted-field
+    default lives in the config validator, which never rewrites ``""``). Doctor
+    must not normalize further — an empty or whitespace-bearing URL has to
+    probe exactly as brokenly as it runs, or doctor passes a config the
+    runtime silently degrades on.
+    """
+    return (base_url or default).rstrip("/")
 
 
 def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], list[str]]:
@@ -7140,15 +7157,16 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
     groups: dict[str, dict[str, set[str]]] = {}
     missing_llm_sites: set[str] = set()
 
-    def add(base_url: str | None, model: str, usage: str) -> None:
-        endpoint = _effective_ollama_base_url(base_url)
-        group = groups.setdefault(endpoint, {"models": set(), "usages": set()})
-        group["models"].add(model)
-        group["usages"].add(usage)
+    def add(endpoint: str, model: str, usage: str) -> None:
+        groups.setdefault(endpoint, {}).setdefault(model, set()).add(usage)
 
     scorer = config.relevance_scorer
     if scorer.scorer == "embedding" and scorer.embedding_provider == "ollama":
-        add(scorer.embedding_base_url, scorer.embedding_model, "embedding scorer")
+        add(
+            _effective_ollama_base_url(scorer.embedding_base_url, default=""),
+            scorer.embedding_model,
+            "embedding scorer",
+        )
 
     def collect_llm_site(strategy: Any, llm: Any, usage: str) -> None:
         if strategy != CompressionStrategy.LLM_SUMMARY:
@@ -7156,7 +7174,11 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
         if llm is None:
             missing_llm_sites.add(usage)
         elif llm.provider == LLMProvider.OLLAMA:
-            add(llm.base_url, llm.model, usage)
+            add(
+                _effective_ollama_base_url(llm.base_url, default=_DEFAULT_OLLAMA_BASE_URL),
+                llm.model,
+                usage,
+            )
 
     for server_name, server in config.upstream_servers.items():
         server_strategy = (
@@ -7183,8 +7205,9 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
     dependencies = [
         _OllamaDependency(
             base_url=base_url,
-            models=tuple(sorted(group["models"])),
-            usages=tuple(sorted(group["usages"])),
+            model_usages=tuple(
+                (model, tuple(sorted(usages))) for model, usages in sorted(group.items())
+            ),
         )
         for base_url, group in sorted(groups.items())
     ]
@@ -7192,10 +7215,14 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
 
 
 def _ollama_model_key(model: str) -> str:
-    """Canonicalize Ollama's implicit ``:latest`` tag for inventory matching."""
-    value = model.strip()
-    tail = value.rsplit("/", 1)[-1]
-    return value if ":" in tail else f"{value}:latest"
+    """Canonicalize Ollama's implicit ``:latest`` tag for inventory matching.
+
+    The configured name is otherwise compared verbatim — the runtime sends it
+    as written, so doctor must not repair (e.g. whitespace-strip) a name the
+    server would reject.
+    """
+    tail = model.rsplit("/", 1)[-1]
+    return model if ":" in tail else f"{model}:latest"
 
 
 async def _probe_ollama_dependencies(
@@ -7206,16 +7233,33 @@ async def _probe_ollama_dependencies(
     # the CLI's own load path must not require one.
     import httpx
 
+    def redact(text: str, base_url: str) -> str:
+        # httpx normalizes userinfo (e.g. percent-encodes a password), so the
+        # configured URL alone can miss the variant its errors embed.
+        out = redact_exception_text(text, base_url)
+        try:
+            normalized = str(httpx.URL(base_url))
+        except Exception:
+            return out
+        return redact_exception_text(out, normalized)
+
+    def failure(dependency: _OllamaDependency, exc: Exception) -> _OllamaProbeResult:
+        detail = redact(str(exc), dependency.base_url)
+        return _OllamaProbeResult(
+            dependency,
+            error=f"{type(exc).__name__}: {detail or 'request failed'}",
+        )
+
     async def probe(client: httpx.AsyncClient, dependency: _OllamaDependency) -> _OllamaProbeResult:
         inventory_url = f"{dependency.base_url}/api/tags"
         try:
-            response = await client.get(inventory_url)
+            # httpx timeouts are per phase (connect/read/...); this outer
+            # deadline is the whole-request bound ``--timeout`` promises, so a
+            # trickling inventory body cannot stall doctor past it.
+            async with asyncio.timeout(timeout):
+                response = await client.get(inventory_url)
         except Exception as exc:  # external endpoint boundary; doctor must render, not crash
-            detail = redact_exception_text(str(exc), dependency.base_url)
-            return _OllamaProbeResult(
-                dependency,
-                error=f"{type(exc).__name__}: {detail or 'request failed'}",
-            )
+            return failure(dependency, exc)
 
         if not 200 <= response.status_code < 300:
             return _OllamaProbeResult(dependency, error=f"HTTP {response.status_code}")
@@ -7238,8 +7282,13 @@ async def _probe_ollama_dependencies(
             available.add(_ollama_model_key(name))
         return _OllamaProbeResult(dependency, frozenset(available))
 
-    async with httpx.AsyncClient(timeout=float(timeout), follow_redirects=False) as client:
-        return list(await asyncio.gather(*(probe(client, dep) for dep in dependencies)))
+    try:
+        async with httpx.AsyncClient(timeout=float(timeout), follow_redirects=False) as client:
+            return list(await asyncio.gather(*(probe(client, dep) for dep in dependencies)))
+    except Exception as exc:
+        # Client construction/teardown can raise before any probe runs (e.g.
+        # an invalid SSL_CERT_FILE); render it as endpoint FAILs, not a crash.
+        return [failure(dependency, exc) for dependency in dependencies]
 
 
 def _ollama_check_id(base_url: str) -> str:
@@ -7257,6 +7306,10 @@ def _is_loopback_ollama(base_url: str) -> bool:
 
 
 def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
+    if not base_url.startswith(("http://", "https://")):
+        # An empty/relative URL never reaches a server; "ollama serve" or
+        # "ollama pull" cannot fix it.
+        return f"set a valid base_url for this endpoint; see {_OLLAMA_SETUP_DOC}"
     if not _is_loopback_ollama(base_url):
         return f"verify the remote Ollama host and models; see {_OLLAMA_SETUP_DOC}"
     return (
@@ -7662,20 +7715,25 @@ def doctor(
                             )
                             continue
 
-                        missing_models = [
-                            model
-                            for model in dependency.models
+                        missing = [
+                            (model, model_usages)
+                            for model, model_usages in dependency.model_usages
                             if _ollama_model_key(model) not in probe.available_models
                         ]
-                        if missing_models:
+                        if missing:
+                            described = ", ".join(
+                                f"{model} (used by {', '.join(model_usages)})"
+                                for model, model_usages in missing
+                            )
                             check(
                                 check_id,
                                 "Ollama endpoint",
                                 "FAIL",
-                                f"{display_url}: missing model(s): "
-                                f"{', '.join(missing_models)}; used by {usages}; "
+                                f"{display_url}: missing model(s): {described}; "
                                 f"see {_OLLAMA_SETUP_DOC}",
-                                _ollama_next_action(dependency.base_url, missing_models),
+                                _ollama_next_action(
+                                    dependency.base_url, [model for model, _ in missing]
+                                ),
                             )
                         else:
                             check(
