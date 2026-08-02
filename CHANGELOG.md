@@ -11,6 +11,39 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- **Migrated to the `mcp` 2.0 SDK; the requirement is now `mcp[cli]>=2,<3`**
+  (#801). 0.1.45 capped below 2.0 because the SDK removed both
+  `streamablehttp_client` and `mcp.server.fastmcp`. The proxy now builds on
+  `mcp.server.mcpserver.MCPServer` and `streamable_http_client`, and declares
+  `httpx2` directly — 2.0 moved its HTTP client there, and streamable-HTTP
+  upstream headers/timeouts now ride an injected `httpx2.AsyncClient` instead
+  of `timeout=`/`sse_read_timeout=` keyword arguments (same budgets: the
+  connect timeout covers connect/write/pool, the read leg keeps the SDK's
+  long default so live streams are not cut short).
+  **Behavior change**: the floor is hard — the SDK supports no dual 1.x/2.x
+  codebase — so **memtomem-stm and memtomem core must be upgraded together**;
+  a resolver will refuse a mix of one package on `mcp` 1.x and one on 2.x.
+  The proxy's own wire behavior is unchanged.
+- **Fixed a silent drop of `tools/list_changed` under the 2.0 SDK.** 2.0 turned
+  `ServerNotification` from a RootModel into a plain union, so the notification
+  handler receives the notification itself and the previous `.root` unwrap
+  would have matched nothing — leaving the cache-eligibility gate replaying a
+  stale read-only verdict after an upstream re-declared a tool (#557's
+  failure mode). The handler now matches the notification directly.
+
+## [0.1.45] — 2026-08-01
+
+Emergency patch: a fresh, unconstrained install of 0.1.44 or earlier from
+PyPI fails at import once `mcp` 2.0.0 is the newest release. The dependency
+declared no upper bound, so resolution picked up an SDK that had removed both
+`streamablehttp_client` and `mcp.server.fastmcp`. Installs that pinned `mcp`
+themselves — including the `uvx` command in the reviewed-resume guide, which
+already carries `mcp<2` — are unaffected, as is any environment already
+resolved against 1.x. Upgrade if your install is broken; nothing else in this
+release changes observable behavior.
+
 ### Security
 
 - docs: `SECURITY.md` corrects two published claims that were broader than the
@@ -56,6 +89,13 @@ changes inline only. See the deprecation policy in
   command STM uses to launch the LTM server. `uvx` resolves its own
   environment, so pinning only the `uv tool install` left the actual Core
   process free to resolve `mcp` 2.x. (#800)
+- deps: STM's own `mcp[cli]` requirement is capped at `<2`, so a fresh install
+  from the index no longer resolves `mcp` 2.x. 2.0 removed both
+  `streamablehttp_client` and `mcp.server.fastmcp`, which the proxy imports at
+  module scope — every install of 0.1.44 and earlier made after 2.0 shipped
+  failed at import. `uv.lock` pinned 1.x, so CI and checkout-based development
+  never resolved 2.0 and the break was visible only on the install-from-index
+  path. The cap is a stopgap; #801 tracks the migration that lifts it. (#802)
 
 ## [0.1.44] — 2026-07-30
 

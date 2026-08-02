@@ -125,7 +125,7 @@ def _fake_tool(name: str, description: str = "", schema: dict | None = None):
     return SimpleNamespace(
         name=name,
         description=description,
-        inputSchema=schema or {"type": "object"},
+        input_schema=schema or {"type": "object"},
         annotations=None,
     )
 

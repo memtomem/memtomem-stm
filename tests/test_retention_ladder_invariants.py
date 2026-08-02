@@ -61,7 +61,7 @@ class TestCountMarkdownHeadings:
 
 
 def _make_result(text: str):
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], isError=False)
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], is_error=False)
 
 
 def _make_manager(

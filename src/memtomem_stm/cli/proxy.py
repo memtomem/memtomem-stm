@@ -5996,10 +5996,13 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     ``env``/``headers`` values (and URL credentials) before being stored —
     ``health``/``doctor`` render ``error`` verbatim.
     """
+    import httpx2
+
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
+
+    from memtomem_stm.utils.mcp_transport import streamable_http_transport
 
     deadline = asyncio.get_running_loop().time() + timeout
 
@@ -6034,11 +6037,14 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
             )
         else:
             sdk_timeout = remaining()
-            ctx = streamablehttp_client(
+            # ``Timeout(sdk_timeout)`` sets connect/write/pool, and the
+            # explicit ``read=`` keeps the probe's single deadline on every
+            # leg — the 1.x call passed ``timeout`` and ``sse_read_timeout``
+            # the same way.
+            ctx = streamable_http_transport(
                 cfg.get("url", ""),
                 headers=cfg.get("headers"),
-                timeout=sdk_timeout,
-                sse_read_timeout=sdk_timeout,
+                timeout=httpx2.Timeout(sdk_timeout, read=sdk_timeout),
             )
 
         async with AsyncExitStack() as stack:
@@ -6154,10 +6160,13 @@ async def _probe_ltm_mcp_server(
     fd-backed sink — ``stdio_client`` forwards this to
     ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
     """
+    import httpx2
+
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
+
+    from memtomem_stm.utils.mcp_transport import streamable_http_transport
 
     deadline = asyncio.get_running_loop().time() + timeout
 
@@ -6176,11 +6185,11 @@ async def _probe_ltm_mcp_server(
             sse_read_timeout=sdk_timeout,
         )
     elif transport == "streamable_http":
-        ctx = streamablehttp_client(
+        # Same mapping as ``_probe_one``: one probe deadline on every leg.
+        ctx = streamable_http_transport(
             url,
             headers=headers,
-            timeout=sdk_timeout,
-            sse_read_timeout=sdk_timeout,
+            timeout=httpx2.Timeout(sdk_timeout, read=sdk_timeout),
         )
     else:
         params = StdioServerParameters(command=command, args=args)
