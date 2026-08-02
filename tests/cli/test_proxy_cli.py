@@ -909,6 +909,87 @@ class TestConfigLoad:
         assert data["error"] == "config_not_found"
         assert str(config) in data["path"]
 
+    def test_list_warns_on_schema_invalid_config(self, runner, config):
+        """A schema-invalid config makes a running server ignore the whole
+        file, so this table shows servers that are NOT being proxied.
+        ``status`` has warned since #611; ``list`` used to render silently,
+        and it is the one command users run to see their servers.
+
+        (A *structurally* broken config — ``upstream_servers`` that is not an
+        object — never reaches here: ``_load`` exits 1 naming the field.)"""
+        config.write_text(
+            json.dumps({"enabled": "yes-please", "upstream_servers": {}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "fails validation" in result.output
+        assert "falls back to env/defaults" in result.output
+        assert "No upstream servers configured" in result.output
+
+    def test_list_stays_silent_when_env_overrides_fix_the_file(self, runner, config, monkeypatch):
+        """The warning claims what a *running server* does, so it has to be
+        computed the way the server composes its config: env over file. The
+        exact file below warns when validated alone; with the env var set the
+        server starts fine, `status` and `health` say nothing, and `list` must
+        agree with them rather than raise a false alarm."""
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+        config.write_text(
+            json.dumps({"enabled": "yes-please", "upstream_servers": {}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert "fails validation" not in result.output
+
+        # Positive control: the same file without the override still warns,
+        # so the assertion above is about the overlay and not about the
+        # fixture having quietly become valid.
+        monkeypatch.delenv("MEMTOMEM_STM_PROXY__ENABLED")
+        assert "fails validation" in runner.invoke(cli, ["list", *_cfg_args(config)]).output
+
+    def test_list_json_config_valid_follows_the_env_overlay(self, runner, config, monkeypatch):
+        """`config_valid` is the same verdict as the text warning — the JSON
+        path must not keep the file-only answer the text path dropped."""
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+        config.write_text(
+            json.dumps({"enabled": "yes-please", "upstream_servers": {}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is True
+        assert data["config_error"] is None
+
+    def test_list_json_flags_schema_invalid_config(self, runner, config):
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": "yes-please",
+                    "upstream_servers": {"a": {"prefix": "a", "command": "a"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is False
+        assert "enabled" in data["config_error"]
+        assert "a" in data["servers"]
+
+    def test_list_json_valid_config_reports_valid(self, runner, config):
+        config.write_text(
+            json.dumps({"upstream_servers": {"a": {"prefix": "a", "command": "a"}}}),
+            encoding="utf-8",
+        )
+        result = runner.invoke(cli, ["list", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["config_valid"] is True
+        assert data["config_error"] is None
+
 
 # ── status command ───────────────────────────────────────────────────────
 
