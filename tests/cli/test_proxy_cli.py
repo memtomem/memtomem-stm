@@ -12345,6 +12345,17 @@ class TestDoctor:
         assert "base_url" in proxy_mod._ollama_next_action("http://", [])
         assert "base_url" in proxy_mod._ollama_next_action("ftp://ollama.test:11434", [])
         assert "base_url" in proxy_mod._ollama_next_action("http://localhost:notaport", [])
+        # An empty '?' / '#' delimiter is erased by urlsplit but survives in
+        # the raw value the probe appends /api/tags to, so the endpoint can
+        # never be reached as configured — no runnable command applies.
+        for url in (
+            "http://localhost:11434?",
+            "http://localhost:11434#",
+            "http://localhost:11434/?",
+        ):
+            hint = proxy_mod._ollama_next_action(url, [])
+            assert "base_url" in hint, url
+            assert "ollama serve" not in hint, url
 
     def test_ollama_oversized_inventory_fails_without_buffering(self, monkeypatch):
         import httpx

@@ -7162,7 +7162,17 @@ class _OllamaEndpoint:
             except ValueError:
                 port_ok = False
         valid = bool(
-            parts is not None and parts.scheme.lower() in {"http", "https"} and hostname and port_ok
+            parts is not None
+            and parts.scheme.lower() in {"http", "https"}
+            and hostname
+            and port_ok
+            # urlsplit erases an EMPTY '?' / '#' delimiter, but the probe (and
+            # the runtime clients) append /api/... to the raw value, where the
+            # delimiter turns the path into a query/fragment — such an
+            # endpoint can never be reached as configured, so no runnable
+            # command can repair it.
+            and "?" not in base_url
+            and "#" not in base_url
         )
         default_local = bool(
             valid
