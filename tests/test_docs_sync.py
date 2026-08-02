@@ -1942,8 +1942,15 @@ def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
     assert mapping, "init's freshness mapping literal moved; update this pin"
     live_ttl, reuse_ttl = mapping.group(1), mapping.group(2)
 
-    assert f"`{live_ttl}`" in text, f"documented live TTL != code ({live_ttl})"
-    assert f"`{reuse_ttl}`" in text, f"documented reuse TTL != code ({reuse_ttl})"
+    # Bind each TTL to its own row. Searching the whole table for both values
+    # would still pass with the two swapped — the readers most likely to be
+    # hurt by that are the ones who came here to learn which is which.
+    for preset, ttl in (("live", live_ttl), ("reuse", reuse_ttl)):
+        row = re.search(rf"^\|\s*`{preset}`[^|]*\|([^|]*)\|", text, re.MULTILINE)
+        assert row, f"docs/cli.md lost the `{preset}` row of the --freshness table"
+        assert f"`{ttl}`" in row.group(1), (
+            f"documented {preset} TTL != code ({ttl}); row says {row.group(1).strip()!r}"
+        )
     schema_default = CacheConfig().default_ttl_seconds
     assert schema_default is not None
     # Compare against the table as written. An earlier form of this line
