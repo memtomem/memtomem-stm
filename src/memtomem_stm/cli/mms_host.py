@@ -182,7 +182,7 @@ def _is_interactive() -> bool:
 
 @click.group(name="host")
 def host_group() -> None:
-    """Host-config inspection and sync (RFC §7.3)."""
+    """Host-config inspection and sync."""
 
 
 # ---------------------------------------------------------------------------

@@ -12611,3 +12611,41 @@ class TestMergeTuneChanges:
         changes, _ = _merge_tune_changes([rec], self._SERVERS)
         assert changes[0].value == 0.4
         assert isinstance(changes[0].value, float)
+
+
+class TestHelpTextHasNoInternalJargon:
+    """User-facing help must not cite internal planning artifacts.
+
+    `mms project enable` on an empty registry told users to wait for
+    "(W1 PR2)" / "planned post-W1", and the host/project group helps cited
+    "RFC §7.x" — references to a private planning doc no user can read.
+    Sweep the whole command tree so a new command can't reintroduce one.
+    """
+
+    _JARGON = ("RFC §", "W1 PR", "post-W1", "(W1)")
+
+    def _iter_help_texts(self):
+        import click
+
+        def walk(cmd, path):
+            ctx = click.Context(cmd, info_name=path)
+            yield path, cmd.get_help(ctx)
+            for name, sub in getattr(cmd, "commands", {}).items():
+                yield from walk(sub, f"{path} {name}")
+
+        yield from walk(cli, "mms")
+
+    def test_no_internal_jargon_in_any_help_text(self):
+        offenders = [
+            (path, token)
+            for path, text in self._iter_help_texts()
+            for token in self._JARGON
+            if token in text
+        ]
+        assert not offenders, f"internal jargon in user-facing help: {offenders}"
+
+    def test_registry_empty_message_has_no_roadmap_jargon(self):
+        from memtomem_stm.cli.mms_project import _REGISTRY_EMPTY_MSG
+
+        assert "W1" not in _REGISTRY_EMPTY_MSG
+        assert "mms import" in _REGISTRY_EMPTY_MSG

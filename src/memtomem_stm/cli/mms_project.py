@@ -31,8 +31,8 @@ from memtomem_stm.mms.detect import Project, Source, detect_project
 
 _REGISTRY_EMPTY_MSG = (
     "Registry is empty.\n"
-    "  Run `mms import --from <host>` (W1 PR2) to import existing MCP definitions,\n"
-    "  or wait for the integrated `mms add` path (planned post-W1).\n"
+    "  Run `mms import --from <host>` to import existing MCP definitions\n"
+    "  from host configs, then re-run this command.\n"
 )
 
 
@@ -62,7 +62,7 @@ def _show_git_no_marker_text(root: Path) -> str:
 
 @click.group(name="project")
 def project_group() -> None:
-    """Project-scoped MCP management (RFC §7.1).
+    """Project-scoped MCP management.
 
     Commands operate on the project containing the current working
     directory unless ``--project NAME`` is passed (where supported).
@@ -371,7 +371,7 @@ def list_cmd(prune: bool, json_output: bool) -> None:
 )
 @with_write_lock
 def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
-    """Add MCP names to the project's enabled list (RFC §7.1)."""
+    """Add MCP names to the project's enabled list."""
     proj = _resolve_project_for_mutation(project_name)
 
     registry = state.load_registry()

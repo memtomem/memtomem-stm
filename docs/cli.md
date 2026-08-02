@@ -58,11 +58,11 @@ Commands:
   gateway    Inspect and configure Toolgraph-backed gateway policy.
   health     Check upstream server connectivity.
   hook       Bridge a host's built-in tool calls into STM (PostToolUse...
-  host       Host-config inspection and sync (RFC §7.3).
+  host       Host-config inspection and sync.
   import     Import MCP definitions from host configs into the mms registry.
   init       Guided first-time setup for memtomem-stm.
   list       List configured upstream servers.
-  project    Project-scoped MCP management (RFC §7.1).
+  project    Project-scoped MCP management.
   prune      Remove direct registrations for STM upstreams that are...
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
@@ -778,27 +778,27 @@ and Windows hosts without sending them an incompatible frame.
 
 ## `mms project` — project-scoped MCP management
 
-`mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap) — see RFC §5 for the full data model.
+`mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap).
 
 The group ships six subcommands. State lives in three TOML files plus the
 explicit route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
-| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add` in W1) | **No** — gitignore |
+| `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add`) | **No** — gitignore |
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
 
 ```
 Usage: mms project [OPTIONS] COMMAND [ARGS]...
 
-  Project-scoped MCP management (RFC §7.1).
+  Project-scoped MCP management.
 
 Commands:
   init     Create <path>/.mms/project.toml (default path = cwd) and add to index.
   show     Show the detected (or named) project, with init hints when no marker.
   list     List known projects from the index. Mark current cwd's project with `*`.
-  enable   Add MCP names to the project's enabled list (RFC §7.1).
+  enable   Add MCP names to the project's enabled list.
   disable  Remove MCP names from the project's enabled list.
   route    Preview or apply selected registry entries as STM proxy upstreams.
 ```
@@ -907,7 +907,7 @@ Missing configs are silently treated as "no candidates" so `--from all` works ac
 
 ### Secret classification
 
-The env block of each entry runs through a two-signal classifier (RFC §7.2.1):
+The env block of each entry runs through a two-signal classifier:
 
 1. **Key pattern** (case-insensitive substring): `*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASSWORD*`, `*PASS*`, `*AUTH*`, `*CREDENTIAL*`, `*API_KEY*`. Hits even if the value is short (`API_KEY=test` is still classified — pattern beats value).
 2. **Value heuristic**: length ≥ 32 AND the value is mostly base64- or hex-charset (catches opaque tokens stored under unusual key names).
