@@ -1838,9 +1838,12 @@ def list_servers(config_path: str, *, as_json: bool = False) -> None:
     servers: dict[str, Any] = data.get("upstream_servers", {})
     # Same lenient warning as ``status`` (#611): on a schema-invalid config a
     # running server ignores the whole file, so this table shows servers that
-    # are NOT being proxied (or none at all when the key itself is mangled) —
-    # without the warning a typo'd config makes them silently vanish here.
-    config_error = _schema_validation_error(data)
+    # are NOT being proxied. The env-overlaid validator, not the file-only
+    # one: the warning claims what a *running server* would do, and an env
+    # var can make a malformed subtree irrelevant — validating the file
+    # alone would warn here while `status` and `health` stay silent on the
+    # very same config.
+    config_error = _runtime_schema_validation_error(data)
 
     if as_json:
         click.echo(

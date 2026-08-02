@@ -286,7 +286,7 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
 
 The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
@@ -349,7 +349,7 @@ mms add --import --select filesystem,github
 
 # List configured upstreams (per-server detail: prefix, transport, surfacing, origin)
 mms list
-mms list --json            # machine-readable: {config_path, servers}
+mms list --json            # machine-readable: {config_path, config_valid, config_error, servers}
 
 # Config summary (path, enabled flag, server count)
 mms status
@@ -551,7 +551,7 @@ Shows a config summary: the configuration file path, enabled flag, schema-valida
 
 `status --json` is unchanged by that split: it still carries the full redacted `servers` map (plus additive `server_count` / `pruned_count` keys), so scripted consumers keep working. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
-When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `health` print a warning naming the first error — exit code unchanged. Use `mms config validate` for the strict check.
+When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status`, `list`, and `health` print a warning naming the first error — exit code unchanged. All three validate the file *with* the `MEMTOMEM_STM_PROXY__*` env overlay applied, so the warning matches what a running server would actually do rather than firing on a file an env var already repairs. Use `mms config validate` for the strict check.
 
 ### `config validate`
 
