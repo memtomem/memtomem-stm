@@ -1045,6 +1045,35 @@ class TestStatus:
         assert data["config_valid"] is True
         assert data["config_error"] is None
 
+    def test_env_override_can_repair_invalid_file_for_runtime_validation(
+        self, runner, config, monkeypatch
+    ):
+        """The server validates env > file, so status must not claim that it
+        discarded a file whose invalid value is repaired by an env override."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": "not-a-boolean",
+                    "upstream_servers": {
+                        "fs": {"prefix": "fs", "command": "uvx", "args": ["mcp-server-fs"]}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+
+        human_result = runner.invoke(cli, ["status", *_cfg_args(config)])
+        result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])
+
+        assert human_result.exit_code == 0, human_result.output
+        assert "falls back to env/defaults" not in human_result.output
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["config_valid"] is True
+        assert data["config_error"] is None
+        assert "fs" in data["servers"]
+
     def test_json_redacts_origin_original(self, runner, config):
         """``origin.original`` is the verbatim host entry and may carry
         secrets — ``status --json`` must emit only the provenance summary
@@ -3372,6 +3401,29 @@ class TestInitDiscoveryHelpers:
         assert _suggest_prefix("fs", {"fs"}) == "fs2"
         assert _suggest_prefix("fs", {"fs", "fs2"}) == "fs3"
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "filesystem",
+            "my-server.name",
+            "123",
+            "a-–-b",  # odd-length separator run: one `__`-collapse pass isn't enough
+            "x  -  y",
+            "!!!",
+            "한글",
+            "_leading_and_trailing_",
+        ],
+    )
+    def test_suggest_prefix_is_always_a_valid_prefix(self, name):
+        """Every suggestion must pass the runtime's own format rule. The
+        non-interactive import path (#817) saves this value with nobody to
+        re-prompt, so an invalid one would strand the user with a config the
+        proxy refuses to load."""
+        from memtomem_stm.cli.proxy import _suggest_prefix
+        from memtomem_stm.proxy import prefixes
+
+        assert prefixes.prefix_format_error(_suggest_prefix(name, set())) is None
+
     def test_is_self_reference_blocks_recursion(self):
         """STM (mms/memtomem-stm) and the LTM companion (memtomem/
         memtomem-server) must never be imported as upstream servers.
@@ -3658,7 +3710,7 @@ class TestInitImportFlow:
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
-        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: None)
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: ([], []))
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -4171,7 +4223,7 @@ class TestImportOriginCapture:
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
-        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: None)
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: ([], []))
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -5999,6 +6051,382 @@ class TestAddFromClients:
         assert hint == (
             f"# Edit {_desktop_config_path()} and remove 'bad\\u000Aname' under mcpServers."
         )
+
+
+class TestAddFromClientsNonInteractive:
+    """`mms add --from-clients --all/--select` (#817) — the scripted path.
+
+    Both flags replace the selection prompt *and* the per-server prefix
+    prompt, so a CI caller never has to drive stdin (where a stray line
+    silently became the prefix). None of these tests pass ``input=``: any
+    surviving prompt would hit EOF and fail the run, which is the point.
+    """
+
+    def _stub_candidates(self, monkeypatch, candidates):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
+
+    def _seed_config(self, config: Path, servers: dict) -> None:
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": servers}, indent=2),
+            encoding="utf-8",
+        )
+
+    def _two_candidates(self):
+        return [
+            {
+                "name": "filesystem",
+                "source": "Claude Code (user)",
+                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@fs"]},
+                "raw": {"command": "npx", "args": ["-y", "@fs"]},
+                "source_ref": {"kind": "claude-code-user"},
+            },
+            {
+                "name": "github",
+                "source": "Claude Desktop",
+                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@gh"]},
+                "raw": {"command": "npx", "args": ["-y", "@gh"]},
+                "source_ref": {"kind": "claude-desktop"},
+            },
+        ]
+
+    def test_all_imports_every_candidate_without_prompting(self, runner, config, monkeypatch):
+        """No stdin at all → both candidates land with suggested prefixes."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "Tool prefix" not in result.output  # the prefix prompt never ran
+        assert "Added 2 server" in result.output
+
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(servers) == {"filesystem", "github"}
+        assert servers["filesystem"]["prefix"] == "filesystem"
+        assert servers["github"]["prefix"] == "github"
+        # Provenance is recorded exactly as the interactive path records it.
+        assert servers["filesystem"]["origin"]["source"]["kind"] == "claude-code-user"
+
+    def test_all_never_prompts_even_on_a_tty(self, runner, config, monkeypatch):
+        """The gate is the flag, not the terminal: with `_should_use_tui`
+        forced True the run must still complete on empty stdin. Without the
+        flag that same setup would sit on the questionary selector."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+
+        def boom(*_a, **_kw):  # pragma: no cover - must never run
+            raise AssertionError("interactive selection reached in --all mode")
+
+        monkeypatch.setattr(proxy_mod, "_pick_imports", boom)
+        monkeypatch.setattr(proxy_mod, "_pick_imports_tui", boom)
+        monkeypatch.setattr(proxy_mod, "_prompt_prefix", boom)
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert len(json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]) == 2
+
+    def test_auto_prefix_suffixes_around_an_existing_prefix(self, runner, config, monkeypatch):
+        """The suggested prefix collides with one already in the config. The
+        interactive path re-prompts; here the deterministic rule applies the
+        numeric suffix instead of writing a config the runtime would refuse
+        to load (duplicate prefixes are a hard load error)."""
+        self._seed_config(
+            config,
+            {"other": {"prefix": "filesystem", "transport": "stdio", "command": "old"}},
+        )
+        self._stub_candidates(monkeypatch, self._two_candidates()[:1])
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert servers["filesystem"]["prefix"] == "filesystem2"
+
+    def test_auto_prefix_truncates_an_over_budget_name(self, runner, config, monkeypatch):
+        """A name longer than the tool-name budget has no valid prefix to
+        suggest. With nobody to re-prompt, truncate to the hard limit and
+        warn — saving it would make every proxied tool name overflow."""
+        from memtomem_stm.proxy import prefixes, tool_name_budget
+
+        hard_limit = tool_name_budget.prefix_hard_limit()
+        long_name = "x" * (hard_limit + 20)
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": long_name,
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        saved = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"][long_name]
+        assert len(saved["prefix"]) <= hard_limit
+        assert prefixes.prefix_format_error(saved["prefix"]) is None
+        assert "leaves only" in result.output  # budget warning surfaced
+
+    def test_select_imports_only_the_named_servers(self, runner, config, monkeypatch):
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--select", "github", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert set(json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]) == {"github"}
+
+    def test_select_accepts_commas_and_repetition(self, runner, config, monkeypatch):
+        """``--select a,b`` and ``--select a --select b`` are the same request;
+        a name repeated across both spellings imports once."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--select",
+                "filesystem,github",
+                "--select",
+                "github",
+                *_cfg_args(config),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Added 2 server" in result.output
+        assert set(json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]) == {
+            "filesystem",
+            "github",
+        }
+
+    def test_select_unknown_name_aborts_before_writing_anything(self, runner, config, monkeypatch):
+        """A name no client advertises is a typo. Importing the names that
+        *did* resolve would leave the caller with a half-applied request they
+        never asked for, so nothing is written."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+        before = config.read_bytes()
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--select", "github,typo", *_cfg_args(config)]
+        )
+        assert result.exit_code == 1, result.output
+        assert "no MCP client advertises: typo" in result.output
+        assert config.read_bytes() == before
+
+    def test_select_already_registered_is_a_skip_not_an_error(self, runner, config, monkeypatch):
+        """Re-running the same scripted import must stay idempotent: the
+        server is already there, so warn and exit 0 rather than fail the
+        pipeline on its second run."""
+        self._seed_config(
+            config,
+            {"github": {"prefix": "gh", "transport": "stdio", "command": "npx"}},
+        )
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--select", "github", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Skipping: 'github'" in result.output
+        assert "All discovered servers are already registered." in result.output
+        # The unselected candidate is neither imported nor mentioned.
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(servers) == {"github"}
+        assert "filesystem" not in result.output
+
+    def test_all_and_select_are_mutually_exclusive(self, runner, config, monkeypatch):
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [])
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--select", "x", *_cfg_args(config)]
+        )
+        assert result.exit_code == 2, result.output
+        assert "--all cannot be combined with --select" in result.output
+
+    @pytest.mark.parametrize("flag", [["--all"], ["--select", "x"]])
+    def test_selection_flags_require_from_clients(self, runner, config, monkeypatch, flag):
+        """On the manual single-server path these flags have no meaning; a
+        silent no-op would hide the mistake."""
+        self._seed_config(config, {})
+
+        result = runner.invoke(
+            cli, ["add", "srv", "--prefix", "s", "--command", "x", *flag, *_cfg_args(config)]
+        )
+        assert result.exit_code == 2, result.output
+        assert "--all / --select require --from-clients" in result.output
+
+    def test_json_payload_lists_imports_and_redacts_secrets(self, runner, config, monkeypatch):
+        """stdout carries exactly one document; env values are masked because
+        --json output is routinely piped into CI logs."""
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "github",
+                    "source": "Claude Desktop",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "env": {"GITHUB_TOKEN": "ghp_supersecret"},
+                    },
+                },
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["mode"] == "from_clients"
+        assert payload["validated"] is False
+        assert payload["prune"] is None
+        assert [row["name"] for row in payload["imported"]] == ["github"]
+        assert payload["imported"][0]["prefix"] == "github"
+        assert payload["imported"][0]["source"] == "Claude Desktop"
+        assert "ghp_supersecret" not in result.stdout
+        # ...but the real value still reached the config.
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert servers["github"]["env"]["GITHUB_TOKEN"] == "ghp_supersecret"
+
+    def test_json_reports_skips_with_an_empty_import_list(self, runner, config, monkeypatch):
+        """Nothing left to import is success, not failure — and the payload
+        says *why* each name produced no import."""
+        self._seed_config(
+            config,
+            {"github": {"prefix": "gh", "transport": "stdio", "command": "npx"}},
+        )
+        self._stub_candidates(monkeypatch, self._two_candidates()[1:])
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 0, result.output
+
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert payload["imported"] == []
+        assert payload["skipped"] == [{"name": "github", "reason": "already_registered"}]
+
+    def test_json_unknown_select_uses_the_failure_envelope(self, runner, config, monkeypatch):
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--select", "typo", "--json", *_cfg_args(config)]
+        )
+        assert result.exit_code == 1, result.output
+
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["error"] == "unknown_server"
+        assert payload["unknown"] == ["typo"]
+        assert payload["available"] == ["filesystem", "github"]
+
+    def test_json_still_rejected_without_a_selection_flag(self, runner, config, monkeypatch):
+        """Bare `--from-clients --json` stays a usage error: a formatting flag
+        must not turn the selection prompt into a guess about what to import."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--json", *_cfg_args(config)])
+        assert result.exit_code == 2, result.output
+        assert "pass --all or --select" in result.output
+
+    def test_json_validate_records_probe_outcome_per_server(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "filesystem": _probe_ok(tools=7),
+                "github": StagedProbeResult(
+                    stage=ProbeStage.CONFIGURED, error="connection refused"
+                ),
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--json", "--validate", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+
+        payload = json.loads(result.stdout)
+        assert payload["validated"] is True
+        rows = {row["name"]: row for row in payload["imported"]}
+        assert rows["filesystem"]["reachable"] is True
+        assert rows["filesystem"]["tools_reachable"] == 7
+        assert rows["github"]["reachable"] is False
+        assert rows["github"]["tools_reachable"] is None
+        # A failed probe warns but still saves — same as the interactive path.
+        assert any("connection refused" in w for w in payload["warnings"])
+        assert set(json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]) == {
+            "filesystem",
+            "github",
+        }
+
+    def test_prune_never_prompts_on_a_tty_in_scripted_mode(self, runner, config, monkeypatch):
+        """Without --prune the scripted path falls straight through to the
+        hint, even on a TTY: the confirm prompt would block a caller who has
+        nobody at the keyboard."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates()[:1])
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+
+        def boom(*_a, **_kw):  # pragma: no cover - must never run
+            raise AssertionError("prune confirmation reached in --all mode")
+
+        monkeypatch.setattr(proxy_mod, "_confirm_prune_prompt", boom)
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "claude mcp remove" in result.output  # hint-only fallback
+
+    def test_json_prune_reports_removed_sources(self, runner, config, monkeypatch):
+        """With explicit --prune consent the payload carries the outcome that
+        the suppressed stdout block would have printed."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, self._two_candidates()[:1])
+        monkeypatch.setattr(
+            proxy_mod,
+            "_prune_imported_candidates",
+            lambda cands, pruned_at: ([("filesystem", "Claude Code (user)")], []),
+        )
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--prune", "--json", *_cfg_args(config)],
+        )
+        assert result.exit_code == 0, result.output
+
+        payload = json.loads(result.stdout)
+        assert payload["prune"] == {
+            "pruned": [{"name": "filesystem", "source": "Claude Code (user)"}],
+            "failed": [],
+        }
 
 
 class TestAddFromClientsPrune:
