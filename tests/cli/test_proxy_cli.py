@@ -12153,6 +12153,96 @@ class TestDoctor:
             for secret in ("alice", "pw1", "bob", "pw2"):
                 assert secret not in check_id
 
+    def test_ollama_check_id_unparseable_authority_hides_credentials(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        schemeless = proxy_mod._ollama_check_id("alice:hunter2@ollama.test:11434")
+        rotated = proxy_mod._ollama_check_id("alice:rotated@ollama.test:11434")
+        single_slash = proxy_mod._ollama_check_id("http:/alice:hunter2@ollama.test:11434")
+        # These parse without a netloc (credentials land in scheme/path), so
+        # the digest must come from a fixed sentinel — nothing
+        # password-dependent survives.
+        assert schemeless == rotated == single_slash
+
+    def test_ollama_twin_id_mapping_survives_password_rotation(self, runner, config, monkeypatch):
+        """Each use site must keep its ID when only a password changes.
+
+        Ordinal suffixes are assigned in credential-independent order; a raw
+        URL sort would let a rotated password swap which twin owns the base ID.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok() for n in servers}
+
+        async def fake_probe_ollama(dependencies, timeout):
+            return [
+                proxy_mod._OllamaProbeResult(dependency, frozenset()) for dependency in dependencies
+            ]
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
+
+        def site_ids(url_one, url_two):
+            config.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "cache": {"tool_annotation_policy": "strict"},
+                        "upstream_servers": {
+                            name: {
+                                "prefix": prefix,
+                                "transport": "stdio",
+                                "command": "x",
+                                "compression": "llm_summary",
+                                "llm": {
+                                    "provider": "ollama",
+                                    "model": "qwen3:4b",
+                                    "base_url": url,
+                                },
+                            }
+                            for name, prefix, url in [
+                                ("one", "p1", url_one),
+                                ("two", "p2", url_two),
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+            payload = json.loads(result.output)
+            mapping = {}
+            for check in payload["checks"]:
+                if check["id"].startswith("ollama_endpoint:"):
+                    site = "one" if "'one'" in check["detail"] else "two"
+                    mapping[site] = check["id"]
+            return mapping
+
+        # Rotating site one's password from 1 to 9 flips a raw-URL sort
+        # (u:1@ < u:2@ but u:9@ > u:2@); the mapping must not move.
+        before = site_ids("http://u:1@ollama.test:11434", "http://u:2@ollama.test:11434")
+        after = site_ids("http://u:9@ollama.test:11434", "http://u:2@ollama.test:11434")
+        assert len(set(before.values())) == 2
+        assert before == after
+
+    def test_remote_hint_escapes_hostile_model_names(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        hint = proxy_mod._ollama_next_action("http://ollama.remote:11434", ["evil\x1b[31mmodel"])
+        assert "\x1b" not in hint
+        assert "\\u001B" in hint
+        assert hint.startswith("verify the remote Ollama host serves model(s) ")
+
+    def test_ollama_next_action_scheme_and_host_validation(self):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        # Scheme matching is case-insensitive (httpx accepts HTTP://).
+        assert proxy_mod._ollama_next_action("HTTP://LOCALHOST:11434", []) == "ollama serve"
+        # Hostless or non-HTTP endpoints cannot be fixed by serve/pull.
+        assert "base_url" in proxy_mod._ollama_next_action("http://", [])
+        assert "base_url" in proxy_mod._ollama_next_action("ftp://ollama.test:11434", [])
+
     def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
         """LTM 미설정 scenario: WARN with the ratified messaging — names
         surfacing as the only casualty, never reads as an install failure."""

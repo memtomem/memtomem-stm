@@ -7301,8 +7301,17 @@ def _ollama_check_id(base_url: str) -> str:
     """
     try:
         parts = urlsplit(base_url)
-        stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
     except ValueError:
+        parts = None
+    if parts is not None and parts.netloc:
+        stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+    elif parts is not None and "@" not in base_url:
+        stripped = base_url
+    else:
+        # No parseable authority: a scheme-less or single-slash form parses
+        # its credentials into scheme/path, so an '@'-bearing value we cannot
+        # decompose hashes a fixed sentinel instead — mirroring
+        # redact_url_userinfo's wholesale fallback.
         stripped = "<unparseable url>"
     digest = hashlib.sha256(stripped.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
     return f"ollama_endpoint:{digest}"
@@ -7317,12 +7326,21 @@ def _is_loopback_ollama(base_url: str) -> bool:
 
 
 def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
-    if not base_url.startswith(("http://", "https://")):
-        # An empty/relative URL never reaches a server; "ollama serve" or
-        # "ollama pull" cannot fix it.
+    try:
+        parts = urlsplit(base_url)
+        hostname = parts.hostname
+    except ValueError:
+        parts, hostname = None, None
+    if parts is None or parts.scheme.lower() not in {"http", "https"} or not hostname:
+        # An empty/relative/hostless URL never reaches a server; "ollama
+        # serve" or "ollama pull" cannot fix it.
         return f"set a valid base_url for this endpoint; see {_OLLAMA_SETUP_DOC}"
     if not _is_loopback_ollama(base_url):
-        target = f" serves model(s) {', '.join(missing_models)}" if missing_models else ""
+        # Prose, not a command, so config-derived model names must be
+        # display-escaped here (the render loop deliberately prints
+        # next_action raw — every other one is a literal template or goes
+        # through _shell_join, which refuses hostile characters).
+        target = f" serves model(s) {_disp(', '.join(missing_models))}" if missing_models else ""
         return f"verify the remote Ollama host{target}; see {_OLLAMA_SETUP_DOC}"
     return (
         _shell_join(["ollama", "pull", missing_models[0]])
@@ -7710,9 +7728,20 @@ def doctor(
 
                 if ollama_dependencies:
                     seen_ollama_check_ids: dict[str, int] = {}
-                    for probe in asyncio.run(
+                    ollama_probes = asyncio.run(
                         _probe_ollama_dependencies(ollama_dependencies, timeout)
-                    ):
+                    )
+                    # Ordinal assignment must not follow the raw URL sort:
+                    # rotating a password could otherwise swap which
+                    # credential-only twin owns the base ID. Order by the
+                    # stripped ID, then the credential-independent use sites.
+                    ollama_probes.sort(
+                        key=lambda p: (
+                            _ollama_check_id(p.dependency.base_url),
+                            p.dependency.usages,
+                        )
+                    )
+                    for probe in ollama_probes:
                         dependency = probe.dependency
                         display_url = redact_url_userinfo(dependency.base_url)
                         usages = ", ".join(dependency.usages)
