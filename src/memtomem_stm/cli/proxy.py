@@ -7098,9 +7098,62 @@ def health(
 _DOCTOR_STYLES = {"PASS": _ok, "WARN": _warn, "FAIL": _bad}
 
 _DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+# Real /api/tags payloads are a few KB; the cap only guards doctor's memory
+# against a hostile or misconfigured endpoint streaming an unbounded body.
+_OLLAMA_INVENTORY_MAX_BYTES = 5 * 1024 * 1024
 _OLLAMA_SETUP_DOC = (
     "https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md#local-ollama-setup"
 )
+
+
+@dataclass(frozen=True)
+class _OllamaEndpoint:
+    """One parse of a configured base URL, shared by identity/hints/validity.
+
+    Independently parsed views of the same endpoint kept disagreeing across
+    review rounds (the identity hashed credentials the display redacted; the
+    hint recommended ``ollama serve`` for URLs the client rejects). Every
+    URL-derived doctor behavior except the probe itself — which must use the
+    raw value exactly as the runtime clients do — derives from this single
+    parse so the views cannot drift apart.
+    """
+
+    raw: str
+    stripped: str
+    hostname: str | None
+    valid: bool
+
+    @classmethod
+    def parse(cls, base_url: str) -> "_OllamaEndpoint":
+        try:
+            parts = urlsplit(base_url)
+            hostname = parts.hostname
+        except ValueError:
+            parts, hostname = None, None
+        if parts is not None and parts.netloc:
+            stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+        elif parts is not None and "@" not in base_url:
+            stripped = base_url
+        else:
+            # No parseable authority: a scheme-less or single-slash form
+            # parses its credentials into scheme/path, so an '@'-bearing value
+            # we cannot decompose maps to a fixed sentinel instead — mirroring
+            # redact_url_userinfo's wholesale fallback.
+            stripped = "<unparseable url>"
+        port_ok = True
+        if parts is not None:
+            try:
+                parts.port
+            except ValueError:
+                port_ok = False
+        valid = bool(
+            parts is not None and parts.scheme.lower() in {"http", "https"} and hostname and port_ok
+        )
+        return cls(raw=base_url, stripped=stripped, hostname=hostname, valid=valid)
+
+    @property
+    def loopback(self) -> bool:
+        return (self.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
 
 
 @dataclass(frozen=True)
@@ -7255,17 +7308,27 @@ async def _probe_ollama_dependencies(
         try:
             # httpx timeouts are per phase (connect/read/...); this outer
             # deadline is the whole-request bound ``--timeout`` promises, so a
-            # trickling inventory body cannot stall doctor past it.
+            # trickling inventory body cannot stall doctor past it. Streaming
+            # with a byte cap keeps a fast oversized body from exhausting
+            # memory before JSON validation would reject it.
             async with asyncio.timeout(timeout):
-                response = await client.get(inventory_url)
+                async with client.stream("GET", inventory_url) as response:
+                    if not 200 <= response.status_code < 300:
+                        return _OllamaProbeResult(dependency, error=f"HTTP {response.status_code}")
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body += chunk
+                        if len(body) > _OLLAMA_INVENTORY_MAX_BYTES:
+                            return _OllamaProbeResult(
+                                dependency,
+                                error="inventory response exceeds "
+                                f"{_OLLAMA_INVENTORY_MAX_BYTES} bytes",
+                            )
         except Exception as exc:  # external endpoint boundary; doctor must render, not crash
             return failure(dependency, exc)
 
-        if not 200 <= response.status_code < 300:
-            return _OllamaProbeResult(dependency, error=f"HTTP {response.status_code}")
-
         try:
-            payload = response.json()
+            payload = json.loads(bytes(body))
         except ValueError:
             return _OllamaProbeResult(dependency, error="returned invalid JSON")
         models = payload.get("models") if isinstance(payload, dict) else None
@@ -7297,45 +7360,20 @@ def _ollama_check_id(base_url: str) -> str:
     Hashing the raw URL would publish a truncated digest of the credentials
     in ``--json`` — enough for an offline password-guessing verifier once the
     host is known. Two endpoints differing only by userinfo therefore share
-    an ID; the caller disambiguates with an ordinal suffix.
+    an ID; the caller appends a use-site digest to disambiguate.
     """
-    try:
-        parts = urlsplit(base_url)
-    except ValueError:
-        parts = None
-    if parts is not None and parts.netloc:
-        stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
-    elif parts is not None and "@" not in base_url:
-        stripped = base_url
-    else:
-        # No parseable authority: a scheme-less or single-slash form parses
-        # its credentials into scheme/path, so an '@'-bearing value we cannot
-        # decompose hashes a fixed sentinel instead — mirroring
-        # redact_url_userinfo's wholesale fallback.
-        stripped = "<unparseable url>"
+    stripped = _OllamaEndpoint.parse(base_url).stripped
     digest = hashlib.sha256(stripped.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
     return f"ollama_endpoint:{digest}"
 
 
-def _is_loopback_ollama(base_url: str) -> bool:
-    try:
-        host = (urlsplit(base_url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host in {"", "localhost", "127.0.0.1", "::1"}
-
-
 def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
-    try:
-        parts = urlsplit(base_url)
-        hostname = parts.hostname
-    except ValueError:
-        parts, hostname = None, None
-    if parts is None or parts.scheme.lower() not in {"http", "https"} or not hostname:
-        # An empty/relative/hostless URL never reaches a server; "ollama
-        # serve" or "ollama pull" cannot fix it.
+    endpoint = _OllamaEndpoint.parse(base_url)
+    if not endpoint.valid:
+        # An empty/relative/hostless/badly-ported URL never reaches a server;
+        # "ollama serve" or "ollama pull" cannot fix it.
         return f"set a valid base_url for this endpoint; see {_OLLAMA_SETUP_DOC}"
-    if not _is_loopback_ollama(base_url):
+    if not endpoint.loopback:
         # Prose, not a command, so config-derived model names must be
         # display-escaped here (the render loop deliberately prints
         # next_action raw — every other one is a literal template or goes
@@ -7727,32 +7765,38 @@ def doctor(
                     )
 
                 if ollama_dependencies:
-                    seen_ollama_check_ids: dict[str, int] = {}
                     ollama_probes = asyncio.run(
                         _probe_ollama_dependencies(ollama_dependencies, timeout)
                     )
-                    # Ordinal assignment must not follow the raw URL sort:
-                    # rotating a password could otherwise swap which
-                    # credential-only twin owns the base ID. Order by the
-                    # stripped ID, then the credential-independent use sites.
+                    # Render in credential-independent order (the collection
+                    # order sorts by the raw, credential-bearing URL).
                     ollama_probes.sort(
                         key=lambda p: (
                             _ollama_check_id(p.dependency.base_url),
                             p.dependency.usages,
                         )
                     )
+                    stripped_id_counts: dict[str, int] = {}
+                    for ollama_probe in ollama_probes:
+                        base_id = _ollama_check_id(ollama_probe.dependency.base_url)
+                        stripped_id_counts[base_id] = stripped_id_counts.get(base_id, 0) + 1
                     for probe in ollama_probes:
                         dependency = probe.dependency
                         display_url = redact_url_userinfo(dependency.base_url)
                         usages = ", ".join(dependency.usages)
                         check_id = _ollama_check_id(dependency.base_url)
-                        # Credential-stripped IDs can collide when endpoints
-                        # differ only by userinfo; keep them distinct without
-                        # reintroducing secret-derived data.
-                        ordinal = seen_ollama_check_ids.get(check_id, 0)
-                        seen_ollama_check_ids[check_id] = ordinal + 1
-                        if ordinal:
-                            check_id = f"{check_id}-{ordinal + 1}"
+                        if stripped_id_counts[check_id] > 1:
+                            # Credential-only twins share a stripped identity.
+                            # Discriminate by the config-source use sites — a
+                            # use site names exactly one endpoint, so the
+                            # digest is unique, stable under password changes,
+                            # and unaffected by another twin's insertion or
+                            # removal (ordinals were not), with no
+                            # secret-derived data.
+                            site_digest = hashlib.sha256(
+                                "|".join(dependency.usages).encode("utf-8", errors="surrogatepass")
+                            ).hexdigest()[:8]
+                            check_id = f"{check_id}-{site_digest}"
                         if probe.error:
                             check(
                                 check_id,

@@ -12145,13 +12145,20 @@ class TestDoctor:
             check["id"] for check in payload["checks"] if check["id"].startswith("ollama_endpoint:")
         ]
         assert len(ollama_ids) == 2
-        # Same stripped identity, so the second gets an ordinal suffix rather
-        # than a secret-derived discriminator.
         assert len(set(ollama_ids)) == 2
-        assert sorted(ollama_ids)[1] == f"{sorted(ollama_ids)[0]}-2"
+        # Same stripped identity: both twins carry a use-site digest suffix
+        # on a shared credential-free base (never ordinals, whose numbering
+        # shifted when an unrelated twin appeared).
+        bases = set()
         for check_id in ollama_ids:
+            prefix, digest_part = check_id.split(":", 1)
+            assert prefix == "ollama_endpoint"
+            base, dash, site_digest = digest_part.partition("-")
+            assert dash and len(base) == 12 and len(site_digest) == 8
+            bases.add(base)
             for secret in ("alice", "pw1", "bob", "pw2"):
                 assert secret not in check_id
+        assert len(bases) == 1
 
     def test_ollama_check_id_unparseable_authority_hides_credentials(self):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -12164,11 +12171,14 @@ class TestDoctor:
         # password-dependent survives.
         assert schemeless == rotated == single_slash
 
-    def test_ollama_twin_id_mapping_survives_password_rotation(self, runner, config, monkeypatch):
-        """Each use site must keep its ID when only a password changes.
+    def test_ollama_twin_id_mapping_survives_rotation_and_insertion(
+        self, runner, config, monkeypatch
+    ):
+        """Each use site must keep its ID across password and twin changes.
 
-        Ordinal suffixes are assigned in credential-independent order; a raw
-        URL sort would let a rotated password swap which twin owns the base ID.
+        The twin discriminator derives from the use sites, so neither a
+        rotated password (which flips a raw-URL sort) nor an inserted twin
+        that sorts first (which renumbered ordinals) may move an existing ID.
         """
         from memtomem_stm.cli import proxy as proxy_mod
 
@@ -12183,7 +12193,7 @@ class TestDoctor:
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
         monkeypatch.setattr(proxy_mod, "_probe_ollama_dependencies", fake_probe_ollama)
 
-        def site_ids(url_one, url_two):
+        def site_ids(*servers):
             config.write_text(
                 json.dumps(
                     {
@@ -12201,10 +12211,7 @@ class TestDoctor:
                                     "base_url": url,
                                 },
                             }
-                            for name, prefix, url in [
-                                ("one", "p1", url_one),
-                                ("two", "p2", url_two),
-                            ]
+                            for name, prefix, url in servers
                         },
                     }
                 ),
@@ -12215,16 +12222,34 @@ class TestDoctor:
             mapping = {}
             for check in payload["checks"]:
                 if check["id"].startswith("ollama_endpoint:"):
-                    site = "one" if "'one'" in check["detail"] else "two"
+                    site = next(n for n, _, _ in servers if f"'{n}'" in check["detail"])
                     mapping[site] = check["id"]
             return mapping
 
+        before = site_ids(
+            ("one", "p1", "http://u:1@ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert len(set(before.values())) == 2
+
         # Rotating site one's password from 1 to 9 flips a raw-URL sort
         # (u:1@ < u:2@ but u:9@ > u:2@); the mapping must not move.
-        before = site_ids("http://u:1@ollama.test:11434", "http://u:2@ollama.test:11434")
-        after = site_ids("http://u:9@ollama.test:11434", "http://u:2@ollama.test:11434")
-        assert len(set(before.values())) == 2
-        assert before == after
+        rotated = site_ids(
+            ("one", "p1", "http://u:9@ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+        )
+        assert rotated == before
+
+        # A third twin whose use site sorts before the others must get its
+        # own ID without renumbering theirs.
+        grown = site_ids(
+            ("one", "p1", "http://u:1@ollama.test:11434"),
+            ("two", "p2", "http://u:2@ollama.test:11434"),
+            ("a-early", "p0", "http://u:3@ollama.test:11434"),
+        )
+        assert grown["one"] == before["one"]
+        assert grown["two"] == before["two"]
+        assert grown["a-early"] not in {before["one"], before["two"]}
 
     def test_remote_hint_escapes_hostile_model_names(self):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -12239,9 +12264,35 @@ class TestDoctor:
 
         # Scheme matching is case-insensitive (httpx accepts HTTP://).
         assert proxy_mod._ollama_next_action("HTTP://LOCALHOST:11434", []) == "ollama serve"
-        # Hostless or non-HTTP endpoints cannot be fixed by serve/pull.
+        # Hostless, non-HTTP, or badly-ported endpoints cannot be fixed by
+        # serve/pull — the client would reject the URL before connecting.
         assert "base_url" in proxy_mod._ollama_next_action("http://", [])
         assert "base_url" in proxy_mod._ollama_next_action("ftp://ollama.test:11434", [])
+        assert "base_url" in proxy_mod._ollama_next_action("http://localhost:notaport", [])
+
+    def test_ollama_oversized_inventory_fails_without_buffering(self, monkeypatch):
+        import httpx
+
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        dependency = proxy_mod._OllamaDependency(
+            "http://ollama.test:11434",
+            (("nomic-embed-text", ("embedding scorer",)),),
+        )
+        real_async_client = httpx.AsyncClient
+        monkeypatch.setattr(proxy_mod, "_OLLAMA_INVENTORY_MAX_BYTES", 64)
+
+        def handler(request):
+            return httpx.Response(200, content=b"x" * 200)
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda **kwargs: real_async_client(transport=transport, **kwargs),
+        )
+        result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+        assert result.error == "inventory response exceeds 64 bytes"
 
     def test_ltm_unconfigured_is_warn_never_fail(self, runner, config, monkeypatch):
         """LTM 미설정 scenario: WARN with the ratified messaging — names
