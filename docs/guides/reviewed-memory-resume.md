@@ -19,6 +19,13 @@ in an existing checkout.
 Run this from a Git project root. Project-local memory is gitignored and does
 not leave the current checkout.
 
+The pins below deliberately install the `mcp` 1.x stack — core 0.3.x with
+memtomem-stm 0.1.x — because that is the combination this walkthrough has been
+run against end to end. It is not the newest release of either package:
+memtomem-stm 0.2.0 and core 0.4.0 moved to `mcp` 2.x, and this guide moves with
+them once both are published. Each is its own `uv tool install`, so the two
+never share a Python environment either way.
+
 ```bash
 uv tool install --with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'
 uv tool install 'memtomem-stm>=0.1.44,<0.2'

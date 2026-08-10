@@ -46,8 +46,15 @@ jobs:
           - core: "0.3.14"
             expected: schema4
             mcp_pin: ""
-          # The first mcp-2.x Core (0.4.0) gets its row when it publishes;
-          # adding it before the artifact exists only reddens this job.
+          # 0.4.0 is the first mcp-2.x Core and the lockstep partner of STM
+          # 0.2.0. Its row lands with that release; until 0.4.0 is on PyPI the
+          # install step cannot resolve and this row alone reds (fail-fast is
+          # off). Its capability surface is unchanged from 0.3.14 — Core's
+          # advertisement still reads context_compose schema_version 4 — so it
+          # expects schema4, and it caps mcp itself, so no pin.
+          - core: "0.4.0"
+            expected: schema4
+            mcp_pin: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
