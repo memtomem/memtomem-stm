@@ -400,8 +400,12 @@ async def _smoke(core_bin_dir: Path, expected: str) -> None:
                         env=env,
                     )
                     if expected == "schema4":
-                        # The guide declares a 0.3.12 floor and its cleanup uses
-                        # ``gc orphan-sources``, which 0.3.10 does not ship.
+                        # The guide's cleanup uses ``gc orphan-sources``, which
+                        # 0.3.10 does not ship, so it runs only for the rows at
+                        # or above the generation that has it. The guide's own
+                        # install floor is higher still (Core 0.4.0) and is not
+                        # what gates this — these rows replay its CLI flow
+                        # against older Cores on purpose.
                         _assert_guide_cleanup(mm, project=project, env=env)
             finally:
                 await adapter.stop()
