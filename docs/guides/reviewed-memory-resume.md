@@ -1,8 +1,8 @@
 # Resume a project with reviewed memory
 
 This scenario shows the boundary between operator-owned project context and
-review-first user memory. It requires memtomem core 0.3.12 or later and
-memtomem-stm 0.1.44 or later. Both packages remain separate processes and
+review-first user memory. It requires memtomem core 0.4.0 or later and
+memtomem-stm 0.2.0 or later. Both packages remain separate processes and
 negotiate the feature through `context_compose` schema 4. Runtime behavior
 still follows the connected Core's advertised capability rather than its
 package version.
@@ -19,16 +19,9 @@ in an existing checkout.
 Run this from a Git project root. Project-local memory is gitignored and does
 not leave the current checkout.
 
-The pins below deliberately install the `mcp` 1.x stack — core 0.3.x with
-memtomem-stm 0.1.x — because that is the combination this walkthrough has been
-run against end to end. It is not the newest release of either package:
-memtomem-stm 0.2.0 and core 0.4.0 moved to `mcp` 2.x, and this guide moves with
-them once both are published. Each is its own `uv tool install`, so the two
-never share a Python environment either way.
-
 ```bash
-uv tool install --with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'
-uv tool install 'memtomem-stm>=0.1.44,<0.2'
+uv tool install 'memtomem[all]>=0.4,<0.5'
+uv tool install 'memtomem-stm>=0.2,<0.3'
 
 mm status
 mm mem init
@@ -41,14 +34,15 @@ mm pinned list --json
 mm pinned compose "blue-green rollback checklist"
 ```
 
-Core 0.3.x imports the MCP 1.x `FastMCP` module, which the separately released
-`mcp` 2.x package removed. The explicit `--with 'mcp<2'` keeps a fresh install
-on Core's compatible MCP runtime until Core's package metadata carries that
-upper bound. For an existing uv tool, reinstall with the same constraint before
-continuing:
+Both pins sit on the `mcp` 2.x SDK: core 0.4.0 and memtomem-stm 0.2.0 declare
+`mcp[cli]>=2,<3` themselves, so neither needs a `--with` constraint the way the
+0.3.x/0.1.x stack did. They are still two separate `uv tool install`
+environments — the SDK major matters per environment, not across the MCP
+connection between them. Upgrading an existing tool from the older stack takes
+a reinstall:
 
 ```bash
-uv tool install --reinstall --with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'
+uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'
 ```
 
 Do not run `mm init` as part of this scenario: it rewrites the user-level Core
@@ -96,7 +90,7 @@ your normal thresholds afterwards.
 
 ```bash
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=uvx
-export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--with","mcp<2","--from","memtomem>=0.3.12,<0.4","memtomem-server"]'
+export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem>=0.4,<0.5","memtomem-server"]'
 export MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE=resume-demo
 export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=1
 export MEMTOMEM_STM_SURFACING__MIN_SCORE=0
@@ -108,9 +102,9 @@ mms add resume_fs \
   --prefix resume_fs
 mms daemon stop
 ```
-`uvx` resolves its own environment, so the `mcp<2` constraint from step 1 has
-to be repeated here — the tool you installed and the server STM launches are
-two different environments.
+`uvx` resolves its own environment, so the version pin from step 1 has to be
+repeated here — the tool you installed and the server STM launches are two
+different environments.
 
 Restart the AI client so it reloads STM and its environment. Ask it to call the
 proxied `resume_fs__read_file` tool for

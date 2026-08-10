@@ -1780,8 +1780,29 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     ):
         assert snippet in guide, f"reviewed-memory-resume guide lost {snippet!r}"
 
-    assert "--with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'" in guide
-    assert "memtomem>=0.3.12,<0.4" in guide
+    # Pin the executable lines whole, not the version substrings inside them:
+    # a version string survives in prose after the command that installs it
+    # has been edited out from under it, so substrings alone would keep
+    # passing over a recipe that no longer installs anything.
+    for command in (
+        "uv tool install 'memtomem[all]>=0.4,<0.5'",
+        "uv tool install 'memtomem-stm>=0.2,<0.3'",
+        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'",
+        'export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='
+        '\'["--from","memtomem>=0.4,<0.5","memtomem-server"]\'',
+    ):
+        assert command in guide, f"reviewed-memory-resume guide lost {command!r}"
+
+    # Core 0.4.0 and STM 0.2.0 declare mcp>=2 themselves, so the `mcp<2` this
+    # recipe used to carry in three separate places now makes an environment
+    # unresolvable rather than merely redundant. Guard the fenced commands
+    # only — prose may legitimately describe the older stack — and strip
+    # whitespace first so a spaced `mcp < 2` cannot walk past the check.
+    fenced = "".join(re.findall(r"```.*?```", guide, re.DOTALL))
+    assert "mcp<2" not in re.sub(r"\s+", "", fenced), (
+        "reviewed-memory-resume guide reacquired an mcp<2 constraint in an "
+        "executable block; with a 0.4/0.2 stack that environment cannot resolve"
+    )
     assert "does not approve" in guide and "one implicitly." in guide
     assert "\nmms daemon stop --all\n" not in guide
     assert "schema 4" in guide
