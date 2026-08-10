@@ -1780,8 +1780,14 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     ):
         assert snippet in guide, f"reviewed-memory-resume guide lost {snippet!r}"
 
-    assert "--with 'mcp<2' 'memtomem[all]>=0.3.12,<0.4'" in guide
-    assert "memtomem>=0.3.12,<0.4" in guide
+    # Both packages sit on the mcp 2.x SDK and declare it themselves, so the
+    # guide carries no `--with 'mcp<2'` anywhere: not in either install, and
+    # not in the uvx args STM launches Core with. That constraint reappearing
+    # would silently drag a reader back to the 0.3.x/0.1.x stack.
+    assert "memtomem[all]>=0.4,<0.5" in guide
+    assert "memtomem>=0.4,<0.5" in guide
+    assert "memtomem-stm>=0.2,<0.3" in guide
+    assert "mcp<2" not in guide
     assert "does not approve" in guide and "one implicitly." in guide
     assert "\nmms daemon stop --all\n" not in guide
     assert "schema 4" in guide
